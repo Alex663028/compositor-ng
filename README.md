@@ -12,11 +12,16 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **119 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **129 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
   `scripts/run_regression.py`（含鸿蒙交叉编译，6 步全绿）。
+  2026-10-15 再追加（第二轮独立审计）：修复 12 个缺陷并补10 条回归护栏，
+  详见 `../report/AUDIT2-compositor-ng-20261015-claude.md`——
+  含 `remove_subtree` 悬垂指针（UAF）、`.comp` 非法像素格式导致步长归零、
+  事务句柄悬垂、活动事务内可undo/redo 导致历史链错位、跨父级 reorder、
+  6 个 adjustment ABI 缺异常护栏（可`std::terminate` 宿主）等。
 
 ## 1. M1 目标与范围
 
@@ -433,11 +438,21 @@ N2/N6 为报告与注释订正。**P1-5 维持撤销，零代码改动。**
 
 | 项 | 命令 | 实测 |
 |----|------|------|
-| 单测 | `build/compositor_tests.exe` | `summary: 119 cases, 0 failed, 0 check failures`，rc=0（原 107 + 本轮 12：合并/拼合/COW 隔离/字节预算重写） |
+| 单测 | `build/compositor_tests.exe` | `summary: 129 cases, 0 failed, 0 check failures`，rc=0（原 107 + 合并/拼合/COW/字节预算 12 + 第二轮审计护栏 10） |
 | 壳自检 | `build/compositor_shell.exe --selftest=<报告文件路径>` | rc=0，27 项 OK；SHA256 与仓内基线**逐字节相同**（壳层新增菜单项不改自检行为） |
 | 编解码交叉 | `python scripts/crosscheck_codec.py` | `failures = 0`，rc=0 |
 | `.comp` 交叉 | `python scripts/crosscheck_comp.py` | 全 PASS，rc=0 |
 | 共享构建 | `python scripts/build.py --shared` | `ctypes` 真实调用 `comp_version() = "1.0.0"` |
+
+> ⚠️ **构建解释器**：`scripts/` 依赖 PyPI 的 `ziglang`（自带 clang），
+> 编解码交叉验证还需要 `numpy` + `PIL`。请用**已装齐这三者的解释器**运行，例如：
+>
+> ```bat
+> <local-workspace>\tools\python\python.exe scripts\run_regression.py
+> ```
+>
+> 用一个缺依赖的解释器（如裸系统 Python）跑，回归会 5 步全 FAIL 且报
+> `No module named ziglang` —— 那是环境问题，不是代码问题。
 | 鸿蒙交叉编译 | `bash scripts/build_ohos.sh` + `build_ohos_shell.sh` | 68 单元 0 失败；`.so` 仅导出 `RegisterCompositorOHOSModule` |
 | 一键回归 | `python scripts/run_regression.py` | **6/6 PASS，rc=0**（上述步骤固化为单入口，杜绝「挑着验」） |
 
