@@ -357,7 +357,15 @@ double JsonValue::as_number(double fallback) const {
 }
 
 long long JsonValue::as_integer(long long fallback) const {
-  return type_ == Type::Number ? static_cast<long long>(number_) : fallback;
+  /*
+   * JSON 数字经 strtod 解析："1e999" 会得到 inf。浮点→整数的转换对 inf/NaN
+   * 是未定义行为（x86 上常表现为 INT_MIN 一类"看起来正常"的垃圾值），而调用方
+   * （manifest 宽高、engineLayerID、export quality）都把它当可信整数使用。
+   * 非有限值一律回退缺省，交由上层校验拒绝，而不是放垃圾整数进门。
+   */
+  if (type_ != Type::Number) return fallback;
+  if (!std::isfinite(number_)) return fallback;
+  return static_cast<long long>(number_);
 }
 
 std::string JsonValue::as_string(const std::string& fallback) const {

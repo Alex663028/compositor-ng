@@ -541,3 +541,188 @@ COMP_TEST(format_comp_rejects_exr_layers) {
   COMP_CHECK(loaded == nullptr);
   comp_engine_destroy(engine);
 }
+
+/* --------------------------------------------- AUDIT3：manifest 读侧守卫 */
+
+namespace {
+
+/* 手写 manifest 的公共脚手架：返回 .comp 根目录（images/ 已建好）。 */
+std::string audit3_root(const char* name) {
+  std::error_code ec;
+  const std::string root = std::string("build/") + name;
+  std::filesystem::remove_all(root, ec);
+  std::filesystem::create_directories(root + "/images", ec);
+  return root;
+}
+
+void write_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+}
+
+/* 一份最小合法 manifest：单层、transform 六键由调用方给全（缺任一键上游
+ * Swift 都解码失败，故不提供缺省形态）；extra_layer_keys 可插入附加键。 */
+std::string minimal_manifest(const char* layer_id, const char* transform_json,
+                             const char* extra_layer_keys) {
+  return std::string("{\n"
+                     "  \"format\": \"com.compositor.project\",\n"
+                     "  \"version\": 13,\n"
+                     "  \"colorSpace\": \"sRGB\",\n"
+                     "  \"resolution\": 72,\n"
+                     "  \"documentID\": \"E621E1F8-C36C-495A-93FC-0C247A3E6E5F\",\n"
+                     "  \"width\": 4,\n"
+                     "  \"height\": 4,\n"
+                     "  \"layers\": [\n"
+                     "    {\n"
+                     "      \"id\": \"") +
+         layer_id + "\",\n"
+                    "      \"name\": \"L\",\n"
+                    "      \"isVisible\": true,\n"
+                    "      \"transform\": " +
+         transform_json + ",\n" +
+         extra_layer_keys +
+         "      \"isGroup\": false\n"
+         "    }\n"
+         "  ]\n"
+         "}\n";
+}
+
+const char* kWellFormedTransform =
+    "{\"origin\":[0,0],\"size\":[4,4],\"rotation\":0,"
+    "\"flipX\":false,\"flipY\":false,\"sampling\":\"High quality\"}";
+
+}  // namespace
+
+/* P0-2：PNG 解码路径只产 RGBA8（4 字节/像素）。manifest 若声明 16 位格式，
+ * 旧代码把 format 覆写成 8 字节/像素，stride/byte_size 翻倍而缓冲容量不变，
+ * row(y) 对 y >= h/2 越界读写。必须明确拒绝。 */
+COMP_TEST(format_comp_rejects_16bit_pixel_format) {
+  const std::string layer_uuid = "5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D";
+  const std::string root = audit3_root("format_16bit.comp");
+
+  /* 真实的 RGBA8 PNG 资产（不透明红，预乘=直色）。 */
+  const SolidImage red(2, 2, 255, 0, 0, 255);
+  std::vector<uint8_t> png;
+  std::string png_error;
+  COMP_CHECK(png_encode_rgba8(red.bytes.data(), 2, 2, &png, &png_error));
+  write_bytes(root + "/images/" + layer_uuid + ".png", png);
+
+  const comp_pixel_format rejected[] = {COMP_PIXEL_RGBA16, COMP_PIXEL_RGBA16F};
+  for (comp_pixel_format format : rejected) {
+    write_text(root + "/manifest.json",
+               minimal_manifest(layer_uuid.c_str(), kWellFormedTransform,
+                                (std::string("      \"imageFile\": \"") + layer_uuid +
+                                 ".png\",\n      \"enginePixelFormat\": " +
+                                 std::to_string(static_cast<long long>(format)) + ",\n")
+                                    .c_str()));
+    comp_engine engine = make_engine();
+    comp_document loaded = nullptr;
+    COMP_CHECK_MSG(comp_io_load_project(engine, root.c_str(), &loaded) != COMP_OK,
+                   "declared 16-bit pixel format is rejected on load");
+    COMP_CHECK(loaded == nullptr);
+    comp_engine_destroy(engine);
+  }
+}
+
+/* P1-11：两条不同 UUID 的层声明同一 engineLayerID 时，find()/parentID 全部
+ * 别名错层。读侧必须去重。 */
+COMP_TEST(format_comp_rejects_duplicate_engine_layer_id) {
+  const std::string root = audit3_root("format_dup_id.comp");
+  write_text(root + "/manifest.json",
+             std::string("{\n"
+                         "  \"format\": \"com.compositor.project\",\n"
+                         "  \"version\": 13,\n"
+                         "  \"colorSpace\": \"sRGB\",\n"
+                         "  \"resolution\": 72,\n"
+                         "  \"documentID\": \"E621E1F8-C36C-495A-93FC-0C247A3E6E5F\",\n"
+                         "  \"width\": 4,\n"
+                         "  \"height\": 4,\n"
+                         "  \"layers\": [\n"
+                         "    {\"id\": \"5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D\","
+                         " \"name\": \"A\", \"isVisible\": true,"
+                         " \"transform\": {\"origin\":[0,0],\"size\":[4,4],\"rotation\":0,"
+                         "\"flipX\":false,\"flipY\":false,\"sampling\":\"High quality\"},"
+                         " \"engineLayerID\": 7, \"isGroup\": false},\n"
+                         "    {\"id\": \"6A3C2D5B-2E4F-4B7C-9D0E-1F2A3B4C5D6E\","
+                         " \"name\": \"B\", \"isVisible\": true,"
+                         " \"transform\": {\"origin\":[0,0],\"size\":[4,4],\"rotation\":0,"
+                         "\"flipX\":false,\"flipY\":false,\"sampling\":\"High quality\"},"
+                         " \"engineLayerID\": 7, \"isGroup\": false}\n"
+                         "  ]\n"
+                         "}\n"));
+
+  comp_engine engine = make_engine();
+  comp_document loaded = nullptr;
+  COMP_CHECK_MSG(comp_io_load_project(engine, root.c_str(), &loaded) != COMP_OK,
+                 "duplicate engineLayerID is rejected instead of aliasing two layers");
+  COMP_CHECK(loaded == nullptr);
+  comp_engine_destroy(engine);
+}
+
+/* P2-8：transform 读侧钳制。任意大的整数截断成 int32_t 后，effective_bounds
+ * 里的 a.x + a.w 是有符号溢出（UB）。读入必须落在上游 isValid 边界内。 */
+COMP_TEST(format_comp_clamps_out_of_range_transform) {
+  const std::string layer_uuid = "5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D";
+  const std::string root = audit3_root("format_clamp.comp");
+  write_text(root + "/manifest.json",
+             minimal_manifest(layer_uuid.c_str(),
+                              "{\"origin\":[1000000000000000000,-1000000000000000000],"
+                              "\"size\":[1000000000000000000,1000000000000000000],"
+                              "\"rotation\":0,\"flipX\":false,\"flipY\":false,"
+                              "\"sampling\":\"High quality\"}",
+                              ""));
+
+  comp_engine engine = make_engine();
+  comp_document loaded = nullptr;
+  COMP_CHECK(comp_io_load_project(engine, root.c_str(), &loaded) == COMP_OK);
+  COMP_CHECK(loaded != nullptr);
+
+  /* 保存后回读：钳制后的值必须落在 [-1e6, 1e6] / [1, 3e5]。 */
+  const std::string out = "build/format_clamp_out.comp";
+  COMP_CHECK(comp_document_save(loaded, out.c_str()) == COMP_OK);
+  std::string parse_error;
+  const JsonValue saved = json_parse(read_text(out + "/manifest.json"), &parse_error);
+  COMP_CHECK(saved.is_object());
+  const JsonValue* layers = saved.find("layers");
+  COMP_CHECK(layers != nullptr && layers->is_array() && layers->as_array().size() == 1u);
+  const JsonValue* transform = layers->as_array()[0].find("transform");
+  COMP_CHECK(transform != nullptr && transform->is_object());
+  const JsonValue* origin = transform->find("origin");
+  const JsonValue* size = transform->find("size");
+  COMP_CHECK(origin != nullptr && origin->is_array() && origin->as_array().size() >= 2u);
+  COMP_CHECK(size != nullptr && size->is_array() && size->as_array().size() >= 2u);
+  COMP_CHECK_MSG(origin->as_array()[0].as_number(0.0) == 1000000.0,
+                 "origin x clamped to the upstream upper bound");
+  COMP_CHECK_MSG(origin->as_array()[1].as_number(0.0) == -1000000.0,
+                 "origin y clamped to the upstream lower bound");
+  COMP_CHECK_MSG(size->as_array()[0].as_number(0.0) == 300000.0,
+                 "size clamped to the upstream upper bound");
+  COMP_CHECK_MSG(size->as_array()[1].as_number(0.0) == 300000.0,
+                 "size clamped to the upstream upper bound");
+
+  comp_document_destroy(loaded);
+  comp_engine_destroy(engine);
+}
+
+/* P1-7：manifest 的 4 MiB 上界必须在读取之前生效。数 GB 的假 manifest
+ * 不能先把进程内存吃光才走到大小检查。 */
+COMP_TEST(format_comp_rejects_oversized_manifest) {
+  const std::string root = audit3_root("format_oversize.comp");
+  const std::string padding(5u * 1024u * 1024u, 'x');
+  write_text(root + "/manifest.json",
+             std::string("{\"format\": \"com.compositor.project\", \"version\": 13,"
+                         " \"colorSpace\": \"sRGB\", \"width\": 4, \"height\": 4,"
+                         " \"documentID\": \"E621E1F8-C36C-495A-93FC-0C247A3E6E5F\","
+                         " \"padding\": \"") +
+                 padding + "\"}");
+
+  comp_engine engine = make_engine();
+  comp_document loaded = nullptr;
+  COMP_CHECK_MSG(comp_io_load_project(engine, root.c_str(), &loaded) != COMP_OK,
+                 "oversized manifest is rejected before it is read into memory");
+  COMP_CHECK(loaded == nullptr);
+  COMP_CHECK_MSG(std::string(comp_engine_last_error(engine)).find("4 MiB") != std::string::npos,
+                 "rejection reason names the manifest size limit");
+  comp_engine_destroy(engine);
+}

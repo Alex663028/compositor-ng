@@ -140,7 +140,16 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
-
+  /*
+   * M1 合成器与 CPU/D3D12 后端只按 4 字节/像素解释图层缓冲：16 位 comp_image
+   * 若放行，copy_image_into 会把 format 带进 ImageBuffer，随后合成侧按 RGBA8
+   * 步长读 8 字节/像素的数据——不报错，但画面是垃圾。入口明确拒绝。
+   */
+  if (image != nullptr && image->format != COMP_PIXEL_RGBA8) {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                 "comp_image format must be RGBA8; 16-bit layer pixels are "
+                                 "not supported by the M1 compositor");
+  }
   compositor::abi::ImplicitTxn txn(doc, "Set Layer Pixels");
   if (image == nullptr) {
     /* 清空为全透明：保留既有尺寸；尚无缓冲则按画布尺寸建立。 */

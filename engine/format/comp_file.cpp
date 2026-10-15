@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "compositing/blend.h"
@@ -49,14 +50,34 @@ bool write_text_file(const fs::path& path, const std::string& text, std::string*
 }
 
 bool read_text_file(const fs::path& path, std::string* text, std::string* error) {
-  std::ifstream in(path, std::ios::binary);
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
   if (!in) {
     if (error != nullptr) *error = "cannot open for read: " + path.u8string();
     return false;
   }
-  std::ostringstream buffer;
-  buffer << in.rdbuf();
-  *text = buffer.str();
+  /*
+   * 先取大小再读：manifest 有 4 MiB 上界（load / probe 都查）。若像从前那样
+   * 用 rdbuf 流式读入，一个数 GB 的假 manifest 会先把进程内存吃光才走到
+   * 大小检查——检查形同虚设。ate 模式 tellg 即字节数，超限在读前就拒。
+   */
+  const std::streamoff size = in.tellg();
+  if (size < 0) {
+    if (error != nullptr) *error = "cannot stat: " + path.u8string();
+    return false;
+  }
+  if (static_cast<int64_t>(size) > kMaxManifestBytes) {
+    if (error != nullptr) *error = "manifest exceeds 4 MiB";
+    return false;
+  }
+  text->resize(static_cast<size_t>(size));
+  in.seekg(0, std::ios::beg);
+  if (size > 0) {
+    in.read(text->data(), size);
+    if (!in) {
+      if (error != nullptr) *error = "read failed: " + path.u8string();
+      return false;
+    }
+  }
   return true;
 }
 
@@ -146,6 +167,11 @@ bool blend_from_json(const JsonValue& j, comp_blend_mode* out, std::string* erro
 /*
  * transform 必须是上游 LayerTransform 的六键形态。缺任一键都会让上游解码失败
  * （Swift 合成 Codable 对非 Optional 属性一律 decode(_:forKey:)），因此这里逐键写全。
+ *
+ * 写侧钳制（kMaxTransformOrigin / kMaxTransformSize）同时是读侧防线：
+ * manifest 是跨端交换格式，恶意/损坏文件可以写任意大的整数。裸 static_cast<int32_t>
+ * 截断后，effective_bounds 与 clamp_to_canvas 里的 `a.x + a.w` 就是有符号溢出（UB）。
+ * 读侧按同一套边界钳制，与上游 LayerTransform.isValid 对齐。
  */
 JsonValue transform_to_json(const Layer& layer) {
   int64_t width = layer.transform.w;
@@ -183,18 +209,31 @@ JsonValue transform_to_json(const Layer& layer) {
   return transform;
 }
 
+/* 读侧钳制：与 transform_to_json 同一套边界（上游 LayerTransform.isValid）。 */
+int32_t clamp_transform_origin(double value) {
+  if (!(value >= -kMaxTransformOrigin)) return static_cast<int32_t>(-kMaxTransformOrigin);
+  if (value > kMaxTransformOrigin) return static_cast<int32_t>(kMaxTransformOrigin);
+  return static_cast<int32_t>(value);
+}
+
+int32_t clamp_transform_size(double value) {
+  if (!(value >= 1.0)) return 1;
+  if (value > kMaxTransformSize) return static_cast<int32_t>(kMaxTransformSize);
+  return static_cast<int32_t>(value);
+}
+
 void transform_from_json(const JsonValue& entry, Layer* layer) {
   const JsonValue* transform = entry.find("transform");
   if (transform == nullptr || !transform->is_object()) return;
   const JsonValue* origin = transform->find("origin");
   if (origin != nullptr && origin->is_array() && origin->as_array().size() >= 2) {
-    layer->transform.x = static_cast<int32_t>(origin->as_array()[0].as_integer(0));
-    layer->transform.y = static_cast<int32_t>(origin->as_array()[1].as_integer(0));
+    layer->transform.x = clamp_transform_origin(origin->as_array()[0].as_number(0.0));
+    layer->transform.y = clamp_transform_origin(origin->as_array()[1].as_number(0.0));
   }
   const JsonValue* size = transform->find("size");
   if (size != nullptr && size->is_array() && size->as_array().size() >= 2) {
-    layer->transform.w = static_cast<int32_t>(size->as_array()[0].as_integer(0));
-    layer->transform.h = static_cast<int32_t>(size->as_array()[1].as_integer(0));
+    layer->transform.w = clamp_transform_size(size->as_array()[0].as_number(0.0));
+    layer->transform.h = clamp_transform_size(size->as_array()[1].as_number(0.0));
   }
   layer->rotation = static_cast<float>(transform->number_or("rotation", 0.0));
   layer->flip_x = transform->bool_or("flipX", false);
@@ -506,8 +545,12 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
     }
 
     std::unordered_map<std::string, comp_layer_id> uuid_to_id;
-    std::vector<std::string> uuid_of_layer;
-    uuid_of_layer.reserve(layers->as_array().size());
+    /*
+     * engineLayerID 是引擎内部 id 的持久化形态：两条不同 UUID 的层一旦声明同一
+     * id，find()/parentID 解析全部别名错层，撤销栈按 id 寻的也会打到别人。
+     * 显式 id 与顺序分配的 id 共用同一张去重表，两个方向的碰撞都堵。
+     */
+    std::unordered_set<comp_layer_id> used_ids;
 
     /* 第一趟：分配内部 id、解析基础字段与像素。 */
     comp_layer_id next_id = 1;
@@ -536,6 +579,10 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
         layer.id = next_id;
       }
       if (layer.id >= next_id) next_id = layer.id + 1;
+      if (!used_ids.insert(layer.id).second) {
+        if (error != nullptr) *error = "duplicate engineLayerID in manifest";
+        return false;
+      }
 
       layer.name = entry.string_or("name", "");
       layer.visible = entry.bool_or("isVisible", true);
@@ -553,22 +600,21 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       if (!read_layer_pixels(entry, root, uuid, &layer, error)) return false;
       if (!read_layer_mask(entry, root, &layer, error)) return false;
 
-      /* 引擎扩展：格式、调整、效果。 */
+      /* 引擎扩展：格式、调整、效果。
+       * PNG 解码路径（read_layer_pixels）只产 RGBA8：缓冲按 4 字节/像素
+       * resize 后 memcpy 4 字节/像素数据。若此时把 format 覆写成 8 字节/像素
+       * 的 16 位格式，stride()/byte_size() 翻倍而缓冲容量不变，row(y) 与
+       * writable_row(y) 对 y >= h/2 越界读写——一个畸形文件即可读坏堆。
+       * 保存侧（save_project）同样拒绝非 RGBA8，故合法往返永远写不出非
+       * RGBA8 声明；读侧一律明确报错，不静默按 RGBA8 近似。 */
       const long long pixel_format = entry.integer_or("enginePixelFormat", COMP_PIXEL_RGBA8);
-      /*
-       * 像素格式必须先校验再写入：非法枚举会让 bytes_per_pixel() 返回 0，
-       * stride() 与 byte_size() 随之全零，composite_layer 按 format 计算的
-       * 步长与实际缓冲不符——一个畸形文件就能让读路径越界写堆。
-       * 识别得出但不支持的格式明确报错，不静默按 RGBA8 近似。
-       */
-      if (!layer.pixels.empty() &&
-          pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8)) {
-        if (pixel_format != static_cast<long long>(COMP_PIXEL_RGBA16) &&
-            pixel_format != static_cast<long long>(COMP_PIXEL_RGBA16F)) {
-          if (error != nullptr) *error = "layer " + layer.name + ": unknown enginePixelFormat";
-          return false;
+      if (pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8)) {
+        if (error != nullptr) {
+          *error = "layer " + layer.name +
+                   ": enginePixelFormat must be RGBA8 (PNG decode path); "
+                   "16-bit assets require EXR which this build does not support";
         }
-        layer.pixels.format = static_cast<comp_pixel_format>(pixel_format);
+        return false;
       }
       const JsonValue* adjustments = entry.find("engineAdjustments");
       if (adjustments != nullptr && adjustments->is_array()) {
@@ -590,7 +636,6 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       }
 
       uuid_to_id[uuid] = layer.id;
-      uuid_of_layer.push_back(uuid);
       state.layers.push_back(std::move(layer));
     }
 

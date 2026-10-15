@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -129,6 +130,8 @@ int quality_from_options(const char* options_json_utf8) {
   const compositor::JsonValue root = compositor::json_parse(options_json_utf8, &parse_error);
   if (!root.is_object()) return kDefault;
   const double value = root.number_or("quality", static_cast<double>(kDefault));
+  /* inf/NaN 走 static_cast<int> 是 UB（钳位来不及救）：先挡非有限值。 */
+  if (!std::isfinite(value)) return kDefault;
   int quality = static_cast<int>(value + 0.5);
   if (quality < 1) quality = 1;
   if (quality > 100) quality = 100;

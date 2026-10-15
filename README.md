@@ -127,7 +127,7 @@ compositor-ng/
 ├── shells/                        # 平台外壳（只 include ABI 头，不含像素处理）
 │   ├── windows/src/main.cpp       # ★ Win32 + GDI 上屏、菜单/快捷键、图层面板、撤销接线
 │   └── ohos/                      # ★ NAPI + XComponent 薄壳 + ArkTS 页面/typings
-└── tests/                         # 零依赖测试框架 + 13 组测试（test_main 为入口）
+└── tests/                         # 零依赖测试框架 + 16 组测试（test_main 为入口）
     ├── test_framework.h / test_main.cpp
     ├── test_core.cpp              # 几何、分配器、并行原语、JSON
     ├── test_domain.cpp            # 缓冲、图层、文档、历史/事务
@@ -284,9 +284,9 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 106 cases, 0 failed, 0 check failures`（当前基线；= 原 99 + P1-7 的 6 个 + 审核报告 §8 的 N5 的 1 个 = 106） |
-| 全量构建耗时 | ≈ 60 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：30 `.cpp` / 38 `.c`（含 vendored 26）/ 47 `.h`；tests：15 `.cpp` |
+| 测试 | `summary: 143 cases, 0 failed, 0 check failures`（当前基线；AUDIT3 起在此基础上继续累加） |
+| 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
+| 源码规模 | engine：30 `.cpp` / 38 `.c`（含 vendored 26）/ 47 `.h`；tests：16 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认

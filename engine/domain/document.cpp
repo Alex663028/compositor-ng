@@ -194,38 +194,47 @@ bool Document::reorder_layer(comp_layer_id id, comp_layer_id before) {
     if (anchor->parent != parent) return false;
   }
 
-  std::vector<comp_layer_id>* list = nullptr;
-  if (parent == 0) {
-    /* 根级：以 state_.layers 的向量序为准，单独处理。 */
-    auto it = std::find_if(state_.layers.begin(), state_.layers.end(),
-                           [id](const Layer& l) { return l.id == id; });
-    if (it == state_.layers.end()) return false;
-    Layer moved = std::move(*it);
-    state_.layers.erase(it);
-    auto pos = state_.layers.end();
-    if (before != 0) {
-      pos = std::find_if(state_.layers.begin(), state_.layers.end(),
-                         [before](const Layer& l) { return l.id == before; });
-      /* 锚点已被同parent 校验保证存在；find 落end 只可能是 before==id（已提前返回）。 */
-      if (pos == state_.layers.end()) return false;
-    }
-    state_.layers.insert(pos, std::move(moved));
-    return true;
-  }
+  /*
+   * 堆叠序的权威是 state_.layers 的向量序——comp_layer.h 写明「数组序即堆叠序」，
+   * 合成器（filter_graph 的 children_of）按 parent 过滤该向量决定兄弟顺序。
+   * 因此组内重排也必须重排 state_.layers：只改 parent->children 簿记向量的话，
+   * 命令返回成功、进历史、children 也变了，唯独画面一点不变（渲染无操作）。
+   * children 向量在末尾按新序重建，保持簿记与权威序一致。
+   */
+  auto it = std::find_if(state_.layers.begin(), state_.layers.end(),
+                         [id](const Layer& l) { return l.id == id; });
+  if (it == state_.layers.end()) return false;
+  Layer moved = std::move(*it);
+  state_.layers.erase(it);
 
-  Layer* p = find(parent);
-  if (p == nullptr) return false;
-  list = &p->children;
-  auto it = std::find(list->begin(), list->end(), id);
-  if (it == list->end()) return false;
-  list->erase(it);
-  auto pos = list->end();
+  auto pos = state_.layers.end();
   if (before != 0) {
-    pos = std::find(list->begin(), list->end(), before);
-    /* 同上：锚点不在同级列表里说明树已不一致，宁可拒绝也不静默落到末位。 */
-    if (pos == list->end()) return false;
+    pos = std::find_if(state_.layers.begin(), state_.layers.end(),
+                       [before](const Layer& l) { return l.id == before; });
+    /* 锚点已被同 parent 校验保证存在；find 落 end 只可能是 before==id（已提前返回）。 */
+    if (pos == state_.layers.end()) return false;
+  } else if (parent != 0) {
+    /*
+     * before == 0 表示移到同级末尾：插到向量中最后一个同级层之后。
+     * 插在中间不影响其它父级的相对次序（插入保持其余元素的相对顺序），
+     * Children_of(parent) 只关心同级层之间的相对次序。
+     */
+    for (auto scan = state_.layers.begin(); scan != state_.layers.end(); ++scan) {
+      if (scan->parent == parent) pos = scan + 1;
+    }
   }
-  list->insert(pos, id);
+  /* before == 0 且 parent == 0（根级）：pos 保持 end()，即移到数组末尾。 */
+  state_.layers.insert(pos, std::move(moved));
+
+  /* 簿记同步：父级 children 按新的向量序重建（根级没有 children 向量）。 */
+  if (parent != 0) {
+    Layer* p = find(parent);
+    if (p == nullptr) return false;
+    p->children.clear();
+    for (const Layer& l : state_.layers) {
+      if (l.parent == parent) p->children.push_back(l.id);
+    }
+  }
   return true;
 }
 
@@ -471,15 +480,10 @@ bool Document::merge_down(comp_layer_id id, std::string* error) {
   state_.active_layer = merged_layer.id;
   if (!owns_txn) return true;
   /*
-   * commit 内部要拷贝两份整篇 DocumentState 进历史栈，分配失败时会抛。
-   * 此时状态已替换却撤不回，属于「静默数据损坏」——显式回滚到快照，
-   * 让调用方看到失败时文档确实没变。
+   * commit 内部要拷贝两份整篇 DocumentState 进历史栈，分配失败时它已自行
+   * 回滚到快照并返回错误码（见 txn_commit）——失败即未发生，无需再 abort。
    */
-  if (txn_commit(error) != COMP_OK) {
-    txn_abort(nullptr);
-    return false;
-  }
-  return true;
+  return txn_commit(error) == COMP_OK;
 }
 
 bool Document::flatten_image(std::string* error) {
@@ -517,12 +521,8 @@ bool Document::flatten_image(std::string* error) {
   state_.layers.push_back(std::move(flat));
   state_.active_layer = state_.layers.front().id;
   if (!owns_txn) return true;
-  /* commit 失败（历史栈分配失败）时回滚，避免「报失败但文档已改」。 */
-  if (txn_commit(error) != COMP_OK) {
-    txn_abort(nullptr);
-    return false;
-  }
-  return true;
+  /* commit 失败（历史栈分配失败）时 txn_commit 已自行回滚，避免「报失败但文档已改」。 */
+  return txn_commit(error) == COMP_OK;
 }
 
 comp_result Document::txn_begin(std::string label, std::string* error) {
@@ -530,9 +530,16 @@ comp_result Document::txn_begin(std::string label, std::string* error) {
     if (error != nullptr) *error = "transaction already active";
     return COMP_ERR_STATE;
   }
+  /*
+   * 先拷快照再置 active：快照拷贝（整篇 DocumentState）在内存压力下会抛
+   * bad_alloc。若先置 active 再拷，异常逃出后 txn_active_ 永远为真——
+   * 后续 txn_begin 全部被拒、undo/redo 全部被拒，宿主只能销毁文档。
+   * 拷贝失败时零状态变动，异常由 ABI 护栏转成错误码即可。
+   */
+  DocumentState snapshot = state_;
   txn_active_ = true;
   txn_label_ = std::move(label);
-  txn_snapshot_ = state_;
+  txn_snapshot_ = std::move(snapshot);
   return COMP_OK;
 }
 
@@ -542,7 +549,27 @@ comp_result Document::txn_commit(std::string* error) {
     return COMP_ERR_STATE;
   }
   txn_active_ = false;
-  history_.push(txn_label_.empty() ? std::string("Edit") : txn_label_, txn_snapshot_, state_);
+  /*
+   * 压历史可能抛 bad_alloc（两份整篇状态进撤销栈）。此前异常直接逃出：
+   * 状态已改、事务已关闭、历史里却没有这条记录——「报失败但改动生效且撤不回」，
+   * 与 P1-5 同型的半完成操作。这里回滚到事务前快照，保证「失败即未发生」。
+   * 回滚用 std::swap（vector/string 的移动语义 noexcept），回滚路径本身不再抛。
+   */
+  try {
+    history_.push(txn_label_.empty() ? std::string("Edit") : txn_label_, txn_snapshot_, state_);
+  } catch (const std::bad_alloc&) {
+    std::swap(state_, txn_snapshot_);
+    txn_snapshot_ = DocumentState{};
+    txn_label_.clear();
+    if (error != nullptr) *error = "out of memory while recording history; transaction rolled back";
+    return COMP_ERR_OUT_OF_MEMORY;
+  } catch (const std::exception& ex) {
+    std::swap(state_, txn_snapshot_);
+    txn_snapshot_ = DocumentState{};
+    txn_label_.clear();
+    if (error != nullptr) *error = ex.what();
+    return COMP_ERR_INTERNAL;
+  }
   txn_snapshot_ = DocumentState{};
   txn_label_.clear();
   dirty_ = true;
@@ -555,7 +582,11 @@ comp_result Document::txn_abort(std::string* error) {
     return COMP_ERR_STATE;
   }
   txn_active_ = false;
-  state_ = txn_snapshot_;
+  /*
+   * 与 txn_commit 的回滚同一把尺子：swap 是 noexcept 的，且把「待回滚的新状态」
+   * 装进 txn_snapshot_ 后随临时量销毁——不用可能抛 bad_alloc 的拷贝赋值。
+   */
+  std::swap(state_, txn_snapshot_);
   txn_snapshot_ = DocumentState{};
   txn_label_.clear();
   return COMP_OK;

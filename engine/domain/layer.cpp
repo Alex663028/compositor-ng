@@ -50,6 +50,9 @@ void MaskBuffer::resize(int32_t w, int32_t h, uint8_t fill_value) {
 
 void MaskBuffer::fill(uint8_t value) {
   std::vector<uint8_t>& dst = writable_pixels();
+  /* 空掩码时 data() 可以是 nullptr：memset(nullptr, v, 0) 虽是"无害的"技术 UB，
+   * 也没有像素可填，直接早退。 */
+  if (dst.empty()) return;
   std::memset(dst.data(), value, dst.size());
 }
 

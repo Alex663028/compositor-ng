@@ -93,7 +93,10 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
   std::unique_ptr<compositor::RenderBackend> backend =
       compositor::create_backend(engine, engine->backend(), &backend_error);
   if (backend == nullptr) {
-    delete engine;
+    /* Engine::create 是 placement new + 引擎分配器：释放必须走配对的
+     * Engine::destroy。全局 delete 在定制分配器场景下跨堆释放（报告 6.2
+     * 同类错误的漏网处）。 */
+    Engine::destroy(engine);
     return COMP_ERR_BACKEND;
   }
   if (!backend_error.empty()) engine->set_last_error(backend_error);
@@ -154,28 +157,36 @@ comp_result comp_document_create(comp_engine engine, const comp_document_desc* d
   const float dpi = desc->dpi > 0.0f ? desc->dpi : 72.0f;
   const std::string color_space = desc->color_space != nullptr ? desc->color_space : "sRGB";
 
-  Document* document = nullptr;
+  Document* raw_document = nullptr;
   try {
-    document = Document::create(e, desc->width, desc->height, dpi, color_space);
+    raw_document = Document::create(e, desc->width, desc->height, dpi, color_space);
   } catch (const std::bad_alloc&) {
     return compositor::abi::fail(e, COMP_ERR_OUT_OF_MEMORY, "cannot allocate document");
   }
-  if (document == nullptr) {
+  if (raw_document == nullptr) {
     return compositor::abi::fail(e, COMP_ERR_OUT_OF_MEMORY, "cannot allocate document");
   }
+  /*
+   * attach 之前的所有权用 unique_ptr 看守：Document::create 出自引擎分配器的
+   * placement new，unique_ptr 的删除器必须是配对的 Document::destroy。此前
+   * uuid_v4_new()（字符串分配）与 ensure_background_layer()（背景层 resize）
+   * 都在 try 之外，一旦抛 bad_alloc，异常直达 COMP_ABI_CATCH，文档既未 attach
+   * 也未 destroy——定制分配器场景即泄漏。
+   */
+  std::unique_ptr<Document, void (*)(Document*)> document(raw_document,
+                                                          Document::destroy);
 
   /* .comp 包的 documentID 必须非空（上游为必填 UUID）：文档一创建就分配，
    * 随文档持久保存，保证多次保存产出稳定的图层文件名。 */
   document->state().document_id = compositor::uuid_v4_new();
 
-  if (ensure_background_layer(document) == nullptr) {
-    Document::destroy(document);
+  if (ensure_background_layer(document.get()) == nullptr) {
     return compositor::abi::fail(e, COMP_ERR_INTERNAL, "cannot create background layer");
   }
 
   document->mark_dirty(false);
-  e->attach_document(document);
-  *out_document = reinterpret_cast<comp_document>(document);
+  e->attach_document(document.get());
+  *out_document = reinterpret_cast<comp_document>(document.release());
   return compositor::abi::ok(e);
   COMP_ABI_CATCH(e)
 }

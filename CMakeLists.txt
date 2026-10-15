@@ -86,21 +86,12 @@ endif()
 
 enable_testing()
 
-add_executable(compositor_tests
-  tests/test_main.cpp
-  tests/test_core.cpp
-  tests/test_domain.cpp
-  tests/test_compositing.cpp
-  tests/test_imaging.cpp
-  tests/test_parallel.cpp
-  tests/test_filter_graph.cpp
-  tests/test_format.cpp
-  tests/test_abi.cpp
-  tests/test_resample.cpp
-  tests/test_rhi.cpp
-  tests/test_codec.cpp
-  tests/test_adjustment.cpp
-  tests/test_shell_contract.cpp)
+# 测试源用 glob 而非硬编码列表：历史上硬编码表漏掉 test_layer_merge.cpp 与
+# test_layer_mutation.cpp，CMake 路径静默少跑两整个文件（框架靠静态注册，
+# 漏链的文件连编译都不会发生）。新增测试文件从此自动进入构建。
+file(GLOB COMP_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+
+add_executable(compositor_tests ${COMP_TEST_SOURCES})
 
 target_link_libraries(compositor_tests PRIVATE compositor_engine)
 

@@ -21,8 +21,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
+try:
+    import numpy as np
+    from PIL import Image
+except Exception as exc:  # pragma: no cover
+    # 与 crosscheck_codec.py 同一约定：依赖缺失 exit(2)，回归脚本据此记 SKIP
+    # （环境问题）而不是 FAIL（看起来像引擎回归失败）。
+    print("PIL unavailable:", exc)
+    sys.exit(2)
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"

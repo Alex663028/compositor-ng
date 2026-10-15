@@ -889,6 +889,131 @@ COMP_TEST(command_list_requires_document_for_desc_mode) {
   comp_engine_destroy(engine);
 }
 
+/* ------------------------------------------------- AUDIT3：分配器失败路径 */
+
+namespace {
+
+/* 恒失败分配器：验证「分配器返回 null」被如实转成 OOM，且不吐句柄。 */
+struct FailingAlloc {
+  int calls = 0;
+};
+
+void* failing_alloc(size_t bytes, void* user) {
+  (void)bytes;
+  ++static_cast<FailingAlloc*>(user)->calls;
+  return nullptr;
+}
+
+void failing_free(void* pointer, void* user) {
+  (void)pointer;
+  (void)user;
+}
+
+/* 可关断分配器：引擎创建期间放行，之后一律失败（document_create 的 OOM 路径）。
+ * 开关由测试在两次 create 之间翻转，不依赖引擎内部分配次数。 */
+struct SwitchableAlloc {
+  int allocations = 0;
+  int releases = 0;
+  bool allow = true;
+};
+
+void* switchable_alloc(size_t bytes, void* user) {
+  SwitchableAlloc* state = static_cast<SwitchableAlloc*>(user);
+  if (!state->allow) return nullptr;
+  ++state->allocations;
+  return std::malloc(bytes);
+}
+
+void switchable_free(void* pointer, void* user) {
+  if (pointer == nullptr) return;
+  ++static_cast<SwitchableAlloc*>(user)->releases;
+  std::free(pointer);
+}
+
+}  // namespace
+
+COMP_TEST(engine_create_fails_cleanly_when_allocator_returns_null) {
+  comp_engine_desc desc = test_engine_desc();
+  FailingAlloc state;
+  desc.alloc.alloc = failing_alloc;
+  desc.alloc.free = failing_free;
+  desc.alloc.user = &state;
+
+  comp_engine engine = nullptr;
+  const comp_result result = comp_engine_create(&desc, &engine);
+  COMP_CHECK_MSG(result == COMP_ERR_OUT_OF_MEMORY,
+                 "allocator returning null surfaces as OOM, not a crash or a bogus handle");
+  COMP_CHECK_MSG(engine == nullptr, "no engine handle escapes on allocation failure");
+  COMP_CHECK_MSG(state.calls >= 1, "engine object really went through the injected allocator");
+}
+
+COMP_TEST(document_create_fails_cleanly_when_allocator_exhausted) {
+  comp_engine_desc desc = test_engine_desc();
+  SwitchableAlloc state;
+  desc.alloc.alloc = switchable_alloc;
+  desc.alloc.free = switchable_free;
+  desc.alloc.user = &state;
+
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK(engine != nullptr);
+
+  /* 关断分配器：文档对象分配必须失败并如实报 OOM。 */
+  state.allow = false;
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK_MSG(comp_document_create(engine, &document_desc, &document) == COMP_ERR_OUT_OF_MEMORY,
+                 "document object allocation failure surfaces as OOM");
+  COMP_CHECK(document == nullptr);
+
+  /* 失败路径不损坏引擎：销毁时分配与释放仍然成对（ASAN 下亦可兜住泄漏）。 */
+  comp_engine_destroy(engine);
+  COMP_CHECK_MSG(state.allocations == state.releases,
+                 "engine destroy releases every object it allocated, failure path included");
+}
+
+/* AUDIT3 P2-13：16 位 comp_image 若放行，copy_image_into 会把 8 字节/像素的
+ * format 带进 ImageBuffer，而合成器全程按 4 字节/像素解释——不报错，但画面是
+ * 垃圾。入口必须明确拒绝，且拒绝不能碰坏既有像素。 */
+COMP_TEST(layer_set_pixels_rejects_16bit_format) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  const SolidImage red(4, 4, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+
+  const comp_pixel_format rejected[] = {COMP_PIXEL_RGBA16, COMP_PIXEL_RGBA16F};
+  for (comp_pixel_format format : rejected) {
+    std::vector<uint8_t> sixteen(4u * 4u * 8u, 0xff);
+    comp_image image{};
+    image.width = 4;
+    image.height = 4;
+    image.format = format;
+    image.stride = 4u * 8u;
+    image.pixels = sixteen.data();
+    COMP_CHECK_MSG(comp_layer_set_pixels(document, background, &image) == COMP_ERR_UNSUPPORTED,
+                   "16-bit layer pixels are rejected instead of silently misread");
+  }
+
+  /* 拒绝之后原像素不动：画布仍是不透明的红。 */
+  const std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 255, 0, 0, 255, 0),
+                 "rejection leaves the existing pixels intact");
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
 /* 错误槽线程隔离：一个线程的错误不得覆盖另一个线程的错误
  * （此前 last_error_ 是进程级共享 string，多线程共用引擎即数据竞争）。 */
 COMP_TEST(last_error_slot_is_thread_local) {

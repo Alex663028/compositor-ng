@@ -25,6 +25,9 @@
     python scripts/run_regression.py --require-ohos   # NDK 缺失视为失败
     python scripts/run_regression.py --keep-build     # 不做 --clean，增量（快但非全量）
     python scripts/run_regression.py --log <path>     # 日志另存一份
+    python scripts/run_regression.py --python <path>  # 指定跑 crosscheck 的解释器
+                                                     # （需要 Pillow；缺省取 $CROSSCHECK_PYTHON
+                                                     #  或当前解释器。PIL 缺失记 SKIP 不记 FAIL）
 
 退出码：0 = 全部通过（含 SKIP）；1 = 有步骤失败；2 = 环境/参数问题。
 """
@@ -169,10 +172,17 @@ def step_windows_shell(reg: Regression) -> bool:
     return reg.step("2. Windows 壳自检（rc / failures / SHA256 基线）", fn)
 
 
-def step_crosscheck(reg: Regression, script: str, title: str) -> bool:
+def step_crosscheck(reg: Regression, script: str, title: str, python: str) -> bool:
     def fn():
-        proc = reg.run_cmd([sys.executable, os.path.join("scripts", script)])
+        proc = reg.run_cmd([python, os.path.join("scripts", script)], capture=True)
         if proc.returncode != 0:
+            # rc=2 是 crosscheck 脚本的 "PIL unavailable" 退出码：这是环境缺失，
+            # 不是引擎回归。没有这条诊断时，一个没装 Pillow 的解释器会让第 3/4 步
+            # 以晦涩的 rc 失败——看起来像编码器坏了，实际只是用错了解释器。
+            if proc.returncode == 2 and "PIL unavailable" in (proc.stdout or ""):
+                return ("SKIP",
+                        f"{script} 需要 Pillow；当前解释器 {python} 未安装。"
+                        "若该解释器用于其它用途，可用 --python <带 Pillow 的解释器> 重跑")
             return "FAIL", f"{script} rc={proc.returncode}"
         return "PASS", "rc=0"
 
@@ -231,6 +241,10 @@ def main() -> int:
     parser.add_argument("--keep-build", action="store_true",
                         help="skip --clean (faster, but not a full rebuild)")
     parser.add_argument("--log", metavar="PATH", help="also write the log to PATH")
+    parser.add_argument("--python", metavar="PATH",
+                        default=os.environ.get("CROSSCHECK_PYTHON", sys.executable),
+                        help="interpreter for the PIL crosscheck steps "
+                             "(default: $CROSSCHECK_PYTHON or this interpreter)")
     args = parser.parse_args()
 
     if args.skip_ohos and args.require_ohos:
@@ -247,8 +261,8 @@ def main() -> int:
 
     step_build_and_tests(reg, clean=not args.keep_build)
     step_windows_shell(reg)
-    step_crosscheck(reg, "crosscheck_codec.py", "3. 编解码交叉验证（引擎写 -> PIL 读）")
-    step_crosscheck(reg, "crosscheck_comp.py", "4. .comp 双向交叉验证（<-> PIL）")
+    step_crosscheck(reg, "crosscheck_codec.py", "3. 编解码交叉验证（引擎写 -> PIL 读）", args.python)
+    step_crosscheck(reg, "crosscheck_comp.py", "4. .comp 双向交叉验证（<-> PIL）", args.python)
     step_shared_dll(reg)
     if not args.skip_ohos:
         step_ohos(reg, require=args.require_ohos)

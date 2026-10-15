@@ -166,7 +166,15 @@ typedef struct comp_size { int32_t width, height; } comp_size;
  *   - realloc 为空时，引擎的 reallocate 不保留旧内容（旧块容量对引擎不可见，
  *     任何拷贝尝试都是越界读），仅保证分配成功且已清零。
  *   - 分配器用于引擎与文档对象本身（placement new 配对手动析构）。
- *     回调可能来自其它模块/CRT，因此 alloc/free 必须同源。 */
+ *     回调可能来自其它模块/CRT，因此 alloc/free 必须同源。
+ *     范围仅此而已：图层像素 / 掩码 / 历史快照等工作数据走进程默认堆
+ *     （std::vector + COW），不经此分配器——它们才是内存大头，宿主若要
+ *     统计与控制引擎内存，请以进程级分配器（如 tcmalloc / mimalloc 的
+ *     malloc 替换）切入，而非期待逐层路由。
+ *   - alloc 返回的块必须满足 max_align_t 对齐（引擎在其上放置 C++ 对象，
+ *     含 long double / SIMD 成员）；实现可用 aligned_alloc / _aligned_malloc
+ *     或普通 malloc（glibc / MSVC CRT 的 malloc 均已满足 16 字节对齐）。
+ *     若分配器只保证更弱的对齐（如 8 字节），请通过 user 指针换用对齐变体。 */
 typedef struct comp_allocator {
   void* (*alloc)(size_t bytes, void* user);
   void* (*realloc)(void* p, size_t bytes, void* user);

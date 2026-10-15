@@ -843,3 +843,78 @@ COMP_TEST(engine_threads_reports_the_effective_parallelism) {
   comp_engine_destroy(second);
   comp_engine_destroy(first);
 }
+/* --------------------------------------- AUDIT3：组内重排必须改变堆叠序 */
+
+/* P0-1 回归：组内 reorder 此前只改 parent->children 簿记向量，而合成器按
+ * state.layers 权威序渲染——结果返回 COMP_OK、进历史、画面毫无变化。
+ * 判据是端到端事实：组内两个子层交换后，合成结果必须翻转。 */
+COMP_TEST(group_reorder_changes_stacking_order) {
+  comp_engine_desc desc = mutation_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  COMP_CHECK(background != 0);
+  const SolidImage red(4, 4, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "G";
+  group_desc.blend = COMP_BLEND_NORMAL;
+  group_desc.opacity = 1.0f;
+  group_desc.transform = comp_rect{0, 0, 4, 4};
+  group_desc.is_group = 1;
+  comp_layer_id group = 0;
+  COMP_CHECK(comp_layer_add(document, &group_desc, &group) == COMP_OK);
+
+  /* 组内两个实心子层：先蓝后绿 = 绿在上（数组更靠后 = 堆叠更靠上）。 */
+  comp_layer_desc child_desc{};
+  child_desc.name = "child";
+  child_desc.blend = COMP_BLEND_NORMAL;
+  child_desc.opacity = 1.0f;
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  child_desc.parent = group;
+  comp_layer_id child_a = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &child_a) == COMP_OK);
+  const SolidImage blue(4, 4, 0, 0, 255, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, child_a, &blue.image) == COMP_OK);
+
+  child_desc.parent = group;
+  comp_layer_id child_b = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &child_b) == COMP_OK);
+  const SolidImage green(4, 4, 0, 255, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, child_b, &green.image) == COMP_OK);
+
+  std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 255, 0, 255),
+                 "later child in the group stacks on top");
+
+  /* 组内重排：child_b 移到 child_a 之前 -> 蓝在上。画面必须翻转，
+     这正是旧实现只改 children 簿记、渲染毫无变化的那条路径。 */
+  COMP_CHECK_MSG(comp_layer_reorder(document, child_b, child_a) == COMP_OK,
+                 "in-group reorder is accepted");
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 0, 255, 255),
+                 "in-group reorder changes the rendered stacking order");
+
+  /* before = 0：移到同级末尾（最上层）-> 绿复归。 */
+  COMP_CHECK(comp_layer_reorder(document, child_b, 0) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 255, 0, 255),
+                 "before=0 moves the child back to the top of its group");
+
+  /* 组内重排同样进撤销栈：撤销一次回到「蓝在上」。 */
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 0, 255, 255),
+                 "in-group reorder is undoable");
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}

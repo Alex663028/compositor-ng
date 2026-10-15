@@ -214,12 +214,22 @@ bool png_decode_impl(const uint8_t* data, size_t size, CodecImage* out, std::str
   /*
    * P2-12：错误回调必须在 setjmp 之前装好，真实原因（如 "png exceeds maximum canvas
    * size" / "Invalid IHDR data"）才会被记进 error 而不再被吞成通用文案。
-   * 注意：libpng 用 longjmp 报错，setjmp 与 longjmp 之间不做堆分配即可安全返回。
+   *
+   * longjmp 安全（P2-10）：C++ 对象在 setjmp 之后构造，其析构会被 longjmp 跳过。
+   * scratch/rows 是最大可达数百 MB 的逐行缓冲（png_read_image / png_read_end 遇
+   * 畸形数据都会长跳回来），必须声明在 setjmp 之前，并在错误分支显式释放——
+   * 否则每个畸形 PNG 泄漏一份，可被同一个宿主反复触发直到耗尽内存。
    */
+  std::vector<uint8_t> scratch;
+  std::vector<png_bytep> rows;
+
   PngErrorSink sink{error};
   png_set_error_fn(png, &sink, png_error_sink, nullptr);
   if (setjmp(png_jmpbuf(png)) != 0) {
     png_destroy_read_struct(&png, &info, nullptr);
+    /* swap 惯用法保证真正归还内存（clear() 不舍容量）。 */
+    std::vector<uint8_t>().swap(scratch);
+    std::vector<png_bytep>().swap(rows);
     if (error != nullptr && !error->empty()) return false;
     return fail(error, "libpng decode failed (malformed or unsupported PNG)");
   }
@@ -260,8 +270,10 @@ bool png_decode_impl(const uint8_t* data, size_t size, CodecImage* out, std::str
   const size_t packed_bytes = static_cast<size_t>(width) * 4u;
   if (row_bytes < packed_bytes) png_error(png, "unexpected decoded row size");
 
-  std::vector<uint8_t> scratch(static_cast<size_t>(height) * row_bytes, 0u);
-  std::vector<png_bytep> rows(static_cast<size_t>(height));
+  /* 复用 setjmp 前声明的缓冲：此处的分配失败以 bad_alloc 正常上抛（此刻已无
+   * longjmp 帧需要保护），由调用方护栏转错误码。 */
+  scratch.assign(static_cast<size_t>(height) * row_bytes, 0u);
+  rows.resize(static_cast<size_t>(height));
   for (size_t y = 0; y < static_cast<size_t>(height); ++y) {
     rows[y] = scratch.data() + y * row_bytes;
   }
@@ -287,8 +299,14 @@ bool png_encode_impl(const uint8_t* premultiplied_rgba, int32_t width, int32_t h
   if (width <= 0 || height <= 0) return fail(error, "non-positive extent");
 
   const size_t packed_bytes = static_cast<size_t>(width) * 4u;
+  /*
+   * 与 png_decode_impl 同一套 longjmp 纪律：非 POD 缓冲一律声明在 setjmp 之前，
+   * 错误分支显式归还。straight 是整幅 4 字节/像素缓冲、rows 是行指针表——
+   * png_write_image / png_write_end 遇错都会长跳回下面的分支，析构不会被调用。
+   */
   std::vector<uint8_t> straight(premultiplied_rgba,
                                 premultiplied_rgba + packed_bytes * static_cast<size_t>(height));
+  std::vector<png_bytep> rows;
   unpremultiply_in_place(&straight);
 
   out->clear();
@@ -302,6 +320,8 @@ bool png_encode_impl(const uint8_t* premultiplied_rgba, int32_t width, int32_t h
   if (setjmp(png_jmpbuf(png)) != 0) {
     png_destroy_write_struct(&png, &info);
     out->clear();
+    std::vector<uint8_t>().swap(straight);
+    std::vector<png_bytep>().swap(rows);
     return fail(error, "libpng encode failed");
   }
 
@@ -314,7 +334,7 @@ bool png_encode_impl(const uint8_t* premultiplied_rgba, int32_t width, int32_t h
   png_set_compression_level(png, g_png_compression_level);
   png_write_info(png, info);
 
-  std::vector<png_bytep> rows(static_cast<size_t>(height));
+  rows.resize(static_cast<size_t>(height));
   for (size_t y = 0; y < static_cast<size_t>(height); ++y) {
     rows[y] = const_cast<png_bytep>(straight.data() + y * packed_bytes);
   }
