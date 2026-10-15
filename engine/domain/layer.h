@@ -1,0 +1,184 @@
+// AI生成
+/*
+ * layer.h — 图层领域模型（内部 C++ 类型）。
+ *
+ * 与 ABI 的关系：comp_layer_desc / comp_image / comp_mask 是 ABI 视图，
+ * 本文件是引擎内部持有的完整模型（含像素、蒙版、调整、效果与子节点）。
+ *
+ * 数据布局与 10 个像素内核对齐：RGBA8 预乘、4 字节/像素、行优先、自上而下。
+ */
+#ifndef COMPOSITOR_DOMAIN_LAYER_H
+#define COMPOSITOR_DOMAIN_LAYER_H
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "compositor/comp_core.h"
+#include "compositor/comp_layer.h"
+#include "core/comp_geometry.h"
+
+namespace compositor {
+
+/*
+ * 像素资产模型（对齐上游 DocumentHistory.swift 的
+ * "Value snapshots share immutable CGImages; no pixel copies for layer edits."）：
+ *
+ * ImageBuffer / MaskBuffer 的像素数据由 shared_ptr 持有。拷贝缓冲（文档快照、
+ * 历史记录、Layer 复制）只增引用，不复制像素；写入走 writable_pixels()，
+ * 引用计数 > 1（被历史或其它缓冲共享）时先复制（copy-on-write），
+ * 保证任何写入不会污染共享方。
+ *
+ * 读路径一律走 row()（const 语义，绝不触发复制）；
+ * 写路径必须显式调 writable_row() / writable_pixels()。
+ */
+struct ImageBuffer {
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  /* 懒创建：nullptr 等价于空缓冲；见文件头「像素资产模型」。 */
+  std::shared_ptr<std::vector<uint8_t>> pixels;
+
+  /* 只读视图：惰性空缓冲，绝不触发 COW。 */
+  const std::vector<uint8_t>& pixel_data() const {
+    static const std::vector<uint8_t> kEmpty;
+    return pixels != nullptr ? *pixels : kEmpty;
+  }
+
+  /* 可写视图：被共享时先复制（COW）。拿裸指针写入前必须经此函数。 */
+  std::vector<uint8_t>& writable_pixels() {
+    if (pixels == nullptr) {
+      pixels = std::make_shared<std::vector<uint8_t>>();
+    } else if (pixels.use_count() > 1) {
+      pixels = std::make_shared<std::vector<uint8_t>>(*pixels);
+    }
+    return *pixels;
+  }
+
+  /* 格式是否被引擎认识（bytes_per_pixel > 0）。合法像素宽，未知枚举一律拒绝。 */
+  static bool valid_format(comp_pixel_format fmt) { return bytes_per_pixel(fmt) > 0; }
+
+  size_t stride() const {
+    return static_cast<size_t>(width) * static_cast<size_t>(bytes_per_pixel(format));
+  }
+  bool empty() const {
+    /*
+     * 未知像素格式一律视为空：否则 stride() 会是 0，调用方按 format 算出的
+     * 步长与真实行宽不符，越界写堆。宁可"没有像素"也不要错误的像素。
+     */
+    if (!valid_format(format)) return true;
+    return width <= 0 || height <= 0 || pixels == nullptr || pixels->empty();
+  }
+  size_t byte_size() const { return stride() * static_cast<size_t>(height); }
+
+  void resize(int32_t w, int32_t h, comp_pixel_format fmt);
+  void fill(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+  void clear_transparent() { fill(0, 0, 0, 0); }
+
+  static ImageBuffer solid(int32_t w, int32_t h, comp_pixel_format fmt,
+                           uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+
+  /* 只读行指针（const 语义；非 const 对象调用也绝不触发复制）。 */
+  const uint8_t* row(int32_t y) const {
+    return pixel_data().data() + static_cast<size_t>(y) * stride();
+  }
+  /* 可写行指针：触发 COW。仅写入路径使用。 */
+  uint8_t* writable_row(int32_t y) {
+    return writable_pixels().data() + static_cast<size_t>(y) * stride();
+  }
+};
+
+/* 8 位灰度蒙版：1 字节/像素，0 = 全透明，255 = 完全不透明。
+ * 资产模型同 ImageBuffer（共享 + COW）。 */
+struct MaskBuffer {
+  int32_t width = 0;
+  int32_t height = 0;
+  std::shared_ptr<std::vector<uint8_t>> pixels;
+
+  const std::vector<uint8_t>& pixel_data() const {
+    static const std::vector<uint8_t> kEmpty;
+    return pixels != nullptr ? *pixels : kEmpty;
+  }
+
+  std::vector<uint8_t>& writable_pixels() {
+    if (pixels == nullptr) {
+      pixels = std::make_shared<std::vector<uint8_t>>();
+    } else if (pixels.use_count() > 1) {
+      pixels = std::make_shared<std::vector<uint8_t>>(*pixels);
+    }
+    return *pixels;
+  }
+
+  size_t stride() const { return static_cast<size_t>(width); }
+  bool empty() const {
+    return width <= 0 || height <= 0 || pixels == nullptr || pixels->empty();
+  }
+  size_t byte_size() const { return stride() * static_cast<size_t>(height); }
+
+  void resize(int32_t w, int32_t h, uint8_t fill_value = 255);
+  void fill(uint8_t value);
+
+  const uint8_t* row(int32_t y) const {
+    return pixel_data().data() + static_cast<size_t>(y) * stride();
+  }
+  uint8_t* writable_row(int32_t y) {
+    return writable_pixels().data() + static_cast<size_t>(y) * stride();
+  }
+};
+
+/* 调整图层参数：kind 与 .comp 规范一致，settings 为 JSON（后向兼容扩展）。 */
+struct Adjustment {
+  uint32_t kind = 0;
+  std::string settings_json = "{}";
+};
+
+/* 图层效果参数：effect 为效果枚举，settings 为 JSON。 */
+struct Effect {
+  uint32_t effect = 0;
+  std::string settings_json = "{}";
+};
+
+struct Layer {
+  comp_layer_id id = 0;
+  std::string name;
+  comp_blend_mode blend = COMP_BLEND_NORMAL;
+  float opacity = 1.0f;
+  comp_rect transform{0, 0, 0, 0}; /* 文档像素空间；w/h<=0 表示按像素尺寸 */
+  /* 缩画布把图层整体裁到画布外时置位：此时包围盒为空矩形，不再回落到
+   * 像素尺寸（否则契约里的「超出部分被裁剪」对完全离屏图层失效）。 */
+  bool clipped_empty = false;
+  float rotation = 0.0f;
+  bool flip_x = false;
+  bool flip_y = false;
+  /* 采样模式：与上游 transform.sampling 对齐，缺省 High quality。 */
+  comp_sampling sampling = COMP_SAMPLING_HIGH_QUALITY;
+  bool is_group = false;
+  /* 图层组语义：false = 穿透（默认，对齐上游：子层直接叠加到组下方内容）；
+   * true = 隔离（子树先自合成一张缓冲，再作为一个单元与下层混合）。非组图层忽略。 */
+  bool isolated = false;
+  bool visible = true;
+  comp_layer_id parent = 0;
+  comp_layer_id clipping_source = 0;
+  /* .comp 互通：上游 live-mask 的来源图层 UUID（manifest 键 maskSourceID）。
+   * 内核暂不参与合成（这是显式记录的能力边界），但读写时原样保真，
+   * 避免跨端往返把该引用丢掉。 */
+  std::string mask_source_uuid;
+  std::vector<comp_layer_id> children; /* 仅图层组使用 */
+
+  ImageBuffer pixels;
+  MaskBuffer mask;
+  std::vector<Adjustment> adjustments;
+  std::vector<Effect> effects;
+
+  /* 图层在文档像素空间的包围盒：transform 未指定时取像素尺寸 + 原点 (0,0)。
+   * clipped_empty 为真时返回空矩形（缩画布把图层整个裁掉的显式标记，
+   * 与「transform 未指定尺寸」区分开，否则会被上面的回落逻辑放大回来）。 */
+  comp_rect effective_bounds() const;
+
+  bool has_pixels() const { return !pixels.empty(); }
+};
+
+}  // namespace compositor
+
+#endif /* COMPOSITOR_DOMAIN_LAYER_H */

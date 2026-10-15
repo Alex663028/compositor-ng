@@ -1,0 +1,36 @@
+# compositor-shell selftest (Windows shell + engine C ABI)
+[OK] comp_engine_create(AUTO)
+[OK] comp_engine_backend()
+[info] backend = CPU
+[OK] comp_document_create(64x64)
+[OK] comp_document_size() == 64x64
+[OK] comp_layer_add()
+[OK] comp_layer_set_pixels()
+[OK] comp_layer_count() >= 2 (background + added)
+[info] layers = 2
+[OK] comp_render_flatten()
+[OK] flatten output has non-transparent pixels
+[info] non-transparent pixels = 4096 / 4096
+[info] history: can_undo=1 depth=2 redo=0
+[OK] comp_document_undo()
+[OK] comp_document_save(.comp)
+[OK] comp_document_load(.comp round trip)
+[OK] round trip keeps canvas size
+[OK] comp_layer_adjustment_kind_name(3) == Exposure
+[OK] comp_layer_adjustment_param_count(3) == 3
+[OK] comp_layer_adjustment_param_at(3,0) path
+[OK] comp_layer_adjustment_build_settings(size probe)
+[OK] comp_layer_adjustment_build_settings
+[info] panel settings = {"exposureSettings":{"exposure":1.5,"offset":0.25,"gamma":2.2}}
+[OK] comp_layer_add_adjustment(panel settings)
+[OK] comp_layer_adjustment_count() == 1
+[OK] comp_layer_adjustment_read_value(exposure) == 1.5
+[OK] comp_layer_update_adjustment_at(0)
+[OK] updated gamma == 1.8
+[OK] out-of-range panel value rejected
+[OK] comp_layer_remove_adjustment(out of range) rejected
+[OK] comp_layer_remove_adjustment(0)
+[OK] comp_layer_adjustment_count() == 0 after remove
+
+[summary] failures = 0
+[PASS] compositor-shell selftest

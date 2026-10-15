@@ -1,0 +1,64 @@
+# AI生成
+# compositor-ng 构建产物与临时文件。
+#
+# 原则：仓库里只放源码与契约文件。任何能由scripts/ 重新生成的东西都不入库，
+# 避免构建产物被误当源码 review，或污染 diff。
+
+# --------------------------------------------------------------- 构建输出
+# 主构建目录（build.py / build_windows_shell.py / run_regression.py 共用）
+build/
+
+# 早期调试留下的验证目录（现已清空，仍保留规则防止复发）
+build_verify_r5/
+build_*/
+
+# 交叉编译与绑定生成脚本的常见落点
+out/
+dist/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+# 共享构建产物不是契约文件（内容随源码变），只保留源码与构建脚本。
+compositor_engine.dll
+libcompositor_engine.so
+libcompositor_engine.dylib
+
+# 根目录散落的图像/文档产物（测试与脚本的临时输出）
+out.png
+*.comp/
+*.comp
+!docs/**/*.comp
+build_test_*.png
+
+# --------------------------------------------------------------- Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# ------------------------------------------------------- 日志与临时文件
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# --------------------------------------------------------- 编辑器 / 系统
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
