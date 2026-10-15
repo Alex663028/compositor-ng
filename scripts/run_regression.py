@@ -85,11 +85,16 @@ class Regression:
 
 
 def sha256_of(path: str) -> str:
-    h = hashlib.sha256()
+    """文本文件的 SHA256，先把行尾归一化为 LF。
+
+    为什么必须归一化：外壳按Windows 惯例写 CRLF，而仓内基线是 LF。
+    直接对字节算哈希，同一份内容会因为行尾不同而给出不同摘要——那这个
+    "基线"既不跨平台也不跨检出目录可用（曾导致干净 clone 后回归误报FAIL）。
+    归一化后比对的是**内容**是否一致，与行尾、与检出路径都无关。
+    """
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 16), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        raw = f.read()
+    return hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def step_build_and_tests(reg: Regression, clean: bool) -> bool:
