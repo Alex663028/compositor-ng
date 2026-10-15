@@ -251,6 +251,15 @@ def main() -> int:
         print("--skip-ohos and --require-ohos are mutually exclusive", file=sys.stderr)
         return 2
 
+    if args.log:
+        # 第 1 步会 --clean 整个 build/：日志若写进 build/，rmtree 撞上正在
+        # 写入的日志文件（WinError 32）会让第一步就炸，后续步骤连锁失败。
+        log_path = os.path.abspath(args.log)
+        if log_path.startswith(os.path.abspath(BUILD) + os.sep):
+            print(f"--log 不能指向 build/ 目录内（会被 --clean 删除）: {args.log}",
+                  file=sys.stderr)
+            return 2
+
     log_fh = open(args.log, "w", encoding="utf-8") if args.log else None
     if log_fh is not None:
         sys.stdout = _Tee(sys.stdout, log_fh)  # type: ignore[assignment]

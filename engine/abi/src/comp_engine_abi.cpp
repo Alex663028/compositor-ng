@@ -296,6 +296,21 @@ comp_result comp_document_set_size(comp_document document, comp_size size) {
   COMP_ABI_CATCH(engine)
 }
 
+comp_result comp_document_resize_image(comp_document document, comp_size size) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  std::string error;
+  if (!doc->resize_image(size, &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error.c_str());
+  }
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 comp_result comp_document_is_dirty(comp_document document, int32_t* out_dirty) {
   Document* doc = nullptr;
   Engine* engine = nullptr;

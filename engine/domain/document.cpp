@@ -2,9 +2,13 @@
 #include "domain/document.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "compositing/compositor.h"
+#include "compositing/resample.h"
 #include "domain/history.h"
 #include "domain/layer_merge.h"
 #include "engine.h"
@@ -483,6 +487,124 @@ bool Document::merge_down(comp_layer_id id, std::string* error) {
    * commit 内部要拷贝两份整篇 DocumentState 进历史栈，分配失败时它已自行
    * 回滚到快照并返回错误码（见 txn_commit）——失败即未发生，无需再 abort。
    */
+  return txn_commit(error) == COMP_OK;
+}
+
+namespace {
+
+/* Image Size 的几何缩放：原点四舍五入；尺寸下限 1（上游 transform.isValid 同款）。 */
+int32_t scaled_origin(int32_t value, double factor) {
+  return static_cast<int32_t>(std::lround(static_cast<double>(value) * factor));
+}
+
+int32_t scaled_dimension(int32_t value, double factor) {
+  const int32_t out = static_cast<int32_t>(std::lround(static_cast<double>(value) * factor));
+  return out < 1 ? 1 : out;
+}
+
+}  // namespace
+
+bool Document::resize_image(comp_size size, std::string* error) {
+  if (!compositor::is_valid_canvas(size)) {
+    if (error != nullptr) *error = "invalid canvas size";
+    return false;
+  }
+  /* 尺寸不变：无操作，不进历史（对齐上游 ImageResizer 的同款短路）。 */
+  if (size.width == state_.width && size.height == state_.height) return true;
+
+  const double sx = static_cast<double>(size.width) / static_cast<double>(state_.width);
+  const double sy = static_cast<double>(size.height) / static_cast<double>(state_.height);
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Image Size", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+
+  for (Layer& layer : state_.layers) {
+    if (layer.clipped_empty) continue; /* 已被裁空的层没有内容可缩放 */
+
+    /* 原点始终按比例缩放；尺寸分量仅在显式指定时缩放（w/h<=0 = 按像素尺寸，
+     * 跟随缩放后的像素自动变化，保持「未指定」语义）。 */
+    layer.transform.x = scaled_origin(layer.transform.x, sx);
+    layer.transform.y = scaled_origin(layer.transform.y, sy);
+    if (layer.transform.w > 0) layer.transform.w = scaled_dimension(layer.transform.w, sx);
+    if (layer.transform.h > 0) layer.transform.h = scaled_dimension(layer.transform.h, sy);
+
+    /* 组与空层只有几何；children 簿记按 id 记录，不随尺寸变化。 */
+    if (layer.is_group || !layer.has_pixels()) continue;
+
+    const compositor::SamplingMode mode = compositor::sampling_from_abi(layer.sampling);
+    /*
+     * 本地快速路：无旋转且 transform 尺寸与像素一致（未拉伸）时，直接重采样
+     * 像素缓冲——翻转是贴图几何、不影响像素内容，原样保留即可。此时
+     * 「本地像素缩放 + transform 缩放」与上游「画布坐标光栅化」逐字节等价。
+     */
+    const bool local_path = std::fabs(layer.rotation) < 1e-9f &&
+                            layer.transform.w == layer.pixels.width &&
+                            layer.transform.h == layer.pixels.height;
+
+    if (local_path) {
+      const int32_t new_w = scaled_dimension(layer.pixels.width, sx);
+      const int32_t new_h = scaled_dimension(layer.pixels.height, sy);
+      compositor::ImageBuffer scaled;
+      if (!compositor::resample_image(layer.pixels, new_w, new_h, mode, &scaled)) {
+        if (owns_txn) txn_abort(nullptr);
+        if (error != nullptr) *error = "layer " + layer.name + ": resample failed";
+        return false;
+      }
+      layer.pixels = std::move(scaled);
+      /* transform.w/h 已在上面按同一比例缩放，与新像素尺寸一致。 */
+
+      /* 掩版：1x1 的 uniform 掩版分辨率无关，保持原样（上游同款）；其余按
+       * 同一比例重采样，保留可编辑性（不烘入 alpha）。 */
+      if (!layer.mask.empty() && !(layer.mask.width == 1 && layer.mask.height == 1)) {
+        const int32_t mw = scaled_dimension(layer.mask.width, sx);
+        const int32_t mh = scaled_dimension(layer.mask.height, sy);
+        std::vector<uint8_t> scaled_mask;
+        if (!compositor::resample_gray(layer.mask.pixel_data().data(), layer.mask.width,
+                                       layer.mask.height, mw, mh, mode, &scaled_mask)) {
+          if (owns_txn) txn_abort(nullptr);
+          if (error != nullptr) *error = "layer " + layer.name + ": mask resample failed";
+          return false;
+        }
+        layer.mask.width = mw;
+        layer.mask.height = mh;
+        layer.mask.pixels = std::make_shared<std::vector<uint8_t>>(std::move(scaled_mask));
+      }
+      continue;
+    }
+
+    /*
+     * 光栅化路径（对齐上游 rasterize each transformed layer）：旋转层与拉伸层
+     * 先按旧几何烘成「目标矩形空间」的像素单元（翻转/旋转/蒙版已烘入），再
+     * 整幅重采样到新尺寸。新层是 identity 几何的纯像素层——旋转与翻转标志
+     * 随之丢弃（上游对旋转层同样丢弃：新 transform 不带 rotation）。
+     */
+    compositor::ImageBuffer unit;
+    if (!compositor::build_layer_unit(layer, mode, &unit, nullptr, error)) {
+      if (owns_txn) txn_abort(nullptr);
+      return false;
+    }
+    if (unit.empty()) continue; /* 无内容（has_pixels 已挡，防御性） */
+    compositor::ImageBuffer scaled;
+    if (!compositor::resample_image(unit, layer.transform.w, layer.transform.h, mode, &scaled)) {
+      if (owns_txn) txn_abort(nullptr);
+      if (error != nullptr) *error = "layer " + layer.name + ": resample failed";
+      return false;
+    }
+    layer.pixels = std::move(scaled);
+    layer.mask = MaskBuffer{}; /* 蒙版已烘入 alpha */
+    layer.rotation = 0.0f;
+    layer.flip_x = false;
+    layer.flip_y = false;
+  }
+
+  state_.width = size.width;
+  state_.height = size.height;
+  if (!owns_txn) return true;
+  /* commit 失败时已自行回滚到快照（见 txn_commit），失败即未发生。 */
   return txn_commit(error) == COMP_OK;
 }
 

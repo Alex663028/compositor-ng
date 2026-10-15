@@ -209,4 +209,110 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
   return true;
 }
 
+bool resample_image(const ImageBuffer& src, int32_t dst_w, int32_t dst_h,
+                    SamplingMode mode, ImageBuffer* out) {
+  if (out == nullptr) return false;
+  const int32_t sw = src.width;
+  const int32_t sh = src.height;
+  if (src.empty() || dst_w <= 0 || dst_h <= 0) return false;
+
+  out->resize(dst_w, dst_h, COMP_PIXEL_RGBA8);
+  for (int32_t y = 0; y < dst_h; ++y) {
+    uint8_t* dst_row = out->writable_row(y);
+    /* 与 build_layer_unit 同口径的像素中心逆映射；sw==dst_w 时退化为整数坐标。 */
+    const double sy = (static_cast<double>(y) + 0.5) * sh / dst_h - 0.5;
+    for (int32_t x = 0; x < dst_w; ++x) {
+      const double sx = (static_cast<double>(x) + 0.5) * sw / dst_w - 0.5;
+      uint8_t* dst_px = dst_row + static_cast<size_t>(x) * 4;
+      switch (mode) {
+        case SamplingMode::kNearest: sample_nearest(src, sx, sy, dst_px); break;
+        case SamplingMode::kSmooth: sample_bilinear(src, sx, sy, dst_px); break;
+        case SamplingMode::kHighQuality:
+        default: sample_bicubic(src, sx, sy, dst_px); break;
+      }
+    }
+  }
+  return true;
+}
+
+namespace {
+
+/* 灰度版取样：边缘夹取（整幅掩版缩放不引入透明）。 */
+inline uint8_t gray_at(const uint8_t* src, int32_t sw, int32_t sh, int32_t x, int32_t y) {
+  return src[static_cast<size_t>(clamp_index(y, sh)) * sw + clamp_index(x, sw)];
+}
+
+void gray_nearest(const uint8_t* src, int32_t sw, int32_t sh, double sx, double sy,
+                  uint8_t* out) {
+  *out = gray_at(src, sw, sh, static_cast<int32_t>(std::lround(sx)),
+                 static_cast<int32_t>(std::lround(sy)));
+}
+
+void gray_bilinear(const uint8_t* src, int32_t sw, int32_t sh, double sx, double sy,
+                   uint8_t* out) {
+  const double fx = std::floor(sx);
+  const double fy = std::floor(sy);
+  const double tx = sx - fx;
+  const double ty = sy - fy;
+  const int32_t x0 = static_cast<int32_t>(fx);
+  const int32_t y0 = static_cast<int32_t>(fy);
+  const double p00 = gray_at(src, sw, sh, x0, y0);
+  const double p10 = gray_at(src, sw, sh, x0 + 1, y0);
+  const double p01 = gray_at(src, sw, sh, x0, y0 + 1);
+  const double p11 = gray_at(src, sw, sh, x0 + 1, y0 + 1);
+  const double top = p00 * (1.0 - tx) + p10 * tx;
+  const double bottom = p01 * (1.0 - tx) + p11 * tx;
+  *out = static_cast<uint8_t>(std::min(255.0, std::max(0.0, top * (1.0 - ty) + bottom * ty + 0.5)));
+}
+
+void gray_bicubic(const uint8_t* src, int32_t sw, int32_t sh, double sx, double sy,
+                  uint8_t* out) {
+  const double fx = std::floor(sx);
+  const double fy = std::floor(sy);
+  const int32_t x0 = static_cast<int32_t>(fx);
+  const int32_t y0 = static_cast<int32_t>(fy);
+  double wx[4];
+  double wy[4];
+  catmull_rom_weights(sx - fx, wx);
+  catmull_rom_weights(sy - fy, wy);
+  double acc = 0.0;
+  for (int j = 0; j < 4; ++j) {
+    for (int i = 0; i < 4; ++i) {
+      acc += static_cast<double>(gray_at(src, sw, sh, x0 - 1 + i, y0 - 1 + j)) * wx[i] * wy[j];
+    }
+  }
+  *out = static_cast<uint8_t>(std::min(255.0, std::max(0.0, acc + 0.5)));
+}
+
+}  // namespace
+
+bool resample_gray(const uint8_t* src, int32_t src_w, int32_t src_h,
+                   int32_t dst_w, int32_t dst_h, SamplingMode mode,
+                   std::vector<uint8_t>* out) {
+  if (out == nullptr || src == nullptr) return false;
+  if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return false;
+
+  out->assign(static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h), 0u);
+  for (int32_t y = 0; y < dst_h; ++y) {
+    const double sy = (static_cast<double>(y) + 0.5) * src_h / dst_h - 0.5;
+    uint8_t* dst_row = out->data() + static_cast<size_t>(y) * dst_w;
+    for (int32_t x = 0; x < dst_w; ++x) {
+      const double sx = (static_cast<double>(x) + 0.5) * src_w / dst_w - 0.5;
+      switch (mode) {
+        case SamplingMode::kNearest:
+          gray_nearest(src, src_w, src_h, sx, sy, &dst_row[x]);
+          break;
+        case SamplingMode::kSmooth:
+          gray_bilinear(src, src_w, src_h, sx, sy, &dst_row[x]);
+          break;
+        case SamplingMode::kHighQuality:
+        default:
+          gray_bicubic(src, src_w, src_h, sx, sy, &dst_row[x]);
+          break;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace compositor

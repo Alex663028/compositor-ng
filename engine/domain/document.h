@@ -95,6 +95,22 @@ class Document {
    */
   bool flatten_image(std::string* error);
 
+  /*
+   * 整篇重采样到新画布尺寸（对齐上游 ImageResizer / Image Size）：
+   *   - 每层像素与掩版按画布缩放比例重采样（层的采样模式），transform 的
+   *     原点与尺寸同步缩放；w/h<=0 的「按像素尺寸」分量保持未指定语义；
+   *   - 旋转层（或 transform 尺寸与像素不一致的拉伸层）走光栅化：翻转、
+   *     旋转与掩版烘入像素后丢弃这些标志——非均匀缩放的旋转矩形在本仓
+   *     origin/size/rotation 模型里无法表示（会引入剪切），上游对此同样
+   *     光栅化（rasterize each transformed layer）；
+   *   - 1x1 的 uniform 掩版分辨率无关，保持原样（上游同款）；
+   *   - 尺寸不变为无操作（不进历史，对齐上游短路）；
+   *   - 效果参数为 JSON 透传（像素求值属滤镜图里程碑），不随尺寸缩放——
+   *     已记录的能力边界，上游此时按 effectScale 缩放。
+   * 一步撤销（加入宿主显式事务或自开自提交）。
+   */
+  bool resize_image(comp_size size, std::string* error);
+
   bool is_dirty() const noexcept { return dirty_; }
   void mark_dirty(bool value) noexcept { dirty_ = value; }
 

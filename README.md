@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **135 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **154 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -284,7 +284,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 143 cases, 0 failed, 0 check failures`（当前基线；AUDIT3 起在此基础上继续累加） |
+| 测试 | `summary: 154 cases, 0 failed, 0 check failures`（当前基线；AUDIT3 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：30 `.cpp` / 38 `.c`（含 vendored 26）/ 47 `.h`；tests：16 `.cpp` |
 

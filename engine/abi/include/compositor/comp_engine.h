@@ -80,6 +80,15 @@ COMP_API void comp_document_destroy(comp_document document);
 COMP_API comp_result comp_document_size(comp_document document, comp_size* out_size);
 COMP_API comp_result comp_document_set_size(comp_document document, comp_size size);
 
+/*
+ * 整篇重采样到新画布尺寸（对齐上游 Image Size）：每层像素/掩版按比例重采样、
+ * transform 同步缩放；旋转层光栅化后转为 identity 几何（上游同策略——非均匀
+ * 缩放的旋转矩形无法用 origin/size/rotation 表示）。1x1 的 uniform 掩版保持
+ * 原样。尺寸不变为无操作。效果参数（JSON 透传、求值未实现）不随尺寸缩放，
+ * 这是已记录的能力边界。一步撤销。
+ */
+COMP_API comp_result comp_document_resize_image(comp_document document, comp_size size);
+
 /* 文档是否包含未提交的修改。 */
 COMP_API comp_result comp_document_is_dirty(comp_document document, int32_t* out_dirty);
 

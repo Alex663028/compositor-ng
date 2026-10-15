@@ -16,6 +16,7 @@
 #define COMPOSITOR_COMPOSITING_RESAMPLE_H
 
 #include <string>
+#include <vector>
 
 #include "compositor/comp_core.h"
 #include "core/comp_geometry.h"
@@ -43,6 +44,25 @@ comp_sampling sampling_to_abi(SamplingMode mode);
  */
 bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
                       comp_rect* out_bounds, std::string* error);
+
+/*
+ * 把普通 RGBA8 预乘缓冲（单位几何：无旋转/翻转/掩版，像素即内容）重采样到
+ * 目标尺寸。用于 Image Size（对齐上游 ImageResizer）中已光栅化层单元的整幅
+ * 缩放：逆映射 + 与 build_layer_unit 同一组采样内核；目标尺寸与源相同时在
+ * 整数对齐下逐字节精确（缩放路径的安全属性）。源外坐标按边缘夹取——整幅
+ * 缩放不该像图层贴图那样引入透明边。src 为空或目标尺寸为 0 返回 false。
+ */
+bool resample_image(const ImageBuffer& src, int32_t dst_w, int32_t dst_h,
+                    SamplingMode mode, ImageBuffer* out);
+
+/*
+ * 单通道（掩版）重采样：同一套 nearest/bilinear/bicubic 内核的灰度版。
+ * 1x1 的 uniform 掩版分辨率无关，由调用方保持原样，不进本函数。
+ * src 为空或目标尺寸为 0 返回 false。
+ */
+bool resample_gray(const uint8_t* src, int32_t src_w, int32_t src_h,
+                   int32_t dst_w, int32_t dst_h, SamplingMode mode,
+                   std::vector<uint8_t>* out);
 
 }  // namespace compositor
 
