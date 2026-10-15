@@ -6,9 +6,11 @@
  * 三端外壳（Windows / HarmonyOS / macOS）的集成路径与此完全一致。
  */
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "compositor/comp_command.h"
@@ -79,6 +81,22 @@ comp_layer_id background_layer(comp_document document) {
   size_t count = 0;
   comp_layer_list(document, ids, 8, &count);
   return count > 0 ? ids[0] : 0;
+}
+
+/* 计数分配器：验证引擎/文档对象真的流经调用方分配器（架构修复验证用）。 */
+struct Counting {
+  int allocations = 0;
+  int releases = 0;
+};
+
+void* counting_alloc(size_t bytes, void* user) {
+  ++static_cast<Counting*>(user)->allocations;
+  return std::malloc(bytes);
+}
+
+void counting_free(void* pointer, void* user) {
+  if (pointer != nullptr) ++static_cast<Counting*>(user)->releases;
+  std::free(pointer);
 }
 
 }  // namespace
@@ -511,27 +529,35 @@ COMP_TEST(abi_command_model) {
   comp_engine engine = nullptr;
   COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
 
-  size_t command_count = 0;
-  COMP_CHECK(comp_command_list(engine, nullptr, 0, &command_count) == COMP_OK);
-  COMP_CHECK(command_count >= 5);
-
-  std::vector<comp_command_desc> commands(command_count);
-  size_t written = 0;
-  COMP_CHECK(comp_command_list(engine, commands.data(), commands.size(), &written) == COMP_OK);
-  COMP_CHECK(written == command_count);
-
-  bool found_undo = false;
-  for (const comp_command_desc& command : commands) {
-    COMP_CHECK(command.id != nullptr && command.title != nullptr);
-    if (std::string(command.id) == "edit.undo") found_undo = true;
-  }
-  COMP_CHECK(found_undo);
-
   comp_document_desc document_desc{};
   document_desc.width = 4;
   document_desc.height = 4;
   comp_document document = nullptr;
   COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  /* count-only 枚举不要求文档；带 desc 的枚举按文档状态求值 enabled。 */
+  size_t command_count = 0;
+  COMP_CHECK(comp_command_list(nullptr, nullptr, 0, &command_count) == COMP_OK);
+  COMP_CHECK(command_count >= 5);
+
+  std::vector<comp_command_desc> commands(command_count);
+  size_t written = 0;
+  COMP_CHECK(comp_command_list(document, commands.data(), commands.size(), &written) == COMP_OK);
+  COMP_CHECK(written == command_count);
+
+  bool found_undo = false;
+  bool all_disabled_undo = true;
+  for (const comp_command_desc& command : commands) {
+    COMP_CHECK(command.id != nullptr && command.title != nullptr);
+    if (std::string(command.id) == "edit.undo") {
+      found_undo = true;
+      /* 新文档没有可撤销内容：列表与逐条查询必须给出一致的答案。 */
+      if (command.enabled != 0) all_disabled_undo = false;
+    }
+  }
+  COMP_CHECK(found_undo);
+  COMP_CHECK_MSG(all_disabled_undo,
+                 "command_list enabled matches command_state on a fresh document");
 
   /* 新文档：无可撤销内容。 */
   int32_t enabled = -1;
@@ -707,6 +733,198 @@ COMP_TEST(abi_layer_thumbnail) {
   COMP_CHECK(result == COMP_OK);
   COMP_CHECK(thumbnail_size.width <= 8 && thumbnail_size.height <= 8);
   COMP_CHECK(thumbnail_size.width > 0 && thumbnail_size.height > 0);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* ==================================================================
+ * 第三轮：架构风险收口的回归护栏。
+ * 每条对应一处已修复的架构级风险（详见报告第六节）。
+ * ================================================================== */
+
+/* 句柄有效性：销毁后的文档句柄继续使用必须得到错误码，而不是静默解引用
+ * （对象 magic 在析构时擦除）。 */
+COMP_TEST(destroyed_document_handle_is_rejected) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  comp_document_destroy(document);
+
+  /* 销毁后：所有入口一律拒绝，不再有 use-after-free。 */
+  comp_size size{};
+  COMP_CHECK_MSG(comp_document_size(document, &size) == COMP_ERR_INVALID_ARGUMENT,
+                 "destroyed document handle is rejected, not dereferenced");
+  int32_t dirty = -1;
+  COMP_CHECK_MSG(comp_document_is_dirty(document, &dirty) == COMP_ERR_INVALID_ARGUMENT,
+                 "destroyed document handle rejected by a second entry point too");
+
+  /* 引擎本身不受影响（文档销毁不波及引擎）。 */
+  uint32_t threads = 0;
+  COMP_CHECK(comp_engine_threads(engine, &threads) == COMP_OK);
+
+  /* 重复 destroy 为无操作。 */
+  comp_document_destroy(document);
+
+  comp_engine_destroy(engine);
+}
+
+/* 反序生命周期：宿主先销毁引擎时，在册文档必须被一并回收，
+ * 且「分配/释放」必须成对（经同一分配器）。 */
+COMP_TEST(engine_destroy_cleans_up_documents_in_order) {
+  Counting counting;
+
+  comp_engine_desc desc = test_engine_desc();
+  desc.alloc.alloc = counting_alloc;
+  desc.alloc.free = counting_free;
+  desc.alloc.user = &counting;
+
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  /* 引擎对象本身经定制分配器（此前 desc.alloc 收下从不使用）。 */
+  COMP_CHECK_MSG(counting.allocations >= 1, "engine object flows through the custom allocator");
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+  COMP_CHECK_MSG(counting.allocations >= 2, "document object flows through the custom allocator");
+
+  /* 反序：先销毁引擎。~Engine 兜底销毁在册文档。 */
+  comp_engine_destroy(engine);
+
+  COMP_CHECK_MSG(counting.allocations == counting.releases,
+                 "engine destroy releases every object it allocated (documents included)");
+
+  /* 引擎已销毁：其句柄同样失效。 */
+  uint32_t threads = 0;
+  COMP_CHECK(comp_engine_threads(engine, &threads) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+/* 分配器契约：alloc 与 free 必须成对，只填一半在引擎创建时即被拒绝
+ * （块无法归还 / 来源不明指针都是调用方错误，早失败好过带进运行期）。 */
+COMP_TEST(engine_create_rejects_unpaired_allocator) {
+  comp_engine_desc alloc_only = test_engine_desc();
+  alloc_only.alloc.alloc = counting_alloc;
+  comp_engine engine = nullptr;
+  COMP_CHECK_MSG(comp_engine_create(&alloc_only, &engine) == COMP_ERR_INVALID_ARGUMENT,
+                 "alloc without free is rejected at engine creation");
+
+  comp_engine_desc free_only = test_engine_desc();
+  free_only.alloc.free = counting_free;
+  COMP_CHECK_MSG(comp_engine_create(&free_only, &engine) == COMP_ERR_INVALID_ARGUMENT,
+                 "free without alloc is rejected at engine creation");
+
+  /* 成对提供仍然放行（默认分配器路径不受影响）。 */
+  comp_engine_desc plain{};
+  COMP_CHECK(comp_engine_create(&plain, &engine) == COMP_OK);
+  comp_engine_destroy(engine);
+}
+
+/* 类型混淆：把引擎句柄当文档句柄传，必须被拒绝而不是把 Engine 当 Document 用。 */
+COMP_TEST(handle_type_confusion_is_rejected) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document fake = reinterpret_cast<comp_document>(engine);
+  comp_size size{};
+  COMP_CHECK_MSG(comp_document_size(fake, &size) == COMP_ERR_INVALID_ARGUMENT,
+                 "engine handle used as document handle is rejected by the magic check");
+  comp_document_destroy(fake); /* 无操作，不能真的删掉引擎 */
+
+  /* 引擎仍然活着且可用。 */
+  uint32_t threads = 0;
+  COMP_CHECK(comp_engine_threads(engine, &threads) == COMP_OK);
+
+  comp_engine_destroy(engine);
+  /* 重复 destroy 引擎同样无操作。 */
+  comp_engine_destroy(engine);
+}
+
+/* 命令列表：desc 模式必须提供文档（enabled 按文档状态求值）；
+ * count-only 模式不要求文档（外壳可在打开文档前枚举命令表）。 */
+COMP_TEST(command_list_requires_document_for_desc_mode) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  size_t count = 0;
+  COMP_CHECK(comp_command_list(nullptr, nullptr, 0, &count) == COMP_OK);
+  COMP_CHECK(count >= 5);
+
+  std::vector<comp_command_desc> commands(count);
+  COMP_CHECK_MSG(comp_command_list(nullptr, commands.data(), count, &count) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "desc mode without a document is rejected (enabled is document-scoped)");
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  /* 新文档：undo 不可用。列表与逐条查询给出一致答案（两套标准已合并）。 */
+  size_t written = 0;
+  COMP_CHECK(comp_command_list(document, commands.data(), count, &written) == COMP_OK);
+  COMP_CHECK(written == count);
+  for (const comp_command_desc& command : commands) {
+    if (std::string(command.id) == "edit.undo") {
+      COMP_CHECK_MSG(command.enabled == 0, "undo disabled on a fresh document");
+    }
+    if (std::string(command.id) == "layer.add") {
+      COMP_CHECK_MSG(command.enabled == 1, "add layer enabled on a fresh document");
+    }
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* 错误槽线程隔离：一个线程的错误不得覆盖另一个线程的错误
+ * （此前 last_error_ 是进程级共享 string，多线程共用引擎即数据竞争）。 */
+COMP_TEST(last_error_slot_is_thread_local) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  /* 主线程制造一条错误。 */
+  int32_t enabled = -1;
+  int32_t is_on = -1;
+  COMP_CHECK(comp_command_state(document, "no.such.command", &enabled, &is_on) ==
+             COMP_ERR_NOT_FOUND);
+  const std::string main_error = comp_engine_last_error(engine);
+  COMP_CHECK(!main_error.empty());
+
+  /* 工作线程只做成功调用：它的错误槽必须为空，主线程的错误原样保留。 */
+  std::string worker_error = "unset";
+  std::thread worker([&]() {
+    comp_document_desc inner{};
+    inner.width = 2;
+    inner.height = 2;
+    comp_document inner_document = nullptr;
+    if (comp_document_create(engine, &inner, &inner_document) == COMP_OK) {
+      comp_document_destroy(inner_document);
+    }
+    worker_error = comp_engine_last_error(engine);
+  });
+  worker.join();
+  COMP_CHECK_MSG(worker_error.empty(), "worker thread owns a separate error slot");
+  COMP_CHECK(std::string(comp_engine_last_error(engine)) == main_error);
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);
