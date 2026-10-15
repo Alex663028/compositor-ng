@@ -5,11 +5,14 @@
 #ifndef COMPOSITOR_DOMAIN_DOCUMENT_H
 #define COMPOSITOR_DOMAIN_DOCUMENT_H
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
+#include "core/comp_alloc.h"
+#include "core/comp_handle_magic.h"
 #include "domain/domain_state.h"
 #include "domain/history.h"
 
@@ -27,6 +30,15 @@ class Document {
    * ABI 层 Document 均为堆分配，故此析构本就是删除路径。
    */
   ~Document();
+
+  /*
+   * 经引擎分配器创建/销毁（placement new + 手动析构；失败抛 bad_alloc）。
+   * comp_document_create 与 format 层 load_project 共用这一对函数，
+   * 保证「谁分配谁释放」在两条创建路径上都成立（见 Engine::create）。
+   */
+  static Document* create(Engine* engine, int32_t width, int32_t height, float dpi,
+                          std::string color_space);
+  static void destroy(Document* document);
 
   Document(const Document&) = delete;
   Document& operator=(const Document&) = delete;
@@ -86,6 +98,13 @@ class Document {
   bool is_dirty() const noexcept { return dirty_; }
   void mark_dirty(bool value) noexcept { dirty_ = value; }
 
+  /*
+   * 句柄有效性（与 Engine 同一套轻量方案，见 engine.h 文件头）：
+   * 构造期置 kDocumentMagic，析构期 poison。abi 层 as_document 据此
+   * 把「销毁后使用 / 类型混淆 / 野指针」挡成错误码而不是静默解引用。
+   */
+  bool is_alive() const noexcept { return handle_magic_ == kDocumentMagic; }
+
   /* ------------------------------------------------------------- 事务 */
 
   bool txn_active() const noexcept { return txn_active_; }
@@ -126,6 +145,7 @@ class Document {
   std::string txn_label_;
   DocumentState txn_snapshot_{};
   std::vector<void*> txn_slots_{};
+  uint32_t handle_magic_ = kDocumentMagic;
 };
 
 }  // namespace compositor

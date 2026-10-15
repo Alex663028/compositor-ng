@@ -4,8 +4,15 @@
  *
  * 生命周期约定：
  *   comp_engine_create  -> 进程内通常只创建一个引擎实例（跨文档共享线程池与后端）
- *   comp_engine_destroy -> 必须在其创建的文档全部销毁之后调用
+ *   comp_engine_destroy -> 推荐在其创建的文档全部销毁之后调用；若宿主反序
+ *                          （引擎先销毁），引擎会兜底销毁在册文档，不会泄漏
  *   comp_document_*     -> 文档句柄由引擎创建，destroy 后其下所有 comp_layer_id 失效
+ *
+ * 句柄有效性：销毁后的句柄继续使用会得到 COMP_ERR_INVALID_ARGUMENT 而不是崩溃
+ * （对象内置 magic 在析构时擦除）；重复 destroy 为无操作。
+ *
+ * 错误信息：comp_engine_last_error 返回调用线程的错误槽（thread_local）——
+ * 多线程共用一个引擎实例时，请在同一线程内「调用 + 读错误」。
  */
 #ifndef COMPOSITOR_COMP_ENGINE_H
 #define COMPOSITOR_COMP_ENGINE_H
@@ -32,7 +39,10 @@ COMP_API comp_result comp_engine_create(const comp_engine_desc* desc, comp_engin
 /* 销毁引擎。传入 NULL 为无操作。 */
 COMP_API void comp_engine_destroy(comp_engine engine);
 
-/* 最近一次错误信息（UTF-8）。返回的指针由引擎持有，下一次调用前有效。 */
+/*
+ * 最近一次错误信息（UTF-8）。返回的指针由引擎持有，在同一次「调用 → 读取」
+ * 的线程内有效；错误槽是线程局部的，另一个线程的调用不会覆盖它。
+ */
 COMP_API const char* comp_engine_last_error(comp_engine engine);
 
 /* 查询实际生效的后端；写入 buf（含 '\0'）。 */

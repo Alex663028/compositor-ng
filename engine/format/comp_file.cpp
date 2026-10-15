@@ -431,12 +431,13 @@ bool read_layer_mask(const JsonValue& entry, const fs::path& root, Layer* layer,
 
 }  // namespace
 
-bool load_project(const std::string& path, Engine* engine, std::unique_ptr<Document>* out,
+bool load_project(const std::string& path, Engine* engine, Document** out,
                   std::string* error) {
   if (out == nullptr) {
     if (error != nullptr) *error = "out document pointer is null";
     return false;
   }
+  *out = nullptr;
 
   const fs::path root = fs::u8path(path);
   std::error_code ec;
@@ -484,10 +485,15 @@ bool load_project(const std::string& path, Engine* engine, std::unique_ptr<Docum
     document_id = uuid_v4_new();
   }
 
-  auto doc = std::unique_ptr<Document>(new Document(engine, width, height,
-                                                   static_cast<float>(clamp_resolution(
-                                                       manifest.number_or("resolution", 72.0))),
-                                                   color_space));
+  /* 与 comp_document_create 走同一对工厂函数：文档对象经引擎分配器分配，
+   * unique_ptr 的删除器必须用 Document::destroy 而不是默认 delete，
+   * 否则定制分配器场景下「分配/释放」来自两座堆。 */
+  auto doc = std::unique_ptr<Document, void (*)(Document*)>(
+      Document::create(engine, width, height,
+                       static_cast<float>(clamp_resolution(
+                           manifest.number_or("resolution", 72.0))),
+                       color_space),
+      Document::destroy);
   DocumentState& state = doc->state();
   state.layers.clear();
   state.document_id = document_id;
@@ -627,7 +633,7 @@ bool load_project(const std::string& path, Engine* engine, std::unique_ptr<Docum
 
   doc->mark_dirty(false);
   doc->history().clear();
-  *out = std::move(doc);
+  *out = doc.release(); /* 所有权移交调用方；失败路径由 unique_ptr 自动 destroy */
   return true;
 }
 

@@ -50,9 +50,11 @@ struct ProjectInfo {
  * 以保证「同一文档多次保存」的图层文件名（由 UUID 派生）不漂移。 */
 bool save_project(Document& doc, const std::string& path, std::string* error);
 
-/* 从 .comp 目录包加载，成功时创建 Document（engine 可为 nullptr）。 */
+/* 从 .comp 目录包加载，成功时创建 Document（engine 可为 nullptr）。
+ * 出参为裸指针：文档对象经引擎分配器创建，调用方必须用 Document::destroy
+ * 释放（而不是 delete）——与 comp_document_create 的分配路径保持一致。 */
 bool load_project(const std::string& path, Engine* engine,
-                  std::unique_ptr<Document>* out, std::string* error);
+                  Document** out, std::string* error);
 
 /* 只读 manifest 元信息，不加载像素。 */
 bool probe_project(const std::string& path, ProjectInfo* info, std::string* error);

@@ -38,10 +38,12 @@ typedef struct comp_command_desc {
 } comp_command_desc;
 
 /*
- * 两段式枚举：desc 为 NULL 时仅写 out_count；否则最多写入 capacity 条并写 out_count
- * （out_count 始终为该引擎的完整命令数）。
+ * 两段式枚举：desc 为 NULL 时仅写 out_count（此模式不要求 document 存在）；
+ * desc 非 NULL 时 document 必须有效——enabled 按该文档的当前状态求值
+ * （契约见 comp_command_desc::enabled 注释）。
+ * out_count 始终为完整命令数。
  */
-COMP_API comp_result comp_command_list(comp_engine engine,
+COMP_API comp_result comp_command_list(comp_document document,
                                        comp_command_desc* desc,
                                        size_t capacity,
                                        size_t* out_count);

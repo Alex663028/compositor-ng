@@ -793,9 +793,10 @@ void redo_document(ShellState& shell) {
 
 /* 命令层冒烟：两段式枚举，只报数量，不猜测命令 id。 */
 void list_commands(ShellState& shell) {
-  if (shell.engine == nullptr) return;
+  if (shell.document == nullptr) return;
   size_t count = 0;
-  if (comp_command_list(shell.engine, nullptr, 0, &count) != COMP_OK) {
+  /* count-only 模式不要求文档；带 desc 的枚举才需要按文档状态求值 enabled。 */
+  if (comp_command_list(shell.document, nullptr, 0, &count) != COMP_OK) {
     set_status(shell, L"命令枚举失败");
     return;
   }

@@ -48,16 +48,52 @@ const CommandEntry* find_command(const char* id) {
   return nullptr;
 }
 
+/*
+ * 命令可用性求值（comp_command_state 与 comp_command_list 共用同一份逻辑，
+ * 杜绝「列表说可用、逐条查询说不可用」的两套标准）。
+ * document 为 nullptr 时一律视为不可用——没有文档就没有可操作的对象。
+ */
+int32_t command_enabled(compositor::Document* doc, const char* id) {
+  if (doc == nullptr) return 0;
+  const std::string command_id = id;
+  if (command_id == "edit.undo") {
+    return doc->history().can_undo() ? 1 : 0;
+  }
+  if (command_id == "edit.redo") {
+    return doc->history().can_redo() ? 1 : 0;
+  }
+  if (command_id == "layer.remove") {
+    return doc->state().layers.size() > 1 ? 1 : 0;
+  }
+  if (command_id == "layer.merge_down") {
+    const compositor::Layer* active = doc->find(doc->state().active_layer);
+    return (active != nullptr && doc->can_merge_down(active->id)) ? 1 : 0;
+  }
+  if (command_id == "layer.flatten") {
+    return doc->state().layers.empty() ? 0 : 1;
+  }
+  /* layer.add / file.save 不依赖文档状态。 */
+  return 1;
+}
+
 }  // namespace
 
 extern "C" {
 
-comp_result comp_command_list(comp_engine engine, comp_command_desc* desc, size_t capacity,
+/*
+ * 两段式枚举：desc 为 NULL 时仅写 out_count（此模式不要求文档存在，
+ * 外壳可在打开文档前枚举命令表）；desc 非 NULL 时必须提供 document——
+ * enabled 按当前文档状态求值（头文件契约），没有文档就无从求值。
+ */
+comp_result comp_command_list(comp_document document, comp_command_desc* desc, size_t capacity,
                              size_t* out_count) {
   if (out_count == nullptr) return COMP_ERR_INVALID_ARGUMENT;
-  compositor::Engine* e = compositor::abi::as_engine(engine);
+  compositor::Document* doc = compositor::abi::as_document(document);
+  if (doc == nullptr && desc != nullptr) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  compositor::Engine* e = doc != nullptr ? doc->engine() : nullptr;
   COMP_ABI_TRY(e)
-  if (e == nullptr) return COMP_ERR_INVALID_ARGUMENT;
 
   *out_count = kCommandCount;
   if (desc == nullptr) return compositor::abi::ok(e);
@@ -70,7 +106,7 @@ comp_result comp_command_list(comp_engine engine, comp_command_desc* desc, size_
     desc[i].key_code = kCommands[i].key_code;
     desc[i].modifiers = kCommands[i].modifiers;
     desc[i].is_toggle = kCommands[i].is_toggle;
-    desc[i].enabled = 1;
+    desc[i].enabled = static_cast<uint8_t>(command_enabled(doc, kCommands[i].id));
     desc[i]._reserved[0] = 0;
     desc[i]._reserved[1] = 0;
   }
@@ -95,24 +131,8 @@ comp_result comp_command_state(comp_document document, const char* id, int32_t* 
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "unknown command id");
   }
 
-  int32_t enabled = 1;
-  const std::string command_id = entry->id;
-  if (command_id == "edit.undo") {
-    enabled = doc->history().can_undo() ? 1 : 0;
-  } else if (command_id == "edit.redo") {
-    enabled = doc->history().can_redo() ? 1 : 0;
-  } else if (command_id == "layer.remove") {
-    enabled = doc->state().layers.size() > 1 ? 1 : 0;
-  } else if (command_id == "layer.merge_down") {
-    const compositor::Layer* active = doc->find(doc->state().active_layer);
-    enabled = (active != nullptr && doc->can_merge_down(active->id)) ? 1 : 0;
-  } else if (command_id == "layer.flatten") {
-    enabled = doc->state().layers.empty() ? 0 : 1;
-  } else if (command_id == "file.save") {
-    enabled = 1;
-  }
-
-  *out_enabled = enabled;
+  /* 与 comp_command_list 共用同一份求值，杜绝两套标准。 */
+  *out_enabled = command_enabled(doc, entry->id);
   *out_is_on = 0;
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)

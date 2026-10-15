@@ -49,6 +49,17 @@ Layer* ensure_background_layer(Document* document) {
   return layer;
 }
 
+/*
+ * 分配器完整性：alloc 与 free 必须成对出现。
+ * 只填 alloc 不填 free = 分配出的块永远无法归还（必然泄漏，且多半来自另一座
+ * 堆）；只填 free 不填 alloc = 释放来源不明的指针。两者都是调用方错误，
+ * 在引擎创建时一次性拒绝，好过把隐患带进运行期。realloc 允许为空——
+ * 契约规定此时 reallocate 不保留旧内容（见 comp_core.h）。
+ */
+bool allocator_is_paired(const comp_allocator& alloc) {
+  return (alloc.alloc == nullptr) == (alloc.free == nullptr);
+}
+
 }  // namespace
 
 extern "C" {
@@ -60,10 +71,13 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
 
   comp_engine_desc resolved{};
   if (desc != nullptr) resolved = *desc;
+  if (!allocator_is_paired(resolved.alloc)) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
 
   Engine* engine = nullptr;
   try {
-    engine = new Engine(resolved);
+    engine = Engine::create(resolved);
   } catch (const std::bad_alloc&) {
     return COMP_ERR_OUT_OF_MEMORY;
   } catch (...) {
@@ -88,7 +102,13 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
   return COMP_OK;
 }
 
-void comp_engine_destroy(comp_engine engine) { delete compositor::abi::as_engine(engine); }
+void comp_engine_destroy(comp_engine engine) {
+  /*
+   * as_engine 已做 magic 校验：NULL、已销毁句柄（含重复 destroy）均为无操作。
+   * ~Engine 会兜底销毁所有在册文档——宿主先销毁引擎的反序用法从此安全。
+   */
+  Engine::destroy(compositor::abi::as_engine(engine));
+}
 
 const char* comp_engine_last_error(comp_engine engine) {
   Engine* e = compositor::abi::as_engine(engine);
@@ -136,7 +156,7 @@ comp_result comp_document_create(comp_engine engine, const comp_document_desc* d
 
   Document* document = nullptr;
   try {
-    document = new Document(e, desc->width, desc->height, dpi, color_space);
+    document = Document::create(e, desc->width, desc->height, dpi, color_space);
   } catch (const std::bad_alloc&) {
     return compositor::abi::fail(e, COMP_ERR_OUT_OF_MEMORY, "cannot allocate document");
   }
@@ -149,11 +169,12 @@ comp_result comp_document_create(comp_engine engine, const comp_document_desc* d
   document->state().document_id = compositor::uuid_v4_new();
 
   if (ensure_background_layer(document) == nullptr) {
-    delete document;
+    Document::destroy(document);
     return compositor::abi::fail(e, COMP_ERR_INTERNAL, "cannot create background layer");
   }
 
   document->mark_dirty(false);
+  e->attach_document(document);
   *out_document = reinterpret_cast<comp_document>(document);
   return compositor::abi::ok(e);
   COMP_ABI_CATCH(e)
@@ -169,12 +190,16 @@ comp_result comp_document_load(comp_engine engine, const char* comp_path_utf8,
     return compositor::abi::fail(e, COMP_ERR_INVALID_ARGUMENT, "comp path is null");
   }
 
-  std::unique_ptr<Document> document;
+  Document* loaded = nullptr;
   std::string error;
-  if (!compositor::load_project(comp_path_utf8, e, &document, &error)) {
+  if (!compositor::load_project(comp_path_utf8, e, &loaded, &error)) {
     return compositor::abi::fail(e, COMP_ERR_IO, error);
   }
-  *out_document = reinterpret_cast<comp_document>(document.release());
+  if (loaded == nullptr) {
+    return compositor::abi::fail(e, COMP_ERR_IO, "load produced no document");
+  }
+  e->attach_document(loaded);
+  *out_document = reinterpret_cast<comp_document>(loaded);
   return compositor::abi::ok(e);
   COMP_ABI_CATCH(e)
 }
@@ -199,7 +224,14 @@ comp_result comp_document_save(comp_document document, const char* comp_path_utf
   COMP_ABI_CATCH(engine)
 }
 
-void comp_document_destroy(comp_document document) { delete compositor::abi::as_document(document); }
+void comp_document_destroy(comp_document document) {
+  /*
+   * 经引擎分配器析构（与 Document::create 的 placement new 配对）。
+   * as_document 已校验 magic：NULL 与已销毁句柄均为无操作（重复 destroy 安全）。
+   * ~Document 会自行从引擎登记表摘掉自己。
+   */
+  Document::destroy(compositor::abi::as_document(document));
+}
 
 comp_result comp_document_size(comp_document document, comp_size* out_size) {
   Document* doc = nullptr;

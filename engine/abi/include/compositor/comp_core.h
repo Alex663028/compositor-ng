@@ -159,7 +159,14 @@ typedef struct comp_size { int32_t width, height; } comp_size;
 /* ------------------------------------------------------------ 分配器 */
 
 /* 调用方注入的分配器；全零表示使用引擎内置默认分配器。
- * realloc 允许为空（引擎将以 alloc+copy+free 替代）。 */
+ *
+ * 契约：
+ *   - alloc 与 free 必须成对提供；只填一半时 comp_engine_create 直接拒绝
+ *     （块无法归还是最可能的结局）。realloc 可以为空。
+ *   - realloc 为空时，引擎的 reallocate 不保留旧内容（旧块容量对引擎不可见，
+ *     任何拷贝尝试都是越界读），仅保证分配成功且已清零。
+ *   - 分配器用于引擎与文档对象本身（placement new 配对手动析构）。
+ *     回调可能来自其它模块/CRT，因此 alloc/free 必须同源。 */
 typedef struct comp_allocator {
   void* (*alloc)(size_t bytes, void* user);
   void* (*realloc)(void* p, size_t bytes, void* user);

@@ -32,6 +32,36 @@ Document::~Document() {
     *static_cast<Document**>(slot) = nullptr;
   }
   txn_slots_.clear();
+
+  /* 从引擎的登记表摘掉自己（引擎可能已先析构，那时列表已空，erase 无操作）。 */
+  if (engine_ != nullptr) {
+    engine_->detach_document(this);
+  }
+
+  /* 句柄 poison：此后任何 as_document 命中本对象的调用都会被拒绝。 */
+  handle_magic_ = kHandlePoisoned;
+}
+
+Document* Document::create(Engine* engine, int32_t width, int32_t height, float dpi,
+                           std::string color_space) {
+  const Allocator& alloc =
+      engine != nullptr ? engine->allocator() : Allocator{};
+  void* memory = alloc.allocate(sizeof(Document));
+  if (memory == nullptr) throw std::bad_alloc();
+  try {
+    return new (memory) Document(engine, width, height, dpi, std::move(color_space));
+  } catch (...) {
+    alloc.release(memory);
+    throw;
+  }
+}
+
+void Document::destroy(Document* document) {
+  if (document == nullptr) return;
+  Engine* engine = document->engine();
+  const Allocator alloc = engine != nullptr ? engine->allocator() : Allocator{};
+  document->~Document();
+  alloc.release(document);
 }
 
 void Document::register_txn_slot(void* slot) {
