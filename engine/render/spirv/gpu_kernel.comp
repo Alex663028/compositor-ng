@@ -1,0 +1,119 @@
+
+// Compositor 合成计算着色器 —— Vulkan / GLSL 450
+// 与 D3D12 版（render/gpu_kernel.cpp 的 HLSL）及 CPU 基准 blend.cpp 语义一一对应。
+// 每个 case 后的注释即 comp_blend_mode 的上游规范名（ABI 冻结表）。
+#version 450
+#define COMP_BLEND_COUNT 24
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba8, set = 0, binding = 0) uniform image2D g_dst;
+layout(rgba8, set = 0, binding = 1) uniform image2D g_src;
+
+layout(push_constant) uniform Params {
+  uint  mode;
+  uint  width;
+  uint  height;
+  uint  pad;
+  float alpha;  // 图层有效不透明度
+} pc;
+
+float clamp01(float v) { return clamp(v, 0.0, 1.0); }
+
+float f_burn(float cb, float cs) { return cs <= 0.0 ? 0.0 : clamp01(1.0 - (1.0 - cb) / cs); }
+float f_dodge(float cb, float cs) { return cs >= 1.0 ? 1.0 : clamp01(cb / (1.0 - cs)); }
+float f_hardlight(float cb, float cs) {
+  return cs <= 0.5 ? clamp01(2.0 * cb * cs) : clamp01(1.0 - 2.0 * (1.0 - cb) * (1.0 - cs));
+}
+float f_softlight(float cb, float cs) {
+  if (cs <= 0.5) return clamp01(cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb));
+  float d = cb <= 0.25 ? ((16.0 * cb - 12.0) * cb + 4.0) * cb : sqrt(cb);
+  return clamp01(cb + (2.0 * cs - 1.0) * (d - cb));
+}
+float f_vivid(float cb, float cs) {
+  return cs <= 0.5 ? f_burn(cb, clamp01(2.0 * cs)) : f_dodge(cb, clamp01(2.0 * cs - 1.0));
+}
+
+float blend_channel(uint m, float cb, float cs) {
+  switch (m) {
+    case 0:  /* Normal */             return cs;
+    case 1:  /* Darken */             return min(cb, cs);
+    case 2:  /* Multiply */           return cb * cs;
+    case 3:  /* Color Burn */         return f_burn(cb, cs);
+    case 4:  /* Linear Burn */        return clamp01(cb + cs - 1.0);
+    case 5:  /* Lighten */            return max(cb, cs);
+    case 6:  /* Screen */             return cb + cs - cb * cs;
+    case 7:  /* Color Dodge */        return f_dodge(cb, cs);
+    case 8:  /* Linear Dodge (Add) */ return clamp01(cb + cs);
+    case 9:  /* Overlay */            return f_hardlight(cs, cb);
+    case 10: /* Soft Light */         return f_softlight(cb, cs);
+    case 11: /* Hard Light */         return f_hardlight(cb, cs);
+    case 12: /* Vivid Light */        return f_vivid(cb, cs);
+    case 13: /* Linear Light */       return clamp01(cb + 2.0 * cs - 1.0);
+    case 14: /* Pin Light */          return cs <= 0.5 ? min(cb, clamp01(2.0 * cs)) : max(cb, clamp01(2.0 * cs - 1.0));
+    case 15: /* Hard Mix */           return f_vivid(cb, cs) < 0.5 ? 0.0 : 1.0;
+    case 16: /* Difference */         return abs(cb - cs);
+    case 17: /* Exclusion */          return clamp01(cb + cs - 2.0 * cb * cs);
+    case 18: /* Subtract */           return clamp01(cb - cs);
+    case 19: /* Divide */             return cs <= 0.0 ? 0.0 : clamp01(cb / cs);
+    default:                          return cs;
+  }
+}
+
+float lum3(vec3 c) { return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b; }
+float sat3(vec3 c) { return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)); }
+
+void clip_color(inout vec3 c) {
+  float l = lum3(c);
+  float n = min(c.r, min(c.g, c.b));
+  float x = max(c.r, max(c.g, c.b));
+  if (n < 0.0) c = l + ((c - l) * l) / (l - n);
+  if (x > 1.0) c = l + ((c - l) * (1.0 - l)) / (x - l);
+}
+
+void set_lum(inout vec3 c, float l) { c += (l - lum3(c)); clip_color(c); }
+
+void set_sat(inout vec3 c, float s) {
+  int i0 = 0, i1 = 1, i2 = 2;
+  float a[3] = float[3](c.r, c.g, c.b);
+  if (a[i0] > a[i1]) { int t = i0; i0 = i1; i1 = t; }
+  if (a[i1] > a[i2]) { int t = i1; i1 = i2; i2 = t; }
+  if (a[i0] > a[i1]) { int t = i0; i0 = i1; i1 = t; }
+  float mn = a[i0], mx = a[i2], md = a[i1];
+  if (mx > mn) { md = ((md - mn) * s) / (mx - mn); mx = s; } else { md = 0.0; mx = 0.0; }
+  float r[3];
+  r[i0] = 0.0; r[i1] = md; r[i2] = mx;
+  c = vec3(r[0], r[1], r[2]);
+}
+
+vec3 blend_rgb3(uint m, vec3 cb, vec3 cs) {
+  switch (m) {
+    case 20: /* Hue */        { vec3 t = cs; set_sat(t, sat3(cb)); set_lum(t, lum3(cb)); return t; }
+    case 21: /* Saturation */ { vec3 t = cb; set_sat(t, sat3(cs)); set_lum(t, lum3(cb)); return t; }
+    case 22: /* Color */      { vec3 t = cs; set_lum(t, lum3(cb)); return t; }
+    case 23: /* Luminosity */ { vec3 t = cb; set_lum(t, lum3(cs)); return t; }
+    default: break;
+  }
+  return vec3(blend_channel(m, cb.r, cs.r), blend_channel(m, cb.g, cs.g), blend_channel(m, cb.b, cs.b));
+}
+
+void main() {
+  uvec2 tid = gl_GlobalInvocationID.xy;
+  if (tid.x >= pc.width || tid.y >= pc.height) return;
+
+  vec4 d = imageLoad(g_dst, ivec2(tid));
+  vec4 s = imageLoad(g_src, ivec2(tid));
+
+  vec3 Cb = d.a > 0.0 ? d.rgb / d.a : vec3(0.0);
+  vec3 Cs = s.a > 0.0 ? s.rgb / s.a : vec3(0.0);
+
+  float alpha = s.a * pc.alpha;
+  float ab = d.a;
+
+  vec3 B = blend_rgb3(pc.mode, Cb, Cs);
+  vec3 co = alpha * (1.0 - ab) * Cs + alpha * ab * B + (1.0 - alpha) * ab * Cb;
+  float ao = alpha + ab * (1.0 - alpha);
+
+  vec3 q = floor(clamp(co, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+  float qa = floor(clamp(ao, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+  imageStore(g_dst, ivec2(tid), vec4(q, qa));
+}

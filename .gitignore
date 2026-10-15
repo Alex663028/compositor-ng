@@ -32,9 +32,15 @@ libcompositor_engine.so
 libcompositor_engine.dylib
 
 # 根目录散落的图像/文档产物（测试与脚本的临时输出）
+#
+# 注意两个例外：engine/render/spirv/ 下的 .comp 是从 gpu_kernel.cpp 抽取出的
+# GLSL **源码**（供人工审阅），同目录的 .comp.spv 与 gpu_kernel_spv.h 是被
+# vulkan_backend.cpp #include 的 SPIR-V 字模块 —— 三者都是构建的必需输入，
+# 不是产物，必须入库。
 out.png
 *.comp/
 *.comp
+!engine/render/spirv/gpu_kernel.comp
 !docs/**/*.comp
 build_test_*.png
 
