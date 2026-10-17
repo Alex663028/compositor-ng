@@ -3,6 +3,10 @@
 #define DeepPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // 16-bit layers kept through 8-bit operations. Each color gets an 8-bit `low` a little below it (0 to 2 steps, rounded
 // as dither rounds, so where bands would start falls at random and comes out as fine noise). An 8-bit operation is run
 // on `low`, and on `low` one, two and four steps up, and the result at 16 bits is read off between them by where the
@@ -75,4 +79,8 @@ void deep_restore_alpha_hdr(uint16_t *rgba, size_t stride, const float *alpha, s
 // `deep_take_painted` for an HDR layer's half floats.
 void deep_take_painted_hdr(uint16_t *hdr, size_t hdrStride, const uint8_t *painted, const uint8_t *base, size_t stride,
                            size_t width, size_t height);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

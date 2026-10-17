@@ -3,6 +3,10 @@
 #define NoisePixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Adds noise to the color of premultiplied RGBA pixels (4 bytes per pixel, `stride` bytes per
 // row), leaving alpha untouched and fully transparent pixels alone. `amount` is Photoshop's
 // percentage: uniform noise spans ±amount% of half the range, Gaussian noise has a standard
@@ -13,4 +17,8 @@ void noise_add(uint8_t *rgba, size_t width, size_t height, size_t stride,
 void noise_add_at(uint8_t *rgba, size_t width, size_t height, size_t stride,
                   float amount, int gaussian, int monochromatic, uint32_t seed,
                   int64_t origin_x, int64_t origin_y);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

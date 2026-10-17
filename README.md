@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **154 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **212 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -30,6 +30,29 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   配对手动析构；alloc/free 必须成对，缺 realloc 时 `reallocate` 不再越界读）、
   **`comp_command_list` 改按文档求值 enabled**（与 `comp_command_state`
   共用同一份逻辑，消除两套标准）。
+  2026-10-16 第四轮（工具算子产品通路）：7 组原「孤立内核」接入新 ABI
+  `comp_tool_apply`（Wand/Heal/Patch/Dither/Lens/Brush/Deep），逐算子参数契约见
+  `docs/tool-ops.md`；基线 184 → **204 用例**，6/6 回归全绿。
+  详见 `../report/AUDIT7-compositor-ng-20261016-dsh.md`。
+  2026-10-17 第五轮（16 位通路收口）：`comp_layer_set_pixels` 接受 `COMP_PIXEL_RGBA16`
+  之后，把「16 位资产的 8 位工作副本」补成真实现——`domain/layer.h` 的 `deep_to_rgba8`
+  是唯一生产者（对齐上游 `DeepLayer.dithered`），合成 / 缩略图、裁剪基底取 alpha、
+  8 位像素工具三处消费点全部改走它；此前这三处会按 4 字节/像素读 8 字节/像素的缓冲，
+  不报错但画面是垃圾。同时把 `COMP_PIXEL_RGBA16` 的 ABI 口径从「非预乘」改正为
+  「预乘」（与上游布局一致；该格式此前在任何入口都被拒绝，无宿主可依赖旧措辞）。
+  基线 204 → **207 用例**，6/6 回归全绿。
+  详见 `../report/AUDIT8-compositor-ng-20261017-grok.md`。
+  2026-10-17 第六轮（内核收口 + 完成度对标）：修掉 4 处真实缺陷——**剪贴栈 alpha 语义**
+  （旧实现「先合成基底再按基底 alpha 缩放」，软 alpha 基底 + MULTIPLY 子层得到 `a=0`，
+  改为上游 `LiveMaskRenderer.drawComposite` 的 extract → 不透明基底上混合 → restore，实测
+  `a=128` 与上游一致）、**`ImageBuffer::fill` 未预乘**（直通色写进预乘缓冲，半透明实色得到
+  「比 alpha 还亮」的值）、**`run_tool_op` 成功时不回写 `out_code`**（调用方传初值当标志位会
+  把成功读成失败）、**`engine/imaging/*.h` 全部缺 `extern "C"`**（这正是「未接线核」的根因：
+  C++ 侧 include 后符号被 mangle，只能各自重写一份 C++ 版）；并接线 `wand_trace`、Scanlines、
+  Chunky、deep round trip、16 位通道混合调整、`extract/restore_alpha`。
+  基线 207 → **212 用例**，6/6 回归全绿。
+  同轮产出**双口径完成度对标**：引擎核内 **≈92%**、作为「Photoshop 替代品」的产品口径 **≈45%**
+  （详见 §6.4 与 `../report/AUDIT9-compositor-ng-20261017-pi.md`）。
 
 ## 1. M1 目标与范围
 
@@ -282,11 +305,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
+| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 154 cases, 0 failed, 0 check failures`（当前基线；AUDIT3 起在此基础上继续累加） |
+| 测试 | `summary: 212 cases, 0 failed, 0 check failures`（当前基线；§6.1.10 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：30 `.cpp` / 38 `.c`（含 vendored 26）/ 47 `.h`；tests：16 `.cpp` |
+| 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
@@ -479,7 +502,108 @@ N2/N6 为报告与注释订正。**P1-5 维持撤销，零代码改动。**
    **渲染不变性**由 12 个新用例钉住（合并前后整篇合成逐字节一致）。
 3. **漂移与遗留修复**：README 去掉 `.so` 精确字节数（非契约项，随源码必变）、写明
    `--selftest=` 参数是**报告文件路径**；`comp_command_abi.cpp` 补齐异常护栏（全仓 `COMP_ABI_TRY`
-   计 41 处：command 3 + engine 4 + io 4 + layer 22 + render 5 + undo 3）。
+   与 `COMP_ABI_CATCH` 各 50 处、逐文件配平：command 3 + engine 5 + io 4 + layer 30 + render 5 + undo 3）。
+   > 护栏总数是**快照而非契约**，会随新增异常入口变动；可复核的契约是
+   > 「TRY 与 CATCH 一一配平、每个外部 ABI 函数都有一对」——用
+   > `grep -c COMP_ABI_TRY engine/abi/src/comp_*.cpp` 现场统计即可，不要把数字写进契约。
+
+### 6.1.8 工具算子产品通路基线（2026-10-16，DSH 接手核实 AUDIT7）
+
+Pi 第五轮留下的 Step 5（Tool ops：把 7 组孤立内核接出 ABI 入口）在被 API 403/525
+打断时**代码已落地但未上报**。DSH 接手后逐文件核实并跑通全量回归：
+
+- **实测**：`run_regression.py --require-ohos` → **6/6 PASS**，单测 `204 cases, 0 failed,
+  0 check failures`（AUDIT6 的 184 + Pi 本组 16 + DSH 补 4），OHOS aarch64 交叉编译
+  **72 单元 fail=0** rc=0，Windows 外壳 27 项实机自检 SHA256 与仓内基线一致。
+- **环境辨析（重要）**：先前记录的「进程非零退出」**不是测试失败**——是 `python` 解析到
+  Studio 自带 venv（未装 `ziglang`），使步骤 1/2/3/5 全部报环境错。改用
+  `<local-workspace>\tools\python\python.exe` 后 6/6 全绿、退出码 0。**跑回归必须用该解释器**。
+- **接线核实（查调用点，不是读文档）**：`tool_ops.cpp` 实际调用 `wand_mask`、`spot_heal`
+  （内部派发 `patch_fill` + `heal_membrane`）、`dither_apply`、`lens_distort`、
+  `dither_quantize16`；`run_tool_op` 的参数闸全部位于 `txn_begin` **之前**，与上游
+  `EditorSession.swift:516`「先 guard 再 beginEdit」同序。
+- **本轮发现并修复的三个问题**：
+  ① ABI 头 `comp_tool_dither.levels` 注释写 2..8，而域层闸与 `docs/tool-ops.md` 都是
+  2..16（唯一真源是域层闸）——已改正注释；
+  ② ABI 头把 `deep round trip -> COMP_ERR_UNSUPPORTED` 列为可达错误码，但
+  `comp_tool_op_desc` 刻意不承载 `deep_mode`，该码在 ABI 边界**不可达**——已改成如实
+  说明，避免宿主照不存在的码写重试逻辑；
+  ③ **测试名与断言不符**：`tests/test_tool_ops.cpp` 的
+  `tool_ops_deep_round_trip_is_reported_unsupported` 名字承诺冻结 round trip 的拒绝，
+  但 ABI 无法表达该模式，实际只测到「DEEP 打在 RGBA8 上失败」，且断言写成 `!= COMP_OK`
+  ——任何内部错误都能骗过它。已改名为
+  `tool_ops_deep_quantize_on_rgba8_is_refused_with_state` 并把错误码钉死为
+  `COMP_ERR_STATE`；至于 round trip 那条**ABI 不可达**的契约，另开
+  `tests/test_tool_ops_domain.cpp`（+4 用例）直接调域层 `run_tool_op` 验证：
+  `COMP_ERR_UNSUPPORTED`、不留悬空事务、不进撤销栈、像素逐字节不变；并补
+  `pressure * flow == 0` 笔画逐字节不变与「被拒后紧接一次合法调用仍成功」。
+
+### 6.1.9 16 位通路收口（2026-10-17，Grok）
+
+AUDIT7 §6 的第一条缺口是「Deep 降位路径**当前不可达**：`set_pixels` 仍拒绝
+`COMP_PIXEL_RGBA16`」。复核工作树后发现真实情况比这条记录更糟一档：`set_pixels` 的
+格式闸**已经被放开**（接受 RGBA16），但合成侧、裁剪基底取 alpha、8 位像素工具三处仍按
+「4 字节/像素」解释像素缓冲，`tests/test_abi.cpp` 里那条「16 位必须被拒」的用例因此变成
+红色（**204 用例 1 失败**，与 AUDIT7 记载的 204/0 不符）——也就是说：门开了，房间还没修。
+
+本轮把它做成真通路，口径以上游 `DeepLayers.swift` 为准（：「A layer whose `ImportedImage`
+carries `deep` keeps its pixels at 16 bits a channel; its `image` is a dithered 8-bit copy
+that the canvas, thumbnails and every tool keep using unchanged」）：
+
+- **唯一生产者**：`domain/layer.h` 的 `deep_to_rgba8`（`dither_quantize16` 加约一阶噪声
+  后取整；噪声按 (x,y,通道) 固定，同一输入恒得同一输出）。原先 `tool_ops.cpp` 内自带一份
+  同名实现，已合并——两份实现一旦漂移，同一张 16 位图层「合成出来」与「quantize 出来」
+  就会不同。
+- **三处消费点改走它**：`compositing/resample.cpp` 的 `build_layer_unit`（合成与缩略图
+  的唯一光栅化入口）、`compositing/composite_ops.cpp` 的 `clipping_factor`（按实际字节宽
+  取 alpha，取整口径与内核一致）、`domain/tool_ops.cpp`（8 位工具先把 16 位图层落到那份
+  副本，图层自此是 8 位——上游 :5 同款语义）。
+- **口径纠正**：`COMP_PIXEL_RGBA16` 的 ABI 注释从「非预乘」改为「**预乘**、native-endian」。
+  上游布局是预乘，`dither_quantize16` 也按预乘取值（颜色夹到 alpha 以内）。改动安全：
+  该格式在 HEAD 的任何入口都被拒绝，没有宿主可能依赖旧措辞。
+- **实测**：`run_regression.py --require-ohos` **6/6 PASS**，单测 **207 cases, 0 failed,
+  0 check failures**，OHOS aarch64 交叉编译 **72 单元 fail=0** rc=0。
+- **负向对照（确认护栏不是空的）**：① 把 `build_layer_unit` 的 8 位副本改回直读 →
+  新用例 18 条断言失败；② 只把 `clipping_factor` 改回写死 4 字节 → 恰好 1 条
+  （剪贴子层与 8 位副本逐字节相同那条）失败。两次对照后均已还原。
+- **仍未落地**：引擎自己的解码器还不能**产出** 16 位资产（无 16 位 PNG / EXR 导入，
+  `.comp` 存盘也只写 RGBA8），所以「16 位资产从文件进来」这条路仍缺；本轮打通的是
+  **ABI 供给 16 位像素 -> 合成 -> quantize 落盘**这一条，并且可实测。
+
+### 6.1.10 内核收口 + 双口径完成度对标（2026-10-17，Pi）
+
+本轮两件事：把 AUDIT8 §6 列的可达缺口接线完毕，并对标上游做一个可复核的完成度评估。
+
+**修复的 4 个真实缺陷**（均为接线过程中暴露的既有缺陷，非本轮新增）：
+
+- **剪贴栈 alpha 语义错误（最严重）**：旧实现是「先合成基底、再按基底 alpha 逐像素缩放」，
+  半透明基底 + MULTIPLY 子层两次 source-over 把 alpha 叠没了，得到 `a=0`——非 Normal 混合
+  的语义完全不对。改为上游 `LiveMaskRenderer.drawComposite` 的口径：**extract alpha →
+  把颜色变不透明 → 在不透明基底上按混合模式混 → 按原 alpha restore**，实测 `a=128`
+  且 RGB `0,0,0`，与上游一致。`FilterGraph` 新增 `kClippingStack` 节点（此前图里根本没有
+  剪贴栈节点，只靠 `blend_layer_into` 里的 `clipping_factor` 兼）。
+- **`ImageBuffer::fill` 未预乘**：直通色直接写进预乘缓冲，半透明实色得到 `rgb=(255,0,0)`
+  `alpha=128` 这种「比 alpha 还亮」的值。已按 `(c*a+127)/255` 预乘；`MaskBuffer::fill` 同核。
+- **`run_tool_op` 成功时不回写 `out_code`**：调用方传 `COMP_ERR_INTERNAL` 初值当标志位，
+  成功路径上该值不被覆盖，把成功读成失败。已在每个出口写明并修复。
+- **`engine/imaging/*.h` 10 个头全部缺 `extern "C"`**：**这就是「未接线核」的根因**——
+  这些是上游 C 内核，C++ 侧 include 后符号被 mangle，链接不上，只能各自重写一份 C++ 版。
+  补完后真正的 C 内核可直接调用。`LevelsPixels.h` 还顺带补了缺失的 include guard。
+
+**接线的内核**：`wand_trace` → `SelectionOutline`（只读闭合轮廓，不写像素/蒙版）；
+Scanlines / Chunky 新入口；deep round trip（RGBA16 保持 16 位，low/+1/+2/+4 四档，
+ABI 携带内层 8 位算子）；16 位通道混合调整（与 8 位共用 `build_hsv_cube`，对齐 `DeepLayer.lookup`）；
+`extract_alpha` / `restore_alpha`（剪贴栈）；`blur_rgba8_copy` 抽出复用（扫描线 glow）。
+
+**实测**：`run_regression.py --require-ohos` **6/6 PASS**，单测 **212 cases, 0 failed,
+0 check failures**，OHOS aarch64 交叉编译 **72 单元 fail=0** rc=0，Windows 壳 27 项
+SHA256 `32151220f4748dfa…` 与基线一致。
+
+**完成度对标结论（两个口径，见 §6.4）**：引擎核内 **≈92%**；若分母放大到上游 README 的
+48 条**产品功能条目**（而非引擎核能力），ng 命中约 20 条，产品口径 **≈45%**。
+像素算法层几乎满配（10 组 `.c` 内核中 6 组与上游逐字节等同，另 4 组差异仅注释），
+缺的是**功能面**而非接线——Camera Raw / 选区几何 / Type·Shape·Gradient / Clone·Smudge·Liquify /
+Crop 工具 / 5 种格式导入，grep 全仓零命中，属未开工。详见 `../report/AUDIT9-compositor-ng-20261017-pi.md`。
 
 ### 6.2 尚未验证的部分（证据边界）
 
@@ -526,19 +650,156 @@ N2/N6 为报告与注释订正。**P1-5 维持撤销，零代码改动。**
 以下上游字段在 `.comp` 读写时**原样保真**，但内核暂不参与合成计算，避免跨端往返丢信息：
 
 - `guides`（画布参考线）、live-mask 的启用状态；
-- 文本 / 形状 / 图层效果 / 调整图层的上游语义参数（引擎侧以 `engineAdjustments` / `engineEffects`
-  承载自有参数，上游对象型键不覆盖）；
+- 文本 / 形状的上游语义参数（引擎侧承载自有参数，上游对象型键不覆盖）；
 - `maskSourceID` 仅原样保真，不参与合成。
 
-**图层合并的显式边界（2026-10-15，随合并能力落地）**：
+**图层效果已参与合成（2026-10-16 起，见 `compositing/effect_eval.cpp`）**：
+`comp_layer_set_effect` 写入的 6 个 kind（描边 / 投影 / 颜色叠加 / 内阴影 / 外发光 / 内发光）
+全部有像素实现，在图层的单元缓冲上就地求值，绘制次序对齐上游
+`LayerEffects.swift:388 render(_:mask:effects:)`：
 
-- 被合并图层**携带调整/效果**时，合并返回 `COMP_ERR_UNSUPPORTED`——调整/效果的像素求值属
-  滤镜图里程碑（见 `compositing/compositor.h` 声明），在求值落地前明确拒绝，不悄悄丢参数、
-  不假装烘入；
-- 被合并图层**上方的穿透组不透明度非 100%** 时，合并返回 `COMP_ERR_STATE`——穿透组的不透明度
-  按「每个子层」缩放（`filter_graph.cpp` 的 `child_scale`），两层并一层后无等价单层表示；
-  隔离组不受此限（其不透明度在子树合成后整体应用）。二者叠加时「渲染不变」不成立，
-  因此拒绝而非近似。
+- **绘制次序不可交换**：投影 / 外发光 / outside 描边垫在图层像素**之下**；
+  图层像素；颜色叠加 / 内发光 / 内阴影 / inside 描边压在像素**之上**。
+  叠色类（Color Overlay / 内发光 / 内阴影）走 **source-atop**——只落在已有 alpha 之内
+  且**不改变 alpha**，半透明像素因此完全吃到颜色（这正是上游注释强调的语义）；
+- 效果以图层「呈现出来的形状」（变换与蒙版已烘进单元缓冲）为源，因此效果跟随实际形状；
+- 包围盒按 `effects_margin()` 外扩（outside 描边吃 size、投影吃 distance + blur×3、
+  外发光吃 size×3），否则 outside 类效果会被图层 bounds 裁掉；
+- 效果求值在**混合之前**，因此效果不吃图层的混合模式与不透明度——与上游「先做效果、
+  再当普通图层混合」一致；
+- 参数缺键回落**上游同名字段的默认值**（如 `StrokeEffect.size=4/opacity=1/color=black`）；
+  不可见参数（opacity=0 / size=0 / 距离与模糊同时为 0）逐字节无变化；坏 JSON 与键类型不对
+  回落默认值而非跳过——注意上游默认值全都是**可见**的，早期把「回落默认值」当成
+  「当作无效果跳过」会让实现与上游语义分道扬镳；
+- **引擎不认识的 effect kind**（`kind >= 6`，如未来版本或第三方扩展）既不求值也不绘制：
+  逐字节跳过，但**仍然阻止 flatten / merge_down**——烘入会静默丢弃它，正是 AUDIT5 §7.4
+  记的那类「报成功但丢参数」；
+- 已知差异：上游用 Core Image 的高斯模糊与 GPU 路径，本引擎复用调整求值里同一套三趟
+  滑动窗口盒式近似（同一参数在两条路径上得到同一结果），语义等价但**未与上游逐像素比对**
+  （证据边界见 §6.2）；上游在图层**像素网格**上算效果再整体贴到画布，本引擎在文档坐标上算，
+  免去 inset 与 transform 的往返换算。
+
+**调整图层已参与合成（2026-10-16 起，见 `compositing/adjustment_eval.cpp`）**：
+`comp_layer_add_adjustment` 写入的 12 个 kind 全部有像素实现，并在合成路径的滤镜节点
+位置求值——对齐上游 `EditorCanvas.swift:3092`「调整作用于其下方已合成结果」的语义：
+
+- 调整作用于 **backdrop（下层合成结果）**，不影响其上方图层；
+- coverage = **自身蒙版 × 祖先组蒙版链（最多 64 层）× 图层不透明度**，逐像素相乘，
+  对齐上游 `EditorCanvas.swift:3114-3120` 的 `folders: true` 分支；部分覆盖处按 W3C 源-over
+  混合回原 backdrop（满覆盖保持逐字节写回）；
+- **非 normal 混合模式**已按上游 `EditorCanvas.swift:3096-3106` 处理：满覆盖时先按该模式把
+  调整结果与下层混一次，再按 below 的**原始 alpha** 取回原 coverage（因此软边缘不会被加厚）；
+- opacity < 1 是「半强度调整」，不是「只对部分像素调整」；
+- 隐藏调整图层 ⇒ 渲染结果逐字节回到无调整状态；
+- 参数缺键回落默认（恒等），坏 JSON / 未知 kind 跳过并计入 skipped，不让一条坏参数毁掉整篇合成。
+
+**图层合并的显式边界（2026-10-15，随合并能力落地；2026-10-16 更新）**：
+
+- **携带图层效果（effects）的图层现在允许合并**（2026-10-16）：效果求值落地后整篇合成已包含
+  效果，烘入合成结果即为正确行为，且合并是**渲染不变**的（合并前后逐字节一致，
+  由 `merge_down_bakes_adjustments_and_effects` 钉住）；
+- **携带调整（adjustments）的图层允许合并**（同上）；
+- 仍拒绝的两种情形，都**不改文档状态**：
+  - 被合并图层携带**引擎不认识的 effect kind** ⇒ `COMP_ERR_UNSUPPORTED`（烘入会静默丢弃）；
+  - 被合并图层**上方的穿透组不透明度非 100%** ⇒ `COMP_ERR_STATE`——穿透组的不透明度按
+    「每个子层」缩放（`filter_graph.cpp` 的 `child_scale`），两层并一层后无等价单层表示；
+    隔离组不受此限（其不透明度在子树合成后整体应用）。二者叠加时「渲染不变」不成立，
+    因此拒绝而非近似。
+
+### 6.4 整体完成度评估（2026-10-17，以「与上游 Compositor 同等正常使用」为 100%）
+
+**先说清楚一件事：两个口径，两个数字，不能混用。**
+
+- **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈92%**。
+- **口径 B：分母 = 上游产品功能条目**（上游 README 的 48 条）。回答「能当 Photoshop 用吗」
+  → **≈45%**（命中约 20 条）。
+
+AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Compositor/UI` 9.3k 行 +
+`ContentView`），因此「90% vs 45%」不矛盾。
+
+#### 口径 A：引擎核
+
+把「同等正常使用」拆成**四层**，逐层给权重与实测覆盖率。
+引擎核（`engine/` + ABI + 两壳）已完成，**UI/编辑器层整体不在本仓范围**。
+
+| 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
+|----|------|--------|--------|---------|
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 89 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ② 像素内核**有产品通路**的部分 | 35% | **~91%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）。余 `dither_dots`/`dither_glow`、`deep_split`/`deep_merge`/`deep_take_painted`、`hdr_*`，以及解码器仍不能产出 16 位资产 |
+| ③ 合成与渲染正确性 | 20% | **~96%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
+
+**加权完成度 ≈ 92%**（口径 A）。算术：① 30%×95% + ② 35%×91% + ③ 20%×96%
++ ④ 15%×80% = 28.5 + 31.85 + 19.2 + 12 = **91.55% ≈ 92%**。
+
+**剩下的 8% 里大半是「需要语义决定」而非技术债**：`deep_split` 需先定 32 位浮点深度语义、
+`hdr_*` 需先定线性 HDR 决策。这两项投入前必须先拍板，否则写出来的东西会被推翻。
+
+#### 口径 B：产品功能面
+
+| 上游类（README 48 条 / 7 大类） | ng 命中 |
+|---------|---------|
+| Layers（图层/组/不透明度/全混合模式/图层蒙版/剪贴蒙版/调整层 12 kind/图层效果 6 kind/合并/重排嵌套） | ✓ |
+| Transform（仿射 move·scale·rotate / distort / 精确值） | ✓ |
+| Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样） |
+| Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
+| **Camera Raw**（6 文件 1,708 行） | **零** |
+| **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | **零**（ng 只有 `wand_mask` 选颜色 + `wand_trace` 轮廓查询） |
+| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
+| **Clone Stamp / Smudge / Liquify**（400+ 行） | **零** |
+| **Crop 工具**（`Crop.swift` 249 行） | **零**（只有 canvas resize，非裁剪工具） |
+| **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
+| **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
+
+即 **20/48 命中 ≈ 45%**。缺的约 5,000+ 行 Swift **完全没有对应物**，且这些**不属于「接线」
+范畴，属新增功能**——不是把孤立内核接出去能解决的。
+
+#### 口径 A 与 B 不一致的原因与推进顺序
+
+两者差异集中在 ①~④ 盖不到的地方：口径 A 问的是「引擎核的契约面与像素保真度做完了吗」，
+答案是基本做完（≈92%）；口径 B 问的是「用户能做的事做完了吗」，答案是还差一半。
+**像素算法层几乎满配**：上游 10 组 `.c` 内核逐文件 diff，**6 组 diff 行数为 0**
+（Brush/Heal/Lens/Levels/Noise/Wand 逐字节等同），另 4 组差异仅注释。
+
+**功能面推进顺序建议**（边际成本从低到高）：
+选区几何（1,000+ 行，但它是几乎所有下游编辑的入口）→ Crop 工具（249 行，解锁导出打印尺寸）
+→ Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用）
+→ Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能）
+→ 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
+
+### 6.5 工具算子（Tool ops）已接入产品通路（2026-10-16 起）
+
+`comp_tool_apply` 是 7 组原「孤立内核」的统一产品入口，参数契约见
+[`docs/tool-ops.md`](docs/tool-ops.md)。要点：
+
+- **坐标空间显式转换**：ABI 收**文档像素坐标**（种子、笔迹折点），内核要**图层像素坐标**，
+  引擎用 `effective_bounds()` 的原点做平移，与合成路径同一套口径；种子落在图层外一律
+  `COMP_ERR_INVALID_ARGUMENT`，不做静默夹取。
+- **一步撤销 + 闸在事务之前**：非法参数不留半成品、不进撤销栈（`comp_document_can_undo`
+  不变），全部参数校验先于 `txn_begin`。
+- **不改几何**：工具算子不写 `transform`/`blend`/`opacity`，因此 `merge_down`/`flatten`
+  的逐字节不变性契约不受影响。
+- **可重复性**：`seed` 固定 + 笔画「不叠加」（同像素被同一笔压两次仍是同一结果），
+  使「同参数两次调用逐字节相同」成立，并有「撤销后重做 = 逐字节相等」的护栏。
+- **空选中不写蒙版**：魔棒选中数为 0 时不留下全 0 蒙版（否则整层被蒙成透明），
+  对齐上游「无选中即不改变」；写入既有蒙版是逐像素**取最大值**（加选）。
+- **note 两段式**：`note_capacity = 0` 时只回报所需长度（含 `\0`）；终止符落在
+  `note[min(capacity-1, size)]`，**永不写出调用方缓冲**（护栏含首字节与 capacity 后一字节断言）。
+- **明示边界而非静默回落**：字形图集不由 ABI 灌入，`GLYPHS` 回落菱形网点**并在 note 里
+  如实回报**；deep round trip **§6.1.10 起已实现**（RGBA16 保持 16 位，low/+1/+2/+4 四档），
+  在 8 位图层上则显式拒绝（`COMP_ERR_STATE`）而不是伪造一组像素。
+
+### 6.6 内核接线现状（2026-10-17 更新）
+
+| 内核 | 产品通路 | 已接线 | 仍未接线 |
+|------|---------|--------|----------|
+| Wand | `COMP_TOOL_SELECT` | `wand_mask`、`wand_trace`（只读闭合轮廓） | — |
+| Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发） | `heal_coverage_bounds` |
+| Patch | `COMP_TOOL_HEAL` | `patch_fill` | — |
+| Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky` | `dither_dots` / `dither_glow` |
+| Lens | `COMP_TOOL_LENS` | `lens_distort` | — |
+| Brush | `COMP_TOOL_STROKE` | 解析式圆头笔（噪声未采样，`seed` 契约保留但不参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_split`/`deep_merge`（需 32 位浮点深度语义决定）、`deep_take_painted`、`hdr_*`（需线性 HDR 决策） |
 
 ## 7. 许可
 

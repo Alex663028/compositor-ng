@@ -57,14 +57,35 @@ double clipping_factor(const Document& doc, const Layer& layer, int32_t x, int32
  * 把图层的像素（含 bounds / 翻转 / 蒙版 / 剪贴）叠加到 dst。
  * opacity_scale 为上层穿透组累积的不透明度系数（顶层调用传 1.0）。
  * 图层组自身不产生像素，直接返回 true——组的聚合由 FilterGraph 负责。
+ *
+ * error 可为 nullptr；非 nullptr 时写入失败的内因（如 "layer unit too large"）。
+ * 此前本函数失败时只返回 false，调用点（filter_graph.cpp）只能写一句笼统的
+ * "blend layer failed"，真实原因在 build_layer_unit 里产生后就被丢掉，
+ * 宿主 comp_engine_last_error 因此永远看不到达因（与 P0-2 同一类诊断缺陷）。
  */
-bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer, double opacity_scale);
+bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
+                      double opacity_scale, std::string* error);
 
 /*
  * 把一个与画布同尺寸的缓冲整体叠加到 dst：用于「隔离组」把子树结果作为
  * 一个单元参与混合。src 与 dst 尺寸必须一致，mode/opacity 取组的混合模式与不透明度。
  */
 bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode mode, double opacity);
+
+/*
+ * 剪贴栈的 alpha 拆合（上游 LiveMaskRenderer.drawComposite:110-150 的口径）：
+ *   extract → 把基底 alpha 存进 coverage、颜色拉成不透明；
+ *   restore → 把 coverage 放回。
+ * 与 `clipping_factor` 的差别是**语义**不是精度：剪贴栈里子层是在基底**里面**
+ * 着色，而 clipping_factor 是把子层按基底 alpha 逐像素缩放（等于两次半透明的
+ * source-over，叠出来 alpha 归 0）。两者在 Normal 下碰巧一致，非 Normal 必须走栈。
+ *
+ * coverage 统一用 16 位容器：8 位表面会在 extract 时拓宽（*257）、restore 时收窄
+ * （/257），量纲都是 0..1，调用方因此不必为两种底色各写一份。
+ */
+bool extract_stack_alpha(ImageBuffer* surface, std::vector<uint16_t>* coverage16, std::string* error);
+bool restore_stack_alpha(ImageBuffer* surface, const std::vector<uint16_t>& coverage16,
+                         std::string* error);
 
 }  // namespace compositor
 

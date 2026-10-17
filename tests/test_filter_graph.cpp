@@ -252,3 +252,103 @@ COMP_TEST(filter_graph_rejects_orphan_layer) {
   ImageBuffer out;
   COMP_CHECK(!composite_document(document, &out, &error));
 }
+
+/*
+ * 剪贴栈的 alpha 语义（对齐上游 LiveMaskRenderer.drawComposite:110-150）。
+ *
+ * 本轮实测到的缺陷：软 alpha 基底（a=128）+ MULTIPLY 子层，旧的「按基底 alpha
+ * 逐像素缩放」实现得到 a=0——两次半透明 source-over 把 alpha 叠没了，而且
+ * 非 Normal 的混合语义完全不对。上游口径（extract → 不透明基底上混合 → restore）
+ * 应得 a=128，RGB 为 multiply(红, 绿) = 黑。
+ *
+ * 这条断言盯的是**语义**不是数值巧合：alpha 必须原样取回，而不是被叠乘。
+ */
+COMP_TEST(clipping_stack_keeps_base_alpha_and_blends_in_normal_mode) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  comp_layer_desc base_desc{};
+  base_desc.name = "base";
+  base_desc.transform = comp_rect{0, 0, 4, 4};
+  base_desc.opacity = 1.0f;
+  comp_layer_id base = 0;
+  COMP_CHECK(document.create_layer(base_desc, &base));
+  /* 预乘红，alpha=128（straight 255 预乘后为 128）。 */
+  document.find(base)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 128, 0, 0, 128);
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "multiply";
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  child_desc.opacity = 1.0f;
+  child_desc.blend = COMP_BLEND_MULTIPLY;
+  comp_layer_id child = 0;
+  COMP_CHECK(document.create_layer(child_desc, &child));
+  document.find(child)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 0, 255, 0, 255);
+  document.find(child)->clipping_source = base;
+  COMP_CHECK(document.find(child)->clipping_source == base);
+
+  ImageBuffer out;
+  std::string error;
+  COMP_CHECK_MSG(composite_document(document, &out, &error), "composite: " + error);
+  const uint8_t* px = out.pixel_data().data();
+  COMP_CHECK_MSG(px[3] == 128, "the stack restores the base alpha verbatim, not zero");
+  COMP_CHECK_MSG(px[0] == 0 && px[1] == 0 && px[2] == 0,
+                 "multiply happens inside the base, so red x green is black");
+}
+
+/*
+ * Normal 模式下两种口径应当一致（不透明基底上 source-over 再乘回 alpha ≈ 缩放），
+ * 但**走的是同一条代码路径**：这里钉住「隐藏一个剪贴成员不改变基底 alpha」，
+ * 因为那正是成员被错误并入/排除出栈时最先暴露的破绽。
+ */
+COMP_TEST(clipping_stack_hidden_member_leaves_base_untouched) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  comp_layer_desc base_desc{};
+  base_desc.name = "base";
+  base_desc.transform = comp_rect{0, 0, 4, 4};
+  base_desc.opacity = 1.0f;
+  comp_layer_id base = 0;
+  COMP_CHECK(document.create_layer(base_desc, &base));
+  document.find(base)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 128, 0, 0, 128);
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "normal";
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  child_desc.opacity = 1.0f;
+  comp_layer_id child = 0;
+  COMP_CHECK(document.create_layer(child_desc, &child));
+  document.find(child)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 0, 0, 255, 255);
+  document.find(child)->clipping_source = base;
+
+  ImageBuffer with_child;
+  std::string error;
+  COMP_CHECK(composite_document(document, &with_child, &error));
+
+  document.find(child)->visible = false;
+  ImageBuffer hidden_child;
+  COMP_CHECK_MSG(composite_document(document, &hidden_child, &error), "composite: " + error);
+
+  const uint8_t* shown = with_child.pixel_data().data();
+  const uint8_t* hidden = hidden_child.pixel_data().data();
+  COMP_CHECK_MSG(hidden[3] == 128,
+                 "hiding the clipped member leaves the base alpha alone");
+  COMP_CHECK_MSG(shown[3] == hidden[3], "a hidden member does not change the stack coverage");
+  /* 蓝成员在可见时会把基底染蓝，隐藏后应回到纯底色。 */
+  COMP_CHECK_MSG(shown[2] != hidden[2], "the visible member really contributes colour");
+}
+
+/*
+ * 半透明实色必须存成**预乘**像素：直通色直接写进预乘缓冲会得到
+ * rgb=(255,0,0) alpha=128 这种「比 alpha 还亮」的值，一过剪贴栈的
+ * extract/restore 就会整体偏亮。fill/solid 因此要预乘。
+ */
+COMP_TEST(solid_fill_premultiplies_straight_colour) {
+  ImageBuffer buffer = ImageBuffer::solid(2, 2, COMP_PIXEL_RGBA8, 255, 0, 0, 255);
+  buffer.fill(255, 0, 0, 128);
+  const uint8_t* px = buffer.pixel_data().data();
+  COMP_CHECK_MSG(px[0] == 128 && px[3] == 128,
+                 "a half-transparent red must be stored premultiplied, not straight");
+  COMP_CHECK_MSG(px[1] == 0 && px[2] == 0, "green and blue stay zero");
+}

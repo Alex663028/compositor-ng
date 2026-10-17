@@ -1,6 +1,19 @@
 // AI生成
+#ifndef LevelsPixels_h
+#define LevelsPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void levels_apply(uint8_t *pixels, size_t count, const float *tables);
 void levels_histogram(const uint8_t *pixels, const uint8_t *coverage, size_t count, double *bins);
 void cube_apply(uint8_t *pixels, size_t count, const float *cube, int dimension);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
+
+#endif /* LevelsPixels_h */

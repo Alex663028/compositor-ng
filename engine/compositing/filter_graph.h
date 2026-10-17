@@ -21,6 +21,9 @@
  *     不参与求值。
  *   - 隔离组（isolated == true）：子树先合成到一张透明缓冲，作为一个整体再与
  *     backdrop 混合——此时组的混合模式与不透明度作用在「组结果」这一个单元上。
+ *   - 剪贴栈（kClippingStack）：基底与被剪子层合成一个单元，该单元以**基底的
+ *     混合模式与不透明度**参与，与上游 LiveMaskRenderer.drawComposite 同口径
+ *     （含 alpha 取回：见 composite_ops.cpp 的 composite_clipping_stack）。
  */
 #ifndef COMPOSITOR_COMPOSITING_FILTER_GRAPH_H
 #define COMPOSITOR_COMPOSITING_FILTER_GRAPH_H
@@ -35,10 +38,15 @@
 
 namespace compositor {
 
-/* 图节点类别：像素源（叶子图层）与图层组（子树聚合）。 */
+/* 图节点类别：像素源（叶子图层）、图层组（子树聚合）与剪贴栈。 */
 enum class FilterNodeKind {
   kSource = 0, /* 普通像素图层 */
   kGroup = 1,  /* 图层组 */
+  /*
+   * 剪贴栈：基底（inputs[0]）+ 一串被它剪贴的子层（inputs[1..]，自下而上）。
+   * 求值时按上游 LiveMaskRenderer.drawComposite 的 extract/restore 口径整体求值。
+   */
+  kClippingStack = 2,
 };
 
 struct FilterNode {
@@ -46,7 +54,7 @@ struct FilterNode {
   FilterNodeKind kind = FilterNodeKind::kSource;
   bool isolated = false;             /* 仅图层组：true=隔离，false=穿透 */
   int32_t parent = -1;               /* 父节点索引；文档根为 -1 */
-  std::vector<int32_t> inputs;       /* 子节点索引（自下而上的绘制序） */
+  std::vector<int32_t> inputs;       /* 子节点索引（自下而上的绘制序）；剪贴栈：基底在前 */
   int32_t backdrop = -1;             /* 绘制下层结果所在节点索引；-1=透明画布 */
 };
 

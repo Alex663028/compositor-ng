@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "compositing/compositor.h"
+#include "compositing/effect_eval.h"
 #include "compositing/resample.h"
 #include "domain/history.h"
 #include "domain/layer_merge.h"
@@ -244,19 +245,56 @@ bool Document::reorder_layer(comp_layer_id id, comp_layer_id before) {
 
 namespace {
 
-/* 合并前校验：携带调整/效果的图层在像素求值落地前不参与合并（明确拒绝，
- * 不悄悄丢参数、不假装烘入——与 compositor.h 声明的能力边界一致）。 */
+/* 合并前校验：携带「尚无像素求值」的图层在烘入前不参与合并（明确拒绝，
+ * 不悄悄丢参数、不假装烘入——与 compositor.h 声明的能力边界一致）。
+ *
+ * 2026-10-16 变更：**调整（adjustments）不再阻止合并**。
+ * 调整图层此前只入库不求值，因此当时按「无法烘入」拒绝；调整求值落地后
+ * （compositing/adjustment_eval.cpp + filter_graph 的滤镜节点），
+ * 整篇合成已经包含调整的效果，拼合/合并直接走合成结果就是正确的烘入，
+ * 无需拒绝。
+ *
+ * 同日再变更：**效果（effects）也不再阻止合并**。效果求值落地后
+ * （compositing/effect_eval.cpp），投影/发光/描边/叠色等已包含在合成结果中。
+ * flatten 与 merge_down 都经由 composite_document 取结果（document.cpp:641、
+ * layer_merge.cpp:54），因此效果此时确实被烘入，而不是被丢弃。
+ *
+ * 仅剩一种拒绝：**引擎不认识的 effect 值**。这类效果既不求值也不绘制，
+ * 烘入会静默丢弃，正是 AUDIT5 §7.4 记的那类「报成功但丢参数」，必须拒绝。
+ *
+ * 本函数现在**只有一个拒绝条件**，保留下来因为调用点需要区分它与其它失败
+ * （祖先穿透组不透明度不为 1 等，属 COMP_ERR_STATE）。ABI 层靠错误文案里是否含
+ * `kUnevaluatedEffectMarker` 来区分（见 comp_layer_abi.cpp），因此该字面量在两边
+ * 必须一致——它定义在 effect_eval.h，与本文件共用一处，避免文案改动后两边悄悄
+ * 脱节（早期版本就是各写一个 "effects" 子串匹配，文案一改就错报错误码）。
+ *
+ * merge_subset_is_bakeable 保留为显式断言点：将来若引入无法烘入的特性（例如
+ * GPU 独占资源、引用外部文件的链接层），这里是唯一的拦截位置。
+ */
 bool merge_subset_is_bakeable(const Document& doc,
                               const std::vector<comp_layer_id>& subset,
                               std::string* error) {
   for (comp_layer_id id : subset) {
     const Layer* layer = doc.find(id);
     if (layer == nullptr || layer->is_group) continue; /* 组本身不携带调整/效果 */
-    if (layer->adjustments.empty() && layer->effects.empty()) continue;
+    if (layer->effects.empty()) continue;
     if (error != nullptr) {
-      *error = "layer '" + layer->name +
-               "' carries adjustments/effects; baking them requires the filter graph "
-               "(documented boundary), merge refused";
+      /*
+       * 唯一的保留拒绝点：**引擎不认识的 effect 值**（engineEffects 里出现
+       * 未来版本或第三方新增的 kind）。这类效果本引擎既不求值也不绘制，
+       * 烘入合成结果会把它们静默丢弃——正是 AUDIT5 §7.4 记的那类「报成功但丢参数」。
+       * 引擎已知的 6 种（effect_kind_is_evaluated）此时已由合成结果包含，放行。
+       */
+      bool all_known = true;
+      for (const Effect& effect : layer->effects) {
+        if (!effect_kind_is_evaluated(effect.effect)) {
+          all_known = false;
+          break;
+        }
+      }
+      if (all_known) continue;
+      *error = "layer '" + layer->name + "' carries an " + kUnevaluatedEffectMarker +
+               "; baking it would silently drop it, merge refused";
     }
     return false;
   }

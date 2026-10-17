@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -367,4 +368,118 @@ COMP_TEST(resample_sampling_rejects_invalid) {
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);
+}
+
+/* =====================================================================
+ * AUDIT4 §2：transform 边界口径三处不一致 + 写入侧无闸。
+ *
+ * 三道护栏分别钉住三个独立事实，任何一道被推翻都算回归：
+ *   (1) 写入侧拒绝越界 transform（不再让死文档入库）；
+ *   (2) 拒绝非有限 rotation（上游 isValid 的 allSatisfy(isFinite)）；
+ *   (3) 越过 30000 的**合法** transform 仍必须可渲染 —— 这一条是本轮真正的
+ *       修复点：引擎改为只光栅化「可见窗口」，拉出画布的巨图层不再需要整幅
+ *       中间缓冲，因此 10001/30000/200000 全部正常合成。
+ * ===================================================================== */
+
+/* (1)+(2) 写入侧闸：越界与非有限值一律 COMP_ERR_INVALID_ARGUMENT，
+ * 且不留半写状态（rejected transform 不得改变图层几何）。 */
+COMP_TEST(resample_abi_rejects_out_of_range_transform) {
+  comp_engine_desc engine_desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&engine_desc, &engine) == COMP_OK);
+  comp_document document = make_document(engine, 8, 8);
+  const comp_layer_id layer = background_layer(document);
+  COMP_CHECK(comp_layer_set_transform(document, layer, comp_rect{0, 0, 8, 8}, 0.0f) == COMP_OK);
+
+  const comp_rect too_wide{0, 0, 300001, 8};
+  const comp_rect too_tall{0, 0, 8, 300001};
+  const comp_rect origin_too_far{1000001, 0, 8, 8};
+  const comp_rect origin_too_low{0, -1000001, 8, 8};
+
+  COMP_CHECK_MSG(comp_layer_set_transform(document, layer, too_wide, 0.0f) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "transform wider than the upstream 300000 bound is rejected");
+  COMP_CHECK(comp_layer_set_transform(document, layer, too_tall, 0.0f) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_set_transform(document, layer, origin_too_far, 0.0f) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_set_transform(document, layer, origin_too_low, 0.0f) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  /* 非有限 rotation：上游 isValid 要求五个分量 allSatisfy(isFinite)。
+   * 实测修复前 inf 会让图层静默渲成全透明且返回 COMP_OK。 */
+  const float nan_value = std::numeric_limits<float>::quiet_NaN();
+  const float inf_value = std::numeric_limits<float>::infinity();
+  COMP_CHECK_MSG(comp_layer_set_transform(document, layer, comp_rect{0, 0, 8, 8}, nan_value) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "NaN rotation is rejected");
+  COMP_CHECK(comp_layer_set_transform(document, layer, comp_rect{0, 0, 8, 8}, inf_value) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  /* 上界恰好合法时必须放行（不得把 300000 本身也拒掉）。 */
+  COMP_CHECK_MSG(comp_layer_set_transform(document, layer,
+                                          comp_rect{0, 0, 300000, 300000}, 0.0f) == COMP_OK,
+                 "the upper bound itself stays legal");
+  COMP_CHECK(comp_layer_set_transform(document, layer,
+                                      comp_rect{1000000, -1000000, 8, 8}, 0.0f) == COMP_OK);
+
+  /* comp_layer_add 同一把尺子：不让非法 transform 从创建路径入库。 */
+  comp_layer_desc desc{};
+  desc.blend = COMP_BLEND_NORMAL;
+  desc.opacity = 1.0f;
+  desc.transform = comp_rect{0, 0, 300001, 8};
+  comp_layer_id added = 0;
+  COMP_CHECK_MSG(comp_layer_add(document, &desc, &added) == COMP_ERR_INVALID_ARGUMENT,
+                 "comp_layer_add rejects an out-of-range transform too");
+  COMP_CHECK(added == 0);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* (3) 可见窗口光栅化：越出 30000 尺寸闸的 transform 仍必须可渲染。
+ * 修复前这三种尺寸一律 build_layer_unit 失败 → flatten 返回 COMP_ERR_UNSUPPORTED
+ * 且 last_error 只有笼统的 "blend layer failed"。 */
+COMP_TEST(resample_oversized_transform_still_composites) {
+  comp_engine_desc engine_desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&engine_desc, &engine) == COMP_OK);
+  comp_document document = make_document(engine, 16, 16);
+  const comp_layer_id layer = background_layer(document);
+
+  std::vector<Rgba> pixels(16 * 16, kRed);
+  RawImage image(16, 16, pixels);
+  COMP_CHECK(comp_layer_set_pixels(document, layer, &image.image) == COMP_OK);
+
+  const int32_t kSizes[] = {10001, 30000, 200000};
+  for (const int32_t size : kSizes) {
+    COMP_CHECK_MSG(comp_layer_set_transform(document, layer, comp_rect{0, 0, size, size}, 0.0f) ==
+                       COMP_OK,
+                   "a stretched layer is still a legal transform");
+    std::vector<uint8_t> canvas(static_cast<size_t>(16) * 16u * 4u, 0);
+    const comp_result result = comp_render_flatten(document, canvas.data(), COMP_PIXEL_RGBA8,
+                                                   static_cast<size_t>(16) * 4u);
+    COMP_CHECK_MSG(result == COMP_OK,
+                   "an oversized transform must still composite (visible-window rasterization)");
+    /* 画布内仍是实心红：窗口外不参与光栅化不改变画布内的采样结果。 */
+    COMP_CHECK_MSG(matches(canvas, 16, 8, 8, kRed, 2),
+                   "the visible window keeps the on-canvas pixels unchanged");
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* 诊断达因：失败必须给出内因，而不是笼统的 "blend layer failed"。
+ * 直接构造越界图层（绕过 ABI 写入侧闸）来触达 build_layer_unit 的尺寸闸。 */
+COMP_TEST(resample_blend_failure_reports_the_cause) {
+  ImageBuffer unit;
+  Layer oversized;
+  oversized.pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 255, 0, 0, 255);
+  oversized.transform = comp_rect{0, 0, 30001, 30001};
+  std::string error;
+  COMP_CHECK_MSG(!build_layer_unit(oversized, SamplingMode::kHighQuality, &unit, nullptr, &error),
+                 "an oversized unit still fails when rasterized whole");
+  COMP_CHECK_MSG(error == "layer unit too large",
+                 "the size guard names its cause instead of failing anonymously");
 }

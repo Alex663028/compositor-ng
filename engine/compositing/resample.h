@@ -40,10 +40,17 @@ comp_sampling sampling_to_abi(SamplingMode mode);
  *   - out 尺寸 = bounds.w × bounds.h，COMP_PIXEL_RGBA8 预乘；
  *   - 已烘焙翻转、旋转、缩放与蒙版（蒙版按最近采样乘入 alpha 与颜色）；
  *   - 源外区域保持全透明。
- * out_bounds 返回目标矩形（layer.effective_bounds()）。失败写 error 并返回 false。
+ *
+ * clip 可为 nullptr（光栅化完整 bounds）。传入非空值时只光栅化 bounds ∩ clip
+ * 这一块，out_bounds 一并改报该窗口；合成路径传 clamp_to_canvas 后的可见矩形，
+ * 使中间缓冲以可见区域为界（上游 TiledLayerRenderer 同思路：从不为一层实体化
+ * 整幅光栅）。裁剪不改变任何像素值——逆映射分母始终用完整 bounds，见实现注释。
+ *
+ * out_bounds 返回目标矩形。失败写 error 并返回 false。
  */
 bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
-                      comp_rect* out_bounds, std::string* error);
+                      comp_rect* out_bounds, std::string* error,
+                      const comp_rect* clip = nullptr);
 
 /*
  * 把普通 RGBA8 预乘缓冲（单位几何：无旋转/翻转/掩版，像素即内容）重采样到

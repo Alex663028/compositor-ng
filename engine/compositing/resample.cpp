@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "core/comp_geometry.h"
+
 namespace compositor {
 
 namespace {
@@ -138,7 +140,7 @@ comp_sampling sampling_to_abi(SamplingMode mode) {
 }
 
 bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
-                      comp_rect* out_bounds, std::string* error) {
+                      comp_rect* out_bounds, std::string* error, const comp_rect* clip) {
   if (out == nullptr) {
     if (error != nullptr) *error = "out buffer is null";
     return false;
@@ -151,11 +153,59 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
     return true;
   }
 
+  /*
+   * 16 位图层按它的 8 位工作副本光栅化：上游同一处（DeepLayers.swift:4）
+   * 「its `image` is a dithered 8-bit copy that the canvas, thumbnails and every
+   * tool keep using unchanged」。少了这一步，采样内核会按 4 字节/像素读
+   * 8 字节/像素的缓冲——不报错，画面是垃圾（AUDIT3 P2-13 的原观察）。
+   */
+  ImageBuffer rgba8_view;
+  const ImageBuffer* pixels = &layer.pixels;
+  if (layer.pixels.format != COMP_PIXEL_RGBA8) {
+    if (!deep_to_rgba8(layer.pixels, &rgba8_view)) {
+      if (error != nullptr) *error = "unsupported layer pixel format";
+      return false;
+    }
+    pixels = &rgba8_view;
+  }
+
+  /*
+   * 光栅窗口：默认整幅 bounds；传入 clip（合成路径给的是 clamp_to_canvas 后的
+   * 可见矩形）时光栅化 **只覆盖裁剪后那一块**。
+   *
+   * 为什么必须裁剪：上游从不为一层实体化整幅光栅，而是按可见矩形分块绘制
+   * （TiledLayerRenderer 分块 + LayerRenderer.reduced 缩到设备尺寸）。本引擎若
+   * 整幅光栅，一个 transform 拉大到 200000×200000 的图层就会要 160 GB 中间缓冲，
+   * 只能在 build_layer_unit 被尺寸闸拦下——于是「拉大图层」这个正常操作直接变成
+   * 「整篇不可渲染」（AUDIT4 §2）。裁剪后中间缓冲以可见矩形为界，与上游同思路。
+   *
+   * 不变量：逆映射的分母始终用完整 bounds，窗口内每个像素算出的源坐标与
+   * 「不裁剪时同一坐标处的像素」完全一致——因此裁剪只改变算多少像素，不改变
+   * 任何像素值，恒等/缩放/旋转三条路径的逐字节不变性不受影响。
+   */
+  comp_rect window = bounds;
+  if (clip != nullptr) {
+    window = intersection(bounds, *clip);
+    if (is_empty(window)) {
+      out->resize(0, 0, COMP_PIXEL_RGBA8);
+      return true;
+    }
+  }
+  if (out_bounds != nullptr) *out_bounds = window;
+
   const int32_t sw = layer.pixels.width;
   const int32_t sh = layer.pixels.height;
-  const int32_t ow = bounds.w;
-  const int32_t oh = bounds.h;
-  if (ow > 30000 || oh > 30000 || static_cast<int64_t>(ow) * oh > 100000000LL) {
+  const int32_t ow = window.w;
+  const int32_t oh = window.h;
+  /*
+   * 边界读单一真源（compositor::limits），不再本文件另写 30000 / 1e8。
+   * 加闸后合成路径的窗口以画布为界（≤ 30000×30000 且交于本画布），
+   * 这道闸实际拦的是「不传 clip 的整幅光栅」路径与不可信 manifest；
+   * 它必须保留：绕过 ABI 直接构造的 Document 同样不受写入侧保护。
+   * 内因写进 error —— 上游调用方据此报 ProjectError.tooLarge。
+   */
+  if (ow > compositor::limits::kMaxSide || oh > compositor::limits::kMaxSide ||
+      static_cast<int64_t>(ow) * oh > compositor::limits::kMaxSurfacePixels) {
     if (error != nullptr) *error = "layer unit too large";
     return false;
   }
@@ -173,9 +223,12 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
 
   for (int32_t y = 0; y < oh; ++y) {
     uint8_t* dst_row = out->writable_row(y);
-    const double vd = (static_cast<double>(y) + 0.5) / oh * 2.0 - 1.0;
+    /* 归一化分母用完整 bounds（见上方不变量），窗口偏移只平移起点。 */
+    const double doc_y = static_cast<double>(y + window.y - bounds.y);
+    const double vd = (doc_y + 0.5) / bounds.h * 2.0 - 1.0;
     for (int32_t x = 0; x < ow; ++x) {
-      const double ud = (static_cast<double>(x) + 0.5) / ow * 2.0 - 1.0;
+      const double doc_x = static_cast<double>(x + window.x - bounds.x);
+      const double ud = (doc_x + 0.5) / bounds.w * 2.0 - 1.0;
       /* 逆旋转：顺时针 θ 的正向为 (u,v)->(u cosθ - v sinθ, u sinθ + v cosθ)。 */
       double us = rotate ? (ud * cos_t + vd * sin_t) : ud;
       double vs = rotate ? (-ud * sin_t + vd * cos_t) : vd;
@@ -188,10 +241,10 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
       if (!inside(sx, sy, sw, sh)) continue; /* 源外 -> 保持透明 */
 
       switch (mode) {
-        case SamplingMode::kNearest: sample_nearest(layer.pixels, sx, sy, dst_px); break;
-        case SamplingMode::kSmooth: sample_bilinear(layer.pixels, sx, sy, dst_px); break;
+        case SamplingMode::kNearest: sample_nearest(*pixels, sx, sy, dst_px); break;
+        case SamplingMode::kSmooth: sample_bilinear(*pixels, sx, sy, dst_px); break;
         case SamplingMode::kHighQuality:
-        default: sample_bicubic(layer.pixels, sx, sy, dst_px); break;
+        default: sample_bicubic(*pixels, sx, sy, dst_px); break;
       }
 
       if (has_mask) {

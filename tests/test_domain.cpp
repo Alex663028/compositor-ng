@@ -43,9 +43,20 @@ COMP_TEST(image_buffer_layout) {
   buffer.clear_transparent();
   COMP_CHECK(buffer.row(0)[0] == 0 && buffer.row(0)[3] == 0);
 
+  /*
+   * fill 的入参是**直通色**，缓冲是**预乘**的：半透明必须预乘。
+   * (10*40+127)/255=2、(20*40+127)/255=3、(30*40+127)/255=5。
+   * 不预乘会得到 rgb=(10,20,30) alpha=40 的「比 alpha 还亮」的预乘像素，
+   * 剪贴栈的 extract/restore 与非 normal 混合都会因此偏亮。
+   */
   buffer.fill(10, 20, 30, 40);
+  COMP_CHECK(buffer.row(1)[0] == 2 && buffer.row(1)[1] == 3);
+  COMP_CHECK(buffer.row(1)[2] == 5 && buffer.row(1)[3] == 40);
+
+  /* 不透明像素不受影响（预乘系数为 255）。 */
+  buffer.fill(10, 20, 30, 255);
   COMP_CHECK(buffer.row(1)[0] == 10 && buffer.row(1)[1] == 20);
-  COMP_CHECK(buffer.row(1)[2] == 30 && buffer.row(1)[3] == 40);
+  COMP_CHECK(buffer.row(1)[2] == 30 && buffer.row(1)[3] == 255);
 
   buffer.resize(0, 0, COMP_PIXEL_RGBA8);
   COMP_CHECK(buffer.empty());

@@ -28,10 +28,15 @@ namespace {
 constexpr uint32_t kManifestVersion = 13;
 constexpr const char* kFormatId = "com.compositor.project";
 constexpr const char* kColorSpace = "sRGB";
-constexpr int64_t kMaxTransformSize = 300000;   /* 上游 LayerTransform.isValid */
-constexpr int64_t kMaxTransformOrigin = 1000000;
 constexpr int64_t kMaxLayers = 10000;
 constexpr int64_t kMaxManifestBytes = 4 * 1024 * 1024;
+
+/* transform 边界不再在此各写一份：改读 compositor::limits 单一真源
+ * （engine/core/comp_geometry.h），与 ABI 写入侧的 is_valid_transform 同源。
+ * 此前本文件的两份常量与 resample.cpp 的 30000/1e8 互不相识，是 AUDIT4 §2
+ * 那条「三处口径不一致」的根源。 */
+constexpr int64_t kMaxTransformSize = compositor::limits::kMaxTransformSize;
+constexpr int64_t kMaxTransformOrigin = compositor::limits::kMaxTransformOrigin;
 
 /* ------------------------------------------------------------ 文件助手 */
 

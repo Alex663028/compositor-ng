@@ -3,6 +3,10 @@
 #define AdjustPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Gradient Map on premultiplied RGBA pixels (4 bytes per pixel, `stride` bytes per row): each pixel's
 // luminance picks a color from `table` (256 × 3 straight sRGB bytes, darkest first). Alpha is kept and
 // fully transparent pixels are left alone.
@@ -118,4 +122,8 @@ void adjust_camera_raw_calibration(uint8_t *rgba, size_t width, size_t height, s
                                    double shadowTint, double redHue, double redSaturation,
                                    double greenHue, double greenSaturation, double blueHue, double blueSaturation,
                                    int processVersion);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

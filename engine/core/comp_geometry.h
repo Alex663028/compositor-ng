@@ -10,6 +10,7 @@
 #define COMPOSITOR_CORE_COMP_GEOMETRY_H
 
 #include <algorithm>
+#include <cmath>
 
 #include "compositor/comp_core.h"
 
@@ -52,13 +53,71 @@ inline int64_t pixel_count(comp_size s) {
   return static_cast<int64_t>(s.width) * static_cast<int64_t>(s.height);
 }
 
+/* ------------------------------------------------------------ 文档尺寸上限
+ *
+ * 单一真源：引擎内所有「多大多小算合法」的判据都读这里的常量。此前
+ * 30000 / 1e8 三处各写一份（is_valid_canvas、resample.cpp 的 build_layer_unit、
+ * comp_file.cpp 的写侧钳制），任何一处漏改就变成「写进去能存、读出来渲不了」
+ * 的契约漂移（见 AUDIT4 §2）。
+ *
+ * 取值对齐上游 Compositor/Document/DocumentLimits.swift：
+ *   maxSide = 30_000；maxSurfacePixels = 200_000_000
+ *
+ * 与上游的一处**有意分歧**：上游 maxSurfacePixels 是 2 亿，本引擎是 1 亿。
+ * 这是此前就存在的口径（tests/test_core.cpp 已按 1 亿钉住），不在本轮改动范围；
+ * 记在这里是为了让下一个读到这里的人知道它是已知偏差，而不是漏抄。
+ */
+namespace limits {
+
+/* 最长边（像素）：画布 / 图层 / 蒙版 / 任何生成表面。 */
+inline constexpr int32_t kMaxSide = 30000;
+
+/* 单个表面像素数上限：RGBA8 下约 400 MB。 */
+inline constexpr int64_t kMaxSurfacePixels = 100000000LL; /* 1 亿像素（上游为 2 亿） */
+
+/* transform 尺寸分量上限（像素）。 */
+inline constexpr int64_t kMaxTransformSize = 300000;   /* 上游 LayerTransform.isValid */
+
+/* transform 原点绝对值上限（像素）。 */
+inline constexpr int64_t kMaxTransformOrigin = 1000000;
+
+}  // namespace limits
+
 /* 校验画布尺寸是否落在 .comp 规范允许范围内。 */
 inline bool is_valid_canvas(comp_size s) {
-  constexpr int32_t kMaxEdge = 30000;
-  constexpr int64_t kMaxPixels = 100000000LL; /* 1 亿像素 */
   if (s.width <= 0 || s.height <= 0) return false;
-  if (s.width > kMaxEdge || s.height > kMaxEdge) return false;
-  return pixel_count(s) <= kMaxPixels;
+  if (s.width > limits::kMaxSide || s.height > limits::kMaxSide) return false;
+  return pixel_count(s) <= limits::kMaxSurfacePixels;
+}
+
+/* ------------------------------------------------------------ transform 有效性
+ *
+ * 对齐上游 LayerTransform.isValid（Compositor/Document/LayerTransform.swift:27）：
+ *
+ *   [origin.x, origin.y, size.width, size.height, rotation].allSatisfy(\.isFinite)
+ *       && (1...300_000).contains(size.width) && (1...300_000).contains(size.height)
+ *       && abs(origin.x) <= 1_000_000 && abs(origin.y) <= 1_000_000
+ *
+ * 上游是「写入前校验 + 不合法则回退原值」（EditorSession.swift:506 `guard moved.isValid
+ * else { continue }`、LayerTransform.swift:213 `return result.isValid ? result : original`），
+ * 即**拒绝非法值**，不是钳制。本引擎的 ABI 层此前零校验，直接把任意 comp_rect 写进
+ * 图层，于是越界值能存盘、能往返 .comp、到合成时才炸——宿主拿不到任何达因。
+ *
+ * 这里给出与上游同口径的判定，供 ABI 入口把关；.comp 读写侧的**钳制**是另一回事
+ * （manifest 是不可信的交换格式，只能钳不能拒），两者各自保留，边界常量同源。
+ */
+inline bool is_valid_transform(const comp_rect& r, float rotation) {
+  /* w/h <= 0 是引擎的「按像素尺寸回落」语义（见 Layer::effective_bounds），
+   * 对应上游尺寸未指定的情形，不是非法值，故此处只要求不越上界。 */
+  if (r.w > static_cast<int32_t>(limits::kMaxTransformSize)) return false;
+  if (r.h > static_cast<int32_t>(limits::kMaxTransformSize)) return false;
+  if (r.x > static_cast<int32_t>(limits::kMaxTransformOrigin)) return false;
+  if (r.x < -static_cast<int32_t>(limits::kMaxTransformOrigin)) return false;
+  if (r.y > static_cast<int32_t>(limits::kMaxTransformOrigin)) return false;
+  if (r.y < -static_cast<int32_t>(limits::kMaxTransformOrigin)) return false;
+  /* 上游 allSatisfy(\.isFinite) 同样覆盖 rotation：NaN/inf 会让 cos/sin 产出 NaN，
+     之后所有比较都为 false，图层静默渲成全透明且不报任何错（实测 inf 即如此）。 */
+  return std::isfinite(rotation);
 }
 
 inline int32_t bytes_per_pixel(comp_pixel_format fmt) {

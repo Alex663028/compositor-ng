@@ -45,7 +45,20 @@ COMP_API comp_result comp_layer_reorder(comp_document document,
                                         comp_layer_id id,
                                         comp_layer_id before);
 
-/* 替换图层像素内容。pixels 可为 NULL 表示清空为全透明。 */
+/*
+ * 替换图层像素内容。pixels 可为 NULL 表示清空为全透明。
+ *
+ * 格式契约（写进 ABI 是因为宿主必须知道传什么、能读回什么）：
+ *   - `COMP_PIXEL_RGBA8`：正常合成路径。
+ *   - `COMP_PIXEL_RGBA16`：16 位图层。引擎保留 16 位资产，并为它维护一份
+ *     8 位预乘副本（加约一阶噪声后取整，可复现），合成、缩略图与 8 位像素工具
+ *     一律用那份副本——所以「传 16 位」与「传它的 8 位副本」合成结果一致。
+ *     8 位工具作用于 16 位图层后，该图层就是 8 位（对齐上游 DeepLayers.swift:5）。
+ *   - `COMP_PIXEL_RGBA16F` 与未知格式 -> `COMP_ERR_UNSUPPORTED`，且不改动既有像素。
+ *
+ * `.comp` 存盘只接受 RGBA8 图层：16 位图层要落盘，先跑 `COMP_TOOL_DEEP` 的
+ * quantize（16 位 -> 8 位），见 docs/tool-ops.md。
+ */
 COMP_API comp_result comp_layer_set_pixels(comp_document document,
                                            comp_layer_id id,
                                            const comp_image* image);
@@ -318,6 +331,127 @@ COMP_API comp_result comp_layer_set_active(comp_document document, comp_layer_id
  * COMP_ERR_UNSUPPORTED（同 comp_layer_merge_down 的边界）。
  */
 COMP_API comp_result comp_document_flatten(comp_document document);
+
+/* --------------------------------------------------------- 工具操作 */
+
+/*
+ * 工具操作：把 engine/imaging 下 10 组上游像素内核接到宿主可调用的通路上。
+ *
+ * 背景（为什么有这组）：上游 10 组像素内核（魔棒/修补/抖动/透镜/画笔/16 位深度等）
+ * 在本仓已实现且有测试覆盖，但历史上**没有任何 comp_* 入口能触发它们**——有实现、
+ * 无功能。缺的不是把函数调用起来，而是参数契约：笔压、选区、容差、种子、蒙版来源
+ * 在上游是工具层的交互概念。本组接口把这些概念收敛成稳定结构，由引擎装配成
+ * 内核签名要的形态（详见 docs/tool-ops.md）。
+ *
+ * 通用契约：
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）；
+ *   - 参数闸在开事务**之前**：非法参数不留半成品、不进撤销栈；
+ *   - 写入类算子不改 transform / blend / opacity，故合并、.comp 往返的
+ *     既有不变性不受影响；
+ *   - `note` 是非致命说明（UTF-8，如「GLYPHS 缺字形图集已回落菱形网点」）；
+ *     致命原因写 comp_engine_last_error，此时返回非 0。
+ */
+typedef enum comp_tool_op {
+  COMP_TOOL_NONE  = 0,
+  COMP_TOOL_SELECT = 1, /* 魔棒 / 色彩范围 -> 累积写入图层蒙版 */
+  COMP_TOOL_STROKE = 2, /* 笔刷 -> 落笔到图层像素 */
+  COMP_TOOL_HEAL   = 3, /* 修补 -> 按 coverage 替换图层像素 */
+  COMP_TOOL_DITHER = 4, /* 抖动 / 半调 -> 图层像素 */
+  COMP_TOOL_LENS   = 5, /* 透镜畸变 -> 图层像素 */
+  COMP_TOOL_DEEP   = 6  /* 深度保持 -> 16 位资产降位 */
+} comp_tool_op;
+
+/* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
+typedef struct comp_tool_select {
+  int32_t tolerance;   /* 逐通道距离阈值 0..255（alpha 也参与比较） */
+  int32_t radius;      /* 种子邻域半边长：参考色 = 该 (2r+1)^2 方窗的平均色 */
+  int32_t contiguous;  /* 1 = 从种子 4-连通泛洪（种子不匹配则选中 0）；0 = 全图同色 */
+  int32_t invert;      /* 1 = 选中取反 */
+  int32_t use_color_range; /* 1 = 走 Color Range（按 include/exclude 列表）而非魔棒 */
+  int32_t fuzziness;   /* Color Range 的逐通道容差 0..255 */
+  int32_t seed_x;      /* 种子，文档像素坐标；必须落在目标图层内 */
+  int32_t seed_y;
+  /* include / exclude 为直通 sRGB 三元组（各 3*count 字节），各至多 8 色。 */
+  const uint8_t* include;
+  int32_t         include_count;
+  const uint8_t* exclude;
+  int32_t         exclude_count;
+} comp_tool_select;
+
+/* 笔刷参数。pressure 与 flow 相乘作为单次落笔的覆盖率上限（上游画笔口径）。 */
+typedef struct comp_tool_brush {
+  uint8_t color[3];  /* 直通 sRGB 笔画色 */
+  float   diameter;  /* 笔迹直径（图层像素），>0 */
+  float   pressure;  /* 笔压 0..1 */
+  float   hardness;  /* 0..1，1 = 全实，0 = 从笔芯就羽化 */
+  float   flow;      /* 0..1，覆盖率上限（防止高笔压涂死细节） */
+  uint32_t seed;     /* 固定以保证同参数同结果 */
+} comp_tool_brush;
+
+/* 修补参数（Spot Heal / Content-Aware Fill）。 */
+typedef struct comp_tool_heal {
+  float   opacity; /* 0..1，结果按 coverage x opacity 替换 */
+  int32_t mode;    /* 0 = Content-Aware（PatchMatch）；1 = Create Texture；2 = Proximity Match */
+  uint32_t seed;   /* 固定以保证同参数同结果 */
+} comp_tool_heal;
+
+/* 抖动 / 半调参数（DitherParams 的引擎侧子集；字形图集属宿主资源，不由 ABI 灌入）。 */
+typedef struct comp_tool_dither {
+  int32_t style;   /* 0..9 = Atkinson/Floyd-Steinberg/Bayer2/4/8/Dots/Lines/Diamonds/Patterns/Glyphs */
+  int32_t levels;  /* 2..16 阶（内核自身上限 16；2 = 纯 1-bit） */
+  float   diffusion; /* 0..1，误差扩散强度 */
+  float   density;   /* -1..1，加深（负）/减淡（正） */
+  float   contrast;  /* -1..1 */
+  int32_t cell;      /* 半调单元边长（像素）2..512 */
+  float   angle;     /* 半调网屏角度（弧度） */
+  int32_t light_on_dark;   /* 半调在暗色上标亮调而非在亮色上标暗调 */
+  int32_t original_colors; /* 1 = 保留图像原色而非 dark/light 二色 */
+  uint8_t dark[3];
+  uint8_t light[3];
+} comp_tool_dither;
+
+/* 透镜畸变参数。k > 0 拉直桶形（边角裁切），k < 0 拉直枕形，k = 0 恒等。 */
+typedef struct comp_tool_lens { double k; } comp_tool_lens;
+
+/*
+ * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
+ * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
+ * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
+ * 按 `heal.coverage_stride`（字节/行，至少等于图层宽）逐行解释。
+ */
+typedef struct comp_tool_op_desc {
+  comp_tool_op     kind;
+  comp_tool_select select;
+  comp_tool_brush  brush;
+  const float*     stroke_points;
+  int32_t          stroke_point_count;
+  comp_tool_heal   heal;
+  const uint8_t*   heal_coverage;
+  size_t           heal_coverage_stride;
+  comp_tool_dither dither;
+  comp_tool_lens   lens;
+} comp_tool_op_desc;
+
+/*
+ * 执行一次工具操作。note 可为 NULL；非 NULL 时写入 UTF-8 非致命说明
+ * （需要 '\0' 空间，两段式：note_capacity 为 0 时只回报所需长度，out_note_size
+ * 写入含 '\0' 的长度）。
+ *
+ * 错误码（经本入口可达的只有下列四种）：
+ *   id 不存在 -> COMP_ERR_NOT_FOUND；kind/参数非法 -> COMP_ERR_INVALID_ARGUMENT；
+ *   组图层/无像素图层 -> COMP_ERR_STATE；内核内存不足 -> COMP_ERR_OUT_OF_MEMORY。
+ *
+ * 注意：deep 的 round trip 模式**刻意不经本 ABI 暴露**——`comp_tool_op_desc`
+ * 不承载 `deep_mode`（它需要「一组 8 位操作结果集」，本结构体装不下），故经本
+ * 入口只能做 16 位降位（quantize）。域层的 `ToolOpParams::deep_mode` 对 round trip
+ * 有显式 `COMP_ERR_UNSUPPORTED` 拒绝，但该码在 ABI 边界不可达，宿主契约里不要写它。
+ */
+COMP_API comp_result comp_tool_apply(comp_document document,
+                                     comp_layer_id target,
+                                     const comp_tool_op_desc* desc,
+                                     char* note,
+                                     size_t note_capacity,
+                                     size_t* out_note_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

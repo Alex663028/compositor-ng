@@ -1,0 +1,166 @@
+# 工具操作（Tool Ops）参数契约
+
+> 本文是 `comp_tool_apply` 的契约说明。ABI 声明见
+> [`engine/abi/include/compositor/comp_layer.h`](../engine/abi/include/compositor/comp_layer.h)，
+> 领域实现见 [`engine/domain/tool_ops.h`](../engine/domain/tool_ops.h) / `tool_ops.cpp`。
+
+## 1. 为什么有这组接口
+
+`engine/imaging/` 下有 10 组从上游 `robbietilton/Compositor` 移植的**纯 C 像素内核**。
+它们的算法已经完成并有测试覆盖，但历史上**没有任何 `comp_*` 入口能触发它们**——
+魔棒、修补、抖动、透镜、画笔对宿主而言是「有实现、无功能」。
+
+缺的不是「把函数调用起来」，而是**参数契约**：笔压、选区、容差、种子、蒙版来源
+在上游是工具层的交互概念（宿主跟踪鼠标采样与笔压曲线），内核签名里只留下结果。
+本组接口把这些交互概念收敛成稳定结构，由引擎装配成内核签名要的形态。
+
+## 2. 坐标空间（最容易踩的一条）
+
+| 空间 | 谁在用 |
+|------|--------|
+| **文档像素坐标** | ABI 的 `select.seed_x/y`、`stroke_points` |
+| **图层像素坐标** | 全部 10 组内核（魔棒种子、修补 coverage、透镜中心、笔迹） |
+
+引擎显式做文档 → 图层的平移（用 `effective_bounds()` 的原点，对齐合成路径）。
+种子落在图层之外 ⇒ `COMP_ERR_INVALID_ARGUMENT`，不做静默夹取。
+
+`heal_coverage` 的尺寸与**图层像素**一致，不是画布。
+
+## 3. 通用契约
+
+- **一步撤销**：加入调用方已开启的显式事务，或自成一个隐式步。
+- **参数闸在开事务之前**：非法参数不留半成品、不进撤销栈
+  （`comp_document_can_undo` 保持不变）。
+- **不改几何**：工具算子不改 `transform` / `blend` / `opacity`，因此
+  `merge_down` / `flatten` 的逐字节不变性契约不受影响。
+- **note 两段式**：非致命说明走 `note` + `out_note_size`；
+  `note_capacity` 为 0 时只回报所需长度（含 `'\0'`）。终止符落在
+  `note[min(capacity-1, size)]`，**永不写出调用方缓冲**。
+- **错误码由域层直接回报**，不从文案反推。
+
+| 错误码 | 场景 |
+|--------|------|
+| `COMP_ERR_NOT_FOUND` | `target` 图层不存在 |
+| `COMP_ERR_INVALID_ARGUMENT` | kind 非法、种子出界、容差/半径/点数越界、coverage stride 过小 |
+| `COMP_ERR_STATE` | 目标是图层组（不持有像素）、图层无像素、16 位降位要求 RGBA16 资产 |
+| `COMP_ERR_OUT_OF_MEMORY` | 内核工作内存申请失败 |
+| `COMP_ERR_UNSUPPORTED` | `deep` 的 round trip 模式（见 §7）。**域层可达、ABI 边界不可达**：`comp_tool_op_desc` 刻意不承载 `deep_mode`，经 `comp_tool_apply` 只能做 quantize；该码只由直接调域层的调用方触发 |
+
+## 4. 逐算子语义
+
+### 4.1 Select（`COMP_TOOL_SELECT`）
+
+魔棒（`use_color_range = 0`）与 Color Range（`= 1`）。
+
+- `tolerance`：**逐通道**距离阈值 0..255，alpha 也参与比较。
+- `radius`：种子邻域半边长。参考色 = 该 `(2r+1)²` 方窗内的平均色，方窗按边界裁剪。
+- `contiguous`：`1` = 从种子做 4-连通泛洪（种子自身不匹配则选中 0 个）；
+  `0` = 选中全图所有匹配像素。
+- `include` / `exclude`：直通 sRGB 三元组，各至多 8 色。`fuzziness` 为逐通道容差。
+- **选中数不为 0 时才写蒙版**——点了个空处不留下一张全 0 的空蒙版
+  （否则整层被蒙成透明；上游是「无选中即不改变」）。
+- 写入是**加选**：与既有蒙版取逐像素最大值。
+
+### 4.2 Stroke（`COMP_TOOL_STROKE`）
+
+圆头笔，`stroke_points` 为折线折点（x, y 成对，共 `stroke_point_count * 2` 个 float）。
+
+- 形状 = 到最近线段的距离 ≤ `diameter / 2`；
+  `hardness` 决定 `[hardness * r, r]` 这段的 smoothstep 羽化带
+  （`1` = 全实，`0` = 从笔芯就羽化）。
+- `pressure * flow` 乘进峰值 coverage。两者相乘是上游画笔口径：
+  `pressure` 是笔压，`flow` 是「单次落笔不把像素涂死」的总量上限。
+- **不叠加**：笔画按 coverage 做 source-over（同一像素被同一笔压两次仍是同一结果）。
+  这让「同参数两次调用逐字节相同」成立——若改成累加，可重复性就没了。
+- `pressure * flow == 0` ⇒ 逐字节不变。
+- `seed` 保留在结构里以固定契约；当前圆头笔形状是解析式的（不采样噪声），故不参与计算。
+
+### 4.3 Heal（`COMP_TOOL_HEAL`）
+
+`mode`：`0` = Content-Aware（PatchMatch）、`1` = Create Texture、`2` = Proximity Match。
+三者都是 `spot_heal` 的 mode（`patch_fill` 与 `heal_membrane` 经它传递调用）。
+
+结果按 `coverage * opacity` 替换原像素。`seed` 固定 ⇒ 同参数同结果
+（PatchMatch 内部是随机化的，必须靠它定住）。
+
+### 4.4 Dither（`COMP_TOOL_DITHER`）
+
+`style` 0..9 = Atkinson / Floyd-Steinberg / Bayer 2,4,8 / Dots / Lines / Diamonds / Patterns / Glyphs。
+
+**字形图集不由 ABI 携带**（`glyphs` / `glyphCoverage` / `glyphCount` 是宿主资源）。
+`style = 9`（GLYPHS）时这三项为 0，内核走 `spot()` 的 `default` 分支，
+即**菱形网点**——note 会如实回报这一回落，不静默按方块画。
+
+`levels` 2..16（内核自身上限 16；面板常用 2 = 纯 1-bit）。
+
+### 4.5 Lens（`COMP_TOOL_LENS`）
+
+径向畸变，作用在**图层像素**上，几何不变。
+
+- `k > 0` 拉直桶形畸变（边角裁切）；`k < 0` 拉直枕形畸变（边角转透明）；
+  `k = 0` 恒等（逐字节不变，引擎另有一条短路）。
+- 畸变中心取**图层像素的中心**。上游 Lens 是整篇镜头（中心 = 画布中心），
+  这里把作用面收窄到当前图层，与上游工具栏一致，也避免图层在画布一角时轴心跑偏。
+- `|k| > 1` 被参数闸拒绝。
+
+### 4.6 Deep（`COMP_TOOL_DEEP`）
+
+16 位资产的落位，也是 ABI 唯一暴露的 deep 模式（**quantize**）：把图层像素从
+`COMP_PIXEL_RGBA16`（预乘、native-endian）换成 8 位预乘 RGBA8 的工作副本。实现是
+`domain/layer.h` 的 `deep_to_rgba8`——`dither_quantize16` 加约一阶噪声后取整，
+对齐上游 `DeepLayer.dithered`：平滑梯度不出台阶，且噪声按 (x,y,通道) 固定，
+**同一输入恒得同一输出**。
+
+- 这份 8 位副本是 16 位图层的**唯一 8 位视图**：合成、缩略图、裁剪基底 alpha、
+  8 位像素工具都由它或与它同口径的取值出发（`comp_layer.h` 的格式契约）。
+  于是「传 16 位资产」与「传它的 8 位副本」合成结果逐字节一致。
+- 8 位工具（Select / Stroke / Heal / Dither / Lens）打在 16 位图层上时，图层先落到
+  这份副本、**自此就是 8 位**，与上游「任何不认识 16 位的操作都让图层不再是 16 位」
+  （`DeepLayers.swift:5`）一致。
+- 打在 RGBA8 图层上 -> `COMP_ERR_STATE`（拿 8 位图层要 16 位精度是错的**状态**请求，
+  不是能力边界）。round trip 模式 -> `COMP_ERR_UNSUPPORTED`（见 §7）。
+- `.comp` 存盘只接受 RGBA8 图层，所以 16 位资产要落盘必须先 quantize（见 §6）。
+
+## 5. 可重复性
+
+`dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。
+`seed` 字段与「不叠加」的落笔口径共同保证：**同参数两次调用逐字节相同**。
+`tests/test_tool_ops.cpp` 对此有专门护栏（撤销后重做 = 逐字节相等）。
+
+## 6. 与 `.comp` 的关系
+
+工具算子**不引入新的 manifest 键**：结果都落进既有的 `layer` 像素 / `mask` / `transform`，
+因此 `.comp` 往返与既有护栏完全不受影响。
+
+## 7. 已知边界（未接线，按实记录）
+
+| 内核函数 | 状态 |
+|---------|------|
+| `deep_split` / `deep_merge` / `deep_take_painted` | `deep` 的 round trip 模式被**显式拒绝**（`COMP_ERR_UNSUPPORTED`）。往返需要「一组 8 位操作在 low/+1/+2/+4 上的结果」，ABI 尚未承载——硬造一个往返等于伪造像素 |
+| `deep_*` 其余（`cube_apply` / `hdr_*` / `extract_alpha` / `restore_alpha`） | HDR / 线性深度层语义未定。16 位资产现在可以从 ABI 进来（`comp_layer_set_pixels` 接受 `COMP_PIXEL_RGBA16`），但这一组要的是「颜色查找 / 高光归一 / alpha 拆合」的语义决定，不是缺资产 |
+| `wand_trace` | 选区轮廓提取。需要「把蒙版轮廓变成可编辑路径」的语义决定（多边形简化、洞的表示），本轮未做 |
+| `scanlines_apply` / `dither_dots` / `dither_glow` | CRT 扫描线等专用形态，需要独立入口与各自的参数结构 |
+| `brush_alpha_bounds` / `layer_extract_alpha` / `layer_unpremultiply_opaque` / `layer_restore_alpha` | 剪贴栈的 alpha 拆合。上游用它把剪贴基底的不透明度摊平，本仓合成路径走 `clipping_factor()` 逐点取 alpha，语义不同故未接线 |
+
+## 8. 交付与验证基线（2026-10-16 DSH 接手复核；2026-10-17 Grok 收口 16 位通路）
+
+- 实现：`engine/domain/tool_ops.{h,cpp}`（领域层闸 + 装配）、ABI 入口
+  `comp_tool_apply`（`engine/abi/src/comp_layer_abi.cpp`）、护栏 `tests/test_tool_ops.cpp`
+  （ABI 视角）与 `tests/test_tool_ops_domain.cpp`（域层视角，覆盖 ABI 不可达的 deep 模式契约）。
+- Grok 收口（16 位通路）：`comp_layer_set_pixels` 接受 `COMP_PIXEL_RGBA16` 之后，
+  顺带把「16 位资产的 8 位视图」补成真实现——`domain/layer.h` 的 `deep_to_rgba8` 是唯一生产者，
+  合成/缩略图（`compositing/resample.cpp` 的 `build_layer_unit`）、裁剪基底 alpha
+  （`compositing/composite_ops.cpp` 的 `clipping_factor`）、8 位像素工具
+  （`domain/tool_ops.cpp`）三处消费点全部改走它。此前这三处会按 4 字节/像素读
+  8 字节/像素的缓冲：不报错，画面是垃圾。
+- 全量基线：**207 用例 0 失败**（AUDIT7 的 204 + 本轮 ABI 16 位等价性 1 + 域层 2；原
+  `layer_set_pixels_rejects_16bit_format` 改名并只保半精度那一半），
+  `scripts/run_regression.py --require-ohos` **6/6 PASS**，OHOS aarch64 交叉编译 72 单元 rc=0。
+  （跑回归必须用带 ziglang 的解释器 `<local-workspace>\tools\python\python.exe`；
+  用 Studio 自带 venv 的 `python` 会因缺 `ziglang` 让步骤 1/2/3/5 全红——那是环境问题不是测试失败。）
+- 复核结论：7 组「孤立内核」中**可达的 6 组已有产品通路**——
+  `wand_mask`（Select）、`spot_heal` → 内部 `patch_fill` + `heal_membrane`（Heal / Patch）、
+  `dither_apply`（Dither）、`lens_distort`（Lens）、`dither_quantize16`（Deep 降位）。
+  Brush 组本身（`BrushPixels.c` 只有 4 个剪贴栈 alpha 助手）由解析式圆头笔实现替代，
+  按 §7 明示未接线；`wand_trace`、`dither_dots`/`dither_glow`/`scanlines_apply`、
+  `deep_split`/`deep_merge`/`deep_take_painted` 同样按 §7 明示未接线。

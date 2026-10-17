@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // The dither styles, in the order the Filter panel lists them.
 enum {
     DITHER_ATKINSON, DITHER_FLOYD_STEINBERG,
@@ -86,4 +90,8 @@ void dither_glow(uint8_t *rgba, const uint8_t *glow, size_t width, size_t height
 // row), adding noise of about one 8-bit step first so smooth gradients don't come out in steps. The noise is fixed per
 // pixel, so the same input always gives the same output.
 void dither_quantize16(const uint16_t *wide, uint8_t *rgba, size_t width, size_t height, size_t stride);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

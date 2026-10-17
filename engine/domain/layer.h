@@ -89,6 +89,24 @@ struct ImageBuffer {
   }
 };
 
+/*
+ * 16 位资产的 8 位工作副本（上游 DeepLayer.dithered 同款内核）。
+ *
+ * 为什么需要它：合成、缩略图、裁剪基底 alpha、8 位像素工具全部按
+ * 「RGBA8 预乘、4 字节/像素」解释像素缓冲。RGBA16 走同一条路会按
+ * 错误的步长取值——不报错，画面直接是垃圾（AUDIT3 P2-13 的原观察）。
+ * 上游的解法不是拒绝 16 位资产，而是**为每个 16 位图层维护一份 8 位副本**：
+ * 「its `image` is a dithered 8-bit copy that the canvas, thumbnails and every
+ * tool keep using unchanged」（DeepLayers.swift:4），本函数就是那份副本的
+ * 唯一生产者，保证「哪里读像素」都得到同一个 8 位视图。
+ *
+ * 口径：src 必须是 COMP_PIXEL_RGBA16（预乘、native-endian、行紧排，即
+ * ImageBuffer 的存储形态）。加约一阶噪声后取整，平滑梯度不出台阶；噪声按
+ * (x,y,通道) 固定，同一输入恒得同一输出（可复现、可回归）。dst 会重置为
+ * 同尺寸的 RGBA8。src 为空或不是 RGBA16 返回 false 且不写 dst。
+ */
+bool deep_to_rgba8(const ImageBuffer& src, ImageBuffer* dst);
+
 /* 8 位灰度蒙版：1 字节/像素，0 = 全透明，255 = 完全不透明。
  * 资产模型同 ImageBuffer（共享 + COW）。 */
 struct MaskBuffer {

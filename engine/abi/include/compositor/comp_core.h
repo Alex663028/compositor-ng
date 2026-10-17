@@ -77,8 +77,12 @@ typedef uint64_t comp_layer_id;
 
 typedef enum comp_pixel_format {
   COMP_PIXEL_RGBA8    = 0, /* 8 位/通道，预乘 Alpha，4 字节/像素 */
-  COMP_PIXEL_RGBA16   = 1, /* 16 位/通道，非预乘，8 字节/像素 */
-  COMP_PIXEL_RGBA16F  = 2  /* 半精度浮点，8 字节/像素 */
+  /* 16 位/通道，**预乘** Alpha，8 字节/像素，native-endian。
+   * 与上游同一布局（DeepLayers.swift:8「sRGB, premultiplied RGBA, native-endian
+   * 16-bit, rows packed」）。合成与 8 位工具通过它的 8 位副本工作（见
+   * comp_layer_set_pixels 的格式契约）。 */
+  COMP_PIXEL_RGBA16   = 1,
+  COMP_PIXEL_RGBA16F  = 2  /* 半精度浮点，8 字节/像素；本构建无半精度像素路径，入口拒绝 */
 } comp_pixel_format;
 
 /* 内存布局：行优先、自上而下、stride 以字节计。 */

@@ -3,9 +3,17 @@
 #define BrushPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Half-open bounds of nonzero alpha in premultiplied RGBA. Empty returns all zero.
 void brush_alpha_bounds(const uint8_t *bytes, size_t width, size_t height, size_t stride, size_t bounds[4]);
 void layer_extract_alpha(const uint8_t *rgba, size_t rgbaStride, uint8_t *gray, size_t grayStride, size_t width, size_t height);
 void layer_unpremultiply_opaque(uint8_t *rgba, size_t stride, size_t width, size_t height);
 void layer_restore_alpha(uint8_t *rgba, size_t stride, const uint8_t *alpha, size_t alphaStride, size_t width, size_t height);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

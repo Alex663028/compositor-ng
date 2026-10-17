@@ -976,8 +976,9 @@ COMP_TEST(document_create_fails_cleanly_when_allocator_exhausted) {
 
 /* AUDIT3 P2-13：16 位 comp_image 若放行，copy_image_into 会把 8 字节/像素的
  * format 带进 ImageBuffer，而合成器全程按 4 字节/像素解释——不报错，但画面是
- * 垃圾。入口必须明确拒绝，且拒绝不能碰坏既有像素。 */
-COMP_TEST(layer_set_pixels_rejects_16bit_format) {
+ * 垃圾。半精度（RGBA16F）至今没有像素路径，入口必须明确拒绝，且拒绝不能碰坏
+ * 既有像素。（RGBA16 已有真通路，见下一个用例。） */
+COMP_TEST(layer_set_pixels_rejects_16bit_float_format) {
   comp_engine_desc desc = test_engine_desc();
   comp_engine engine = nullptr;
   COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
@@ -992,18 +993,15 @@ COMP_TEST(layer_set_pixels_rejects_16bit_format) {
   const SolidImage red(4, 4, 255, 0, 0, 255);
   COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
 
-  const comp_pixel_format rejected[] = {COMP_PIXEL_RGBA16, COMP_PIXEL_RGBA16F};
-  for (comp_pixel_format format : rejected) {
-    std::vector<uint8_t> sixteen(4u * 4u * 8u, 0xff);
-    comp_image image{};
-    image.width = 4;
-    image.height = 4;
-    image.format = format;
-    image.stride = 4u * 8u;
-    image.pixels = sixteen.data();
-    COMP_CHECK_MSG(comp_layer_set_pixels(document, background, &image) == COMP_ERR_UNSUPPORTED,
-                   "16-bit layer pixels are rejected instead of silently misread");
-  }
+  std::vector<uint8_t> sixteen(4u * 4u * 8u, 0xff);
+  comp_image image{};
+  image.width = 4;
+  image.height = 4;
+  image.format = COMP_PIXEL_RGBA16F;
+  image.stride = 4u * 8u;
+  image.pixels = sixteen.data();
+  COMP_CHECK_MSG(comp_layer_set_pixels(document, background, &image) == COMP_ERR_UNSUPPORTED,
+                 "half-float layer pixels are rejected instead of silently misread");
 
   /* 拒绝之后原像素不动：画布仍是不透明的红。 */
   const std::vector<uint8_t> canvas = flatten(document, 4, 4);
@@ -1011,6 +1009,114 @@ COMP_TEST(layer_set_pixels_rejects_16bit_format) {
                  "rejection leaves the existing pixels intact");
 
   comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* 16 位图层的真通路（本轮收口）：
+ *
+ *   1. `comp_layer_set_pixels` 接受 COMP_PIXEL_RGBA16（预乘、native-endian）；
+ *   2. 合成按该图层的 8 位副本进行（加约一阶噪声后取整，上游 DeepLayer.dithered
+ *      同款内核）——所以画面是「接近原值的不透明灰」，而不是按错步长读出来的
+ *      垃圾（旧行为下每像素读到像素中间的字节，alpha 时有时无）；
+ *   3. `COMP_TOOL_DEEP`（ABI 只暴露 quantize）打在同一张 16 位图层上，得到的 8 位
+ *      图层与第 2 步用的是同一份副本：两条路径的整幅合成逐字节相同。
+ *
+ * 这条等价关系就是 ABI 文档里对 16 位格式的承诺（comp_layer.h 的格式契约），
+ * 也是 AUDIT7 §6「Deep 降位路径不可达」的收口证据。 */
+COMP_TEST(sixteen_bit_layer_composites_as_its_eight_bit_copy) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  /* 16 位资产：预乘、半透明、颜色呈梯度（纯色会让「按错步长读」看起来也对）。 */
+  std::vector<uint16_t> wide(4u * 4u * 4u, 0);
+  for (int32_t y = 0; y < 4; ++y) {
+    for (int32_t x = 0; x < 4; ++x) {
+      uint16_t* px = wide.data() + (static_cast<size_t>(y) * 4u + static_cast<size_t>(x)) * 4u;
+      const uint16_t alpha = static_cast<uint16_t>(0x4000 + 0x1000 * (x + y));
+      px[3] = alpha;
+      px[0] = static_cast<uint16_t>(alpha / 2u);            /* 预乘：rgb <= alpha */
+      px[1] = static_cast<uint16_t>(alpha / 3u);
+      px[2] = static_cast<uint16_t>(alpha / 4u);
+    }
+  }
+  comp_image image{};
+  image.width = 4;
+  image.height = 4;
+  image.format = COMP_PIXEL_RGBA16;
+  image.stride = 4u * 8u;
+  image.pixels = wide.data();
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+
+  comp_document as_sixteen = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &as_sixteen) == COMP_OK);
+  const comp_layer_id wide_layer = background_layer(as_sixteen);
+  COMP_CHECK_MSG(comp_layer_set_pixels(as_sixteen, wide_layer, &image) == COMP_OK,
+                 "COMP_PIXEL_RGBA16 layer pixels are accepted");
+
+  comp_document as_eight = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &as_eight) == COMP_OK);
+  const comp_layer_id copied_layer = background_layer(as_eight);
+  COMP_CHECK(comp_layer_set_pixels(as_eight, copied_layer, &image) == COMP_OK);
+  comp_tool_op_desc quantize{};
+  quantize.kind = COMP_TOOL_DEEP;
+  COMP_CHECK_MSG(comp_tool_apply(as_eight, copied_layer, &quantize, nullptr, 0, nullptr) == COMP_OK,
+                 "COMP_TOOL_DEEP quantizes a 16-bit layer to 8 bits");
+
+  const std::vector<uint8_t> sixteen_canvas = flatten(as_sixteen, 4, 4);
+  const std::vector<uint8_t> eight_canvas = flatten(as_eight, 4, 4);
+  COMP_CHECK_MSG(sixteen_canvas == eight_canvas,
+                 "a 16-bit layer composites exactly as its 8-bit working copy");
+
+  /* 逐像素断言，保证上一条不是因为两边都空/都透明而「相等」。
+   * 半透明灰：alpha 介于 64..191，rgb 与其成预乘比例（容差覆盖一阶噪声）。 */
+  for (int32_t y = 0; y < 4; ++y) {
+    for (int32_t x = 0; x < 4; ++x) {
+      const size_t index = (static_cast<size_t>(y) * 4u + static_cast<size_t>(x)) * 4u;
+      const uint16_t alpha16 = static_cast<uint16_t>(0x4000 + 0x1000 * (x + y));
+      const uint8_t expected_alpha =
+          static_cast<uint8_t>((static_cast<int32_t>(alpha16) + 128) / 257);
+      COMP_CHECK_MSG(matches(sixteen_canvas, 4, x, y, expected_alpha / 2, expected_alpha / 3,
+                             expected_alpha / 4, expected_alpha, 3),
+                     "the 16-bit layer is composited from its rounded 8-bit copy");
+      COMP_CHECK_MSG(sixteen_canvas[index + 3] != 0,
+                     "the composite is not transparent (a wrong-stride read would show up here)");
+    }
+  }
+
+  /*
+   * 裁剪基底：再挂一层剪贴子层。合成分支会把基底的 alpha 当裁剪因子逐像素读——
+   * 若按 4 字节/像素去读 8 字节/像素的基底，因子就是随机数。两个文档仍须逐字节
+   * 相同，且子层必须真的改变了画面（否则这条断言是空的）。
+   */
+  auto add_clipped_child = [](comp_document doc, comp_layer_id base) {
+    comp_layer_desc child_desc{};
+    child_desc.name = "clipped";
+    child_desc.blend = COMP_BLEND_NORMAL;
+    child_desc.opacity = 1.0f;
+    child_desc.transform = comp_rect{0, 0, 4, 4};
+    child_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+    comp_layer_id child = 0;
+    COMP_CHECK(comp_layer_add(doc, &child_desc, &child) == COMP_OK);
+    COMP_CHECK(comp_layer_set_clipping_source(doc, child, base) == COMP_OK);
+    const SolidImage green(4, 4, 0, 255, 0, 255);
+    COMP_CHECK(comp_layer_set_pixels(doc, child, &green.image) == COMP_OK);
+  };
+  add_clipped_child(as_sixteen, wide_layer);
+  add_clipped_child(as_eight, copied_layer);
+
+  const std::vector<uint8_t> clipped_sixteen = flatten(as_sixteen, 4, 4);
+  const std::vector<uint8_t> clipped_eight = flatten(as_eight, 4, 4);
+  COMP_CHECK_MSG(clipped_sixteen != sixteen_canvas,
+                 "the clipped child really contributes (otherwise the next check is vacuous)");
+  COMP_CHECK_MSG(clipped_sixteen == clipped_eight,
+                 "clipping against a 16-bit base reads the same alpha as against its 8-bit copy");
+
+  comp_document_destroy(as_sixteen);
+  comp_document_destroy(as_eight);
   comp_engine_destroy(engine);
 }
 

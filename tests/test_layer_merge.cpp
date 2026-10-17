@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "compositing/compositor.h"
+#include "compositing/effect_eval.h"
 #include "domain/document.h"
 #include "domain/layer.h"
 #include "engine.h"
@@ -365,28 +366,92 @@ COMP_TEST(merge_down_rejects_unmergeable_plans) {
   (void)group;
 }
 
-COMP_TEST(merge_down_refuses_adjustments_until_evaluated) {
-  Engine engine(test_engine_desc());
-  Document document(&engine, 4, 4, 72.0f, "sRGB");
+/*
+ * 合并烘入与求值口径一致（2026-10-16 调整求值落地后的行为）：
+ *   - 调整（adjustments）已被合成路径求值，因此合并 **允许** 且烘入结果正确；
+ *   - 效果（effects）仍无求值点，仍然明确拒绝。
+ */
+COMP_TEST(merge_down_bakes_adjustments_and_effects) {
+  /* (1) 携带调整的图层：合并成功，且烘入结果与「先渲染再合并」逐字节一致。 */
+  {
+    Engine engine(test_engine_desc());
+    Document document(&engine, 4, 4, 72.0f, "sRGB");
+    add_solid_layer(document, "Red", 255, 0, 0, 255);
+    const comp_layer_id above = add_solid_layer(document, "Blue", 0, 0, 255, 255);
 
-  const comp_layer_id below = add_solid_layer(document, "Red", 255, 0, 0, 255);
-  const comp_layer_id above = add_solid_layer(document, "Blue", 0, 0, 255, 255);
+    Layer* blue = document.find(above);
+    COMP_CHECK(blue != nullptr);
+    Adjustment adjustment;
+    adjustment.kind = COMP_ADJUSTMENT_INVERT;
+    blue->adjustments.push_back(adjustment);
 
-  /* 下层挂一个反相调整：携带调整/效果的合并在求值落地前明确拒绝。 */
-  Layer* blue = document.find(above);
-  COMP_CHECK(blue != nullptr);
-  Adjustment adjustment;
-  adjustment.kind = COMP_ADJUSTMENT_INVERT;
-  blue->adjustments.push_back(adjustment);
+    /* 烘入前的整篇合成结果（含调整）作为期望值。 */
+    std::vector<uint8_t> expected;
+    std::string error;
+    COMP_CHECK(flatten_copy(document, &expected, &error));
 
-  std::string error;
-  COMP_CHECK(!document.merge_down(above, &error));
-  COMP_CHECK_MSG(error.find("adjustments/effects") != std::string::npos,
-                 "adjustment-carrying merge must be refused with the documented boundary");
-  /* 状态未被改动。 */
-  COMP_CHECK(document.state().layers.size() == 2);
-  COMP_CHECK(document.history().undo_depth() == 0);
-  (void)below;
+    COMP_CHECK_MSG(document.merge_down(above, &error),
+                   "adjustment-carrying layers are now evaluable and must bake, not be refused");
+    COMP_CHECK(document.state().layers.size() == 1);
+
+    std::vector<uint8_t> after;
+    COMP_CHECK(flatten_copy(document, &after, &error));
+    COMP_CHECK_MSG(after == expected,
+                   "baked pixels must be byte-identical to the pre-merge composite");
+    /* 合并后调整不再残留（已被烘进像素）。 */
+    COMP_CHECK(document.state().layers.front().adjustments.empty());
+  }
+
+  /* (2) 携带效果的图层：效果求值落地后同样烘入，不再拒绝。 */
+  {
+    Engine engine(test_engine_desc());
+    Document document(&engine, 4, 4, 72.0f, "sRGB");
+    add_solid_layer(document, "Red", 255, 0, 0, 255);
+    const comp_layer_id above = add_solid_layer(document, "Blue", 0, 0, 255, 255);
+
+    Layer* blue = document.find(above);
+    COMP_CHECK(blue != nullptr);
+    Effect effect;
+    effect.effect = 0;
+    blue->effects.push_back(effect);
+
+    std::string error;
+    std::vector<uint8_t> expected;
+    COMP_CHECK(flatten_copy(document, &expected, &error));
+
+    COMP_CHECK_MSG(document.merge_down(above, &error),
+                   "effect-carrying layers are now evaluated and must bake, not be refused");
+    COMP_CHECK(document.state().layers.size() == 1);
+
+    std::vector<uint8_t> after;
+    COMP_CHECK(flatten_copy(document, &after, &error));
+    COMP_CHECK_MSG(after == expected,
+                   "baked pixels must be byte-identical to the pre-merge composite");
+    /* 合并后效果不再残留（已烘进像素）。 */
+    COMP_CHECK(document.state().layers.front().effects.empty());
+  }
+
+  /* (3) 引擎不认识的 effect 值：仍拒绝，否则烘入会静默丢弃它。 */
+  {
+    Engine engine(test_engine_desc());
+    Document document(&engine, 4, 4, 72.0f, "sRGB");
+    add_solid_layer(document, "Red", 255, 0, 0, 255);
+    const comp_layer_id above = add_solid_layer(document, "Blue", 0, 0, 255, 255);
+
+    Layer* blue = document.find(above);
+    COMP_CHECK(blue != nullptr);
+    Effect effect;
+    effect.effect = 999; /* 远超 kEffectKindCount */
+    blue->effects.push_back(effect);
+
+    std::string error;
+    COMP_CHECK(!document.merge_down(above, &error));
+    COMP_CHECK_MSG(error.find(kUnevaluatedEffectMarker) != std::string::npos,
+                   "unknown effect kind must be refused with the shared reason marker");
+    /* 状态未被改动。 */
+    COMP_CHECK(document.state().layers.size() == 2);
+    COMP_CHECK(document.history().undo_depth() == 0);
+  }
 }
 
 COMP_TEST(merge_down_repoints_clipping) {
@@ -594,7 +659,18 @@ COMP_TEST(abi_merge_down_error_paths) {
   /* 不存在的图层 -> COMP_ERR_NOT_FOUND。 */
   COMP_CHECK(comp_layer_merge_down(document, 9999) == COMP_ERR_NOT_FOUND);
 
-  /* 叠加两层，下层挂调整 -> COMP_ERR_UNSUPPORTED（文档化边界）。 */
+  /*
+   * 叠加两层，下层挂引擎**不认识**的 effect 值 -> COMP_ERR_UNSUPPORTED。
+   *
+   * 区分两种情形（这是本用例的要点）：
+   *   - 引擎已知的 6 种效果：已由合成求值包含，烘入即正确，允许合并
+   *     （见 merge_down_bakes_adjustments_and_effects）；
+   *   - 未知的 kind（如 999）：本引擎既不求值也不绘制，烘入会静默丢弃，
+   *     所以必须拒绝。
+   * 早期版本用 kind=0（已知的描边）来测这条拒绝路径，那是在“效果只入库不求值”
+   * 的旧边界下写的；效果求值落地后 kind=0 已经可以正常烘入，故改用未知 kind，
+   * 让拒绝断言继续守住真正需要守住的那条线。
+   */
   const comp_layer_id top = abi_add_solid_layer(document, 4, 4, 0, 0, 255, 255);
   comp_layer_id below = 0;
   {
@@ -604,7 +680,7 @@ COMP_TEST(abi_merge_down_error_paths) {
     below = n >= 2 ? ids[0] : 0;
   }
   COMP_CHECK(below != 0);
-  COMP_CHECK(comp_layer_add_adjustment(document, below, COMP_ADJUSTMENT_INVERT, "{}") == COMP_OK);
+  COMP_CHECK(comp_layer_set_effect(document, below, 999, "{}") == COMP_OK);
   COMP_CHECK(comp_layer_merge_down(document, top) == COMP_ERR_UNSUPPORTED);
   /* 状态未被改动。 */
   size_t count = 0;

@@ -3,6 +3,10 @@
 #define WandPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Magic Wand match over premultiplied RGBA (4 bytes per pixel, `stride` bytes per row, rows
 // top-down). The reference color is the average over a (2 * radius + 1)² square around the
 // seed, clipped to the image. A pixel matches when every channel, alpha included, is within
@@ -26,4 +30,8 @@ long color_range_mask(const uint8_t *rgba, size_t width, size_t height, size_t s
 // outline is too detailed to be worth drawing.
 int wand_trace(const uint8_t *mask, size_t width, size_t height,
                int32_t **points, size_t *pointCount, int32_t **loops, size_t *loopCount);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif

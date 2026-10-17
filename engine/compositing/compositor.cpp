@@ -42,14 +42,58 @@ bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out, st
   out->resize(state.width, state.height, COMP_PIXEL_RGBA8);
   out->clear_transparent();
 
-  /* 若存在剪贴基底，先合成基底再合成本层，保证结果与整篇合成一致。 */
+  /*
+   * 若存在剪贴基底，走剪贴栈口径（与 FilterGraph 的 kClippingStack 节点同一条路）：
+   * 基底 alpha 取出 → 子层在不透明基底上叠 → alpha 放回 → 整个栈作为一个单元参与。
+   *
+   * 此前这里是「先合成基底、再按基底 alpha 逐像素缩放本层」，alpha 会被叠成 0
+   * （实测：软 alpha 基底 + MULTIPLY 子层得 a=0，上游口径应得 a=128），
+   * 而且非 Normal 混合的语义完全不对。
+   *
+   * 单层视图（comp_render_composite_layer）只见到「基底 + 这一个成员」，
+   * 而 FilterGraph 会见到整串成员；两处对「一层栈」的定义一致，结果也就一致。
+   */
   if (layer->clipping_source != 0) {
     const Layer* base = doc.find(layer->clipping_source);
-    if (base != nullptr && !blend_layer_into(out, doc, *base, 1.0)) return false;
+    if (base != nullptr && !base->pixels.empty()) {
+      Layer base_standalone = *base;
+      base_standalone.clipping_source = 0;
+      Layer member = *layer;
+      member.clipping_source = 0;
+
+      /*
+       * 表面是**画布大小**的：blend_layer_into 把 dst 的尺寸当画布边界
+       * （clamp_to_canvas(padded, dst->size)），局部坐标缓冲会被当成画布而错位。
+       * 栈内部是整幅画布的 extract/member/restore，缩小到 bounds 是 FilterGraph
+       * 那边的做法；此处保持画布大小，两处求值结果仍然一致。
+       */
+      ImageBuffer surface;
+      surface.resize(state.width, state.height, COMP_PIXEL_RGBA8);
+      surface.clear_transparent();
+      std::string stack_error;
+      if (!blend_layer_into(&surface, doc, base_standalone, 1.0, &stack_error)) {
+        if (error != nullptr) *error = stack_error;
+        return false;
+      }
+      std::vector<uint16_t> coverage;
+      if (!extract_stack_alpha(&surface, &coverage, &stack_error)) {
+        if (error != nullptr) *error = stack_error;
+        return false;
+      }
+      if (!blend_layer_into(&surface, doc, member, 1.0, &stack_error)) {
+        if (error != nullptr) *error = stack_error;
+        return false;
+      }
+      if (!restore_stack_alpha(&surface, coverage, &stack_error)) {
+        if (error != nullptr) *error = stack_error;
+        return false;
+      }
+      return blend_buffer_into(out, surface, base->blend, static_cast<double>(layer->opacity));
+    }
   }
   Layer standalone = *layer;
-  standalone.clipping_source = 0; /* 基底已单独合成，避免重复裁剪 */
-  return blend_layer_into(out, doc, standalone, 1.0);
+  standalone.clipping_source = 0;
+  return blend_layer_into(out, doc, standalone, 1.0, error);
 }
 
 bool downsample_rgba8(const ImageBuffer& src, int32_t max_edge, ImageBuffer* out) {

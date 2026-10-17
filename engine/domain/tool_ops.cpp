@@ -1,0 +1,940 @@
+// AI生成
+/*
+ * tool_ops.cpp — 工具操作领域层实现（像素内核的产品通路）。
+ *
+ * 本文件是 engine/imaging 下 7 组「此前只有测试直调」的内核进入产品路径的唯一入口：
+ *   WandPixels / HealPixels / PatchPixels / DitherPixels / LensPixels /
+ *   BrushPixels / DeepPixels
+ *
+ * 装配原则（见 tool_ops.h 文件头）：
+ *   - 内核签名按上游原样保留（它们是纯 C、不是本仓设计的），本文件负责把
+ *     「领域参数 + 图层几何 + 坐标空间」翻译成内核要的形态；
+ *   - 坐标空间：内核全部工作在**图层像素空间**（图层自己的像素网格），
+ *     上游的魔棒种子、修补 coverage、透镜中心也都在图层像素空间。宿主的
+ *     指针在文档像素空间，故本文件显式做文档→图层的换算；
+ *   - 参数闸在开事务之前；像素写入一律走 writable_pixels()（COW）。
+ */
+#include "domain/tool_ops.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <vector>
+
+#include "core/comp_geometry.h"
+#include "compositing/adjustment_eval.h"
+#include "domain/document.h"
+#include "imaging/comp_imaging.h"
+
+namespace compositor {
+namespace {
+
+/* 校验上限：色彩范围吸管列表。8 色已远超上游面板容量，取整为闸。 */
+constexpr int32_t kMaxRangeColors = 8;
+
+/* 半径/直径/点数上限：防止宿主传进来一个把缓冲写爆的值。 */
+constexpr int32_t kMaxSelectRadius = 512;
+constexpr float kMaxBrushDiameter = 8192.0f;
+constexpr int32_t kMaxStrokePoints = 1 << 16;
+
+bool finite01(float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; }
+
+std::string label(uint32_t kind) {
+  switch (kind) {
+    case kToolOpSelect: return "select";
+    case kToolOpStroke: return "stroke";
+    case kToolOpHeal: return "heal";
+    case kToolOpDither: return "dither";
+    case kToolOpLens: return "lens";
+    case kToolOpDeep: return "deep";
+    case kToolOpScanlines: return "scanlines";
+    case kToolOpChunky: return "chunky";
+    default: return "none";
+  }
+}
+
+/* ------------------------------------------------------------ 选区 */
+
+/*
+ * 宿主指针在文档像素坐标，内核工作在图层像素坐标。返回 false 表示落在图层外。
+ * 用 effective_bounds() 的原点做平移（对齐合成路径，见 composite_ops.cpp）：
+ * transform 的 x/y 就是图层像素 (0,0) 在文档里的位置。
+ */
+bool seed_to_layer(const Layer& layer, int32_t doc_x, int32_t doc_y, int32_t* out_x, int32_t* out_y) {
+  const comp_rect b = layer.effective_bounds();
+  const int32_t x = doc_x - b.x;
+  const int32_t y = doc_y - b.y;
+  if (x < 0 || y < 0 || x >= layer.pixels.width || y >= layer.pixels.height) return false;
+  *out_x = x;
+  *out_y = y;
+  return true;
+}
+
+/* 累积蒙版：新 coverage 与既有蒙版取最大（反复点选是"加选"，对齐上游）。 */
+void accumulate_mask(Layer* layer, const std::vector<uint8_t>& coverage) {
+  MaskBuffer& mask = layer->mask;
+  if (mask.width != layer->pixels.width || mask.height != layer->pixels.height ||
+      mask.empty()) {
+    mask.resize(layer->pixels.width, layer->pixels.height, 0);
+  }
+  for (int32_t y = 0; y < layer->pixels.height; ++y) {
+    uint8_t* row = mask.writable_row(y);
+    const uint8_t* src = coverage.data() + static_cast<size_t>(y) * static_cast<size_t>(layer->pixels.width);
+    const size_t w = static_cast<size_t>(layer->pixels.width);
+    for (size_t x = 0; x < w; ++x) {
+      if (src[x] > row[x]) row[x] = src[x];
+    }
+  }
+}
+
+/* ------------------------------------------------------------ 笔刷 */
+
+/*
+ * 圆头笔的 coverage（0..255），在图层像素空间上按折线插值落笔。
+ *
+ * 形状 = 到线段的距离 <= 半径；hardness 决定 [hardness*半径, 半径] 这段的
+ * 线性羽化带（hardness=1 带宽 0 ⇒ 全实；hardness=0 从中心就开始羽化）。
+ * pressure × flow 乘进峰值 coverage：flow 是「单次落笔把像素涂死」的总量上限，
+ * 与 pressure（笔压）区分开，两者相乘是上游画笔的合成口径。
+ */
+void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
+                    const float* points, int32_t point_count, const BrushStrokeParams& brush) {
+  const float diameter = brush.diameter > 0.0f ? brush.diameter : 1.0f;
+  const float radius = diameter * 0.5f;
+  const float hard = std::min(std::max(brush.hardness, 0.0f), 1.0f);
+  const float peak = std::min(std::max(brush.pressure * brush.flow, 0.0f), 1.0f);
+  if (peak <= 0.0f) return;
+
+  const float inner = radius * hard;      /* 全实区半径 */
+  const float feather = radius - inner;   /* 羽化带宽 */
+
+  /* coverage 在 (px,py) 上取到最近线段的距离。 */
+  auto coverage_at = [&](float px, float py) -> float {
+    float best = 1e30f;
+    for (int32_t i = 0; i + 1 < point_count; ++i) {
+      const float ax = points[i * 2], ay = points[i * 2 + 1];
+      const float bx = points[(i + 1) * 2], by = points[(i + 1) * 2 + 1];
+      const float dx = bx - ax, dy = by - ay;
+      const float len2 = dx * dx + dy * dy;
+      float t = len2 > 0.0f ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
+      t = std::min(std::max(t, 0.0f), 1.0f);
+      const float ex = px - (ax + dx * t), ey = py - (ay + dy * t);
+      const float d2 = ex * ex + ey * ey;
+      if (d2 < best) best = d2;
+    }
+    if (best > radius * radius) return 0.0f;
+    const float d = std::sqrt(best);
+    if (d <= inner || feather <= 0.0f) return peak;
+    const float t = 1.0f - (d - inner) / feather;  /* 0..1：羽化外缘 → 实心 */
+    const float e = t * t * (3.0f - 2.0f * t);    /* smoothstep，两端导数为 0 */
+    return peak * e;
+  };
+
+  /* 落笔包围盒：按半径外扩，避免整幅扫描。 */
+  float min_x = points[0], max_x = points[0], min_y = points[1], max_y = points[1];
+  for (int32_t i = 1; i < point_count; ++i) {
+    min_x = std::min(min_x, points[i * 2]);
+    max_x = std::max(max_x, points[i * 2]);
+    min_y = std::min(min_y, points[i * 2 + 1]);
+    max_y = std::max(max_y, points[i * 2 + 1]);
+  }
+  int32_t x0 = static_cast<int32_t>(std::floor(min_x - radius));
+  int32_t x1 = static_cast<int32_t>(std::ceil(max_x + radius));
+  int32_t y0 = static_cast<int32_t>(std::floor(min_y - radius));
+  int32_t y1 = static_cast<int32_t>(std::ceil(max_y + radius));
+  x0 = std::max(x0, 0);
+  y0 = std::max(y0, 0);
+  x1 = std::min(x1, width - 1);
+  y1 = std::min(y1, height - 1);
+  if (x0 > x1 || y0 > y1) return;
+
+  /*
+   * 合成口径：笔画按 coverage 盖在图层上，**不叠加**——同 alpha 源覆盖。这与
+   * paint 工具一致，也让「同一参数两次调用逐字节相同」成立（若累加，第二次会
+   * 把像素推得更深，可重复性就没了）。alpha 取 source-over 结果。
+   */
+  for (int32_t y = y0; y <= y1; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = x0; x <= x1; ++x) {
+      const float cov = coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+      if (cov <= 0.0f) continue;
+      uint8_t* px = row + static_cast<size_t>(x) * 4;
+      /* 图层是预乘的：笔色直通 sRGB 先乘 coverage 得预乘值，再 source-over。 */
+      const double sa = cov;
+      const double ba = px[3] / 255.0;
+      const double oa = sa + ba * (1.0 - sa);
+      for (int c = 0; c < 3; ++c) {
+        const double sc = (brush.color[c] / 255.0) * sa;
+        const double bc = px[c] / 255.0;
+        const double oc = sc + bc * (1.0 - sa);
+        px[c] = static_cast<uint8_t>(std::lround(std::min(std::max(oc, 0.0), 1.0) * 255.0));
+      }
+      px[3] = static_cast<uint8_t>(std::lround(std::min(oa, 1.0) * 255.0));
+    }
+  }
+}
+
+/* ------------------------------------------------------------ 透镜 */
+
+/*
+ * 以图层像素中心为畸变中心做径向重采样。
+ *
+ * 上游 Lens 是整篇镜头（中心 = 画布中心）；工具入口把作用面收窄到图层，
+ * 中心取该图层像素的中心，与上游工具栏「Lens 作用于当前图层」一致，
+ * 也避免「图层在画布一角时畸变轴心跑偏」这种直觉上错误的结果。
+ * k = 0 时内核本身即恒等，这里再短路一次以保证逐字节不动。
+ */
+void apply_lens(ImageBuffer* pixels, double k) {
+  if (k == 0.0) return;
+  const size_t width = static_cast<size_t>(pixels->width);
+  const size_t height = static_cast<size_t>(pixels->height);
+  std::vector<uint8_t> source(pixels->pixel_data());
+  lens_distort(source.data(), pixels->writable_pixels().data(), width, height, pixels->stride(), k);
+}
+
+/* ------------------------------------------------------------ 16 位深度 */
+
+/*
+ * 16 位 → 8 位的工作副本统一在 domain/layer.h 的 `deep_to_rgba8`（唯一生产者，
+ * 与合成/缩略图/裁剪取 alpha 用的是同一份）。本层只用它，不再自带一份实现——
+ * 两份实现一旦漂移，同一张 16 位图层在「合成出来」和「quantize 出来」就会不同。
+ */
+
+/*
+ * 16 位图层上的 8 位工具：上游的做法是让操作落在图层**那份 dithered 8 位副本**
+ * 上（DeepLayers.swift:4「a dithered 8-bit copy that … every tool keep using
+ * unchanged」），图层自此不再是 16 位（:5「any other operation makes a new
+ * ImportedImage without it, and the layer is simply 8-bit from then on」）。
+ * 本函数照做：把 16 位像素换成它的 8 位副本，让后面的内核按 4 字节/像素工作。
+ */
+bool use_rgba8_working_copy(Layer* layer) {
+  if (layer->pixels.format == COMP_PIXEL_RGBA8) return true;
+  if (layer->pixels.format != COMP_PIXEL_RGBA16) return false;
+  return deep_to_rgba8(layer->pixels, &layer->pixels);
+}
+
+/*
+ * 16 位深度往返在文件下方实现（`deep_round_trip`）：deep_split 把 16 位像素拆成
+ * low / +1 / +2 / +4 四档的 8 位副本，在每档副本上跑**同一个** 8 位操作，再由
+ * deep_merge 按「颜色落在 low 之上多少」读回 16 位。这是往返唯一能成立的形状：
+ * 四趟都跑同一个内核操作，宿主不能自己造结果，否则就变成伪造像素。
+ */
+
+}  // namespace
+
+/*
+ * 把一个 16 位缓冲穿过 `op`（一个 8 位像素操作）再变回 16 位。
+ *
+ * 口径逐字对齐上游 DeepLayer.run：
+ *   - 不混合通道时跑 4 趟：step = 0,1,2,4，每档 channel = -1（三个颜色通道一起
+ *     上抬），deep_merge 按各档自己那条线读回；
+ *   - mixes 时跑 10 趟：step = 0 加 (1/2/4) x (红/绿/蓝各自单抬)，因为跨通道的
+ *     操作（色相/饱和度等）读本通道的结果会失真。
+ *
+ * 每档副本用 w*4 的紧排 stride（内核按 width 步进，与 ImageBuffer 在 RGBA8
+ * 下的存储一致）。结果先算进 out，**不写 deep**：这样调用方可以把 src/dst 指同一
+ * 个对象而不会边读边写。
+ */
+bool deep_round_trip(const uint16_t* deep, size_t deep_stride, uint16_t* out, size_t out_stride,
+                     size_t width, size_t height, const std::function<bool(uint8_t*, size_t, size_t, size_t)>& op,
+                     int mixes, std::string* error) {
+  if (deep == nullptr || out == nullptr || !op) {
+    if (error != nullptr) *error = "deep round trip got null arguments";
+    return false;
+  }
+  if (width == 0 || height == 0) return true;
+
+  const size_t stride = width * 4u;
+  const size_t bytes = stride * height;
+  const int steps[3] = {1, 2, 4};
+
+  /*
+   * splits 的布局必须与 deep_merge 的读取顺序逐字一致：
+   *   results[0] = low (step 0)；results[1 + i*per + j]，i = 0,1,2 对应 step
+   *   1/2/4，per = mixes ? 3 : 1，j = mixes 时是该颜色通道，否则固定 0。
+   */
+  const int per = mixes ? 3 : 1;
+  std::vector<std::vector<uint8_t>> results;
+  results.reserve(static_cast<size_t>(1) + static_cast<size_t>(per) * 3u);
+  std::vector<uint8_t> buffer;
+
+  buffer.assign(bytes, 0);   /* low 档 */
+  deep_split(deep, deep_stride, buffer.data(), stride, width, height, 0, -1);
+  if (!op(buffer.data(), width, height, stride)) {
+    if (error != nullptr) *error = "deep round trip: the 8-bit operation failed on the low step";
+    return false;
+  }
+  results.push_back(std::move(buffer));
+
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < per; ++j) {
+      const int channel = mixes ? j : -1;
+      buffer.assign(bytes, 0);
+      deep_split(deep, deep_stride, buffer.data(), stride, width, height, steps[i], channel);
+      if (!op(buffer.data(), width, height, stride)) {
+        if (error != nullptr) *error = "deep round trip: the 8-bit operation failed on a near step";
+        return false;
+      }
+      results.push_back(std::move(buffer));
+    }
+  }
+
+  /* 按内核的读取顺序组装三组指针（非 mixes 时三组各自指向同一档）。 */
+  const uint8_t* low_result = results[0].data();
+  const uint8_t* near_results[3];
+  const uint8_t* mid_results[3];
+  const uint8_t* far_results[3];
+  for (int i = 0; i < 3; ++i) {
+    const size_t base = 1u + static_cast<size_t>(i) * static_cast<size_t>(per);
+    near_results[i] = results[base].data();
+    mid_results[i] = results[base + (per > 1 ? 1u : 0u)].data();
+    far_results[i] = results[base + (per > 1 ? 2u : 0u)].data();
+  }
+  deep_merge(deep, deep_stride, low_result, near_results, mid_results, far_results, stride,
+             out, out_stride, width, height, mixes);
+  return true;
+}
+
+/* ============================================================ 选区轮廓 */
+
+/*
+ * 图层蒙版的轮廓折线（上游 MagicWand.outline，`wand_trace`，WandPixels.h）。
+ *
+ * 为什么要有它：上游魔棒不止产出蒙版，还把蒙版的非零区域沿像素边缘描成闭合
+ * 环（外边界顺时针、洞逆时针，于是缠绕规则正好填出那些像素），宿主拿它做
+ * 「选区转可编辑路径」。本仓此前只做了「选中 -> 累积蒙版」那半。唯一的落点
+ * 决定：轮廓必须给在**文档像素坐标**上，因为宿主要把它接到画布路径上，而
+ * 蒙版缓冲区走的是图层像素网格，两者差一个 `effective_bounds()` 的原点。
+ *
+ * 语义（不改内核口径）：
+ *   - 只读：不写图层像素、不写蒙版、不开事务、不进撤销栈；
+ *   - 蒙版为空 → 成功且 loops 为空（对齐上游 `guard loopCount > 0` 返回 nil）；
+ *   - 内核 -2（轮廓过于碎，不值得描）→ COMP_ERR_STATE，与上游 tooDetailed 同义；
+ *   - 内核 -1（内存不足）→ COMP_ERR_OUT_OF_MEMORY。
+ */
+bool selection_outline(const Layer& layer, SelectionOutline* out, comp_result* out_code,
+                       std::string* error) {
+  auto fail = [&](comp_result code, const std::string& message) {
+    if (out_code != nullptr) *out_code = code;
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (out == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "outline out is null");
+
+  out->loops.clear();
+  out->points.clear();
+  if (layer.mask.empty()) return true;   /* 无蒙版 = 无选中 = 无轮廓 */
+
+  const size_t w = static_cast<size_t>(layer.mask.width);
+  const size_t h = static_cast<size_t>(layer.mask.height);
+  int32_t* points = nullptr;
+  int32_t* loops = nullptr;
+  size_t point_count = 0;
+  size_t loop_count = 0;
+  const int rc = wand_trace(layer.mask.row(0), w, h, &points, &point_count, &loops, &loop_count);
+  /*
+   * 无论走哪条分支，两段 malloc 都只在这里释放一次（内核失败时也会置空/不填，
+   * free(nullptr) 安全）。搬到宿主 vector 后裸指针不越过本函数，避免把
+   * malloc 契约泄漏给 ABI 边界。
+   */
+  if (rc == -2) {
+    free(points);
+    free(loops);
+    return fail(COMP_ERR_STATE, "selection outline is too detailed to draw; raise the tolerance or "
+                "turn off contiguous");
+  }
+  if (rc != 0) {
+    free(points);
+    free(loops);
+    return fail(COMP_ERR_OUT_OF_MEMORY, "selection outline ran out of memory");
+  }
+  out->points.assign(points, points + point_count * 2);
+  out->loops.assign(loops, loops + loop_count);
+  free(points);
+  free(loops);
+
+  /* 平移到文档像素空间：宿主要把轮廓接到画布路径上。 */
+  const comp_rect b = layer.effective_bounds();
+  if (b.x != 0 || b.y != 0) {
+    for (size_t i = 0; i < out->points.size(); i += 2) {
+      out->points[i] += b.x;
+      out->points[i + 1] += b.y;
+    }
+  }
+  return true;
+}
+
+/* ============================================================ 入口 */
+
+bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
+                 comp_result* out_code, std::string* error, std::string* note) {
+  /*
+   * 错误码由本层直接回报，不让调用方从文案反推（见 tool_ops.h 末尾）。
+   * 每一处失败都自带码；兜底为 INTERNAL，只在 fail() 被漏标的路径上出现。
+   */
+  auto fail = [&](comp_result code, const std::string& message) {
+    if (out_code != nullptr) *out_code = code;
+    if (error != nullptr) *error = label(static_cast<uint32_t>(params.kind)) + ": " + message;
+    return false;
+  };
+  auto bad_arg = [&](const std::string& message) { return fail(COMP_ERR_INVALID_ARGUMENT, message); };
+  auto bad_state = [&](const std::string& message) { return fail(COMP_ERR_STATE, message); };
+  auto oom = [&](const std::string& message) { return fail(COMP_ERR_OUT_OF_MEMORY, message); };
+
+  if (document == nullptr) return bad_arg("document is null");
+  Layer* layer = document->find(target);
+  if (layer == nullptr) return fail(COMP_ERR_NOT_FOUND, "layer not found");
+  if (layer->is_group) return bad_state("group layer has no pixels to operate on");
+  if (!layer->has_pixels()) return bad_state("layer has no pixels");
+
+  const size_t width = static_cast<size_t>(layer->pixels.width);
+  const size_t height = static_cast<size_t>(layer->pixels.height);
+
+  /* ---------------- 参数闸（全部在开事务之前，见 tool_ops.h 设计原则 3） */
+
+  switch (params.kind) {
+    case kToolOpNone:
+      return bad_arg("kind is none");
+
+    case kToolOpSelect: {
+      const bool use_range = params.use_color_range != 0;
+      if (use_range) {
+        if (params.color_range.fuzziness < 0 || params.color_range.fuzziness > 255) {
+          return bad_arg("color range fuzziness out of 0..255");
+        }
+        if (params.include_count < 0 || params.include_count > kMaxRangeColors) {
+          return bad_arg("include color count out of range");
+        }
+        if (params.exclude_count < 0 || params.exclude_count > kMaxRangeColors) {
+          return bad_arg("exclude color count out of range");
+        }
+        if (params.include_count > 0 && params.include == nullptr) {
+          return bad_arg("include colors are null");
+        }
+        if (params.exclude_count > 0 && params.exclude == nullptr) {
+          return bad_arg("exclude colors are null");
+        }
+      } else {
+        if (params.select.tolerance < 0 || params.select.tolerance > 255) {
+          return bad_arg("select tolerance out of 0..255");
+        }
+        if (params.select.radius < 0 || params.select.radius > kMaxSelectRadius) {
+          return bad_arg("select radius out of range");
+        }
+        int32_t seed_x = 0, seed_y = 0;
+        if (!seed_to_layer(*layer, params.seed_x, params.seed_y, &seed_x, &seed_y)) {
+          return bad_arg("wand seed lies outside the layer");
+        }
+      }
+      break;
+    }
+
+    case kToolOpStroke: {
+      if (params.point_count <= 0 || params.point_count > kMaxStrokePoints) {
+        return bad_arg("stroke needs 1..65536 points");
+      }
+      if (params.points == nullptr) return bad_arg("stroke points are null");
+      if (!std::isfinite(params.brush.diameter) || params.brush.diameter <= 0.0f ||
+          params.brush.diameter > kMaxBrushDiameter) {
+        return bad_arg("brush diameter out of range");
+      }
+      if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
+      if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
+      if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i])) return bad_arg("stroke point is not finite");
+      }
+      break;
+    }
+
+    case kToolOpHeal: {
+      if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
+      if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
+      if (params.coverage == nullptr) return bad_arg("heal coverage is null");
+      const size_t need = width > 0 ? width : 1u;
+      if (params.coverage_stride < need) return bad_arg("heal coverage stride too small");
+      break;
+    }
+
+    case kToolOpDither: {
+      if (params.dither.style < 0 || params.dither.style > DITHER_GLYPHS) {
+        return bad_arg("dither style out of range");
+      }
+      if (params.dither.levels < 2 || params.dither.levels > 16) {
+        return bad_arg("dither levels must be 2..16");
+      }
+      if (!std::isfinite(params.dither.diffusion) || params.dither.diffusion < 0.0f ||
+          params.dither.diffusion > 1.0f) {
+        return bad_arg("dither diffusion out of 0..1");
+      }
+      if (params.dither.cell < 2 || params.dither.cell > 512) {
+        return bad_arg("dither cell must be 2..512");
+      }
+      if (!std::isfinite(params.dither.angle)) return bad_arg("dither angle is not finite");
+      if (!std::isfinite(params.dither.density) || !std::isfinite(params.dither.contrast)) {
+        return bad_arg("dither density/contrast is not finite");
+      }
+      break;
+    }
+
+    case kToolOpLens: {
+      if (!std::isfinite(params.lens.k)) return bad_arg("lens k is not finite");
+      if (std::fabs(params.lens.k) > 1.0) return bad_arg("lens k must be within -1..1");
+      break;
+    }
+
+    case kToolOpScanlines: {
+      const ScanlinesParams& s = params.scanlines;
+      if (s.spacing < 2 || s.spacing > 32) return bad_arg("scanlines spacing must be 2..32");
+      if (!finite01(s.thickness) || s.thickness < 0.05f) return bad_arg("scanlines thickness must be 0.05..1");
+      if (!finite01(s.glow) || !finite01(s.dots) || !finite01(s.smoothness) ||
+          !finite01(s.threshold) || !finite01(s.black_level)) {
+        return bad_arg("scanlines glow/dots/smoothness/threshold/black_level must be 0..1");
+      }
+      if (!std::isfinite(s.wobble) || s.wobble < 0.0f || s.wobble > 64.0f) {
+        return bad_arg("scanlines wobble must be 0..64");
+      }
+      if (!std::isfinite(s.displace) || s.displace < -100.0f || s.displace > 100.0f) {
+        return bad_arg("scanlines displace must be -100..100");
+      }
+      if (!std::isfinite(s.split) || s.split < 0.0f || s.split > 16.0f) {
+        return bad_arg("scanlines split must be 0..16");
+      }
+      if (!finite01(s.density + 0.5f) || !finite01(s.contrast + 0.5f)) {
+        return bad_arg("scanlines density/contrast must be -1..1");
+      }
+      break;
+    }
+
+    case kToolOpChunky: {
+      if (params.chunky.block < 2 || params.chunky.block > 64) {
+        return bad_arg("chunky block must be 2..64");
+      }
+      if (params.chunky.dot != 0 && params.chunky.two_colors == 0) {
+        return bad_arg("chunky dot gaps take the dark color only when two_colors is set");
+      }
+      break;
+    }
+
+    case kToolOpDeep: {
+      if (params.deep_mode != kToolDeepQuantize && params.deep_mode != kToolDeepRoundTrip) {
+        return bad_arg("deep mode must be quantize or round trip");
+      }
+      if (layer->pixels.format != COMP_PIXEL_RGBA16) {
+        return bad_state("deep quantize needs a COMP_PIXEL_RGBA16 layer (the layer holds 8-bit "
+                    "pixels already); import a 16-bit asset, or set RGBA16 pixels via "
+                    "comp_layer_set_pixels");
+      }
+      if (params.deep_mode == kToolDeepRoundTrip) {
+        /*
+         * 往返的内层操作只允许**不改几何、不写蒙版**的像素算子（目前是 lens /
+         * dither / none）。stroke、heal 需要坐标与 coverage，select 写蒙版，
+         * scanlines/chunky 改了就是另一回事——降级成「对副本的像素变换」等于
+         * 伪造它们在 16 位上的语义，所以在参数闸拒绝，不留给执行期。
+         */
+        if (params.inner != kToolOpNone && params.inner != kToolOpLens && params.inner != kToolOpDither) {
+          return bad_arg("deep round trip inner op must be none, lens or dither (operations that "
+                    "change geometry or write the mask have no 16-bit meaning here)");
+        }
+        if (params.inner == kToolOpLens) {
+          if (!std::isfinite(params.lens.k) || std::fabs(params.lens.k) > 1.0) {
+            return bad_arg("deep round trip inner lens k must be finite and within -1..1");
+          }
+        }
+        if (params.inner == kToolOpDither) {
+          if (params.dither.style < 0 || params.dither.style > DITHER_GLYPHS) {
+            return bad_arg("deep round trip inner dither style out of range");
+          }
+          if (params.dither.levels < 2 || params.dither.levels > 16) {
+            return bad_arg("deep round trip inner dither levels must be 2..16");
+          }
+          if (!std::isfinite(params.dither.diffusion) || params.dither.diffusion < 0.0f ||
+              params.dither.diffusion > 1.0f) {
+            return bad_arg("deep round trip inner dither diffusion out of 0..1");
+          }
+          if (params.dither.cell < 2 || params.dither.cell > 512) {
+            return bad_arg("deep round trip inner dither cell must be 2..512");
+          }
+          if (!std::isfinite(params.dither.angle)) return bad_arg("deep round trip inner dither angle is not finite");
+          if (!std::isfinite(params.dither.density) || !std::isfinite(params.dither.contrast)) {
+            return bad_arg("deep round trip inner dither density/contrast is not finite");
+          }
+        }
+      }
+      break;
+    }
+
+    default:
+      return bad_arg("unknown tool op kind");
+  }
+
+  /* ---------------- 执行（一步撤销） */
+
+  const bool owns_txn = !document->txn_active();
+  std::string txn_error;
+  if (owns_txn && document->txn_begin("Tool: " + label(static_cast<uint32_t>(params.kind)),
+                                      &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    if (out_code != nullptr) *out_code = COMP_ERR_STATE;
+    return false;
+  }
+  Layer* target_layer = document->find(target);
+  if (target_layer == nullptr) {
+    if (owns_txn) document->txn_abort(&txn_error);
+    return fail(COMP_ERR_NOT_FOUND, "layer vanished after the parameter gate");
+  }
+
+  /*
+   * deep 之外的工具全是 8 位内核：先把 16 位像素落到它的 8 位副本（见
+   * use_rgba8_working_copy）。deep 自己不在这里降位——quantize 分支做的就是
+   * 这件事，round trip 分支在参数闸已经拒绝，在这里降位会掩盖那条拒绝。
+   */
+  if (params.kind != kToolOpDeep && !use_rgba8_working_copy(target_layer)) {
+    if (owns_txn) document->txn_abort(&txn_error);
+    return bad_state("layer pixels are neither RGBA8 nor RGBA16");
+  }
+
+  bool ok = true;
+  switch (params.kind) {
+    case kToolOpSelect: {
+      std::vector<uint8_t> mask(width * height, 0);
+      long selected = 0;
+      if (params.use_color_range != 0) {
+        selected = color_range_mask(target_layer->pixels.writable_pixels().data(), width, height,
+                                    target_layer->pixels.stride(), params.include,
+                                    params.include_count, params.exclude, params.exclude_count,
+                                    params.color_range.fuzziness, params.color_range.invert,
+                                    mask.data());
+      } else {
+        int32_t seed_x = 0, seed_y = 0;
+        seed_to_layer(*target_layer, params.seed_x, params.seed_y, &seed_x, &seed_y);
+        selected = wand_mask(target_layer->pixels.writable_pixels().data(), width, height,
+                             target_layer->pixels.stride(),
+                             static_cast<size_t>(seed_x), static_cast<size_t>(seed_y),
+                             static_cast<size_t>(params.select.radius), params.select.tolerance,
+                             params.select.contiguous, mask.data());
+      }
+      if (selected < 0) {
+        ok = oom("select ran out of memory");
+        break;
+      }
+      /* 选中数不为 0 时才写蒙版：否则「点了个空处」会留下一张全 0 的空蒙版，
+       * 把整层蒙成透明——这与上游「无选中即不改变」一致。 */
+      if (selected > 0) accumulate_mask(target_layer, mask);
+      if (note != nullptr) *note += "selected pixels are accumulated into the layer mask (add)";
+      break;
+    }
+
+    case kToolOpStroke: {
+      /* 文档 → 图层像素坐标平移。 */
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        const int32_t coordinate = static_cast<int32_t>(params.points[i]);
+        local[i] = static_cast<float>(coordinate - ((i & 1) ? b.y : b.x));
+      }
+      stamp_polyline(target_layer->pixels.writable_pixels().data(),
+                     target_layer->pixels.stride(), target_layer->pixels.width,
+                     target_layer->pixels.height, local.data(), params.point_count, params.brush);
+      break;
+    }
+
+    case kToolOpHeal: {
+      /* coverage 按图层像素空间解释，逐行按宿主 stride 取。 */
+      std::vector<uint8_t> tight(width * height);
+      for (size_t y = 0; y < height; ++y) {
+        std::memcpy(tight.data() + y * width,
+                    params.coverage + y * params.coverage_stride, width);
+      }
+      const int rc = spot_heal(target_layer->pixels.writable_pixels().data(), tight.data(), width,
+                               height, target_layer->pixels.stride(), params.heal.opacity,
+                               params.heal.mode, params.heal.seed);
+      if (rc < 0) ok = oom("heal ran out of memory");
+      break;
+    }
+
+    case kToolOpDither: {
+      /* 域层 DitherParams -> 内核 DitherParams：字段名逐字对应，缺省项显式置 0。 */
+      ::DitherParams p{};
+      p.style = params.dither.style;
+      p.levels = params.dither.levels;
+      p.diffusion = params.dither.diffusion;
+      p.density = params.dither.density;
+      p.contrast = params.dither.contrast;
+      p.cell = params.dither.cell;
+      p.angle = params.dither.angle;
+      p.lightOnDark = params.dither.light_on_dark;
+      p.originalColors = params.dither.original_colors;
+      for (int c = 0; c < 3; ++c) {
+        p.dark[c] = params.dither.dark[c];
+        p.light[c] = params.dither.light[c];
+      }
+      /*
+       * 字形图集刻意不由 ABI 灌入（那是宿主资源，见 tool_ops.h）。GLYPHS 缺图集时
+       * 内核走 spot() 的 default 分支 = 菱形网点：如实回报，不静默按方块画，
+       * 因为把内核的菱形说成方块就是在撒谎。
+       */
+      p.glyphs = nullptr;
+      p.glyphCoverage = nullptr;
+      p.glyphCount = 0;
+      p.glyphWidth = 0;
+      p.glyphHeight = 0;
+      if (p.style == DITHER_GLYPHS && note != nullptr) {
+        *note += "glyph atlas not carried by the ABI; GLYPHS fell back to the diamond screen "
+                 "(DitherPixels spot() default branch); ";
+      }
+      if (dither_apply(target_layer->pixels.writable_pixels().data(), width, height,
+                       target_layer->pixels.stride(), &p) == 0) {
+        ok = oom("dither ran out of memory");
+      }
+      break;
+    }
+
+    case kToolOpLens: {
+      apply_lens(&target_layer->pixels, params.lens.k);
+      break;
+    }
+
+    case kToolOpDeep: {
+      if (params.deep_mode == kToolDeepQuantize) {
+        if (!deep_to_rgba8(target_layer->pixels, &target_layer->pixels)) {
+          ok = bad_state("deep quantize could not build the 8-bit working copy");
+        }
+        break;
+      }
+      /*
+       * 往返：图层保持 RGBA16，把 pixels 穿过 `params.inner` 那个 8 位操作四遍
+       * （deep_split/deep_merge），结果仍是 16 位。inner 为 none 时不做任何操作，
+       * 直接把 low 档结果合回——这条路径等价于「8 位量化后又读回 16 位」，
+       * 会丢掉 8 位以上的精度，如实写进 note 而不是当作无损往返。
+       */
+      {
+        const uint16_t* deep = reinterpret_cast<const uint16_t*>(target_layer->pixels.row(0));
+        const size_t deep_stride = target_layer->pixels.stride();
+        std::vector<uint16_t> merged(width * height * 4u, 0);
+
+        /* 把 inner 那个 8 位操作包成 std::function：四趟各跑一遍同一个内核。 */
+        auto apply_inner = [&](uint8_t* buf, size_t w, size_t h, size_t stride) -> bool {
+          switch (params.inner) {
+            case kToolOpNone:
+              return true;   /* 不做操作：见上面的 note 说明 */
+            case kToolOpLens: {
+              if (params.lens.k == 0.0) return true;
+              std::vector<uint8_t> src(buf, buf + stride * h);
+              lens_distort(src.data(), buf, w, h, stride, params.lens.k);
+              return true;
+            }
+            case kToolOpDither: {
+              ::DitherParams p{};
+              p.style = params.dither.style;
+              p.levels = params.dither.levels;
+              p.diffusion = params.dither.diffusion;
+              p.density = params.dither.density;
+              p.contrast = params.dither.contrast;
+              p.cell = params.dither.cell;
+              p.angle = params.dither.angle;
+              p.lightOnDark = params.dither.light_on_dark;
+              p.originalColors = params.dither.original_colors;
+              for (int c = 0; c < 3; ++c) {
+                p.dark[c] = params.dither.dark[c];
+                p.light[c] = params.dither.light[c];
+              }
+              p.glyphs = nullptr;
+              p.glyphCoverage = nullptr;
+              p.glyphCount = 0;
+              p.glyphWidth = 0;
+              p.glyphHeight = 0;
+              return dither_apply(buf, w, h, stride, &p) != 0;
+            }
+            default:
+              /* 其余算子要么改几何（stroke/heal）、要么写蒙版（select），都不可
+               * 降级成「对副本的像素变换」，故不列入；参数闸已拒绝。 */
+              return false;
+          }
+        };
+
+        std::string rt_error;
+        if (!deep_round_trip(deep, deep_stride, merged.data(), width * 8u, width, height,
+                             apply_inner, /*mixes=*/0, &rt_error)) {
+          ok = fail(COMP_ERR_INTERNAL, rt_error);
+          break;
+        }
+        /* 结果写回（COW）：图层仍是 16 位，像素换成合回的结果。 */
+        std::memcpy(target_layer->pixels.writable_pixels().data(), merged.data(), width * height * 8u);
+        if (params.inner == kToolOpNone && note != nullptr) {
+          *note += "deep round trip without an inner operation is a quantize-and-read-back: "
+                   "it keeps the layer at 16 bits but loses precision above 8 bits; ";
+        }
+      }
+      break;
+    }
+
+    case kToolOpScanlines: {
+      /* 域层参数 -> 内核 ScanlinesParams（字段逐字对应，缺省项显式置 0）。 */
+      ::ScanlinesParams p{};
+      p.spacing = params.scanlines.spacing;
+      p.thickness = params.scanlines.thickness;
+      p.dots = params.scanlines.dots;
+      p.wobble = params.scanlines.wobble;
+      p.displace = params.scanlines.displace;
+      p.threshold = params.scanlines.threshold;
+      p.split = params.scanlines.split;
+      p.density = params.scanlines.density;
+      p.contrast = params.scanlines.contrast;
+      p.blackLevel = params.scanlines.black_level;
+      p.smoothness = params.scanlines.smoothness;
+      p.originalColors = params.scanlines.original_colors;
+      for (int c = 0; c < 3; ++c) {
+        p.dark[c] = params.scanlines.dark[c];
+        p.light[c] = params.scanlines.light[c];
+      }
+      if (scanlines_apply(target_layer->pixels.writable_pixels().data(), width, height,
+                          target_layer->pixels.stride(), &p) == 0) {
+        ok = oom("scanlines ran out of memory");
+        break;
+      }
+      /*
+       * glow > 0 时上游再加一遍「线外的光晕」：把线本身模糊后加回（磷光晕开）。
+       * 上游用 Core Image 的高斯模糊；本仓没有该路径，用调整求值里已有的
+       * 三趟盒式近似（adjustment_eval.cpp 的 blur）——同一份代码、同一个调用，
+       * 免得再抄一份模糊实现出来。模糊在图层像素空间做，与 scanlines 同一坐标系。
+       */
+      if (params.scanlines.glow > 0.0f) {
+        const ImageBuffer& src = target_layer->pixels;   /* 只读：row() 绝不触发复制 */
+        const size_t sigma_px = static_cast<size_t>(params.scanlines.spacing) * 3u + 3u;
+        std::vector<uint8_t> bloom;
+        if (blur_rgba8_copy(src.row(0), src.width, src.height, src.stride(),
+                            static_cast<float>(sigma_px), &bloom)) {
+          /*
+           * 上游 amount = glow/100 * 2.5（glow 已归一到 0..1，故 ×2.5）。
+           * 内核自己反预乘/再预乘，此处不得动 alpha。
+           */
+          dither_glow(target_layer->pixels.writable_pixels().data(), bloom.data(), width, height,
+                      target_layer->pixels.stride(),
+                      std::min(params.scanlines.glow * 2.5f, 2.5f));
+        } else {
+          ok = oom("scanlines glow ran out of memory");
+        }
+      }
+      break;
+    }
+
+    case kToolOpChunky: {
+      /*
+       * 上游口径（0bit/Dither.swift:98-127）：先把图降采样到 1/block，在**副本**
+       * 上抖动（避免半调参数去改原图），再用无平滑的最近邻放大回去；pixelShape
+       * 为 dot 时用 dither_dots 把块间缝隙填成 dark 色。ASCII 风格按像素尺寸走，
+       * 与本算子无关，故不区分。
+       */
+      const int32_t block = params.chunky.block;
+      const int32_t small_w = static_cast<int32_t>((width + static_cast<size_t>(block) - 1u) / static_cast<size_t>(block));
+      const int32_t small_h = static_cast<int32_t>((height + static_cast<size_t>(block) - 1u) / static_cast<size_t>(block));
+      if (small_w <= 0 || small_h <= 0) { ok = bad_arg("chunky block is larger than the layer"); break; }
+
+      /* 降采样取小块内的直通 sRGB 均值（预乘均值的 alpha 会偏暗，故按直通道算）。 */
+      std::vector<uint8_t> small(static_cast<size_t>(small_w) * static_cast<size_t>(small_h) * 4u, 0);
+      for (int32_t y = 0; y < small_h; ++y) {
+        for (int32_t x = 0; x < small_w; ++x) {
+          uint32_t acc[4] = {0, 0, 0, 0};
+          uint32_t n = 0;
+          const int32_t x1 = std::min(static_cast<int32_t>(width), (x + 1) * block);
+          const int32_t y1 = std::min(static_cast<int32_t>(height), (y + 1) * block);
+          for (int32_t sy = y * block; sy < y1; ++sy) {
+            const uint8_t* row = target_layer->pixels.row(sy);
+            for (int32_t sx = x * block; sx < x1; ++sx) {
+              const uint8_t* px = row + static_cast<size_t>(sx) * 4u;
+              const uint32_t a = px[3];
+                  uint32_t straight[3];
+                  for (int c = 0; c < 3; ++c) straight[c] = a ? (px[c] * 255u + a / 2u) / a : 0u;
+                  for (int c = 0; c < 3; ++c) acc[c] += straight[c];
+                  acc[3] += a;
+                  ++n;
+                }
+          }
+          if (n == 0) continue;
+          const uint32_t sa = acc[3] / n;
+          uint8_t* out = small.data() + (static_cast<size_t>(y) * static_cast<size_t>(small_w) + static_cast<size_t>(x)) * 4u;
+          for (int c = 0; c < 3; ++c) {
+            const uint32_t sc = acc[c] / n;
+            out[c] = static_cast<uint8_t>(sc > sa ? sa : sc);
+          }
+          out[3] = static_cast<uint8_t>(sa);
+        }
+      }
+
+      /* 抖动落在副本上（同 DitherParams，字形图集仍不由 ABI 灌入）。 */
+      ::DitherParams p{};
+      p.style = params.dither.style;
+      p.levels = params.dither.levels;
+      p.diffusion = params.dither.diffusion;
+      p.density = params.dither.density;
+      p.contrast = params.dither.contrast;
+      p.cell = params.dither.cell;
+      p.angle = params.dither.angle;
+      p.lightOnDark = params.dither.light_on_dark;
+      p.originalColors = params.dither.original_colors;
+      for (int c = 0; c < 3; ++c) {
+        p.dark[c] = params.dither.dark[c];
+        p.light[c] = params.dither.light[c];
+      }
+      if (p.style == DITHER_GLYPHS && note != nullptr) {
+        *note += "glyph atlas not carried by the ABI; GLYPHS fell back to the diamond screen "
+                 "(DitherPixels spot() default branch); ";
+      }
+      if (dither_apply(small.data(), static_cast<size_t>(small_w), static_cast<size_t>(small_h),
+                       static_cast<size_t>(small_w) * 4u, &p) == 0) {
+        ok = oom("chunky dither ran out of memory");
+        break;
+      }
+
+      /* 最近邻放大回原尺寸（上游放大时不设插值质量，即不平滑）。 */
+      std::vector<uint8_t>& full = target_layer->pixels.writable_pixels();
+      for (int32_t y = 0; y < target_layer->pixels.height; ++y) {
+        uint8_t* row = full.data() + static_cast<size_t>(y) * target_layer->pixels.stride();
+        const size_t sy = std::min(static_cast<size_t>(y) / static_cast<size_t>(block),
+                                   static_cast<size_t>(small_h) - 1u);
+        const uint8_t* src = small.data() + sy * static_cast<size_t>(small_w) * 4u;
+        for (int32_t x = 0; x < target_layer->pixels.width; ++x) {
+          const size_t sx = std::min(static_cast<size_t>(x) / static_cast<size_t>(block),
+                                     static_cast<size_t>(small_w) - 1u);
+          std::memcpy(row + static_cast<size_t>(x) * 4u, src + sx * 4u, 4u);
+        }
+      }
+      if (params.chunky.dot != 0) {
+        uint8_t gap[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c) gap[c] = params.chunky.two_colors ? params.chunky.gap[c] : 0u;
+        dither_dots(full.data(), width, height, target_layer->pixels.stride(), block, gap);
+      }
+      break;
+    }
+
+    default:
+      ok = bad_arg("unknown tool op kind");
+      break;
+  }
+
+  if (!ok) {
+    if (owns_txn) document->txn_abort(&txn_error);
+    return false;
+  }
+  if (owns_txn) {
+    std::string commit_error;
+    if (document->txn_commit(&commit_error) != COMP_OK) {
+      if (error != nullptr) *error = commit_error;
+      if (out_code != nullptr) *out_code = COMP_ERR_STATE;
+      return false;
+    }
+  }
+  document->mark_dirty(true);
+  /*
+   * 成功也回写 out_code = COMP_OK：调用方常把一个初值为 COMP_ERR_INTERNAL 的
+   * 变量传进来当作「有没有出错」的标志，只在失败时写就等于让上一次失败的残值
+   * 留在那里，把成功读成失败（域层测试里真踩到了这个）。
+   */
+  if (out_code != nullptr) *out_code = COMP_OK;
+  return true;
+}
+
+}  // namespace compositor

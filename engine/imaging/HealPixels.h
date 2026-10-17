@@ -3,6 +3,10 @@
 #define HealPixels_h
 #include <stdint.h>
 #include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 // Half-open bounds of nonzero bytes in a gray bitmap; all zero when empty.
 void heal_coverage_bounds(const uint8_t *gray, size_t width, size_t height, size_t stride, long bounds[4]);
 // Spot healing, in place, over premultiplied RGBA (4 bytes per pixel, `stride` bytes per row).
@@ -21,4 +25,8 @@ void heal_coverage_bounds(const uint8_t *gray, size_t width, size_t height, size
 void heal_membrane(float *value, const uint8_t *role, long w, long h, int depth);
 int spot_heal(uint8_t *rgba, const uint8_t *coverage, size_t width, size_t height, size_t stride,
               float opacity, int mode, uint32_t seed);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 #endif
