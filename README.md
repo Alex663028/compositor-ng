@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **241 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **249 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -307,7 +307,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 241 cases, 0 failed, 0 check failures`（当前基线；§6.1.14 起在此基础上继续累加） |
+| 测试 | `summary: 249 cases, 0 failed, 0 check failures`（当前基线；§6.1.15 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
 
@@ -761,6 +761,71 @@ C1 是 C 方案的第一块地基：`COMP_PIXEL_RGBA16F` 枚举早就在
 基线 **233 → 241**（0 failed），`run_regression.py --require-ohos` **6/6 PASS**，
 OHOS 72 fail=0，Windows 壳 27 项 SHA256 与基线一致。
 
+### 6.1.15 上游函数对齐：AdjustPixels 缺失的 4 个 Camera Raw 函数（2026-10-17，Pi）
+
+ALEX 拍板「1. 对齐上游函数」。先把 10 组内核做了一次**函数名集合差**扫描（不是靠 diff 行数
+目测），确认缺口**只有 AdjustPixels 一组**：
+
+| 内核 | 上游函数数 | ng 函数数 | 上游有 ng 无 |
+|------|-----------|----------|------------|
+| Brush / Heal / Lens / Levels / Noise / Wand | 4/6/1/3/4/7 | 同 | **零** |
+| PatchPixels / DitherPixels / DeepPixels | 19 / 17 / 23 | 19 / 17 / 27 | **零**（Deep 多 4 个是 C1 主动新增的 half↔u16，ng 是超集） |
+| **AdjustPixels** | **62** | **58** | **4** |
+
+补进来的四个（上游 v1.5.2 / v1.5.3 新增，ng 一个都没有）：
+
+| 上游函数 | 作用 | 为什么之前缺它也没崩 |
+|----------|------|--------------------|
+| `camera_raw_lookup_is_valid` | Metal lookup 的**受支持表域闸**：`grid==33` 且每个分量有限且在 0..1 | ng 无 GPU lookup 通路，域闸无人问 |
+| `camera_raw_repair_lookup` | GPU 舍入边界像素回落到原双精度 `composed_lookup` | 同上 |
+| `box_mean_plane`（static） | **窗口在边缘收缩**的盒式均值 | 与已有的 `box_blur_plane` 名字相近、职责相近，极易误认为重复 |
+| `adjust_camera_raw_shadows` | 按画面**分区自适应**的 Shadows（log2 亮度域 + 引导滤波） | Camera Raw 无产品通路（见口径 B） |
+
+移植后 `AdjustPixels.c` 与上游 `origin/main 365b574` 的 diff **只剩两处**：三处
+`dispatch_apply` → 顺序 `for`（M1 去 GCD，与同文件既有的两处写法逐字一致），以及
+include 与 `in_bands` 的桥接。头文件除 `// AI生成` 与 `extern "C"` 包裹外与上游一致。
+
+**`box_mean_plane` 与 `box_blur_plane` 不是重复，是两个不同的算子**（README 之前没写清，
+本轮踩过一次）：前者边缘**收缩窗口**、分母用实际可用计数；后者边缘**重复取值**、分母恒为 `2r+1`。
+Shadow 的区域层正是靠前者算的，换成后者会让图像边缘变暗。
+
+护栏交付 `tests/test_camera_raw_align.cpp` 7 个用例，注入验证：
+
+- 注 1 去 `grid!=33` → 1 case / 3 checks 挂 ✓
+- 注 2 去 `uncertain` 闸（无脑重算全部像素）→ 1 case / 1 check 挂 ✓
+- 注 3 去 Shadows 的 alpha 守卫生 → 1 case / 1 check 挂 ✓
+- 注 6 放松 `kCount<1` 守卫 → 1 case / 1 check 挂 ✓
+- **注 5（x 域右端夹取）初报不红** → 见下
+- **注 4（`box_mean_plane` 换成 `box_blur_plane` 语义）初报不红** → 见下
+
+**两次「护栏初报不红」，根因各不同，都已定位并补栏**（本轮第三个、第四次同类事件，
+前两次见 §6.1.13 / §6.1.14）：
+
+1. **注 5 是真缺陷，不是等价变异。** 上游写 `int x0c = (int)xp < xCount - 1 ? (int)xp : xCount - 2;`
+   是因为三个平面要在 x 上**双线性插值**，列号必须夹到 `xCount-2` 才读得到右邻。
+   我先写了脚本穷举 `xp ∈ [0, xCount-1]`，确认注入版 `int x0c = (int)xp` 只在
+   `xp` **恰好落在最右列**（`xt` 恰为 0）时才越界——共 38 种可达情形，`xt=0` 时读到的
+   是**下一个 K 行的第 0 列**（末行时直接读出整个 `coefficients` 缓冲区）。
+   原护栏用 `xLow=-6.0f` 让 `xp` 落在域内而非末列，压根碰不到。
+   补 `camera_raw_shadows_clamps_the_x_domain_inside_its_row`：用 `xLow=-7.5f` 强制
+   `xp` 落到最右列，且把**下一个 K 行的第 0 列**设成 `9.0`（lift=9 → gain=512 → 白场），
+   正误两条路给出「不变」与「全白」两种互斥结果。补后注入被抓住。
+2. **注 4 是真差异，但我前两版探针都是瞎的。** 换 `box_blur_plane` 语义后
+   `adjust_camera_raw_shadows` 输出**逐字节不变**，连查三步：
+   ① 线性 ramp——两种窗口的均值都等于 ramp 本身；② 阶跃边缘 + `radius=1`——饱和成同一串；
+   ③ 把 `box_mean_plane` 单独拷出来对比——**差异极大**（`step row0: -4.000 -4.000 -2.400`
+   vs `fixed row0: -1.440 -1.920 -1.440`）。
+   根因是探针**只把 lift 平面设成非零**：`lift` 不乘 `detail`，所以输出与被注入的平滑结果无关。
+   改成只给 **gain-above** 平面非零（`detail = level - region` 才生效）后立刻分道扬镳——
+   正确实现 `212 208 205 204 203 202 201 200`（过边后逐点衰减），固定窗长版
+   `200 200 200 ...`（一步跳到平台）。补
+   `camera_raw_shadows_detail_gain_exposes_the_smoothing_window` 钉住「过边后 >200 且严格递减」。
+   教训比结论重要：**护栏的输入要选在「被注入的量真正参与输出」的那条支路上**，
+   否则注入的是一条死路，测一百遍也不红。
+
+护栏与注入记录见 `report/A1-upstream-align-20261017-pi.md`。基线 **241 → 249**（0 failed），
+`run_regression.py --require-ohos` **6/6 PASS**，OHOS 72 fail=0，Windows 壳 27 项 SHA256 一致。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -916,7 +981,11 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 两者差异集中在 ①~④ 盖不到的地方：口径 A 问的是「引擎核的契约面与像素保真度做完了吗」，
 答案是基本做完（≈92%）；口径 B 问的是「用户能做的事做完了吗」，答案是还差一半。
 **像素算法层几乎满配**：上游 10 组 `.c` 内核逐文件 diff，**6 组 diff 行数为 0**
-（Brush/Heal/Lens/Levels/Noise/Wand 逐字节等同），另 4 组差异仅注释。
+（Brush/Heal/Lens/Levels/Noise/Wand 逐字节等同）；PatchPixels / DitherPixels / DeepPixels
+为去 GCD 的调度改写或主动超集；**AdjustPixels 曾落后 4 个函数**（上游 1.5.2/1.5.3 新增的
+`camera_raw_lookup_is_valid` / `camera_raw_repair_lookup` / `box_mean_plane` /
+`adjust_camera_raw_shadows`），已于 §6.1.15 全部补齐——补完后 10 组的**函数名差集为零**，
+AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 
 **功能面推进顺序建议**（边际成本从低到高）：
 选区几何（1,000+ 行，但它是几乎所有下游编辑的入口）→ Crop 工具（249 行，解锁导出打印尺寸）
@@ -961,6 +1030,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**C 方案已拍板，口径已于 §6.1.13 冻结并配 14 条护栏**；接线属 C2，前置是 C1 的 RGBA16F 像素路径） |
 | HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1：`deep_half_to_u16` → `dither_quantize16`，8 位工作副本） | 六件套 `hdr_normalize`/`hdr_restore`/`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 仍是零通路（口径与 14 条护栏见 §6.1.13，接线属 **C2**）；`rgba8_to_hdr` 已实现但无消费点；**无浮点解码器**，HDR 图层存盘仍拒绝（见 §6.1.12、§6.1.14） |
+| Adjust | **零产品通路**（`adjust_*` 一族无任何工具/命令消费） | 内核 62 个函数已与上游对齐（§6.1.15） | 整族无产品通路；属 F4 Camera Raw 产品通路 |
 
 ## 7. 许可
 
