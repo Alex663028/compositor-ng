@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **212 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **219 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -307,7 +307,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 212 cases, 0 failed, 0 check failures`（当前基线；§6.1.10 起在此基础上继续累加） |
+| 测试 | `summary: 219 cases, 0 failed, 0 check failures`（当前基线；§6.1.11 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
 
@@ -605,6 +605,39 @@ SHA256 `32151220f4748dfa…` 与基线一致。
 缺的是**功能面**而非接线——Camera Raw / 选区几何 / Type·Shape·Gradient / Clone·Smudge·Liquify /
 Crop 工具 / 5 种格式导入，grep 全仓零命中，属未开工。详见 `../report/AUDIT9-compositor-ng-20261017-pi.md`。
 
+### 6.1.11 引擎核收尾：颗粒 / 直方图 / 修补范围（2026-10-17，Pi）
+
+AUDIT9 列的「未接线内核」逐核实后发现：`dither_dots` / `dither_glow` 已由
+chunky / scanlines 分支接线，`deep_split` / `deep_merge` 已由 deep round trip 接线、
+`patch_fill` / `heal_membrane` 已由 `spot_heal` 内部派发——**剩下真正无产品通路的只有四个**，
+本轮全部接上：
+
+- **`noise_add_at`（颗粒）** -> `comp_tool_brush` 新增 `grain_amount` / `grain_gaussian` /
+  `grain_monochromatic`。为什么用 `noise_add_at` 而不是 `noise_add`：内核噪声只取决于
+  **像素位置 + seed**，而笔画以文档坐标给出、以图层原点平移后落笔——用 `noise_add` 则同一笔
+  在图层移动后会得到不同颗粒（噪声跟着图层原点跑）。颗粒叠在**落笔之后、整图层范围**
+  （不是只在笔迹上）。
+- **`levels_histogram`（直方图）** -> `comp_layer_histogram` 新 ABI。关键口径：
+  **预乘像素先反预乘再取亮度**（否则半透明区域的颜色被 alpha 压低，面板曲线系统性偏向暗部，
+  与实际 levels 调整对不上），coverage 权重按 alpha 走。16 位图层显式 `COMP_ERR_UNSUPPORTED`
+  ——桶是 8 位的，不偷偷降位。
+- **`heal_coverage_bounds`（修补范围）** -> `comp_tool_coverage_bounds` 新 ABI。
+  `spot_heal` 内部算的是同一份包围盒，暴露出来免得宿主自己再扫一遍、然后与内核漂移。
+  **全 0 coverage 报四 0 而不是 [-1,-1,-1,-1]**（宿主会拿它去算宽度）。该函数是纯计算、
+  不触引擎状态，故不取引擎句柄、不写 `last_error`。
+
+**基线 212 -> 219 用例**（6 条新护栏）。`run_regression.py --require-ohos` **6/6 PASS**；
+OHOS aarch64 72 单元 fail=0；Windows 壳 27 项 SHA256 与基线一致。
+
+**负向对照（证护栏不是空的）**：三条新护栏逐一做了反向注入，每次恰好击穿并已还原：
+① 直方图去掉反预乘 -> `histogram_unpremultiplies_before_taking_luma` 红；
+② 颗粒 origin 改成 `0,0`（即 `noise_add` 口径）-> `grain_is_reproducible_and_origin_anchored` 红；
+③ 空 coverage 报 [-1,-1,-1,-1] -> `coverage_bounds_matches_nonzero_pixels` 红。
+
+> 注：② 一开始报不红的原因是**测试本身写错了**（断言「两条图层内容相同、原点不同应得同一颗粒」）。
+> 正确口径是**同 seed + 同起始像素 + 同文档原点** -> 逐字节相同，而颗粒是**叠加**的
+> （再跑一遍会再加一层，这正是画笔该有的行为，不是幂等）。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -796,9 +829,12 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Wand | `COMP_TOOL_SELECT` | `wand_mask`、`wand_trace`（只读闭合轮廓） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发） | `heal_coverage_bounds` |
 | Patch | `COMP_TOOL_HEAL` | `patch_fill` | — |
-| Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky` | `dither_dots` / `dither_glow` |
+| Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
 | Lens | `COMP_TOOL_LENS` | `lens_distort` | — |
-| Brush | `COMP_TOOL_STROKE` | 解析式圆头笔（噪声未采样，`seed` 契约保留但不参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
+| Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
+| Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
+| Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
+| Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_split`/`deep_merge`（需 32 位浮点深度语义决定）、`deep_take_painted`、`hdr_*`（需线性 HDR 决策） |
 
 ## 7. 许可

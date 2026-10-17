@@ -386,6 +386,17 @@ typedef struct comp_tool_brush {
   float   hardness;  /* 0..1，1 = 全实，0 = 从笔芯就羽化 */
   float   flow;      /* 0..1，覆盖率上限（防止高笔压涂死细节） */
   uint32_t seed;     /* 固定以保证同参数同结果 */
+  /*
+   * 颗粒（NoisePixels.h `noise_add_at`）。`grain_amount` 是 Photoshop 百分比
+   * 口径（均匀噪声 ±amount% 半程，高斯标准差为其 2/3），0 = 不加颗粒。
+   *
+   * 颗粒叠在**落笔之后、整图层范围**，不是只在笔画上。噪声按文档坐标定，
+   * 因此图层平移后同一笔仍得到同样的颗粒（否则颗粒会跟着图层原点跑）。
+   * `grain_gaussian` 非 0 = 高斯；`grain_monochromatic` 非 0 = 三通道同值。
+   */
+  float   grain_amount;        /* 0..100，0 = 不加 */
+  int32_t grain_gaussian;
+  int32_t grain_monochromatic;
 } comp_tool_brush;
 
 /* 修补参数（Spot Heal / Content-Aware Fill）。 */
@@ -452,6 +463,45 @@ COMP_API comp_result comp_tool_apply(comp_document document,
                                      char* note,
                                      size_t note_capacity,
                                      size_t* out_note_size);
+
+/* ============================================================ 只读查询 */
+
+/*
+ * 图层像素的 256 桶亮度直方图（上游 Levels 面板的直方图，`levels_histogram`）。
+ *
+ * `bins` 必须是 `double[256]`。`coverage` 可为 NULL（权重 1）；非 NULL 时按
+ * `coverage_stride` 逐行取行，尺寸须不小于图层高、每行不小于图层宽。
+ *
+ * **只读**：不写像素、不写蒙版、不开事务、不进撤销栈。
+ *
+ * 关键口径：预乘像素**先反预乘再取亮度**，coverage 权重按 alpha 走——否则半透明
+ * 区域的颜色被 alpha 压低，面板曲线系统性偏向暗部，与实际 levels 调整对不上。
+ *
+ * 错误码：`bins` 为 NULL -> COMP_ERR_INVALID_ARGUMENT；图层不存在 -> COMP_ERR_NOT_FOUND；
+ * 图层无像素或是组 -> COMP_ERR_STATE；**16 位图层 -> COMP_ERR_UNSUPPORTED**（桶是 8 位的，
+ * 先用 COMP_TOOL_DEEP 降位，本入口不偷偷降位）。
+ */
+COMP_API comp_result comp_layer_histogram(comp_document document,
+                                          comp_layer_id target,
+                                          const uint8_t* coverage,
+                                          size_t coverage_stride,
+                                          double* bins);
+
+/*
+ * 修补 coverage 的非零包围盒（`heal_coverage_bounds`），半开区间
+ * `[bounds[0], bounds[2]) x [bounds[1], bounds[3])`，四个 `int32_t` 出参。
+ * coverage 全 0 时四个值都是 0。**只读**，不开事务、不进撤销栈。
+ *
+ * 存在的意义：`spot_heal` 内部算的是同一份包围盒，暴露出来免得宿主自己再扫一遍
+ * 然后与内核漂移。
+ *
+ * 错误码：出参为 NULL 或尺寸非正或 coverage 为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_tool_coverage_bounds(const uint8_t* coverage,
+                                               size_t coverage_stride,
+                                               int32_t width,
+                                               int32_t height,
+                                               int32_t bounds[4]);
 
 #ifdef __cplusplus
 } /* extern "C" */

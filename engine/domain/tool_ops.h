@@ -85,6 +85,20 @@ struct BrushStrokeParams {
   float hardness = 1.0f;
   float flow = 1.0f;
   uint32_t seed = 0;
+  /*
+   * 颗粒（NoisePixels.h `noise_add_at`）。`grain_amount` 是 Photoshop 百分比口径
+   * （均匀噪声 ±amount% 半程，高斯标准差为其 2/3），0 = 不加颗粒。
+   *
+   * **用 noise_add_at 而不是 noise_add**：内核的噪声只取决于像素位置与 seed，
+   * 笔画以文档坐标给出、以图层原点平移后落笔，若用 noise_add 则同一笔在图层
+   * 移动后会得到不同的颗粒（噪声跟着图层原点跑）。noise_add_at 带 origin，
+   * 把噪声钉在文档坐标系上，跨笔画/跨图层移动都稳定。
+   *
+   * `grain_gaussian` 非 0 = 高斯，`grain_monochromatic` 非 0 = 三通道同值。
+   */
+  float grain_amount = 0.0f;
+  int32_t grain_gaussian = 0;
+  int32_t grain_monochromatic = 0;
 };
 
 /* ============================================================== 修补 */
@@ -327,6 +341,30 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
 /* 图层蒙版的轮廓折线（上游 MagicWand.outline）。见 SelectionOutline 的注释。 */
 bool selection_outline(const Layer& layer, SelectionOutline* out, comp_result* out_code,
                        std::string* error);
+
+/*
+ * 图层像素的 256 桶亮度直方图（上游 Levels 面板的直方图，`levels_histogram`）。
+ *
+ * `bins` 必须是 `double[256]`，函数不分配内存。`coverage` 可空（空 = 权重 1）；
+ * 非空时尺寸须等于图层像素的 `height × stride` 布局。
+ *
+ * 关键口径：**预乘像素先反预乘再取亮度**，coverage 权重按 alpha 走。否则
+ * 半透明区域的颜色被 alpha 压低，面板曲线会系统性偏向暗部，与实际 levels
+ * 调整对不上。16 位图层显式 `COMP_ERR_UNSUPPORTED`——桶是 8 位的，量化归
+ * `COMP_TOOL_DEEP`，本函数不偷偷降位。
+ */
+bool layer_histogram(const Layer& layer, const uint8_t* coverage, size_t coverage_stride,
+                     double* bins, comp_result* out_code, std::string* error);
+
+/*
+ * 修补 coverage 的非零包围盒（`heal_coverage_bounds`），半开区间
+ * `[bounds[0], bounds[2]) × [bounds[1], bounds[3])`；coverage 空或全 0 时四个
+ * 值都是 0。`spot_heal` 内部算的是同一份，本函数把它暴露给宿主，
+ * 免得宿主再扫一遍、然后与内核漂移。只读，不开事务、不进撤销栈。
+ */
+bool heal_coverage_bounds_of(const uint8_t* coverage, size_t coverage_stride,
+                             int32_t width, int32_t height, int32_t bounds[4],
+                             comp_result* out_code, std::string* error);
 
 }  // namespace compositor
 

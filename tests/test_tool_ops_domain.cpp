@@ -16,6 +16,7 @@
  * 本文件的错误码断言全部钉**具体值**而非「非 OK」：`!= COMP_OK` 会让
  * INTERNAL 这类内部错误伪装成「按契约拒绝了」。
  */
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -344,4 +345,259 @@ COMP_TEST(tool_ops_domain_zero_pressure_stroke_is_byte_identical) {
                  "a zero-pressure stroke is a legal no-op");
   COMP_CHECK_MSG(pixels_of(document, id) == before,
                  "pressure * flow == 0 must be byte-identical (documented contract)");
+}
+
+/* ================================================================ 颗粒 */
+
+COMP_TEST(tool_ops_domain_grain_is_reproducible_and_origin_anchored) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+
+  /*
+   * 两条图层缓冲内容相同，但**文档原点不同**：id0 覆盖 (0,0)-(8,8)，
+   * id4 覆盖 (4,4)-(12,12)。颗粒噪声钉在文档坐标上，所以同一条落在同一个
+   * 文档像素 (6,6) 上的笔画，两条图层得到的颗粒**必须不同**——若相同就说明
+   * 噪声跟着图层原点跑（也就是用了 noise_add 而不是 noise_add_at）。
+   */
+  comp_layer_desc at0{};
+  at0.name = "At0";
+  at0.transform = comp_rect{0, 0, 8, 8};
+  comp_layer_id id0 = 0;
+  document.create_layer(at0, &id0);
+  document.find(id0)->pixels = ImageBuffer::solid(8, 8, COMP_PIXEL_RGBA8, 40, 80, 120, 255);
+
+  comp_layer_desc at4{};
+  at4.name = "At4";
+  at4.transform = comp_rect{4, 4, 8, 8};
+  comp_layer_id id4 = 0;
+  document.create_layer(at4, &id4);
+  document.find(id4)->pixels = ImageBuffer::solid(8, 8, COMP_PIXEL_RGBA8, 40, 80, 120, 255);
+
+  /* 两层的无颗粒基线，逐字节相同。 */
+  const std::vector<uint8_t> plain0 = pixels_of(document, id0);
+  const std::vector<uint8_t> plain4 = pixels_of(document, id4);
+  COMP_CHECK_MSG(plain0 == plain4, "the two layers start byte-identical");
+
+  /* 落笔点固定在文档像素 (6,6)；压力 0 ⇒ 只加颗粒、不落笔。 */
+  const float points[2] = {6.0f, 6.0f};
+  auto run_grain = [&](comp_layer_id id) {
+    ToolOpParams params;
+    params.kind = kToolOpStroke;
+    params.points = points;
+    params.point_count = 1;
+    params.brush.diameter = 2.0f;
+    params.brush.pressure = 0.0f;
+    params.brush.hardness = 1.0f;
+    params.brush.flow = 1.0f;
+    params.brush.grain_amount = 30.0f;
+    params.brush.seed = 12345;
+    comp_result code = COMP_ERR_INTERNAL;
+    std::string error;
+    COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr), "grain stroke");
+    COMP_CHECK_MSG(code == COMP_OK, "out_code is written on success");
+  };
+
+  run_grain(id0);
+  const std::vector<uint8_t> grained0 = pixels_of(document, id0);
+  COMP_CHECK_MSG(grained0 != plain0, "grain actually changes pixels (otherwise this proves nothing)");
+
+  /*
+   * 可重复性口径（同 seed + 同起始像素 ⇒ 同结果），**不是幂等**：
+   * 颗粒是叠加的，再跑一遍会在已有颗粒上再加一层，正是画笔该有的行为。
+   * 所以复现性要用一条起始像素相同、文档原点也相同的图层来比，
+   * 而不是把同一条图层跑两遍。
+   */
+  comp_layer_desc twin_desc{};
+  twin_desc.name = "At0Twin";
+  twin_desc.transform = comp_rect{0, 0, 8, 8};
+  comp_layer_id id_twin = 0;
+  document.create_layer(twin_desc, &id_twin);
+  document.find(id_twin)->pixels = ImageBuffer::solid(8, 8, COMP_PIXEL_RGBA8, 40, 80, 120, 255);
+  COMP_CHECK_MSG(pixels_of(document, id_twin) == plain0, "twin starts byte-identical");
+  run_grain(id_twin);
+  COMP_CHECK_MSG(pixels_of(document, id_twin) == grained0,
+                 "same seed + same start + same document origin => byte-identical grain "
+                 "(reproducibility contract)");
+
+  run_grain(id4);
+  const std::vector<uint8_t> grained4 = pixels_of(document, id4);
+  COMP_CHECK_MSG(grained4 != plain4, "the offset layer is grained too");
+  COMP_CHECK_MSG(grained0 != grained4,
+                 "grain keys off document coordinates: the same buffer content at a different "
+                 "layer origin gets different noise (this is what noise_add_at buys over noise_add)");
+}
+
+COMP_TEST(tool_ops_domain_zero_grain_is_byte_identical) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  const float points[2] = {3.0f, 3.0f};
+  ToolOpParams params;
+  params.kind = kToolOpStroke;
+  params.points = points;
+  params.point_count = 1;
+  params.brush.diameter = 4.0f;
+  params.brush.pressure = 0.0f;
+  params.brush.grain_amount = 0.0f;  /* 不加颗粒 */
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr), "zero grain");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "grain_amount == 0 is byte-identical");
+}
+
+COMP_TEST(tool_ops_domain_negative_grain_is_refused_before_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = document.history().undo_depth();
+
+  const float points[2] = {3.0f, 3.0f};
+  ToolOpParams params;
+  params.kind = kToolOpStroke;
+  params.points = points;
+  params.point_count = 1;
+  params.brush.diameter = 4.0f;
+  params.brush.grain_amount = -1.0f;  /* 负数会被内核当反相噪声，必须拒绝 */
+
+  comp_result code = COMP_OK;
+  std::string error;
+  COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr), "negative grain refused");
+  COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "negative grain -> COMP_ERR_INVALID_ARGUMENT");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "a refused call changes no pixels");
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before, "and records no history");
+}
+
+/* ================================================================ 直方图 */
+
+COMP_TEST(tool_ops_domain_histogram_unpremultiplies_before_taking_luma) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+  comp_layer_desc desc{};
+  desc.name = "Half";
+  desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id id = 0;
+  document.create_layer(desc, &id);
+
+  /*
+   * 预乘半透明红：rgb=(128,0,0) alpha=128 ⇒ 直通红是 (255,0,0)，亮度应落 76 桶。
+   * 若引擎忘了反预乘、直接拿 128 去算，桶会落在 38 附近——差一倍。
+   */
+  ImageBuffer buffer;
+  buffer.resize(4, 4, COMP_PIXEL_RGBA8);
+  uint8_t* px = buffer.writable_pixels().data();
+  const size_t stride = buffer.stride();
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) {
+      uint8_t* p = px + y * stride + x * 4;
+      p[0] = 128; p[1] = 0; p[2] = 0; p[3] = 128;
+    }
+  }
+  document.find(id)->pixels = std::move(buffer);
+
+  double bins[256];
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(layer_histogram(*document.find(id), nullptr, 0, bins, &code, &error),
+                 "histogram of an 8-bit layer");
+  COMP_CHECK_MSG(code == COMP_OK, "out_code is written on success");
+
+  const int expected = static_cast<int>(std::lround(0.299f * 255.0f));
+  COMP_CHECK_MSG(bins[expected] == 16.0,
+                 "premultiplied (128,0,0,128) must report luma 0.299*255 (unpremultiplied), "
+                 "not 0.299*128 — all 16 pixels land in one bucket");
+
+  double total = 0.0;
+  for (int i = 0; i < 256; ++i) total += bins[i];
+  COMP_CHECK_MSG(total == 16.0, "every pixel is counted exactly once");
+}
+
+COMP_TEST(tool_ops_domain_histogram_weights_by_coverage) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+
+  /* 全覆盖 ⇒ 与无 coverage 同结果；全 0 ⇒ 总权重 0。 */
+  std::vector<uint8_t> full(4 * 4, 255);
+  std::vector<uint8_t> none(4 * 4, 0);
+  double plain[256];
+  double covered[256];
+  double empty[256];
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK(layer_histogram(*document.find(id), nullptr, 0, plain, &code, &error));
+  COMP_CHECK(layer_histogram(*document.find(id), full.data(), 4, covered, &code, &error));
+  COMP_CHECK(layer_histogram(*document.find(id), none.data(), 4, empty, &code, &error));
+
+  bool covered_matches = true;
+  for (int i = 0; i < 256; ++i) {
+    if (plain[i] != covered[i]) covered_matches = false;
+  }
+  COMP_CHECK_MSG(covered_matches, "coverage 255 is weight 1 per pixel, same as no coverage");
+
+  double empty_total = 0.0;
+  for (int i = 0; i < 256; ++i) empty_total += empty[i];
+  COMP_CHECK_MSG(empty_total == 0.0, "coverage 0 everywhere weighs nothing");
+}
+
+COMP_TEST(tool_ops_domain_histogram_rejects_null_bins_and_sixteen_bit) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+  comp_result code = COMP_OK;
+  std::string error;
+
+  const comp_layer_id id = add_pixel_layer(document);
+  COMP_CHECK(!layer_histogram(*document.find(id), nullptr, 0, nullptr, &code, &error));
+  COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "null bins -> COMP_ERR_INVALID_ARGUMENT");
+
+  /* 16 位图层显式拒绝：桶是 8 位的，本函数不偷偷降位。 */
+  Document wide_doc(&engine, 4, 4, 72.0f, "sRGB");
+  const comp_layer_id wid = add_wide_layer(wide_doc);
+  double bins[256];
+  code = COMP_OK;
+  COMP_CHECK(!layer_histogram(*wide_doc.find(wid), nullptr, 0, bins, &code, &error));
+  COMP_CHECK_MSG(code == COMP_ERR_UNSUPPORTED,
+                 "16-bit layer -> COMP_ERR_UNSUPPORTED (quantize via COMP_TOOL_DEEP first)");
+}
+
+/* ================================================================ 修补范围 */
+
+COMP_TEST(tool_ops_domain_coverage_bounds_matches_nonzero_pixels) {
+  const int32_t w = 8;
+  const int32_t h = 6;
+  const size_t stride = 8;
+  std::vector<uint8_t> cov(static_cast<size_t>(h) * stride, 0);
+  /* 一块 3x2 的非零区域，落在 [2,5) x [1,3)。 */
+  for (int32_t y = 1; y < 3; ++y) {
+    for (int32_t x = 2; x < 5; ++x) {
+      cov[static_cast<size_t>(y) * stride + static_cast<size_t>(x)] = 255;
+    }
+  }
+  int32_t bounds[4] = {-1, -1, -1, -1};
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(heal_coverage_bounds_of(cov.data(), stride, w, h, bounds, &code, &error),
+                 "coverage bounds");
+  COMP_CHECK_MSG(code == COMP_OK, "out_code is written on success");
+  COMP_CHECK_MSG(bounds[0] == 2 && bounds[1] == 1 && bounds[2] == 5 && bounds[3] == 3,
+                 "half-open bounds [x0,y0,x1,y1) of the nonzero region");
+
+  /* 全 0 coverage ⇒ 全 0（不是 [-1,-1,-1,-1]，宿主会拿它去算宽度）。 */
+  std::vector<uint8_t> none(static_cast<size_t>(h) * stride, 0);
+  int32_t zero_bounds[4] = {7, 7, 7, 7};
+  COMP_CHECK(heal_coverage_bounds_of(none.data(), stride, w, h, zero_bounds, &code, &error));
+  COMP_CHECK_MSG(zero_bounds[0] == 0 && zero_bounds[1] == 0 && zero_bounds[2] == 0 &&
+                     zero_bounds[3] == 0,
+                 "an empty coverage reports all-zero bounds, which reads as a zero-width box");
+
+  /* 参数闸 */
+  code = COMP_OK;
+  COMP_CHECK(!heal_coverage_bounds_of(cov.data(), stride, 0, h, bounds, &code, &error));
+  COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "non-positive width -> COMP_ERR_INVALID_ARGUMENT");
+  code = COMP_OK;
+  COMP_CHECK(!heal_coverage_bounds_of(nullptr, stride, w, h, bounds, &code, &error));
+  COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "null coverage -> COMP_ERR_INVALID_ARGUMENT");
 }

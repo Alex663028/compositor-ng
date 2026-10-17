@@ -961,6 +961,9 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.brush.hardness = desc->brush.hardness;
   params.brush.flow = desc->brush.flow;
   params.brush.seed = desc->brush.seed;
+  params.brush.grain_amount = desc->brush.grain_amount;
+  params.brush.grain_gaussian = desc->brush.grain_gaussian;
+  params.brush.grain_monochromatic = desc->brush.grain_monochromatic;
   params.points = desc->stroke_points;
   params.point_count = desc->stroke_point_count;
   params.heal.opacity = desc->heal.opacity;
@@ -1002,6 +1005,57 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   }
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_histogram(comp_document document, comp_layer_id target,
+                                 const uint8_t* coverage, size_t coverage_stride,
+                                 double* bins) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (bins == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "histogram bins are null");
+  }
+  Layer* layer = doc->find(target);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /*
+   * coverage 显式传入时尺寸必须容得下图层像素。宁可拒绝也不静默截断：宿主传
+   * 一个按自己那层尺寸做的 coverage（层被换过），静默按较小值读会读出半张图的
+   * 直方图而不报错。
+   */
+  if (coverage != nullptr) {
+    if (coverage_stride < layer->pixels.width || layer->pixels.height == 0) {
+      return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                   "coverage stride is smaller than the layer width");
+    }
+  }
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  if (!compositor::layer_histogram(*layer, coverage, coverage_stride, bins, &code, &error)) {
+    return compositor::abi::fail(engine, code, error);
+  }
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_tool_coverage_bounds(const uint8_t* coverage, size_t coverage_stride,
+                                      int32_t width, int32_t height, int32_t bounds[4]) {
+  /*
+   * 纯计算：只读调用方给的 coverage，不碰任何引擎状态（无文档、无引擎槽）。
+   * 因此不取引擎句柄、不写 last_error——这不是一个“引擎操作”，只是一个
+   * 对像素内核算法的转发；错误码直接由参数校验给出。
+   */
+  if (bounds == nullptr || coverage == nullptr || width <= 0 || height <= 0) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  compositor::heal_coverage_bounds_of(coverage, coverage_stride, width, height, bounds,
+                                       nullptr, nullptr);
+  return COMP_OK;
 }
 
 } /* extern "C" */

@@ -38,6 +38,12 @@ constexpr int32_t kMaxRangeColors = 8;
 constexpr int32_t kMaxSelectRadius = 512;
 constexpr float kMaxBrushDiameter = 8192.0f;
 constexpr int32_t kMaxStrokePoints = 1 << 16;
+/*
+ * 颗粒百分比上限。上游 Grain 面板最大 100（Photoshop 的 Noise 面板也是 0..100），
+ * 但内核把 amount 当“半程百分比”放大到整程，>100 会让噪声幅度超过信号本身；
+ * 取 100 作为闸，与上游面板量程一致。
+ */
+constexpr float kMaxGrainAmount = 100.0f;
 
 bool finite01(float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; }
 
@@ -366,6 +372,114 @@ bool selection_outline(const Layer& layer, SelectionOutline* out, comp_result* o
   return true;
 }
 
+/* ============================================================ 直方图 */
+
+/*
+ * 图层像素的 256 桶直方图（`levels_histogram`，LevelsPixels.h）。
+ *
+ * 为什么要有它：Levels 面板要显示直方图，而上游 `Levels.swift` 的直方图是
+ * **带 coverage 的加权直方图**——coverage 是该像素被蒙版/不透明度覆盖的比例，
+ * 权重按 alpha 走，而不是「每个像素各算一票」。宿主此前只能自己扫像素，
+ * 于是不得不自己决定加权口径；一旦与内核差一档，面板上的曲线就和实际
+ * levels 调整脱节。
+ *
+ * `bins` 必须是 `double[256]`。coverage 可空：空 = 权重 1（整幅按不透明计），
+ * 非空时尺寸须等于图层像素的 `height × stride` 布局，按 `coverage_stride` 取行。
+ * 16 位图层显式拒绝（COMP_ERR_UNSUPPORTED）——直方图的桶是 8 位的，
+ * 量化口径归 deep_to_rgba8 管，本函数只做 8 位的直读，不在这里偷偷降位。
+ */
+bool layer_histogram(const Layer& layer, const uint8_t* coverage, size_t coverage_stride,
+                     double* bins, comp_result* out_code, std::string* error) {
+  auto fail = [&](comp_result code, const std::string& message) {
+    if (out_code != nullptr) *out_code = code;
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (bins == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "histogram bins are null");
+  if (layer.pixels.empty()) {
+    return fail(COMP_ERR_STATE, "layer has no pixels");
+  }
+  if (layer.pixels.format == COMP_PIXEL_RGBA16) {
+    return fail(COMP_ERR_UNSUPPORTED,
+                "histogram is 8-bit only; quantize the layer first (COMP_TOOL_DEEP / quantize)");
+  }
+  for (int i = 0; i < 256; ++i) bins[i] = 0.0;
+
+  const size_t w = layer.pixels.width;
+  const size_t h = layer.pixels.height;
+  const size_t stride = layer.pixels.stride();
+  for (size_t y = 0; y < h; ++y) {
+    const uint8_t* px = layer.pixels.row(y);
+    const uint8_t* cov = coverage != nullptr ? coverage + y * coverage_stride : nullptr;
+    for (size_t x = 0; x < w; ++x) {
+      /*
+       * 内核逐像素取三个颜色通道，桶是「亮度」（0.299R+0.587G+0.114B）。
+       * 预乘像素直接取 R/G/B 就是取亮度被 alpha 压过——半透明区域会被
+       * 系统性低估。因此这里先把颜色**反预乘回直通**，让面板显示的是
+       * 用户实际看到的颜色分布，而不是 alpha 的分布。
+       */
+      const uint8_t a = px[x * 4 + 3];
+      float r, g, b;
+      if (a == 0) {
+        r = g = b = 0.0f;
+      } else if (a == 255) {
+        r = px[x * 4 + 0];
+        g = px[x * 4 + 1];
+        b = px[x * 4 + 2];
+      } else {
+        const float inv = 255.0f / static_cast<float>(a);
+        r = std::min(255.0f, px[x * 4 + 0] * inv);
+        g = std::min(255.0f, px[x * 4 + 1] * inv);
+        b = std::min(255.0f, px[x * 4 + 2] * inv);
+      }
+      const uint8_t luma = static_cast<uint8_t>(
+          std::lround(0.299f * r + 0.587f * g + 0.114f * b));
+      bins[luma] += cov != nullptr ? (cov[x] / 255.0) : 1.0;
+    }
+  }
+  if (out_code != nullptr) *out_code = COMP_OK;
+  return true;
+}
+
+/* ============================================================ 修补范围 */
+
+/*
+ * 修补 coverage 的非零包围盒（`heal_coverage_bounds`，HealPixels.h）。
+ *
+ * 为什么要有它：Spot Heal 的实现要先把待修补区域裁到包围盒再做 PatchMatch，
+ * 否则一张大图上点一个小洞也要全图求解。上游 `Heal.swift` 自己算这个包围盒；
+ * 本仓的 `spot_heal` 内部已经在算，宿主却算不出自己手上的 coverage 覆盖了
+ * 哪里——只能自己写一遍扫描，多一处与内核漂移的机会。
+ *
+ * 只读：不改图层、不开事务、不进撤销栈。coverage 空或全 0 时 bounds 全 0
+ * （半开区间 [x0,x1)×[y0,y1)），与内核一致。coverage 的 stride 由调用方给，
+ * 因为 coverage 不存在「图层像素缓冲」那个自动 stride 的东西。
+ */
+bool heal_coverage_bounds_of(const uint8_t* coverage, size_t coverage_stride,
+                             int32_t width, int32_t height, int32_t bounds[4],
+                             comp_result* out_code, std::string* error) {
+  auto fail = [&](comp_result code, const std::string& message) {
+    if (out_code != nullptr) *out_code = code;
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (bounds == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "bounds out is null");
+  if (width <= 0 || height <= 0) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "coverage size must be positive");
+  }
+  if (coverage == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "heal coverage is null");
+
+  long raw[4] = {0, 0, 0, 0};
+  heal_coverage_bounds(coverage, static_cast<size_t>(width), static_cast<size_t>(height),
+                       coverage_stride, raw);
+  bounds[0] = static_cast<int32_t>(raw[0]);
+  bounds[1] = static_cast<int32_t>(raw[1]);
+  bounds[2] = static_cast<int32_t>(raw[2]);
+  bounds[3] = static_cast<int32_t>(raw[3]);
+  if (out_code != nullptr) *out_code = COMP_OK;
+  return true;
+}
+
 /* ============================================================ 入口 */
 
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
@@ -443,6 +557,11 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
       if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
       if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+      /* 颗粒是可选附加项，但一旦给出就得在合法区间：负数会当反相噪声，比拒绝更坏。 */
+      if (!std::isfinite(params.brush.grain_amount) || params.brush.grain_amount < 0.0f ||
+          params.brush.grain_amount > kMaxGrainAmount) {
+        return bad_arg("brush grain amount out of range");
+      }
       for (int32_t i = 0; i < params.point_count * 2; ++i) {
         if (!std::isfinite(params.points[i])) return bad_arg("stroke point is not finite");
       }
@@ -638,6 +757,19 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       stamp_polyline(target_layer->pixels.writable_pixels().data(),
                      target_layer->pixels.stride(), target_layer->pixels.width,
                      target_layer->pixels.height, local.data(), params.point_count, params.brush);
+      /*
+       * 颗粒叠加在落笔之后（全图层范围，不是只在笔画上），口径对齐 NoisePixels.h：
+       * amount 是 Photoshop 百分比（均匀 ±amount% 半程、高斯标准差 2/3），
+       * alpha 不动、全透明像素不动。origin 取 effective_bounds 的原点，使噪声
+       * 钉在**文档坐标系**上——同一笔在图层平移后得到同样的颗粒。
+       */
+      if (params.brush.grain_amount > 0.0f) {
+        noise_add_at(target_layer->pixels.writable_pixels().data(), target_layer->pixels.width,
+                     target_layer->pixels.height, target_layer->pixels.stride(),
+                     params.brush.grain_amount, params.brush.grain_gaussian,
+                     params.brush.grain_monochromatic, params.brush.seed,
+                     static_cast<int64_t>(b.x), static_cast<int64_t>(b.y));
+      }
       break;
     }
 
