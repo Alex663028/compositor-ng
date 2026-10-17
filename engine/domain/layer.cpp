@@ -78,6 +78,65 @@ bool deep_to_rgba8(const ImageBuffer& src, ImageBuffer* dst) {
   return true;
 }
 
+bool hdr_to_rgba8(const ImageBuffer& src, ImageBuffer* dst) {
+  if (dst == nullptr) return false;
+  if (src.format != COMP_PIXEL_RGBA16F || src.empty()) return false;
+  const size_t w = static_cast<size_t>(src.width);
+  const size_t h = static_cast<size_t>(src.height);
+  /*
+   * 两趟，与上游 `dithered(image(hdr))` 同序：
+   *   1. `deep_half_to_u16`：半精度的**值**按 0..65535 取整写进 16 位布局
+   *      （white 以上的光在此截断，DeepLayers.swift:31 的 canonical/image）。
+   *   2. `dither_quantize16`：在这份 16 位布局上加约一阶噪声后取整成 8 位
+   *      （DeepLayers.swift:37 的 dithered）。
+   * 两趟不能合并：把 half 的位模式直接当 16 位整数取整，0x3C00（1.0）会得 15360
+   * 而不是 255——这正是「高光当噪声、画面全错」的那类错误。
+   *
+   * 两个中间缓冲都先落在本地：src 与 dst 允许是同一个对象，先算完再重置 dst
+   * 才不会边读边写。
+   */
+  std::vector<uint16_t> wide(w * h * 4u, 0);
+  deep_half_to_u16(reinterpret_cast<const uint16_t*>(src.row(0)), src.stride(), wide.data(), w * 8u, w, h);
+  std::vector<uint8_t> out(w * h * 4u, 0);
+  dither_quantize16(wide.data(), out.data(), w, h, w * 4u);
+  dst->resize(src.width, src.height, COMP_PIXEL_RGBA8);
+  const size_t row_bytes = w * 4u;
+  for (size_t y = 0; y < h; ++y) {
+    std::memcpy(dst->writable_row(static_cast<int32_t>(y)), out.data() + y * row_bytes, row_bytes);
+  }
+  return true;
+}
+
+bool rgba8_to_hdr(const ImageBuffer& src, ImageBuffer* dst) {
+  if (dst == nullptr) return false;
+  if (src.format != COMP_PIXEL_RGBA8 || src.empty()) return false;
+  if (dst->width != src.width || dst->height != src.height || dst->format != COMP_PIXEL_RGBA16F) {
+    return false;
+  }
+  /*
+   * 8 位工作副本写回 HDR 图层：**不回填高光**。上游的口径是 8 位工具用完后图层
+   * 整体降为 8 位（DeepLayers.swift:297 "they're dithered down, halving the
+   * layer's memory and file size"），因此这一步只承诺「把 8 位值按分量写成半精度」，
+   * 之前被截断的高光不会回来。要保留高光必须走 hdr_normalize/restore 那对内核，
+   * 那是 C2 的事。
+   */
+  const size_t w = static_cast<size_t>(src.width);
+  const size_t h = static_cast<size_t>(src.height);
+  std::vector<uint16_t> wide(w * h * 4u, 0);
+  for (size_t y = 0; y < h; ++y) {
+    const uint8_t* in = src.row(static_cast<int32_t>(y));
+    uint16_t* o = wide.data() + y * w * 4u;
+    for (size_t x = 0; x < w * 4u; ++x) o[x] = static_cast<uint16_t>(in[x] * 257u);
+  }
+  std::vector<uint16_t> half(w * h * 4u, 0);
+  deep_u16_to_half(wide.data(), w * 8u, half.data(), w * 8u, w, h);
+  for (size_t y = 0; y < h; ++y) {
+    std::memcpy(dst->writable_row(static_cast<int32_t>(y)), half.data() + y * w * 4u * sizeof(uint16_t),
+                w * 4u * sizeof(uint16_t));
+  }
+  return true;
+}
+
 void MaskBuffer::resize(int32_t w, int32_t h, uint8_t fill_value) {
   width = std::max(0, w);
   height = std::max(0, h);

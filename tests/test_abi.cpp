@@ -974,11 +974,23 @@ COMP_TEST(document_create_fails_cleanly_when_allocator_exhausted) {
                  "engine destroy releases every object it allocated, failure path included");
 }
 
-/* AUDIT3 P2-13：16 位 comp_image 若放行，copy_image_into 会把 8 字节/像素的
- * format 带进 ImageBuffer，而合成器全程按 4 字节/像素解释——不报错，但画面是
- * 垃圾。半精度（RGBA16F）至今没有像素路径，入口必须明确拒绝，且拒绝不能碰坏
- * 既有像素。（RGBA16 已有真通路，见下一个用例。） */
-COMP_TEST(layer_set_pixels_rejects_16bit_float_format) {
+/* C 方案 C1：RGBA16F（半精度 / HDR）图层的真通路。
+ *
+ * 这条用例改写自旧版的 `layer_set_pixels_rejects_16bit_float_format`——旧版断言
+ * 「半精度必须拒绝」，理由是「域层与合成侧没有半精度像素路径」。C1 把那条路径
+ * 补上��，断言随之反过来：
+ *
+ *   1. `comp_layer_set_pixels` 接受 COMP_PIXEL_RGBA16F（8 字节/像素、预乘、
+ *      native-endian，每通道一个 IEEE 754 half）。
+ *   2. 合成走 `hdr_to_rgba8`：先 `deep_half_to_u16` 按 0..65535 取整
+ *      （对齐上游 `DeepLayer.image(_:)`，white 以上的光截断），再 dither 取整。
+ *
+ * 关键陷阱（也是旧版拒绝理由真正成立的地方，现由本用例钉住）：
+ * **半精度的位模式不能当 16 位整数读。** half 的 1.0 是 0x3C00（15360），
+ * 若原样取整成 8 位就是 15360>>8 = 60 而非 255。因此本用例铺的 half 数据里
+ * 故意包含 0x3C00（1.0）这个值，并断言画布是接近白色的高值（>= 200）；
+ * 若哪天有人把 hdr_to_rgba8 换成直接按 16 位读，这个断言会立刻挂。 */
+COMP_TEST(layer_set_pixels_accepts_halffloat_format) {
   comp_engine_desc desc = test_engine_desc();
   comp_engine engine = nullptr;
   COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
@@ -990,23 +1002,98 @@ COMP_TEST(layer_set_pixels_rejects_16bit_float_format) {
   COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
 
   const comp_layer_id background = background_layer(document);
-  const SolidImage red(4, 4, 255, 0, 0, 255);
-  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
 
-  std::vector<uint8_t> sixteen(4u * 4u * 8u, 0xff);
+  /*
+   * 不透明纯白（half 1.0 = 0x3C00 的位模式）铺满：
+   * `deep_half_to_u16` 应把每个分量算成 65535，dither 后落成 255 左右。
+   * 若半精度被当成 16 位整数（0x3C00 = 15360），8 位视图会是 60 左右的深灰。
+   */
+  std::vector<uint16_t> hdr(4u * 4u * 4u, 0);
+  for (size_t i = 0; i < hdr.size(); ++i) {
+    hdr[i] = 0x3c00; /* half 1.0 */
+  }
   comp_image image{};
   image.width = 4;
   image.height = 4;
   image.format = COMP_PIXEL_RGBA16F;
   image.stride = 4u * 8u;
-  image.pixels = sixteen.data();
-  COMP_CHECK_MSG(comp_layer_set_pixels(document, background, &image) == COMP_ERR_UNSUPPORTED,
-                 "half-float layer pixels are rejected instead of silently misread");
+  image.pixels = hdr.data();
+  COMP_CHECK_MSG(comp_layer_set_pixels(document, background, &image) == COMP_OK,
+                 "half-float layer pixels are accepted once the HDR pixel path exists");
 
-  /* 拒绝之后原像素不动：画布仍是不透明的红。 */
   const std::vector<uint8_t> canvas = flatten(document, 4, 4);
-  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 255, 0, 0, 255, 0),
-                 "rejection leaves the existing pixels intact");
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 255, 255, 255, 255, 0),
+                 "half 1.0 shows as white: the bit pattern is not read as a 16-bit integer");
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* HDR 图层的 8 位视图：预乘、高光截断、half 不当整数读。
+ *
+ * 铺的是背景**黑**（不是白：白底上 alpha=0.5 的层合成出来仍是不透明白，
+ * 任何算错都可能被掩盖）。HDR 层每个像素 alpha = half 0.5、三个色分量
+ * = half 2.0；其中 (1,1) 换成 half 的最大值 0x7BFF（65504）。
+ *
+ * 三件事被同时钉住：
+ *   1. **half 不能当 16 位整数读。** 若按位模式当整数，2.0（0x4000 = 16384）
+ *      会得 8 位的 64、alpha 0.5（0x3800 = 14336）会得 56，黑底上得 ~(14,14,14,56)，
+ *      与正确值 (128,128,128,128) 差两个数量级。
+ *   2. **预乘。** 色分量 2.0 × alpha 0.5 = 1.0 → 截到白；合成时再按 0.5 不透明度
+ *      压在黑底上得 128（alpha 亦为 128）。
+ *   3. **高光截断而非回绕。** (1,1) 的 half 是 65504（比 2.0 亮三万多倍），
+ *      正确做法是同样截到白；不加夹紧则 65504×65535 取整后回绕成乱色。
+ *      断言 (1,1) 与 (0,0) 完全相同即证明截断生效。
+ */
+COMP_TEST(hdr_highlights_clamp_to_white_in_eight_bit_view) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  const SolidImage black(4, 4, 0, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &black.image) == COMP_OK);
+
+  comp_layer_desc hdr_desc{};
+  hdr_desc.name = "HDR";
+  hdr_desc.blend = COMP_BLEND_NORMAL;
+  hdr_desc.opacity = 1.0f;
+  hdr_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id hdr_layer = 0;
+  COMP_CHECK(comp_layer_add(document, &hdr_desc, &hdr_layer) == COMP_OK);
+
+  std::vector<uint16_t> hdr(4u * 4u * 4u, 0);
+  for (size_t p = 0; p < 4u * 4u; ++p) {
+    /* 0x4000 = half 2.0，0x7BFF = half 65504（可表示的最大值）。 */
+    const uint16_t color = (p == 5u) ? 0x7bff : 0x4000;
+    hdr[p * 4u + 0u] = color;
+    hdr[p * 4u + 1u] = color;
+    hdr[p * 4u + 2u] = color;
+    hdr[p * 4u + 3u] = 0x3800; /* half 0.5 */
+  }
+  comp_image image{};
+  image.width = 4;
+  image.height = 4;
+  image.format = COMP_PIXEL_RGBA16F;
+  image.stride = 4u * 8u;
+  image.pixels = hdr.data();
+  COMP_CHECK_MSG(comp_layer_set_pixels(document, hdr_layer, &image) == COMP_OK,
+                 "half-float layer pixels are accepted on a new layer too");
+
+  const std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  /* 容差 2：dither 加约一阶噪声，128 上下浮动一格是预期内的。
+   * 注意 alpha 断言是 255：背景是**不透明**黑，它把整幅的 alpha 拉满；
+   * HDR 层那 0.5 的不透明度体现在 RGB 上（白 × 0.5 压在黑底 = 128）。 */
+  COMP_CHECK_MSG(matches(canvas, 4, 0, 0, 128, 128, 128, 255, 2),
+                 "an HDR layer reads as half floats, premultiplied, over black");
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 128, 128, 128, 255, 2),
+                 "half 65504 clamps to white exactly like half 2.0 instead of wrapping");
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

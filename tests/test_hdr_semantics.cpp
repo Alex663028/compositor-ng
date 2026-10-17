@@ -441,3 +441,164 @@ COMP_TEST(hdr_take_painted_only_touches_painted_pixels) {
   COMP_CHECK_MSG(close_to(p.g, 100.0f / 255.0f, 0.002f) && close_to(p.b, 50.0f / 255.0f, 0.002f),
                  "every channel of a painted pixel is taken");
 }
+
+/* ===========================================================================
+ * C1：半精度 ↔ 16 位整数的两个转换内核（deep_half_to_u16 / deep_u16_to_half）。
+ *
+ * 这两个内核是 HDR 通路的**地基**：RGBA16F 图层能被接受、能合成，靠的就是
+ * hdr_to_rgba8 里先走 deep_half_to_u16 再 dither。没有它们，C1 只能是「放开了
+ * 入口但画面是噪声」——正是 AUDIT3 P2-13 当初要拒绝 RGBA16F 的理由。
+ *
+ * 上游口径（DeepLayers.swift）：
+ *   - :24 canonical / :31 image(_:)：把 HDR 图画进 16 位 premultiplied sRGB
+ *     context —— 白点以上的光被**截断**到 65535，NaN/Inf 落不进来。
+ *   - :37 dithered(_:)：在这份 16 位布局上加约一阶噪声取整成 8 位（由 hdr_to_rgba8
+ *     调用，不在本文件测）。
+ * =========================================================================== */
+
+/* [C1-1] 白点及以下线性映射：0.0→0、1.0→65535、0.5→32768（±1 取整）。
+ * 预乘关系保持：分量与 alpha 各自独立换算，不做反预乘。 */
+COMP_TEST(half_to_u16_maps_the_unit_range_linearly) {
+  const size_t width = 4, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> half(width * 4, 0);
+  write_half(&half[0], 1.0f, 1.0f, 1.0f, 1.0f);     /* 不透明白 → 65535 */
+  write_half(&half[4], 0.0f, 0.0f, 0.0f, 0.0f);     /* 全透明 → 0 */
+  write_half(&half[8], 0.5f, 0.25f, 0.5f, 0.5f);    /* 半不透明 → 一半 */
+  /* 半透明像素按**预乘**给：rgb 0.5×0.5 = 0.25。 */
+  write_half(&half[12], 0.25f, 0.125f, 0.0f, 0.5f);
+
+  std::vector<uint16_t> out(width * 4, 0xaaaa);
+  deep_half_to_u16(half.data(), stride, out.data(), stride, width, height);
+
+  COMP_CHECK_MSG(out[3] == 65535, "half 1.0 maps to full scale");
+  COMP_CHECK_MSG(out[7] == 0, "half 0.0 maps to zero");
+  COMP_CHECK_MSG(std::abs(static_cast<int>(out[8]) - 32768) <= 1, "half 0.5 maps to mid scale");
+  COMP_CHECK_MSG(std::abs(static_cast<int>(out[11]) - 32768) <= 1, "half alpha 0.5 maps to mid scale");
+  COMP_CHECK_MSG(std::abs(static_cast<int>(out[12]) - 16384) <= 1,
+                 "a premultiplied half colour is mapped as it is, not unpremultiplied");
+  COMP_CHECK_MSG(std::abs(static_cast<int>(out[13]) - 8192) <= 1,
+                 "a premultiplied quarter of a colour maps to a quarter scale");
+  COMP_CHECK_MSG(out[14] == 0, "a premultiplied channel of zero stays zero");
+}
+
+/* [C1-2] 白点以上的光**饱和**而不是回绕。
+ *
+ * 这是本组最关键的一条：half 最大 65504，若直接 `(uint16_t)(v*65535)` 会被截成
+ * 低 16 位 —— 65504×65535 的低 16 位是一个随机乱值，画面出现彩色噪点。
+ * 上游是画进 16 位 context，被钳到白。 */
+COMP_TEST(half_to_u16_saturates_above_white) {
+  const size_t width = 4, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> half(width * 4, 0);
+  write_half(&half[0], 2.0f, 2.0f, 2.0f, 1.0f);       /* 刚过白点 */
+  write_half(&half[4], 65504.0f, 65504.0f, 65504.0f, 1.0f); /* half 的最大值 */
+  write_half(&half[8], 1e30f, 1e30f, 1e30f, 1.0f);   /* 远超 half 范围 → +Inf */
+  /* 真 +Inf 的位模式是 0x7C00（指数全 1、尾数全 0）；0x7FFF 是 NaN，落 0。 */
+  half[12] = 0x7c00;
+  half[13] = 0x7c00;
+  half[14] = 0x7c00;
+  half[15] = 0x3c00;
+
+  std::vector<uint16_t> out(width * 4, 0);
+  deep_half_to_u16(half.data(), stride, out.data(), stride, width, height);
+
+  for (size_t i = 0; i < 4; ++i) {
+    COMP_CHECK_MSG(out[i] == 65535, "half 2.0 clamps to full scale");
+  }
+  for (size_t i = 4; i < 8; ++i) {
+    COMP_CHECK_MSG(out[i] == 65535, "half 65504 (its maximum) clamps instead of wrapping");
+  }
+  for (size_t i = 8; i < 12; ++i) {
+    COMP_CHECK_MSG(out[i] == 65535, "a value past half's range becomes +Inf and clamps to full scale");
+  }
+  for (size_t i = 12; i < 15; ++i) {
+    COMP_CHECK_MSG(out[i] == 65535, "+Inf clamps to full scale");
+  }
+}
+
+/* [C1-3] 负值与 NaN 落 0，而 +Inf 落上限——两者刻意不同。
+ *
+ * 负光不是有效颜色，16 位 sRGB context 也存不下 → 0。NaN 同样落 0（不是白）：
+ * 把一个坏像素映成白会在画面上打出刺眼亮斑，映成 0 最多是它透明，破坏面小得多。
+ * +Inf 则是「光超过表示范围」，语义上就是白 → 上限。 */
+COMP_TEST(half_to_u16_clamps_negatives_and_nan_to_zero) {
+  const size_t width = 4, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> half(width * 4, 0);
+  half[0] = ref_half(-1.0f);            /* -1.0 → 0 */
+  half[1] = ref_half(-0.5f);
+  half[2] = ref_half(-0.0f);            /* -0.0 → 0 */
+  half[3] = ref_half(-65504.0f);
+  half[4] = 0x7fff;                     /* NaN（指数全 1、尾数非 0）→ 0，不是白 */
+  half[5] = 0xffff;
+  half[6] = 0x0001;                     /* 最小次正规数 → 0 */
+  half[7] = ref_half(2.5f);
+
+  std::vector<uint16_t> out(width * 4, 0xaaaa);
+  deep_half_to_u16(half.data(), stride, out.data(), stride, width, height);
+
+  COMP_CHECK_MSG(out[0] == 0 && out[1] == 0 && out[2] == 0 && out[3] == 0,
+                 "negative halves clamp to zero rather than wrapping to 65535");
+  COMP_CHECK_MSG(out[4] == 0 && out[5] == 0,
+                 "NaN clamps to zero, not to white: one bad pixel must not become a bright spot");
+  COMP_CHECK_MSG(out[6] == 0, "a subnormal half rounds to zero");
+  COMP_CHECK_MSG(out[7] == 65535, "half 2.5 saturates rather than wrapping");
+}
+
+/* [C1-4] 逆方向：16 位整数 → half。0→0、65535→1.0，白点仍是 1.0。
+ * 与 normalize 的区别是这里**不**缩放高光——它就是同一量纲的另一种写法。 */
+COMP_TEST(u16_to_half_maps_the_full_range_to_unit_white) {
+  const size_t width = 4, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> wide(width * 4, 0);
+  wide[0] = 0; wide[1] = 0; wide[2] = 0; wide[3] = 0;
+  wide[4] = 65535; wide[5] = 65535; wide[6] = 65535; wide[7] = 65535;
+  wide[8] = 32768; wide[9] = 32768; wide[10] = 32768; wide[11] = 32768;
+
+  std::vector<uint16_t> half(width * 4, 0xaaaa);
+  deep_u16_to_half(wide.data(), stride, half.data(), stride, width, height);
+
+  COMP_CHECK_MSG(half_to_float(half[3]) == 0.0f, "0 maps to half zero");
+  COMP_CHECK_MSG(close_to(half_to_float(half[7]), 1.0f, 0.0005f), "65535 maps to half 1.0 (white)");
+  COMP_CHECK_MSG(close_to(half_to_float(half[11]), 0.5f, 0.0005f), "32768 maps to half 0.5");
+  COMP_CHECK_MSG(half[7] == ref_half(1.0f), "white is exactly half 1.0, not some other encoding");
+}
+
+/* [C1-5] 往返：white 以下的值往返后仍在 ±1 个 8 位步长内。
+ * 白点以上**不**保往返（那是 normalize/restore 的职责，不是存储转换的）。 */
+COMP_TEST(half_round_trip_preserves_values_within_white) {
+  const size_t width = 4, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> half(width * 4, 0);
+  const float values[4] = {0.0f, 0.25f, 0.5f, 1.0f};
+  for (size_t i = 0; i < 4; ++i) {
+    half[i * 4 + 0] = ref_half(values[i]);
+    half[i * 4 + 1] = ref_half(values[i]);
+    half[i * 4 + 2] = ref_half(values[i]);
+    half[i * 4 + 3] = ref_half(values[i]);
+  }
+
+  std::vector<uint16_t> wide(width * 4, 0);
+  std::vector<uint16_t> back(width * 4, 0);
+  deep_half_to_u16(half.data(), stride, wide.data(), stride, width, height);
+  deep_u16_to_half(wide.data(), stride, back.data(), stride, width, height);
+
+  for (size_t i = 0; i < 4; ++i) {
+    /* 往返一次的容差是 half 的精度（约 2⁻¹¹），远小于 1/255。 */
+    COMP_CHECK_MSG(close_to(half_to_float(back[i * 4 + 0]), values[i], 0.001f),
+                   "a value within white survives the round trip");
+  }
+}
+
+/* [C1-6] 两趟的顺序不可交换：half 必须先按**值**换算。
+ * 若把 half 的位模式直接交给 16 位整数路径，1.0（0x3C00 = 15360）会得 15360，
+ * 是白点的 23 倍——这就是「RGBA16F 放行后画面全错」的具体形态。 */
+COMP_TEST(half_bit_patterns_are_not_read_as_sixteen_bit_integers) {
+  const size_t width = 2, height = 1, stride = width * 4 * sizeof(uint16_t);
+  std::vector<uint16_t> half(width * 4, 0);
+  const uint16_t one = ref_half(1.0f);
+  for (size_t i = 0; i < 4; ++i) half[i] = one;
+  COMP_CHECK_MSG(one == 0x3c00, "half 1.0 is the bit pattern 0x3C00");
+
+  std::vector<uint16_t> out(width * 4, 0);
+  deep_half_to_u16(half.data(), stride, out.data(), stride, width, height);
+
+  COMP_CHECK_MSG(out[0] == 65535,
+                 "half 1.0 converts to full scale, where the bit pattern alone would give 15360");
+}

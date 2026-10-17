@@ -162,7 +162,15 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
   ImageBuffer rgba8_view;
   const ImageBuffer* pixels = &layer.pixels;
   if (layer.pixels.format != COMP_PIXEL_RGBA8) {
-    if (!deep_to_rgba8(layer.pixels, &rgba8_view)) {
+    /*
+     * HDR（RGBA16F）走 hdr_to_rgba8 而不是 deep_to_rgba8：后者把缓冲按 16 位
+     * 整数读，会把 half 的位模式当成数值（0x3C00 = 1.0 读成 15360），
+     * 画面是噪声而不是「白点以上显示为白」。
+     */
+    const bool ok = layer.pixels.format == COMP_PIXEL_RGBA16F
+                        ? hdr_to_rgba8(layer.pixels, &rgba8_view)
+                        : deep_to_rgba8(layer.pixels, &rgba8_view);
+    if (!ok) {
       if (error != nullptr) *error = "unsupported layer pixel format";
       return false;
     }

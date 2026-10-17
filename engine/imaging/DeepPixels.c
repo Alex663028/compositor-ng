@@ -361,3 +361,50 @@ void deep_restore_alpha_hdr(uint16_t *rgba, size_t stride, const float *alpha, s
         }
     });
 }
+
+/* [C1] 半精度 → 16 位整数布局。上游这一步是 Core Image 把 HDR 图画进 16 位
+ * premultiplied sRGB context（`canonical` / `image(_:)`，DeepLayers.swift:24/31）：
+ * white 以上的光被截断、NaN/Inf 落不进来，其余按 0..65535 取整。这里逐位复现该
+ * 截断与取整，预乘关系保持（分量与 alpha 各自独立换算，不做反预乘）。
+ *
+ * 夹紧而非回绕：half 能表示到 65504，浮点上限远在 1.0 之上，若不夹紧 4.0 会被
+ * 取整成 262144 并回绕成 0——比截断更糟，也与上游 context 的行为不符。 */
+static inline uint16_t deep_half_to_u16_one(uint16_t bits) {
+    float value = deep_half(bits);
+    /* 负数与 -Inf 落 0：16 位 context 存不下它们，且负光不是有效颜色。
+     * NaN 也走这一支（`value > 0.0f` 对 NaN 为假）——**刻意**与 +Inf 分开：
+     * 把 NaN 映成白会在画面上打出亮斑（一处坏像素变成一个刺眼白点），
+     * 映成 0 最多是该像素透明，破坏面小得多。上游这一层由 Core Image 兜底，
+     * 我们的 16 位 context 是裸存储，必须自己定这个行为。 */
+    if (!(value > 0.0f)) return 0;                       /* 0.0、负数、-Inf、NaN */
+    float scaled = value * 65535.0f;
+    /* +Inf 与所有超过白点的值饱和到上限：白点以上的光在 8/16 位下就是白
+     * （"anything brighter than white shows as white"，DeepLayers.swift:175）。
+     * 饱和而非回绕：65504×65535 的低 16 位是乱值，画面会出现彩色噪点。 */
+    if (scaled > 65535.0f) scaled = 65535.0f;
+    return (uint16_t)lroundf(scaled);
+}
+
+void deep_half_to_u16(const uint16_t *half, size_t halfStride, uint16_t *out, size_t outStride, size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const uint16_t *in = (const uint16_t *)((const uint8_t *)half + y * halfStride);
+            uint16_t *o = (uint16_t *)((uint8_t *)out + y * outStride);
+            for (size_t x = 0; x < width * 4; ++x) o[x] = deep_half_to_u16_one(in[x]);
+        }
+    });
+}
+
+/* [C1] 16 位整数 → 半精度。0..65535 映射为 extended sRGB 编码、white 仍为 1.0；
+ * 这是存储/合成侧的写法，不是 normalize（后者把高光按最亮通道除下来）。 */
+static inline uint16_t deep_u16_to_half_one(uint16_t value) { return deep_to_half((float)value * (1.0f / 65535.0f)); }
+
+void deep_u16_to_half(const uint16_t *wide, size_t wideStride, uint16_t *out, size_t outStride, size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const uint16_t *in = (const uint16_t *)((const uint8_t *)wide + y * wideStride);
+            uint16_t *o = (uint16_t *)((uint8_t *)out + y * outStride);
+            for (size_t x = 0; x < width * 4; ++x) o[x] = deep_u16_to_half_one(in[x]);
+        }
+    });
+}

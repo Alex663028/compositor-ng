@@ -156,15 +156,19 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
   /*
-   * RGBA8 与 RGBA16 均接受：RGBA8 走正常合成；RGBA16（预乘、native-endian）保留
-   * 16 位资产，合成侧按它的 8 位副本光栅化（domain/layer.h 的 deep_to_rgba8），
+   * RGBA8 / RGBA16 / RGBA16F 均接受：RGBA8 走正常合成；RGBA16（预乘、native-endian）
+   * 保留 16 位资产，合成侧按它的 8 位副本光栅化（domain/layer.h 的 deep_to_rgba8），
    * 并用于 deep 工具链（dither_quantize16 / deep_split / deep_merge）。
-   * RGBA16F 与未知格式入口明确拒绝——域层与合成侧没有半精度像素路径。
+   * RGBA16F（C 方案 C1）是 HDR 资产：同样 8 字节/像素，但每个通道是 half float
+   * （extended sRGB、预乘、native-endian）。它的 8 位工作副本走 hdr_to_rgba8
+   * ——先 deep_half_to_u16（上游 `DeepLayer.image(_:)`，white 以上的光在此截断）
+   * 再 dither_quantize16；直接按 16 位整数读会把 half 的位模式当整数，画面全错。
+   * 未知格式仍然明确拒绝。
    */
   if (image != nullptr && image->format != COMP_PIXEL_RGBA8 &&
-      image->format != COMP_PIXEL_RGBA16) {
+      image->format != COMP_PIXEL_RGBA16 && image->format != COMP_PIXEL_RGBA16F) {
     return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
-                                 "comp_image format must be RGBA8 or RGBA16; unsupported "
+                                 "comp_image format must be RGBA8, RGBA16 or RGBA16F; unsupported "
                                  "pixel format");
   }
   compositor::abi::ImplicitTxn txn(doc, "Set Layer Pixels");

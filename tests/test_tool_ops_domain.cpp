@@ -295,6 +295,50 @@ COMP_TEST(tool_ops_domain_deep_quantize_turns_a_sixteen_bit_layer_into_eight_bit
   COMP_CHECK_MSG(document.history().can_undo(), "quantize is one undo step");
 }
 
+/* [C1-7] deep_to_rgba8 / hdr_to_rgba8 的格式闸互不越界。
+ *
+ * 这条护栏是为一次**注入未红**补的：把 deep_to_rgba8 的入口从
+ * `format != RGBA16` 放宽成 `!= RGBA16 && != RGBA16F`（即 16 位整数转换器
+ * 顺带吃半精度图），此时若 resample 的分流还在，画面照旧全绿——因为没人真的
+ * 走到那条错路。只有两条断言里有一条独立于分流，才钉得住「深拷贝那一步本身
+ * 必须拒绝半精度」。ABI 层的两个用例只经由合成路径，钉不住这个入口。
+ *
+ * 方向不能反：hdr_to_rgba8 收到 RGBA16 同样必须拒绝（否则 16 位图层会被
+ * 当 half 读，值域差 65535 倍）。
+ */
+COMP_TEST(deep_and_hdr_eight_bit_views_keep_their_own_formats) {
+  const int32_t w = 4, h = 2;
+  ImageBuffer wide;
+  wide.resize(w, h, COMP_PIXEL_RGBA16);
+  std::memset(wide.writable_pixels().data(), 0x3c, wide.writable_pixels().size());
+
+  ImageBuffer hdr;
+  hdr.resize(w, h, COMP_PIXEL_RGBA16F);
+  std::memset(hdr.writable_pixels().data(), 0x3c, hdr.writable_pixels().size());
+
+  ImageBuffer out;
+  COMP_CHECK_MSG(!deep_to_rgba8(hdr, &out),
+                 "the 16-bit integer view refuses a half-float source instead of reading bit patterns");
+  COMP_CHECK_MSG(!hdr_to_rgba8(wide, &out),
+                 "the half-float view refuses a 16-bit integer source instead of halving its values");
+
+  /* 正确方向仍然可用：两者互为对方不能做的事。 */
+  COMP_CHECK_MSG(deep_to_rgba8(wide, &out) && out.format == COMP_PIXEL_RGBA8,
+                 "the 16-bit integer view still accepts 16-bit integer pixels");
+  COMP_CHECK_MSG(hdr_to_rgba8(hdr, &out) && out.format == COMP_PIXEL_RGBA8,
+                 "the half-float view still accepts half-float pixels");
+
+  /* 空缓冲同样拒绝，且不写 dst（空 src 没有可转换的像素）。 */
+  ImageBuffer empty;
+  empty.resize(0, 0, COMP_PIXEL_RGBA16F);
+  ImageBuffer sentinel;
+  sentinel.resize(2, 2, COMP_PIXEL_RGBA8);
+  std::memset(sentinel.writable_pixels().data(), 0x5a, sentinel.writable_pixels().size());
+  const std::vector<uint8_t> before = sentinel.pixel_data();
+  COMP_CHECK_MSG(!hdr_to_rgba8(empty, &sentinel), "an empty half-float buffer is refused");
+  COMP_CHECK_MSG(sentinel.pixel_data() == before, "a refused conversion does not disturb the destination");
+}
+
 COMP_TEST(tool_ops_domain_pixel_tool_downgrades_a_sixteen_bit_layer) {
   Engine engine(test_engine_desc());
   Document document(&engine, 4, 4, 72.0f, "sRGB");

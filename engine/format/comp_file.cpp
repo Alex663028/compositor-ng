@@ -617,7 +617,8 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
         if (error != nullptr) {
           *error = "layer " + layer.name +
                    ": enginePixelFormat must be RGBA8 (PNG decode path); "
-                   "16-bit assets require EXR which this build does not support";
+                   "16-bit and HDR assets need a 16-bit-capable decoder (EXR/Radiance), "
+                   "which this build does not support yet";
         }
         return false;
       }

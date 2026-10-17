@@ -80,6 +80,28 @@ void deep_restore_alpha_hdr(uint16_t *rgba, size_t stride, const float *alpha, s
 void deep_take_painted_hdr(uint16_t *hdr, size_t hdrStride, const uint8_t *painted, const uint8_t *base, size_t stride,
                            size_t width, size_t height);
 
+/* C 方案 C1 新增：半精度像素与整数像素之间的两个转换。
+ *
+ * `deep_half_to_u16` 是上游 `DeepLayer.image(_:)`（DeepLayers.swift:31）那一步：
+ * 把 half 的**值**按 0..65535 取整写进 RGBA16 布局。white 以上的光在此被截断
+ * （"anything brighter than white shows as white"，DeepLayers.swift:175），
+ * 但保持预乘关系（分量与 alpha 各自独立取整，不做反预乘）。
+ *
+ * `deep_u16_to_half` 是它的逆（DeepLayers.swift 写入侧同款）：0..65535 的整数
+ * 按 extended sRGB 编码写成 half。
+ *
+ * 为什么不复用 deep_hdr_normalize/restore：那两个是给「8 位操作跑在 HDR 图层上」
+ * 用的，除以各像素最亮通道并记 scales——显示副本不缩放高光，只截断。
+ */
+
+/* Half RGBA → 16-bit RGBA。两侧同为 4 个 uint16 一像素（half 与 16 位同宽），
+ * 行分别按字节给。值域按 0..65535 取整后夹紧，NaN/Inf 按 +Inf 夹到 65535。 */
+void deep_half_to_u16(const uint16_t *half, size_t halfStride, uint16_t *out, size_t outStride, size_t width, size_t height);
+
+/* 16-bit RGBA → Half RGBA（同布局）。0..65535 映射为 extended sRGB 编码的 half，
+ * 白点仍为 1.0——这是**存储/合成**用的，不是 normalize（后者会把高光除下来）。 */
+void deep_u16_to_half(const uint16_t *wide, size_t wideStride, uint16_t *out, size_t outStride, size_t width, size_t height);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **233 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **241 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -307,7 +307,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 233 cases, 0 failed, 0 check failures`（当前基线；§6.1.13 起在此基础上继续累加） |
+| 测试 | `summary: 241 cases, 0 failed, 0 check failures`（当前基线；§6.1.14 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
 
@@ -707,6 +707,60 @@ take_painted 无条件覆盖（1 挂）。
 **护栏写错的记录**（同 S1 颗粒护栏）：先试「去掉 normalize 里的 `fminf`」做注入，结果 0 挂——
 因为该分支不可达（见上第 4 条）。换成「`scale` 恒为 1」才有响应。**护栏初报不红，先怀疑护栏本身。**
 
+### 6.1.14 C 方案 C1：RGBA16F 像素路径打通（2026-10-17，Pi）
+
+C1 是 C 方案的第一块地基：`COMP_PIXEL_RGBA16F` 枚举早就在
+`comp_geometry.h:127`（8 字节/像素），但 ABI 入口一直显式拒绝
+（`comp_layer_abi.cpp:162`），域层与合成侧也没有半精度的像素路径。C1 把它变成真通路。
+
+**新增两个转换内核**（`engine/imaging/DeepPixels.c`，以 C-linkage ABI 暴露，不复制位操作）：
+
+| 内核 | 方向 | 上游对应 |
+|------|------|----------|
+| `deep_half_to_u16` | half RGBA → 16 位 RGBA（按**值**换算） | `DeepLayer.image(_:)` / `canonical`（`DeepLayers.swift:24/31`） |
+| `deep_u16_to_half` | 16 位 RGBA → half RGBA | 写入侧同款 |
+
+口径已冻结成 6 组护栏（`tests/test_hdr_semantics.cpp` C1-1~C1-6），四条要点：
+
+1. **饱和而非回绕。** half 上限 65504，若直接 `(uint16_t)(v*65535)` 会被截成低 16 位，
+   65504×65535 的低 16 位是随机乱值——画面出现彩色噪点。白点以上的光**饱和到 65535**
+   （"anything brighter than white shows as white"，`DeepLayers.swift:175`）。
+2. **NaN→0，+Inf→65535，两条刻意不同。** `!(value > 0.0f)` 把负数、-Inf、NaN 一起落 0
+   （负光不是有效颜色，16 位 context 也存不下）；+Inf 语义上就是「白」故落上限。
+   把 NaN 映成白会在画面上打出刺眼亮斑（一处坏像素变成一个白点），映成 0 最多是它透明。
+3. **预乘保持**：分量与 alpha 各自独立换算，**不做反预乘**。
+4. **子正规数落 0**（`0x0001`），往返容差按 half 精度（约 2⁻¹¹）判定，远小于 1/255。
+
+**8 位视图走 `hdr_to_rgba8`（`domain/layer.cpp`）**，两趟不可交换：
+先 `deep_half_to_u16` 得到 16 位布局，再 `dither_quantize16` 加约一阶噪声取整成 8 位——
+就是上游 `dithered(image(pixels))` 的原序。若把半精度直接喂给 `dither_quantize16`，
+`0x3C00`（1.0）会读成 15360 而非 255，是白点的 23 倍。
+`resample.cpp:171` 按 `format == COMP_PIXEL_RGBA16F` 分流，两个中间缓冲都先落本地
+（src 与 dst 允许是同一个对象，避免边读边写）。
+
+**两件**没做**的事，写明**：
+
+- `rgba8_to_hdr`（8 位工作副本回写 HDR 图层）已实现但**零产品通路**，且**不回填高光**：
+  上游的 8 位工具用完后图层整体降为 8 位（`DeepLayers.swift:297` "they're dithered down"），
+  要保留高光必须走 `hdr_normalize`/`hdr_restore` 那对内核——那是 C2。
+- **`.comp` 解码侧的 RGBA16F 拒绝保留**（`comp_file.cpp:617`）：PNG 路径只产 RGBA8，
+  HDR 图层无法从文件产生，与 C1 的内存路径互相独立。错误消息已改写为指向 C3 解码器。
+  换句话说，**HDR 图层现在能被 API 写进去，但存盘/读盘仍会明确拒绝**。
+
+**护栏反向注入**：注入 1（`deep_half_to_u16` 去掉饱和）→ 3 cases / 14 checks 挂；
+注入 2（`resample.cpp` 去掉格式分流，退回 16 位整型路径）→ 2 cases / 5 checks 挂；
+注入 2b（`deep_to_rgba8` 放宽接受 RGBA16F）**初次未红** → 见下。`grep -rn INJECT` 零残留。
+
+**护栏不够、已补的一条**：注入 2b 单独做时 240 用例全绿——因为 `resample.cpp` 的分流还在，
+没人真的走到那条错路。原来的两个 ABI 用例都**经由合成路径**，钉不住 `deep_to_rgba8`
+这个**入口本身**。故补 `tests/test_tool_ops_domain.cpp` 的
+`deep_and_hdr_eight_bit_views_keep_their_own_formats`：钉死两个 8 位视图的格式闸互不越界
+（16 位视图拒绝 half 源、half 视图拒绝 16 位源），外加空缓冲拒绝且不写 dst。
+补上后注入 2b 独立被抓住。**这是本轮第二个「护栏初报不红，先怀疑护栏本身」**（第一个见 §6.1.13）。
+
+基线 **233 → 241**（0 failed），`run_regression.py --require-ohos` **6/6 PASS**，
+OHOS 72 fail=0，Windows 壳 27 项 SHA256 与基线一致。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -906,7 +960,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**C 方案已拍板，口径已于 §6.1.13 冻结并配 14 条护栏**；接线属 C2，前置是 C1 的 RGBA16F 像素路径） |
-| HDR | （无 —— 入口不可达） | — | `hdr_normalize`/`hdr_restore`/`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 六件套**实现齐备且有 14 条护栏**，但零产品通路：`COMP_PIXEL_RGBA16F` 枚举存在而入口拒绝（`comp_layer_abi.cpp:162`），且无浮点解码器（见 §6.1.12、C0） |
+| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1：`deep_half_to_u16` → `dither_quantize16`，8 位工作副本） | 六件套 `hdr_normalize`/`hdr_restore`/`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 仍是零通路（口径与 14 条护栏见 §6.1.13，接线属 **C2**）；`rgba8_to_hdr` 已实现但无消费点；**无浮点解码器**，HDR 图层存盘仍拒绝（见 §6.1.12、§6.1.14） |
 
 ## 7. 许可
 

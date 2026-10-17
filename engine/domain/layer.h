@@ -107,6 +107,39 @@ struct ImageBuffer {
  */
 bool deep_to_rgba8(const ImageBuffer& src, ImageBuffer* dst);
 
+/* ---------------------------------------------------------------------------
+ * HDR 图层（COMP_PIXEL_RGBA16F）：半精度浮点、extended sRGB、预乘、native-endian，
+ * 4 个 uint16 一像素——与 RGBA16 同样的步长，只是每个通道是 half 而不是 0..65535。
+ *
+ * 「哪里读像素」统一走 hdr_to_rgba8：它就是上游 DeepLayer.dithered 在 HDR 上的那条
+ * 路径（DeepLayers.swift:176），即 `dithered(image(pixels))`——
+ *   1. `image(_:)`（DeepLayers.swift:31）把半精度**重新解释回 RGBA16 布局**；
+ *      white 以上的亮度在此被截到 65535（"anything brighter than white shows
+ *      as white"，DeepLayers.swift:175）。
+ *   2. `dithered(_:)` 在这份 16 位布局上加约一阶噪声后取整成 8 位。
+ * 不能把半精度直接喂给 dither_quantize16：那会把 half 的位模式当整数，
+ * 0x3C00（1.0）会变成 15360 而非 255。
+ *
+ * 口径：src 必须是 COMP_PIXEL_RGBA16F（预乘、native-endian、行紧排，即
+ * ImageBuffer 的存储形态）。dst 会重置为同尺寸的 RGBA8。src 为空或不是
+ * RGBA16F 返回 false 且不写 dst。
+ */
+bool hdr_to_rgba8(const ImageBuffer& src, ImageBuffer* dst);
+
+/* 8 位工作副本回写 HDR 图层（C 方案 C2 的合并/合成消费点）。
+ * 口径：src 必须 COMP_PIXEL_RGBA8、dst 必须 COMP_PIXEL_RGBA16F 且同尺寸；
+ * 按分量写半精度（extended sRGB 编码、预乘），不经过 normalize/restore
+ * ——上游的 8 位工具用完后图层整体降为 8 位（DeepLayers.swift:297
+ * "they're dithered down, halving the layer's memory and file size"），
+ * 高光因此不回填。尺寸不符或格式不对返回 false 且不写 dst。
+ */
+bool rgba8_to_hdr(const ImageBuffer& src, ImageBuffer* dst);
+
+/* 图层是否带 HDR 深度（半精度而非 16 位整数）。16 位与 8 位都返回 false。 */
+inline bool is_hdr_format(comp_pixel_format fmt) {
+  return fmt == COMP_PIXEL_RGBA16F;
+}
+
 /* 8 位灰度蒙版：1 字节/像素，0 = 全透明，255 = 完全不透明。
  * 资产模型同 ImageBuffer（共享 + COW）。 */
 struct MaskBuffer {

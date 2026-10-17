@@ -54,7 +54,13 @@ COMP_API comp_result comp_layer_reorder(comp_document document,
  *     8 位预乘副本（加约一阶噪声后取整，可复现），合成、缩略图与 8 位像素工具
  *     一律用那份副本——所以「传 16 位」与「传它的 8 位副本」合成结果一致。
  *     8 位工具作用于 16 位图层后，该图层就是 8 位（对齐上游 DeepLayers.swift:5）。
- *   - `COMP_PIXEL_RGBA16F` 与未知格式 -> `COMP_ERR_UNSUPPORTED`，且不改动既有像素。
+ *   - `COMP_PIXEL_RGBA16F`：HDR 图层（C 方案 C1）。同样是 8 字节/像素、预乘、
+ *     native-endian，但每个通道是 IEEE 754 half float 而非 0..65535 整数，
+ *     色彩空间为 extended sRGB（白 = 1.0，高光可 > 1.0）。引擎同样为它维护一份
+ *     8 位工作副本：先把 half 的**值**按 0..65535 取整（white 以上的光在此截断，
+ *     对齐上游 `DeepLayer.image(_:)`），再加约一阶噪声取整成 8 位。
+ *     注意不要按 16 位整数的位模式直接读——那是 HDR 通路最典型的画面错误。
+ *   - 未知格式 -> `COMP_ERR_UNSUPPORTED`，且不改动既有像素。
  *
  * `.comp` 存盘只接受 RGBA8 图层：16 位图层要落盘，先跑 `COMP_TOOL_DEEP` 的
  * quantize（16 位 -> 8 位），见 docs/tool-ops.md。
