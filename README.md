@@ -638,6 +638,39 @@ OHOS aarch64 72 单元 fail=0；Windows 壳 27 项 SHA256 与基线一致。
 > 正确口径是**同 seed + 同起始像素 + 同文档原点** -> 逐字节相同，而颗粒是**叠加**的
 > （再跑一遍会再加一层，这正是画笔该有的行为，不是幂等）。
 
+### 6.1.12 深度语义核实：32 位浮点不成立、HDR 被解码器阻塞（2026-10-17，Pi）
+
+AUDIT9 把 `deep_split` 记作「需先定 32 位浮点深度语义」、`hdr_*` 记作「需线性 HDR 决策」，
+并据此认为它们占引擎核剩余缺口的大半。本轮逐条对上游核实，**其中两条的前提不成立**，
+已从 §6.4 口径 A 的缺口列表中撤下（口径本身未变，仍为 ≈92%）。
+
+**① `deep_split` 的 32 位浮点深度语义 —— 伪命题，无需决策。**
+上游全仓 35 处图层存储上下文分配，32 处 `bitsPerComponent: 8`、1 处 `: 16`（`DeepLayers.swift:14`），
+**零处 32 位浮点**。唯一的 `CIFormat.RGBAf` 在 `DeepLayers.swift:251`，且只作 Core Image 的
+`workingFormat`（中间态，`PixelAdjust.render` 的落点仍是 `.RGBA16`）。即上游深度模型只有
+**三层**：8 位层 / 16 位层 / HDR（半浮点 extended sRGB）层，**没有第四层**。
+而 `deep_split` 的口径本就写死在 `DeepPixels.h` 里，且与上游 `.c` 逐字节等同
+（`diff` 仅差 GCD 一处、见 §6.1.11 注），也已由 deep round trip 接线（`tool_ops.cpp:270`）。
+**结论：没有需要拍板的东西。**
+
+**② `deep_take_painted` —— 语义明确，但被仿制笔刷阻塞，非语义问题。**
+上游触发面只有两处：`DeepLayers.swift:71`（`flattened`）与 `BrushStroke.swift:1120`
+（`sixteenBit`）。语义是「16 位层被笔刷/仿制笔刷涂抹后，哪里的 8 位像素与 8 位基底不同，
+哪里就是被画过，取该值」。ng 现状：`grep -rni "clone|smudge|liquify" engine/` **零命中**，
+且非 deep 工具全走 `use_rgba8_working_copy` 直接降 8 位（`tool_ops.cpp:713`）。
+**结论：要等 S4 仿制笔刷的 tile + coverage 模型，届时上游口径无歧义。**
+
+**③ `hdr_*` 线性 HDR —— 语义已可定，但被解码器硬阻塞。**
+上游 HDR 存在的唯一理由是 EXR / Radiance HDR 往返：`ImageImporter.swift:97` 只对
+`.openEXR` / `.radianceHDR` 开浮点路径，`DeepLayers.swift:171-174` 用 `deep_half_peak` 取峰值、
+**`peak > 1.001` 才算 HDR 层**（"a file brushing white through rounding isn't HDR"），
+存储在 **extended sRGB 半浮点、预乘**（`hdrSpace`，`DeepLayers.swift:85`）。口径确定，但 ng 的 `codec_lib_can_decode`
+只有 png / jpeg / psd（`codec_lib.cpp:470`），**没有任何浮点解码器**，HDR 层无法从文件产生。
+另需注意：两个 PNG 解码器都**截掉 16 位**——`codec_lib.cpp:260` 调 `png_set_strip_16`，
+`comp_png.cpp:342` 的 `sample8` 对 depth 16 直接取高字节，故 **16 位 PNG 也会掉到 8 位**。
+**结论：这是「有没有解码器」的前置问题，不是「线性还是非线性」的语义问题**；
+HDR 六个内核的接法在上游有唯一解，但入口不可达时接上去即死代码。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -758,15 +791,16 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 89 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
-| ② 像素内核**有产品通路**的部分 | 35% | **~91%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）。余 `dither_dots`/`dither_glow`、`deep_split`/`deep_merge`/`deep_take_painted`、`hdr_*`，以及解码器仍不能产出 16 位资产 |
+| ② 像素内核**有产品通路**的部分 | 35% | **~91%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）。余 `deep_take_painted`（等 S4 仿制笔刷 tile 模型）与 `hdr_*`（无浮点解码器，见 §6.1.12）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
 | ③ 合成与渲染正确性 | 20% | **~96%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐 |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
 
 **加权完成度 ≈ 92%**（口径 A）。算术：① 30%×95% + ② 35%×91% + ③ 20%×96%
 + ④ 15%×80% = 28.5 + 31.85 + 19.2 + 12 = **91.55% ≈ 92%**。
 
-**剩下的 8% 里大半是「需要语义决定」而非技术债**：`deep_split` 需先定 32 位浮点深度语义、
-`hdr_*` 需先定线性 HDR 决策。这两项投入前必须先拍板，否则写出来的东西会被推翻。
+**剩下的 8% 里大半不是技术债，而是「需要语义决定」或「被上游工具面阻塞」**——
+这两项在 §6.1.12 重新核实过：`deep_split` 的 32 位浮点语义**不成立**（上游深度模型只有
+8/16/HDR 三层，无 32 位浮点图层），`deep_take_painted` 被仿制笔刷阻塞。真正待定的只剩 `hdr_*`。
 
 #### 口径 B：产品功能面
 
@@ -835,7 +869,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
-| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_split`/`deep_merge`（需 32 位浮点深度语义决定）、`deep_take_painted`、`hdr_*`（需线性 HDR 决策） |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**已定语义**：`half` / extended sRGB / 预乘 / peak>1.001 才算 HDR 层；等 EXR·Radiance·float-TIFF 解码器，见 §6.1.12） |
 
 ## 7. 许可
 
