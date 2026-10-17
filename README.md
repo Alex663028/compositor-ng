@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **219 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **233 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -307,7 +307,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 219 cases, 0 failed, 0 check failures`（当前基线；§6.1.11 起在此基础上继续累加） |
+| 测试 | `summary: 233 cases, 0 failed, 0 check failures`（当前基线；§6.1.13 起在此基础上继续累加） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
 
@@ -671,6 +671,42 @@ AUDIT9 把 `deep_split` 记作「需先定 32 位浮点深度语义」、`hdr_*`
 **结论：这是「有没有解码器」的前置问题，不是「线性还是非线性」的语义问题**；
 HDR 六个内核的接法在上游有唯一解，但入口不可达时接上去即死代码。
 
+### 6.1.13 C 方案 C0 口径冻结：HDR 六内核护栏（2026-10-17，Pi）
+
+ALEX 选 **C**（完整 HDR：EXR/Radiance/float-TIFF 解码器 + 6 内核 + 全部调整走浮点 + EXR 导出）。
+推进前先做 C0（口径冻结）。**触发 C0 的不是「需要写文档」，而是一个核对结果**：
+
+```
+grep -rn "deep_hdr" tests/   →  零命中
+```
+
+6 个 `hdr_*` 内核在 `DeepPixels.c:257-363` 全部有实现、且与上游逐字节等同，
+但**一行测试都没有执行过**——口径没对着测试冻结，等于没冻结。故 C0 交付
+`tests/test_hdr_semantics.cpp` **14 条行为护栏**，未改动任何引擎源码。
+
+完整口径文档：`report/C0-hdr-contract-20261017-pi.md`。四条最易踩的：
+
+1. **normalize 的输出是 RGBA16，不是 half float**（`DeepLayers.swift:101` 的目标 `context(...)` 未传 `hdr:`；
+   `:115` 的 restore 输入取自 `canonical(operation(...))`，同样 16 位）。只有两端是半精度。
+   写反会让 16 位布局被当浮点解释，读出 0 或 65535 倍偏差。
+2. **`inverseGamma` 是 `1/gamma`，而 `gamma` 默认 1.0**（`ImageAdjustments.swift:45`），
+   故上游正常路径传进来就是 **1.0** 而非 `1/2.2`；内核不校验，传错照样出结果。
+3. **Exposure 的缩放发生在线性域**，编码回来的数值不等于「原值除以 2 的幂」：
+   8 的两档下压在线性域是 /4，编码回来是 **4.46 而不是 2**。
+4. **`scale = brightest` 使 `color[c]/scale ≤ 1` 由构造保证**，源码里那个 `fminf(1, ...)`
+   本就不可达——别去「修」它。
+
+判定闸冻结为 `peak > 1.001`（`DeepLayers.swift:174` "a file brushing white through rounding
+isn't HDR"），峰值取**反预乘后**值，`alpha==0` 跳过、`< INFINITY` 才参与。
+
+**14 条护栏全部做了反向注入**（改坏内核 → 确认对应护栏变红 → 还原，`diff` 无差异）：
+峰值去反预乘（1 挂）、峰值不排除 inf（1 挂）、normalize 的 `scale` 恒为 1（**4 cases / 11 checks 挂**）、
+exposure 在白点裁切（2 cases / 6 checks 挂）、extract 去掉 `alpha>0` 守卫（1 case / 6 checks 挂）、
+take_painted 无条件覆盖（1 挂）。
+
+**护栏写错的记录**（同 S1 颗粒护栏）：先试「去掉 normalize 里的 `fminf`」做注入，结果 0 挂——
+因为该分支不可达（见上第 4 条）。换成「`scale` 恒为 1」才有响应。**护栏初报不红，先怀疑护栏本身。**
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -869,7 +905,8 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
-| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**已定语义**：`half` / extended sRGB / 预乘 / peak>1.001 才算 HDR 层；等 EXR·Radiance·float-TIFF 解码器，见 §6.1.12） |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**C 方案已拍板，口径已于 §6.1.13 冻结并配 14 条护栏**；接线属 C2，前置是 C1 的 RGBA16F 像素路径） |
+| HDR | （无 —— 入口不可达） | — | `hdr_normalize`/`hdr_restore`/`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 六件套**实现齐备且有 14 条护栏**，但零产品通路：`COMP_PIXEL_RGBA16F` 枚举存在而入口拒绝（`comp_layer_abi.cpp:162`），且无浮点解码器（见 §6.1.12、C0） |
 
 ## 7. 许可
 
