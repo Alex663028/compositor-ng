@@ -75,6 +75,38 @@ bool blur_rgba8_copy(const uint8_t* src, int32_t width, int32_t height, size_t s
 bool apply_channel_mixing_sixteen_bit(uint16_t* pixels, size_t stride, int32_t width, int32_t height,
                                       const std::string& settings_json);
 
+/* ---------------------------------------------------------------------------
+ * C 方案 C2 的口径记录（**尚无实现，调用点随 C5 到来**）。
+ *
+ * 上游口径（compositor/Compositor/Rendering/LiveMaskRenderer.swift:43）：
+ *   let deep = sixteenBit && original.bitsPerComponent == 16
+ *   ... settings.applySixteenBit(original, ...)
+ *   ——`hdr` 为真时同一段代码落在 half 像素上（`adjust` 的 context 是
+ *   `DeepLayer.context(..., hdr: hdr)`）。
+ *
+ * 而 `LayerAdjustment.applySixteenBit`（LayerAdjustment.swift:156-160）只有三条路：
+ *   1. 高斯/动感模糊 → CI 里按图像自身深度渲染（与像素格式无关）；
+ *   2. Exposure 且是 HDR → **deep_hdr_exposure**，直接在 half 上，不经 normalize；
+ *   3. 跨通道的调整（hsv / blackWhite / colorBalance / gradientMap）→ **deep_cube_apply**，
+ *      它在 16 位 RGBA 布局上查表，于是 `DeepLayer.lookup` 先 deep_hdr_normalize
+ *      把高光除回白内、查完 deep_hdr_restore 乘回去（DeepLayers.swift:240-244）；
+ *   4. 其余 → **deep_round_trip**（deep_split/deep_merge），同样被
+ *      `DeepLayer.run`（:196）包在 normalize/restore 之间。
+ *
+ * 为什么这里还没有 `apply_adjustments_hdr`：本仓的调整求值只有一个调用点
+ * （filter_graph.cpp 的 kSource，作用在 RGBA8 的 backdrop 上），而生成路径的每一块
+ * 表面都是 `COMP_PIXEL_RGBA8`。也就是说，即便照上面的分派表写出一个「作用在 half
+ * 像素上」的求值函数，也**没有任何调用者**——它会成为第 7 族零通路内核，正是
+ * README §6.6 与历轮审计反复点名的那种缺口。让调整求值真正落在 half 上，前提是
+ * 合成表面能按文档深度携带 half（上游那个 `sixteenBit` 开关），那是 C5 的范围。
+ *
+ * C2 已落地的那一半（有真调用点）在 domain/tool_ops.cpp：`deep_hdr_round_trip`
+ * 把任一 8 位操作包在 deep_hdr_normalize / deep_hdr_restore 之间跑 16 位往返，
+ * 由 `COMP_TOOL_DEEP` 的 round trip 分支对 HDR 图层调用（上游 DeepLayers.swift:196
+ * 的 `normalizing(deep) { run(...) }`）。上面的分派表 2/4 两条据此可以直接落，
+ * 只要 C5 把调整求值的缓冲换成 half，第 1、3 条也已具备同一层原语。
+ * --------------------------------------------------------------------------- */
+
 }  // namespace compositor
 
 #endif /* COMPOSITOR_COMPOSITING_ADJUSTMENT_EVAL_H */

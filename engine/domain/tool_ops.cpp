@@ -303,6 +303,50 @@ bool deep_round_trip(const uint16_t* deep, size_t deep_stride, uint16_t* out, si
   return true;
 }
 
+/*
+ * HDR 图层上的 8 位操作：先把高光除回白内，再让操作穿过 16 位往返，最后乘回去。
+ *
+ * 逐字对齐上游 `DeepLayer.run` 的 HDR 分支（DeepLayers.swift:196）：
+ *     if isHDR(deep) { return try normalizing(deep) { try run($0, …) } }
+ * `normalizing`（:99-120）正是三步：`deep_hdr_normalize` 按每个像素最亮的通道把
+ * 它除进白内（倍数记在 scales 里，alpha 不动）、操作在 16 位整数布局上跑、
+ * `deep_hdr_restore` 按 scales 乘回去。于是 HDR 图层**不**像 16 位图层那样被降成
+ * 8 位：像素仍是 half，只是这一趟操作看不见白以上的光（DeepLayers.swift:82-84）。
+ *
+ * 为什么先 normalize 再往返：`deep_round_trip` 的内核（deep_split/deep_merge）读的是
+ * 16 位整数布局，而 HDR 的缓冲是 half——把 half 的位模式当整数读，0x3C00（1.0）
+ * 会得 15360，画面是噪声而不是「白点以上显示为白」。
+ *
+ * stride 一律以字节计。原地安全：normalized 与合回的结果都先落在本地缓冲，
+ * src/dst 指同一个对象也不会边读边写。
+ */
+bool deep_hdr_round_trip(const uint16_t* hdr, size_t hdr_stride, uint16_t* out, size_t out_stride,
+                         size_t width, size_t height,
+                         const std::function<bool(uint8_t*, size_t, size_t, size_t)>& op,
+                         int mixes, std::string* error) {
+  if (hdr == nullptr || out == nullptr || !op) {
+    if (error != nullptr) *error = "hdr round trip got null arguments";
+    return false;
+  }
+  if (width == 0 || height == 0) return true;
+
+  /* 16 位整数布局：4 通道 × 2 字节。上游 normal 上下文同宽同高（DeepLayers.swift:102）。 */
+  const size_t normal_stride = width * 8u;
+  std::vector<uint16_t> normal(width * height * 4u, 0);
+  std::vector<float> scales(width * height, 1.0f);
+  deep_hdr_normalize(hdr, hdr_stride, normal.data(), normal_stride, scales.data(), width, height);
+
+  std::vector<uint16_t> merged(width * height * 4u, 0);
+  if (!deep_round_trip(normal.data(), normal_stride, merged.data(), normal_stride, width, height, op,
+                       mixes, error)) {
+    return false;
+  }
+
+  /* restore 写 half：颜色按 scales 乘回去，alpha 原样（内核自己按预乘处理）。 */
+  deep_hdr_restore(merged.data(), normal_stride, scales.data(), out, out_stride, width, height);
+  return true;
+}
+
 /* ============================================================ 选区轮廓 */
 
 /*
@@ -641,10 +685,17 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       if (params.deep_mode != kToolDeepQuantize && params.deep_mode != kToolDeepRoundTrip) {
         return bad_arg("deep mode must be quantize or round trip");
       }
-      if (layer->pixels.format != COMP_PIXEL_RGBA16) {
-        return bad_state("deep quantize needs a COMP_PIXEL_RGBA16 layer (the layer holds 8-bit "
-                    "pixels already); import a 16-bit asset, or set RGBA16 pixels via "
-                    "comp_layer_set_pixels");
+      /*
+       * 16 位与 HDR 两种深度都收：前者的往返在 16 位整数布局上跑，后者先经
+       * deep_hdr_normalize 把高光除回白内（见下面的 deep_hdr_round_trip）。
+       * 8 位图层仍然拒绝——它没有 16 位以上的精度可保，降级成「对 8 位像素再跑
+       * 一遍」就是伪造。HDR 不是 8 位：它带着白以上的光，深度的往返对它有实义
+       * （DeepLayers.swift:82-84）。
+       */
+      if (layer->pixels.format != COMP_PIXEL_RGBA16 && layer->pixels.format != COMP_PIXEL_RGBA16F) {
+        return bad_state("deep needs a COMP_PIXEL_RGBA16 or COMP_PIXEL_RGBA16F layer (this layer "
+                    "holds 8-bit pixels already); import a 16-bit or HDR asset, or set those "
+                    "pixels via comp_layer_set_pixels");
       }
       if (params.deep_mode == kToolDeepRoundTrip) {
         /*
@@ -709,10 +760,17 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
    * deep 之外的工具全是 8 位内核：先把 16 位像素落到它的 8 位副本（见
    * use_rgba8_working_copy）。deep 自己不在这里降位——quantize 分支做的就是
    * 这件事，round trip 分支在参数闸已经拒绝，在这里降位会掩盖那条拒绝。
+   *
+   * HDR（RGBA16F）**不**降位，也不在这里接：上游对 HDR 图层的 8 位工具是
+   * 「先 normalize 再往返再 restore」（DeepLayers.swift:196），落笔那一路还要
+   * take_painted_hdr 的 tile+coverage 模型（等 S4）。降成 8 位等于把那层白以上的光
+   * 永久丢掉——那是 16 位图层的规则（DeepLayers.swift:5），不是 HDR 的（:82-84）。
+   * 所以这里如实拒绝，不静默降级；deep 的往返已是 HDR 上可用的那条路。
    */
   if (params.kind != kToolOpDeep && !use_rgba8_working_copy(target_layer)) {
     if (owns_txn) document->txn_abort(&txn_error);
-    return bad_state("layer pixels are neither RGBA8 nor RGBA16");
+    return bad_state("layer pixels are neither RGBA8 nor RGBA16 (an HDR layer takes only the deep "
+                     "tool's round trip today)");
   }
 
   bool ok = true;
@@ -831,18 +889,29 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
 
     case kToolOpDeep: {
       if (params.deep_mode == kToolDeepQuantize) {
-        if (!deep_to_rgba8(target_layer->pixels, &target_layer->pixels)) {
+        /*
+         * HDR 的 8 位副本走 hdr_to_rgba8：先 deep_half_to_u16 把 half 的**值**落成
+         * 16 位整数，再 dither_quantize16 取整成 8 位（domain/layer.cpp 的两趟）。
+         * 直接送进 deep_to_rgba8 会按 16 位整数读 half 的位模式——0x3C00（1.0）
+         * 读成 15360，画面全是噪声。两条路都是「白点以上显示为白」。
+         */
+        const bool quantized = target_layer->pixels.format == COMP_PIXEL_RGBA16F
+                                   ? hdr_to_rgba8(target_layer->pixels, &target_layer->pixels)
+                                   : deep_to_rgba8(target_layer->pixels, &target_layer->pixels);
+        if (!quantized) {
           ok = bad_state("deep quantize could not build the 8-bit working copy");
         }
         break;
       }
       /*
-       * 往返：图层保持 RGBA16，把 pixels 穿过 `params.inner` 那个 8 位操作四遍
-       * （deep_split/deep_merge），结果仍是 16 位。inner 为 none 时不做任何操作，
-       * 直接把 low 档结果合回——这条路径等价于「8 位量化后又读回 16 位」，
-       * 会丢掉 8 位以上的精度，如实写进 note 而不是当作无损往返。
+       * 往返：图层保持它的深度（RGBA16 仍是 16 位、RGBA16F 仍是 half），把 pixels
+       * 穿过 `params.inner` 那个 8 位操作四遍（deep_split/deep_merge）。inner 为
+       * none 时不做任何操作，直接把 low 档结果合回——这条路径等价于「8 位量化后
+       * 又读回 16 位」，会丢掉 8 位以上的精度，如实写进 note 而不是当作无损往返。
+       * HDR 走 deep_hdr_round_trip（上游 normalizing 那一层）。
        */
       {
+        const bool is_hdr = target_layer->pixels.format == COMP_PIXEL_RGBA16F;
         const uint16_t* deep = reinterpret_cast<const uint16_t*>(target_layer->pixels.row(0));
         const size_t deep_stride = target_layer->pixels.stride();
         std::vector<uint16_t> merged(width * height * 4u, 0);
@@ -888,12 +957,16 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
         };
 
         std::string rt_error;
-        if (!deep_round_trip(deep, deep_stride, merged.data(), width * 8u, width, height,
-                             apply_inner, /*mixes=*/0, &rt_error)) {
+        const bool ran = is_hdr
+                             ? deep_hdr_round_trip(deep, deep_stride, merged.data(), width * 8u, width,
+                                                   height, apply_inner, /*mixes=*/0, &rt_error)
+                             : deep_round_trip(deep, deep_stride, merged.data(), width * 8u, width,
+                                               height, apply_inner, /*mixes=*/0, &rt_error);
+        if (!ran) {
           ok = fail(COMP_ERR_INTERNAL, rt_error);
           break;
         }
-        /* 结果写回（COW）：图层仍是 16 位，像素换成合回的结果。 */
+        /* 结果写回（COW）：深度不变（RGBA16 仍 16 位、RGBA16F 仍 half），像素换成合回的结果。 */
         std::memcpy(target_layer->pixels.writable_pixels().data(), merged.data(), width * height * 8u);
         if (params.inner == kToolOpNone && note != nullptr) {
           *note += "deep round trip without an inner operation is a quantize-and-read-back: "

@@ -742,7 +742,8 @@ C1 是 C 方案的第一块地基：`COMP_PIXEL_RGBA16F` 枚举早就在
 
 - `rgba8_to_hdr`（8 位工作副本回写 HDR 图层）已实现但**零产品通路**，且**不回填高光**：
   上游的 8 位工具用完后图层整体降为 8 位（`DeepLayers.swift:297` "they're dithered down"），
-  要保留高光必须走 `hdr_normalize`/`hdr_restore` 那对内核——那是 C2。
+  要保留高光必须走 `hdr_normalize`/`hdr_restore` 那对内核——那是 C2（已在 §6.1.16 落地为
+  「HDR 图层上的 deep round trip」；本句在 C1 时写下，故仍按当时的待办表述保留）。
 - **`.comp` 解码侧的 RGBA16F 拒绝保留**（`comp_file.cpp:617`）：PNG 路径只产 RGBA8，
   HDR 图层无法从文件产生，与 C1 的内存路径互相独立。错误消息已改写为指向 C3 解码器。
   换句话说，**HDR 图层现在能被 API 写进去，但存盘/读盘仍会明确拒绝**。
@@ -825,6 +826,58 @@ Shadow 的区域层正是靠前者算的，换成后者会让图像边缘变暗�
 
 护栏与注入记录见 `report/A1-upstream-align-20261017-pi.md`。基线 **241 → 249**（0 failed），
 `run_regression.py --require-ohos` **6/6 PASS**，OHOS 72 fail=0，Windows 壳 27 项 SHA256 一致。
+
+### 6.1.16 C 方案 C2：HDR 图层走 normalize/restore 的深度往返（2026-10-17，Claude 接手）
+
+Pi 连续三次因 provider 侧额度错误（`403 no active subscription`）无法继续，由 Claude 接替 C2。
+接手的第一个动作不是补实现，而是**核实调用点**——结论把 C2 的范围缩小了一半：
+
+- `comp_*` 导出面里**没有任何「把一组调整烘到图层上」的入口**；工具侧唯一入口是
+  `comp_tool_apply` → `run_tool_op`。
+- `apply_adjustments` 全仓**只有一个调用点**（`engine/compositing/filter_graph.cpp` 的 `kSource`），
+  作用在 **RGBA8 的 backdrop** 上；生成路径的每一块表面都是 `COMP_PIXEL_RGBA8`。
+- 故 Pi 留下的、**只有声明没有实现**的 `apply_adjustments_hdr` 即便照上游
+  `LayerAdjustment.applySixteenBit`（`LayerAdjustment.swift:156-160`）的分派表写全，
+  也**没有任何调用者**——它会成为第 7 族零通路内核。**上游那个 `sixteenBit` 开关的前提是合成
+  表面按文档深度携带 half，那是 C5。** 口径与出处留在 `adjustment_eval.h`（纯注释，无代码）。
+
+C2 因此交付**有真调用点的那一半**：`COMP_TOOL_DEEP` 的往返分支对 HDR 图层走
+`deep_hdr_normalize` → 8 位操作 → `deep_hdr_restore`（`tool_ops.cpp:323-347`，对齐上游 `DeepLayer.run`
+HDR 分支的 `normalizing`，`DeepLayers.swift:196` / `:99-120`）。同轮：quantize 分支按格式分流到
+`hdr_to_rgba8`（`:898`）、deep 参数闸放宽到收 RGBA16F（`:695`）、非 deep 闸对 HDR **如实拒绝**
+而不是静默降位。语义要点：normalize 的输出是 **RGBA16 整数布局而非 half**（C0 冻结第 1 条），
+restore 按 `scales` 乘回颜色、**alpha 原样**（`DeepPixels.c:289-290`）。
+
+| 内核 | C2 前 | C2 后 |
+|------|-------|-------|
+| `deep_hdr_normalize` / `deep_hdr_restore` | 零通路 | **已接线**（HDR 图层上的 deep round trip） |
+| `deep_hdr_exposure` / `extract_alpha_hdr` / `restore_alpha_hdr` | 零通路 | 零通路，阻塞点 = **C5**（调整表面与剪贴栈基底的深度） |
+| `deep_take_painted_hdr` | 零通路 | 零通路，阻塞点 = **S4**（tile+coverage 仿制笔刷） |
+
+护栏 4 例（`tests/test_tool_ops_domain.cpp:335/396/477/522`）。反向注入三次，各自只打红该红的用例：
+N1（`is_hdr` 恒 false）→ C2-1 / C2-2 挂；N2（deep 闸退回只收 RGBA16）→ C2-1 / C2-2 / C2-3 挂；
+N3（`use_rgba8_working_copy` 顺手把 HDR 降成 8 位）→ C2-4 挂 5 check（运行成功、深度掉到 RGBA8、
+进了撤销栈）。还原后 `253 cases, 0 failed`，`grep -rn INJECT` 零残留。
+
+**本轮第 5 次「护栏初报不红，先怀疑护栏本身」**：C2-2 最初用**均匀 4.0 高光场**、判据「亮点 ≥3/4」，
+注入 N1 时**不红**。两层根因：
+
+1. **`deep_low` 不做反预乘**（`DeepPixels.c:29-32`）：它把 16 位值整体乘 `255/65535` 再减 1，
+   然后**夹到 `alpha8`**。4.0 的位模式 `0x4400` 经此得 66/67，被夹到错读出来的 alpha(60)，
+   比值恰好 1.0——**错路给操作看到的也是满白**，只是标尺被一起读错了。反预乘其实发生在更下游的
+   8 位内核里（`dither_apply` 自己除 `px[3]`）。
+2. **均匀场天生看不见这件事**：`scale = max(brightest, 1)` 使「颜色 == 自身最大值」的均匀场在正确
+   路径上必然归一到白；两条路在「亮不亮」这一维不可分，可分的是**还原后的绝对量级**（4.0 vs 1.059）
+   ——那正是 C2-1 钉住的。
+
+修法：探针换成**不透明 0.5 中灰**（正确路径 `scale = 1` ⇒ 操作看到 0.5 ⇒ 亮 2/4；错路看到
+54/60 ≈ 0.9 ⇒ 亮 4/4，实测 32/64 vs 64/64），判据由单侧下界改为**上下界夹住**，并加一条不依赖
+阈值的精确断言：完全不透明的 alpha 走完往返必须逐字节是 `0x3C00`（错路 `0x3C3C`）。补后 N1 稳定打红。
+C2-1 最初也因「均匀场乘径向重采样仍是自己」在 `after != before` 上挂过一次，改用「左 3/4 高光块 +
+右 1/4 逐列阶梯」的场才成立。教训同 §6.1.15：**探针的输入必须落在被注入量真正参与输出的那条支路上。**
+
+基线 **249 → 253**（0 failed），`run_regression.py --require-ohos` **6/6 PASS**，OHOS 72 fail=0，
+Windows 壳 27 项 SHA256 与基线一致。报告：`report/C2-hdr-round-trip-20261017-claude.md`。
 
 ### 6.2 尚未验证的部分（证据边界）
 
@@ -1028,8 +1081,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
-| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha` | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型才能接线）、`hdr_*` 六个（**C 方案已拍板，口径已于 §6.1.13 冻结并配 14 条护栏**；接线属 C2，前置是 C1 的 RGBA16F 像素路径） |
-| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1：`deep_half_to_u16` → `dither_quantize16`，8 位工作副本） | 六件套 `hdr_normalize`/`hdr_restore`/`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 仍是零通路（口径与 14 条护栏见 §6.1.13，接线属 **C2**）；`rgba8_to_hdr` 已实现但无消费点；**无浮点解码器**，HDR 图层存盘仍拒绝（见 §6.1.12、§6.1.14） |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`（口径 §6.1.13 已冻结并配 14 条护栏，**阻塞点 = C5** 的文档深度表面）、`take_painted_hdr`（阻塞点 = S4） |
+| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`） | `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 仍是零通路（阻塞点见上，口径见 §6.1.13、接线范围见 §6.1.16）；`rgba8_to_hdr` 已实现但无消费点；**无浮点解码器**，HDR 图层存盘仍拒绝（见 §6.1.12、§6.1.14） |
 | Adjust | **零产品通路**（`adjust_*` 一族无任何工具/命令消费） | 内核 62 个函数已与上游对齐（§6.1.15） | 整族无产品通路；属 F4 Camera Raw 产品通路 |
 
 ## 7. 许可

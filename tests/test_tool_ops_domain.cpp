@@ -11,7 +11,11 @@
  *   3. 往返内层不得是改几何 / 写蒙版的算子（参数闸拒绝）；
  *   4. 非法 deep_mode 值 -> `COMP_ERR_INVALID_ARGUMENT`；
  *   5. 参数闸在**开事务之前**：被拒的调用不留悬空事务、不进撤销栈、不改像素；
- *   6. `pressure * flow == 0` 的笔画逐字节不变（可重复性契约的边界）。
+ *   6. `pressure * flow == 0` 的笔画逐字节不变（可重复性契约的边界）；
+ *   7. HDR（COMP_PIXEL_RGBA16F）图层上的 deep round trip 走 normalize/restore，
+ *      深度不变、一步撤销、高光还在白以上 [C2-1 / C2-2]；
+ *   8. HDR 的 deep quantize 是 half 视图那条路，不是 16 位整数视图 [C2-3]；
+ *   9. HDR 图层上的其余工具如实拒绝（STATE），不静默降位 [C2-4]。
  *
  * 本文件的错误码断言全部钉**具体值**而非「非 OK」：`!= COMP_OK` 会让
  * INTERNAL 这类内部错误伪装成「按契约拒绝了」。
@@ -25,6 +29,7 @@
 #include "domain/layer.h"
 #include "domain/tool_ops.h"
 #include "engine.h"
+#include "imaging/DitherPixels.h"
 #include "test_framework.h"
 
 using namespace compositor;
@@ -98,6 +103,112 @@ ImageBuffer copy_of(const std::vector<uint8_t>& bytes, int32_t w, int32_t h, com
   out.resize(w, h, fmt);
   std::memcpy(out.writable_pixels().data(), bytes.data(), bytes.size());
   return out;
+}
+
+/*
+ * float → half 的位模式，half 位模式 → float。
+ *
+ * 本文件的取值全是二的幂（0.25 / 0.5 / 1 / 2 / 4），尾数精确，所以这里只做
+ * 「移位 + 偏置」的直译，不写第二份参考舍入：被测的是域层的**接线**，
+ * 内核自己的转换口径由 test_hdr_semantics.cpp 的 C0 那批钉住。
+ * 负数（符号位）本文件不用。
+ */
+uint16_t half_bits(float value) {
+  union {
+    float f;
+    uint32_t u;
+  } in = {value};
+  const uint32_t exponent = (in.u >> 23) & 0xffu;
+  if (exponent == 0xffu) return static_cast<uint16_t>(0x7c00u);
+  const int32_t e = static_cast<int32_t>(exponent) - 127 + 15;
+  if (e <= 0) return 0; /* 本文件不用次正规数 */
+  if (e >= 31) return 0x7c00u;
+  return static_cast<uint16_t>((static_cast<uint32_t>(e) << 10) | ((in.u & 0x7fffffu) >> 13));
+}
+
+float half_value(uint16_t bits) {
+  const uint32_t exponent = (bits >> 10) & 0x1fu, mantissa = bits & 0x3ffu;
+  uint32_t out = 0;
+  if (exponent == 31u) {
+    out = 0x7f800000u | (mantissa << 13);
+  } else if (exponent != 0u) {
+    out = ((exponent + 112u) << 23) | (mantissa << 13);
+  }
+  float value = 0.0f;
+  std::memcpy(&value, &out, sizeof(value));
+  return value;
+}
+
+/* 读回某个像素的四个 half 通道（预乘、native-endian）；越界时返回全 0。 */
+void half_pixel(const std::vector<uint8_t>& bytes, int32_t w, int32_t x, int32_t y, uint16_t out[4]) {
+  out[0] = out[1] = out[2] = out[3] = 0;
+  const size_t at = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u;
+  if (bytes.size() < (at + 4u) * sizeof(uint16_t)) return;
+  std::memcpy(out, bytes.data() + at * sizeof(uint16_t), 4u * sizeof(uint16_t));
+}
+
+/*
+ * 铺满画布的 **HDR**（半精度 RGBA16F、预乘、native-endian）图层：全幅同一个
+ * 预乘色与不透明度。
+ *
+ * 之所以要**均匀**：本节的断言是「那个 8 位操作看到了什么」，而它只在均匀场上
+ * 才有唯一答案（重采样 / 抖动在均匀场上都是确定性的），不必靠逐像素碰运气。
+ */
+comp_layer_id add_hdr_layer(Document& doc, uint16_t r, uint16_t g, uint16_t b, uint16_t a) {
+  comp_layer_desc desc{};
+  desc.name = "HDR";
+  desc.transform = comp_rect{0, 0, doc.state().width, doc.state().height};
+  comp_layer_id id = 0;
+  doc.create_layer(desc, &id);
+  Layer* layer = doc.find(id);
+  if (layer != nullptr) {
+    const int32_t w = doc.state().width;
+    const int32_t h = doc.state().height;
+    layer->pixels.resize(w, h, COMP_PIXEL_RGBA16F);
+    uint16_t* wide = reinterpret_cast<uint16_t*>(layer->pixels.writable_pixels().data());
+    const size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
+    for (size_t i = 0; i < count; ++i) {
+      wide[i * 4u + 0u] = r;
+      wide[i * 4u + 1u] = g;
+      wide[i * 4u + 2u] = b;
+      wide[i * 4u + 3u] = a;
+    }
+  }
+  return id;
+}
+
+/*
+ * 同样的 HDR 图层，但**有变化**：左边 3/4 是均匀的高光块（`highlight`），右边 1/4
+ * 逐列递增（0.25 / 0.5 / 0.75 / 1.0），不透明度一律 1。
+ *
+ * 为什么要有变化：全幅均匀时径向重采样是恒等的，改不了任何字节——「像素确实被
+ * 操作改过」这条断言就会落空。而高光块内部仍然均匀，所以「高光还在白以上」那条
+ * 断言在块中央依旧可判定（取景中心离交界有 4 列，任何径向映射都不会把它挪出去）。
+ */
+comp_layer_id add_hdr_gradient_layer(Document& doc, float highlight) {
+  const uint16_t dim[4] = {half_bits(0.25f), half_bits(0.5f), half_bits(0.75f), half_bits(1.0f)};
+  const int32_t w = doc.state().width, h = doc.state().height;
+  comp_layer_desc desc{};
+  desc.name = "HDR";
+  desc.transform = comp_rect{0, 0, w, h};
+  comp_layer_id id = 0;
+  doc.create_layer(desc, &id);
+  Layer* layer = doc.find(id);
+  if (layer != nullptr) {
+    layer->pixels.resize(w, h, COMP_PIXEL_RGBA16F);
+    uint16_t* wide = reinterpret_cast<uint16_t*>(layer->pixels.writable_pixels().data());
+    for (int32_t y = 0; y < h; ++y) {
+      for (int32_t x = 0; x < w; ++x) {
+        uint16_t* px = wide + (static_cast<size_t>(y) * static_cast<size_t>(w) +
+                               static_cast<size_t>(x)) * 4u;
+        const bool bright = x * 4 < w * 3; /* 左 3/4 = 高光块 */
+        const uint16_t value = bright ? half_bits(highlight) : dim[x - (w / 4) * 3];
+        px[0] = px[1] = px[2] = value;
+        px[3] = half_bits(1.0f);
+      }
+    }
+  }
+  return id;
 }
 
 }  // namespace
@@ -202,6 +313,233 @@ COMP_TEST(tool_ops_domain_deep_round_trip_rejects_geometry_ops) {
   COMP_CHECK_MSG(!document.txn_active(), "the gate runs before txn_begin: no txn left open");
   COMP_CHECK_MSG(!document.history().can_undo(), "a refused op must not enter the undo stack");
   COMP_CHECK_MSG(pixels_of(document, id) == before, "a refused op must not touch the pixels");
+}
+
+/* ================================================= C2：HDR（半精度）图层上的往返 */
+
+/*
+ * [C2-1] HDR 图层（COMP_PIXEL_RGBA16F）上的 deep round trip——这是**今天唯一**
+ * 真的走到 deep_hdr_normalize / deep_hdr_restore 的产品路径（上游
+ * `DeepLayer.run` 的 HDR 分支，DeepLayers.swift:196 的 `normalizing` 那一层）。
+ * C2 之前它被参数闸按「不是 RGBA16」直接拒掉。
+ *
+ * 顺带钉住「深度不变」：16 位图层保持 16 位是 DeepLayers.swift:5 的规则，
+ * HDR 图层保持 half 是 :82-84 的规则——往返不能把 HDR 降成 8 位，否则白以上的光
+ * 就被永久丢掉了。
+ *
+ * 场必须**有变化**：均匀场乘上径向重采样还是自己，改不改都逐字节相同，那样的
+ * 断言没有判定力。左 3/4 是白以上的 4.0 高光块、右 1/4 是 0.25→1.0 的逐列阶梯；
+ * 中心落在高光块里且径向畸变在中心是恒等的，于是「restore 把 normalize 除掉的
+ * scale 乘了回来」是可判定的——高光穿过 8 位操作后仍在白以上。
+ */
+COMP_TEST(tool_ops_domain_deep_round_trip_carries_an_hdr_layer) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_hdr_gradient_layer(document, 4.0f); /* 白以上的高光、完全不透明 */
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  COMP_CHECK(!before.empty());
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16F, "the layer starts as half floats");
+
+  ToolOpParams params;
+  params.kind = kToolOpDeep;
+  params.deep_mode = kToolDeepRoundTrip;
+  params.inner = kToolOpLens;
+  params.lens.k = 0.3;
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  std::string note;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, &note),
+                 "the deep round trip reaches an HDR layer (the parameter gate used to refuse it)");
+  COMP_CHECK_MSG(code == COMP_OK, "the HDR round trip reports COMP_OK");
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16F,
+                 "the HDR layer stays half-float (the round trip must not downgrade it)");
+  COMP_CHECK_MSG(layer->pixels.byte_size() == before.size(),
+                 "the pixel buffer size is unchanged (8 bytes a pixel throughout)");
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(after != before, "the inner lens actually changed the pixels");
+
+  uint16_t px[4] = {0, 0, 0, 0};
+  half_pixel(after, 16, 8, 8, px);
+  COMP_CHECK_MSG(half_value(px[0]) > 2.0f && half_value(px[3]) > 0.9f,
+                 "a highlight stays well above white through the round trip");
+
+  COMP_CHECK_MSG(document.history().can_undo(), "the round trip is one undo step");
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "one undo restores the half-float pixels byte for byte");
+}
+
+/*
+ * [C2-2] 8 位操作在 HDR 图层上看到的，必须是**半精度的值**（各自按最亮通道除回
+ * 白内的那一份），而不是 half 的位模式被当成 16 位整数读出来的那份数——这正是
+ * DeepLayers.swift:82-84/:97-99 的 normalize → run → restore 三步存在的理由。
+ *
+ * 探针是不透明的 0.5 中灰场加 1-bit 有序抖动（BAYER_2、levels 2、无扩散、密度与
+ * 对比度取默认的 0 ⇒ gamma 与 contrast 都是恒等）：抖动的输出只由「它看到的色调」
+ * 决定，两种读法给出的色调差得很远——
+ *   - 按值读（正确）：scale = max(0.5, 1) = 1，操作看到 0.5 ⇒ 4 个亚单元亮 2 个；
+ *   - 按位模式读（把 half 当 16 位整数，即 C1 之前那条错路）：0.5 的位模式 0x3800
+ *     经 `deep_low` 落成 54/60 ≈ 0.9（alpha 0x3C00 同样被读成 60，反预乘又把它
+ *     除回比例上，所以只看「亮不亮」是看不出来的）⇒ 4 个亚单元全亮。
+ * 判据因此是亮点比例的上下界：≥1/4（操作确实在做事）且 ≤3/4（它没看到满白）。
+ *
+ * 同一趟钉住 alpha：完全不透明的 alpha 走完往返必须逐字节还是 1.0（0x3C00）。
+ * 错路上它会被 merge 的 `lo[3]*257` 改写成 0x3C3C ≈ 1.059——「alpha 悄悄变了」
+ * 是最容易漏掉的那种坏法，而且它不依赖任何阈值判断，一眼就能看出来。
+ *
+ * 另钉「不写坏位模式」：把 16 位整数直接当 half 存回，值一过 0x7C00 就是 Inf/NaN。
+ */
+COMP_TEST(tool_ops_domain_hdr_round_trip_lets_the_op_see_half_values) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_hdr_layer(document, half_bits(0.5f), half_bits(0.5f), half_bits(0.5f),
+                                         half_bits(1.0f));
+
+  ToolOpParams params;
+  params.kind = kToolOpDeep;
+  params.deep_mode = kToolDeepRoundTrip;
+  params.inner = kToolOpDither;
+  params.dither.style = DITHER_BAYER_2; /* 有序：均匀场上的点亮比例是确定的 */
+  params.dither.levels = 2;             /* 纯 1-bit */
+  params.dither.diffusion = 0.0f;
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  std::string note;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, &note),
+                 "a 1-bit dither inside an HDR round trip is a real product path");
+  COMP_CHECK_MSG(code == COMP_OK, "the HDR round trip reports COMP_OK");
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16F, "the HDR layer stays half-float");
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  const uint16_t* wide = reinterpret_cast<const uint16_t*>(after.data());
+  const size_t pixel_count = static_cast<size_t>(8) * 8u;
+  size_t broken = 0; /* 位模式落在 Inf/NaN 区间（0x7C00 以上）的通道数 */
+  for (size_t i = 0; i < pixel_count * 4u; ++i) {
+    if (!std::isfinite(half_value(wide[i]))) ++broken;
+  }
+  COMP_CHECK_MSG(broken == 0,
+                 "every half-float channel stays finite (16-bit integers must not be stored as half bit "
+                 "patterns, where 0x7C00 and up is Inf/NaN; " + std::to_string(broken) + " channels are not)");
+  /* 逐像素判定、一次汇总：一个坏像素和整幅坏掉不该给出同样长的输出。 */
+  size_t opaque = 0;
+  size_t first_off = pixel_count; /* 第一个不是 0x3C00 的像素，报出来给人看 */
+  for (size_t i = 0; i < pixel_count; ++i) {
+    if (wide[i * 4u + 3u] == half_bits(1.0f)) {
+      ++opaque;
+    } else if (first_off == pixel_count) {
+      first_off = i;
+    }
+  }
+  COMP_CHECK_MSG(opaque == pixel_count,
+                 "full opacity survives the round trip exactly (1.0 is 0x3C00 before and after; " +
+                     std::to_string(pixel_count - opaque) + " of " + std::to_string(pixel_count) +
+                     " pixels differ, first at " + std::to_string(first_off) + " = 0x" +
+                     std::to_string(first_off < pixel_count ? wide[first_off * 4u + 3u] : 0u) + ")");
+
+  /* 8 位视图：levels == 2 的抖动只产出黑与白，亮点比例就是「它看到的色调」。 */
+  ImageBuffer view;
+  COMP_CHECK(hdr_to_rgba8(copy_of(after, 8, 8, COMP_PIXEL_RGBA16F), &view));
+  const std::vector<uint8_t>& v = view.pixel_data();
+  int lit = 0, total = 0;
+  for (size_t i = 0; i + 3u < v.size(); i += 4u) {
+    ++total;
+    if (v[i] > 128) ++lit;
+  }
+  COMP_CHECK_MSG(lit * 4 >= total,
+                 "the op ran on a mid tone, so some cells stay dark; lit = " + std::to_string(lit) + " of " +
+                     std::to_string(total));
+  COMP_CHECK_MSG(lit * 4 <= total * 3,
+                 "the op saw 0.5 (half the cells lit), not the bit pattern read as an integer (all lit); lit = " +
+                     std::to_string(lit) + " of " + std::to_string(total));
+
+  COMP_CHECK_MSG(document.history().can_undo(), "the round trip is one undo step");
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16F, "undo keeps the depth too");
+}
+
+/*
+ * [C2-3] HDR 图层的 deep quantize：落成 8 位副本的那一步必须走
+ * `hdr_to_rgba8`（half 的**值**按 0..65535 取整后再抖动取整，domain/layer.cpp
+ * 的两趟），不能把 half 的位模式当 16 位整数读——0x3C00（1.0）会被读成 15360，
+ * 画面成了噪声。
+ *
+ * 判据是**双向**的：结果既逐字节等于 half 视图，也逐字节不等于「同样这些字节
+ * 按 RGBA16 解释」的那份。只钉前者的话，某个把两种转换都改坏的改动不会变红。
+ */
+COMP_TEST(tool_ops_domain_hdr_quantize_is_the_half_to_u16_view) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+  const comp_layer_id id = add_hdr_layer(document, half_bits(4.0f), half_bits(0.5f), half_bits(0.25f),
+                                         half_bits(1.0f));
+  const std::vector<uint8_t> half_before = pixels_of(document, id);
+
+  ToolOpParams params;
+  params.kind = kToolOpDeep;
+  params.deep_mode = kToolDeepQuantize;
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "deep quantize on an HDR layer is a real product path");
+  COMP_CHECK_MSG(code == COMP_OK, "quantize reports COMP_OK");
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA8,
+                 "quantize lands the layer on 8 bits (upstream DeepLayers.swift:297)");
+  COMP_CHECK_MSG(layer->pixels.width == 4 && layer->pixels.height == 4, "quantize keeps the geometry");
+
+  ImageBuffer expected;
+  COMP_CHECK(hdr_to_rgba8(copy_of(half_before, 4, 4, COMP_PIXEL_RGBA16F), &expected));
+  COMP_CHECK_MSG(pixels_of(document, id) == expected.pixel_data(),
+                 "quantize is the canonical half-float 8-bit view, byte for byte");
+
+  ImageBuffer misinterpreted;
+  COMP_CHECK(deep_to_rgba8(copy_of(half_before, 4, 4, COMP_PIXEL_RGBA16), &misinterpreted));
+  COMP_CHECK_MSG(pixels_of(document, id) != misinterpreted.pixel_data(),
+                 "the same bytes read as 16-bit integers is a different image (that is the road not taken)");
+  COMP_CHECK_MSG(document.history().can_undo(), "quantize is one undo step");
+}
+
+/*
+ * [C2-4] 8 位工具**不**在 HDR 图层上降位：如实拒绝，不静默丢高光。
+ *
+ * 16 位图层被 8 位工具降成 8 位是 DeepLayers.swift:5 的既定规则（上游就是这么
+ * 缩一半内存的），但 HDR 的规则是 :82-84 的 normalize/restore 往返——今天只有
+ * deep 的往返那条路（[C2-1]），其余工具（stroke / heal / dither / lens /
+ * scanlines / chunky）宁可返回 STATE 也不把白以上的光永久剪掉。
+ *
+ * 错误码钉具体值：`!= COMP_OK` 会让 INTERNAL（内核出错）伪装成「按契约拒绝了」。
+ */
+COMP_TEST(tool_ops_domain_hdr_layer_is_refused_by_eight_bit_tools) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+  const comp_layer_id id = add_hdr_layer(document, half_bits(4.0f), half_bits(4.0f), half_bits(4.0f),
+                                         half_bits(1.0f));
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  /* 恒等 lens：不改任何像素，于是「拒绝」是唯一可观测的差别。 */
+  ToolOpParams params;
+  params.kind = kToolOpLens;
+  params.lens.k = 0.0;
+
+  comp_result code = COMP_OK;
+  std::string error;
+  COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "an 8-bit tool on an HDR layer is refused rather than downgraded");
+  COMP_CHECK_MSG(code == COMP_ERR_STATE, "the refusal is STATE (the layer's depth), not UNSUPPORTED");
+  COMP_CHECK_MSG(!document.txn_active(), "a refused op leaves no transaction open");
+  COMP_CHECK_MSG(!document.history().can_undo(), "a refused op must not enter the undo stack");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "a refused op must not touch the pixels");
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16F, "the HDR layer keeps its depth");
 }
 
 COMP_TEST(tool_ops_domain_invalid_deep_mode_is_bad_argument) {
