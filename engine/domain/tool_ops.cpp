@@ -144,6 +144,15 @@ class StrokeShape {
   /* coverage 在 (px,py) 上取到最近线段的距离。 */
   float coverage_at(float px, float py) const {
     float best = 1e30f;
+    if (point_count_ == 1) {
+      /*
+       * 单点 = 一记圆形 dab：鼠标只在原地按一下松手（没有 MOUSEMOVE）也必须留下
+       * 笔尖。参数闸允许 1..65536 个折点，这里不接受「1 个点静默不画」。
+       */
+      const float ex = px - points_[0];
+      const float ey = py - points_[1];
+      best = ex * ex + ey * ey;
+    }
     for (int32_t i = 0; i + 1 < point_count_; ++i) {
       const float ax = points_[i * 2], ay = points_[i * 2 + 1];
       const float bx = points_[(i + 1) * 2], by = points_[(i + 1) * 2 + 1];

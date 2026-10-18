@@ -7,6 +7,7 @@
  */
 #include "compositor/comp_eyedropper.h"
 
+#include <cmath>
 #include <string>
 
 #include "comp_abi_internal.h"
@@ -46,10 +47,23 @@ comp_result comp_eyedropper_sample(comp_document document, comp_layer_id layer, 
                                  "sample size must be odd in 1..101");
   }
 
+  /* 坐标在进入领域层前判完，领域层剩下的失败就只剩「合成 / 8 位副本失败」，
+   * 按头文件的约定映射为 INTERNAL。 */
+  const compositor::DocumentState& state = doc->state();
+  if (!std::isfinite(x) || !std::isfinite(y)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "eyedropper coordinate is not finite");
+  }
+  if (state.width <= 0 || state.height <= 0 || x < 0.0 || y < 0.0 ||
+      x >= static_cast<double>(state.width) || y >= static_cast<double>(state.height)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "eyedropper coordinate lies outside the canvas");
+  }
+
   std::string error;
   float srgb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   if (!compositor::eyedropper_sample(*doc, layer, x, y, sample_size, source, srgb, &error)) {
-    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, error);
   }
   for (int i = 0; i < 4; ++i) out_srgb[i] = srgb[i];
   return compositor::abi::ok(engine);

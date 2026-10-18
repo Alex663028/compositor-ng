@@ -400,6 +400,39 @@ COMP_TEST(tool_ops_stroke_is_reproducible_and_undoable) {
   COMP_CHECK_MSG(flatten(fx.doc) == first, "redo reproduces the stroke byte for byte");
 }
 
+COMP_TEST(tool_ops_single_point_stroke_is_a_round_dab) {
+  /*
+   * 鼠标只按一下、不移动 —— 折线只有一个点。参数闸收 1..65536 个点，
+   * 所以这里不能「接受但静默不画」：单点就是一记圆形 dab。
+   */
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(0, 0, 0);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_STROKE);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 1;
+  desc.brush.color[0] = 255;
+  desc.brush.color[1] = 255;
+  desc.brush.color[2] = 255;
+  desc.brush.diameter = 6.0f; /* 半径 3（像素中心距离判定） */
+  desc.brush.pressure = 1.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.flow = 1.0f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_OK, "a one-point stroke is accepted");
+
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(after != before, "a single click leaves a dab");
+  COMP_CHECK_MSG(after[(static_cast<size_t>(8) * kW + 8) * 4 + 0] == 255,
+                 "the dab covers its center");
+  COMP_CHECK_MSG(after[(static_cast<size_t>(8) * kW + 6) * 4 + 0] == 255,
+                 "inside the radius the dab is solid");
+  COMP_CHECK_MSG(after[(static_cast<size_t>(8) * kW + 12) * 4 + 0] == 0,
+                 "outside the radius nothing is painted");
+}
+
 COMP_TEST(tool_ops_stroke_zero_pressure_is_a_no_op) {
   Fixture fx;
   std::vector<uint8_t> pixels = plain_pixels(0, 0, 0);

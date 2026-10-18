@@ -1091,15 +1091,23 @@ bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool
   if (dx == 0 && dy == 0) {
     next = base;
   } else {
+    /* 源区间 [left, right) x [top, bottom)。dx > 0 时源列从 0 开始、目标列从 dx
+     * 开始；dx < 0 时源列从 -dx 开始、目标列从 0 开始。因此目标列偏移是
+     * left + dx（= max(dx, 0)），不是 dx——负数直接转 size_t 会把指针甩到缓冲区前。
+     * 平移量超出画布（right <= left 或 bottom <= top）时没有重叠区，直接跳过；
+     * 负数长度交给 memcpy 就是堆损坏。 */
     const int64_t left = std::max<int64_t>(0, -static_cast<int64_t>(dx));
     const int64_t right = std::min<int64_t>(width, static_cast<int64_t>(width) - dx);
     const int64_t top = std::max<int64_t>(0, -static_cast<int64_t>(dy));
     const int64_t bottom = std::min<int64_t>(height, static_cast<int64_t>(height) - dy);
-    for (int64_t y = top; y < bottom; ++y) {
-      const uint8_t* src = base.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
-      uint8_t* dst = next.data() + static_cast<size_t>(y + dy) * static_cast<size_t>(width) +
-                     static_cast<size_t>(dx);
-      std::memcpy(dst, src + left, static_cast<size_t>(right - left));
+    const int64_t dst_x = left + dx;
+    if (right > left && bottom > top) {
+      for (int64_t y = top; y < bottom; ++y) {
+        const uint8_t* src = base.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+        uint8_t* dst = next.data() + static_cast<size_t>(y + dy) * static_cast<size_t>(width) +
+                       static_cast<size_t>(dst_x);
+        std::memcpy(dst, src + left, static_cast<size_t>(right - left));
+      }
     }
   }
 

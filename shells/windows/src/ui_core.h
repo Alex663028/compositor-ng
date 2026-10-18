@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 namespace comp_ui {
 
@@ -344,6 +345,34 @@ inline ToolId tool_for_shortcut(char key) {
   return ToolId::Count;
 }
 
+/*
+ * 工具键位的实际落点：E 在 Brush / Eraser 之间来回切换。
+ *
+ * 上游画笔与橡皮擦共用同一支笔的参数（直径/硬度/压力/流量），只有合成方向相反，
+ * 因此同一个键位在两个模式间切换；当前不是这两者时一律落到 Eraser（与
+ * tool_table 的键位一致）。其余键位直接查表，本函数是唯一入口。
+ */
+inline ToolId tool_shortcut_target(ToolId current, char key) {
+  if (key >= 'A' && key <= 'Z') key = static_cast<char>(key - 'A' + 'a');
+  if (key == 'e') {
+    if (current == ToolId::Brush) return ToolId::Eraser;
+    if (current == ToolId::Eraser) return ToolId::Brush;
+    return ToolId::Eraser;
+  }
+  return tool_for_shortcut(key);
+}
+
+/*
+ * 画布上进行中的笔迹种类。Retouch 族（Blur / Smudge / Liquify）与画笔/橡皮擦
+ * 共用同一条「鼠标折线 -> comp_tool_apply」通路，但提交时装配的参数不同，
+ * 因此状态里必须记住这一笔属于哪一族。
+ */
+enum class StrokeKind : int {
+  None = 0,
+  Retouch, /* COMP_TOOL_BLUR / SMUDGE / LIQUIFY */
+  Paint    /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
+};
+
 /* ------------------------------------------------------------ 笔刷状态 */
 
 /* 直径范围对齐上游笔刷滑杆的量级；[ / ] 用几何步进（手感等比）。 */
@@ -371,6 +400,189 @@ inline double step_brush_hardness(double current, int direction) {
   const double base = clamp_brush_hardness(current);
   const double next = base + (direction > 0 ? 0.1 : (direction < 0 ? -0.1 : 0.0));
   return clamp_brush_hardness(next);
+}
+
+/* ------------------------------------------------------------ 前景色 */
+
+/*
+ * 前景色：8 位直通 sRGB，与 `comp_tool_brush.color` 同口径（不是预乘，
+ * 也不是浮点）。色相面板用 HSV（上游叫 HSB）：h 0..360 度，s/v 0..1。
+ *
+ * 三条表示之间的换算都在这里做完，壳（main.cpp）只做取值与显示：
+ *   - RGB <-> HSV：画笔面板的角度/百分比读数；
+ *   - RGB <-> hex：状态栏显示与 Shift+X 的键入；
+ *   - 色板：固定 12 色的常用锚点，X 键循环。
+ */
+struct ColorRGB {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+};
+
+struct ColorHSV {
+  double h = 0.0; /* 0..360；0 与 360 都是红 */
+  double s = 0.0; /* 0..1 */
+  double v = 0.0; /* 0..1 */
+};
+
+inline bool color_equal(ColorRGB a, ColorRGB b) {
+  return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+/* 0..255 的任意实数 -> 通道字节；NaN 回落到 0，越界夹取。 */
+inline uint8_t color_channel(double value) {
+  if (!(value > 0.0)) return 0;
+  if (value >= 255.0) return 255;
+  return static_cast<uint8_t>(std::lround(value));
+}
+
+inline ColorRGB make_rgb(int r, int g, int b) {
+  return ColorRGB{color_channel(static_cast<double>(r)), color_channel(static_cast<double>(g)),
+                  color_channel(static_cast<double>(b))};
+}
+
+/* 直通 sRGB 0..1 -> 8 位。吸管（comp_eyedropper_sample）的输出就是前者的口径。 */
+inline ColorRGB color_from_unit(double r, double g, double b) {
+  return ColorRGB{color_channel(r * 255.0), color_channel(g * 255.0),
+                  color_channel(b * 255.0)};
+}
+
+inline double color_to_unit(uint8_t channel) {
+  return static_cast<double>(channel) / 255.0;
+}
+
+inline ColorHSV rgb_to_hsv(ColorRGB color) {
+  const double r = color_to_unit(color.r);
+  const double g = color_to_unit(color.g);
+  const double b = color_to_unit(color.b);
+  const double high = std::max(std::max(r, g), b);
+  const double low = std::min(std::min(r, g), b);
+  const double delta = high - low;
+
+  ColorHSV out;
+  out.v = high;
+  out.s = high > 0.0 ? delta / high : 0.0;
+  if (!(delta > 0.0)) return out; /* 灰阶没有色相：约定为 0 */
+
+  double h = 0.0;
+  if (high == r) {
+    h = 60.0 * ((g - b) / delta);
+  } else if (high == g) {
+    h = 60.0 * ((b - r) / delta + 2.0);
+  } else {
+    h = 60.0 * ((r - g) / delta + 4.0);
+  }
+  if (h < 0.0) h += 360.0;
+  out.h = h;
+  return out;
+}
+
+inline ColorRGB hsv_to_rgb(ColorHSV hsv) {
+  double h = std::fmod(hsv.h, 360.0);
+  if (h < 0.0) h += 360.0;
+  const double s = clamp_brush_hardness(hsv.s); /* 复用 0..1 夹取（NaN -> 0） */
+  const double v = clamp_brush_hardness(hsv.v);
+
+  const double c = v * s;
+  const double sector = h / 60.0;
+  const double x = c * (1.0 - std::fabs(std::fmod(sector, 2.0) - 1.0));
+  double r = 0.0, g = 0.0, b = 0.0;
+  switch (static_cast<int>(sector)) {
+    case 0: r = c; g = x; break;
+    case 1: r = x; g = c; break;
+    case 2: g = c; b = x; break;
+    case 3: g = x; b = c; break;
+    case 4: r = x; b = c; break;
+    default: r = c; b = x; break; /* 300..360 度：品红 -> 红 */
+  }
+  const double m = v - c;
+  return color_from_unit(r + m, g + m, b + m);
+}
+
+/* 写 "#RRGGBB"（7 字符 + '\0'）。大写十六进制，状态栏与键入回显共用。 */
+inline void color_to_hex(ColorRGB color, char out[8]) {
+  static const char kDigits[] = "0123456789ABCDEF";
+  out[0] = '#';
+  out[1] = kDigits[(color.r >> 4) & 0x0F];
+  out[2] = kDigits[color.r & 0x0F];
+  out[3] = kDigits[(color.g >> 4) & 0x0F];
+  out[4] = kDigits[color.g & 0x0F];
+  out[5] = kDigits[(color.b >> 4) & 0x0F];
+  out[6] = kDigits[color.b & 0x0F];
+  out[7] = '\0';
+}
+
+/*
+ * 解析 "#RRGGBB" / "RRGGBB"（大小写皆可），并接受 3 位缩写 "#abc" -> "#AABBCC"。
+ * 只接受整串：前后有空白或多余字符都算失败（键入路径宁可让用户改，不静默截断）。
+ */
+inline bool color_parse_hex(const char* text, ColorRGB* out) {
+  if (text == nullptr || out == nullptr) return false;
+  if (text[0] == '#') ++text;
+  size_t length = 0;
+  while (text[length] != '\0') ++length;
+  if (length != 3 && length != 6) return false;
+
+  const auto digit = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  const auto pair = [&](size_t index, int* value) -> bool {
+    int high = 0;
+    int low = 0;
+    if (length == 3) {
+      high = digit(text[index]);
+      low = high;
+    } else {
+      high = digit(text[index * 2]);
+      low = digit(text[index * 2 + 1]);
+    }
+    if (high < 0 || low < 0) return false;
+    *value = high * 16 + low;
+    return true;
+  };
+
+  int r = 0, g = 0, b = 0;
+  if (!pair(0, &r) || !pair(1, &g) || !pair(2, &b)) return false;
+  *out = ColorRGB{static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b)};
+  return true;
+}
+
+/* 色板：黑、白、灰、红、橙、黄、绿、青、蓝、紫、品红、褐。 */
+inline const ColorRGB* swatch_table(size_t* out_count) {
+  static const ColorRGB kSwatches[] = {
+      {0, 0, 0},       {255, 255, 255}, {127, 127, 127}, {255, 0, 0},
+      {255, 128, 0},   {255, 255, 0},   {0, 160, 0},     {0, 255, 255},
+      {0, 90, 255},    {128, 0, 255},   {255, 0, 255},   {139, 69, 19},
+  };
+  if (out_count != nullptr) *out_count = sizeof(kSwatches) / sizeof(kSwatches[0]);
+  return kSwatches;
+}
+
+inline int swatch_count() {
+  size_t count = 0;
+  swatch_table(&count);
+  return static_cast<int>(count);
+}
+
+/* 越界回落到黑色（与 ColorRGB 的缺省一致），不返回 nullptr。 */
+inline ColorRGB swatch_at(int index) {
+  size_t count = 0;
+  const ColorRGB* table = swatch_table(&count);
+  if (index < 0 || static_cast<size_t>(index) >= count) return ColorRGB{};
+  return table[index];
+}
+
+/* 色板循环（X / Shift+X）：返回 [0, count) 内的下一个索引。 */
+inline int step_swatch(int index, int direction) {
+  const int count = swatch_count();
+  if (count <= 0) return 0;
+  int next = index + (direction >= 0 ? 1 : -1);
+  next %= count;
+  if (next < 0) next += count;
+  return next;
 }
 
 /* ------------------------------------------------------------ 滤镜面板 */

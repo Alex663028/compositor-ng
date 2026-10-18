@@ -32,6 +32,7 @@
 #include <compositor/comp_command.h>
 #include <compositor/comp_core.h>
 #include <compositor/comp_engine.h>
+#include <compositor/comp_eyedropper.h>
 #include <compositor/comp_filter.h>
 #include <compositor/comp_io.h>
 #include <compositor/comp_layer.h>
@@ -142,9 +143,25 @@ struct ShellState {
   comp_ui::FilterPanel filter;
   bool filter_open = false;
   std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
-  /* 进行中的 Retouch 笔迹（Blur / Smudge / Liquify，文档像素折线）。 */
-  bool stroke_active = false;
+  /* 前景色（S6）：画笔的笔画色；吸管与色板都写这里。 */
+  comp_ui::ColorRGB foreground{};
+  int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
+  std::wstring color_input;  /* Shift+X 的十六进制键入；非空 = 输入态 */
+  /*
+   * 进行中的画布笔迹（文档像素折线）。Retouch 族（Blur / Smudge / Liquify）与
+   * 画笔/橡皮擦共用同一条折线通路与去抖规则，stroke_kind 记住松开时装配哪种算子；
+   * stroke_erase 在落笔时冻结——拖拽中途按 E 不改变这一笔的合成方向。
+   */
+  comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
+  bool stroke_erase = false;
+  /* 选区搬移（Move 工具，S6）：按下记起点，松开一次性提交（Alt = 复制）。 */
+  bool move_active = false;
+  comp_ui::Point move_start{};
+  comp_ui::Point move_current{};
+  bool move_duplicate = false;
+  /* 吸管拖拽（S6）：按住拖动时连续取样；只读，不产生撤销步。 */
+  bool eyedropper_drag = false;
   /*
    * 选区（comp_selection.h 的 F1 ABI）。mask 是文档分辨率的有效 coverage；
    * 蚂蚁线的线段由 ui_core 从 mask 现算，壳内不维护「选区形状」的第二种表示。
@@ -1080,31 +1097,31 @@ void marquee_end(HWND window, ShellState& shell) {
   finish_selection_command(shell, prefix);
 }
 
-/* ------------------------------------------------------------ Retouch 笔迹 */
+/* ------------------------------------------------------------ 画布落笔（折线） */
 
-/* Blur / Smudge / Liquify 共用同一条「鼠标折线 -> comp_tool_apply」通路。 */
-bool retouch_stroke_available(const ShellState& shell) {
-  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Retouch;
+/*
+ * Retouch 与画笔/橡皮擦共用同一条「鼠标折线 -> comp_tool_apply」通路：
+ * 折线按文档像素累积，松开鼠标时一次性提交，中间不产生事务。
+ */
+bool stroke_in_progress(const ShellState& shell) {
+  return shell.stroke_kind != comp_ui::StrokeKind::None;
 }
 
-void retouch_stroke_begin(HWND window, ShellState& shell, int x, int y,
-                          const Layout& layout) {
-  if (!retouch_stroke_available(shell)) return;
+bool stroke_begin(ShellState& shell, int x, int y, const Layout& layout,
+                  comp_ui::StrokeKind kind) {
+  if (shell.document == nullptr || kind == comp_ui::StrokeKind::None) return false;
   const comp_ui::Point doc =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   shell.stroke_points.clear();
+  /* 单击也要留下一记 dab：单点折线在 COMP_TOOL_STROKE 里就是一个圆形笔尖。 */
   shell.stroke_points.push_back(static_cast<float>(doc.x));
   shell.stroke_points.push_back(static_cast<float>(doc.y));
-  shell.stroke_active = true;
-  SetCapture(window);
-  wchar_t buffer[128];
-  wsprintfW(buffer, L"%s 笔迹…（松开鼠标应用）",
-            widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
-  set_status(shell, buffer);
+  shell.stroke_kind = kind;
+  return true;
 }
 
-void retouch_stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
-  if (!shell.stroke_active) return;
+void stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!stroke_in_progress(shell)) return;
   const comp_ui::Point doc =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   const size_t count = shell.stroke_points.size();
@@ -1115,14 +1132,34 @@ void retouch_stroke_extend(ShellState& shell, int x, int y, const Layout& layout
   shell.stroke_points.push_back(static_cast<float>(doc.y));
 }
 
-void retouch_stroke_cancel(ShellState& shell) {
-  shell.stroke_active = false;
+/* 失焦 / 捕获丢失 / Esc：两种笔迹共用同一个取消动作。 */
+void stroke_cancel(ShellState& shell) {
+  shell.stroke_kind = comp_ui::StrokeKind::None;
   shell.stroke_points.clear();
+  shell.stroke_erase = false;
+}
+
+/* ------------------------------------------------------------ Retouch 笔迹 */
+
+/* Blur / Smudge / Liquify 共用同一条「鼠标折线 -> comp_tool_apply」通路。 */
+bool retouch_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Retouch;
+}
+
+void retouch_stroke_begin(HWND window, ShellState& shell, int x, int y,
+                          const Layout& layout) {
+  if (!retouch_stroke_available(shell)) return;
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Retouch)) return;
+  SetCapture(window);
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"%s 笔迹…（松开鼠标应用）",
+            widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  set_status(shell, buffer);
 }
 
 void retouch_stroke_end(HWND window, ShellState& shell) {
-  if (!shell.stroke_active) return;
-  shell.stroke_active = false;
+  if (shell.stroke_kind != comp_ui::StrokeKind::Retouch) return;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
   ReleaseCapture();
 
   std::vector<float> points;
@@ -1188,6 +1225,255 @@ void retouch_stroke_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 画笔 / 橡皮擦 */
+
+/*
+ * 画笔与橡皮擦是同一条 COMP_TOOL_STROKE：形状与 coverage 相同，只有合成方向
+ * 由 desc.erase 翻转（预乘 destination-out）。取色一律用 shell.foreground——
+ * 吸管与色板都写同一个字段，因此「吸管吸到色 -> 直接画」不需要额外状态。
+ */
+bool paint_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr &&
+         (shell.tool == comp_ui::ToolId::Brush || shell.tool == comp_ui::ToolId::Eraser);
+}
+
+void paint_stroke_begin(HWND window, ShellState& shell, int x, int y,
+                        const Layout& layout) {
+  if (!paint_stroke_available(shell)) return;
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Paint)) return;
+  shell.stroke_erase = shell.tool == comp_ui::ToolId::Eraser;
+  SetCapture(window);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s：拖动画布，松开%s（直径 %d px / 硬度 %d%%）",
+            shell.stroke_erase ? L"橡皮擦" : L"画笔",
+            shell.stroke_erase ? L"擦除" : L"落色",
+            static_cast<int>(shell.brush_size + 0.5),
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void paint_stroke_end(HWND window, ShellState& shell) {
+  if (shell.stroke_kind != comp_ui::StrokeKind::Paint) return;
+  const bool erasing = shell.stroke_erase;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
+  shell.stroke_erase = false;
+  ReleaseCapture();
+
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  if (points.empty()) return;
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, erasing ? L"橡皮擦：请先选择一个图层" : L"画笔：请先选择一个图层");
+    return;
+  }
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_STROKE;
+  desc.brush.color[0] = shell.foreground.r;
+  desc.brush.color[1] = shell.foreground.g;
+  desc.brush.color[2] = shell.foreground.b; /* 抹色不透明：不透明度由 flow 表达（固定 1） */
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.flow = 1.0f;
+  desc.brush.seed = 0; /* 圆头笔是解析式的；固定值守住「同参数同结果」 */
+  desc.erase = erasing ? 1 : 0;
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"%s失败（错误码 %d）", erasing ? L"橡皮擦" : L"画笔",
+              static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+  char hex[8] = {0};
+  comp_ui::color_to_hex(shell.foreground, hex);
+  if (erasing) {
+    wsprintfW(buffer, L"橡皮擦：已擦除 %d 个折点（直径 %d px）", desc.stroke_point_count,
+              static_cast<int>(shell.brush_size + 0.5));
+  } else if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"画笔：已落色 %d 个折点｜%s", desc.stroke_point_count,
+              widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"画笔：已落色 %d 个折点（%s · 直径 %d px）", desc.stroke_point_count,
+              widen_ascii(hex).c_str(), static_cast<int>(shell.brush_size + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------------------ 吸管（只读取色） */
+
+/*
+ * 取样结果写进 shell.foreground（0..1 直通 sRGB -> 0..255）。
+ * 吸管是只读工具：不进撤销栈、不改选区、不改图层。
+ */
+bool eyedropper_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Eyedropper;
+}
+
+void eyedropper_sample(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!eyedropper_available(shell)) return;
+  if (!layout.canvas.contains(x, y)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  /* 画布外不取样：ABI 对越界坐标返回 INVALID_ARGUMENT，那不是「吸管坏了」。 */
+  if (doc.x < 0.0 || doc.y < 0.0 || doc.x >= static_cast<double>(shell.width) ||
+      doc.y >= static_cast<double>(shell.height)) {
+    return;
+  }
+
+  const bool merged = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  comp_layer_id source_layer = merged ? 0 : selected_layer_id(shell);
+  comp_eyedropper_source source = COMP_EYEDROPPER_LAYER;
+  if (merged || source_layer == 0) {
+    /* 没有选中图层时取整篇合成：画布上看到什么就吸什么，比报错更符合预期。 */
+    source = COMP_EYEDROPPER_MERGED;
+    source_layer = 0;
+  }
+
+  float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const comp_result result = comp_eyedropper_sample(
+      shell.document, source_layer, doc.x, doc.y, 1, source, rgba);
+  wchar_t buffer[256];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"吸管：取样失败（%s，错误码 %d）",
+              source == COMP_EYEDROPPER_MERGED ? L"合并源" : L"当前图层",
+              static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+
+  shell.foreground = comp_ui::color_from_unit(rgba[0], rgba[1], rgba[2]);
+  char hex[8] = {0};
+  comp_ui::color_to_hex(shell.foreground, hex);
+  const comp_ui::ColorHSV hsv = comp_ui::rgb_to_hsv(shell.foreground);
+  wsprintfW(buffer, L"吸管：%s · %s · H %d° S %d%% B %d%%（不透明度 %d%%）",
+            widen_ascii(hex).c_str(),
+            source == COMP_EYEDROPPER_MERGED ? L"合并源" : L"当前图层",
+            static_cast<int>(hsv.h + 0.5), static_cast<int>(hsv.s * 100.0 + 0.5),
+            static_cast<int>(hsv.v * 100.0 + 0.5),
+            static_cast<int>(rgba[3] * 100.0f + 0.5f));
+  set_status(shell, buffer);
+}
+
+void eyedropper_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!eyedropper_available(shell)) return;
+  shell.eyedropper_drag = true;
+  SetCapture(window);
+  eyedropper_sample(shell, x, y, layout);
+}
+
+void eyedropper_cancel(ShellState& shell) { shell.eyedropper_drag = false; }
+
+/* ------------------------------------------------------------ 选区搬移（Move） */
+
+/*
+ * 一次拖拽 = 一步撤销：像素搬移与轮廓平移写进同一个显式事务。
+ * 两个 ABI 调用内部的 ImplicitTxn 会「加入」已开启的显式事务，
+ * 因此这里不需要把两步合成一个新的算子。
+ */
+bool move_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Move;
+}
+
+void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!move_available(shell)) return;
+  if (!shell.selection_active) {
+    set_status(shell, L"移动：当前没有选区（先用选框建立选区）");
+    return;
+  }
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.move_active = true;
+  shell.move_start = doc;
+  shell.move_current = doc;
+  shell.move_duplicate = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  SetCapture(window);
+  set_status(shell, shell.move_duplicate
+                        ? L"移动选区像素：Alt = 复制，松开提交"
+                        : L"移动选区像素：松开提交（按住 Alt = 复制）");
+}
+
+void move_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.move_active) return;
+  shell.move_current =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+}
+
+void move_cancel(ShellState& shell) { shell.move_active = false; }
+
+void move_end(HWND window, ShellState& shell) {
+  if (!shell.move_active) return;
+  shell.move_active = false;
+  ReleaseCapture();
+  if (shell.document == nullptr) return;
+
+  const int32_t dx =
+      static_cast<int32_t>(std::lround(shell.move_current.x - shell.move_start.x));
+  const int32_t dy =
+      static_cast<int32_t>(std::lround(shell.move_current.y - shell.move_start.y));
+  if (dx == 0 && dy == 0) {
+    set_status(shell, L"移动：位置未变化");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"移动：请先选择一个图层");
+    return;
+  }
+
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document,
+                     shell.move_duplicate ? "Duplicate Selection Pixels"
+                                          : "Move Selection Pixels",
+                     &txn) != COMP_OK) {
+    set_status(shell, L"移动：无法开始事务");
+    return;
+  }
+
+  /* 顺序不能反：move_pixels 按当前选区取像素，先平移轮廓会搬错地方。 */
+  int32_t moved_pixels = 0;
+  int32_t moved_outline = 0;
+  comp_result result = comp_selection_move_pixels(
+      shell.document, id, dx, dy, shell.move_duplicate ? 1 : 0, &moved_pixels);
+  if (result == COMP_OK) {
+    result = comp_selection_translate(shell.document, dx, dy, &moved_outline);
+  }
+  if (result != COMP_OK) {
+    /* 失败必须整体回滚：半搬的像素比不搬更坏。 */
+    comp_txn_abort(txn);
+    set_status(shell, L"移动失败（16 位 / 带旋转或翻转的图层不支持像素搬移，轮廓已回滚）");
+    return;
+  }
+  if (moved_pixels == 0 && moved_outline == 0) {
+    comp_txn_abort(txn);
+    set_status(shell, L"移动：选区内没有可搬移的像素");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"移动：提交失败");
+    return;
+  }
+
+  refresh_selection(shell);
+  shell.needs_render = true;
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"%s：位移 (%d, %d) px，%d 个像素",
+            shell.move_duplicate ? L"已复制选区像素" : L"已移动选区像素", dx, dy,
+            moved_pixels);
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 文件与命令 */
 
 bool create_document(ShellState& shell) {
@@ -1220,7 +1506,9 @@ bool create_document(ShellState& shell) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
-  retouch_stroke_cancel(shell);
+  stroke_cancel(shell);
+  move_cancel(shell);
+  eyedropper_cancel(shell);
   marquee_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
@@ -1251,7 +1539,9 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
-  retouch_stroke_cancel(shell);
+  stroke_cancel(shell);
+  move_cancel(shell);
+  eyedropper_cancel(shell);
   marquee_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
@@ -1589,9 +1879,30 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
             static_cast<int>(shell.view.zoom * 100.0 + 0.5),
             static_cast<int>(shell.brush_size + 0.5),
             static_cast<int>(shell.brush_hardness * 100.0 + 0.5), extra, shell.status.c_str());
-  RECT text_rect{bar.x + 12, bar.y, bar.right() - 10, bar.bottom()};
+  /* 右端留给前景色读数：色块 + 十六进制，左端长文本按省略号截断。 */
+  RECT text_rect{bar.x + 12, bar.y, bar.right() - 200, bar.bottom()};
   SetTextColor(dc, RGB(220, 222, 228));
   DrawTextW(dc, line, -1, &text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+  if (bar.w >= 260) {
+    char hex[8] = {0};
+    comp_ui::color_to_hex(shell.foreground, hex);
+    RECT swatch{bar.right() - 190, bar.y + 5, bar.right() - 166, bar.y + 21};
+    HBRUSH foreground_brush =
+        CreateSolidBrush(RGB(shell.foreground.r, shell.foreground.g, shell.foreground.b));
+    FillRect(dc, &swatch, foreground_brush);
+    DeleteObject(foreground_brush);
+    HBRUSH swatch_border = CreateSolidBrush(RGB(96, 100, 112));
+    FrameRect(dc, &swatch, swatch_border);
+    DeleteObject(swatch_border);
+
+    wchar_t foreground_text[64];
+    wsprintfW(foreground_text, L"前景 %s", widen_ascii(hex).c_str());
+    RECT foreground_rect{bar.right() - 158, bar.y, bar.right() - 10, bar.bottom()};
+    SetTextColor(dc, RGB(220, 222, 228));
+    DrawTextW(dc, foreground_text, -1, &foreground_rect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  }
 }
 
 /* 图层面板：GDI 文本绘制（外壳不读像素，只呈现引擎的属性查询结果）。 */
@@ -1841,16 +2152,27 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
                     layout.canvas.bottom());
   SetBkMode(dc, TRANSPARENT);
 
+  /*
+   * 移动预览：拖动期间蚂蚁线整体跟着鼠标走，像素与轮廓在松开时一次性提交。
+   * 偏移取整到文档像素，和 move_end 提交的 dx/dy 完全一致，预览不会「差一像素」。
+   */
+  int ants_dx = 0;
+  int ants_dy = 0;
+  if (shell.move_active) {
+    ants_dx = static_cast<int>(std::lround(shell.move_current.x - shell.move_start.x));
+    ants_dy = static_cast<int>(std::lround(shell.move_current.y - shell.move_start.y));
+  }
+
   /* 选区蚂蚁线：白色底线 + 黑色虚线段；相位随时间前进 = 「蚂蚁在爬」。 */
   if (shell.selection_active && !shell.selection_segments.empty()) {
     HPEN base_pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
     HPEN dash_pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
     HGDIOBJ old_pen = SelectObject(dc, base_pen);
     for (const auto& segment : shell.selection_segments) {
-      comp_ui::Point a = shell.view.doc_to_screen(segment.x0, segment.y0, layout.canvas,
-                                                 shell.width, shell.height);
-      comp_ui::Point b = shell.view.doc_to_screen(segment.x1, segment.y1, layout.canvas,
-                                                 shell.width, shell.height);
+      comp_ui::Point a = shell.view.doc_to_screen(segment.x0 + ants_dx, segment.y0 + ants_dy,
+                                                 layout.canvas, shell.width, shell.height);
+      comp_ui::Point b = shell.view.doc_to_screen(segment.x1 + ants_dx, segment.y1 + ants_dy,
+                                                 layout.canvas, shell.width, shell.height);
       if (!clip_axis_aligned(layout.canvas, &a, &b)) continue;
       MoveToEx(dc, static_cast<int>(std::lround(a.x)), static_cast<int>(std::lround(a.y)),
                nullptr);
@@ -1860,10 +2182,10 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     SelectObject(dc, dash_pen);
     comp_ui::DashSpan spans[1024];
     for (const auto& segment : shell.selection_segments) {
-      comp_ui::Point a = shell.view.doc_to_screen(segment.x0, segment.y0, layout.canvas,
-                                                 shell.width, shell.height);
-      comp_ui::Point b = shell.view.doc_to_screen(segment.x1, segment.y1, layout.canvas,
-                                                 shell.width, shell.height);
+      comp_ui::Point a = shell.view.doc_to_screen(segment.x0 + ants_dx, segment.y0 + ants_dy,
+                                                 layout.canvas, shell.width, shell.height);
+      comp_ui::Point b = shell.view.doc_to_screen(segment.x1 + ants_dx, segment.y1 + ants_dy,
+                                                 layout.canvas, shell.width, shell.height);
       if (!clip_axis_aligned(layout.canvas, &a, &b)) continue;
       const double dx = b.x - a.x;
       const double dy = b.y - a.y;
@@ -1911,9 +2233,13 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dotted);
   }
 
-  /* 进行中的笔迹折线（文档像素 -> 屏幕）：只用一条高对比度 3 px 线。 */
-  if (shell.stroke_active && shell.stroke_points.size() >= 4) {
-    HPEN trail = CreatePen(PS_SOLID, 3, RGB(80, 200, 255));
+  /* 进行中的笔迹折线（文档像素 -> 屏幕）：落色用前景色，重绘用高对比度青。 */
+  if (stroke_in_progress(shell) && shell.stroke_points.size() >= 4) {
+    const COLORREF trail_color =
+        shell.stroke_kind == comp_ui::StrokeKind::Paint && !shell.stroke_erase
+            ? RGB(shell.foreground.r, shell.foreground.g, shell.foreground.b)
+            : RGB(80, 200, 255);
+    HPEN trail = CreatePen(PS_SOLID, 3, trail_color);
     HGDIOBJ old_pen = SelectObject(dc, trail);
     bool started = false;
     for (size_t i = 0; i + 1 < shell.stroke_points.size(); i += 2) {
@@ -2163,7 +2489,70 @@ void canvas_click(ShellState& shell, int x, int y, const Layout& layout) {
   set_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 前景色键入（Shift+X） */
+
+void begin_color_input(ShellState& shell) {
+  shell.color_input = L"#";
+  set_status(shell, L"前景色：键入 #RRGGBB 或 #RGB，回车确认（Esc 取消）");
+}
+
+void refresh_color_input_status(ShellState& shell) {
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"前景色：%s（回车确认，Esc 取消）", shell.color_input.c_str());
+  set_status(shell, buffer);
+}
+
+void commit_color_input(ShellState& shell) {
+  char ascii[8] = {0};
+  for (size_t i = 0; i < shell.color_input.size() && i < 7; ++i) {
+    const wchar_t ch = shell.color_input[i];
+    ascii[i] = ch < 128 ? static_cast<char>(ch) : '?';
+  }
+  comp_ui::ColorRGB parsed{};
+  const bool ok = comp_ui::color_parse_hex(ascii, &parsed);
+  shell.color_input.clear();
+  if (!ok) {
+    set_status(shell, L"前景色：格式无效（需 #RGB 或 #RRGGBB）");
+    return;
+  }
+  shell.foreground = parsed;
+  char hex[8] = {0};
+  comp_ui::color_to_hex(shell.foreground, hex);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"前景色：%s", widen_ascii(hex).c_str());
+  set_status(shell, buffer);
+}
+
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
+  /* 前景色十六进制键入态最先生效：它是模态输入，不能漏到工具快捷键。 */
+  if (!shell.color_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.color_input.clear();
+      set_status(shell, L"已取消前景色输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      shell.color_input.pop_back();
+      if (shell.color_input.empty()) {
+        set_status(shell, L"已取消前景色输入");
+      } else {
+        refresh_color_input_status(shell);
+      }
+      return;
+    }
+    if (key == VK_RETURN) {
+      commit_color_input(shell);
+      return;
+    }
+    const bool hex_digit = (key >= '0' && key <= '9') || (key >= 'A' && key <= 'F') ||
+                           (key >= 'a' && key <= 'f');
+    if (hex_digit && shell.color_input.size() < 7) {
+      shell.color_input.push_back(static_cast<wchar_t>(key));
+      refresh_color_input_status(shell);
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
   /* 滤镜面板输入态：与调整面板同一套输入规矩，但目标值是滤镜参数。 */
   if (!shell.filter_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -2400,8 +2789,26 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         panel_begin_input(shell, static_cast<wchar_t>(key));
         break;
       }
+      /* X = 下一项色板；Shift+X = 键入十六进制。前景色是画笔与吸管的公共落点。 */
+      if (key == 'X' && !ctrl) {
+        if (shift) {
+          begin_color_input(shell);
+          break;
+        }
+        shell.palette_index = comp_ui::step_swatch(shell.palette_index, 1);
+        shell.foreground = comp_ui::swatch_at(shell.palette_index);
+        char hex[8] = {0};
+        comp_ui::color_to_hex(shell.foreground, hex);
+        wchar_t buffer[160];
+        wsprintfW(buffer, L"前景色：%s（色板 %d/%d，Shift+X 键入十六进制）",
+                  widen_ascii(hex).c_str(), shell.palette_index + 1,
+                  comp_ui::swatch_count());
+        set_status(shell, buffer);
+        break;
+      }
       if (key < 128) {
-        const comp_ui::ToolId id = comp_ui::tool_for_shortcut(static_cast<char>(key));
+        const comp_ui::ToolId id =
+            comp_ui::tool_shortcut_target(shell.tool, static_cast<char>(key));
         if (id == comp_ui::ToolId::Retouch) {
           /* 重复按 R 在同一工具内循环 Blur -> Smudge -> Liquify（对齐上游）。 */
           set_retouch_mode(shell, shell.tool == comp_ui::ToolId::Retouch
@@ -2494,6 +2901,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               marquee_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (paint_stroke_available(*shell)) {
+              paint_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (eyedropper_available(*shell)) {
+              eyedropper_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (move_available(*shell)) {
+              move_begin(window, *shell, mouse_x, mouse_y, layout);
             } else {
               canvas_click(*shell, mouse_x, mouse_y, layout);
             }
@@ -2518,8 +2931,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
-      if (shell != nullptr && shell->stroke_active) {
+      if (shell != nullptr && shell->move_active) {
+        move_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->eyedropper_drag) {
+        shell->eyedropper_drag = false;
+        ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Retouch) {
         retouch_stroke_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Paint) {
+        paint_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -2533,14 +2962,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         shell->space_down = false;
         end_pan(window, *shell);
-        retouch_stroke_cancel(*shell);
+        stroke_cancel(*shell);
+        move_cancel(*shell);
+        eyedropper_cancel(*shell);
         marquee_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
       if (shell != nullptr) {
         end_pan(window, *shell);
-        retouch_stroke_cancel(*shell);
+        stroke_cancel(*shell);
+        move_cancel(*shell);
+        eyedropper_cancel(*shell);
         marquee_cancel(*shell);
       }
       break;
@@ -2548,11 +2981,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
-          if (shell->marquee_active) {
+          if (shell->move_active) {
+            move_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->eyedropper_drag) {
+            /* 吸管拖动连续取样：只更新前景色与状态栏，不改画布内容。 */
+            eyedropper_sample(*shell, mouse_x, mouse_y, layout);
+          } else if (shell->marquee_active) {
             marquee_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
-          } else if (shell->stroke_active) {
-            retouch_stroke_extend(*shell, mouse_x, mouse_y, layout);
+          } else if (stroke_in_progress(*shell)) {
+            stroke_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->panning) {
             shell->view.pan_by(static_cast<double>(mouse_x - shell->pan_anchor.x),
@@ -3248,6 +3687,124 @@ int run_selftest(const wchar_t* out_path) {
              comp_selection_get_active(document, &selection_active) == COMP_OK &&
              selection_active == 0,
          "comp_selection_deselect() returns to the no-selection state");
+
+  /*
+   * S6：前景色 / 画笔 / 橡皮擦 / 吸管 / 选区搬移。
+   * 壳层只做参数装配，因此这里按 paint_stroke_end / eyedropper_sample / move_end
+   * 的同一顺序调用 ABI——验证的是「壳层接线后的真实序列」，不是另写一套。
+   */
+  verify(comp_ui::tool_shortcut_target(comp_ui::ToolId::Brush, 'e') ==
+                 comp_ui::ToolId::Eraser &&
+             comp_ui::tool_shortcut_target(comp_ui::ToolId::Eraser, 'E') ==
+                 comp_ui::ToolId::Brush,
+         "ui_core tool_shortcut_target(E) toggles brush/eraser");
+  verify(comp_ui::swatch_count() == 12 && comp_ui::step_swatch(11, 1) == 0 &&
+             comp_ui::step_swatch(0, -1) == 11,
+         "ui_core swatch palette cycles (X)");
+
+  comp_ui::ColorRGB foreground{};
+  const bool parse_ok = comp_ui::color_parse_hex("#3A7BD5", &foreground);
+  char foreground_hex[8] = {0};
+  comp_ui::color_to_hex(foreground, foreground_hex);
+  verify(parse_ok && foreground.r == 0x3A && foreground.g == 0x7B && foreground.b == 0xD5 &&
+             std::strcmp(foreground_hex, "#3A7BD5") == 0,
+         "ui_core color_parse_hex / color_to_hex round trip (Shift+X)");
+
+  /* 与 paint_stroke_end 相同：前景色 + 单点折线（单击 = 一记 dab）。 */
+  verify(comp_layer_set_pixels(document, layer, &opaque_image) == COMP_OK,
+         "comp_layer_set_pixels(base for paint)");
+  std::vector<uint8_t> paint_base(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, paint_base.data(), COMP_PIXEL_RGBA8, stride);
+
+  comp_tool_op_desc paint_desc{};
+  paint_desc.kind = COMP_TOOL_STROKE;
+  paint_desc.brush.color[0] = foreground.r;
+  paint_desc.brush.color[1] = foreground.g;
+  paint_desc.brush.color[2] = foreground.b;
+  paint_desc.brush.diameter = 10.0f;
+  paint_desc.brush.pressure = 1.0f;
+  paint_desc.brush.hardness = 1.0f;
+  paint_desc.brush.flow = 1.0f;
+  paint_desc.brush.seed = 0;
+  const float dab[] = {32.0f, 32.0f};
+  paint_desc.stroke_points = dab;
+  paint_desc.stroke_point_count = 1;
+  char stroke_note[256] = {0};
+  size_t stroke_note_size = 0;
+  const bool paint_ok =
+      comp_tool_apply(document, layer, &paint_desc, stroke_note, sizeof(stroke_note),
+                      &stroke_note_size) == COMP_OK;
+  std::vector<uint8_t> paint_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, paint_after.data(), COMP_PIXEL_RGBA8, stride);
+  const size_t center = static_cast<size_t>(32) * stride + static_cast<size_t>(32) * 4u;
+  verify(paint_ok && paint_after != paint_base && paint_after[center + 0] == 0x3A &&
+             paint_after[center + 1] == 0x7B && paint_after[center + 2] == 0xD5,
+         "COMP_TOOL_STROKE paints the shell foreground colour");
+
+  /* 吸管：同一位置取回的直通 sRGB 应还原成同一个前景色。 */
+  float sampled[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  const bool sample_ok = comp_eyedropper_sample(document, layer, 32.0, 32.0, 1,
+                                                COMP_EYEDROPPER_LAYER, sampled) == COMP_OK;
+  const comp_ui::ColorRGB sampled_color =
+      comp_ui::color_from_unit(sampled[0], sampled[1], sampled[2]);
+  verify(sample_ok && sampled_color.r == foreground.r && sampled_color.g == foreground.g &&
+             sampled_color.b == foreground.b && sampled[3] == 1.0f,
+         "comp_eyedropper_sample() returns the painted colour (feeds foreground)");
+
+  /* 橡皮擦：同一支笔、同样的 diameter/hardness，方向翻转成 destination-out。 */
+  paint_desc.erase = 1;
+  const bool erase_ok =
+      comp_tool_apply(document, layer, &paint_desc, stroke_note, sizeof(stroke_note),
+                      &stroke_note_size) == COMP_OK;
+  std::vector<uint8_t> erase_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, erase_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(erase_ok && erase_after != paint_after,
+         "COMP_TOOL_STROKE(erase) removes the painted pixel");
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(erase step)");
+  std::vector<uint8_t> erase_undone(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, erase_undone.data(), COMP_PIXEL_RGBA8, stride);
+  verify(erase_undone == paint_after, "undoing erase restores the painted pixel byte-identically");
+
+  /*
+   * 选区搬移：像素搬移 + 轮廓平移必须落在同一个显式事务里（一次拖拽 = 一步撤销）。
+   * 顺序与 move_end 一致：先按当前选区切像素，再平移轮廓。
+   */
+  comp_rect bounds_before{};
+  const bool move_rect_ok =
+      comp_selection_apply_shape(document, COMP_SELECTION_RECT, rect_points, 2,
+                                 COMP_SELECTION_REPLACE, 1, &selection_changed) == COMP_OK &&
+      comp_selection_get_bounds(document, &bounds_before) == COMP_OK;
+  std::vector<uint8_t> move_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, move_before.data(), COMP_PIXEL_RGBA8, stride);
+
+  comp_txn move_txn = nullptr;
+  const bool move_txn_ok =
+      comp_txn_begin(document, "Move Selection Pixels", &move_txn) == COMP_OK;
+  int32_t moved_pixels = 0;
+  int32_t moved_outline = 0;
+  const bool move_ok =
+      move_txn_ok &&
+      comp_selection_move_pixels(document, layer, 8, 0, 0, &moved_pixels) == COMP_OK &&
+      comp_selection_translate(document, 8, 0, &moved_outline) == COMP_OK &&
+      comp_txn_commit(move_txn) == COMP_OK;
+  comp_rect bounds_after{};
+  comp_selection_get_bounds(document, &bounds_after);
+  verify(move_rect_ok && move_ok && moved_pixels > 0 && moved_outline > 0 &&
+             bounds_after.x == bounds_before.x + 8 && bounds_after.y == bounds_before.y,
+         "selection move pixels + translate commit in one explicit transaction");
+
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(move selection)");
+  comp_rect bounds_undone{};
+  std::vector<uint8_t> move_undone(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, move_undone.data(), COMP_PIXEL_RGBA8, stride);
+  verify(comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 1 &&
+             comp_selection_get_bounds(document, &bounds_undone) == COMP_OK &&
+             bounds_undone.x == bounds_before.x && bounds_undone.y == bounds_before.y &&
+             move_undone == move_before,
+         "one undo restores both the pixels and the selection outline");
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

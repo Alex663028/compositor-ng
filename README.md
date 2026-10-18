@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **373 用例 0 失败**；Windows 外壳实机自检 **41 项全 OK**（与仓内基线逐字节一致）。
+  全量 **397 用例 0 失败**；Windows 外壳实机自检 **71 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -108,6 +108,25 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   新增 5 例护栏（滤镜表量程/缺省、面板夹取与焦点、行命中几何、retouch 循环与
   半径量程、笔迹去抖）。基线 368 → **373 用例**，Windows 壳自检 27 → **41 项**，
   6/6 回归全绿。详见 §6.13。
+  2026-10-18 第十四轮（S4 外壳交互补齐）：`ui_core` 补选区边界折线、虚线相位、
+  笔尖半径与 retouch 强度夹取；Windows 壳接上选区蚂蚁线（`Ctrl+A` / `Ctrl+D` /
+  `Ctrl+Shift+I`、`M` 框选）、落笔预览线、Smudge / Liquify 落笔。基线 373 →
+  **377 用例**，Windows 壳自检 41 → **59 项**，6/6 回归全绿。详见 §6.14。
+  2026-10-18 第十五轮（S5 选区运算 / 像素搬移 / 橡皮擦 / 吸管）：新增
+  `comp_selection_load_layer` / `comp_selection_translate` /
+  `comp_selection_move_pixels` / `comp_eyedropper_sample` 与
+  `comp_tool_op_desc.erase`——图层像素/蒙版载入为选区、平移轮廓、按 coverage
+  剪切/复制选区像素（含扩层与蒙版同步）、预乘 destination-out 擦除、预乘平均后
+  反预乘的取色。基线 377 → **391 用例**（14 例护栏），口径 B **27/48 ≈ 56%**；
+  外壳尚未接线取色/前景色/拖动选区，详见 §6.15。
+  2026-10-18 第十六轮（S6 外壳接线：前景色 / 吸管 / `E` 橡皮擦 / 拖动选区）：`ui_core`
+  补前景色模型（RGB↔HSV、`#RRGGBB` 解析与格式化、12 色板）与 `E` 画笔/橡皮擦切换；
+  Windows 壳接上吸管（`I`，Alt = 合并源，读数含 HSV 与不透明度）、画笔/橡皮擦共用
+  `COMP_TOOL_STROKE`（`desc.erase`）、`V` 拖拽搬移/复制选区像素（像素搬移 + 轮廓平移
+  同一个显式事务 = 一步撤销）、状态栏前景色块与 `Shift+X` 十六进制键入。自检还暴露出
+  一处内核缺陷：单点折线（点一下不移动）被参数闸接受却不落笔——已修为圆形 dab。
+  基线 391 → **397 用例**，Windows 壳自检 59 → **71 项**，口径 B **27/48 ≈ 56%** →
+  **28/48 ≈ 58%**。详见 §6.16。
 
 ## 1. M1 目标与范围
 
@@ -360,11 +379,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 82（38 个 `.c` + 44 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 87（38 个 `.c` + 49 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 352 cases, 0 failed, 0 check failures`（当前基线；§6.11 起） |
+| 测试 | `summary: 397 cases, 0 failed, 0 check failures`（当前基线；§6.16 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：44 `.cpp` / 38 `.c`（含 vendored 26）/ 82 `.h`；tests：32 `.cpp` |
+| 源码规模 | engine：49 `.cpp` / 38 `.c`（含 vendored 26）/ 87 `.h`（含 vendored）；tests：34 `.cpp` |
 
 blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
 `_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
@@ -1371,10 +1390,10 @@ Windows 侧推荐编译器仍是 clang-cl。
 
 - **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈97%**。
 - **口径 B：分母 = 上游产品功能条目**（上游 README 的 48 条）。回答「能当 Photoshop 用吗」
-  → **≈56%**（命中约 27 条）。
+  → **≈58%**（命中约 28 条）。
 
 AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Compositor/UI` 9.3k 行 +
-`ContentView`），因此「90% vs 56%」不矛盾。
+`ContentView`），因此「90% vs 58%」不矛盾。
 
 #### 口径 A：引擎核
 
@@ -1383,7 +1402,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
-| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 102 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 110 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比 |
@@ -1407,25 +1426,25 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 |---------|---------|
 | Layers（图层/组/不透明度/全混合模式/图层蒙版/剪贴蒙版/调整层 12 kind/图层效果 6 kind/合并/重排嵌套） | ✓ |
 | Transform（仿射 move·scale·rotate / distort / 精确值） | ✓ |
-| Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样；**S5 补上 Erase 模式**——同一支笔的 destination-out，§6.15） |
+| Painting（笔刷 / Spot Heal / Content-Aware Fill / 吸管） | ✓（笔刷为解析式，噪声未采样；**S5 补上 Erase 模式**——同一支笔的 destination-out，§6.15；**S6 接上前景色模型、`E` 切换与吸管**，§6.16） |
 | Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
-| **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；缺的只有外壳的拖拽手势，属接线不属算法 |
+| **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；**S6 补上外壳的拖拽手势**（`V`，Alt = 复制，一步撤销，§6.16） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 27/48 命中 ≈ 56%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
+即 **约 28/48 命中 ≈ 58%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
 Lens Correction 是同一 `Filters.swift` 通路的附加值，不额外抬高条数；选区几何按
 「部分命中」计，未抬高条数——缺的 Select Subject / 抠图正是该条的主要工作量；
-Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。S5 只抬高**两条**：
-Selections 的「加选/减选 + 移动轮廓 + 搬移/复制像素」与「载入图层像素或蒙版」。
-Painting 的 Erase 模式算进已计数的笔刷条目，**吸管（Painting #7）仍不计入**——
-引擎与 ABI 已就绪（`comp_eyedropper_sample`），但外壳还没有取色工具和颜色模型，
-按「用户能做的事」口径不能算命中。其余约 4,800 行 Swift **完全没有对应物**，
+Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。S5 抬高**两条**：
+Selections 的「加选/减选 + 移动轮廓 + 搬移/复制像素」与「载入图层像素或蒙版」；
+S6 再抬高**一条**：**吸管（Painting #7）**——前景色模型与取色工具都已接进外壳，
+按「用户能做的事」口径从此命中（§6.16）。Painting 的 Erase 模式仍算进已计数的
+笔刷条目，不额外抬高条数。其余约 4,800 行 Swift **完全没有对应物**，
 且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -2115,10 +2134,10 @@ S5 的目标是把上游 README 里三条「要有、但还没有」的能力补
 
 **1. 载入选区（`comp_selection_load_layer`）。** 两种源：
 
-- `COMP_SELECTION_SOURCE_PIXELS`：取图层的 **alpha**，经 `document_to_pixel()`
+- `COMP_SELECTION_LOAD_PIXELS`：取图层的 **alpha**，经 `document_to_pixel()`
   逐像素映射回文档坐标——与合成、吸管同一套「文档坐标 ↔ 图层像素」公式，因此
   缩放/旋转/翻转的图层也能正确投影（旋转/翻转不重采样：每个文档像素查一次最近源像素）。
-- `COMP_SELECTION_SOURCE_MASK`：取图层蒙版的灰度。**没有蒙版的图层取到空选区**
+- `COMP_SELECTION_LOAD_MASK`：取图层蒙版的灰度。**没有蒙版的图层取到空选区**
   （没有可载入的数据，不做「全不透明」的臆测）；蒙版与像素矩形同尺寸这一约束由
   `comp_layer_set_mask` 保证。阈值与叠加口径同下。
 
@@ -2173,13 +2192,81 @@ S5 的目标是把上游 README 里三条「要有、但还没有」的能力补
 复制保留源、不支持图层拒绝），`tests/test_tool_ops.cpp` 2 例（橡皮擦按 coverage
 做减法而非覆盖、零压力 no-op）。
 
-**7. 验证与边界。** 按老板指示，本轮**只做编译检查**
-（`scripts/build.py --no-run`，exit 0、`[build] OK`），全量回归留到口径 B ≥ 90%
-之后统一跑。**外壳尚未接线**：Windows 壳还没有取色工具、前景色模型、拖拽移动
+**7. 验证与边界。** 交付后按「查残余」补跑全量回归：`scripts/build.py` →
+**391 cases, 0 failed**；`scripts/run_regression.py --require-ohos` → **6/6 PASS，
+0 skipped**（Windows 壳自检 59 项、SHA256 与基线一致；OHOS `ok=87 fail=0`）。
+第一次全量运行曾在 `selection_translate` 处堆损坏（`0xC0000374`）：负向平移把负
+指针偏移转成 `size_t`，越界平移又把负数长度交给 `memcpy`；修复为目标列偏移
+`left + dx`，且只在重叠区非空时拷贝（回归已覆盖两个方向）。
+**外壳尚未接线**：Windows 壳还没有取色工具、前景色模型、拖拽移动
 选区/搬移像素的手势，M 框选之外的载入/搬移只能走 ABI。因此口径 B 只抬高 2 条
-（Selections 的两条），吸管按「用户能做的事」不计入。
+（Selections 的两条），吸管按「用户能做的事」不计入。（S6 已补齐这组接线，见 §6.16。）
 
 报告：`../report/S5-selection-pixels-eyedropper-20261018-claude.md`。
+
+### 6.16 S6 外壳接线：前景色 / 吸管 / `E` 橡皮擦 / 拖动选区（2026-10-18，Claude）
+
+S6 不新增 ABI，也不改 `.comp`——它把 S5 已经交付的 `comp_eyedropper_sample` /
+`comp_selection_move_pixels` / `comp_selection_translate` / `comp_tool_op_desc.erase`
+接到 Windows 壳，并补上让它们「可用」的前景色模型。平台无关部分仍全部在
+`ui_core.h`（无 Win32、无引擎头），`main.cpp` 只做消息到 `ui_core` / C ABI 的翻译。
+
+**1. 前景色模型（`ui_core`）。** `ColorRGB` 是 8 位直通 sRGB，与
+`comp_tool_brush.color` 同口径；`ColorHSV` 为 h 0..360 / s、v 0..1。
+`rgb_to_hsv` / `hsv_to_rgb` 往返在 8 位量化下逐通道相等；`hsv_to_rgb` 对越界输入
+**收口而不报错**：h 用 `fmod` 环绕，s / v 夹到 0..1，NaN 回落到 0（灰阶）。
+`color_to_hex` 写大写 `#RRGGBB`；`color_parse_hex` 只认整串（可选 `#`，
+3 位缩写 `#abc` → `#AABBCC`），前后空白或多余字符整体失败——键入路径宁可让用户改，
+不静默截断。色板固定 12 色，`step_swatch` 双向取模循环，越界 `swatch_at`
+回落黑色而不是野指针。
+
+**2. 吸管（`I`）。** 点按或拖拽画布连续取色；命中画布外 / 文档外直接忽略
+（ABI 对越界坐标返回 `INVALID_ARGUMENT`，那不是「吸管坏了」）。`sample_size` 固定 1；
+按住 `Alt` 取 `COMP_EYEDROPPER_MERGED`（整篇合成），否则取当前图层；**没有选中图层
+时回落到合并源**——画布上看到什么就吸什么，比报错更符合预期。结果经
+`color_from_unit` 写进 `shell.foreground`，状态栏同时给出 hex、源、H/S/B 与不透明度。
+吸管是只读工具：不开事务、不进撤销栈、不置 `needs_render`。
+
+**3. 画笔 / 橡皮擦（`B` / `E` / `X` / `Shift+X`）。** `E` 在画笔与橡皮擦之间往返
+（其余键位仍按 `tool_table`）；两者共用同一条 `COMP_TOOL_STROKE`，形状、`hardness`、
+`pressure * flow` 完全一致，只有 `desc.erase` 翻转合成方向（预乘 destination-out）。
+`stroke_erase` 在**落笔时冻结**：拖拽中途按 `E` 不改变这一笔的合成方向。
+`X` 循环色板、`Shift+X` 进入十六进制键入态（模态：只吃 0-9/A-F，`Backspace` 删字符，
+回车确认，`Esc` 只取消输入而不是关窗口）。状态栏右端 16 px 色块 +
+`前景 #RRGGBB`，左端文本按省略号截断（状态栏窄于 260 px 时不画色块）。
+
+**4. 拖动选区（`V`）。** 没有活动选区时只提示、不开事务。按下鼠标冻结起点并记录
+`Alt`（= 复制，否则剪切），松开时把位移取整到文档像素，在**一个显式事务**里先
+`comp_selection_move_pixels` 再 `comp_selection_translate`——顺序不能反：像素搬移按
+当前选区取像素，先平移轮廓会搬错地方。任一步失败 `comp_txn_abort`（半搬的像素
+比不搬更坏）；两步都 `changed = 0` 也 abort，不产生空的撤销步。拖拽期间蚂蚁线按
+同一取整偏移预览，所以预览与提交不会差一像素。
+
+**5. 自检暴露的内核缺陷：单点折线不落笔。** 第一版 S6 自检有三项红：
+`COMP_TOOL_STROKE paints…` / `comp_eyedropper_sample()…` / `erase removes…`。
+根因不在壳：`stroke_begin` 为一次点按只塞 1 个折点，而 `StrokeShape::coverage_at`
+只量到**线段**的距离——参数闸接受 1..65536 个折点，1 个点时循环一次都不执行，
+coverage 恒 0，于是「点了没反应」。修复在 `engine/domain/tool_ops.cpp`：单点按
+「到该点的距离」算 coverage，等价于一记圆形 dab；既有的两个
+`stroke_point_count == 1` 测试都带 `pressure = 0`，没有断言过「单点必须不画」。
+同轮补了一条 ABI 护栏（单点落笔、笔心实色、半径外不落墨），并订正域层测试里
+「单点没有线段可落」的过时注释；`docs/tool-ops.md` §4.2 同步写明 dab 语义。
+
+**6. 测试。** 新增 6 例：`test_ui_core` 5 例（`E` 往返、RGB↔HSV 往返与越界收口、
+hex 往返与垃圾拒绝、12 色板循环、0..1 换算夹取），`test_tool_ops` 1 例（单点 dab）。
+基线 391 → **397 用例**。`--selftest` 新增 12 项（`E` 切换、色板循环、hex 往返、
+落色后吸管读回同色、橡皮擦擦掉并一步撤销逐字节还原、像素搬移 + 轮廓平移同一事务
+一步撤销），59 → **71 项**。
+
+**7. 验证与边界。** `scripts/build.py` → **397 cases, 0 failed**；
+`scripts/run_regression.py --require-ohos` → **6/6 PASS，0 skipped**（Windows 壳自检
+71 项、`failures = 0`、SHA256 `0adc0e00f2ea2518…` 与仓内基线一致；OHOS aarch64
+交叉编译 rc=0）。本轮仍**没有经过人手实测**：无窗口环境下只能验证到 ABI 与
+`ui_core` 数学层；吸管取样窗口固定 1（没有 N×N 平均的 UI），HSV 只有模型与读数，
+尚无三滑块面板；`V` 搬移沿用引擎约束（RGBA8、1:1、无旋转/翻转），其它图层会得到
+明确失败提示而不是降级。
+
+报告：`../report/S6-shell-wiring-20261018-claude.md`。
 
 ## 7. 许可
 

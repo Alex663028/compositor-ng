@@ -1002,7 +1002,7 @@ COMP_TEST(tool_ops_domain_stroke_keeps_sixteen_bit_depth_outside_the_stroke) {
   const comp_layer_id id = add_wide_layer(document);
   const std::vector<uint8_t> before = pixels_of(document, id);
 
-  /* 两个点：`stamp_polyline` 的 coverage 取最近**线段**，单点没有线段可落。 */
+  /* 两个点：本用例验证的是折线段落笔（单点另有 dab 语义，见 tests/test_tool_ops.cpp）。 */
   const float points[4] = {1.0f, 1.0f, 2.0f, 1.0f};
   ToolOpParams params;
   params.kind = kToolOpStroke;

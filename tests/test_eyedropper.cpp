@@ -13,6 +13,7 @@
  */
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "compositor/comp_core.h"
@@ -222,6 +223,11 @@ COMP_TEST(eyedropper_rejects_bad_arguments_and_bad_layers) {
                                     nullptr) == COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_eyedropper_sample(fx.document, fx.layer, -1.0, 8.0, 1, COMP_EYEDROPPER_LAYER,
                                     rgba) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_eyedropper_sample(fx.document, fx.layer, std::nan(""), 8.0, 1,
+                                    COMP_EYEDROPPER_LAYER, rgba) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_eyedropper_sample(fx.document, fx.layer, 8.0,
+                                    std::numeric_limits<double>::infinity(), 1,
+                                    COMP_EYEDROPPER_LAYER, rgba) == COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_eyedropper_sample(fx.document, fx.layer, 8.0, static_cast<double>(kSide), 1,
                                     COMP_EYEDROPPER_LAYER, rgba) == COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_eyedropper_sample(fx.document, fx.layer, 8.0, 8.0, 2, COMP_EYEDROPPER_LAYER,

@@ -718,3 +718,117 @@ COMP_TEST(ui_core_brush_steps_are_geometric_and_bounded) {
   COMP_CHECK(near_value(comp_ui::step_brush_hardness(0.05, -1), 0.0));
   COMP_CHECK(near_value(comp_ui::step_brush_hardness(0.5, 0), 0.5));
 }
+
+COMP_TEST(ui_core_tool_shortcut_e_toggles_brush_and_eraser) {
+  /* E 在画笔/橡皮擦之间往返：两者共用笔形，只是合成方向不同。 */
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'e') == ToolId::Eraser);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Eraser, 'e') == ToolId::Brush);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Select, 'e') == ToolId::Eraser);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Eraser, 'E') == ToolId::Brush);
+
+  /* 其余键位仍按 tool_table 走，未命中返回 Count。 */
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Eraser, 'b') == ToolId::Brush);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'r') == ToolId::Retouch);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'x') == ToolId::Count);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, '1') == ToolId::Count);
+}
+
+COMP_TEST(ui_core_color_rgb_hsv_round_trips) {
+  using comp_ui::ColorHSV;
+  using comp_ui::ColorRGB;
+
+  /* 三原色的色相锚点：红 0、绿 120、蓝 240。 */
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{255, 0, 0}).h, 0.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{0, 255, 0}).h, 120.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{0, 0, 255}).h, 240.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{255, 255, 0}).h, 60.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{255, 0, 255}).h, 300.0));
+
+  /* 灰阶：没有色相，饱和度 0，明度即灰度。 */
+  const ColorHSV gray = comp_ui::rgb_to_hsv(ColorRGB{127, 127, 127});
+  COMP_CHECK(near_value(gray.s, 0.0));
+  COMP_CHECK(near_value(gray.v, 127.0 / 255.0));
+  COMP_CHECK(near_value(gray.h, 0.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{0, 0, 0}).v, 0.0));
+  COMP_CHECK(near_value(comp_ui::rgb_to_hsv(ColorRGB{255, 255, 255}).v, 1.0));
+
+  /* 任意颜色往返：8 位量化后逐通道相等（HSV 是同一色的另一种写法）。 */
+  const ColorRGB samples[] = {{0, 0, 0},     {255, 255, 255}, {58, 123, 213},
+                              {200, 40, 20}, {0, 160, 0},     {139, 69, 19}};
+  for (const ColorRGB& sample : samples) {
+    const ColorRGB back = comp_ui::hsv_to_rgb(comp_ui::rgb_to_hsv(sample));
+    COMP_CHECK(comp_ui::color_equal(back, sample));
+  }
+
+  /* 越界输入夹取：h 环绕，s/v 夹到 0..1。 */
+  COMP_CHECK(comp_ui::color_equal(comp_ui::hsv_to_rgb(ColorHSV{-60.0, 1.0, 1.0}),
+                                  comp_ui::hsv_to_rgb(ColorHSV{300.0, 1.0, 1.0})));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::hsv_to_rgb(ColorHSV{0.0, 5.0, 5.0}),
+                                  ColorRGB{255, 0, 0})); /* s/v 夹到 1 -> 纯红 */
+  COMP_CHECK(comp_ui::color_equal(comp_ui::hsv_to_rgb(ColorHSV{0.0, -1.0, -1.0}),
+                                  ColorRGB{0, 0, 0}));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::hsv_to_rgb(ColorHSV{0.0, std::nan(""), 1.0}),
+                                  ColorRGB{255, 255, 255})); /* NaN 饱和度 -> 灰阶，v=1 为白 */
+}
+
+COMP_TEST(ui_core_color_hex_round_trips_and_rejects_junk) {
+  using comp_ui::ColorRGB;
+
+  char hex[8] = {0};
+  comp_ui::color_to_hex(ColorRGB{58, 123, 213}, hex);
+  COMP_CHECK(std::string(hex) == "#3A7BD5");
+
+  ColorRGB parsed{};
+  COMP_CHECK(comp_ui::color_parse_hex("#3A7BD5", &parsed));
+  COMP_CHECK(comp_ui::color_equal(parsed, ColorRGB{58, 123, 213}));
+  COMP_CHECK(comp_ui::color_parse_hex("3a7bd5", &parsed)); /* 不带 #，小写也认 */
+  COMP_CHECK(comp_ui::color_equal(parsed, ColorRGB{58, 123, 213}));
+  COMP_CHECK(comp_ui::color_parse_hex("#abc", &parsed)); /* 3 位缩写 */
+  COMP_CHECK(comp_ui::color_equal(parsed, ColorRGB{0xAA, 0xBB, 0xCC}));
+  COMP_CHECK(comp_ui::color_parse_hex("#000000", &parsed));
+  COMP_CHECK(comp_ui::color_equal(parsed, ColorRGB{0, 0, 0}));
+
+  /* 非法输入必须整体失败，不能把前缀当成颜色。 */
+  COMP_CHECK(!comp_ui::color_parse_hex(nullptr, &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#3A7BD5", nullptr));
+  COMP_CHECK(!comp_ui::color_parse_hex("", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#12345", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#1234567", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#GGGGGG", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex(" #123456", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#123456 ", &parsed));
+  COMP_CHECK(!comp_ui::color_parse_hex("#12", &parsed));
+}
+
+COMP_TEST(ui_core_swatch_palette_is_fixed_and_cycles) {
+  COMP_CHECK(comp_ui::swatch_count() == 12);
+  COMP_CHECK(comp_ui::color_equal(comp_ui::swatch_at(0), comp_ui::ColorRGB{0, 0, 0}));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::swatch_at(1), comp_ui::ColorRGB{255, 255, 255}));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::swatch_at(3), comp_ui::ColorRGB{255, 0, 0}));
+
+  /* 越界不返回野指针，也不越界读：回落到黑色。 */
+  COMP_CHECK(comp_ui::color_equal(comp_ui::swatch_at(-1), comp_ui::ColorRGB{0, 0, 0}));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::swatch_at(12), comp_ui::ColorRGB{0, 0, 0}));
+
+  /* 循环：正向到头回到 0，反向从 0 回到末项。 */
+  int index = 0;
+  for (int i = 0; i < comp_ui::swatch_count(); ++i) index = comp_ui::step_swatch(index, 1);
+  COMP_CHECK(index == 0);
+  COMP_CHECK(comp_ui::step_swatch(0, -1) == comp_ui::swatch_count() - 1);
+  COMP_CHECK(comp_ui::step_swatch(comp_ui::swatch_count() - 1, 1) == 0);
+}
+
+COMP_TEST(ui_core_color_unit_conversion_clamps) {
+  COMP_CHECK(comp_ui::color_equal(comp_ui::color_from_unit(1.0, 0.5, 0.0),
+                                  comp_ui::ColorRGB{255, 128, 0}));
+  COMP_CHECK(comp_ui::color_equal(comp_ui::color_from_unit(-1.0, 2.0, std::nan("")),
+                                  comp_ui::ColorRGB{0, 255, 0}));
+  COMP_CHECK(near_value(comp_ui::color_to_unit(255), 1.0));
+  COMP_CHECK(near_value(comp_ui::color_to_unit(0), 0.0));
+
+  /* 吸管的输出就是 0..1 直通 sRGB：这条换算是「吸到的颜色 -> 画笔色」的桥。 */
+  const comp_ui::ColorRGB sampled = comp_ui::color_from_unit(200.0 / 255.0, 40.0 / 255.0,
+                                                             20.0 / 255.0);
+  COMP_CHECK(comp_ui::color_equal(sampled, comp_ui::ColorRGB{200, 40, 20}));
+}

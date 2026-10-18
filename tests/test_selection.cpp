@@ -804,6 +804,19 @@ COMP_TEST(selection_translate_moves_outline_and_clips_to_canvas) {
   COMP_CHECK(changed == 0);
   COMP_CHECK(undo_depth_of(fixture.document) == before_noop);
 
+  /* 负向平移（仍有重叠）：目标列从 0 开始，不能把负偏移直接转 size_t。 */
+  COMP_CHECK(comp_selection_translate(fixture.document, -3, -3, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+
+  /* 反向推出画布：重叠区为空，负数长度不能交给 memcpy。 */
+  COMP_CHECK(comp_selection_translate(fixture.document, -1000, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 0);
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(mask_sum(coverage(fixture.document)) > 0);
+
   /* 推出画布：选区仍是「有选区」状态，但内容空。 */
   COMP_CHECK(comp_selection_translate(fixture.document, 1000, 0, &changed) == COMP_OK);
   COMP_CHECK(changed == 1);

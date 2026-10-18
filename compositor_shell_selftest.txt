@@ -63,6 +63,18 @@
 [OK] comp_selection_select_all() covers the canvas
 [OK] comp_selection_invert() of a full selection means no selection
 [OK] comp_selection_deselect() returns to the no-selection state
+[OK] ui_core tool_shortcut_target(E) toggles brush/eraser
+[OK] ui_core swatch palette cycles (X)
+[OK] ui_core color_parse_hex / color_to_hex round trip (Shift+X)
+[OK] comp_layer_set_pixels(base for paint)
+[OK] COMP_TOOL_STROKE paints the shell foreground colour
+[OK] comp_eyedropper_sample() returns the painted colour (feeds foreground)
+[OK] COMP_TOOL_STROKE(erase) removes the painted pixel
+[OK] comp_document_undo(erase step)
+[OK] undoing erase restores the painted pixel byte-identically
+[OK] selection move pixels + translate commit in one explicit transaction
+[OK] comp_document_undo(move selection)
+[OK] one undo restores both the pixels and the selection outline
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

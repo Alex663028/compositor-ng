@@ -68,6 +68,8 @@
 - 形状 = 到最近线段的距离 ≤ `diameter / 2`；
   `hardness` 决定 `[hardness * r, r]` 这段的 smoothstep 羽化带
   （`1` = 全实，`0` = 从笔芯就羽化）。
+- **单点折线（`stroke_point_count == 1`）是一记圆形 dab**：鼠标只按一下、不移动
+  也必须留下笔尖（参数闸允许 1..65536 个折点，不能对 1 个点静默不画）。
 - `pressure * flow` 乘进峰值 coverage。两者相乘是上游画笔口径：
   `pressure` 是笔压，`flow` 是「单次落笔不把像素涂死」的总量上限。
 - **不叠加**：笔画按 coverage 做 source-over（同一像素被同一笔压两次仍是同一结果）。
@@ -250,7 +252,9 @@ coverage 把样本盖回当前像素。
   （5 例 `test_ui_core`：滤镜表、面板状态机、行几何、retouch 循环、笔迹去抖），
   Windows 壳自检 27 → **41 项**。Win32 交互路径未经人手实测，只验证到 ABI 与
   `ui_core` 数学层。
+- S4 追加（2026-10-18）：Smudge / Liquify 接上 Windows 壳的落笔折线（强度
+  `Alt+[` / `Alt+]` 步进），基线 373 → **377 用例**，壳自检 41 → **59 项**。
 - S5 追加（2026-10-18）：Stroke 增加 `erase` 尾部字段（§4.2，destination-out），
-  新增 2 例：擦除按 coverage 做减法而非覆盖、零压力 no-op。按老板指示本轮
-  **只做编译检查**（`build.py --no-run` exit 0），用例总数待下一次全量回归确认。
+  新增 2 例：擦除按 coverage 做减法而非覆盖、零压力 no-op。全量回归
+  `build.py` → **391 cases, 0 failed**，`run_regression.py --require-ohos` 6/6 PASS。
   选区侧的载入/平移/像素搬移与吸管不走 `comp_tool_apply`，见 README §6.15。
