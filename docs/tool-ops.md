@@ -171,15 +171,19 @@
 工具算子**不引入新的 manifest 键**：结果都落进既有的 `layer` 像素 / `mask` / `transform`，
 因此 `.comp` 往返与既有护栏完全不受影响。
 
-## 7. 已知边界（未接线，按实记录）
+## 7. 接线状态（2026-10-18 更新：已无「孤立内核」）
 
-| 内核函数 | 状态 |
-|---------|------|
-| `deep_split` / `deep_merge` / `deep_take_painted` | `deep` 的 round trip 模式被**显式拒绝**（`COMP_ERR_UNSUPPORTED`）。往返需要「一组 8 位操作在 low/+1/+2/+4 上的结果」，ABI 尚未承载——硬造一个往返等于伪造像素 |
-| `deep_*` 其余（`cube_apply` / `hdr_*` / `extract_alpha` / `restore_alpha`） | HDR / 线性深度层语义未定。16 位资产现在可以从 ABI 进来（`comp_layer_set_pixels` 接受 `COMP_PIXEL_RGBA16`），但这一组要的是「颜色查找 / 高光归一 / alpha 拆合」的语义决定，不是缺资产 |
-| `wand_trace` | 选区轮廓提取。需要「把蒙版轮廓变成可编辑路径」的语义决定（多边形简化、洞的表示），本轮未做 |
-| `scanlines_apply` / `dither_dots` / `dither_glow` | CRT 扫描线等专用形态，需要独立入口与各自的参数结构 |
-| `brush_alpha_bounds` / `layer_extract_alpha` / `layer_unpremultiply_opaque` / `layer_restore_alpha` | 剪贴栈的 alpha 拆合。上游用它把剪贴基底的不透明度摊平，本仓合成路径走 `clipping_factor()` 逐点取 alpha，语义不同故未接线 |
+本表曾记录「已实现但无产品通路」的内核。除最后一行为**主动不接**外，其余全部已接进
+`comp_tool_apply`；与 README §6.6 的表格一致。
+
+| 内核函数 | 现状 | 通路 |
+|---------|------|------|
+| `deep_split` / `deep_merge` / `deep_take_painted` / `deep_take_painted_hdr` | 已接线（2026-10-18 收口最后一对 `take_painted`） | `COMP_TOOL_DEEP`（round trip，RGBA16 保留 16 位）+ 落笔族（Stroke / Clone / Smudge / Liquify 在 RGBA16 / RGBA16F 上保留深像素，见 README §6.1.21） |
+| `cube_apply`（16bit）/ `hdr_normalize` / `hdr_restore` / `hdr_exposure` / `extract_alpha` / `restore_alpha` / `extract_alpha_hdr` / `restore_alpha_hdr` | 已接线 | `COMP_TOOL_DEEP` 与 half 合成表面（README §6.1.16 / §6.1.19） |
+| `wand_trace` | 已接线（只读闭合轮廓） | `comp_tool_coverage_bounds` |
+| `scanlines_apply` / `dither_dots` / `dither_glow` | 已接线 | `COMP_TOOL_DITHER` 的 `scanlines` / `chunky` 模式 |
+| `heal_coverage_bounds` | 已接线 | `comp_tool_coverage_bounds` |
+| `brush_alpha_bounds` / `layer_extract_alpha` / `layer_unpremultiply_opaque` / `layer_restore_alpha` | **主动不接** | 剪贴栈的 alpha 拆合。上游用它把剪贴基底的不透明度摊平；本仓合成路径走 `clipping_factor()` 逐点取 alpha，再由 `extract_alpha`/`restore_alpha` 处理深度路径，语义已覆盖，保留这四个函数只会造成两套写法 |
 
 ## 8. 交付与验证基线（2026-10-16 DSH 接手复核；2026-10-17 Grok 收口 16 位通路）
 
@@ -197,9 +201,11 @@
   `scripts/run_regression.py --require-ohos` **6/6 PASS**，OHOS aarch64 交叉编译 72 单元 rc=0。
   （跑回归必须用带 ziglang 的解释器 `<local-workspace>\tools\python\python.exe`；
   用 Studio 自带 venv 的 `python` 会因缺 `ziglang` 让步骤 1/2/3/5 全红——那是环境问题不是测试失败。）
-- 复核结论：7 组「孤立内核」中**可达的 6 组已有产品通路**——
-  `wand_mask`（Select）、`spot_heal` → 内部 `patch_fill` + `heal_membrane`（Heal / Patch）、
-  `dither_apply`（Dither）、`lens_distort`（Lens）、`dither_quantize16`（Deep 降位）。
+- 复核结论（2026-10-18 更新）：**7 组「孤立内核」已全部有产品通路**——
+  `wand_mask`/`wand_trace`（Select）、`spot_heal` → 内部 `patch_fill` + `heal_membrane`（Heal / Patch）、
+  `dither_apply` + `scanlines`/`chunky`（Dither）、`lens_distort`（Lens）、`dither_quantize16`（Deep 降位）、
+  以及本轮收口的 `deep_take_painted(_hdr)`（落笔族保留深度）。
   Brush 组本身（`BrushPixels.c` 只有 4 个剪贴栈 alpha 助手）由解析式圆头笔实现替代，
-  按 §7 明示未接线；`wand_trace`、`dither_dots`/`dither_glow`/`scanlines_apply`、
-  `deep_split`/`deep_merge`/`deep_take_painted` 同样按 §7 明示未接线。
+  且剪贴栈已改走 `extract_alpha`/`restore_alpha`，属 §7 的**主动不接**。
+- 本轮基线（2026-10-18）：**344 用例 0 失败**，`scripts/run_regression.py --require-ohos`
+  **6/6 PASS / 0 skipped**；CMake（`ctest`）与 clang-cl（MSVC ABI）两条路径同为 344/344。

@@ -983,3 +983,166 @@ COMP_TEST(tool_ops_domain_coverage_bounds_matches_nonzero_pixels) {
   COMP_CHECK(!heal_coverage_bounds_of(nullptr, stride, w, h, bounds, &code, &error));
   COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "null coverage -> COMP_ERR_INVALID_ARGUMENT");
 }
+
+/* ============================================================ 落笔族 × 深度 */
+
+/*
+ * [D1] 16 位图层上的一笔：深度保持 16 位，**笔尖之外逐字节不动**，笔尖之内
+ * 取 8 位值 ×257。
+ *
+ * 这是上游 BrushStroke.swift:1097 `sixteenBit()` 的接线口径：8 位内核跑在
+ * dithered 副本上，`deep_take_painted` 只把 painted != unpainted 的像素写成
+ * 8 位值。断言用「改过的像素四通道都是 257 的倍数、没改的像素与原始 16 位
+ * 逐字节相同」来表达，而不是另算一遍 take_painted（那只会复制实现）。
+ */
+COMP_TEST(tool_ops_domain_stroke_keeps_sixteen_bit_depth_outside_the_stroke) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_wide_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  /* 两个点：`stamp_polyline` 的 coverage 取最近**线段**，单点没有线段可落。 */
+  const float points[4] = {1.0f, 1.0f, 2.0f, 1.0f};
+  ToolOpParams params;
+  params.kind = kToolOpStroke;
+  params.points = points;
+  params.point_count = 2;
+  params.brush.color[0] = 250;
+  params.brush.color[1] = 10;
+  params.brush.color[2] = 10;
+  params.brush.diameter = 3.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a stroke on a 16-bit layer is a real product path");
+  COMP_CHECK_MSG(code == COMP_OK, "the stroke reports COMP_OK");
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16,
+                 "the stroke family keeps the layer at 16 bits (BrushStroke.swift:1097)");
+  COMP_CHECK_MSG(layer->pixels.pixel_data().size() == before.size(),
+                 "the depth change is not a silent downgrade to 4-byte pixels");
+
+  const uint16_t* now = reinterpret_cast<const uint16_t*>(layer->pixels.pixel_data().data());
+  const uint16_t* old = reinterpret_cast<const uint16_t*>(before.data());
+  const size_t count = static_cast<size_t>(8 * 8);
+  size_t changed = 0;
+  bool only_eight_bit_values = true;
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t* p = now + i * 4u;
+    const uint16_t* b = old + i * 4u;
+    if (p[0] == b[0] && p[1] == b[1] && p[2] == b[2] && p[3] == b[3]) continue;
+    ++changed;
+    for (int c = 0; c < 4; ++c) {
+      if (p[c] % 257u != 0u || p[c] / 257u > 255u) only_eight_bit_values = false;
+    }
+  }
+  COMP_CHECK_MSG(changed > 0, "the stroke actually painted something (otherwise this proves nothing)");
+  COMP_CHECK_MSG(changed < count, "pixels outside the stroke keep their 16-bit precision");
+  COMP_CHECK_MSG(only_eight_bit_values,
+                 "a painted pixel takes the 8-bit value * 257 and nothing else (deep_take_painted)");
+
+  /* 一步撤销：深度与像素都回到落笔前。 */
+  COMP_CHECK_MSG(document.history().can_undo(), "the stroke is one undo step");
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                 "undo restores the 16-bit asset, not an 8-bit copy");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
+}
+
+/*
+ * [D2] HDR 图层上的一笔：`deep_take_painted_hdr` 那条分支。
+ *
+ * 与 [D1] 的区别是「白以上的光」：笔尖之外必须仍是 4.0（half），笔尖之内是
+ * 8 位值的 /255（≤ 1.0）。这正是上游 HDR 落笔不剪高光、也不伪造高光的语义
+ * （BrushStroke.swift:1117-1123 的 `painted` / `unpainted` 比较）。
+ */
+COMP_TEST(tool_ops_domain_hdr_stroke_keeps_light_above_white_outside_the_stroke) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_hdr_gradient_layer(document, 4.0f);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  uint16_t untouched[4];
+  half_pixel(before, 8, 4, 4, untouched);
+  COMP_CHECK_MSG(half_value(untouched[0]) > 1.001f, "the layer really starts with light above white");
+
+  const float points[4] = {1.0f, 1.0f, 2.0f, 1.0f};
+  ToolOpParams params;
+  params.kind = kToolOpStroke;
+  params.points = points;
+  params.point_count = 2;
+  params.brush.color[0] = 250;
+  params.brush.color[1] = 10;
+  params.brush.color[2] = 10;
+  params.brush.diameter = 3.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a stroke on an HDR layer is a real product path now (take_painted_hdr)");
+  COMP_CHECK_MSG(code == COMP_OK, "the HDR stroke reports COMP_OK");
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16F,
+                 "an HDR layer stays half-float after a stroke (no silent downgrade)");
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  uint16_t far[4];
+  half_pixel(after, 8, 4, 4, far);
+  COMP_CHECK_MSG(half_value(far[0]) == half_value(untouched[0]),
+                 "a highlight far from the stroke keeps its value above white");
+  uint16_t painted[4];
+  half_pixel(after, 8, 1, 1, painted);
+  COMP_CHECK_MSG(half_value(painted[0]) <= 1.0f,
+                 "a painted pixel takes the 8-bit value (never a fabricated highlight)");
+
+  COMP_CHECK_MSG(document.history().can_undo(), "the HDR stroke is one undo step");
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16F,
+                 "undo keeps the HDR depth too");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the half-float pixels byte for byte");
+}
+
+/* [D3] 落笔族的其余三个算子走同一条深度保持路径（clone / smudge / liquify）。 */
+COMP_TEST(tool_ops_domain_clone_and_warp_keep_sixteen_bit_depth) {
+  const ToolOpKind kinds[3] = {kToolOpClone, kToolOpSmudge, kToolOpLiquify};
+  for (int k = 0; k < 3; ++k) {
+    Engine engine(test_engine_desc());
+    Document document(&engine, 8, 8, 72.0f, "sRGB");
+    const comp_layer_id id = add_wide_layer(document);
+
+    const float points[2] = {2.0f, 2.0f};
+    ToolOpParams params;
+    params.kind = kinds[k];
+    params.points = points;
+    params.point_count = 1;
+    params.brush.diameter = 4.0f;
+    params.brush.hardness = 1.0f;
+    params.brush.pressure = 1.0f;
+    params.brush.flow = 1.0f;
+    params.clone.has_source = 1;
+    params.clone.source_x = 5.0;
+    params.clone.source_y = 5.0;
+    params.clone.opacity = 1.0f;
+    params.warp.strength = 0.5f;
+
+    comp_result code = COMP_ERR_INTERNAL;
+    std::string error;
+    COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a retouch stroke on a 16-bit layer: " + error);
+    COMP_CHECK_MSG(code == COMP_OK, "the retouch stroke reports COMP_OK: " + error);
+    COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                   "the whole stroke family keeps the layer at 16 bits");
+    COMP_CHECK_MSG(document.history().can_undo(), "each retouch stroke is one undo step");
+  }
+}

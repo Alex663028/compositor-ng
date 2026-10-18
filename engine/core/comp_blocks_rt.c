@@ -75,4 +75,29 @@ void _Block_object_dispose(const void* object, const int flags) {
   (void)flags;
 }
 
+/*
+ * Windows / MSVC ABI 的导入槽位（__imp_*）。
+ *
+ * clang 在 MSVC 目标下把 BlocksRuntime 的公开符号声明为 __declspec(dllimport)
+ * （Block.h 的 BLOCKS_EXPORT），因此 block 拷贝辅助函数引用的是 IAT 槽位
+ * __imp__Block_object_assign 等，而不是函数本体。当这些目标文件以散装 .o 参与
+ * 链接时 lld-link 会自动回退到本文件的本地定义（只给 LNK4217 警告）；但当它们
+ * 来自静态库 libcompositor_engine.a 时，lld-link 拒绝用库成员满足 dllimport 引用，
+ * 直接报 "available in ... but cannot be used because it is not an import library"。
+ *
+ * 这里按 COFF 导入槽位的约定补齐 __imp_ 数据符号，指向本文件的实现，使
+ * 「静态库（CMake 路径）」在两端都能链接：clang 对 MSVC 与 MinGW 目标（zig cc
+ * 默认即 x86_64-windows-gnu）都会把 BlocksRuntime 符号声明成 dllimport，因此
+ * 守卫用 _WIN32 而不是 _MSC_VER。Apple 目标不进入本分支。
+ */
+#if defined(_WIN32)
+void* __imp__NSConcreteStackBlock = (void*)_NSConcreteStackBlock;
+void* __imp__NSConcreteGlobalBlock = (void*)_NSConcreteGlobalBlock;
+void* __imp__NSConcreteMallocBlock = (void*)_NSConcreteMallocBlock;
+void* __imp__Block_copy = (void*)&_Block_copy;
+void* __imp__Block_release = (void*)&_Block_release;
+void* __imp__Block_object_assign = (void*)&_Block_object_assign;
+void* __imp__Block_object_dispose = (void*)&_Block_object_dispose;
+#endif /* _WIN32 */
+
 #endif /* !__APPLE__ */

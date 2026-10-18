@@ -80,6 +80,14 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   饱和/自然饱和 → 参数曲线 → folded 合成表 → 逐像素曲线 → 效果/颗粒 → 光学 → 细节，
   恒等设置零副作用，整次应用一步撤销。基线 326 → **341 用例**（15 例护栏），
   6/6 回归全绿。详见 §6.10。
+  2026-10-18 第十一轮（引擎核收尾）：把最后一对未接内核 `deep_take_painted` /
+  `deep_take_painted_hdr` 接进落笔族（Stroke / Clone / Smudge / Liquify）——16 位与 HDR
+  图层落笔后**保留深像素**，只有写成过的像素回写（对齐上游 `BrushStroke.swift:1097` 的
+  `sixteenBit()`），其余工具照旧按 `DeepLayers.swift:5` 永久降 8 位。同轮补上两条从未
+  实测的构建路径：`cmake + ninja + ctest`（344/344）与 clang-cl / MSVC ABI（113 个 TU，
+  344/344），并修掉四处「CMake 与 build.py 不等价」的分叉与 blocks 运行时在静态库下的
+  `__imp_*` 链接问题；订正「本机无 `d3d12.h`」的旧记录。基线 341 → **344 用例**
+  （3 例护栏），6/6 回归全绿。口径 A 由 ≈94% 收敛到 **≈97%**。详见 §6.1.21。
 
 ## 1. M1 目标与范围
 
@@ -334,13 +342,16 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 82（38 个 `.c` + 44 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 341 cases, 0 failed, 0 check failures`（当前基线；§6.10 起） |
+| 测试 | `summary: 344 cases, 0 failed, 0 check failures`（当前基线；§6.1.21 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：44 `.cpp` / 38 `.c`（含 vendored 26）/ 82 `.h`；tests：31 `.cpp` |
 
-已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
-在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
-`dllimport` 标注所致，符号最终解析到 `comp_blocks_rt.c` 的定义，运行结果正确。
+blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
+`_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
+`__imp_*` 槽位上。散装 `.o` 链接时 lld 会自动回退到本地定义（只给 `LNK4217` 警告）；
+但**静态库**参与链接时 lld 拒绝用库成员满足导入引用（`... is available in libcompositor_engine.a
+but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 现已按 COFF 导入
+槽位约定补齐 `__imp_*` 数据符号（`_WIN32` 守卫），两条链接路径都零警告、零未定义符号。
 
 验证覆盖：
 
@@ -1159,12 +1170,79 @@ python scripts/run_regression.py --require-ohos --python <local-workspace>\tools
 flatten 被后端具名拒绝，导出失败而不是退回 8 位。存储是 HALF：线性化后绝对值超过 half
 上限（约 65520）的像素在文件里读回 `inf`——这是 half 容器的量程边界，不是把高光夹成白。
 
+### 6.1.21 引擎核收尾：`deep_take_painted` 接线 + 三条构建路径实测（2026-10-18，Claude）
+
+**1. 最后一对内核接入产品通路。**
+
+上游语义只有一句话（`BrushStroke.swift:1097` 的 `sixteenBit()`）：先把深像素交给画笔画进宽
+缓冲，再渲染两份 **8 位**结果——`painted`（原图 + 笔迹）与 `unpainted`（原图），
+`deep_take_painted` 只把「两者不同」的像素写回深缓冲；HDR 走 `deep_take_painted_hdr`。
+所以这里**不需要** tile+coverage 记账，整幅比较即可。
+
+`engine/domain/tool_ops.cpp` 的实现（`DeepPaintCopy`）：
+
+- `build_deep_paint_copy` 收好原始深像素（共享 + COW，工具写的是副本），
+  并把图层换成 8 位工作副本（RGBA16 → `deep_to_rgba8`，RGBA16F → `hdr_to_rgba8`）；
+- 内核跑完后 `merge_deep_paint` 调 `deep_take_painted(_hdr)`，**只**把写成过的像素并回；
+- 内核失败或并回失败：原始深像素原样放回，事务照旧回滚（不留 8 位半成品）。
+
+作用域严格限定在**落笔族**（Stroke / Clone / Smudge / Liquify，上游 `SmudgeLiquify.swift`
+同样用 `DeepLayer.flattened` + `stroke.deepClone`）。其余工具保持上游
+`DeepLayers.swift:5` 的规则——16 位图层被非深度算子碰过就**永久降 8 位**，HDR 继续如实拒绝。
+
+**2. 护栏（+3 例，341 → 344）。**
+
+| 用例 | 钉住什么 |
+|------|---------|
+| `tool_ops_domain_stroke_keeps_sixteen_bit_depth_outside_the_stroke` | 16 位图层落笔后格式仍是 `RGBA16`；笔迹外像素**未变**；笔迹内每通道都是 `v×257`（真 8 位回写，不是伪造 16 位）；撤销后逐字节还原 |
+| `tool_ops_domain_hdr_stroke_keeps_light_above_white_outside_the_stroke` | HDR 图层落笔后格式仍是 `RGBA16F`；白以上的光（4.0）原样保留；笔迹内落到 ≤1.0；撤销还原 |
+| `tool_ops_domain_clone_and_warp_keep_sixteen_bit_depth` | Clone / Smudge / Liquify 三种落笔族在 16 位上都是 `COMP_OK` + 保持 `RGBA16` + 恰好一步撤销 |
+
+**3. CMake 路径实测（此前一直是「未验证」）。**
+
+本机现装有 CMake 4.4.4 + Ninja（PyPI），但 CMake 无法从 zig 驱动推导出归档器，
+故 `CMAKE_AR` 指向 `python -m ziglang ar` 包装。跑通过程中修掉**四处**「CMake 与
+`build.py` 不等价」的分叉，每一处都会让 CMake 路径静默少测或编不过：
+
+| 症状 | 根因 | 修复 |
+|------|------|------|
+| libpng 在 `pngstruct.h:30` 找不到 `zlib.h` | vendor 包含路径只加进了 `build.py` | `CMakeLists.txt` 同步 `third_party/{zlib,libpng,stb}` |
+| 只注册 341 例（少 3 个） | 测试目标看不到 `zlib.h`，`__has_include` 让 EXR ZIP/ZIPS 用例整段不编译 | 测试目标补齐与引擎相同的包含路径 |
+| `ctest` 报 12 例失败 | `ctest` 默认在 `build-cmake/` 运行，`resources/camera_raw_tables.bin` 用相对仓库根的路径 | `add_test(... WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})` |
+| 静态库链接报 `_Block_object_assign` 未定义 | clang 在 Windows 上把 blocks 符号标成 `dllimport`，lld 拒绝用静态库成员满足导入引用 | `comp_blocks_rt.c` 补 `__imp_*` 导入槽位（`_WIN32` 守卫） |
+
+结果：`cmake --build build-cmake` 全绿，`ctest` **344/344 通过**，与 `build.py` 完全一致。
+
+**4. clang-cl（MSVC ABI）路径实测。**
+
+VS 2022 工具集在位（MSVC 14.44.35207 / Windows SDK 10.0.26100 / clang-cl 19.1.5）。
+用 `vcvars64` 环境 + clang-cl 编译全部 **113 个 TU**（38 `.c` + 44 `.cpp` + 31 测试）并链接，
+`compositor_tests.exe` **344/344 通过**——这是 MSVC ABI + MSVC STL 下的真实构建，
+不是 zig 的 MinGW 目标。顺带确认：`d3d12_backend.cpp` 加 `-DCOMP_HAS_D3D12` 能编译
+（§6.2 的「无 SDK」记录已订正）。`cl.exe` 仍不可用（像素内核的 clang block 语法），
+Windows 侧推荐编译器仍是 clang-cl。
+
+**5. 全量回归。**
+
+`scripts/run_regression.py --require-ohos`：**6/6 PASS，0 skipped，0 failed**；
+步骤 ① `344 cases, 0 failed`，步骤 ② Windows 壳 27 项 `failures=0` + SHA256 与基线一致，
+步骤 ⑤ 共享 DLL（含 `comp_blocks_rt` 改动）真实加载调用，步骤 ⑥ OHOS aarch64 交叉编译 + NAPI rc=0。
+
+**6. 仍然不在本轮的**：设备侧后端接主渲染路径（D3D12/Vulkan 就绪但 `render_document`
+仍走 CPU）、鸿蒙真机联调（`hdc list targets` 为空）、macOS 端逐像素对比。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 
-- **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
-  但未跑通 `cmake + ctest`。
-- **MSVC / clang-cl 路径未实测**：本机无 VS 工具集。
+- ~~**CMake 路径未实测**~~ → **2026-10-18 已实测**：`cmake + ninja + ctest` 在本机跑通
+  （ziglang 驱动，`CMAKE_AR` 指向 `python -m ziglang ar` 包装），`ctest` 344/344 通过。
+  过程中修掉三处「CMake 静默少测」的分叉：vendor 包含路径、测试目标的包含路径
+  （`__has_include("zlib.h")` 决定是否注册 3 个 EXR 用例）、测试工作目录（`resources/`
+  相对仓库根）。证据见 §6.1.21。
+- ~~**MSVC / clang-cl 路径未实测**~~ → **2026-10-18 已实测**：VS 2022 工具集在位
+  （MSVC 14.44.35207、Windows SDK 10.0.26100、clang-cl 19.1.5）。用 clang-cl 以
+  **MSVC ABI + MSVC STL** 编译全部 113 个 TU 并链接 `compositor_tests.exe`，344/344 通过。
+  `cl.exe` 仍不可用（像素内核用 clang block 语法），故 Windows 侧的推荐编译器仍是 clang-cl。
 - **像素内核的逐像素等价性未验证**：并行一致性只证明了「并行不改变自身结果」，
   与 macOS 参考输出的逐像素比对属 M2 的图像回归基准。
 - **band 并行默认关闭**：其它内核站点是否可安全切分尚未逐一评估，故默认线程数保持 1。
@@ -1183,9 +1261,12 @@ flatten 被后端具名拒绝，导出失败而不是退回 8 位。存储是 HA
 - **鸿蒙壳仍无真机可验**：`libcompositor_ohos.so` 已构建，DevEco 工具链（`hvigor` / `node` /
   `hdc`）在位，但 `hdc list targets` 实测返回 `[Empty]` —— **无鸿蒙真机/模拟器在线**，HAP 打包
   与 ArkTS 页面未经设备联调；且当前 `.so` 为 `aarch64`，模拟器平台多为 `x86_64`，需另加交叉目标。
-- **D3D12 真实设备路径不可编译**：本机 `d3d12.dll` / `d3d12core.dll` / `dxgi.dll` 与 GPU 在位，
-  但 **Windows SDK 仅有 8.1 与 NETFXSDK，无 `d3d12.h`**，故 `COMP_HAS_D3D12` 保持关闭，
-  默认构建为诚实 stub。
+- **D3D12 真实设备路径：SDK 已在位，仍未上主渲染路径**（2026-10-18 订正）。
+  此前记录的「无 `d3d12.h`」是错的：Windows SDK 10.0.22621 / 10.0.26100 装在
+  `E:\AMD\include\`，`engine/render/d3d12_backend.cpp` 加 `-DCOMP_HAS_D3D12` 已用 clang-cl
+  实测编译通过（53 KB 目标文件）。因此缺的不是 SDK，而是**把设备侧后端接到引擎主渲染路径**
+  （`render_document` 仍返回 UNSUPPORTED、`caps().offscreen_compute` 仍为 false）——
+  这是功能/性能项，默认构建继续关掉 `COMP_HAS_D3D12`，不把未验证的设备路径带进基线。
 - **SPIR-V 仅静态校验**：真机 `vkCreateShaderModule` 已实际接受该 blob（不报错），但未接校验层
   做更严格的运行期校验；静态证据为 glslang 编译 + 真机管线创建成功。
 - **第三方编解码库：部分已接入，其余仍未链接**。PNG（libpng 1.6.44 + zlib 1.3.1）、
@@ -1268,7 +1349,7 @@ flatten 被后端具名拒绝，导出失败而不是退回 8 位。存储是 HA
 
 **先说清楚一件事：两个口径，两个数字，不能混用。**
 
-- **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈92%**。
+- **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈97%**。
 - **口径 B：分母 = 上游产品功能条目**（上游 README 的 48 条）。回答「能当 Photoshop 用吗」
   → **≈45%**（命中约 20 条）。
 
@@ -1283,16 +1364,22 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 102 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
-| ② 像素内核**有产品通路**的部分 | 35% | **~97%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）。余 `deep_take_painted` 与 `take_painted_hdr` 一对（同被 S4 仿制笔刷 tile 模型阻塞）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
+| ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比 |
 
-**加权完成度 ≈ 94%**（口径 A）。算术：① 30%×95% + ② 35%×97% + ③ 20%×98%
-+ ④ 15%×80% = 28.5 + 33.95 + 19.6 + 12 = **94.05% ≈ 94%**。
+**加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
++ ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
 
-**剩下的 6% 里大半不是技术债，而是「需要语义决定」或「被上游工具面阻塞」**——
-这两项在 §6.1.12 重新核实过：`deep_split` 的 32 位浮点语义**不成立**（上游深度模型只有
-8/16/HDR 三层，无 32 位浮点图层），`deep_take_painted` 被仿制笔刷阻塞。
+**剩下的 3% 按层拆开，全部有明确归属**（不再是「被上游工具面阻塞」）：
+
+- ① 契约面 1.5 个点：`run_tool_op` 之外的少量诊断/边界口径；
+- ③ 合成与渲染 0.4 个点：**设备侧后端未接主渲染路径**（D3D12 代码已能在 SDK 下编译，
+  `render_document` 仍走 CPU，见 §6.2）；
+- ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
+
+上一轮记的「`deep_take_painted` 被 S4 仿制笔刷阻塞」已证伪：上游 `BrushStroke.swift:1097`
+的 `sixteenBit()` 是**整幅**比较 painted/unpainted，本仓照此实现后不再需要 tile+coverage 模型。
 
 #### 口径 B：产品功能面
 
@@ -1317,7 +1404,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 #### 口径 A 与 B 不一致的原因与推进顺序
 
 两者差异集中在 ①~④ 盖不到的地方：口径 A 问的是「引擎核的契约面与像素保真度做完了吗」，
-答案是基本做完（≈92%）；口径 B 问的是「用户能做的事做完了吗」，答案是还差一半。
+答案是基本做完（≈97%，§6.1.21 后）；口径 B 问的是「用户能做的事做完了吗」，答案是还差一半。
 **像素算法层几乎满配**：上游 10 组 `.c` 内核逐文件 diff，**6 组 diff 行数为 0**
 （Brush/Heal/Lens/Levels/Noise/Wand 逐字节等同）；PatchPixels / DitherPixels / DeepPixels
 为去 GCD 的调度改写或主动超集；**AdjustPixels 曾落后 4 个函数**（上游 1.5.2/1.5.3 新增的
@@ -1354,7 +1441,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
   如实回报**；deep round trip **§6.1.10 起已实现**（RGBA16 保持 16 位，low/+1/+2/+4 四档），
   在 8 位图层上则显式拒绝（`COMP_ERR_STATE`）而不是伪造一组像素。
 
-### 6.6 内核接线现状（2026-10-17 更新）
+### 6.6 内核接线现状（2026-10-18 更新）
 
 | 内核 | 产品通路 | 已接线 | 仍未接线 |
 |------|---------|--------|----------|
@@ -1367,8 +1454,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
-| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`take_painted_hdr`（阻塞点 = S4） |
-| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`）+ **half 合成表面与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5，§6.1.19；`rgba8_to_hdr` 由 CPU 后端消费）+ **浮点解码器**（C3，Radiance `.hdr`/`.pic`）+ **`.comp` 的 `<uuid>.exr` 资产读写**（C3b，§6.1.18）+ **合成结果导出 EXR**（C4，`comp_io_export` 全深度 flatten → 线性光 HALF，§6.1.20） | `take_painted_hdr`（阻塞点 = S4）；float TIFF 无解码器、如实不支持 |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19）、**`deep_take_painted`/`deep_take_painted_hdr`**（落笔族在 RGBA16 / RGBA16F 上保留深像素，§6.1.21） | — |
+| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`）+ **half 合成表面与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5，§6.1.19；`rgba8_to_hdr` 由 CPU 后端消费）+ **浮点解码器**（C3，Radiance `.hdr`/`.pic`）+ **`.comp` 的 `<uuid>.exr` 资产读写**（C3b，§6.1.18）+ **合成结果导出 EXR**（C4，`comp_io_export` 全深度 flatten → 线性光 HALF，§6.1.20） | float TIFF 无解码器、如实不支持 |
 | Adjust | `comp_camera_raw_apply`（Camera Raw 全管线）、`comp_layer_histogram` 等 | 内核 62 个函数已与上游对齐（§6.1.15）；Camera Raw 产品通路见 §6.10 | 其余 `adjust_*` 单独算子无独立 ABI |
 
 ### 6.7 F1 选区几何（2026-10-18，Claude）

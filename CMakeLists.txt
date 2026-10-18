@@ -69,6 +69,18 @@ target_include_directories(compositor_engine
   PRIVATE
     "${COMP_ENGINE_ROOT}/abi/src")
 
+# 可选的 vendor 源码（engine/third_party：zlib / libpng / stb）。目录存在才加路径，
+# 与 scripts/build.py 的 INCLUDE_DIRS 同一条规则——libpng 的 pngpriv.h include
+# "zlib.h"，少了这一条 CMake 路径会在 pngstruct.h 处编译失败，而 build.py 能过。
+# 这正是「两条构建路径必须等价」要防的那种分叉。
+set(COMP_VENDOR_INCLUDE_DIRS "")
+foreach(_vendor zlib libpng stb)
+  if(IS_DIRECTORY "${COMP_ENGINE_ROOT}/third_party/${_vendor}")
+    list(APPEND COMP_VENDOR_INCLUDE_DIRS "${COMP_ENGINE_ROOT}/third_party/${_vendor}")
+  endif()
+endforeach()
+target_include_directories(compositor_engine PRIVATE ${COMP_VENDOR_INCLUDE_DIRS})
+
 find_package(Threads REQUIRED)
 target_link_libraries(compositor_engine PUBLIC Threads::Threads)
 
@@ -93,6 +105,20 @@ file(GLOB COMP_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests
 
 add_executable(compositor_tests ${COMP_TEST_SOURCES})
 
+# 测试源必须看到和引擎完全相同的包含路径：test_exr.cpp 用 __has_include("zlib.h")
+# 决定是否编译 ZIP/ZIPS 三组用例，test_camera_raw*.cpp 也依赖 abi/src 的内部头。
+# 少了 vendor 路径，CMake 路径会静默少注册 3 个用例（341 vs 344），而 build.py 全绿——
+# 正是「两条构建路径必须等价」要防的分叉。
+target_include_directories(compositor_tests PRIVATE
+  "${COMP_ENGINE_ROOT}"
+  "${COMP_ENGINE_ROOT}/abi/include"
+  "${COMP_ENGINE_ROOT}/abi/src"
+  ${COMP_VENDOR_INCLUDE_DIRS})
+
 target_link_libraries(compositor_tests PRIVATE compositor_engine)
 
-add_test(NAME compositor_tests COMMAND compositor_tests)
+# 工作目录必须是仓库根：test_camera_raw.cpp 以相对路径 resources/camera_raw_tables.bin
+# 读取随仓数据。scripts/build.py 的 run() 也以 ROOT 为 cwd 启动测试；若不指定，
+# ctest 默认在 build-cmake/ 下运行，12 个 camera_raw 用例会因找不到资源而失败。
+add_test(NAME compositor_tests COMMAND compositor_tests
+         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")

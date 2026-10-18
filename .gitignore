@@ -11,6 +11,8 @@ build/
 # 早期调试留下的验证目录（现已清空，仍保留规则防止复发）
 build_verify_r5/
 build_*/
+# CMake 路径（cmake -B build-cmake）的输出目录；与 build/ 同一性质
+build-cmake/
 
 # 交叉编译与绑定生成脚本的常见落点
 out/

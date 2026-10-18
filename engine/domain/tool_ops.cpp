@@ -237,6 +237,72 @@ bool use_rgba8_working_copy(Layer* layer) {
 }
 
 /*
+ * 落笔族（stroke / clone / smudge / liquify）在 16 位与 HDR 上的往返。
+ *
+ * 上游 BrushStroke.swift:1097 `sixteenBit()` 的口径，不是「全 16 位落笔」：
+ *   1. 把图层的**原始** 16 位像素当宽缓冲 `wide`（工具全程不碰它）；
+ *   2. 8 位内核只在图层那份 dithered 8 位副本上跑，得到 `painted`；
+ *      落笔前同一份副本是 `unpainted`；
+ *   3. `deep_take_painted(_hdr)` 逐像素比较两者，只把**真正变过**的像素写成
+ *      8 位值（16 位：×257；HDR：/255 转 half）。
+ *
+ * 于是「笔尖盖到的地方」是 8 位内核的结果，「没盖到的地方」保住 16 位/HDR
+ * 精度——上游本来就这样（SmudgeLiquify.swift:236-240 的 `deepClone` 走同一条路）。
+ *
+ * 只有落笔族能这么往返：heal / dither / lens 之类的整幅算子在上游会让图层
+ * 直接变成 8 位（DeepLayers.swift:5），本仓照做（use_rgba8_working_copy）。
+ */
+bool is_stroke_family(uint32_t kind) {
+  return kind == static_cast<uint32_t>(kToolOpStroke) ||
+         kind == static_cast<uint32_t>(kToolOpClone) ||
+         kind == static_cast<uint32_t>(kToolOpSmudge) ||
+         kind == static_cast<uint32_t>(kToolOpLiquify);
+}
+
+struct DeepPaintCopy {
+  ImageBuffer deep; /* 原始 16 位 / half 像素，工具全程不碰 */
+  ImageBuffer base; /* 落笔前的 8 位副本 = deep_take_painted 的 unpainted */
+  bool hdr = false;
+  bool active() const { return deep.width > 0 && deep.height > 0 && base.width > 0; }
+};
+
+/* 深像素留在 deep，图层换成 base 的 8 位副本；两张缓冲共享同一条像素存储。 */
+bool build_deep_paint_copy(const ImageBuffer& src, DeepPaintCopy* out) {
+  if (out == nullptr) return false;
+  out->hdr = src.format == COMP_PIXEL_RGBA16F;
+  ImageBuffer base;
+  const bool made = out->hdr ? hdr_to_rgba8(src, &base) : deep_to_rgba8(src, &base);
+  if (!made) return false;
+  out->deep = src; /* 共享 + COW：工具写的是副本，不污染深像素 */
+  out->base = base;
+  return true;
+}
+
+/*
+ * 把 8 位落笔结果并回深像素（只在写成过的像素上取值）。
+ * 返回 false 表示缓冲形态对不上（尺寸/步长），调用方按内部错误处理。
+ */
+bool merge_deep_paint(const ImageBuffer& painted, DeepPaintCopy* copy) {
+  if (copy == nullptr || !copy->active()) return false;
+  if (painted.format != COMP_PIXEL_RGBA8 || copy->base.format != COMP_PIXEL_RGBA8) return false;
+  if (painted.width != copy->base.width || painted.height != copy->base.height) return false;
+  if (copy->deep.width != copy->base.width || copy->deep.height != copy->base.height) return false;
+  ImageBuffer& deep = copy->deep;
+  uint16_t* wide = reinterpret_cast<uint16_t*>(deep.writable_pixels().data());
+  if (wide == nullptr) return false;
+  if (copy->hdr) {
+    deep_take_painted_hdr(wide, deep.stride(), painted.row(0), copy->base.row(0),
+                          copy->base.stride(), static_cast<size_t>(painted.width),
+                          static_cast<size_t>(painted.height));
+  } else {
+    deep_take_painted(wide, deep.stride(), painted.row(0), copy->base.row(0),
+                      copy->base.stride(), static_cast<size_t>(painted.width),
+                      static_cast<size_t>(painted.height));
+  }
+  return true;
+}
+
+/*
  * 16 位深度往返在文件下方实现（`deep_round_trip`）：deep_split 把 16 位像素拆成
  * low / +1 / +2 / +4 四档的 8 位副本，在每档副本上跑**同一个** 8 位操作，再由
  * deep_merge 按「颜色落在 low 之上多少」读回 16 位。这是往返唯一能成立的形状：
@@ -717,15 +783,32 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   }
 
   /*
-   * deep 之外的工具全是 8 位内核：先把 16 位像素落到它的 8 位副本（见
-   * use_rgba8_working_copy）。deep 自己不在这里降位——quantize 分支做的就是
-   * 这件事，round trip 分支在参数闸已经拒绝，在这里降位会掩盖那条拒绝。
+   * 落笔族在 16 位 / HDR 上保留深度（DeepPaintCopy）：先把原始深像素收好，
+   * 图层换成它的 8 位副本；内核跑完后只把**写成过**的像素并回去（见
+   * merge_deep_paint）。这条路径对齐上游 BrushStroke.swift:1097 的 sixteenBit()，
+   * HDR 走同一函数的 `deep_take_painted_hdr` 分支（:1119），不再需要 tile+coverage
+   * 模型——上游也是整幅比较 painted/unpainted，不是按 tile 记账。
+   */
+  DeepPaintCopy deep_paint;
+  if (params.kind != kToolOpDeep && is_stroke_family(static_cast<uint32_t>(params.kind)) &&
+      (target_layer->pixels.format == COMP_PIXEL_RGBA16 ||
+       target_layer->pixels.format == COMP_PIXEL_RGBA16F)) {
+    if (!build_deep_paint_copy(target_layer->pixels, &deep_paint)) {
+      if (owns_txn) document->txn_abort(&txn_error);
+      return bad_state("layer pixels could not be brought to their 8-bit working copy");
+    }
+    target_layer->pixels = deep_paint.base;
+  }
+
+  /*
+   * 其余工具是整幅 8 位算子：先把 16 位像素落到它的 8 位副本（见
+   * use_rgba8_working_copy），图层自此是 8 位（DeepLayers.swift:5）。
+   * deep 自己不在这里降位——quantize 分支做的就是这件事，round trip 分支在参数闸
+   * 已经拒绝，在这里降位会掩盖那条拒绝。
    *
-   * HDR（RGBA16F）**不**降位，也不在这里接：上游对 HDR 图层的 8 位工具是
-   * 「先 normalize 再往返再 restore」（DeepLayers.swift:196），落笔那一路还要
-   * take_painted_hdr 的 tile+coverage 模型（等 S4）。降成 8 位等于把那层白以上的光
-   * 永久丢掉——那是 16 位图层的规则（DeepLayers.swift:5），不是 HDR 的（:82-84）。
-   * 所以这里如实拒绝，不静默降级；deep 的往返已是 HDR 上可用的那条路。
+   * HDR（RGBA16F）**不**降位：降成 8 位等于把白以上的光永久丢掉，而这层规则
+   * 属于 16 位图层（:5），不属于 HDR（:82-84）。除落笔族外，HDR 上可用的仍是
+   * deep 的往返；其余工具如实拒绝，不静默降级。
    */
   if (params.kind != kToolOpDeep && !use_rgba8_working_copy(target_layer)) {
     if (owns_txn) document->txn_abort(&txn_error);
@@ -1192,8 +1275,21 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   }
 
   if (!ok) {
+    /* 落笔族失败：把原始深像素放回去。调用方可能持有外层事务（owns_txn 为假），
+     * 不能把半途的 8 位工作副本留在图层里。 */
+    if (deep_paint.active()) target_layer->pixels = std::move(deep_paint.deep);
     if (owns_txn) document->txn_abort(&txn_error);
     return false;
+  }
+  if (deep_paint.active()) {
+    if (!merge_deep_paint(target_layer->pixels, &deep_paint)) {
+      target_layer->pixels = std::move(deep_paint.deep);
+      if (owns_txn) document->txn_abort(&txn_error);
+      if (error != nullptr) *error = "deep paint merge: buffer shape mismatch";
+      if (out_code != nullptr) *out_code = COMP_ERR_INTERNAL;
+      return false;
+    }
+    target_layer->pixels = std::move(deep_paint.deep);
   }
   if (owns_txn) {
     std::string commit_error;
