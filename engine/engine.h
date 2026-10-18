@@ -15,7 +15,9 @@
 #define COMPOSITOR_ENGINE_ENGINE_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "compositor/comp_core.h"
@@ -25,6 +27,7 @@
 
 namespace compositor {
 
+class CameraRawTableSet;
 class Document;
 
 class Engine {
@@ -83,6 +86,18 @@ class Engine {
 
   void clear_error() { error_slot().clear(); }
 
+  /*
+   * Camera Raw 实测表：一个引擎加载一次，所有文档共享（`CameraRawTableSet` 不可变，
+   * 解码后由 shared_ptr<const> 挂号）。ABI 层 `comp_engine_load_camera_raw_tables`
+   * 解析 CRT4 后交给这里；引擎销毁前表一直有效。
+   */
+  void set_camera_raw_tables(std::shared_ptr<const CameraRawTableSet> tables) {
+    camera_raw_tables_ = std::move(tables);
+  }
+  const CameraRawTableSet* camera_raw_tables() const noexcept { return camera_raw_tables_.get(); }
+  /* 定义在 engine.cpp：`valid()` 需要完整类型。 */
+  bool camera_raw_tables_loaded() const noexcept;
+
  private:
   static std::string& error_slot() {
     static thread_local std::string slot;
@@ -96,6 +111,7 @@ class Engine {
   std::string app_version_;
   uint32_t handle_magic_ = kEngineMagic;
   std::vector<Document*> documents_{};
+  std::shared_ptr<const CameraRawTableSet> camera_raw_tables_{};
 };
 
 }  // namespace compositor

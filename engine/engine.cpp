@@ -4,9 +4,14 @@
 #include <new>
 
 #include "core/comp_parallel.h"
+#include "domain/camera_raw_tables.h"
 #include "domain/document.h"
 
 namespace compositor {
+
+bool Engine::camera_raw_tables_loaded() const noexcept {
+  return camera_raw_tables_ != nullptr && camera_raw_tables_->valid();
+}
 
 namespace {
 

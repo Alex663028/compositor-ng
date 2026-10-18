@@ -72,6 +72,14 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   缓冲拖色；液化（Push）用 dab 前 scratch 做前向位移重采样。参数闸仍在事务之前，
   一步撤销，`out_code` 成功也写 `COMP_OK`。基线 316 → **326 用例**（10 例护栏），
   6/6 回归全绿。详见 §6.9。
+  2026-10-18 第十轮（F4 Camera Raw）：新增 `comp_engine_load_camera_raw_tables` /
+  `comp_engine_camera_raw_tables_loaded` / `comp_camera_raw_apply` 3 个 ABI，把上游
+  `CameraRaw.swift` 的设置、曲线与管线搬成产品通路——763 张 17³ 实测表（上游 CRT3
+  离线转 CRT4/zlib，1.78 MB）引擎级共享，上游 Codable 同名字段、严格 JSON
+  （未知键/越界拒绝，结构修复照旧），校准 → 曝光 → 白平衡 → 对比度 → 黑白场 →
+  饱和/自然饱和 → 参数曲线 → folded 合成表 → 逐像素曲线 → 效果/颗粒 → 光学 → 细节，
+  恒等设置零副作用，整次应用一步撤销。基线 326 → **341 用例**（15 例护栏），
+  6/6 回归全绿。详见 §6.10。
 
 ## 1. M1 目标与范围
 
@@ -324,11 +332,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 78（38 个 `.c` + 40 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 82（38 个 `.c` + 44 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 326 cases, 0 failed, 0 check failures`（当前基线；§6.9 起） |
+| 测试 | `summary: 341 cases, 0 failed, 0 check failures`（当前基线；§6.10 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：40 `.cpp` / 38 `.c`（含 vendored 26）/ 78 `.h`；tests：29 `.cpp` |
+| 源码规模 | engine：44 `.cpp` / 38 `.c`（含 vendored 26）/ 82 `.h`；tests：31 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
@@ -1294,7 +1302,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Transform（仿射 move·scale·rotate / distort / 精确值） | ✓ |
 | Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样） |
 | Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
-| **Camera Raw**（6 文件 1,708 行） | **零** |
+| **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式未做 |
@@ -1302,8 +1310,8 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 22/48 命中 ≈ 46%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
-抠图正是该条的主要工作量；Crop 与 Clone/Smudge/Liquify 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
+即 **约 23/48 命中 ≈ 48%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
+抠图正是该条的主要工作量；Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
 且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1321,7 +1329,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 选区几何（1,000+ 行，但它是几乎所有下游编辑的入口；**2026-10-18 已交付，见 §6.7**）
 → Crop 工具（249 行，解锁导出打印尺寸；**2026-10-18 已交付，见 §6.8**）
 → Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用；**2026-10-18 已交付，见 §6.9**）
-→ Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能）
+→ Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能；**像素管线 2026-10-18 已交付，见 §6.10**）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
 
 ### 6.5 工具算子（Tool ops）已接入产品通路（2026-10-16 起）
@@ -1361,7 +1369,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`take_painted_hdr`（阻塞点 = S4） |
 | HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`）+ **half 合成表面与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5，§6.1.19；`rgba8_to_hdr` 由 CPU 后端消费）+ **浮点解码器**（C3，Radiance `.hdr`/`.pic`）+ **`.comp` 的 `<uuid>.exr` 资产读写**（C3b，§6.1.18）+ **合成结果导出 EXR**（C4，`comp_io_export` 全深度 flatten → 线性光 HALF，§6.1.20） | `take_painted_hdr`（阻塞点 = S4）；float TIFF 无解码器、如实不支持 |
-| Adjust | **零产品通路**（`adjust_*` 一族无任何工具/命令消费） | 内核 62 个函数已与上游对齐（§6.1.15） | 整族无产品通路；属 F4 Camera Raw 产品通路 |
+| Adjust | `comp_camera_raw_apply`（Camera Raw 全管线）、`comp_layer_histogram` 等 | 内核 62 个函数已与上游对齐（§6.1.15）；Camera Raw 产品通路见 §6.10 | 其余 `adjust_*` 单独算子无独立 ABI |
 
 ### 6.7 F1 选区几何（2026-10-18，Claude）
 
@@ -1635,6 +1643,102 @@ OHOS aarch64 交叉编译）。详见 `../report/F3-clone-smudge-liquify-2026101
 - **Blur 模式未做**：上游 `BlurToolMode` 的 liquify / smudge 已交付，同一枚举里的
   `blur` 仍是零通路。
 - **无 UI**：交互（笔刷光标、源点十字、realignment 快捷键）属外壳职责。
+
+### 6.10 F4 Camera Raw（2026-10-18，Claude）
+
+**交付物**：`engine/domain/camera_raw.{h,cpp}`（278 / 1270 行：设置结构、JSON、
+曲线、管线顺序、文档事务）、`engine/domain/camera_raw_tables.{h,cpp}`（110 / 233 行：
+CRT4 解码、取表、stage 装配、表合成、亮度测量）、
+`engine/abi/src/comp_camera_raw_abi.cpp` + `comp_camera_raw.h`（3 个导出）、
+`tools/convert_camera_raw_tables.py`（67 行离线转换）、
+`resources/camera_raw_tables.bin`（1,779,985 字节）、
+`tests/test_camera_raw.cpp`（15 例）与 `docs/camera-raw.md`。
+引擎新增 `set_camera_raw_tables` / `camera_raw_tables()` / `camera_raw_tables_loaded()`，
+表是 `shared_ptr<const>` 的引擎级只读资源，所有文档复用。
+
+#### 表：为什么必须加载
+
+763 张 17³ 色彩表是 Photoshop **实测数据**，不是可重算的公式。缺表时上游整条滤镜
+不可用，本仓同样返回 `COMP_ERR_STATE`，不降级成另一套观感。上游用 CRT3（10 字节头
++ **xz**），本仓不引入 liblzma，离线转成 CRT4（同布局 + **zlib**）：
+
+```
+"CRT4" | u16 size(=17) | u16 count(=763) | u16 step(≠0) | zlib(763×17³×3 差分字节)
+```
+
+解码按通道维护 `uint8_t` running 和：`value = level[axis] + int8(running) × step`，
+`level[axis] = round(axis × 255 / 16)`，再夹到 0..255。加载失败时**旧表原样保留**——
+一次坏 blob 不会让已打开的文档失去 Camera Raw；没有 zlib 的构建单独报
+`COMP_ERR_UNSUPPORTED`，不冒充数据损坏。
+
+#### JSON：严格拒绝 + 上游结构修复
+
+字段名与上游 Codable 逐字一致（camelCase），缺省值取上游缺省。解析复用了
+`engine/format/comp_json.h`，但把「调用方算错」与「上游自身的修复」分开：
+
+| 输入 | 本仓 | 上游 `normalized()` |
+|------|------|---------------------|
+| 未知键（根或任意嵌套） | 拒绝 | 忽略 |
+| 类型不符 / NaN / Inf | 拒绝 | 部分兜底 |
+| 标量越界 | **拒绝**，不静默 clamp | clamp |
+| 曲线点乱序 / 端点缺失 / 间距过小 | 照上游修复 | 修复 |
+| 点颜色 > 8 个 | 截断 | 截断 |
+| 去紫 / 去绿色相端点写反 | 对调 | 对调 |
+
+理由：静默 clamp 会把「宿主算错参数」变成「看起来能用但结果不对」，而结构修复是
+上游定义的产品语义，必须保留。`geometry` 能解析、能回存，但非默认时提交返回
+`COMP_ERR_UNSUPPORTED`（透视变换属 S4）。
+
+#### 管线顺序（逐字对齐上游 `CameraRaw.apply`）
+
+```
+normalize → 恒等即返回 → 几何非默认 → UNSUPPORTED → 缺表 → STATE
+  → 亮度测量（仅 contrast/highlights/shadows 需要，在校准之前）
+  → 校准 shadowTint
+  → 实测表 stages：校准主色 → 曝光 → 白平衡 → 对比度/高光/阴影
+                  → 白/黑/饱和/自然饱和 → 参数曲线
+  → foldingColor（仅 foldsColor && colorAdjusts 时折进合成表）
+  → adjust_camera_raw → applyCurveColor → effects+颗粒 → optics → detail
+```
+
+通路判定：`foldsColor = points 为空 && refineSaturation == 0`；
+`colorAdjusts = curve.adjusts || mixer.adjusts || grading.adjusts`；
+`paintColor = !foldsColor && colorAdjusts`；
+`paintEffects = adjustsEffects`；`paintDetailOptics = detail.adjusts || optics.adjusts`。
+note 回报实际通路（identity / folded / per-pixel）。颗粒
+`kernel = 0.5 + grainSize/100 × 19.5`、`unitsPerPixel = 1/max(scale,1)`，同一 `seed`
+逐字节可复现；光学 `distortion_k = 0.35`。
+
+#### 事务与 ABI
+
+领域层自己 `txn_begin("Camera Raw")` / `txn_commit`，整次应用**恰好一步撤销**；
+ABI 层不再包 `ImplicitTxn`（否则叠出两条历史）。恒等设置不动像素、不开事务，
+`out_changed = 0`。事务内 `bad_alloc` 会先回滚再重抛，不让活动事务逃进 ABI 的
+异常护栏。16 位图层先落 8 位工作副本（与工具层同一约定），HDR / 其它格式 →
+`COMP_ERR_STATE`。`note` 是两段式拷贝：容量 0 只回报所需长度。
+
+#### 与上游的显式分歧 / 边界
+
+1. **越界标量拒绝**（见上），上游 clamp。
+2. **几何 / Upright 未移植**：需要 Core Image 类透视变换与重采样，属 S4。
+3. **预览专用参数未暴露**：`clipping` / `sharpenMask` / `visualizePointColor` 会把
+   预览效果烘进图层像素；`visualize` 可解析但不生效。
+4. **无 RAW 解码**：本接口处理已解码的图层像素；相机原始格式属编解码层。
+5. **无 GPU 通路**：CPU 内核；`camera_raw_lookup_is_valid` / `repair_lookup` 已随
+   AdjustPixels 移植，但 F4 不走 Metal。
+6. **无 UI**：面板、曲线编辑器、颜色轮属外壳职责。
+
+#### 护栏与基线
+
+`tests/test_camera_raw.cpp` 的 15 例覆盖：CRT4 加载/查询/坏 blob 与「失败不破坏旧表」、
+恒等设置零副作用、曝光提亮 + 恰好一步撤销、JSON 严格性、非默认几何、缺表、缺图层、
+folded / per-pixel 两条通路、note 两段式拷贝、颗粒 seed 确定性、细节与光学改像素、
+16 位落 8 位、透明像素保持、曲线求值器边界。像素公式本身由
+`tests/test_camera_raw_align.cpp`（8 例）钉住上游 1.5.3。
+
+基线 326 → **341 cases, 0 failed**；`run_regression.py` 6/6 PASS、0 skipped。
+完整接口与键表见 [`docs/camera-raw.md`](docs/camera-raw.md)，报告见
+`../report/F4-camera-raw-20261018-claude.md`。
 
 ## 7. 许可
 
