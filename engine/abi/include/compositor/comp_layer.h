@@ -373,7 +373,8 @@ typedef enum comp_tool_op {
    */
   COMP_TOOL_CLONE    = 9,  /* 仿制图章 -> 从快照（当前层或整篇合成）拷贝像素 */
   COMP_TOOL_SMUDGE   = 10, /* 涂抹 -> carried 缓冲拖色 */
-  COMP_TOOL_LIQUIFY  = 11  /* 液化 Push -> 前向位移重采样 */
+  COMP_TOOL_LIQUIFY  = 11, /* 液化 Push -> 前向位移重采样 */
+  COMP_TOOL_BLUR     = 12  /* 模糊 -> 快照模糊后按笔迹盖回 */
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -470,6 +471,19 @@ typedef struct comp_tool_clone {
 typedef struct comp_tool_warp { float strength; } comp_tool_warp;
 
 /*
+ * 模糊工具参数（上游 BlurTool.swift `blurSample(for:)` 的 blurRadius）。
+ *
+ * 模糊样本在**一笔开始时**取快照：先把整层像素模糊成副本，再沿折线按笔刷
+ * coverage 把副本盖回当前像素。同一处反复涂抹会继续变软（每笔都以当笔开始
+ * 时的像素为准），与上游一致。
+ *
+ * `radius` 0.5..50 是高斯半径（图层像素）；实际 sigma 再夹到图层较长边的
+ * 一半（上游 `sidePixels / 2`）。几何复用 `stroke_points` 与
+ * `brush.diameter/hardness/pressure/flow`；零半径经参数闸拒绝。
+ */
+typedef struct comp_tool_blur { float radius; } comp_tool_blur;
+
+/*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
  * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
@@ -493,6 +507,11 @@ typedef struct comp_tool_op_desc {
    */
   comp_tool_clone  clone;
   comp_tool_warp   warp;
+  /*
+   * P1 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * 模糊工具用 `stroke_points`、`brush` 与 `blur.radius`。
+   */
+  comp_tool_blur   blur;
 } comp_tool_op_desc;
 
 /*

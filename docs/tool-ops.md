@@ -160,6 +160,24 @@
   8192 直径仅 carried 就约 1 GB；越界在参数闸返回 `COMP_ERR_INVALID_ARGUMENT`。
 - 折点坐标必须有限且 `|v| <= 1e6`（否则取整 UB）；点数 1..65536。
 
+### 4.9 Blur（`COMP_TOOL_BLUR`，P1 尾部追加）
+
+上游 `BlurToolMode` 的 Blur 模式：先把**整层**模糊成一份样本，再沿折线按笔刷
+coverage 把样本盖回当前像素。
+
+- 几何复用 `stroke_points` 与 `brush.diameter / hardness / pressure / flow`；
+  `blur.radius` 是高斯半径（**图层像素**），量程 **0.5..50**。`0` 在参数闸被拒绝，
+  而不是静默当作「不模糊」——上游把 `blurRadius` 夹到 0.5..50，0 会被抬高，
+  宿主若按「radius 0 = 恒等」使用就会得到相反的结果。
+- `sigma = min(radius, max(width, height) * 0.5)`（上游 `sidePixels / 2` 的上夹）。
+- **快照在整笔开始前取好**：同一笔内的折线不会吃到自己刚模糊过的像素；
+  以同一参数重复落笔才会继续变软（每笔都以当笔开始时的像素为准）。
+- 盖回是预乘空间的两点插值 `p + (blurred − p) × coverage`，**四个通道一起**：
+  alpha 也参与，透明边缘随之变软（上游对整幅 CIImage 做高斯模糊）。
+- 折点坐标与其它落笔共用「有限且 `|v| <= 1e6`」的闸；点数 1..65536。
+- 16 位 / HDR：与 Stroke/Clone/Smudge/Liquify 同属落笔族——笔尖盖到的像素写成
+  8 位、笔尖之外**保留深像素**（`deep_take_painted` 口径，见 §4.6）。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。
@@ -209,3 +227,7 @@
   且剪贴栈已改走 `extract_alpha`/`restore_alpha`，属 §7 的**主动不接**。
 - 本轮基线（2026-10-18）：**344 用例 0 失败**，`scripts/run_regression.py --require-ohos`
   **6/6 PASS / 0 skipped**；CMake（`ctest`）与 clang-cl（MSVC ABI）两条路径同为 344/344。
+- P1 追加（2026-10-18）：`COMP_TOOL_BLUR = 12`（§4.9）与 Filter 菜单四条通路
+  （[`docs/filters.md`](filters.md)）同时落地，基线 352 → **368 用例 0 失败**
+  （16 例新增：11 滤镜 + 5 模糊）。`comp_tool_op_desc.blur` 是**尾部追加**字段，
+  既有字段偏移不变。

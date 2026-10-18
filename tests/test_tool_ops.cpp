@@ -617,3 +617,108 @@ COMP_TEST(tool_ops_note_is_two_stage_and_null_safe) {
   COMP_CHECK(comp_tool_apply(fx.doc, fx.layer, nullptr, nullptr, 0, nullptr) ==
              COMP_ERR_INVALID_ARGUMENT);
 }
+
+/* ================================================== 6. 模糊工具（P1 尾部追加） */
+
+namespace {
+
+/* 左右硬边（左黑右白，alpha 全不透明），专门用来看「笔迹内变软、笔迹外不动」。 */
+std::vector<uint8_t> hard_edge_pixels() {
+  std::vector<uint8_t> pixels(static_cast<size_t>(kW) * kH * 4, 0);
+  for (int32_t y = 0; y < kH; ++y) {
+    for (int32_t x = 0; x < kW; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * kW + x) * 4;
+      const uint8_t value = x < kW / 2 ? 0 : 255;
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
+uint8_t red_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
+  return buf[(static_cast<size_t>(y) * kW + x) * 4 + 0];
+}
+
+}  // namespace
+
+COMP_TEST(tool_ops_blur_is_reachable_through_the_abi_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_BLUR) == 12, "COMP_TOOL_BLUR stays at 12");
+
+  Fixture fx;
+  std::vector<uint8_t> pixels = hard_edge_pixels();
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[4] = {4.0f, 8.0f, 12.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_BLUR);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 2;
+  desc.brush.diameter = 7.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.blur.radius = 3.0f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  COMP_CHECK(comp_tool_apply(fx.doc, fx.layer, &desc, nullptr, 0, nullptr) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  /* 硬边两侧都向中间靠：黑变亮、白变暗，且只发生在笔迹覆盖的横带里。 */
+  COMP_CHECK_MSG(red_at(after, 7, 8) > red_at(before, 7, 8),
+                 "the dark side of the edge picks up light under the stroke");
+  COMP_CHECK_MSG(red_at(after, 8, 8) < red_at(before, 8, 8),
+                 "the bright side of the edge loses light under the stroke");
+  COMP_CHECK_MSG(red_at(after, 1, 2) == red_at(before, 1, 2),
+                 "pixels far from the stroke are untouched");
+  COMP_CHECK_MSG(red_at(after, 14, 14) == red_at(before, 14, 14),
+                 "the opposite corner is untouched too");
+  COMP_CHECK_MSG(alpha_at(after, 7, 8) == 255 && alpha_at(after, 8, 8) == 255,
+                 "the blur tool never punches holes in the layer's alpha");
+
+  /* 一笔 = 一步撤销，撤销后逐字节回到落笔前。 */
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after > undo_before, "a blur stroke adds undo history");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the pixels byte for byte");
+}
+
+COMP_TEST(tool_ops_blur_rejects_a_zero_radius_before_opening_the_transaction) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = hard_edge_pixels();
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_BLUR);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 1;
+  desc.brush.diameter = 5.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.blur.radius = 0.0f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT,
+                 "a zero blur radius is an argument error");
+  size_t undo_rejected = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_rejected, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_rejected == undo_before, "the rejected blur leaves no undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the rejected blur leaves the render untouched");
+
+  /* 同一份 desc 只把半径改成合法值就必须成功——证明拒绝的是参数而不是整条通路。 */
+  desc.blur.radius = 2.0f;
+  COMP_CHECK(comp_tool_apply(fx.doc, fx.layer, &desc, nullptr, 0, nullptr) == COMP_OK);
+  size_t undo_ok = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_ok, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_ok > undo_before, "the legal radius goes through and records history");
+}

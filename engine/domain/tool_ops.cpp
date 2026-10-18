@@ -72,6 +72,7 @@ std::string label(uint32_t kind) {
     case kToolOpClone: return "clone";
     case kToolOpSmudge: return "smudge";
     case kToolOpLiquify: return "liquify";
+    case kToolOpBlur: return "blur";
     default: return "none";
   }
 }
@@ -113,30 +114,39 @@ void accumulate_mask(Layer* layer, const std::vector<uint8_t>& coverage) {
 /* ------------------------------------------------------------ 笔刷 */
 
 /*
- * 圆头笔的 coverage（0..255），在图层像素空间上按折线插值落笔。
+ * 圆头笔的几何：折线 + 直径/硬度/峰值 -> coverage。
+ *
+ * Stroke 与 Blur 共用同一份：两者在上游是同一套笔刷遮罩（`BrushStroke` 的
+ * mask），只是把「笔色」还是「模糊样本」画进去不同。分叉会让两支笔在同一组
+ * 参数下画出不同形状——那是最难解释的一类差异。
  *
  * 形状 = 到线段的距离 <= 半径；hardness 决定 [hardness*半径, 半径] 这段的
  * 线性羽化带（hardness=1 带宽 0 ⇒ 全实；hardness=0 从中心就开始羽化）。
  * pressure × flow 乘进峰值 coverage：flow 是「单次落笔把像素涂死」的总量上限，
  * 与 pressure（笔压）区分开，两者相乘是上游画笔的合成口径。
  */
-void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
-                    const float* points, int32_t point_count, const BrushStrokeParams& brush) {
-  const float diameter = brush.diameter > 0.0f ? brush.diameter : 1.0f;
-  const float radius = diameter * 0.5f;
-  const float hard = std::min(std::max(brush.hardness, 0.0f), 1.0f);
-  const float peak = std::min(std::max(brush.pressure * brush.flow, 0.0f), 1.0f);
-  if (peak <= 0.0f) return;
+class StrokeShape {
+ public:
+  StrokeShape(const float* points, int32_t point_count, float diameter, float hardness,
+              float pressure_times_flow)
+      : points_(points), point_count_(point_count) {
+    const float d = diameter > 0.0f ? diameter : 1.0f;
+    radius_ = d * 0.5f;
+    const float hard = std::min(std::max(hardness, 0.0f), 1.0f);
+    peak_ = std::min(std::max(pressure_times_flow, 0.0f), 1.0f);
+    inner_ = radius_ * hard;     /* 全实区半径 */
+    feather_ = radius_ - inner_; /* 羽化带宽 */
+  }
 
-  const float inner = radius * hard;      /* 全实区半径 */
-  const float feather = radius - inner;   /* 羽化带宽 */
+  /* peak 为 0（pressure 或 flow 为 0）：整笔不落任何像素。 */
+  bool empty() const { return peak_ <= 0.0f; }
 
   /* coverage 在 (px,py) 上取到最近线段的距离。 */
-  auto coverage_at = [&](float px, float py) -> float {
+  float coverage_at(float px, float py) const {
     float best = 1e30f;
-    for (int32_t i = 0; i + 1 < point_count; ++i) {
-      const float ax = points[i * 2], ay = points[i * 2 + 1];
-      const float bx = points[(i + 1) * 2], by = points[(i + 1) * 2 + 1];
+    for (int32_t i = 0; i + 1 < point_count_; ++i) {
+      const float ax = points_[i * 2], ay = points_[i * 2 + 1];
+      const float bx = points_[(i + 1) * 2], by = points_[(i + 1) * 2 + 1];
       const float dx = bx - ax, dy = by - ay;
       const float len2 = dx * dx + dy * dy;
       float t = len2 > 0.0f ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.0f;
@@ -145,31 +155,57 @@ void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
       const float d2 = ex * ex + ey * ey;
       if (d2 < best) best = d2;
     }
-    if (best > radius * radius) return 0.0f;
+    if (best > radius_ * radius_) return 0.0f;
     const float d = std::sqrt(best);
-    if (d <= inner || feather <= 0.0f) return peak;
-    const float t = 1.0f - (d - inner) / feather;  /* 0..1：羽化外缘 → 实心 */
-    const float e = t * t * (3.0f - 2.0f * t);    /* smoothstep，两端导数为 0 */
-    return peak * e;
-  };
-
-  /* 落笔包围盒：按半径外扩，避免整幅扫描。 */
-  float min_x = points[0], max_x = points[0], min_y = points[1], max_y = points[1];
-  for (int32_t i = 1; i < point_count; ++i) {
-    min_x = std::min(min_x, points[i * 2]);
-    max_x = std::max(max_x, points[i * 2]);
-    min_y = std::min(min_y, points[i * 2 + 1]);
-    max_y = std::max(max_y, points[i * 2 + 1]);
+    if (d <= inner_ || feather_ <= 0.0f) return peak_;
+    const float t = 1.0f - (d - inner_) / feather_; /* 0..1：羽化外缘 → 实心 */
+    const float e = t * t * (3.0f - 2.0f * t);      /* smoothstep，两端导数为 0 */
+    return peak_ * e;
   }
-  int32_t x0 = static_cast<int32_t>(std::floor(min_x - radius));
-  int32_t x1 = static_cast<int32_t>(std::ceil(max_x + radius));
-  int32_t y0 = static_cast<int32_t>(std::floor(min_y - radius));
-  int32_t y1 = static_cast<int32_t>(std::ceil(max_y + radius));
-  x0 = std::max(x0, 0);
-  y0 = std::max(y0, 0);
-  x1 = std::min(x1, width - 1);
-  y1 = std::min(y1, height - 1);
-  if (x0 > x1 || y0 > y1) return;
+
+  /* 落笔包围盒：按半径外扩，避免整幅扫描。完全落在图层外时返回 false。 */
+  bool bounds(int32_t width, int32_t height, int32_t* x0, int32_t* y0, int32_t* x1,
+              int32_t* y1) const {
+    float min_x = points_[0], max_x = points_[0], min_y = points_[1], max_y = points_[1];
+    for (int32_t i = 1; i < point_count_; ++i) {
+      min_x = std::min(min_x, points_[i * 2]);
+      max_x = std::max(max_x, points_[i * 2]);
+      min_y = std::min(min_y, points_[i * 2 + 1]);
+      max_y = std::max(max_y, points_[i * 2 + 1]);
+    }
+    int32_t left = static_cast<int32_t>(std::floor(min_x - radius_));
+    int32_t right = static_cast<int32_t>(std::ceil(max_x + radius_));
+    int32_t top = static_cast<int32_t>(std::floor(min_y - radius_));
+    int32_t bottom = static_cast<int32_t>(std::ceil(max_y + radius_));
+    left = std::max(left, 0);
+    top = std::max(top, 0);
+    right = std::min(right, width - 1);
+    bottom = std::min(bottom, height - 1);
+    if (left > right || top > bottom) return false;
+    *x0 = left;
+    *y0 = top;
+    *x1 = right;
+    *y1 = bottom;
+    return true;
+  }
+
+ private:
+  const float* points_;
+  int32_t point_count_;
+  float radius_ = 0.0f;
+  float inner_ = 0.0f;
+  float feather_ = 0.0f;
+  float peak_ = 0.0f;
+};
+
+/* 笔刷落笔：按 coverage 把笔色（直通 sRGB）盖到图层像素上。 */
+void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
+                    const float* points, int32_t point_count, const BrushStrokeParams& brush) {
+  const StrokeShape shape(points, point_count, brush.diameter, brush.hardness,
+                          brush.pressure * brush.flow);
+  if (shape.empty()) return;
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  if (!shape.bounds(width, height, &x0, &y0, &x1, &y1)) return;
 
   /*
    * 合成口径：笔画按 coverage 盖在图层上，**不叠加**——同 alpha 源覆盖。这与
@@ -179,7 +215,8 @@ void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
   for (int32_t y = y0; y <= y1; ++y) {
     uint8_t* row = rgba + static_cast<size_t>(y) * stride;
     for (int32_t x = x0; x <= x1; ++x) {
-      const float cov = coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+      const float cov =
+          shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
       if (cov <= 0.0f) continue;
       uint8_t* px = row + static_cast<size_t>(x) * 4;
       /* 图层是预乘的：笔色直通 sRGB 先乘 coverage 得预乘值，再 source-over。 */
@@ -193,6 +230,46 @@ void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
         px[c] = static_cast<uint8_t>(std::lround(std::min(std::max(oc, 0.0), 1.0) * 255.0));
       }
       px[3] = static_cast<uint8_t>(std::lround(std::min(oa, 1.0) * 255.0));
+    }
+  }
+}
+
+/* ------------------------------------------------------------ 模糊 */
+
+/*
+ * 模糊工具：把「当笔开始时的整层模糊副本」按笔迹 coverage 盖回当前像素。
+ *
+ * 与 stamp_polyline 的区别只在「画什么」：这里是预乘空间的两点插值
+ * `p + (blurred - p) * cov`（等价于把模糊副本以 coverage 为 alpha 做
+ * source-over），四个通道一起插值。**alpha 也参与**：上游对整幅 CIImage
+ * 做高斯模糊，边缘会随涂抹变软；不模糊 alpha 会在透明边界上留下硬边。
+ *
+ * 副本在第 1 笔开始前就取好（见 run_tool_op），所以同一笔内的折线不会
+ * 吃到「刚被自己模糊过的像素」再糊一次；重复落笔才会继续变软。
+ */
+void blur_stamp_paint(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
+                      const std::vector<uint8_t>& blurred, const float* points,
+                      int32_t point_count, const BrushStrokeParams& brush) {
+  const StrokeShape shape(points, point_count, brush.diameter, brush.hardness,
+                          brush.pressure * brush.flow);
+  if (shape.empty()) return;
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  if (!shape.bounds(width, height, &x0, &y0, &x1, &y1)) return;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  for (int32_t y = y0; y <= y1; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* src = blurred.data() + static_cast<size_t>(y) * row_bytes;
+    for (int32_t x = x0; x <= x1; ++x) {
+      const float cov =
+          shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+      if (cov <= 0.0f) continue;
+      uint8_t* px = row + static_cast<size_t>(x) * 4;
+      const uint8_t* sp = src + static_cast<size_t>(x) * 4;
+      for (int c = 0; c < 4; ++c) {
+        const double value = static_cast<double>(px[c]) +
+                             (static_cast<double>(sp[c]) - static_cast<double>(px[c])) * cov;
+        px[c] = static_cast<uint8_t>(std::lround(std::min(std::max(value, 0.0), 255.0)));
+      }
     }
   }
 }
@@ -237,7 +314,7 @@ bool use_rgba8_working_copy(Layer* layer) {
 }
 
 /*
- * 落笔族（stroke / clone / smudge / liquify）在 16 位与 HDR 上的往返。
+ * 落笔族（stroke / clone / smudge / liquify / blur）在 16 位与 HDR 上的往返。
  *
  * 上游 BrushStroke.swift:1097 `sixteenBit()` 的口径，不是「全 16 位落笔」：
  *   1. 把图层的**原始** 16 位像素当宽缓冲 `wide`（工具全程不碰它）；
@@ -256,7 +333,9 @@ bool is_stroke_family(uint32_t kind) {
   return kind == static_cast<uint32_t>(kToolOpStroke) ||
          kind == static_cast<uint32_t>(kToolOpClone) ||
          kind == static_cast<uint32_t>(kToolOpSmudge) ||
-         kind == static_cast<uint32_t>(kToolOpLiquify);
+         kind == static_cast<uint32_t>(kToolOpLiquify) ||
+         /* 模糊只改笔尖盖到的像素，笔尖之外保住深像素——与落笔族同一口径。 */
+         kind == static_cast<uint32_t>(kToolOpBlur);
 }
 
 struct DeepPaintCopy {
@@ -638,6 +717,33 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       break;
     }
 
+    case kToolOpBlur: {
+      if (params.point_count <= 0 || params.point_count > kMaxStrokePoints) {
+        return bad_arg("blur stroke needs 1..65536 points");
+      }
+      if (params.points == nullptr) return bad_arg("blur points are null");
+      if (!std::isfinite(params.brush.diameter) || params.brush.diameter <= 0.0f ||
+          params.brush.diameter > kMaxBrushDiameter) {
+        return bad_arg("blur brush diameter out of range");
+      }
+      if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
+      if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
+      if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+      /* 上游把 blurRadius 夹到 0.5..50：0 不是「不模糊」，而是一个会被静默抬高的值，
+       * 这里直接拒绝，免得宿主以为「radius 0 = 恒等」。 */
+      if (!std::isfinite(params.blur.radius) || params.blur.radius < 0.5f ||
+          params.blur.radius > 50.0f) {
+        return bad_arg("blur radius must be 0.5..50");
+      }
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i]) ||
+            std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
+          return bad_arg("blur point is not finite or out of range");
+        }
+      }
+      break;
+    }
+
     case kToolOpHeal: {
       if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
       if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
@@ -982,6 +1088,35 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
                                    params.brush.hardness, params.warp.strength);
       if (!ok_paint) ok = oom(params.kind == kToolOpSmudge ? "smudge ran out of memory"
                                                            : "liquify ran out of memory");
+      break;
+    }
+
+    case kToolOpBlur: {
+      /* 文档 → 图层像素坐标平移（与 Stroke / Clone 同口径）。 */
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        local[i] = static_cast<float>(params.points[i] - ((i & 1) ? b.y : b.x));
+      }
+      /*
+       * 上游 blurSample：sigma = min(blurRadius / perPixel, sidePixels / 2)。
+       * 本仓的笔刷几何本来就在**图层像素**空间（相当于上游已除过 perPixel），
+       * 故只做较长边一半的上夹。样本在盖回之前取：同一笔的折线不会吃到自己
+       * 刚模糊过的像素再糊一遍，重复落笔才会继续变软。
+       */
+      const float side = static_cast<float>(std::max(width, height));
+      const float sigma = std::min(params.blur.radius, side * 0.5f);
+      std::vector<uint8_t> blurred;
+      if (!blur_rgba8_copy(target_layer->pixels.row(0), target_layer->pixels.width,
+                           target_layer->pixels.height, target_layer->pixels.stride(), sigma,
+                           &blurred)) {
+        ok = fail(COMP_ERR_INTERNAL, "blur could not build the blurred sample");
+        break;
+      }
+      blur_stamp_paint(target_layer->pixels.writable_pixels().data(),
+                       target_layer->pixels.stride(), target_layer->pixels.width,
+                       target_layer->pixels.height, blurred, local.data(), params.point_count,
+                       params.brush);
       break;
     }
 

@@ -22,6 +22,7 @@
  */
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1145,4 +1146,186 @@ COMP_TEST(tool_ops_domain_clone_and_warp_keep_sixteen_bit_depth) {
                    "the whole stroke family keeps the layer at 16 bits");
     COMP_CHECK_MSG(document.history().can_undo(), "each retouch stroke is one undo step");
   }
+}
+
+/* ============================================ [E] Blur：模糊工具（P1 追加） */
+
+namespace {
+
+/* 左右两半硬边（左黑右白），用来观察模糊是否只在笔尖下发生。 */
+std::vector<uint8_t> hard_edge_pixels(int32_t width, int32_t height) {
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 255);
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = pixels.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                    static_cast<size_t>(x)) * 4u;
+      p[0] = p[1] = p[2] = x < width / 2 ? 0 : 255;
+    }
+  }
+  return pixels;
+}
+
+ToolOpParams blur_params(const float* points, int32_t point_count, float radius) {
+  ToolOpParams params;
+  params.kind = kToolOpBlur;
+  params.points = points;
+  params.point_count = point_count;
+  params.brush.diameter = 7.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+  params.blur.radius = radius;
+  return params;
+}
+
+}  // namespace
+
+/*
+ * [E1] 一笔模糊只落在笔尖下，且同一条折线不会吃到自己刚模糊过的像素。
+ *
+ * 判定：边缘两侧的像素在笔迹下被拉向中间值（硬边变软）；笔尖外的像素逐字节
+ * 不动；第二笔（同一参数）仍能继续改变像素——因为每笔都以当笔开始时的像素
+ * 取快照（BlurTool.swift 的 blurSample）。
+ */
+COMP_TEST(tool_ops_domain_blur_softens_under_the_brush_only) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  const std::vector<uint8_t> source = hard_edge_pixels(16, 16);
+  layer->pixels.resize(16, 16, COMP_PIXEL_RGBA8);
+  std::memcpy(layer->pixels.writable_pixels().data(), source.data(), source.size());
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  COMP_CHECK(before == source);
+
+  /* 横向穿过边缘（x = 8），直径 7 覆盖 y ∈ [4.5, 11.5] 一带。 */
+  const float points[4] = {4.0f, 8.0f, 12.0f, 8.0f};
+  ToolOpParams params = blur_params(points, 2, 3.0f);
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a blur stroke is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  const auto at = [](int32_t x, int32_t y) -> size_t {
+    return (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * 4u;
+  };
+  COMP_CHECK_MSG(after[at(7, 8)] > before[at(7, 8)],
+                 "the dark side of the edge is pulled toward the blurred sample");
+  COMP_CHECK_MSG(after[at(8, 8)] < before[at(8, 8)],
+                 "the light side of the edge is pulled toward the blurred sample");
+  COMP_CHECK_MSG(after[at(7, 0)] == before[at(7, 0)] && after[at(8, 0)] == before[at(8, 0)],
+                 "pixels outside the brush tip are byte-identical");
+  COMP_CHECK_MSG(after[at(15, 12)] == before[at(15, 12)],
+                 "the stroke does not leak to the far corner of the layer");
+
+  /* 第二笔：快照取的是第一笔之后的像素，所以仍会继续变软（可重复 ≠ 幂等）。 */
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a second blur stroke runs");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(pixels_of(document, id) != after,
+                 "each stroke takes a fresh snapshot, so repeated strokes keep softening");
+
+  COMP_CHECK_MSG(document.history().can_undo(), "the blur strokes are undoable");
+  document.undo();
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "two undos restore the hard edge byte for byte");
+}
+
+/* [E2] radius 的闸：0 / 50+ / NaN / 缺 points 都在开事务之前拒绝。 */
+COMP_TEST(tool_ops_domain_blur_rejects_bad_radius_before_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = document.history().undo_depth();
+
+  const float points[4] = {1.0f, 1.0f, 3.0f, 1.0f};
+  comp_result code = COMP_OK;
+  std::string error;
+
+  {
+    ToolOpParams params = blur_params(points, 2, 0.0f);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "radius 0 is rejected (upstream clamps it, we refuse to guess)");
+    COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "radius 0 is an argument error");
+  }
+  {
+    ToolOpParams params = blur_params(points, 2, 50.5f);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "radius above 50 is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = blur_params(points, 2, std::numeric_limits<float>::quiet_NaN());
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a NaN radius is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = blur_params(nullptr, 2, 3.0f);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a null point array is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+
+  COMP_CHECK_MSG(!document.txn_active(), "the gate runs before txn_begin: no txn left open");
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before, "rejected blur strokes add no undo step");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "rejected blur strokes leave pixels byte-identical");
+
+  /* 合法值通过同一道闸，并恰好记一步。 */
+  ToolOpParams good = blur_params(points, 2, 2.0f);
+  COMP_CHECK_MSG(run_tool_op(&document, id, good, &code, &error, nullptr),
+                 "a legal radius runs: " + error);
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before + 1,
+                 "a blur stroke is exactly one undo step");
+}
+
+/* [E3] 16 位图层：笔尖外保持深精度，笔尖内取 8 位值（×257）。 */
+COMP_TEST(tool_ops_domain_blur_keeps_sixteen_bit_depth_outside_the_stroke) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_wide_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  const float points[4] = {2.0f, 2.0f, 3.0f, 2.0f};
+  ToolOpParams params = blur_params(points, 2, 2.0f);
+  params.brush.diameter = 3.0f;
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a blur stroke on a 16-bit layer is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16,
+                 "blur joins the stroke family and keeps the layer at 16 bits");
+
+  const uint16_t* now = reinterpret_cast<const uint16_t*>(layer->pixels.pixel_data().data());
+  const uint16_t* old = reinterpret_cast<const uint16_t*>(before.data());
+  const size_t count = 8u * 8u;
+  size_t changed = 0;
+  bool only_eight_bit_values = true;
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t* p = now + i * 4u;
+    const uint16_t* b = old + i * 4u;
+    if (p[0] == b[0] && p[1] == b[1] && p[2] == b[2] && p[3] == b[3]) continue;
+    ++changed;
+    for (int c = 0; c < 4; ++c) {
+      if (p[c] % 257u != 0u || p[c] / 257u > 255u) only_eight_bit_values = false;
+    }
+  }
+  COMP_CHECK_MSG(changed > 0, "the blur stroke actually painted something");
+  COMP_CHECK_MSG(changed < count, "pixels outside the stroke keep their 16-bit precision");
+  COMP_CHECK_MSG(only_eight_bit_values,
+                 "a painted pixel takes the 8-bit value * 257 (deep_take_painted)");
+
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                 "undo restores the 16-bit asset");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
 }

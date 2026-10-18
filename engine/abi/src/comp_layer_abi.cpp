@@ -995,6 +995,7 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.clone.sample_all_layers = desc->clone.sample_all_layers;
   params.clone.opacity = desc->clone.opacity;
   params.warp.strength = desc->warp.strength;
+  params.blur.radius = desc->blur.radius;
 
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;

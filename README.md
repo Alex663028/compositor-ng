@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **352 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **368 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -88,6 +88,15 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   344/344），并修掉四处「CMake 与 build.py 不等价」的分叉与 blocks 运行时在静态库下的
   `__imp_*` 链接问题；订正「本机无 `d3d12.h`」的旧记录。基线 341 → **344 用例**
   （3 例护栏），6/6 回归全绿。口径 A 由 ≈94% 收敛到 **≈97%**。详见 §6.1.21。
+  2026-10-18 第十二轮（P1 Filter 菜单 + Blur 工具）：新增 `comp_filter_apply`
+  （`COMP_FILTER_VIGNETTE` / `TONAL_CONTRAST` / `BLOOM` / `LENS_CORRECTION`）——把上游
+  `Filters.swift` 的四条滤镜补成产品通路：参数契约、与图层几何的装配、一步撤销、
+  按**文档坐标**选区混合、16 位工作副本与 HDR 拒绝；Bloom 因 `CIBloom` 不公开而采用
+  显式亮部近似并在 note 里写明。同轮补上 `COMP_TOOL_BLUR = 12`：整层模糊快照在整笔开始前
+  取好，按笔刷 coverage 盖回，笔尖之外保留（含 16 位）像素。参数契约见
+  [`docs/filters.md`](docs/filters.md) 与 [`docs/tool-ops.md`](docs/tool-ops.md) §4.9。
+  基线 352 → **368 用例**（16 例护栏：11 滤镜 + 5 模糊），口径 B ≈48% → **≈52%**。
+  详见 §6.12。
 
 ## 1. M1 目标与范围
 
@@ -1392,13 +1401,15 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
-| **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式未做 |
+| **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
-| **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
+| **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 23/48 命中 ≈ 48%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
-抠图正是该条的主要工作量；Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
+即 **约 25/48 命中 ≈ 52%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
+Lens Correction 是同一 `Filters.swift` 通路的附加值，不额外抬高条数；选区几何按
+「部分命中」计，未抬高条数——缺的 Select Subject / 抠图正是该条的主要工作量；
+Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
 且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1417,6 +1428,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 → Crop 工具（249 行，解锁导出打印尺寸；**2026-10-18 已交付，见 §6.8**）
 → Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用；**2026-10-18 已交付，见 §6.9**）
 → Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能；**像素管线 2026-10-18 已交付，见 §6.10**）
+→ 滤镜 / Blur（`Filters.swift` 四条滤镜 + `BlurToolMode` 的 Blur；复用现有像素内核；
+  **2026-10-18 已交付，见 §6.12**）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
 
 ### 6.5 工具算子（Tool ops）已接入产品通路（2026-10-16 起）
@@ -1440,6 +1453,9 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 - **明示边界而非静默回落**：字形图集不由 ABI 灌入，`GLYPHS` 回落菱形网点**并在 note 里
   如实回报**；deep round trip **§6.1.10 起已实现**（RGBA16 保持 16 位，low/+1/+2/+4 四档），
   在 8 位图层上则显式拒绝（`COMP_ERR_STATE`）而不是伪造一组像素。
+- **Blur（P1 追加，kind 12）**：整层模糊样本在**整笔开始前**取好，同一笔的折线不会
+  吃到自己刚模糊过的像素；`radius` 0.5..50，`0` 被参数闸拒绝（上游会把 0 抬高到 0.5，
+  若按「0 = 恒等」解读会得到相反结果）。细节见 [`docs/tool-ops.md`](docs/tool-ops.md) §4.9。
 
 ### 6.6 内核接线现状（2026-10-18 更新）
 
@@ -1449,7 +1465,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发） | `heal_coverage_bounds` |
 | Patch | `COMP_TOOL_HEAL` | `patch_fill` | — |
 | Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
-| Lens | `COMP_TOOL_LENS` | `lens_distort` | — |
+| Lens | `COMP_TOOL_LENS` / `COMP_FILTER_LENS_CORRECTION` | `lens_distort`（工具收 `|k| <= 1`，滤镜收 `-100..100` 再换算 `k`） | — |
+| Blur | `COMP_TOOL_BLUR` / Tonal Contrast、Bloom 的 detail 模糊 | `blur_rgba8_copy`（三趟滑动窗口盒式近似，与 Gaussian Blur 调整层同一实现） | — |
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
@@ -1898,6 +1915,60 @@ transform 写入侧与像素回读的配合，现有 `comp_layer_*` 只暴露尺
 基线 344 → **352 cases, 0 failed**（8 例新增）；Windows 壳实机自检仍
 **27 项全 OK**，SHA256 与仓内基线**逐字节相同**（本轮只改 UI 层，未触碰 `run_selftest()`）；
 `run_regression.py --require-ohos` **6/6 PASS，0 skipped**。
+
+### 6.12 P1 Filter 菜单 + Blur 工具（2026-10-18，Claude）
+
+**1. 为什么这批不是「新算法」。** Vignette / Tonal Contrast / Bloom / Lens Correction
+的像素内核在 `engine/imaging` 早已就位（`adjust_colored_vignette`、
+`adjust_tonal_contrast`、`lens_distort`；Bloom 复用 `blur_rgba8_copy`）。缺的是与
+`comp_tool_apply` 同级的**产品入口**：参数契约、图层几何装配、一步撤销、选区混合。
+本轮新增 `comp_filter_apply`（`engine/abi/src/comp_filter_abi.cpp`）与领域层
+`engine/domain/filters.{h,cpp}`，四个算子一次收口。
+
+**2. 口径。** 参数量程对齐上游 `FilterSettings.normalized`（Vignette / Bloom 的
+`amount` 0..100、Tonal 三个 gain ±100、Lens `distortion` ±100）；**越界拒绝而不是
+clamp**，闸在 `txn_begin` 之前；恒等设置不碰像素、不开事务。Vignette 作用在图层
+自身像素矩形（不按画布铺底、不改 alpha）；Tonal Contrast 先用 `radius * scale`
+高斯得到 base，再比较局部细节；Lens 的 `k = distortion / 100 * 0.35`
+（上游 `lensStrength`，`Filters.swift:238`），与 Lens 工具共用同一个
+`lens_distort`，回归护栏直接比对两条通路的逐字节结果。
+
+**3. Bloom 的显式近似。** `CIBloom` 内部不公开。本仓定义为：rec.709 亮度在
+`[0.5, 1]` 线性起权提取亮部 → 预乘高斯 → `rgb += glow * (amount / 50)` → 裁到自身
+alpha。**只加光、不改 alpha**，透明像素不会凭空发光；note 如实写明
+`bright-pass approximation (threshold 0.5; CIBloom's curve is not public)`，
+不假装与 Core Image 逐像素一致。
+
+**4. 选区。** 有选区时按 coverage 与原像素混合（`PixelAdjust.blend` 口径），
+coverage 是**文档分辨率**；图层像素的文档坐标 = `effective_bounds()` 原点 + 像素
+坐标。显式空选区是 no-op 且 `out_changed = 0`。
+
+**5. 16 位 / HDR。** RGBA16 先落 `deep_to_rgba8` 工作副本（之后图层就是 8 位，
+note 写明），撤销恢复 16 位资产；RGBA16F 与组 / 无像素图层一律 `COMP_ERR_STATE`。
+上游 Bloom 有 `runsAtSixteenBits`，本仓 8 位内核做不到逐位对齐，如实记入文档。
+
+**6. Blur 工具。** `comp_tool_op_desc` **尾部追加** `blur.radius`（既有偏移不变），
+`COMP_TOOL_BLUR = 12`。整层模糊样本在整笔开始前取好（同一笔不吃自己刚模糊的像素，
+重复落笔才继续变软），按笔刷 coverage 在预乘空间盖回，**四个通道一起**（alpha 也变软）。
+`radius` 0.5..50，`sigma` 再夹到较长边一半；`0` 被参数闸拒绝而不是当作恒等
+（上游会把 0 抬到 0.5）。落笔族口径：16 位 / HDR 图层笔尖之外保留深像素。
+
+**7. 护栏（+16 例，352 → 368）。**
+
+| 文件 | 例数 | 钉住什么 |
+|------|------|---------|
+| `tests/test_filters.cpp` | 11 | 恒等 no-op；6 组越界参数在事务前拒绝；Vignette 压边角/中心不动/alpha 不变；Tonal 保留黑白格结构；Bloom 扩散、远角不动、alpha 全不变、`rgb <= alpha`；Lens 与工具逐字节一致；选区按文档坐标裁切；16 位工作副本与撤销恢复；组/空/HDR/未知 id 错误码；空选区 no-op；ABI `out_changed` 与 note 两段式 |
+| `tests/test_tool_ops_domain.cpp` | 3 | Blur 只软化笔尖下、笔尖外逐字节不动；第二笔继续变软（快照按笔取）；radius 0 / 50.5 / NaN / 缺 points 在事务前拒绝；16 位笔尖外保留深像素 |
+| `tests/test_tool_ops.cpp` | 2 | `COMP_TOOL_BLUR == 12` 可达；硬边两侧变软、alpha 不掉洞、一笔一步撤销；radius 0 拒绝且不留历史，同一 desc 改合法值即成功 |
+
+**8. 验证。** `scripts/run_regression.py --require-ohos` **6/6 PASS，0 skipped**：
+步骤 ① 368 cases / 0 failed；步骤 ② Windows 壳 27 项 `failures=0`、SHA256
+`32151220f4748dfa…` 与基线一致；步骤 ⑤ 共享 DLL 真实加载；步骤 ⑥ OHOS aarch64
+交叉编译 + NAPI rc=0。参数契约见 [`docs/filters.md`](docs/filters.md) 与
+[`docs/tool-ops.md`](docs/tool-ops.md) §4.9。
+
+**9. 仍不在本轮**：Remove Background（依赖 ML / 分割）、滤镜的实时预览缓存、
+上游 Bloom 的 16 位逐位对齐。
 
 ## 7. 许可
 

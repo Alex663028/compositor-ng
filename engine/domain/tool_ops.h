@@ -193,6 +193,20 @@ struct WarpParams {
   float strength = 1.0f;
 };
 
+/*
+ * 模糊工具参数（上游 BlurTool.swift `blurSample(for:)`）。
+ *
+ * 一笔开始时把图层像素拷一份并整体高斯模糊（共享的三趟盒式近似
+ * `blur_rgba8_copy`），再沿折线按笔刷 coverage 把副本盖回当前像素。
+ *   - `radius` 0.5..50（上游 blurRadius 的夹取范围），单位是**图层像素**；
+ *     实际 sigma 再夹到图层较长边的一半（上游 `sidePixels / 2`）；
+ *   - 因此同一处反复涂抹会继续变软：每笔都以当笔开始时的像素为准；
+ *   - 几何（直径 / 硬度 / 压力 / flow）复用 `BrushStrokeParams`。
+ */
+struct BlurParams {
+  float radius = 10.0f;
+};
+
 /* ============================================================== 扫描线 */
 
 /*
@@ -300,6 +314,7 @@ enum ToolOpKind {
   kToolOpClone = 9,       /* 仿制图章 -> 从快照拷贝像素 */
   kToolOpSmudge = 10,     /* 涂抹 -> carried 缓冲拖色 */
   kToolOpLiquify = 11,    /* 液化（Push）-> 前向位移重采样 */
+  kToolOpBlur = 12,       /* 模糊 -> 快照模糊后按笔迹盖回 */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -326,9 +341,10 @@ struct ToolOpParams {
   const float* points = nullptr;
   int32_t point_count = 0;
 
-  /* Clone / Smudge / Liquify 用（定义见各自的参数结构）。 */
+  /* Clone / Smudge / Liquify / Blur 用（定义见各自的参数结构）。 */
   CloneParams clone;
   WarpParams warp;
+  BlurParams blur;
 
   /* Heal 用。coverage 为 8 位灰度蒙版（0..255，255 = 待修补），尺寸须等于图层像素。 */
   HealParams heal;
@@ -386,7 +402,9 @@ struct ToolOpParams {
  *   - kToolOpLens    以图层像素中心为原点做径向重采样，k=0 时**逐字节恒等**；
  *   - kToolOpDeep    像素格式转换（RGBA16 → RGBA8）或深度往返。
  *   - kToolOpScanlines  按 ScanlinesParams 把图层画成 CRT 扫描线；
- *   - kToolOpChunky   先按 block 降采样抖动，再最近邻放大，可选补 dot 缝隙。
+ *   - kToolOpChunky   先按 block 降采样抖动，再最近邻放大，可选补 dot 缝隙；
+ *   - kToolOpBlur     一笔开始时模糊整层副本，再按笔迹 coverage 盖回（alpha 同样
+ *                     按预乘插值，透明边缘会随涂抹变软）。
  */
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
                  comp_result* out_code, std::string* error, std::string* note);
