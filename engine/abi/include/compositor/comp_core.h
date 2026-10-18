@@ -84,8 +84,9 @@ typedef enum comp_pixel_format {
   COMP_PIXEL_RGBA16   = 1,
   /* 半精度浮点（HDR 图层，C1 起为真通路）：同样预乘、8 字节/像素、native-endian，
    * 但每通道是 IEEE 754 half 且处于 **extended sRGB** 编码（白 = 1.0，高光可 > 1.0）。
-   * `comp_layer_set_pixels` 接受它，引擎为它维护一份 8 位工作副本；
-   * 「合成表面按文档深度携带 half」是 C5，在那之前合成走那份 8 位副本。 */
+   * `comp_layer_set_pixels` 接受它；C5 起文档里有 HDR 图层时合成表面本身也是
+   * RGBA16F（白点以上的光在合成途中保留），只有 RGBA8 渲染目标/缩略图才按显示
+   * 口径截到白。 */
   COMP_PIXEL_RGBA16F  = 2
 } comp_pixel_format;
 

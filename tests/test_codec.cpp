@@ -49,7 +49,7 @@ COMP_TEST(codec_support_reports_only_facts) {
   /* PNG 由 vendor 的真实库（libpng + zlib）或自研 comp_png 提供，两者都算真实可用。 */
   COMP_CHECK(state == COMP_CODEC_VENDORED || state == COMP_CODEC_BUILTIN);
 
-  /* EXR：树内自研 scanline 读取器（C3b），可读不可写。 */
+  /* EXR：树内自研 scanline 编解码器（C3b 读 + C4 写），登记表必须如实说可写。 */
   COMP_CHECK(comp_io_codec_support(COMP_FORMAT_EXR, &state, nullptr, 0, &note_size) == COMP_OK);
   COMP_CHECK(state == COMP_CODEC_BUILTIN);
 
@@ -57,8 +57,10 @@ COMP_TEST(codec_support_reports_only_facts) {
   COMP_CHECK(comp_io_codec_support(COMP_FORMAT_EXR, nullptr, note.data(), note.size(), &note_size) ==
              COMP_OK);
   COMP_CHECK(std::strstr(note.data(), "scanline") != nullptr);
-  COMP_CHECK_MSG(std::strstr(note.data(), "export unsupported") != nullptr,
-                 "the note must state that EXR export is not available");
+  COMP_CHECK_MSG(std::strstr(note.data(), "export writes") != nullptr,
+                 "the note must state that EXR export is available");
+  COMP_CHECK_MSG(std::strstr(note.data(), "export unsupported") == nullptr,
+                 "EXR is no longer read-only");
 
   /* 有损栅格：JPEG 由 vendor 的 stb_image / stb_image_write 真读真写。 */
   COMP_CHECK(comp_io_codec_support(COMP_FORMAT_JPEG, &state, nullptr, 0, &note_size) == COMP_OK);

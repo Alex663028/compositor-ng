@@ -56,22 +56,76 @@ static void store_premultiplied(uint8_t* p, const double premul_rgb[3], double a
   p[3] = to_u8(a);
 }
 
+namespace {
+
+/*
+ * W3C 合成公式（Compositing and Blending Level 1，9.1.4）。
+ *
+ * 8 位与 half 两条路共用这一份：两处各写一遍的话，改一处参数（例如漏掉
+ * (1-base.alpha)）只会在其中一条路上静默漂移。结果仍是**预乘**值。
+ */
+void blend_straight(comp_blend_mode mode, const double src_rgb[3], double base_alpha,
+                    const double base_rgb[3], double src_alpha, double out_rgb[3],
+                    double* out_alpha) {
+  double blended[3];
+  blend_rgb(mode, base_rgb, src_rgb, blended);
+
+  *out_alpha = src_alpha + base_alpha * (1.0 - src_alpha);
+  for (int i = 0; i < 3; ++i) {
+    out_rgb[i] = src_alpha * (1.0 - base_alpha) * src_rgb[i] +
+                 src_alpha * base_alpha * blended[i] +
+                 (1.0 - src_alpha) * base_alpha * base_rgb[i];
+  }
+}
+
+/* 预乘 half 像素 -> 直通分量。alpha 是覆盖率，夹进 0..1；颜色不夹（HDR）。 */
+void half_to_straight(const uint16_t* p, double rgb[3], double* alpha) {
+  double a = static_cast<double>(deep_half_value(p[3]));
+  if (!(a > 0.0)) a = 0.0; /* 0、负数、NaN 都按全透明 */
+  if (a > 1.0) a = 1.0;
+  *alpha = a;
+  for (int i = 0; i < 3; ++i) {
+    const double v = static_cast<double>(deep_half_value(p[i]));
+    /* 坏采样不变成亮斑：NaN 落 0；±Inf 照常保留（half 能表示）。 */
+    rgb[i] = (a > 0.0 && v == v) ? v / a : 0.0;
+  }
+}
+
+/* 写入「已经是预乘」的 half 结果。颜色不夹白/不夹到 alpha：这是 HDR 表面。 */
+void store_half_premultiplied(uint16_t* p, const double premul_rgb[3], double alpha) {
+  const double a = alpha <= 0.0 ? 0.0 : (alpha >= 1.0 ? 1.0 : alpha);
+  for (int i = 0; i < 3; ++i) {
+    const double v = premul_rgb[i] == premul_rgb[i] ? premul_rgb[i] : 0.0;
+    p[i] = deep_half_bits(static_cast<float>(v));
+  }
+  p[3] = deep_half_bits(static_cast<float>(a));
+}
+
+}  // namespace
+
 void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, double src_alpha) {
   const StraightPixel src = to_straight(src_px);
   const StraightPixel base = to_straight(dst_px);
 
-  double blended[3];
-  blend_rgb(mode, base.rgb, src.rgb, blended);
-
-  /* W3C 合成公式；结果即为预乘值。 */
   double out_rgb[3];
-  const double out_alpha = src_alpha + base.alpha * (1.0 - src_alpha);
-  for (int i = 0; i < 3; ++i) {
-    out_rgb[i] = src_alpha * (1.0 - base.alpha) * src.rgb[i] +
-                 src_alpha * base.alpha * blended[i] +
-                 (1.0 - src_alpha) * base.alpha * base.rgb[i];
-  }
+  double out_alpha = 0.0;
+  blend_straight(mode, src.rgb, base.alpha, base.rgb, src_alpha, out_rgb, &out_alpha);
   store_premultiplied(dst_px, out_rgb, out_alpha);
+}
+
+void blend_pixels_half(uint16_t* dst_px, const uint16_t* src_px, comp_blend_mode mode,
+                       double src_alpha) {
+  double src_rgb[3];
+  double base_rgb[3];
+  double src_alpha_px = 0.0;
+  double base_alpha = 0.0;
+  half_to_straight(src_px, src_rgb, &src_alpha_px);
+  half_to_straight(dst_px, base_rgb, &base_alpha);
+
+  double out_rgb[3];
+  double out_alpha = 0.0;
+  blend_straight(mode, src_rgb, base_alpha, base_rgb, src_alpha, out_rgb, &out_alpha);
+  store_half_premultiplied(dst_px, out_rgb, out_alpha);
 }
 
 /* 外部可链接的公共入口：薄包装，语义与 blend_pixels 完全一致（不做任何额外换算）。 */
@@ -102,6 +156,15 @@ double clipping_factor(const Document& doc, const Layer& layer, int32_t x, int32
   }
   if (bpp == 8) {
     const uint8_t* px = base->pixels.row(ly) + static_cast<size_t>(lx) * 8u;
+    if (base->pixels.format == COMP_PIXEL_RGBA16F) {
+      /* half 的 alpha 按 IEEE binary16 解码。此前这里按 16 位整数读，1.0 的
+       * 位模式 0x3C00 会变成 15360，夹到 255 再除 255 —— 全不透明基底被当成
+       * alpha≈0.23，剪贴子层被无故裁掉四分之三。 */
+      const double a = static_cast<double>(deep_half_value(
+          *reinterpret_cast<const uint16_t*>(px + 6)));
+      const double clamped = a <= 0.0 ? 0.0 : (a >= 1.0 ? 1.0 : a);
+      return clamped * static_cast<double>(base->opacity);
+    }
     uint16_t a16 = 0;
     std::memcpy(&a16, px + 6, sizeof(a16)); /* native-endian：alpha 在每像素最后两个字节 */
     const int32_t a8 = (static_cast<int32_t>(a16) + 128) / 257;
@@ -198,6 +261,50 @@ bool restore_stack_alpha(ImageBuffer* surface, const std::vector<uint16_t>& cove
   return true;
 }
 
+/* C5：half 表面的 extract/restore。alpha 直接按 float 存，不经 8/16 位容器。 */
+bool extract_stack_alpha(ImageBuffer* surface, std::vector<float>* coverage_hdr,
+                         std::string* error) {
+  if (surface == nullptr || surface->empty()) {
+    if (error != nullptr) *error = "clipping stack surface is empty";
+    return false;
+  }
+  if (surface->format != COMP_PIXEL_RGBA16F) {
+    if (error != nullptr) *error = "hdr clipping stack surface must be RGBA16F";
+    return false;
+  }
+  if (coverage_hdr == nullptr) {
+    if (error != nullptr) *error = "clipping stack needs an float coverage buffer";
+    return false;
+  }
+  const size_t w = static_cast<size_t>(surface->width);
+  const size_t h = static_cast<size_t>(surface->height);
+  coverage_hdr->assign(w * h, 0.0f);
+  deep_extract_alpha_hdr(reinterpret_cast<uint16_t*>(surface->writable_pixels().data()),
+                         surface->stride(), coverage_hdr->data(), w, h);
+  return true;
+}
+
+bool restore_stack_alpha(ImageBuffer* surface, const std::vector<float>& coverage_hdr,
+                         std::string* error) {
+  if (surface == nullptr || surface->empty()) {
+    if (error != nullptr) *error = "clipping stack surface is empty";
+    return false;
+  }
+  if (surface->format != COMP_PIXEL_RGBA16F) {
+    if (error != nullptr) *error = "hdr clipping stack surface must be RGBA16F";
+    return false;
+  }
+  const size_t w = static_cast<size_t>(surface->width);
+  const size_t h = static_cast<size_t>(surface->height);
+  if (coverage_hdr.size() != w * h) {
+    if (error != nullptr) *error = "clipping stack coverage size does not match the surface";
+    return false;
+  }
+  deep_restore_alpha_hdr(reinterpret_cast<uint16_t*>(surface->writable_pixels().data()),
+                         surface->stride(), coverage_hdr.data(), w, h);
+  return true;
+}
+
 bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
                       double opacity_scale, std::string* error) {
   if (dst == nullptr) {
@@ -244,8 +351,14 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
   /* 只光栅化可见窗口（dst_bounds）：中间缓冲以画布内可见区域为界，
    * 不再为一个拉到画布外的巨大图层分配整幅单元（上游 TiledLayerRenderer 同思路）。 */
   comp_rect unit_bounds;
-  if (!build_layer_unit(layer, sampling_from_abi(layer.sampling), &unit, &unit_bounds,
-                        &unit_error, &dst_bounds)) {
+  const bool half_surface = dst->format == COMP_PIXEL_RGBA16F;
+  const bool built =
+      half_surface
+          ? build_layer_unit_hdr(layer, sampling_from_abi(layer.sampling), &unit, &unit_bounds,
+                                 &unit_error, &dst_bounds)
+          : build_layer_unit(layer, sampling_from_abi(layer.sampling), &unit, &unit_bounds,
+                             &unit_error, &dst_bounds);
+  if (!built) {
     /* 内因透传：调用点需要知道是「单元太大」还是别的，直接丢给 error。 */
     if (error != nullptr) *error = std::move(unit_error);
     return false;
@@ -262,16 +375,66 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
   if (!layer.effects.empty()) {
     EffectEvalResult effect_result;
     std::string effect_error;
-    if (!apply_effects(layer.effects, unit.writable_pixels().data(), unit.width, unit.height,
-                        unit.stride(), &effect_result, &effect_error)) {
+    /*
+     * 效果求值是 8 位内核（上游 LayerEffectsRenderer 同样按 8 位渲染，不会在
+     * HDR 上给出浮点发光）。half 单元先取 8 位工作副本、做完效果再写回 half：
+     * 这条边界要如实——效果半径内的白点以上亮度在 8 位副本里被截到白，
+     * 与上游「效果不吃 HDR」一致；没有效果时 half 单元全程不降位。
+     */
+    ImageBuffer effect_target;
+    ImageBuffer* target = &unit;
+    if (unit.format == COMP_PIXEL_RGBA16F) {
+      if (!hdr_to_rgba8(unit, &effect_target)) {
+        if (error != nullptr) *error = "failed to build an 8-bit view for layer effects";
+        return false;
+      }
+      target = &effect_target;
+    }
+    if (!apply_effects(layer.effects, target->writable_pixels().data(), target->width,
+                       target->height, target->stride(), &effect_result, &effect_error)) {
       if (error != nullptr) {
         *error = effect_error.empty() ? "apply effects failed" : effect_error;
       }
       return false;
     }
+    if (unit.format == COMP_PIXEL_RGBA16F) {
+      ImageBuffer restored;
+      restored.resize(unit.width, unit.height, COMP_PIXEL_RGBA16F);
+      if (!rgba8_to_hdr(effect_target, &restored)) {
+        if (error != nullptr) *error = "failed to write layer effects back to a half surface";
+        return false;
+      }
+      unit = std::move(restored);
+    }
   }
 
   const double layer_opacity = static_cast<double>(layer.opacity) * opacity_scale;
+
+  const bool half_dst = dst->format == COMP_PIXEL_RGBA16F;
+  if (half_dst) {
+    for (int32_t y = dst_bounds.y; y < dst_bounds.y + dst_bounds.h; ++y) {
+      uint8_t* dst_row = dst->writable_row(y);
+      const uint8_t* unit_row = unit.row(y - unit_bounds.y);
+      for (int32_t x = dst_bounds.x; x < dst_bounds.x + dst_bounds.w; ++x) {
+        const uint8_t* src_px = unit_row + static_cast<size_t>(x - unit_bounds.x) * 8u;
+        const double src_alpha = static_cast<double>(
+            deep_half_value(*reinterpret_cast<const uint16_t*>(src_px + 6)));
+        double alpha = src_alpha * layer_opacity;
+        if (alpha <= 0.0) continue;
+        alpha *= clipping_factor(doc, layer, x, y);
+        if (alpha <= 0.0) continue;
+        /* dst 行用字节指针推进，按 half 像素（8 字节）换算；src 已是 half 单元。 */
+        blend_pixels_half(
+            reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * 8u),
+            reinterpret_cast<const uint16_t*>(src_px), layer.blend, alpha);
+      }
+    }
+    return true;
+  }
+  if (dst->format != COMP_PIXEL_RGBA8) {
+    if (error != nullptr) *error = "layer blend destination has an unsupported pixel format";
+    return false;
+  }
 
   for (int32_t y = dst_bounds.y; y < dst_bounds.y + dst_bounds.h; ++y) {
     uint8_t* dst_row = dst->writable_row(y);
@@ -297,6 +460,28 @@ bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode
 
   const double clamped_opacity = opacity <= 0.0 ? 0.0 : (opacity >= 1.0 ? 1.0 : opacity);
   if (clamped_opacity <= 0.0) return true;
+
+  /*
+   * C5：half 表面整幅叠加。调用方（隔离组、剪贴栈）决定表面深度，src 与 dst
+   * 必须同深度——不同深度这里没有定义好的「整幅混合」语义，宁可拒绝也不
+   * 把 half 的 8 字节行按 RGBA8 的 4 字节行读成垃圾。
+   */
+  if (dst->format == COMP_PIXEL_RGBA16F || src.format == COMP_PIXEL_RGBA16F) {
+    if (dst->format != COMP_PIXEL_RGBA16F || src.format != COMP_PIXEL_RGBA16F) return false;
+    for (int32_t y = 0; y < dst->height; ++y) {
+      uint16_t* dst_row = reinterpret_cast<uint16_t*>(dst->writable_row(y));
+      const uint16_t* src_row = reinterpret_cast<const uint16_t*>(src.row(y));
+      for (int32_t x = 0; x < dst->width; ++x) {
+        const uint16_t* src_px = src_row + static_cast<size_t>(x) * 4u;
+        const double alpha =
+            (static_cast<double>(deep_half_value(src_px[3]))) * clamped_opacity;
+        if (alpha <= 0.0) continue;
+        blend_pixels_half(dst_row + static_cast<size_t>(x) * 4u, src_px, mode, alpha);
+      }
+    }
+    return true;
+  }
+  if (dst->format != COMP_PIXEL_RGBA8 || src.format != COMP_PIXEL_RGBA8) return false;
 
   for (int32_t y = 0; y < dst->height; ++y) {
     uint8_t* dst_row = dst->writable_row(y);

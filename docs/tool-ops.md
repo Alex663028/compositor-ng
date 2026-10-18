@@ -119,7 +119,8 @@
   （`DeepLayers.swift:5`）一致。
 - 打在 RGBA8 图层上 -> `COMP_ERR_STATE`（拿 8 位图层要 16 位精度是错的**状态**请求，
   不是能力边界）。round trip 模式 -> `COMP_ERR_UNSUPPORTED`（见 §7）。
-- `.comp` 存盘只接受 RGBA8 图层，所以 16 位资产要落盘必须先 quantize（见 §6）。
+- `.comp` 存盘：RGBA16 / RGBA16F 图层写成 `<uuid>.exr` 资产（C3b）；只有宿主明确
+  要求 8 位资产时才需要先 quantize（见 §6）。
 
 ## 5. 可重复性
 

@@ -532,8 +532,11 @@ bool codec_lib_can_encode(uint32_t format) {
       return codec_lib_has_png();
     case kFormatJpeg:
       return codec_lib_has_stb();
+    case kFormatExr:
+      /* C4：写侧与读侧同一份自研 scanline 编解码器，能力取自真实探测。 */
+      return exr_codec_available();
     default:
-      return false; /* PSD 只读 */
+      return false; /* PSD / Radiance 只读 */
   }
 }
 

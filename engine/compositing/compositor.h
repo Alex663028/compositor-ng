@@ -30,10 +30,24 @@ struct CompositeOptions {
   comp_layer_id target_layer = 0;
 };
 
-/* 合成整篇文档；out 会被重置为画布尺寸的 RGBA8 缓冲。 */
+/*
+ * 合成表面的像素格式（C5）：文档里任一层是 half（COMP_PIXEL_RGBA16F）时，
+ * 表面按 RGBA16F 求值，否则 RGBA8。
+ *
+ * 口径与上游一致——有 HDR 图层就在 half 表面上合成，没有就整条路仍是 8 位；
+ * RGBA16（整数 16 位）文档维持既有的 8 位表面（那是 C5 之前记录在案的行为，
+ * 不在本轮改口径，避免把 8 位验收底线牵动到 16 位整数路径）。
+ */
+comp_pixel_format composite_surface_format(const Document& doc);
+
+/* 合成整篇文档；out 会被重置为画布尺寸、composite_surface_format 指定的深度。 */
 bool composite_document(const Document& doc, ImageBuffer* out, std::string* error);
 
-/* 仅合成单个图层（含其剪贴基底），用于图层缩略图。 */
+/*
+ * 仅合成单个图层（含其剪贴基底），用于图层缩略图。
+ * 内部按图层深度求值（half 图层在 half 表面上合成），输出始终是 RGBA8 的
+ * 显示副本——缩略图的调用契约不变，高光只在这最后一步按白显示截断。
+ */
 bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out,
                      std::string* error);
 

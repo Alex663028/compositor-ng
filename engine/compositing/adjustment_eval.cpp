@@ -9,7 +9,9 @@
 
 #include "domain/adjustment_table.h"
 #include "format/comp_json.h"
+#include "imaging/DeepPixels.h"
 #include "imaging/comp_imaging.h"
+#include "imaging/deep_round_trip.h"
 
 namespace compositor {
 
@@ -397,15 +399,29 @@ bool apply_curves(uint8_t* buf, size_t count, const Settings& s) {
 }
 
 /* kind 3 — Exposure：2^EV 增益 + offset + gamma，作用于线性光。 */
+struct ExposureParams {
+  double ev = 0.0;
+  double offset = 0.0;
+  double gamma = 1.0;
+  bool identity() const { return ev == 0.0 && offset == 0.0 && gamma == 1.0; }
+};
+
+/* 8 位与 half 两条路读同一份参数：各写一遍就会在两处用不同的钳位区间。 */
+ExposureParams read_exposure(const Settings& s) {
+  ExposureParams p;
+  p.ev = s.clamp(s.number("exposureSettings", "exposure", 0.0), -20.0, 20.0);
+  p.offset = s.clamp(s.number("exposureSettings", "offset", 0.0), -0.5, 0.5);
+  p.gamma = s.clamp(s.number("exposureSettings", "gamma", 1.0), 0.01, 9.99);
+  return p;
+}
+
 bool apply_exposure(uint8_t* buf, size_t count, const Settings& s) {
-  const double ev = s.clamp(s.number("exposureSettings", "exposure", 0.0), -20.0, 20.0);
-  const double offset = s.clamp(s.number("exposureSettings", "offset", 0.0), -0.5, 0.5);
-  const double gamma = s.clamp(s.number("exposureSettings", "gamma", 1.0), 0.01, 9.99);
-  if (ev == 0.0 && offset == 0.0 && gamma == 1.0) return false;
+  const ExposureParams params = read_exposure(s);
+  if (params.identity()) return false;
 
   unpremultiply_inplace(buf, count);
-  const double gain = std::pow(2.0, ev);
-  const double inv_gamma = 1.0 / gamma;
+  const double gain = std::pow(2.0, params.ev);
+  const double inv_gamma = 1.0 / params.gamma;
   for (size_t i = 0; i < count; ++i) {
     uint8_t* px = buf + i * 4;
     if (px[3] == 0) continue;
@@ -413,7 +429,7 @@ bool apply_exposure(uint8_t* buf, size_t count, const Settings& s) {
       /* 线性化 -> 曝光 -> 反 gamma -> 回 sRGB -> 重新预乘。 */
       const double srgb = px[c] / 255.0;
       const double linear = (srgb <= 0.04045) ? srgb / 12.92 : std::pow((srgb + 0.055) / 1.055, 2.4);
-      double v = linear * gain + offset;
+      double v = linear * gain + params.offset;
       if (v < 0.0) v = 0.0;
       v = std::pow(v, inv_gamma);
       const double back = (v <= 0.0031308) ? v * 12.92 : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
@@ -589,6 +605,33 @@ bool apply_color_balance(uint8_t* buf, int32_t width, int32_t height, size_t str
   return true;
 }
 
+/*
+ * 单条调整的 8 位求值（kind 已确认被支持）。返回「是否真的改变了像素」。
+ *
+ * 8 位主路径与 half 表面的 round trip 共用这一张分派表：half 那条路把同一份
+ * 8 位内核塞进 deep_split/deep_merge 的每一档，若这里再写第二份 switch，
+ * 同一个 kind 在两种表面上就会悄悄用不同的实现。
+ */
+bool apply_adjustment_eight_bit(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                                uint32_t kind, const Settings& settings) {
+  const size_t count = pixel_count(width, height, stride);
+  switch (kind) {
+    case 0: return apply_hue_saturation(buf, count, settings);
+    case 1: return apply_levels(buf, count, settings);
+    case 2: return apply_curves(buf, count, settings);
+    case 3: return apply_exposure(buf, count, settings);
+    case 4: return apply_gradient_map(buf, width, height, stride, settings);
+    case 5: return apply_grain(buf, width, height, stride, settings);
+    case 6: return apply_add_noise(buf, width, height, stride, settings);
+    case 7: return apply_gaussian_blur(buf, width, height, stride, settings);
+    case 8: return apply_motion_blur(buf, width, height, stride, settings);
+    case 9: return apply_invert(buf, count);
+    case 10: return apply_black_white(buf, width, height, stride, settings);
+    case 11: return apply_color_balance(buf, width, height, stride, settings);
+    default: return false;
+  }
+}
+
 }  // namespace
 
 /*
@@ -674,22 +717,86 @@ bool apply_adjustments(const std::vector<Adjustment>& adjustments, uint8_t* buf,
     Settings settings;
     settings.load(adjustment.settings_json);
 
-    bool changed = false;
-    switch (adjustment.kind) {
-      case 0: changed = apply_hue_saturation(buf, count, settings); break;
-      case 1: changed = apply_levels(buf, count, settings); break;
-      case 2: changed = apply_curves(buf, count, settings); break;
-      case 3: changed = apply_exposure(buf, count, settings); break;
-      case 4: changed = apply_gradient_map(buf, width, height, stride, settings); break;
-      case 5: changed = apply_grain(buf, width, height, stride, settings); break;
-      case 6: changed = apply_add_noise(buf, width, height, stride, settings); break;
-      case 7: changed = apply_gaussian_blur(buf, width, height, stride, settings); break;
-      case 8: changed = apply_motion_blur(buf, width, height, stride, settings); break;
-      case 9: changed = apply_invert(buf, count); break;
-      case 10: changed = apply_black_white(buf, width, height, stride, settings); break;
-      case 11: changed = apply_color_balance(buf, width, height, stride, settings); break;
-      default: break;
+    const bool changed = apply_adjustment_eight_bit(buf, width, height, stride, adjustment.kind,
+                                                    settings);
+    if (result != nullptr) {
+      ++result->applied;
+      if (changed) result->changed = true;
     }
+  }
+  return true;
+}
+
+bool apply_adjustments_hdr(const std::vector<Adjustment>& adjustments, uint16_t* pixels,
+                           int32_t width, int32_t height, size_t stride,
+                           AdjustmentEvalResult* result, std::string* error) {
+  if (result != nullptr) *result = AdjustmentEvalResult{};
+  if (adjustments.empty()) return true;
+  if (pixels == nullptr || width <= 0 || height <= 0) {
+    if (error != nullptr) *error = "adjustment target buffer is invalid";
+    return false;
+  }
+
+  const size_t normal_stride = static_cast<size_t>(width) * 8u; /* 4 通道 × uint16 */
+  for (const Adjustment& adjustment : adjustments) {
+    if (!adjustment_kind_is_evaluated(adjustment.kind)) {
+      if (result != nullptr) ++result->skipped;
+      continue;
+    }
+    Settings settings;
+    settings.load(adjustment.settings_json);
+
+    bool changed = false;
+    if (adjustment.kind == 3) {
+      /* 上游 applySixteenBit 的 HDR 分支：直接在 half 上做曝光，不 normalize。 */
+      const ExposureParams params = read_exposure(settings);
+      if (!params.identity()) {
+        deep_hdr_exposure(pixels, stride, static_cast<size_t>(width), static_cast<size_t>(height),
+                          static_cast<float>(std::pow(2.0, params.ev)),
+                          static_cast<float>(params.offset),
+                          static_cast<float>(1.0 / params.gamma));
+        changed = true;
+      }
+    } else if (adjustment.kind == 0) {
+      /* 跨通道调整走 3D cube：先 normalize 把高光除回白内，查完再乘回
+       * （上游 DeepLayer.lookup，DeepLayers.swift:240-244）。 */
+      if (!hsv_settings_is_identity(settings)) {
+        const int dim = kHsvCubeDim;
+        std::vector<float> cube;
+        build_hsv_cube(settings, dim, &cube);
+        std::vector<uint16_t> normal(static_cast<size_t>(width) * height * 4u, 0);
+        std::vector<float> scales(static_cast<size_t>(width) * height, 1.0f);
+        deep_hdr_normalize(pixels, stride, normal.data(), normal_stride, scales.data(),
+                           static_cast<size_t>(width), static_cast<size_t>(height));
+        deep_cube_apply(normal.data(), normal_stride, static_cast<size_t>(width),
+                        static_cast<size_t>(height), cube.data(), dim);
+        deep_hdr_restore(normal.data(), normal_stride, scales.data(), pixels, stride,
+                         static_cast<size_t>(width), static_cast<size_t>(height));
+        changed = true;
+      }
+    } else {
+      /*
+       * 其余 kind 与 tool_ops 的 HDR 路径同一条：normalize → 16 位往返 → restore。
+       * 渐变映射/黑白/色彩平衡的 8 位内核跨通道，用 mixesChannels 的 10 趟布局；
+       * 逐通道的调整用 4 趟即可。模糊（7/8）也走这里——见头文件记录的能力边界。
+       */
+      const bool mixes = adjustment.kind == 4 || adjustment.kind == 10 || adjustment.kind == 11;
+      bool op_changed = false;
+      const DeepRoundTripOp op = [&](uint8_t* buf, size_t w, size_t h, size_t s) {
+        op_changed = apply_adjustment_eight_bit(buf, static_cast<int32_t>(w),
+                                                static_cast<int32_t>(h), s, adjustment.kind,
+                                                settings);
+        /* 恒等参数不算失败：往返本身仍会把像素原样拼回去。 */
+        return true;
+      };
+      /* src/dst 指同一块：deep_hdr_round_trip 先落本地缓冲，不会边读边写。 */
+      if (!deep_hdr_round_trip(pixels, stride, pixels, stride, static_cast<size_t>(width),
+                               static_cast<size_t>(height), op, mixes ? 1 : 0, error)) {
+        return false;
+      }
+      changed = op_changed;
+    }
+
     if (result != nullptr) {
       ++result->applied;
       if (changed) result->changed = true;

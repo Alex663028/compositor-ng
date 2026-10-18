@@ -40,6 +40,7 @@
 #include "format/exr_codec.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
+#include "imaging/DeepPixels.h"
 
 namespace {
 
@@ -543,6 +544,40 @@ comp_result comp_io_export(comp_document document, const char* path_utf8,
   if (result != COMP_OK) return result;
   if (size.width <= 0 || size.height <= 0) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "document has no canvas size");
+  }
+
+  /*
+   * C4：EXR 是浮点容器，导出必须拿**合成表面本身**，不能先走 8 位栅格。
+   * 先降到 8 位再写 EXR 会把白点以上的光截掉——文件写得出来、内容是错的，比失败更坏。
+   *
+   * 这里按 CPU 后端支持的 RGBA16F 表面 flatten（8 位文档由后端用 rgba8_to_hdr
+   * 扩成 half，不额外丢信息），再用与 `.comp` 资产同一对曲线做
+   * 预乘 extended sRGB -> 线性光直通 alpha，最后写 HALF 通道。
+   * 若当前后端不支持 half 目标，flatten 会带名字失败，绝不悄悄降回 8 位。
+   */
+  if (format == COMP_FORMAT_EXR) {
+    const size_t half_stride = static_cast<size_t>(size.width) * 8u;
+    std::vector<uint8_t> half(static_cast<size_t>(size.height) * half_stride, 0u);
+    result = comp_render_flatten(document, half.data(), COMP_PIXEL_RGBA16F, half_stride);
+    if (result != COMP_OK) return result;
+
+    const size_t pixels = static_cast<size_t>(size.width) * static_cast<size_t>(size.height);
+    const size_t float_stride = static_cast<size_t>(size.width) * 4u * sizeof(float);
+    std::vector<float> linear(pixels * 4u);
+    deep_hdr_to_linear(reinterpret_cast<const uint16_t*>(half.data()), half_stride, linear.data(),
+                       float_stride, static_cast<size_t>(size.width),
+                       static_cast<size_t>(size.height));
+
+    std::vector<uint8_t> encoded;
+    std::string error;
+    if (!compositor::exr_encode_float(linear.data(), size.width, size.height,
+                                      compositor::kExrSampleHalf, &encoded, &error)) {
+      return compositor::abi::fail(engine, COMP_ERR_IO, error);
+    }
+    if (!write_file_bytes(path_utf8, encoded.data(), encoded.size(), &error)) {
+      return compositor::abi::fail(engine, COMP_ERR_IO, error);
+    }
+    return COMP_OK;
   }
 
   const size_t stride = static_cast<size_t>(size.width) * 4u;

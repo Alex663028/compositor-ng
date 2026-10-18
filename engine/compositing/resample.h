@@ -53,6 +53,25 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
                       const comp_rect* clip = nullptr);
 
 /*
+ * C5：与 build_layer_unit 同一套几何/采样口径，输出 **half（COMP_PIXEL_RGBA16F）**
+ * 单元缓冲，供 half 合成表面叠加。
+ *
+ *   - 源可以是 RGBA16F（直接按 half 解码）、RGBA16（v/65535）或 RGBA8（v/255）；
+ *   - 采样在 double 里做，**颜色不夹到 [0,1]**：HDR 的白点以上亮度必须留在单元里。
+ *     负值和 NaN 落 0（预乘缓冲不接受负颜色），alpha 夹进 [0,1]；
+ *   - 蒙版按最近采样乘进四个分量；
+ *   - 恒等情形（无旋转、尺寸相同）逐半精度精确：nearest 直接拷贝，bilinear/bicubic
+ *     在整数坐标处的权重退化为 1/0。
+ *
+ * 几何部分与 build_layer_unit 逐行同构（同一组 doc->source 逆映射），因为两条路
+ * 若各算一套坐标，同一个图层在 8 位与 half 表面上会落在不同的像素上。测试
+ * test_c5_half_surface 用「同一图层分别走两条路」钉住这一点。
+ */
+bool build_layer_unit_hdr(const Layer& layer, SamplingMode mode, ImageBuffer* out,
+                          comp_rect* out_bounds, std::string* error,
+                          const comp_rect* clip = nullptr);
+
+/*
  * 把普通 RGBA8 预乘缓冲（单位几何：无旋转/翻转/掩版，像素即内容）重采样到
  * 目标尺寸。用于 Image Size（对齐上游 ImageResizer）中已光栅化层单元的整幅
  * 缩放：逆映射 + 与 build_layer_unit 同一组采样内核；目标尺寸与源相同时在

@@ -50,6 +50,21 @@ void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, 
 void compositor_blend_pixel_scalar(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode,
                                    double src_alpha);
 
+/*
+ * C5：半精度（COMP_PIXEL_RGBA16F）表面的单像素混合。
+ *
+ * 与 blend_pixels 是**同一套 W3C 公式**（共用 blend_straight），差别只在解码/写回：
+ *   - 颜色按 half 值解码，**不夹到 [0,1]**：白以上的光必须活下来（HDR 的全部意义）；
+ *   - alpha 是覆盖率，解码/写回都夹进 [0,1]；
+ *   - 不强制颜色 <= alpha——HDR 的预乘颜色可以比 alpha 亮。
+ *
+ * 混合函数本身（blend_rgb）仍按 W3C 的 0..1 定义域求值：HDR 直通色 >1 时，
+ * 混合项按公式在超白处的行为计算（多数模式在 1 处饱和），未混合的 base/src
+ * 项仍保留原始亮度。这是**有据可查的边界**，不是静默夹白。
+ */
+void blend_pixels_half(uint16_t* dst_px, const uint16_t* src_px, comp_blend_mode mode,
+                       double src_alpha);
+
 /* 取剪贴基底图层在文档坐标处的 alpha（找不到返回 1.0，表现为不裁剪）。 */
 double clipping_factor(const Document& doc, const Layer& layer, int32_t x, int32_t y);
 
@@ -85,6 +100,17 @@ bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode
  */
 bool extract_stack_alpha(ImageBuffer* surface, std::vector<uint16_t>* coverage16, std::string* error);
 bool restore_stack_alpha(ImageBuffer* surface, const std::vector<uint16_t>& coverage16,
+                         std::string* error);
+
+/*
+ * C5：half 表面的同一对操作，走 deep_extract_alpha_hdr / deep_restore_alpha_hdr
+ * （上游 DeepLayer 的 HDR 剪贴栈口径）。coverage 是 float，因为 alpha 在 HDR
+ * 表面上也以 half 存储，8 位或 16 位容器都会把它的低位移掉。调用方按
+ * surface->format == COMP_PIXEL_RGBA16F 选择这一对重载。
+ */
+bool extract_stack_alpha(ImageBuffer* surface, std::vector<float>* coverage_hdr,
+                         std::string* error);
+bool restore_stack_alpha(ImageBuffer* surface, const std::vector<float>& coverage_hdr,
                          std::string* error);
 
 }  // namespace compositor

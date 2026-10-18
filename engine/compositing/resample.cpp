@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "core/comp_geometry.h"
+#include "imaging/DeepPixels.h"
 
 namespace compositor {
 
@@ -102,6 +103,90 @@ void sample_bicubic(const ImageBuffer& src, double sx, double sy, uint8_t out[4]
     out[c] = static_cast<uint8_t>(std::min(255.0, std::max(0.0, acc[c] + 0.5)));
   }
   enforce_premultiplied(out);
+}
+
+/* --------------------------------------------------- C5：half 单元采样内核 */
+
+/*
+ * 从任意源深度取一个直通（预乘）分量到 double：
+ *   RGBA16F -> IEEE half 解码；RGBA16 -> v/65535（与 deep_u16_to_half 同口径）；
+ *   RGBA8 -> v/255。边缘夹取与 8 位内核一致。
+ */
+inline void half_fetch(const ImageBuffer& src, int32_t x, int32_t y, double out[4]) {
+  const uint8_t* row = src.row(clamp_index(y, src.height));
+  const int32_t bpp = bytes_per_pixel(src.format);
+  const uint8_t* p = row + static_cast<size_t>(clamp_index(x, src.width)) * bpp;
+  if (src.format == COMP_PIXEL_RGBA16F) {
+    const uint16_t* h = reinterpret_cast<const uint16_t*>(p);
+    for (int c = 0; c < 4; ++c) out[c] = static_cast<double>(deep_half_value(h[c]));
+    return;
+  }
+  if (src.format == COMP_PIXEL_RGBA16) {
+    const uint16_t* w = reinterpret_cast<const uint16_t*>(p);
+    for (int c = 0; c < 4; ++c) out[c] = static_cast<double>(w[c]) / 65535.0;
+    return;
+  }
+  for (int c = 0; c < 4; ++c) out[c] = static_cast<double>(p[c]) / 255.0;
+}
+
+/* 颜色不夹白（HDR），但负值与 NaN 落 0：预乘缓冲不接受负颜色。 */
+inline double sanitize_hdr_color(double v) { return (v == v && v > 0.0) ? v : 0.0; }
+inline double sanitize_alpha(double v) {
+  if (!(v > 0.0)) return 0.0;
+  return v >= 1.0 ? 1.0 : v;
+}
+
+void sample_nearest_hdr(const ImageBuffer& src, double sx, double sy, double out[4]) {
+  half_fetch(src, static_cast<int32_t>(std::lround(sx)), static_cast<int32_t>(std::lround(sy)),
+             out);
+}
+
+void sample_bilinear_hdr(const ImageBuffer& src, double sx, double sy, double out[4]) {
+  const double fx = std::floor(sx);
+  const double fy = std::floor(sy);
+  const double tx = sx - fx;
+  const double ty = sy - fy;
+  const int32_t x0 = static_cast<int32_t>(fx);
+  const int32_t y0 = static_cast<int32_t>(fy);
+  double p00[4], p10[4], p01[4], p11[4];
+  half_fetch(src, x0, y0, p00);
+  half_fetch(src, x0 + 1, y0, p10);
+  half_fetch(src, x0, y0 + 1, p01);
+  half_fetch(src, x0 + 1, y0 + 1, p11);
+  for (int c = 0; c < 4; ++c) {
+    const double top = p00[c] * (1.0 - tx) + p10[c] * tx;
+    const double bottom = p01[c] * (1.0 - tx) + p11[c] * tx;
+    out[c] = top * (1.0 - ty) + bottom * ty;
+  }
+}
+
+void sample_bicubic_hdr(const ImageBuffer& src, double sx, double sy, double out[4]) {
+  const double fx = std::floor(sx);
+  const double fy = std::floor(sy);
+  const int32_t x0 = static_cast<int32_t>(fx);
+  const int32_t y0 = static_cast<int32_t>(fy);
+  double wx[4];
+  double wy[4];
+  catmull_rom_weights(sx - fx, wx);
+  catmull_rom_weights(sy - fy, wy);
+  double acc[4] = {0.0, 0.0, 0.0, 0.0};
+  for (int j = 0; j < 4; ++j) {
+    for (int i = 0; i < 4; ++i) {
+      double p[4];
+      half_fetch(src, x0 - 1 + i, y0 - 1 + j, p);
+      const double weight = wx[i] * wy[j];
+      for (int c = 0; c < 4; ++c) acc[c] += p[c] * weight;
+    }
+  }
+  for (int c = 0; c < 4; ++c) out[c] = acc[c];
+}
+
+/* 写回 half：alpha 夹进 [0,1]，颜色只挡掉负值/NaN（不夹白）。 */
+inline void store_half_pixel(uint16_t* dst, const double v[4]) {
+  for (int c = 0; c < 3; ++c) {
+    dst[c] = deep_half_bits(static_cast<float>(sanitize_hdr_color(v[c])));
+  }
+  dst[3] = deep_half_bits(static_cast<float>(sanitize_alpha(v[3])));
 }
 
 }  // namespace
@@ -265,6 +350,94 @@ bool build_layer_unit(const Layer& layer, SamplingMode mode, ImageBuffer* out,
               std::min(255.0, std::max(0.0, static_cast<double>(dst_px[c]) * m + 0.5)));
         }
       }
+    }
+  }
+  return true;
+}
+
+bool build_layer_unit_hdr(const Layer& layer, SamplingMode mode, ImageBuffer* out,
+                          comp_rect* out_bounds, std::string* error, const comp_rect* clip) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "out buffer is null";
+    return false;
+  }
+  const comp_rect bounds = layer.effective_bounds();
+  if (out_bounds != nullptr) *out_bounds = bounds;
+
+  if (layer.pixels.empty() || is_empty(bounds)) {
+    out->resize(0, 0, COMP_PIXEL_RGBA16F);
+    return true;
+  }
+  if (layer.pixels.format != COMP_PIXEL_RGBA8 && layer.pixels.format != COMP_PIXEL_RGBA16 &&
+      layer.pixels.format != COMP_PIXEL_RGBA16F) {
+    if (error != nullptr) *error = "unsupported layer pixel format";
+    return false;
+  }
+
+  comp_rect window = bounds;
+  if (clip != nullptr) {
+    window = intersection(bounds, *clip);
+    if (is_empty(window)) {
+      out->resize(0, 0, COMP_PIXEL_RGBA16F);
+      return true;
+    }
+  }
+  if (out_bounds != nullptr) *out_bounds = window;
+
+  const int32_t sw = layer.pixels.width;
+  const int32_t sh = layer.pixels.height;
+  const int32_t ow = window.w;
+  const int32_t oh = window.h;
+  if (ow > compositor::limits::kMaxSide || oh > compositor::limits::kMaxSide ||
+      static_cast<int64_t>(ow) * oh > compositor::limits::kMaxSurfacePixels) {
+    if (error != nullptr) *error = "layer unit too large";
+    return false;
+  }
+
+  out->resize(ow, oh, COMP_PIXEL_RGBA16F);
+
+  const bool rotate = std::fabs(layer.rotation) > 1e-9;
+  const double rad = static_cast<double>(layer.rotation) * kPi / 180.0;
+  const double cos_t = rotate ? std::cos(rad) : 1.0;
+  const double sin_t = rotate ? std::sin(rad) : 0.0;
+
+  const bool has_mask = !layer.mask.empty();
+  const int32_t mw = layer.mask.width;
+  const int32_t mh = layer.mask.height;
+
+  for (int32_t y = 0; y < oh; ++y) {
+    uint8_t* dst_row = out->writable_row(y);
+    const double doc_y = static_cast<double>(y + window.y - bounds.y);
+    const double vd = (doc_y + 0.5) / bounds.h * 2.0 - 1.0;
+    for (int32_t x = 0; x < ow; ++x) {
+      const double doc_x = static_cast<double>(x + window.x - bounds.x);
+      const double ud = (doc_x + 0.5) / bounds.w * 2.0 - 1.0;
+      double us = rotate ? (ud * cos_t + vd * sin_t) : ud;
+      double vs = rotate ? (-ud * sin_t + vd * cos_t) : vd;
+      if (layer.flip_x) us = -us;
+      if (layer.flip_y) vs = -vs;
+      const double sx = (us + 1.0) * 0.5 * sw - 0.5;
+      const double sy = (vs + 1.0) * 0.5 * sh - 0.5;
+
+      uint16_t* dst_px = reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * 8u);
+      if (!inside(sx, sy, sw, sh)) continue; /* 源外 -> 保持透明 */
+
+      double value[4];
+      switch (mode) {
+        case SamplingMode::kNearest: sample_nearest_hdr(layer.pixels, sx, sy, value); break;
+        case SamplingMode::kSmooth: sample_bilinear_hdr(layer.pixels, sx, sy, value); break;
+        case SamplingMode::kHighQuality:
+        default: sample_bicubic_hdr(layer.pixels, sx, sy, value); break;
+      }
+
+      if (has_mask) {
+        const int32_t mx = clamp_index(static_cast<int32_t>(std::lround(sx)), mw);
+        const int32_t my = clamp_index(static_cast<int32_t>(std::lround(sy)), mh);
+        const double m = static_cast<double>(
+                             layer.mask.pixel_data()[static_cast<size_t>(my) * mw + mx]) / 255.0;
+        for (int c = 0; c < 4; ++c) value[c] *= m;
+      }
+      store_half_pixel(dst_px, value);
     }
   }
   return true;

@@ -24,8 +24,10 @@ bool CpuRenderBackend::render_document(Document& doc, const comp_render_target& 
     if (error != nullptr) *error = "target.pixels is null";
     return false;
   }
-  if (target.format != COMP_PIXEL_RGBA8) {
-    if (error != nullptr) *error = "cpu backend only supports RGBA8";
+  if (target.format != COMP_PIXEL_RGBA8 && target.format != COMP_PIXEL_RGBA16F) {
+    if (error != nullptr) {
+      *error = "cpu backend only supports RGBA8 and RGBA16F render targets";
+    }
     return false;
   }
 
@@ -38,12 +40,42 @@ bool CpuRenderBackend::render_document(Document& doc, const comp_render_target& 
   ImageBuffer composite;
   if (!composite_document(doc, &composite, error)) return false;
 
-  const size_t row_bytes = static_cast<size_t>(state.width) * 4;
+  /*
+   * C5：目标深度与合成表面深度不一致时显式转换一次。
+   *
+   *   - half 合成 -> 8 位目标：走 hdr_to_rgba8（上游 `image(_:)` 的显示口径，
+   *     白点以上按白显示），不是按位强转；
+   *   - 8 位合成 -> half 目标：走 rgba8_to_hdr（扩展 sRGB 编码、预乘），
+   *     这样 8 位文档也能请求 half 表面而不必另写一条合成路径。
+   *
+   * 同深度时零拷贝直通：8 位文档的既有输出逐字节不变。
+   */
+  ImageBuffer converted;
+  const ImageBuffer* source = &composite;
+  if (target.format == COMP_PIXEL_RGBA8 && composite.format != COMP_PIXEL_RGBA8) {
+    if (!hdr_to_rgba8(composite, &converted)) {
+      if (error != nullptr) *error = "failed to build an 8-bit view of the HDR composite";
+      return false;
+    }
+    source = &converted;
+  } else if (target.format == COMP_PIXEL_RGBA16F && composite.format != COMP_PIXEL_RGBA16F) {
+    ImageBuffer hdr;
+    hdr.resize(composite.width, composite.height, COMP_PIXEL_RGBA16F);
+    if (!rgba8_to_hdr(composite, &hdr)) {
+      if (error != nullptr) *error = "failed to build a half view of the 8-bit composite";
+      return false;
+    }
+    converted = std::move(hdr);
+    source = &converted;
+  }
+
+  const size_t row_bytes =
+      static_cast<size_t>(state.width) * static_cast<size_t>(bytes_per_pixel(target.format));
   const size_t stride = target.stride >= row_bytes ? target.stride : row_bytes;
   uint8_t* base = static_cast<uint8_t*>(target.pixels);
 
   for (int32_t y = 0; y < state.height; ++y) {
-    std::memcpy(base + static_cast<size_t>(y) * stride, composite.row(y), row_bytes);
+    std::memcpy(base + static_cast<size_t>(y) * stride, source->row(y), row_bytes);
   }
   return true;
 }

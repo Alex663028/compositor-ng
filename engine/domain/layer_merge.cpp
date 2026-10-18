@@ -8,6 +8,7 @@
 
 #include "compositing/compositor.h"
 #include "domain/document.h"
+#include "imaging/DeepPixels.h"
 
 namespace compositor {
 
@@ -72,9 +73,25 @@ bool trim_to_content(const ImageBuffer& src, ImageBuffer* out, comp_rect* out_pl
   for (int32_t y = 0; y < src.height; ++y) {
     const uint8_t* row = src.row(y);
     for (int32_t x = 0; x < src.width; ++x) {
-      /* alpha 位于每像素最后一字节（RGBA8=a[3]，RGBA16/16F 的高字节）。 */
+      /*
+       * alpha 按格式实际解码：RGBA8 看第 4 字节；16 位整数与 half 都看
+       * 每像素最后两个字节。此前统一判 `px[bpp-1]`（最后一字节的高位）
+       * 会把 half 的小 alpha 当 0（0x00FF -> 高位 0），C5 让 HDR 合成结果
+       * 也走这里后，这就不再是理论问题。
+       */
       const uint8_t* px = row + static_cast<size_t>(x) * static_cast<size_t>(bpp);
-      if (px[bpp - 1] == 0) continue;
+      bool has_coverage = false;
+      if (src.format == COMP_PIXEL_RGBA8) {
+        has_coverage = px[3] != 0;
+      } else if (src.format == COMP_PIXEL_RGBA16F) {
+        has_coverage =
+            deep_half_value(*reinterpret_cast<const uint16_t*>(px + 6)) > 0.0f;
+      } else {
+        uint16_t a16 = 0;
+        std::memcpy(&a16, px + 6, sizeof(a16));
+        has_coverage = a16 != 0;
+      }
+      if (!has_coverage) continue;
       min_x = std::min(min_x, x);
       max_x = std::max(max_x, x);
       min_y = std::min(min_y, y);

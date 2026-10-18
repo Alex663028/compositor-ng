@@ -78,14 +78,18 @@ CodecTable::CodecTable() {
    * 而不是等用户打开 PIZ 文件时才收到一句笼统的失败。
    */
   const bool has_exr = codec_lib_can_decode_float(6u);
+  const bool has_exr_write = codec_lib_can_encode(6u);
   exr_note =
       has_exr ? std::string("in-tree scanline codec (") + codec_lib_exr_backend() +
                     "); NONE/RLE/ZIPS/ZIP only, PIZ/PXR24/B44/DWA are rejected with a reason; "
-                    "tiled/deep/multipart/UINT/subsampled files rejected; export unsupported"
+                    "tiled/deep/multipart/UINT/subsampled files rejected; " +
+                    (has_exr_write ? "export writes scanline NONE + HALF, linear light with "
+                                     "straight alpha from the full-depth composite"
+                                   : "export unsupported in this build")
               : "in-tree EXR codec is not compiled into this build";
   entries[5] = CodecEntry{6u, "EXR", has_exr ? kCodecBuiltIn : kCodecUnavailable,
                           has_exr ? codec_lib_exr_backend() : "in-tree scanline codec",
-                          exr_note.c_str(), has_exr, false};
+                          exr_note.c_str(), has_exr, has_exr_write};
   entries[6] = CodecEntry{7u, "PSD", has_stb ? kCodecVendored : kCodecUnavailable,
                           has_stb ? codec_lib_stb_backend() : "custom/libpsd", psd_note.c_str(),
                           has_stb, false};

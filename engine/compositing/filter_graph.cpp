@@ -7,6 +7,8 @@
 #include "compositing/composite_ops.h"
 #include "compositing/adjustment_eval.h"
 #include "compositing/blend.h"
+#include "compositing/compositor.h"
+#include "imaging/DeepPixels.h"
 
 namespace compositor {
 
@@ -270,6 +272,69 @@ bool blend_adjusted_in_blend_mode(const ImageBuffer& adjusted, const ImageBuffer
   return true;
 }
 
+/*
+ * C5：half 表面上的同一对助手。
+ *
+ * 与 8 位版逐行同构，只把像素读写换成 half。两条路必须给出同一套
+ * 「coverage/不透明度如何作用」的语义，否则同一个调整图层在 HDR 文档里
+ * 会与 8 位文档分叉；差别只在颜色是浮点、且**不夹到 [0,1]**。
+ */
+void mix_adjusted_through_coverage_hdr(ImageBuffer* dst, const ImageBuffer& adjusted,
+                                       double opacity, const CoverageMaps& coverage) {
+  if (dst == nullptr || dst->empty()) return;
+  for (int32_t y = 0; y < dst->height; ++y) {
+    uint16_t* dst_row = reinterpret_cast<uint16_t*>(dst->writable_row(y));
+    const uint16_t* src_row = reinterpret_cast<const uint16_t*>(adjusted.row(y));
+    for (int32_t x = 0; x < dst->width; ++x) {
+      const double strength = coverage.at(x, y) * opacity;
+      if (strength <= 0.0) continue;
+      uint16_t* px = dst_row + static_cast<size_t>(x) * 4u;
+      const uint16_t* src = src_row + static_cast<size_t>(x) * 4u;
+      if (strength >= 1.0) {
+        px[0] = src[0];
+        px[1] = src[1];
+        px[2] = src[2];
+        continue; /* alpha 不动：调整只改颜色，coverage 属于下层。 */
+      }
+      for (int channel = 0; channel < 3; ++channel) {
+        const double from = static_cast<double>(deep_half_value(px[channel]));
+        const double to = static_cast<double>(deep_half_value(src[channel]));
+        px[channel] = deep_half_bits(static_cast<float>(from + (to - from) * strength));
+      }
+      /* alpha 不动 */
+    }
+  }
+}
+
+/* half 版：全不透明混一次、再取回 below 的 alpha（见 8 位版注释）。 */
+bool blend_adjusted_in_blend_mode_hdr(const ImageBuffer& adjusted, const ImageBuffer& below,
+                                      comp_blend_mode mode, ImageBuffer* out) {
+  if (out == nullptr || adjusted.empty() || below.empty()) return false;
+  if (adjusted.width != below.width || adjusted.height != below.height) return false;
+  if (!is_blend_supported(mode)) return false;
+  out->resize(adjusted.width, adjusted.height, COMP_PIXEL_RGBA16F);
+  const uint16_t one = deep_half_bits(1.0f);
+  for (int32_t y = 0; y < out->height; ++y) {
+    uint16_t* dst_row = reinterpret_cast<uint16_t*>(out->writable_row(y));
+    const uint16_t* adj_row = reinterpret_cast<const uint16_t*>(adjusted.row(y));
+    const uint16_t* below_row = reinterpret_cast<const uint16_t*>(below.row(y));
+    for (int32_t x = 0; x < out->width; ++x) {
+      uint16_t* px = dst_row + static_cast<size_t>(x) * 4u;
+      const uint16_t* adj = adj_row + static_cast<size_t>(x) * 4u;
+      const uint16_t* below_px = below_row + static_cast<size_t>(x) * 4u;
+      uint16_t opaque_above[4] = {adj[0], adj[1], adj[2], one};
+      uint16_t opaque_below[4] = {below_px[0], below_px[1], below_px[2], one};
+      uint16_t mixed[4] = {below_px[0], below_px[1], below_px[2], one};
+      blend_pixels_half(mixed, opaque_above, mode, 1.0);
+      px[0] = mixed[0];
+      px[1] = mixed[1];
+      px[2] = mixed[2];
+      px[3] = below_px[3]; /* 取回 below 的 coverage */
+    }
+  }
+  return true;
+}
+
 bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
                const ImageBuffer& backdrop, double opacity_scale, ImageBuffer* out,
                std::string* error) {
@@ -303,6 +368,17 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
   }
 
   /*
+   * C5：表面深度跟文档走（有 HDR 图层即 half）。这里从 backdrop 读，
+   * 因为递归的每一条路径都把同一深度的缓冲传下来：再扫一遍图层树只会
+   * 让「哪张表面是 half」出现第二个判定点。
+   */
+  const comp_pixel_format canvas_format =
+      backdrop.empty() ? composite_surface_format(doc)
+                       : (backdrop.format == COMP_PIXEL_RGBA16F ? COMP_PIXEL_RGBA16F
+                                                                : COMP_PIXEL_RGBA8);
+  const bool half_surface = canvas_format == COMP_PIXEL_RGBA16F;
+
+  /*
    * 剪贴栈（上游 LiveMaskRenderer.drawComposite:110-150）。
    * inputs[0] 是基底，inputs[1..] 是被剪的成员（自下而上）。
    *
@@ -334,7 +410,7 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
      * 当基底的下层——否则基底自己没像素，栈就空了。
      */
     ImageBuffer base_backdrop;
-    base_backdrop.resize(doc.state().width, doc.state().height, COMP_PIXEL_RGBA8);
+    base_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
     base_backdrop.clear_transparent();
     ImageBuffer base_surface;
     if (!eval_node(doc, graph, node.inputs[0], base_backdrop, opacity_scale, &base_surface,
@@ -350,13 +426,16 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
     }
     surface = base_surface;
 
-    /* 第二步：取走 alpha、颜色拉成不透明。 */
+    /* 第二步：取走 alpha、颜色拉成不透明（coverage 容器与表面同深度）。 */
     std::vector<uint16_t> coverage;
-    if (!extract_stack_alpha(&surface, &coverage, error)) return false;
+    std::vector<float> coverage_hdr;
+    const bool extracted = half_surface ? extract_stack_alpha(&surface, &coverage_hdr, error)
+                                        : extract_stack_alpha(&surface, &coverage, error);
+    if (!extracted) return false;
 
     /* 第三步：成员在**不透明**基底上按各自模式叠（成员自起透明画布）。 */
     ImageBuffer member_backdrop;
-    member_backdrop.resize(doc.state().width, doc.state().height, COMP_PIXEL_RGBA8);
+    member_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
     member_backdrop.clear_transparent();
     for (size_t i = 1; i < node.inputs.size(); ++i) {
       ImageBuffer member_surface;
@@ -364,19 +443,39 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
                      error)) {
         return false;
       }
+      /*
+       * 成员深度必须与栈表面一致：不同深度按同一 stride 混合会把 half 的
+       * 8 字节行当 RGBA8 的 4 字节行读成垃圾。宁可具名失败，也不静默出错色。
+       */
+      if (member_surface.format != surface.format) {
+        set_error(error, "clipping stack member depth does not match the stack surface");
+        return false;
+      }
       const comp_blend_mode mode = node_blend_mode(doc, graph, node.inputs[i]);
+      const int32_t bpp = half_surface ? 8 : 4;
       for (int32_t y = 0; y < surface.height; ++y) {
         uint8_t* dst_row = surface.writable_row(static_cast<size_t>(y));
         const uint8_t* src_row = member_surface.row(static_cast<size_t>(y));
-        for (int32_t x = 0; x < surface.width; ++x) {
-          blend_pixels(dst_row + static_cast<size_t>(x) * 4,
-                       src_row + static_cast<size_t>(x) * 4, mode, 1.0);
+        if (half_surface) {
+          for (int32_t x = 0; x < surface.width; ++x) {
+            blend_pixels_half(reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * bpp),
+                              reinterpret_cast<const uint16_t*>(src_row +
+                                                                static_cast<size_t>(x) * bpp),
+                              mode, 1.0);
+          }
+        } else {
+          for (int32_t x = 0; x < surface.width; ++x) {
+            blend_pixels(dst_row + static_cast<size_t>(x) * bpp,
+                         src_row + static_cast<size_t>(x) * bpp, mode, 1.0);
+          }
         }
       }
     }
 
     /* 第四步：还原 alpha。 */
-    if (!restore_stack_alpha(&surface, coverage, error)) return false;
+    const bool restored = half_surface ? restore_stack_alpha(&surface, coverage_hdr, error)
+                                       : restore_stack_alpha(&surface, coverage, error);
+    if (!restored) return false;
 
     /* 第五步：整个栈以基底的模式与不透明度参与。 */
     *out = backdrop;
@@ -403,11 +502,23 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
      */
     if (!layer->adjustments.empty()) {
       ImageBuffer adjusted = backdrop;
+      const bool adjusted_half = adjusted.format == COMP_PIXEL_RGBA16F;
       AdjustmentEvalResult eval;
       std::string eval_error;
-      if (!apply_adjustments(layer->adjustments, adjusted.writable_pixels().data(),
-                             adjusted.width, adjusted.height, adjusted.stride(), &eval,
-                             &eval_error)) {
+      uint8_t* adjusted_pixels = adjusted.writable_pixels().data();
+      /*
+       * C5：half 表面走 apply_adjustments_hdr（曝光直接落 half；跨通道调整
+       * normalize → 16 位往返 → restore）。8 位表面仍走原来那条路，
+       * 逐字节不变——这是 C5 的验收底线。
+       */
+      const bool applied =
+          adjusted_half
+              ? apply_adjustments_hdr(layer->adjustments,
+                                      reinterpret_cast<uint16_t*>(adjusted_pixels), adjusted.width,
+                                      adjusted.height, adjusted.stride(), &eval, &eval_error)
+              : apply_adjustments(layer->adjustments, adjusted_pixels, adjusted.width,
+                                  adjusted.height, adjusted.stride(), &eval, &eval_error);
+      if (!applied) {
         set_error(error, eval_error.empty() ? "apply adjustment failed" : eval_error);
         return false;
       }
@@ -418,7 +529,11 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
         const double layer_opacity = static_cast<double>(layer->opacity) * opacity_scale;
         if (layer->blend != COMP_BLEND_NORMAL) {
           ImageBuffer styled;
-          if (blend_adjusted_in_blend_mode(adjusted, backdrop, layer->blend, &styled)) {
+          const bool styled_ok =
+              adjusted_half
+                  ? blend_adjusted_in_blend_mode_hdr(adjusted, backdrop, layer->blend, &styled)
+                  : blend_adjusted_in_blend_mode(adjusted, backdrop, layer->blend, &styled);
+          if (styled_ok) {
             adjusted = std::move(styled);
           }
         }
@@ -438,7 +553,11 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
           parent_id = folder->parent;
           ++depth;
         }
-        mix_adjusted_through_coverage(out, adjusted, layer_opacity, coverage);
+        if (adjusted_half) {
+          mix_adjusted_through_coverage_hdr(out, adjusted, layer_opacity, coverage);
+        } else {
+          mix_adjusted_through_coverage(out, adjusted, layer_opacity, coverage);
+        }
       }
     } else {
       *out = backdrop;
@@ -477,7 +596,7 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
 
   /* 隔离：子树先合成到透明缓冲，再作为整体按组的混合模式与不透明度叠加。 */
   ImageBuffer internal;
-  internal.resize(doc.state().width, doc.state().height, COMP_PIXEL_RGBA8);
+  internal.resize(doc.state().width, doc.state().height, canvas_format);
   internal.clear_transparent();
   for (int32_t input : node.inputs) {
     ImageBuffer next;
@@ -517,7 +636,7 @@ bool execute_filter_graph(const Document& doc, const FilterGraph& graph, ImageBu
   }
 
   ImageBuffer backdrop;
-  backdrop.resize(state.width, state.height, COMP_PIXEL_RGBA8);
+  backdrop.resize(state.width, state.height, composite_surface_format(doc));
   backdrop.clear_transparent();
 
   if (graph.output < 0 || graph.nodes.empty()) {

@@ -1037,10 +1037,11 @@ COMP_TEST(layer_set_pixels_accepts_halffloat_format) {
  *
  * 三件事被同时钉住：
  *   1. **half 不能当 16 位整数读。** 若按位模式当整数，2.0（0x4000 = 16384）
- *      会得 8 位的 64、alpha 0.5（0x3800 = 14336）会得 56，黑底上得 ~(14,14,14,56)，
- *      与正确值 (128,128,128,128) 差两个数量级。
- *   2. **预乘。** 色分量 2.0 × alpha 0.5 = 1.0 → 截到白；合成时再按 0.5 不透明度
- *      压在黑底上得 128（alpha 亦为 128）。
+ *      会得 8 位的 64、alpha 0.5（0x3800 = 14336）会得 56，黑底上得 ~(64,64,64,255)
+ *      的中灰；与正确值「白」一眼可分。
+ *   2. **预乘。** 色 2.0 配 alpha 0.5 是直通 4.0（白点以上）；不透明黑底上合成
+ *      得预乘 2.0、alpha 1，显示时截到纯白。若把颜色当直通值再用 alpha 压一次，
+ *      白会被算成 128——这正是「先夹白再乘 alpha」的 8 位中间缓冲才会有的结果。
  *   3. **高光截断而非回绕。** (1,1) 的 half 是 65504（比 2.0 亮三万多倍），
  *      正确做法是同样截到白；不加夹紧则 65504×65535 取整后回绕成乱色。
  *      断言 (1,1) 与 (0,0) 完全相同即证明截断生效。
@@ -1087,12 +1088,20 @@ COMP_TEST(hdr_highlights_clamp_to_white_in_eight_bit_view) {
                  "half-float layer pixels are accepted on a new layer too");
 
   const std::vector<uint8_t> canvas = flatten(document, 4, 4);
-  /* 容差 2：dither 加约一阶噪声，128 上下浮动一格是预期内的。
+  /*
+   * 期望是纯白。half 像素是**预乘**的：色 2.0 配 alpha 0.5 意味着直通分量
+   * 4.0（白点以上），压在**不透明**黑底上按 W3C 公式得预乘 0.5×4.0 = 2.0、
+   * alpha 1 —— 仍是高光。C5 起合成表面跟文档深度走（有 HDR 图层就是 half），
+   * 这个 2.0 在合成途中不被截断；只有落到 RGBA8 渲染目标时，显示副本才按
+   * 上游 `image(_:)` 的口径「白点以上显示为白」截成 255。
+   *
    * 注意 alpha 断言是 255：背景是**不透明**黑，它把整幅的 alpha 拉满；
-   * HDR 层那 0.5 的不透明度体现在 RGB 上（白 × 0.5 压在黑底 = 128）。 */
-  COMP_CHECK_MSG(matches(canvas, 4, 0, 0, 128, 128, 128, 255, 2),
+   * HDR 层那 0.5 的 alpha 体现在预乘颜色上（2.0×0.5 的直通 4.0），不是把
+   * 白压成 128——128 只有在 8 位中间缓冲里先夹白再乘 alpha 才会出现。
+   */
+  COMP_CHECK_MSG(matches(canvas, 4, 0, 0, 255, 255, 255, 255, 2),
                  "an HDR layer reads as half floats, premultiplied, over black");
-  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 128, 128, 128, 255, 2),
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 255, 255, 255, 255, 2),
                  "half 65504 clamps to white exactly like half 2.0 instead of wrapping");
 
   comp_document_destroy(document);

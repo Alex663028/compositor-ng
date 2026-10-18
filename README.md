@@ -305,11 +305,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **72**（38 个 `.c` + 34 个 `.cpp`；其中 vendored 第三方 26 个 `.c`） |
+| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **74**（38 个 `.c` + 36 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 249 cases, 0 failed, 0 check failures`（当前基线；§6.1.15 起在此基础上继续累加） |
+| 测试 | `summary: 292 cases, 0 failed, 0 check failures`（当前基线；§6.1.20 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：34 `.cpp` / 38 `.c`（含 vendored 26）/ 72 `.h`；tests：21 `.cpp` |
+| 源码规模 | engine：36 `.cpp` / 38 `.c`（含 vendored 26）/ 74 `.h`；tests：27 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
@@ -338,8 +338,9 @@ python scripts/build.py --clean
   越界/类型错/未知顶层键被拒；ABI 元数据（`param_count` / `param_at` / `validate`）与
   `.comp` 往返后「kind 与 settings 逐字节回读」护栏。
 - `test_codec.cpp`：能力表只陈述事实（PNG = `VENDORED`/`BUILTIN`、JPEG = `VENDORED` 且 note 含
-  `stb_image`、EXR = `BUILTIN` 且 note 写明 scanline 与 export unsupported、未知格式 `NOT_FOUND`、
-  截断读取仍以 `'\0'` 收尾）；另有 `test_exr.cpp` 覆盖自研 EXR 读写器（见 §6.1.18）；
+  `stb_image`、EXR = `BUILTIN` 且 note 写明 scanline 与 `export writes … HALF`、未知格式 `NOT_FOUND`、
+  截断读取仍以 `'\0'` 收尾）；另有 `test_exr.cpp` 覆盖自研 EXR 读写器（见 §6.1.18）、
+  `test_c4_exr_export.cpp` 覆盖合成结果导出（见 §6.1.20）；
   PNG 导出→导入**往返逐字节精确**；JPEG 往返**有损但一致**；`import_layer` 恰好追加一层；
   文件缺失是 IO 错误而非「不支持」；不可用格式（如 TIFF）显式 `UNSUPPORTED`；
   **P1-2 负向入库**：伪造 IHDR（`40000x40000` 与 `1000000x4`，CRC 重算）在 C ABI（libpng 路径）
@@ -400,7 +401,7 @@ python scripts/build.py --clean
 | 面板控件由引擎驱动 | 外壳经 `comp_layer_adjustment_param_count` / `param_at` 取控件元数据，经 `comp_layer_adjustment_build_settings` 组装 settings JSON（壳内不拼、不解析 JSON）；实机自检回读 `{"exposureSettings":{"exposure":1.5,"offset":0.25,"gamma":2.2}}` |
 | 调整图层回读 | `.comp` 往返后 `comp_layer_adjustment_count == 1`，kind 与 settings 逐字节一致（`tests/test_adjustment.cpp`） |
 | 外壳实机自检 | `build/compositor_shell.exe --selftest=<报告文件路径>` 实机 **rc = 0**，**27 项全 OK**（本轮新增调整面板 7 项 + 删除 3 项） |
-| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（只读）；EXR = `BUILTIN`（树内 scanline 读取器，note 写明只读与支持的压缩）；未知格式 = `COMP_ERR_NOT_FOUND` |
+| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（只读）；EXR = `BUILTIN`（树内 scanline 读写器，note 写明可写 HALF 与支持的压缩）；未知格式 = `COMP_ERR_NOT_FOUND` |
 | 真实导入 / 导出 | `comp_io_export` / `comp_io_import` / `comp_io_import_layer` 已打通：PNG 8x6 全不透明像素往返 **diffs = 0、worst = 0 LSB**；JPEG 往返有损但一致 |
 | 独立解码器交叉 | `scripts/crosscheck_codec.py` 用 PIL 12.3.0 回读引擎产物：`round_trip.png` / `layer_source.png` / `round_trip.jpg` 全部 `[OK]`、`failures = 0` |
 | 回归（M5 当时） | `summary: 83 cases, 0 failed, 0 check failures`；累计到最新为 **106**（见 §6.1.6） |
@@ -1010,12 +1011,129 @@ I1 拿掉逆重排时用例**仍然是绿的**。改成真正的重复游程编�
 **6/6 PASS**；OHOS aarch64 交叉编译 **73 单元 fail=0**；Windows 壳 27 项 SHA256 与基线
 一致；PIL 交叉验证 rc=0。报告：`report/C3b-exr-reader-20261018-claude.md`。
 
-**如实边界**：EXR **只读不写**——`comp_io_export(EXR)` 仍是 `UNSUPPORTED`（合成结果导出是
-C4）；只做 scanline（tile/deep/multipart 未实现）；PIZ/PXR24/B44/DWA 需要对应编解码器，
+**如实边界**：C3b 交付时 EXR 只读不写（`comp_io_export(EXR)` 为 `UNSUPPORTED`）；
+写侧已由 C4 接上（§6.1.20），但只写 scanline NONE + HALF。读取只做 scanline
+（tile/deep/multipart 未实现）；PIZ/PXR24/B44/DWA 需要对应编解码器，
 明确拒绝；不解析 chromaticities 等色彩属性，按 sRGB 口径；ZIP 的 16 字节前缀变体只在两个
 长度字段都精确匹配时才跳过。
 
+### 6.1.19 C 方案 C5：合成表面按文档深度携带 half（2026-10-18，Claude 接手）
+
+C5 的目标是让**文档里有 HDR 图层时，合成表面本身就是 half**，白点以上的光在合成途中不被截断，
+只有最终交付 8 位的缩略图/渲染目标才按显示口径截到白。验收底线是**8 位文档的 24 种混合模式
+逐字节不变**。
+
+| 位置 | 内容 |
+|------|------|
+| `compositing/compositor.cpp` | `composite_surface_format` 扫到任一非空 RGBA16F 图层即返回 half；`composite_layer` 按图层（或剪贴基底的 half）决定表面深度，half 结果经 `hdr_to_rgba8` 返回显示副本（缩略图输出契约仍是 RGBA8） |
+| `compositing/composite_ops.cpp` | `half_to_straight`（alpha 夹 [0,1]，**颜色不夹**）、`store_half_premultiplied`（不夹到白、不夹到 alpha）、`blend_pixels_half`（与 8 位共用同一套 W3C 公式）、`blend_layer_into` 的 half 分支、`extract/restore_stack_alpha` 的 float 重载（走 `deep_extract_alpha_hdr` / `deep_restore_alpha_hdr`） |
+| `compositing/filter_graph.cpp` | 剪贴栈表面/成员 backdrop 取 `canvas_format`；成员结果与栈表面深度不一致时以具名错误拒绝，绝不按错误字节宽混读 |
+| `compositing/adjustment_eval.cpp` | half 表面上的调整：Exposure 直落 `deep_hdr_exposure`；跨通道调整 `deep_hdr_normalize` → 16 位往返 → `deep_hdr_restore` |
+| `render/cpu_backend.cpp` | 渲染目标接受 RGBA8 与 RGBA16F；同深度零拷贝，跨深度显式转换（half→8 位走 `hdr_to_rgba8`，8 位→half 走 `rgba8_to_hdr`）；其余格式**带名字拒绝** |
+| `domain/layer_merge.cpp` | `trim_to_content` 按格式解码 alpha（8 位看第 4 字节；16 位整数与 half 都看末两字节；half 走 `deep_half_value`），`0x00FF` / `0x0001` 不再被当成透明裁掉 |
+
+**三处「看起来该夹、实际绝不能夹」**：
+
+1. half 颜色**不夹到 alpha**。预乘 HDR 像素的 2.0 配 alpha 0.5 是合法状态（直通 4.0 的光），
+   夹一次就变成 0.5。8 位显示副本的夹紧发生在 `dither_quantize16`（`DitherPixels.c:325-334`）：
+   先按 alpha 截断再量化，于是 2.0@0.5 显示为 **128**（50% 白），不是 255（不透明的白）。
+2. half 的**显示口径是截断到白，不是回绕**。`hdr_to_rgba8` 逐通道夹到 0..65535 再抖动量化，
+   2.0 与 half 65504 都显示为白。
+3. **HSV 的 saturation/lightness 是绝对 HSL 参数**（`hsv_to_rgb(hue, sat/100, light/100, …)`），
+   不是增量。lightness=50 表示归一化后的 0.5，不是「加 50%」。
+
+**护栏（`tests/test_c5_half_surface.cpp`，10 例；总数 276 → 286）**：
+
+1. 表面深度跟随文档（RGBA8→8 位、RGBA16→8 位既有口径、RGBA16F→half）；
+2. 2.0 与 65504 穿过合成仍原值，8 位副本两者都截到白；
+3. **验收底线**：24 种混合模式下 FilterGraph 结果与直接顺序 `blend_layer_into` 逐字节相同；
+4. half 混合与 8 位公式逐通道差 ≤ 2（24 种模式）；
+5. 预乘颜色可高于 alpha（2.0 > 0.5，且不被改写）；
+6. half 表面上的曝光与 HSV 调整保留白点以上的光；
+7. half 剪贴栈按栈语义求值（成员替换基底颜色、alpha 保持 1）；
+8. CPU 后端接受 half 目标（逐字节零拷贝）、RGBA8 目标是 half 结果的显示副本、RGBA16 被具名拒绝；
+9. 图层缩略图对 HDR 图层仍返回 RGBA8 显示副本（2.0@0.5 → 128）；
+10. 裁边按格式解码 alpha（half `0x00FF`、16 位整数 `0x0001` 都算有内容）。
+
+**反向注入（5 轮，各自只打红该打红的用例）**：
+
+| 注入 | 结果 |
+|------|------|
+| A. `store_half_premultiplied` 把颜色夹到 alpha | 3 cases / 6 checks（第 5、7 例等） |
+| B. 裁边退回旧的 `px[bpp-1]` 判 alpha | 1 case / 6 checks（第 10 例） |
+| C. CPU 后端放行 RGBA16 目标 | 1 case / 2 checks（第 8 例） |
+| D. 表面深度恒为 RGBA8 | 6 cases / 10 checks（含 `test_abi.cpp` 两条 HDR 用例） |
+| E. 剪贴栈成员 backdrop 强制 8 位 | 1 case / 2 checks（第 7 例：具名错误触发、合成失败） |
+
+注入 E 同时证明 `filter_graph.cpp` 的「成员深度与栈表面不一致」这道守卫**是活的**：正常路径下
+成员由 `canvas_format` 构造、深度必然一致，因此它是**防御性守卫**，靠注入才会触发；但触发时
+拿到的是具名错误而不是按错误字节宽混读。还原后全量 `286 cases, 0 failed, 0 check failures`，
+`grep -rn INJECT` 零残留。
+
+**如实边界**：half 目标目前只在 **CPU 后端**落地；D3D12 构建（本机为诚实 stub）仍只接受
+RGBA8 并**明确拒绝**其它格式，Vulkan 主渲染路径本就不在这次构建里（`render_document` 返回
+UNSUPPORTED）。GPU 侧的 half 目标留待后端接线，不在这里假装支持。
+
+### 6.1.20 C 方案 C4：合成结果导出 EXR（2026-10-18，Claude 接手）
+
+C4 交付的是 `comp_io_export(EXR)`：写**合成表面本身**，不是 8 位显示副本。
+先降到 8 位再写 EXR 会把白点以上的光截掉——文件写得出来、内容是错的，比失败更坏。
+
+| 位置 | 内容 |
+|------|------|
+| `engine/abi/src/comp_io_abi.cpp` | EXR 分支在 8 位 flatten **之前**：申请 RGBA16F 表面 → `comp_render_flatten(..., COMP_PIXEL_RGBA16F, width*8)` → `deep_hdr_to_linear`（除 alpha + extended sRGB 曲线）→ `exr_encode_float(..., kExrSampleHalf)` → 写文件。PNG/JPEG 仍走原 8 位路径 |
+| `engine/format/codec_lib.cpp` | `codec_lib_can_encode(EXR)` 取 `exr_codec_available()`：读写同一份自研 scanline 编解码器 |
+| `engine/format/codec_registry.cpp` | EXR 条目 `can_write = codec_lib_can_encode(6u)`；可写时 note 追加 `export writes scanline NONE + HALF, linear light with straight alpha from the full-depth composite` |
+| `tests/test_c4_exr_export.cpp` | 6 例：登记表可写、HDR 高光保真、8 位文档同路径、失败原因具名；C6 追加两例——写的是**合成结果**不是图层资产（图层只盖右半，左半必须透明黑）、空文档导出为全透明黑而不是未初始化内存 |
+| `tests/test_codec.cpp` | 旧断言「EXR 导出不可用」改为「登记表必须说可写」，并保留反侧断言（note 不得再出现 `export unsupported`） |
+
+**口径**：文件与 `.comp` 资产一致——线性光、直通 alpha、HALF；8 位文档由 CPU 后端
+`rgba8_to_hdr` 扩成 half，走同一条路径；后端给不出 half 目标时**具名失败**，不悄悄降回 8 位。
+
+**护栏**：新增 6 例，总数 **286 → 292**（`292 cases, 0 failed`）。关键断言用测试内独立
+`ref_linear` 给期望值：预乘 2.0 → `ref_linear(2.0) ≈ 4.95` 且 `> 1`；预乘 0.25/0.5/1.0 @ alpha 0.5
+→ 直通 0.5/1.0/2.0 的线性值（同时钉住「除 alpha」与「sRGB 曲线」）；8 位 (100,150,200) →
+`ref_linear(100/255)` 等，全透明像素为 0；TIFF 仍 `UNSUPPORTED` 且错误里出现 `TIFF`。
+C6 追加的两例把「导出的是合成表面」从注释变成可观测：画布 2×1、图层只覆盖右半时，左半必须
+读到透明黑；无图层的空文档必须全零（含 alpha），而不是把未初始化缓冲写出去。
+
+**反向注入（6 轮，各自只打红该打红的用例）**：
+
+| 注入 | 模拟的错误 | 结果 |
+|------|-----------|------|
+| A. 线性值夹到 1.0 | 先降 8 位再写 EXR（高光截到白） | 1 case / 3 checks |
+| B. `codec_lib_can_encode(EXR)` 返回 false | 登记表谎称只读 | 4 cases / 9 checks |
+| C. 把 extended sRGB 直接写进 EXR | 忘了线性化 | 2 cases / 4 checks |
+| D. 转换后乘回 alpha | 忘了除 alpha（写的是预乘值） | 1 case / 2 checks |
+| E. 导出前把每个像素 alpha 置 1 | 输出变成整幅不透明（空文档不再全零） | 4 cases / 6 checks |
+| F. 合成表面整体右移一像素 | 把资产位置当画布位置（导出不是合成结果） | 3 cases / 8 checks |
+
+E 打红的是所有断言 alpha 的用例（含空文档全零），F 打红的是断言**位置**的三例、空文档保持
+全绿——这正是「各自只打红该打红的用例」应有的形态。还原后全量 `292 cases, 0 failed,
+0 check failures`，`grep -rn INJECT` 零残留（仅 README 有历史提及）。
+
+**全量回归（C6，2026-10-18）**：
+
+```
+python scripts/run_regression.py --require-ohos --python <local-workspace>\tools\python\python.exe
+```
+
+**6/6 PASS，0 skipped**：① 构建 + 单测 100.6s（`292 cases, 0 failed`）；② Windows 壳 27 项
+`failures=0`、SHA256 `32151220f4748dfa…` 与基线一致；③ 编解码交叉验证 rc=0；④ `.comp` 双向
+交叉验证 rc=0；⑤ 共享 DLL ctypes 真实调用（`comp_version=1.0.0`）；⑥ OHOS aarch64 交叉编译
++ NAPI 壳 rc=0。指定带 Pillow 12.3.0 + numpy 2.5.3 的 `<local-workspace>\tools\python\python.exe`
+后，步骤 ③/④ 从历来的 `SKIP`（PIL unavailable）变为真实执行——提升的是证据等级，不是代码。
+
+**这里要说明一条边界**：步骤 ③ 的交叉验证覆盖 PNG/JPEG 等 8 位格式，**不覆盖 EXR**——本机没有
+独立的 EXR 解码器。C4 的 EXR 验收是「写出 → 同族自研读取器读回 → 与测试内独立公式比对」，
+钉住了编码语义，但**不能**声称已与第三方 EXR 实现互操作。详见报告 §14.4。
+
+**如实边界**：EXR 导出要求后端能产出 RGBA16F 表面，当前只有 CPU 后端可写；D3D12 构建下
+flatten 被后端具名拒绝，导出失败而不是退回 8 位。存储是 HALF：线性化后绝对值超过 half
+上限（约 65520）的像素在文件里读回 `inf`——这是 half 容器的量程边界，不是把高光夹成白。
+
 ### 6.2 尚未验证的部分（证据边界）
+
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
   但未跑通 `cmake + ctest`。
@@ -1047,8 +1165,8 @@ C4）；只做 scanline（tile/deep/multipart 未实现）；PIZ/PXR24/B44/DWA �
   JPEG（stb，有损）、PSD（stb，只读）的真实源码已 vendoring 到 `engine/third_party/` 并真实可用；
   TIFF / HEIF / WebP 在本机**无任何可链接依赖**（无 cmake / make / gcc / clang /
   pkg-config / vcpkg，全盘常见根目录下未找到 `jpeglib.h` / `lcms2.h` / `ImfHeader.h`），
-  故仍如实 `UNSUPPORTED` 并写明原因。**EXR 例外**：C3b 用树内 zlib 自己写了 scanline
-  读取器（不复用 OpenEXR 库），只解 NONE/RLE/ZIPS/ZIP；PIZ/PXR24/B44/B44A/DWAA/DWAB、
+  故仍如实 `UNSUPPORTED` 并写明原因。**EXR 例外**：C3b/C4 用树内 zlib 自己写了 scanline
+  读写器（不复用 OpenEXR 库）：读只解 NONE/RLE/ZIPS/ZIP，写只出 NONE + HALF；PIZ/PXR24/B44/B44A/DWAA/DWAB、
   tiled、deep、multipart、UINT、子采样通道、RANDOM_Y 一律带名字拒绝。后续接入步骤见
   `docs/codec-migration.md` 第 6 节。
   Python 侧 PIL 只作交叉验证参照，不可链接进 C++ 引擎。
@@ -1138,16 +1256,16 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 89 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
-| ② 像素内核**有产品通路**的部分 | 35% | **~91%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）。余 `deep_take_painted`（等 S4 仿制笔刷 tile 模型）与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`（浮点通路 C3 已通，**阻塞点改为 C5 的按文档深度携带 half 的表面**，见 §6.1.17）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
-| ③ 合成与渲染正确性 | 20% | **~96%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐 |
+| ② 像素内核**有产品通路**的部分 | 35% | **~97%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）。余 `deep_take_painted` 与 `take_painted_hdr` 一对（同被 S4 仿制笔刷 tile 模型阻塞）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
+| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
 
-**加权完成度 ≈ 92%**（口径 A）。算术：① 30%×95% + ② 35%×91% + ③ 20%×96%
-+ ④ 15%×80% = 28.5 + 31.85 + 19.2 + 12 = **91.55% ≈ 92%**。
+**加权完成度 ≈ 94%**（口径 A）。算术：① 30%×95% + ② 35%×97% + ③ 20%×98%
++ ④ 15%×80% = 28.5 + 33.95 + 19.6 + 12 = **94.05% ≈ 94%**。
 
-**剩下的 8% 里大半不是技术债，而是「需要语义决定」或「被上游工具面阻塞」**——
+**剩下的 6% 里大半不是技术债，而是「需要语义决定」或「被上游工具面阻塞」**——
 这两项在 §6.1.12 重新核实过：`deep_split` 的 32 位浮点语义**不成立**（上游深度模型只有
-8/16/HDR 三层，无 32 位浮点图层），`deep_take_painted` 被仿制笔刷阻塞。真正待定的只剩 `hdr_*`。
+8/16/HDR 三层，无 32 位浮点图层），`deep_take_painted` 被仿制笔刷阻塞。
 
 #### 口径 B：产品功能面
 
@@ -1220,8 +1338,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
-| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`（口径 §6.1.13 已冻结并配 14 条护栏，**阻塞点 = C5** 的文档深度表面）、`take_painted_hdr`（阻塞点 = S4） |
-| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`） | `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`/`take_painted_hdr` 仍是零通路（阻塞点见上，口径见 §6.1.13、接线范围见 §6.1.16）；`rgba8_to_hdr` 已实现但无消费点；**浮点解码器 C3 已接入**（Radiance `.hdr`/`.pic` → RGBA16F 或 RGBA16，`comp_io_abi.cpp:291-331`，见 §6.1.17），**EXR / float TIFF 仍无**；HDR 图层**存盘仍拒绝**（`.comp` 只收 RGBA8，`comp_file.cpp:383-385`，需 C4 的 `<uuid>.exr` 资产写出器） |
+| Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`take_painted_hdr`（阻塞点 = S4） |
+| HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`）+ **half 合成表面与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5，§6.1.19；`rgba8_to_hdr` 由 CPU 后端消费）+ **浮点解码器**（C3，Radiance `.hdr`/`.pic`）+ **`.comp` 的 `<uuid>.exr` 资产读写**（C3b，§6.1.18）+ **合成结果导出 EXR**（C4，`comp_io_export` 全深度 flatten → 线性光 HALF，§6.1.20） | `take_painted_hdr`（阻塞点 = S4）；float TIFF 无解码器、如实不支持 |
 | Adjust | **零产品通路**（`adjust_*` 一族无任何工具/命令消费） | 内核 62 个函数已与上游对齐（§6.1.15） | 整族无产品通路；属 F4 Camera Raw 产品通路 |
 
 ## 7. 许可

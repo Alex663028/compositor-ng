@@ -10,6 +10,37 @@
 
 namespace compositor {
 
+namespace {
+
+/*
+ * half 表面 -> 缩略图 API 的 8 位显示副本。
+ *
+ * 上游 `DeepLayer.image(_:)` 的口径：白点以上按白显示（截断），不是丢弃高光
+ * ——高光在合成途中已经按 half 保留，只有这份显示副本才降到 8 位。
+ * 失败时保留原缓冲不动，调用方拿到 false 与具名 error。
+ */
+bool to_display_rgba8(ImageBuffer* buffer, std::string* error) {
+  ImageBuffer view;
+  if (buffer == nullptr || !hdr_to_rgba8(*buffer, &view)) {
+    if (error != nullptr) *error = "failed to build an 8-bit display copy of an HDR layer view";
+    return false;
+  }
+  *buffer = std::move(view);
+  return true;
+}
+
+}  // namespace
+
+comp_pixel_format composite_surface_format(const Document& doc) {
+  /* 扁平存储 + parent 引用：扫一遍全部图层即可，无需递归。 */
+  for (const Layer& layer : doc.state().layers) {
+    if (layer.pixels.format == COMP_PIXEL_RGBA16F && !layer.pixels.empty()) {
+      return COMP_PIXEL_RGBA16F;
+    }
+  }
+  return COMP_PIXEL_RGBA8;
+}
+
 bool composite_document(const Document& doc, ImageBuffer* out, std::string* error) {
   if (out == nullptr) {
     if (error != nullptr) *error = "out buffer is null";
@@ -39,7 +70,22 @@ bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out, st
     return false;
   }
 
-  out->resize(state.width, state.height, COMP_PIXEL_RGBA8);
+  /*
+   * C5：单层视图的深度跟图层本身走——half 图层在 half 表面上求值，再取 8 位
+   * 显示副本返回（缩略图 API 的输出契约仍是 RGBA8）。这样高光在合成途中
+   * 不会先被截到白；只有最终显示副本才按上游 `image(_:)` 的口径截断。
+   * 剪贴基底是 half 时同一张表面也得是 half，否则基底高光在栈内就丢了。
+   */
+  comp_pixel_format surface_format =
+      layer->pixels.format == COMP_PIXEL_RGBA16F ? COMP_PIXEL_RGBA16F : COMP_PIXEL_RGBA8;
+  if (layer->clipping_source != 0) {
+    const Layer* clip_base = doc.find(layer->clipping_source);
+    if (clip_base != nullptr && clip_base->pixels.format == COMP_PIXEL_RGBA16F) {
+      surface_format = COMP_PIXEL_RGBA16F;
+    }
+  }
+
+  out->resize(state.width, state.height, surface_format);
   out->clear_transparent();
 
   /*
@@ -68,15 +114,21 @@ bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out, st
        * 那边的做法；此处保持画布大小，两处求值结果仍然一致。
        */
       ImageBuffer surface;
-      surface.resize(state.width, state.height, COMP_PIXEL_RGBA8);
+      surface.resize(state.width, state.height, surface_format);
       surface.clear_transparent();
       std::string stack_error;
       if (!blend_layer_into(&surface, doc, base_standalone, 1.0, &stack_error)) {
         if (error != nullptr) *error = stack_error;
         return false;
       }
+      /* 栈内 coverage 与表面同深度：half 用 float，其余用 16 位整数。 */
+      const bool half_stack = surface_format == COMP_PIXEL_RGBA16F;
       std::vector<uint16_t> coverage;
-      if (!extract_stack_alpha(&surface, &coverage, &stack_error)) {
+      std::vector<float> coverage_hdr;
+      const bool extracted = half_stack
+                                 ? extract_stack_alpha(&surface, &coverage_hdr, &stack_error)
+                                 : extract_stack_alpha(&surface, &coverage, &stack_error);
+      if (!extracted) {
         if (error != nullptr) *error = stack_error;
         return false;
       }
@@ -84,16 +136,24 @@ bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out, st
         if (error != nullptr) *error = stack_error;
         return false;
       }
-      if (!restore_stack_alpha(&surface, coverage, &stack_error)) {
+      const bool restored = half_stack
+                                ? restore_stack_alpha(&surface, coverage_hdr, &stack_error)
+                                : restore_stack_alpha(&surface, coverage, &stack_error);
+      if (!restored) {
         if (error != nullptr) *error = stack_error;
         return false;
       }
-      return blend_buffer_into(out, surface, base->blend, static_cast<double>(layer->opacity));
+      if (!blend_buffer_into(out, surface, base->blend, static_cast<double>(layer->opacity))) {
+        if (error != nullptr) *error = "failed to blend the clipping stack onto the layer view";
+        return false;
+      }
+      return surface_format == COMP_PIXEL_RGBA16F ? to_display_rgba8(out, error) : true;
     }
   }
   Layer standalone = *layer;
   standalone.clipping_source = 0;
-  return blend_layer_into(out, doc, standalone, 1.0, error);
+  if (!blend_layer_into(out, doc, standalone, 1.0, error)) return false;
+  return surface_format == COMP_PIXEL_RGBA16F ? to_display_rgba8(out, error) : true;
 }
 
 bool downsample_rgba8(const ImageBuffer& src, int32_t max_edge, ImageBuffer* out) {

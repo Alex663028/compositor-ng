@@ -68,6 +68,9 @@ COMP_API comp_result comp_io_import_layer(comp_document document,
  * 合成整篇文档并导出为图像文件。
  * options_json_utf8 可为 NULL；支持键：{"quality":92}（JPEG/HEIF/WEBP）、
  * {"flatten":true}（PSD 是否拍平，M2 生效）。
+ * EXR 导出走**合成表面本身**（有 HDR 图层时是 RGBA16F，8 位文档由后端扩成 half），
+ * 文件为线性光、直通 alpha 的 HALF scanline；不会先降到 8 位再写。
+ * 本构建不支持的格式由登记表给出具名原因（COMP_ERR_UNSUPPORTED），不写冒名文件。
  */
 COMP_API comp_result comp_io_export(comp_document document,
                                     const char* path_utf8,

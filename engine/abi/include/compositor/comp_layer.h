@@ -62,8 +62,10 @@ COMP_API comp_result comp_layer_reorder(comp_document document,
  *     注意不要按 16 位整数的位模式直接读——那是 HDR 通路最典型的画面错误。
  *   - 未知格式 -> `COMP_ERR_UNSUPPORTED`，且不改动既有像素。
  *
- * `.comp` 存盘只接受 RGBA8 图层：16 位图层要落盘，先跑 `COMP_TOOL_DEEP` 的
- * quantize（16 位 -> 8 位），见 docs/tool-ops.md。
+ * `.comp` 存盘：RGBA8 图层写成 `.png`；RGBA16 与 RGBA16F 图层写成 `<uuid>.exr`
+ * 资产（C3b，FLOAT / HALF 通道，逐位或保尾数），读盘按 `enginePixelFormat`
+ * 声明校验。若宿主只接受 8 位资产，先跑 `COMP_TOOL_DEEP` 的 quantize，
+ * 见 docs/tool-ops.md。
  */
 COMP_API comp_result comp_layer_set_pixels(comp_document document,
                                            comp_layer_id id,
