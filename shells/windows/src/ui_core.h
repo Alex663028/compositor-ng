@@ -315,6 +315,24 @@ inline const ToolInfo* tool_info(ToolId id) {
   return tool_info_at(tool_index(id));
 }
 
+/*
+ * 哪些工具需要画「笔尖轮廓」。Brush / Eraser / Spot Healing / Clone Stamp 与
+ * Retouch 族（Blur / Smudge / Liquify）都吃 `brush_size`，画同一个圆；
+ * 选区类工具不吃笔刷直径，不画（避免误导）。
+ */
+inline bool tool_has_brush_tip(ToolId id) {
+  switch (id) {
+    case ToolId::Brush:
+    case ToolId::Eraser:
+    case ToolId::Heal:
+    case ToolId::Clone:
+    case ToolId::Retouch:
+      return true;
+    default:
+      return false;
+  }
+}
+
 /* 键位 -> 工具；key 必须是小写 ASCII，未命中返回 ToolId::Count。 */
 inline ToolId tool_for_shortcut(char key) {
   if (key >= 'A' && key <= 'Z') key = static_cast<char>(key - 'A' + 'a');
@@ -573,13 +591,15 @@ inline int filter_param_row_at(const Rect& panel, int param_count, double x, dou
  * 重复按 R 依次切换，模式名进状态栏。
  */
 inline constexpr int kRetouchModeCount = 3;
-inline constexpr int kRetouchBlur = 0; /* 0 = 模糊，走 COMP_TOOL_BLUR */
+inline constexpr int kRetouchBlur = 0;     /* 走 COMP_TOOL_BLUR，调 blur.radius */
+inline constexpr int kRetouchSmudge = 1;   /* 走 COMP_TOOL_SMUDGE，调 warp.strength */
+inline constexpr int kRetouchLiquify = 2;  /* 走 COMP_TOOL_LIQUIFY，调 warp.strength */
 
 inline const char* retouch_mode_name(int mode) {
   switch (mode) {
-    case 0: return "Blur";
-    case 1: return "Smudge";
-    case 2: return "Liquify";
+    case kRetouchBlur: return "Blur";
+    case kRetouchSmudge: return "Smudge";
+    case kRetouchLiquify: return "Liquify";
     default: return "?";
   }
 }
@@ -617,6 +637,158 @@ inline bool stroke_point_should_append(double last_x, double last_y, double x, d
   const double dx = x - last_x;
   const double dy = y - last_y;
   return dx * dx + dy * dy >= kStrokeMinDistance * kStrokeMinDistance;
+}
+
+/*
+ * 笔尖半径（客户区像素）：文档像素直径 x 缩放 / 2，下限 1 px。
+ * 上限 1 px 只是为了保证「极小缩放时」圆仍然可见；放大时不做人为夹取
+ * （32 倍下 500 px 笔刷的圆本来就该很大）。
+ */
+inline double brush_tip_radius(double diameter, double zoom) {
+  if (!(diameter > 0.0) || !(zoom > 0.0)) return 1.0;
+  const double radius = diameter * zoom * 0.5;
+  return radius < 1.0 ? 1.0 : radius;
+}
+
+/* Smudge / Liquify 强度（comp_tool_warp.strength，0..1，0 = 逐字节不动）。 */
+inline constexpr double kMinRetouchStrength = 0.01;
+inline constexpr double kMaxRetouchStrength = 1.0;
+
+inline double clamp_retouch_strength(double value) {
+  if (!(value > 0.0)) return kMinRetouchStrength; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinRetouchStrength), kMaxRetouchStrength);
+}
+
+inline double step_retouch_strength(double current, int direction) {
+  const double base = clamp_retouch_strength(current);
+  if (direction > 0) return clamp_retouch_strength(base + 0.1);
+  if (direction < 0) return clamp_retouch_strength(base - 0.1);
+  return base;
+}
+
+/* ------------------------------------------------------------ 选区蚂蚁线 */
+
+/*
+ * 文档坐标（像素网格）上的边界线段。坐标是「像素边界」而不是像素中心：
+ * 选中 [10,20) x [20,40) 的矩形，输出 x=10/30、y=20/40 四条边。
+ */
+struct BoundarySegment {
+  double x0 = 0.0;
+  double y0 = 0.0;
+  double x1 = 0.0;
+  double y1 = 0.0;
+};
+
+/*
+ * 从 8 位 coverage 蒙版提取「选中 / 未选中」之间的边界线段。
+ *
+ *   - mask 是文档分辨率灰度图（comp_selection_get_coverage 的输出），
+ *     `stride` 是字节/行，必须 >= width；
+ *   - `threshold` 是 1..255 的「算作选中」阈值，0 或越界按 1 处理；
+ *   - 共线且连续的边界像素会被**合并**成一条线段（矩形只出 4 条），
+ *     因此线段数的量级是「边界拐点」而不是「边界像素」。
+ *
+ * 返回值是**总线段数**（可能大于 capacity）；out 只写前 capacity 条。
+ * 调用方据此判断是否被截断（复杂选区应放大缓冲或降采样蒙版）。
+ * mask 为空 / 尺寸非正 / capacity < 0 时返回 0。
+ */
+inline int selection_boundary_segments(const uint8_t* mask, int width, int height,
+                                       std::size_t stride, int threshold,
+                                       BoundarySegment* out, int capacity) {
+  if (mask == nullptr || width <= 0 || height <= 0 || capacity < 0) return 0;
+  if (threshold < 1) threshold = 1;
+  if (threshold > 255) threshold = 255;
+
+  const auto inside = [&](int x, int y) {
+    return mask[static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x)] >=
+           static_cast<uint8_t>(threshold);
+  };
+  const auto emit = [&](double x0, double y0, double x1, double y1, int& count) {
+    if (out != nullptr && count < capacity) {
+      out[count] = BoundarySegment{x0, y0, x1, y1};
+    }
+    ++count;
+  };
+
+  int count = 0;
+  /* 水平边：行 y 的上方与下方归属不同 -> 沿 x 合并成一条线段。 */
+  for (int y = 0; y <= height; ++y) {
+    int run_start = -1;
+    for (int x = 0; x < width; ++x) {
+      const bool above = y > 0 && inside(x, y - 1);
+      const bool below = y < height && inside(x, y);
+      if (above != below) {
+        if (run_start < 0) run_start = x;
+      } else if (run_start >= 0) {
+        emit(static_cast<double>(run_start), static_cast<double>(y),
+             static_cast<double>(x), static_cast<double>(y), count);
+        run_start = -1;
+      }
+    }
+    if (run_start >= 0) {
+      emit(static_cast<double>(run_start), static_cast<double>(y),
+           static_cast<double>(width), static_cast<double>(y), count);
+    }
+  }
+  /* 垂直边：列 x 的左侧与右侧归属不同 -> 沿 y 合并成一条线段。 */
+  for (int x = 0; x <= width; ++x) {
+    int run_start = -1;
+    for (int y = 0; y < height; ++y) {
+      const bool left = x > 0 && inside(x - 1, y);
+      const bool right = x < width && inside(x, y);
+      if (left != right) {
+        if (run_start < 0) run_start = y;
+      } else if (run_start >= 0) {
+        emit(static_cast<double>(x), static_cast<double>(run_start),
+             static_cast<double>(x), static_cast<double>(y), count);
+        run_start = -1;
+      }
+    }
+    if (run_start >= 0) {
+      emit(static_cast<double>(x), static_cast<double>(run_start),
+           static_cast<double>(x), static_cast<double>(height), count);
+    }
+  }
+  return count;
+}
+
+/* 虚线段在「沿线段长度」上的一段 [begin, end]，begin < end。 */
+struct DashSpan {
+  double begin = 0.0;
+  double end = 0.0;
+};
+
+/*
+ * 把长度 length 的线段切成 dash/gap 交替的虚线段，phase 是图案的相位
+ * （像素，随时间递增得到「蚂蚁在爬」的观感）。phase 会被折到 [0, period)。
+ *
+ * 返回值是总段数（可能大于 capacity），out 只写前 capacity 段——
+ * 与 selection_boundary_segments 同一套「两段式」口径。
+ *
+ * 退化输入一律返回 0：length <= 0、dash <= 0、gap < 0、NaN，以及
+ * period 小于 1e-3 px（否则循环次数会失控）。
+ */
+inline int dash_spans(double length, double dash, double gap, double phase,
+                      DashSpan* out, int capacity) {
+  if (!(length > 0.0) || !(dash > 0.0) || !(gap >= 0.0) || !(phase == phase)) return 0;
+  if (capacity < 0) return 0;
+  const double period = dash + gap;
+  if (!(period >= 1e-3)) return 0;
+
+  double offset = std::fmod(phase, period);
+  if (offset < 0.0) offset += period;
+
+  int count = 0;
+  for (double start = -offset; start < length; start += period) {
+    const double begin = start > 0.0 ? start : 0.0;
+    const double end = std::min(start + dash, length);
+    if (end <= begin) continue;
+    if (out != nullptr && count < capacity) {
+      out[count] = DashSpan{begin, end};
+    }
+    ++count;
+  }
+  return count;
 }
 
 }  // namespace comp_ui

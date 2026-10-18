@@ -159,6 +159,11 @@
 - **warp 直径上限 1024**：carried / scratch 是 O(diameter²) 个 float，
   8192 直径仅 carried 就约 1 GB；越界在参数闸返回 `COMP_ERR_INVALID_ARGUMENT`。
 - 折点坐标必须有限且 `|v| <= 1e6`（否则取整 UB）；点数 1..65536。
+- **壳层接线（2026-10-18）**：Windows 壳的 `retouch_stroke_*` 按
+  `shell.retouch_mode` 选 kind——Blur 用 `comp_tool_blur.radius`，Smudge /
+  Liquify 用 `comp_tool_warp.strength`（`clamp_retouch_strength` 夹在 0.01..1，
+  `Alt+[` / `Alt+]` 步进 10%）。鼠标折线在 `WM_LBUTTONUP` 一次提交，落笔前
+  只在画布上画预览线，不产生中间事务。
 
 ### 4.9 Blur（`COMP_TOOL_BLUR`，P1 尾部追加）
 

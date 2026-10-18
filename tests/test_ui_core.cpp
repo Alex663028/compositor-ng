@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "../shells/windows/src/ui_core.h"
 #include "test_framework.h"
@@ -523,6 +524,177 @@ COMP_TEST(ui_core_stroke_points_are_debounced) {
       0.0, 0.0, comp_ui::kStrokeMinDistance * 0.7, comp_ui::kStrokeMinDistance * 0.7));
   COMP_CHECK(comp_ui::stroke_point_should_append(
       0.0, 0.0, comp_ui::kStrokeMinDistance * 0.8, comp_ui::kStrokeMinDistance * 0.8));
+}
+
+COMP_TEST(ui_core_selection_boundary_traces_a_rect_outline) {
+  /* 8x8 蒙版，选中 [2,6) x [1,5)。边界应合并成 4 条整边，而不是 16 个像素段。 */
+  const int width = 8;
+  const int height = 8;
+  std::vector<uint8_t> mask(static_cast<size_t>(width) * height, 0);
+  for (int y = 1; y < 5; ++y) {
+    for (int x = 2; x < 6; ++x) mask[static_cast<size_t>(y) * width + x] = 255;
+  }
+
+  comp_ui::BoundarySegment segments[16];
+  const int count = comp_ui::selection_boundary_segments(
+      mask.data(), width, height, width, 128, segments, 16);
+  COMP_CHECK_MSG(count == 4, "a filled rectangle has exactly four boundary edges");
+
+  /* 四条边逐条核对（顺序由扫描方向决定，不依赖实现顺序）。 */
+  const bool has_top = [&] {
+    for (int i = 0; i < count; ++i) {
+      const auto& s = segments[i];
+      if (near_value(s.y0, 1.0) && near_value(s.y1, 1.0) && near_value(s.x0, 2.0) &&
+          near_value(s.x1, 6.0)) return true;
+    }
+    return false;
+  }();
+  const bool has_bottom = [&] {
+    for (int i = 0; i < count; ++i) {
+      const auto& s = segments[i];
+      if (near_value(s.y0, 5.0) && near_value(s.y1, 5.0) && near_value(s.x0, 2.0) &&
+          near_value(s.x1, 6.0)) return true;
+    }
+    return false;
+  }();
+  const bool has_left = [&] {
+    for (int i = 0; i < count; ++i) {
+      const auto& s = segments[i];
+      if (near_value(s.x0, 2.0) && near_value(s.x1, 2.0) && near_value(s.y0, 1.0) &&
+          near_value(s.y1, 5.0)) return true;
+    }
+    return false;
+  }();
+  const bool has_right = [&] {
+    for (int i = 0; i < count; ++i) {
+      const auto& s = segments[i];
+      if (near_value(s.x0, 6.0) && near_value(s.x1, 6.0) && near_value(s.y0, 1.0) &&
+          near_value(s.y1, 5.0)) return true;
+    }
+    return false;
+  }();
+  COMP_CHECK_MSG(has_top && has_bottom && has_left && has_right,
+                 "the four edges sit on pixel boundaries, not pixel centres");
+
+  /* 所有线段都必须是轴对齐的（蚂蚁线只沿像素网格走）。 */
+  for (int i = 0; i < count; ++i) {
+    const auto& s = segments[i];
+    COMP_CHECK(near_value(s.x0, s.x1) || near_value(s.y0, s.y1));
+  }
+
+  /* 容量不足时返回真实总数，只写前 capacity 条（调用方据此判断截断）。 */
+  comp_ui::BoundarySegment small[2];
+  COMP_CHECK(comp_ui::selection_boundary_segments(mask.data(), width, height, width, 128,
+                                                  small, 2) == 4);
+}
+
+COMP_TEST(ui_core_selection_boundary_handles_edges_and_threshold) {
+  const int width = 4;
+  const int height = 4;
+
+  /* 全空没有边界；全选的边界是画布外框（与上游 Ctrl+A 后沿画布边爬蚂蚁一致）。 */
+  std::vector<uint8_t> empty(static_cast<size_t>(width) * height, 0);
+  comp_ui::BoundarySegment out[8];
+  COMP_CHECK(comp_ui::selection_boundary_segments(empty.data(), width, height, width, 128,
+                                                  out, 8) == 0);
+
+  std::vector<uint8_t> full(static_cast<size_t>(width) * height, 255);
+  COMP_CHECK(comp_ui::selection_boundary_segments(full.data(), width, height, width, 128,
+                                                  out, 8) == 4);
+
+  /* 贴住文档左上角的选区：边界必须落在 x=0 / y=0 这两条网格线上。 */
+  std::vector<uint8_t> corner(static_cast<size_t>(width) * height, 0);
+  for (int y = 0; y < 2; ++y) {
+    for (int x = 0; x < 2; ++x) corner[static_cast<size_t>(y) * width + x] = 255;
+  }
+  const int corner_count = comp_ui::selection_boundary_segments(corner.data(), width, height,
+                                                                width, 128, out, 8);
+  COMP_CHECK(corner_count == 4); /* 矩形在文档角上时仍只缺两条内侧边 -> 4 条（含 0 边） */
+
+  /* 阈值：100 在 128 下算「未选中」，在 64 下算「选中」。 */
+  std::vector<uint8_t> faint(static_cast<size_t>(width) * height, 0);
+  for (int y = 0; y < 2; ++y) {
+    for (int x = 0; x < 2; ++x) faint[static_cast<size_t>(y) * width + x] = 100;
+  }
+  COMP_CHECK(comp_ui::selection_boundary_segments(faint.data(), width, height, width, 128,
+                                                  out, 8) == 0);
+  COMP_CHECK(comp_ui::selection_boundary_segments(faint.data(), width, height, width, 64,
+                                                  out, 8) == 4);
+
+  /* 空指针 / 非正尺寸 / 负容量一律 0，不越界读。 */
+  COMP_CHECK(comp_ui::selection_boundary_segments(nullptr, width, height, width, 128, out,
+                                                  8) == 0);
+  COMP_CHECK(comp_ui::selection_boundary_segments(empty.data(), 0, height, width, 128, out,
+                                                  8) == 0);
+  COMP_CHECK(comp_ui::selection_boundary_segments(empty.data(), width, height, width, 128,
+                                                  out, -1) == 0);
+}
+
+COMP_TEST(ui_core_dash_spans_alternate_and_wrap_phase) {
+  comp_ui::DashSpan spans[16];
+
+  /* 相位 0：20 px、4 实 4 空 -> [0,4] [8,12] [16,20]。 */
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, 4.0, 0.0, spans, 16) == 3);
+  COMP_CHECK(near_value(spans[0].begin, 0.0) && near_value(spans[0].end, 4.0));
+  COMP_CHECK(near_value(spans[1].begin, 8.0) && near_value(spans[1].end, 12.0));
+  COMP_CHECK(near_value(spans[2].begin, 16.0) && near_value(spans[2].end, 20.0));
+
+  /* 相位 2：整体左移 2 px，第一段被裁成 [0,2]。 */
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, 4.0, 2.0, spans, 16) == 3);
+  COMP_CHECK(near_value(spans[0].begin, 0.0) && near_value(spans[0].end, 2.0));
+  COMP_CHECK(near_value(spans[1].begin, 6.0) && near_value(spans[1].end, 10.0));
+  COMP_CHECK(near_value(spans[2].begin, 14.0) && near_value(spans[2].end, 18.0));
+
+  /* 相位按 period 取模：8 与 0 相同，负数也折回正区间。 */
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, 4.0, 8.0, spans, 16) == 3);
+  COMP_CHECK(near_value(spans[0].end, 4.0));
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, 4.0, -8.0, spans, 16) == 3);
+  COMP_CHECK(near_value(spans[0].end, 4.0));
+
+  /* 容量不足：返回真实总数，只写前 capacity 段。 */
+  COMP_CHECK(comp_ui::dash_spans(80.0, 4.0, 4.0, 0.0, spans, 2) == 10);
+
+  /* 退化输入：不进入死循环、不写出 NaN。 */
+  COMP_CHECK(comp_ui::dash_spans(0.0, 4.0, 4.0, 0.0, spans, 16) == 0);
+  COMP_CHECK(comp_ui::dash_spans(20.0, 0.0, 4.0, 0.0, spans, 16) == 0);
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, -1.0, 0.0, spans, 16) == 0);
+  COMP_CHECK(comp_ui::dash_spans(20.0, 4.0, 4.0, std::nan(""), spans, 16) == 0);
+  COMP_CHECK(comp_ui::dash_spans(20.0, 1e-9, 1e-9, 0.0, spans, 16) == 0);
+}
+
+COMP_TEST(ui_core_brush_tip_and_retouch_strength_are_bounded) {
+  /* 文档像素直径 -> 客户区半径：24 px @100% = 12，@50% = 6。 */
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(24.0, 1.0), 12.0));
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(24.0, 0.5), 6.0));
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(1.0, 0.02), 1.0)); /* 下限 1 px */
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(500.0, 32.0), 8000.0));
+  /* 非法输入回落到 1 px，不产生 NaN 圆。 */
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(0.0, 1.0), 1.0));
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(-5.0, 1.0), 1.0));
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(std::nan(""), 1.0), 1.0));
+  COMP_CHECK(near_value(comp_ui::brush_tip_radius(24.0, 0.0), 1.0));
+
+  /* 只有吃笔刷直径的工具画笔尖。 */
+  COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Brush));
+  COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Retouch));
+  COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Clone));
+  COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Marquee));
+  COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Hand));
+
+  /* Smudge / Liquify 强度：0/NaN 回落到下限，越界夹取，步进 0.1。 */
+  COMP_CHECK(near_value(comp_ui::clamp_retouch_strength(0.0), comp_ui::kMinRetouchStrength));
+  COMP_CHECK(near_value(comp_ui::clamp_retouch_strength(std::nan("")),
+                        comp_ui::kMinRetouchStrength));
+  COMP_CHECK(near_value(comp_ui::clamp_retouch_strength(5.0), comp_ui::kMaxRetouchStrength));
+  COMP_CHECK(near_value(comp_ui::step_retouch_strength(0.5, 1), 0.6));
+  COMP_CHECK(near_value(comp_ui::step_retouch_strength(0.5, -1), 0.4));
+  COMP_CHECK(near_value(comp_ui::step_retouch_strength(0.5, 0), 0.5));
+
+  double strength = comp_ui::kMinRetouchStrength;
+  for (int i = 0; i < 100; ++i) strength = comp_ui::step_retouch_strength(strength, 1);
+  COMP_CHECK(near_value(strength, comp_ui::kMaxRetouchStrength));
+  for (int i = 0; i < 100; ++i) strength = comp_ui::step_retouch_strength(strength, -1);
+  COMP_CHECK(near_value(strength, comp_ui::kMinRetouchStrength));
 }
 
 COMP_TEST(ui_core_brush_steps_are_geometric_and_bounded) {

@@ -2044,6 +2044,61 @@ note 写明），撤销恢复 16 位资产；RGBA16F 与组 / 无像素图层一
 
 报告：`../report/P1b-ui-filter-blur-20261018-claude.md`。
 
+### 6.14 S4 外壳交互补齐：选区蚂蚁线 / 可视笔迹 / Smudge-Liquify 接线（2026-10-18，Claude）
+
+**1. 分工仍是两层。** 选区边界、虚线段、笔尖半径、retouch 强度这些**几何与状态机**
+留在 `ui_core.h`（不 include Windows/engine 头、不分配内存、可单测），`main.cpp` 只做
+「消息 → ui_core 调用 → GDI」和 ABI 映射。新增的叠加层绘制 `draw_canvas_overlays()`
+在画布 `StretchDIBits` 之后、面板之前调用，并先 `IntersectClipRect` 到画布。
+
+**2. 选区蚂蚁线。**
+
+- 几何：`selection_boundary_segments()` 在像素网格上取「命中/未命中」的跨界处，
+  同一行/列的连续边合并成一条线段；返回真实总数，容量不足时只写前 N 条，调用方
+  据此如实提示截断（壳层上限 20000 条）。
+- 数据源：`comp_selection_get_coverage`（文档分辨率 8 位、含 feather）阈值 128。
+  壳层**先查 `comp_selection_get_active`**：按 ABI 契约，反选「全选」得到的是
+  「无选区」而不是空选区，此时取覆盖率会返回 `COMP_ERR_STATE`。
+- 绘制：白色底线 + 黑色虚线段；`dash_spans()` 按阶段生成，`WM_TIMER` 每 120 ms
+  推进相位（dash 4 + gap 4 = 8 px 周期）。**没有选区时一条线都不画**，定时器处理
+  函数也直接返回，不产生空转重绘。
+- 性能：屏幕线段先用画布矩形做轴对齐裁剪再分段。32 倍放大时一条文档边是数万
+  屏幕像素，不裁剪会为一条边生成上千段虚线。
+- 交互：`Ctrl+A` 全选 / `Ctrl+D` 取消 / `Ctrl+Shift+I` 反选（菜单「编辑」同项）；
+  Marquee（`M`）拖矩形走 `comp_selection_apply_shape(RECT)`，Shift 并集、Alt 差集、
+  默认替换。每次写入一个撤销步，`undo/redo` 后重取覆盖率，蚂蚁线同步出现/消失。
+
+**3. 可视笔迹。** 落笔期间把文档坐标折线画成 3 px 预览线，并在光标处画笔尖轮廓
+（`brush_tip_radius = 直径 × 缩放 / 2`，最小 1 px）；`TrackMouseEvent` +
+`WM_MOUSELEAVE` 负责离开画布后隐藏。预览不写像素：提交仍只在 `WM_LBUTTONUP`
+发生一次，所以「拖很久」不会产生一串撤销步。
+
+**4. Smudge / Liquify 接线。** 原来的 `blur_stroke_*` 收敛成 `retouch_stroke_*`，
+按 `shell.retouch_mode` 选 kind：Blur → `COMP_TOOL_BLUR` + `blur.radius`；
+Smudge → `COMP_TOOL_SMUDGE` + `warp.strength`；Liquify → `COMP_TOOL_LIQUIFY` +
+`warp.strength`。强度 `clamp_retouch_strength` 夹在 0.01..1（ABI 允许 0，壳层不把
+「0 强度」当可用状态），`Alt+[` / `Alt+]` 步进 10%。工具条与状态栏按子模式显示
+半径或强度，不再出现「尚未接内核」。
+
+**5. 测试与自检。** 新增 4 例 `test_ui_core`：矩形边界 4 条（落在像素边界而非
+像素中心）、空选区/全选/贴边/threshold、虚线相位与截断、笔尖半径 + 强度夹取。
+`--selftest` 新增 18 项，仍只走 C ABI：Smudge 改变像素且一步撤销逐字节还原、
+Liquify `strength = 0` 是**逐字节 no-op**、`strength = 0.8` 改变像素；选区部分冻结
+「矩形覆盖率 255/0、边界 4 条、撤销清除蚂蚁线、全选覆盖画布、反选全选 = 无选区、
+取消后回到 active=0」。
+
+**6. 验证。** `scripts/run_regression.py --require-ohos` **6/6 PASS，0 skipped**：
+步骤 ① **377 cases / 0 failed**（373 + 4）；步骤 ② Windows 壳自检 **59 项**
+`failures=0`、SHA256 `3478e678835dc537…` 与仓内基线逐字节一致（基线已同步更新）；
+步骤 ⑤ 共享 DLL 真实加载；步骤 ⑥ OHOS aarch64 交叉编译 + NAPI rc=0。
+
+**7. 如实说明的边界。** 本轮新增的 Win32 交互路径（框选拖拽、蚂蚁线动画、笔尖
+轮廓、Smudge/Liquify 落笔）**没有经过人手实测**——无窗口环境下只能验证到 ABI 层与
+`ui_core` 数学层。选区目前只接矩形框选与全选/取消/反选，羽化/扩缩手柄、套索与
+魔棒仍在后续；滤镜实时预览、面板缩放/停靠未变。
+
+报告：`../report/S4-shell-interaction-20261018-claude.md`。
+
 ## 7. 许可
 
 上游 `robbietilton/Compositor` 为 MIT 许可；本仓沿用 MIT，并保留上游版权声明。

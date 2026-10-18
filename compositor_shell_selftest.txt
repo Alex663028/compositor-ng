@@ -45,6 +45,24 @@
 [OK] comp_document_undo(blur step)
 [OK] blur undo restores pixels byte-for-byte
 [OK] COMP_TOOL_BLUR(radius=0) rejected
+[OK] comp_tool_apply(COMP_TOOL_SMUDGE)
+[OK] smudge drags colour along the stroke
+[OK] comp_document_undo(smudge step)
+[OK] COMP_TOOL_LIQUIFY(strength=0) is a byte-identical no-op
+[OK] comp_tool_apply(COMP_TOOL_LIQUIFY)
+[OK] liquify moves pixels along the stroke
+[OK] comp_document_undo(liquify step)
+[OK] comp_selection_get_active() starts at 0 (no selection)
+[OK] comp_selection_apply_shape(rect)
+[OK] comp_selection_get_active() == 1 after a rect shape
+[OK] comp_selection_get_coverage()
+[OK] coverage is 255 inside the rect and 0 outside
+[OK] selection_boundary_segments(rect) == 4 (what the shell draws)
+[OK] comp_document_undo(selection step)
+[OK] undoing the selection shape clears the ants
+[OK] comp_selection_select_all() covers the canvas
+[OK] comp_selection_invert() of a full selection means no selection
+[OK] comp_selection_deselect() returns to the no-selection state
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

@@ -93,7 +93,7 @@ compositor-ng 是「同引擎、两壳」结构：
 上游 `Compositor` 只有 macOS 应用层，**没有 Windows 版可供参照**，故 Windows 壳的
 编辑器界面是自建的。为让 UI 数学可回归，平台无关部分被抽到
 `shells/windows/src/ui_core.h`（header-only，不 include Windows 头、不 include `engine/` 头、
-不分配内存），由 `tests/test_ui_core.cpp` 的 12 例覆盖；`main.cpp` 只做
+不分配内存），由 `tests/test_ui_core.cpp` 的 17 例覆盖；`main.cpp` 只做
 「消息 → ui_core 调用 → 绘制」。**绘制与命中测试共用同一套几何函数**，这是本层的第一原则。
 
 ### 5.1 冻结的布局常量
@@ -146,16 +146,49 @@ compositor-ng 是「同引擎、两壳」结构：
 - **笔迹去抖**：点间距小于 `kStrokeMinDistance`（0.75 文档像素）不追加，
   整笔在 `WM_LBUTTONUP` 一次提交；失焦/捕获丢失取消未完成笔迹。
 
-### 5.4 未达成的 UI 项
+### 5.4 选区蚂蚁线 / 可视笔迹 / Smudge-Liquify 接线（2026-10-18 追加）
+
+**蚂蚁线几何在 `ui_core.h`，不在 `main.cpp`。** `selection_boundary_segments()` 在
+像素网格上取「命中 vs 未命中」的跨界处，并把同一行/列的连续边合并成一条线段；
+`main.cpp` 只做文档→屏幕变换、按画布裁剪、生成虚线段并画「白底 + 黑虚」。要点：
+
+- 覆盖率来源是 `comp_selection_get_coverage`（文档分辨率、8 位、含 feather），
+  阈值 128。壳层**先查 `comp_selection_get_active`**：反选「全选」按 ABI 契约
+  得到的是「无选区」而不是空选区，此时取覆盖率返回 `COMP_ERR_STATE`。
+- **无选区时一条线都不画**：`selection_segments` 为空，叠加层直接跳过。
+- 全选时边界是**画布外框**（贴边选区同理），与上游 Ctrl+A 后沿画布爬虫一致。
+- 相位动画：`WM_TIMER` 每 120 ms 把相位 +1（周期 dash 4 + gap 4 = 8 px），
+  没有选区时定时器处理函数直接返回、不触发重绘。
+- 线段先用画布矩形做轴对齐裁剪，再生成虚线段：32 倍放大时一条文档边会变成
+  数万屏幕像素，不裁剪会为一条边生成上千个虚线段。
+
+**选区交互。** 「编辑」菜单与快捷键：`Ctrl+A` 全选、`Ctrl+D` 取消、`Ctrl+Shift+I`
+反选；Marquee（`M`）在画布上拖矩形 → `comp_selection_apply_shape(RECT)`，
+Shift 并集 / Alt 差集 / 否则替换。每次写入是一个撤销步；`undo_document` /
+`redo_document` 都会重取覆盖率，撤销后蚂蚁线同步消失。
+
+**可视笔迹。** 落笔期间把文档坐标折线画成 3 px 高对比度折线，并在光标处画笔尖
+轮廓（`直径 × 缩放 / 2`，最小 1 px 半径）；`WM_MOUSELEAVE`（`TrackMouseEvent`）
+后隐藏。笔迹只是**预览**，真正提交仍只在 `WM_LBUTTONUP` 发生一次。
+
+**Smudge / Liquify 接线。** 原来的 `blur_stroke_*` 收敛为 `retouch_stroke_*`：
+按 `shell.retouch_mode` 选择 `COMP_TOOL_BLUR`（`blur.radius`）/
+`COMP_TOOL_SMUDGE` / `COMP_TOOL_LIQUIFY`（`warp.strength`）。强度由
+`clamp_retouch_strength` 夹在 0.01..1，`Alt+[` / `Alt+]` 步进 10%；模糊模式
+同一组键仍调半径。状态栏与工具条按当前子模式显示半径或强度，不再写「尚未接内核」。
+
+**事实边界。** 与 §5.3 相同：以上交互路径**没有经过真人鼠标实测**。`ui_core` 的
+几何/分段与 ABI 调用有测试和 `--selftest` 覆盖，但「画出来对不对」仍需开窗目视。
+
+### 5.5 未达成的 UI 项
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|
 | Move 工具拖拽平移图层 | 未做 | 需图层 transform 写入侧与像素回读配合；现有 `comp_layer_*` 不足以在不猜语义的前提下实现 |
 | 工具按钮图标 | 未做 | 当前为文字快捷键字母，避免引入图标资源/字体 |
-| 画布上的选区 / 蚂蚁线 / 裁剪手柄 | 未做 | 选区 ABI 已具备（README §6.7），交互层待补 |
-| 笔刷落笔 | 部分做 | Blur 已接「折线 → `COMP_TOOL_BLUR`」；Brush/Eraser 等仍缺可视笔迹预览与逐笔撤销粒度 |
+| 选区羽化 / 扩缩手柄 | 未做 | ABI `comp_selection_modify` 已有；壳层只接了矩形框选与全选/取消/反选 |
+| Brush/Eraser 逐笔撤销粒度 | 部分做 | 已有可视笔迹预览与笔尖轮廓；Brush/Eraser 的像素提交仍走既有 Stroke 通路 |
 | 滤镜实时预览 | 未做 | 当前是「回车应用一次」，无拖动滑杆的增量预览缓存 |
-| Smudge / Liquify 壳层接线 | 未做 | 内核与 `COMP_TOOL_SMUDGE`/`LIQUIFY` 已具备，状态栏如实显示「尚未接内核」 |
 | 面板缩放 / 停靠 | 未做 | 固定布局，窄窗口按规则收起 |
 
 以上均为**外壳交互**缺口，不涉及引擎核与两壳共享语义。

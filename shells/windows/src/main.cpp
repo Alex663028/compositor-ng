@@ -36,6 +36,7 @@
 #include <compositor/comp_io.h>
 #include <compositor/comp_layer.h>
 #include <compositor/comp_render.h>
+#include <compositor/comp_selection.h>
 #include <compositor/comp_undo.h>
 
 #include "ui_core.h" /* 平台无关的视图变换 / 布局 / 命中 / 工具表 */
@@ -44,6 +45,15 @@ namespace {
 
 constexpr int kDefaultWidth = 1280;
 constexpr int kDefaultHeight = 720;
+
+/* 蚂蚁线：虚线 4 px / 间隔 4 px，每 120 ms 前进 1 px（一个周期 8 px）。 */
+constexpr UINT_PTR kAntsTimerId = 1;
+constexpr UINT kAntsTimerPeriodMs = 120;
+constexpr int kAntsDashPx = 4;
+constexpr int kAntsGapPx = 4;
+constexpr int kAntsPhasePeriod = kAntsDashPx + kAntsGapPx;
+/* 边界线段缓冲上限：常规选区的量级是几十条；超过即截断并如实报到状态栏。 */
+constexpr int kMaxAntSegments = 20000;
 
 /* 面板几何统一由 ui_core.h 提供：绘制与命中测试必须共用同一套常量。 */
 using comp_ui::Layout;
@@ -82,6 +92,9 @@ constexpr UINT kCmdViewFit = 1027;
 constexpr UINT kCmdViewActual = 1028;
 constexpr UINT kCmdViewZoomIn = 1029;
 constexpr UINT kCmdViewZoomOut = 1030;
+constexpr UINT kCmdSelectAll = 1031;
+constexpr UINT kCmdSelectNone = 1032;
+constexpr UINT kCmdSelectInvert = 1033;
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -124,13 +137,32 @@ struct ShellState {
   /* Retouch 工具（R 循环）：0 = 模糊（走 COMP_TOOL_BLUR）/ 1 涂抹 / 2 液化。 */
   int retouch_mode = comp_ui::kRetouchBlur;
   double blur_radius = 8.0;
+  double retouch_strength = 0.5; /* Smudge / Liquify 的 warp.strength */
   /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
   comp_ui::FilterPanel filter;
   bool filter_open = false;
   std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
-  /* 进行中的模糊笔迹（文档像素折线）。 */
+  /* 进行中的 Retouch 笔迹（Blur / Smudge / Liquify，文档像素折线）。 */
   bool stroke_active = false;
   std::vector<float> stroke_points;
+  /*
+   * 选区（comp_selection.h 的 F1 ABI）。mask 是文档分辨率的有效 coverage；
+   * 蚂蚁线的线段由 ui_core 从 mask 现算，壳内不维护「选区形状」的第二种表示。
+   */
+  bool selection_active = false;
+  std::vector<uint8_t> selection_mask;
+  std::vector<comp_ui::BoundarySegment> selection_segments;
+  int32_t selection_phase = 0;    /* 蚂蚁线相位 0..7 px */
+  bool selection_truncated = false; /* 线段数超过缓冲上限（如实提示） */
+  /* 框选（Marquee 工具）进行中的矩形，文档坐标。 */
+  bool marquee_active = false;
+  comp_ui::Point marquee_start{};
+  comp_ui::Point marquee_current{};
+  /* 鼠标是否停在画布上（决定画不画笔尖轮廓），客户区坐标。 */
+  bool cursor_valid = false;
+  bool tracking_leave = false;
+  int cursor_x = 0;
+  int cursor_y = 0;
   bool space_down = false; /* 按住空格 = 临时抓手 */
   bool panning = false;
   POINT pan_anchor{};
@@ -895,15 +927,169 @@ void apply_filter(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
-/* ------------------------------------------------------------ 模糊工具笔迹 */
+/* ------------------------------------------------------------ 选区 */
 
-bool blur_stroke_available(const ShellState& shell) {
-  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Retouch &&
-         shell.retouch_mode == comp_ui::kRetouchBlur;
+/*
+ * 从引擎取完整选区状态：active、有效 coverage（含羽化）、边界线段。
+ * 无选区时清空全部缓存——「上一次的蚂蚁线」绝不能留在屏幕上。
+ *
+ * coverage 是文档分辨率的 8 位灰度图；1500 万像素的文档约 15 MB 副本，
+ * 只在选区/文档变化时取一次（不随每帧绘制重取）。
+ */
+void refresh_selection(ShellState& shell) {
+  shell.selection_active = false;
+  shell.selection_mask.clear();
+  shell.selection_segments.clear();
+  shell.selection_truncated = false;
+  if (shell.document == nullptr || shell.width <= 0 || shell.height <= 0) return;
+
+  int32_t active = 0;
+  if (comp_selection_get_active(shell.document, &active) != COMP_OK || active == 0) return;
+
+  const std::size_t pixel_count = static_cast<std::size_t>(shell.width) *
+                                  static_cast<std::size_t>(shell.height);
+  shell.selection_mask.assign(pixel_count, 0);
+  comp_mask mask{};
+  mask.width = shell.width;
+  mask.height = shell.height;
+  mask.stride = static_cast<std::size_t>(shell.width);
+  mask.pixels = shell.selection_mask.data();
+  if (comp_selection_get_coverage(shell.document, &mask) != COMP_OK) {
+    shell.selection_mask.clear();
+    return;
+  }
+  shell.selection_active = true;
+
+  shell.selection_segments.resize(kMaxAntSegments);
+  const int needed = comp_ui::selection_boundary_segments(
+      shell.selection_mask.data(), shell.width, shell.height,
+      static_cast<std::size_t>(shell.width), 128, shell.selection_segments.data(),
+      kMaxAntSegments);
+  shell.selection_truncated = needed > kMaxAntSegments;
+  if (!shell.selection_truncated) {
+    shell.selection_segments.resize(static_cast<std::size_t>(needed));
+  }
 }
 
-void blur_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
-  if (!blur_stroke_available(shell)) return;
+/* 选区命令的共同尾部：刷新缓存 + 撤销深度 + 截断提示（如有）。 */
+void finish_selection_command(ShellState& shell, const wchar_t* prefix) {
+  refresh_selection(shell);
+  wchar_t buffer[192];
+  if (shell.selection_truncated) {
+    wsprintfW(buffer, L"%s（选区边界过多，蚂蚁线截断显示）", prefix);
+    refresh_history_status(shell, buffer);
+  } else {
+    refresh_history_status(shell, prefix);
+  }
+}
+
+void select_all(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_select_all(shell.document, &changed) != COMP_OK) {
+    set_status(shell, L"全选失败");
+    return;
+  }
+  finish_selection_command(shell, changed ? L"已全选（Ctrl+D 取消）" : L"已全选：选区未变化");
+}
+
+void deselect_all(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_deselect(shell.document, &changed) != COMP_OK) {
+    set_status(shell, L"取消选择失败");
+    return;
+  }
+  finish_selection_command(shell, changed ? L"已取消选择" : L"取消选择：本来就没有选区");
+}
+
+void invert_selection(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_invert(shell.document, &changed) != COMP_OK) {
+    set_status(shell, L"反选失败");
+    return;
+  }
+  finish_selection_command(shell, changed ? L"已反选" : L"反选：无选区，未变化");
+}
+
+/* ------------------------------------------------------------ 框选（Marquee） */
+
+bool marquee_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Marquee;
+}
+
+void marquee_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!marquee_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.marquee_active = true;
+  shell.marquee_start = doc;
+  shell.marquee_current = doc;
+  SetCapture(window);
+  set_status(shell, L"框选：拖出矩形后松开（Shift 加选 / Alt 减选）");
+}
+
+void marquee_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.marquee_active) return;
+  shell.marquee_current =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+}
+
+void marquee_cancel(ShellState& shell) { shell.marquee_active = false; }
+
+void marquee_end(HWND window, ShellState& shell) {
+  if (!shell.marquee_active) return;
+  shell.marquee_active = false;
+  ReleaseCapture();
+  if (shell.document == nullptr) return;
+
+  /* 框选矩形的两个角点（顺序任意，引擎按包围盒解释）。 */
+  const float points[4] = {static_cast<float>(shell.marquee_start.x),
+                           static_cast<float>(shell.marquee_start.y),
+                           static_cast<float>(shell.marquee_current.x),
+                           static_cast<float>(shell.marquee_current.y)};
+  comp_selection_combine combine = COMP_SELECTION_REPLACE;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+    combine = COMP_SELECTION_ADD;
+  } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+    combine = COMP_SELECTION_SUBTRACT;
+  }
+
+  int32_t changed = 0;
+  const comp_result result = comp_selection_apply_shape(
+      shell.document, COMP_SELECTION_RECT, points, 2, combine, /*antialias=*/1, &changed);
+  if (result != COMP_OK) {
+    set_status(shell, L"框选失败");
+    return;
+  }
+  const wchar_t* prefix = changed ? L"框选：已应用" : L"框选：选区未变化";
+  if (combine == COMP_SELECTION_ADD) prefix = changed ? L"框选：已加选" : L"框选：加选未变化";
+  if (combine == COMP_SELECTION_SUBTRACT) {
+    prefix = changed ? L"框选：已减选" : L"框选：减选未变化";
+  }
+  finish_selection_command(shell, prefix);
+}
+
+/* ------------------------------------------------------------ Retouch 笔迹 */
+
+/* Blur / Smudge / Liquify 共用同一条「鼠标折线 -> comp_tool_apply」通路。 */
+bool retouch_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Retouch;
+}
+
+void retouch_stroke_begin(HWND window, ShellState& shell, int x, int y,
+                          const Layout& layout) {
+  if (!retouch_stroke_available(shell)) return;
   const comp_ui::Point doc =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   shell.stroke_points.clear();
@@ -911,10 +1097,13 @@ void blur_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layou
   shell.stroke_points.push_back(static_cast<float>(doc.y));
   shell.stroke_active = true;
   SetCapture(window);
-  set_status(shell, L"模糊笔迹…（松开鼠标应用）");
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"%s 笔迹…（松开鼠标应用）",
+            widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  set_status(shell, buffer);
 }
 
-void blur_stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
+void retouch_stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
   if (!shell.stroke_active) return;
   const comp_ui::Point doc =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
@@ -926,12 +1115,12 @@ void blur_stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
   shell.stroke_points.push_back(static_cast<float>(doc.y));
 }
 
-void blur_stroke_cancel(ShellState& shell) {
+void retouch_stroke_cancel(ShellState& shell) {
   shell.stroke_active = false;
   shell.stroke_points.clear();
 }
 
-void blur_stroke_end(HWND window, ShellState& shell) {
+void retouch_stroke_end(HWND window, ShellState& shell) {
   if (!shell.stroke_active) return;
   shell.stroke_active = false;
   ReleaseCapture();
@@ -942,20 +1131,34 @@ void blur_stroke_end(HWND window, ShellState& shell) {
 
   const comp_layer_id id = selected_layer_id(shell);
   if (shell.document == nullptr || id == 0) {
-    set_status(shell, L"模糊：请先选择一个图层");
+    set_status(shell, L"Retouch：请先选择一个图层");
     return;
   }
 
   comp_tool_op_desc desc{};
-  desc.kind = COMP_TOOL_BLUR;
+  switch (shell.retouch_mode) {
+    case comp_ui::kRetouchBlur:
+      desc.kind = COMP_TOOL_BLUR;
+      desc.blur.radius = static_cast<float>(shell.blur_radius);
+      break;
+    case comp_ui::kRetouchSmudge:
+      desc.kind = COMP_TOOL_SMUDGE;
+      desc.warp.strength = static_cast<float>(shell.retouch_strength);
+      break;
+    case comp_ui::kRetouchLiquify:
+      desc.kind = COMP_TOOL_LIQUIFY;
+      desc.warp.strength = static_cast<float>(shell.retouch_strength);
+      break;
+    default:
+      return;
+  }
   desc.stroke_points = points.data();
   desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
   desc.brush.diameter = static_cast<float>(shell.brush_size);
   desc.brush.hardness = static_cast<float>(shell.brush_hardness);
   desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
   desc.brush.flow = 1.0f;
-  desc.brush.seed = 0; /* 模糊不用随机数；固定值保证同参数同结果 */
-  desc.blur.radius = static_cast<float>(shell.blur_radius);
+  desc.brush.seed = 0; /* 三个算子都不用随机数；固定值保证同参数同结果 */
 
   char note[256] = {0};
   size_t note_size = 0;
@@ -963,18 +1166,24 @@ void blur_stroke_end(HWND window, ShellState& shell) {
       comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
   shell.needs_render = true;
 
+  const char* mode_name = comp_ui::retouch_mode_name(shell.retouch_mode);
   wchar_t buffer[384];
   if (result != COMP_OK) {
-    wsprintfW(buffer, L"模糊失败（半径 %.1f px）", shell.blur_radius);
+    wsprintfW(buffer, L"%s 失败", widen_ascii(mode_name).c_str());
     set_status(shell, buffer);
     return;
   }
   if (note[0] != '\0' && note_size > 1) {
-    wsprintfW(buffer, L"模糊：已应用 %d 个折点｜%s", desc.stroke_point_count,
-              widen_ascii(note).c_str());
-  } else {
-    wsprintfW(buffer, L"模糊：已应用 %d 个折点（半径 %d px）", desc.stroke_point_count,
+    wsprintfW(buffer, L"%s：已应用 %d 个折点｜%s", widen_ascii(mode_name).c_str(),
+              desc.stroke_point_count, widen_ascii(note).c_str());
+  } else if (shell.retouch_mode == comp_ui::kRetouchBlur) {
+    wsprintfW(buffer, L"%s：已应用 %d 个折点（半径 %d px）",
+              widen_ascii(mode_name).c_str(), desc.stroke_point_count,
               static_cast<int>(shell.blur_radius + 0.5));
+  } else {
+    wsprintfW(buffer, L"%s：已应用 %d 个折点（强度 %d%%）",
+              widen_ascii(mode_name).c_str(), desc.stroke_point_count,
+              static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
   }
   refresh_history_status(shell, buffer);
 }
@@ -1011,8 +1220,10 @@ bool create_document(ShellState& shell) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
-  blur_stroke_cancel(shell);
+  retouch_stroke_cancel(shell);
+  marquee_cancel(shell);
   refresh_layers(shell);
+  refresh_selection(shell);
   refresh_history_status(shell, L"已新建文档");
   return true;
 }
@@ -1040,8 +1251,10 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
-  blur_stroke_cancel(shell);
+  retouch_stroke_cancel(shell);
+  marquee_cancel(shell);
   refresh_layers(shell);
+  refresh_selection(shell);
   refresh_history_status(shell, L"已打开 .comp");
   return true;
 }
@@ -1072,6 +1285,7 @@ void undo_document(ShellState& shell) {
   }
   shell.needs_render = true;
   refresh_layers(shell);
+  refresh_selection(shell); /* 选区操作也在撤销栈里：撤销可能改变蚂蚁线 */
   refresh_history_status(shell, L"已撤销");
 }
 
@@ -1092,6 +1306,7 @@ void redo_document(ShellState& shell) {
   }
   shell.needs_render = true;
   refresh_layers(shell);
+  refresh_selection(shell); /* 同撤销：重做也可能恢复/撤掉选区 */
   refresh_history_status(shell, L"已重做");
 }
 
@@ -1171,6 +1386,15 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdListCommands:
       list_commands(shell);
+      break;
+    case kCmdSelectAll:
+      select_all(shell);
+      break;
+    case kCmdSelectNone:
+      deselect_all(shell);
+      break;
+    case kCmdSelectInvert:
+      invert_selection(shell);
       break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
@@ -1308,12 +1532,18 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     DrawTextW(dc, letter, 1, &button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   }
 
-  /* 右侧读数：缩放、笔刷，Retouch 工具再带上子模式与模糊半径。 */
+  /* 右侧读数：缩放、笔刷，Retouch 工具再带上子模式与当前参数。 */
   wchar_t extra[96] = L"";
   if (shell.tool == comp_ui::ToolId::Retouch) {
-    wsprintfW(extra, L"   %s / 半径 %d px",
-              widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
-              static_cast<int>(shell.blur_radius + 0.5));
+    if (shell.retouch_mode == comp_ui::kRetouchBlur) {
+      wsprintfW(extra, L"   %s / 半径 %d px",
+                widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
+                static_cast<int>(shell.blur_radius + 0.5));
+    } else {
+      wsprintfW(extra, L"   %s / 强度 %d%%",
+                widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
+                static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
+    }
   }
   wchar_t info_text[192];
   wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%%s",
@@ -1344,7 +1574,12 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
   }
   wchar_t extra[64] = L"";
   if (shell.tool == comp_ui::ToolId::Retouch) {
-    wsprintfW(extra, L" · 模糊半径 %d px", static_cast<int>(shell.blur_radius + 0.5));
+    if (shell.retouch_mode == comp_ui::kRetouchBlur) {
+      wsprintfW(extra, L" · 半径 %d px", static_cast<int>(shell.blur_radius + 0.5));
+    } else {
+      wsprintfW(extra, L" · 强度 %d%%",
+                static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
+    }
   }
   wchar_t line[768];
   wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%%%s · %s", tool_name,
@@ -1559,6 +1794,169 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   }
 }
 
+/*
+ * 画布叠加层（选区蚂蚁线 / 框选矩形 / 笔迹预览 / 笔尖轮廓）。
+ *
+ * 只画在画布矩形内：先把轴对齐线段裁到画布，再生成虚线段，避免 32 倍缩放
+ * 时一条边生成上万个屏幕虚线段。几何与分段规则全部来自 ui_core.h，这里只做
+ * 「文档坐标 -> 屏幕坐标 -> GDI 调用」的搬运。
+ */
+bool clip_axis_aligned(const comp_ui::Rect& canvas, comp_ui::Point* a, comp_ui::Point* b) {
+  const double tolerance = 1e-6;
+  if (std::fabs(a->y - b->y) <= tolerance) { /* 水平线 */
+    const double y = a->y;
+    if (y < static_cast<double>(canvas.y) || y >= static_cast<double>(canvas.bottom())) {
+      return false;
+    }
+    double x0 = std::min(a->x, b->x);
+    double x1 = std::max(a->x, b->x);
+    x0 = std::max(x0, static_cast<double>(canvas.x));
+    x1 = std::min(x1, static_cast<double>(canvas.right()));
+    if (x1 <= x0) return false;
+    *a = comp_ui::Point{x0, y};
+    *b = comp_ui::Point{x1, y};
+    return true;
+  }
+  if (std::fabs(a->x - b->x) <= tolerance) { /* 垂直线 */
+    const double x = a->x;
+    if (x < static_cast<double>(canvas.x) || x >= static_cast<double>(canvas.right())) {
+      return false;
+    }
+    double y0 = std::min(a->y, b->y);
+    double y1 = std::max(a->y, b->y);
+    y0 = std::max(y0, static_cast<double>(canvas.y));
+    y1 = std::min(y1, static_cast<double>(canvas.bottom()));
+    if (y1 <= y0) return false;
+    *a = comp_ui::Point{x, y0};
+    *b = comp_ui::Point{x, y1};
+    return true;
+  }
+  return true; /* 非轴对齐线段（当前不产生）原样返回，不做错误裁剪 */
+}
+
+void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout) {
+  if (layout.canvas.empty()) return;
+  const int saved = SaveDC(dc);
+  IntersectClipRect(dc, layout.canvas.x, layout.canvas.y, layout.canvas.right(),
+                    layout.canvas.bottom());
+  SetBkMode(dc, TRANSPARENT);
+
+  /* 选区蚂蚁线：白色底线 + 黑色虚线段；相位随时间前进 = 「蚂蚁在爬」。 */
+  if (shell.selection_active && !shell.selection_segments.empty()) {
+    HPEN base_pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dash_pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, base_pen);
+    for (const auto& segment : shell.selection_segments) {
+      comp_ui::Point a = shell.view.doc_to_screen(segment.x0, segment.y0, layout.canvas,
+                                                 shell.width, shell.height);
+      comp_ui::Point b = shell.view.doc_to_screen(segment.x1, segment.y1, layout.canvas,
+                                                 shell.width, shell.height);
+      if (!clip_axis_aligned(layout.canvas, &a, &b)) continue;
+      MoveToEx(dc, static_cast<int>(std::lround(a.x)), static_cast<int>(std::lround(a.y)),
+               nullptr);
+      LineTo(dc, static_cast<int>(std::lround(b.x)), static_cast<int>(std::lround(b.y)));
+    }
+
+    SelectObject(dc, dash_pen);
+    comp_ui::DashSpan spans[1024];
+    for (const auto& segment : shell.selection_segments) {
+      comp_ui::Point a = shell.view.doc_to_screen(segment.x0, segment.y0, layout.canvas,
+                                                 shell.width, shell.height);
+      comp_ui::Point b = shell.view.doc_to_screen(segment.x1, segment.y1, layout.canvas,
+                                                 shell.width, shell.height);
+      if (!clip_axis_aligned(layout.canvas, &a, &b)) continue;
+      const double dx = b.x - a.x;
+      const double dy = b.y - a.y;
+      const double length = std::sqrt(dx * dx + dy * dy);
+      if (!(length > 0.0)) continue;
+      const int count = comp_ui::dash_spans(length, kAntsDashPx, kAntsGapPx,
+                                            shell.selection_phase, spans, 1024);
+      const int drawn = std::min(count, 1024);
+      for (int i = 0; i < drawn; ++i) {
+        const double t0 = spans[i].begin / length;
+        const double t1 = spans[i].end / length;
+        MoveToEx(dc, static_cast<int>(std::lround(a.x + dx * t0)),
+                 static_cast<int>(std::lround(a.y + dy * t0)), nullptr);
+        LineTo(dc, static_cast<int>(std::lround(a.x + dx * t1)),
+               static_cast<int>(std::lround(a.y + dy * t1)));
+      }
+    }
+    SelectObject(dc, old_pen);
+    DeleteObject(base_pen);
+    DeleteObject(dash_pen);
+  }
+
+  /* 框选矩形：文档坐标两点 -> 屏幕矩形；白实线 + 黑虚线。 */
+  if (shell.marquee_active) {
+    const comp_ui::Point a = shell.view.doc_to_screen(shell.marquee_start.x,
+                                                     shell.marquee_start.y, layout.canvas,
+                                                     shell.width, shell.height);
+    const comp_ui::Point b = shell.view.doc_to_screen(shell.marquee_current.x,
+                                                     shell.marquee_current.y, layout.canvas,
+                                                     shell.width, shell.height);
+    const int left = static_cast<int>(std::lround(std::min(a.x, b.x)));
+    const int top = static_cast<int>(std::lround(std::min(a.y, b.y)));
+    const int right = static_cast<int>(std::lround(std::max(a.x, b.x)));
+    const int bottom = static_cast<int>(std::lround(std::max(a.y, b.y)));
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, dotted);
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+
+  /* 进行中的笔迹折线（文档像素 -> 屏幕）：只用一条高对比度 3 px 线。 */
+  if (shell.stroke_active && shell.stroke_points.size() >= 4) {
+    HPEN trail = CreatePen(PS_SOLID, 3, RGB(80, 200, 255));
+    HGDIOBJ old_pen = SelectObject(dc, trail);
+    bool started = false;
+    for (size_t i = 0; i + 1 < shell.stroke_points.size(); i += 2) {
+      const comp_ui::Point screen = shell.view.doc_to_screen(
+          shell.stroke_points[i], shell.stroke_points[i + 1], layout.canvas, shell.width,
+          shell.height);
+      const int px = static_cast<int>(std::lround(screen.x));
+      const int py = static_cast<int>(std::lround(screen.y));
+      if (!started) {
+        MoveToEx(dc, px, py, nullptr);
+        started = true;
+      } else {
+        LineTo(dc, px, py);
+      }
+    }
+    SelectObject(dc, old_pen);
+    DeleteObject(trail);
+  }
+
+  /* 笔尖轮廓：吃笔刷直径的工具，鼠标在画布上时随时可见。 */
+  if (shell.cursor_valid && comp_ui::tool_has_brush_tip(shell.tool) &&
+      layout.canvas.contains(shell.cursor_x, shell.cursor_y)) {
+    const double radius = comp_ui::brush_tip_radius(shell.brush_size, shell.view.zoom);
+    const int left = static_cast<int>(std::lround(shell.cursor_x - radius));
+    const int top = static_cast<int>(std::lround(shell.cursor_y - radius));
+    const int right = static_cast<int>(std::lround(shell.cursor_x + radius));
+    const int bottom = static_cast<int>(std::lround(shell.cursor_y + radius));
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(255, 255, 255));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Ellipse(dc, left, top, right, bottom);
+    SelectObject(dc, dotted);
+    Ellipse(dc, left, top, right, bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+
+  RestoreDC(dc, saved);
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -1641,6 +2039,8 @@ void present(HWND window, ShellState& shell) {
     }
   }
 
+  draw_canvas_overlays(memory_dc, shell, layout);
+
   draw_toolbar(memory_dc, shell, layout.toolbar);
   if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
   if (layout.adjust_panel.w > 0) {
@@ -1676,17 +2076,18 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   set_status(shell, buffer);
 }
 
-/* R 键循环 Blur / Smudge / Liquify；只有 Blur 接了内核，其余如实说明。 */
+/* R 键循环 Blur / Smudge / Liquify；三者都走 comp_tool_apply。 */
 void set_retouch_mode(ShellState& shell, int mode) {
   shell.retouch_mode = mode;
   shell.tool = comp_ui::ToolId::Retouch;
-  wchar_t buffer[160];
+  wchar_t buffer[192];
   if (mode == comp_ui::kRetouchBlur) {
     wsprintfW(buffer, L"工具：Retouch / Blur（Alt+[ / ] 调半径，当前 %d px）",
               static_cast<int>(shell.blur_radius + 0.5));
   } else {
-    wsprintfW(buffer, L"工具：Retouch / %s（尚未接内核）",
-              widen_ascii(comp_ui::retouch_mode_name(mode)).c_str());
+    wsprintfW(buffer, L"工具：Retouch / %s（Alt+[ / ] 调强度，当前 %d%%）",
+              widen_ascii(comp_ui::retouch_mode_name(mode)).c_str(),
+              static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
   }
   set_status(shell, buffer);
 }
@@ -1877,6 +2278,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           run_shell_command(window, shell, kCmdAdjAdd);
           return;
         }
+        run_shell_command(window, shell, kCmdSelectAll);
+        return;
+      case 'I':
+        /* Ctrl+Shift+I 反选（与上游一致）；单独 Ctrl+I 不做绑定。 */
+        if (shift) {
+          run_shell_command(window, shell, kCmdSelectInvert);
+          return;
+        }
         break;
       case 'U':
         if (shift) {
@@ -1897,12 +2306,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         }
         break;
       case 'D':
-        /* Ctrl+Shift+D 删除选中的调整。 */
+        /* Ctrl+Shift+D 删除选中的调整；Ctrl+D 取消选区。 */
         if (shift) {
           run_shell_command(window, shell, kCmdAdjRemove);
           return;
         }
-        break;
+        run_shell_command(window, shell, kCmdSelectNone);
+        return;
       case 'Z':
         /* Ctrl+Shift+Z 与 Ctrl+Y 同为重做，兼容两种习惯。 */
         run_shell_command(window, shell, shift ? kCmdRedo : kCmdUndo);
@@ -2080,8 +2490,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
-            } else if (blur_stroke_available(*shell)) {
-              blur_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (marquee_available(*shell)) {
+              marquee_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (retouch_stroke_available(*shell)) {
+              retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else {
               canvas_click(*shell, mouse_x, mouse_y, layout);
             }
@@ -2101,8 +2513,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      if (shell != nullptr && shell->marquee_active) {
+        marquee_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->stroke_active) {
-        blur_stroke_end(window, *shell);
+        retouch_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -2116,41 +2533,93 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         shell->space_down = false;
         end_pan(window, *shell);
-        blur_stroke_cancel(*shell);
+        retouch_stroke_cancel(*shell);
+        marquee_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
       if (shell != nullptr) {
         end_pan(window, *shell);
-        blur_stroke_cancel(*shell);
+        retouch_stroke_cancel(*shell);
+        marquee_cancel(*shell);
       }
       break;
     case WM_MOUSEMOVE:
-      if (shell != nullptr && shell->stroke_active) {
+      if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
-          blur_stroke_extend(*shell, mouse_x, mouse_y, layout);
+          if (shell->marquee_active) {
+            marquee_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->stroke_active) {
+            retouch_stroke_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->panning) {
+            shell->view.pan_by(static_cast<double>(mouse_x - shell->pan_anchor.x),
+                               static_cast<double>(mouse_y - shell->pan_anchor.y));
+            shell->pan_anchor.x = mouse_x;
+            shell->pan_anchor.y = mouse_y;
+            InvalidateRect(window, nullptr, FALSE);
+          }
+        }
+        /*
+         * 笔尖轮廓跟随光标：只在笔刷类工具下刷新，避免每帧重画。
+         * WM_MOUSELEAVE 是一次性的，收到后要重新 Track 才能再收到。
+         */
+        if (comp_ui::tool_has_brush_tip(shell->tool)) {
+          shell->cursor_x = mouse_x;
+          shell->cursor_y = mouse_y;
+          shell->cursor_valid = true;
+          if (!shell->tracking_leave) {
+            TRACKMOUSEEVENT track{};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+            shell->tracking_leave = true;
+          }
           InvalidateRect(window, nullptr, FALSE);
         }
-      } else if (shell != nullptr && shell->panning) {
-        shell->view.pan_by(static_cast<double>(mouse_x - shell->pan_anchor.x),
-                           static_cast<double>(mouse_y - shell->pan_anchor.y));
-        shell->pan_anchor.x = mouse_x;
-        shell->pan_anchor.y = mouse_y;
+      }
+      break;
+    case WM_MOUSELEAVE:
+      if (shell != nullptr) {
+        shell->cursor_valid = false;
+        shell->tracking_leave = false;
         InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_TIMER:
+      /* 蚂蚁线相位：只在有选区时跑，避免空转重绘。 */
+      if (shell != nullptr && wparam == kAntsTimerId) {
+        if (shell->selection_active) {
+          shell->selection_phase = (shell->selection_phase + 1) % kAntsPhasePeriod;
+          InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
       }
       break;
     case WM_SYSKEYDOWN:
       /*
-       * Alt+[ / Alt+] 调模糊半径。普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，
-       * 因此把模糊半径放到 Alt 组合，且必须在这里吞掉，否则 DefWindowProc 会响铃。
+       * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化模式调强度。
+       * 普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，因此放到 Alt 组合，
+       * 且必须在这里吞掉，否则 DefWindowProc 会响铃。
        */
       if (shell != nullptr && (wparam == VK_OEM_4 || wparam == VK_OEM_6)) {
-        const double next = comp_ui::step_blur_radius(
-            shell->blur_radius, wparam == VK_OEM_6 ? 1 : -1);
-        shell->blur_radius = next;
+        const int direction = wparam == VK_OEM_6 ? 1 : -1;
         wchar_t buffer[96];
-        wsprintfW(buffer, L"模糊半径 %d px", static_cast<int>(next + 0.5));
+        if (shell->tool == comp_ui::ToolId::Retouch &&
+            shell->retouch_mode != comp_ui::kRetouchBlur) {
+          shell->retouch_strength =
+              comp_ui::step_retouch_strength(shell->retouch_strength, direction);
+          wsprintfW(buffer, L"%s强度 %d%%",
+                    widen_ascii(comp_ui::retouch_mode_name(shell->retouch_mode)).c_str(),
+                    static_cast<int>(shell->retouch_strength * 100.0 + 0.5));
+        } else {
+          shell->blur_radius = comp_ui::step_blur_radius(shell->blur_radius, direction);
+          wsprintfW(buffer, L"模糊半径 %d px",
+                    static_cast<int>(shell->blur_radius + 0.5));
+        }
         set_status(*shell, buffer);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -2223,6 +2692,10 @@ HMENU build_menu() {
   HMENU edit_menu = CreatePopupMenu();
   AppendMenuW(edit_menu, MF_STRING, kCmdUndo, L"撤销(&U)\tCtrl+Z");
   AppendMenuW(edit_menu, MF_STRING, kCmdRedo, L"重做(&R)\tCtrl+Y");
+  AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(edit_menu, MF_STRING, kCmdSelectAll, L"全选(&A)\tCtrl+A");
+  AppendMenuW(edit_menu, MF_STRING, kCmdSelectNone, L"取消选择(&D)\tCtrl+D");
+  AppendMenuW(edit_menu, MF_STRING, kCmdSelectInvert, L"反选(&I)\tCtrl+Shift+I");
   AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(edit_menu, MF_STRING, kCmdListCommands, L"枚举引擎命令(&L)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit_menu), L"编辑(&E)");
@@ -2662,6 +3135,120 @@ int run_selftest(const wchar_t* out_path) {
                          &tool_note_size) == COMP_ERR_INVALID_ARGUMENT,
          "COMP_TOOL_BLUR(radius=0) rejected");
 
+  /*
+   * 涂抹 / 液化（COMP_TOOL_SMUDGE / LIQUIFY）：与模糊共用同一条「鼠标折线 ->
+   * comp_tool_apply」通路，参数换成 warp.strength。strength=0 必须逐字节不动，
+   * 否则壳层把 Alt+] 调到 0 时会悄悄改图。
+   */
+  std::vector<uint8_t> warp_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, warp_before.data(), COMP_PIXEL_RGBA8, stride);
+
+  comp_tool_op_desc smudge_desc{};
+  smudge_desc.kind = COMP_TOOL_SMUDGE;
+  smudge_desc.stroke_points = stroke;
+  smudge_desc.stroke_point_count = 5;
+  smudge_desc.brush.diameter = 24.0f;
+  smudge_desc.brush.hardness = 0.75f;
+  smudge_desc.brush.pressure = 1.0f;
+  smudge_desc.brush.flow = 1.0f;
+  smudge_desc.warp.strength = 0.5f;
+  const bool smudge_ok =
+      comp_tool_apply(document, layer, &smudge_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(smudge_ok, "comp_tool_apply(COMP_TOOL_SMUDGE)");
+  std::vector<uint8_t> smudge_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, smudge_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(smudge_ok && smudge_after != warp_before, "smudge drags colour along the stroke");
+  verify(smudge_ok && comp_document_undo(document) == COMP_OK, "comp_document_undo(smudge step)");
+
+  comp_tool_op_desc liquify_desc = smudge_desc;
+  liquify_desc.kind = COMP_TOOL_LIQUIFY;
+  liquify_desc.warp.strength = 0.0f;
+  const bool liquify_zero_ok =
+      comp_tool_apply(document, layer, &liquify_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  std::vector<uint8_t> liquify_zero(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, liquify_zero.data(), COMP_PIXEL_RGBA8, stride);
+  verify(liquify_zero_ok && liquify_zero == warp_before,
+         "COMP_TOOL_LIQUIFY(strength=0) is a byte-identical no-op");
+
+  liquify_desc.warp.strength = 0.8f;
+  const bool liquify_ok =
+      comp_tool_apply(document, layer, &liquify_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(liquify_ok, "comp_tool_apply(COMP_TOOL_LIQUIFY)");
+  std::vector<uint8_t> liquify_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, liquify_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(liquify_ok && liquify_after != warp_before, "liquify moves pixels along the stroke");
+  verify(liquify_ok && comp_document_undo(document) == COMP_OK, "comp_document_undo(liquify step)");
+
+  /*
+   * 选区：壳层蚂蚁线的数据源就是这条「有效 coverage」查询。这里冻结三件事：
+   * 契约里「无选区」与「显式空选区」不同、覆盖率为文档分辨率、选区变更是一步撤销。
+   */
+  int32_t selection_active = -1;
+  verify(comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "comp_selection_get_active() starts at 0 (no selection)");
+
+  const float rect_points[4] = {8.0f, 8.0f, 40.0f, 40.0f};
+  int32_t selection_changed = 0;
+  const bool rect_ok =
+      comp_selection_apply_shape(document, COMP_SELECTION_RECT, rect_points, 2,
+                                 COMP_SELECTION_REPLACE, 1, &selection_changed) == COMP_OK &&
+      selection_changed == 1;
+  verify(rect_ok, "comp_selection_apply_shape(rect)");
+
+  std::vector<uint8_t> coverage(stride * static_cast<size_t>(height), 0);
+  comp_mask coverage_mask{};
+  coverage_mask.width = width;
+  coverage_mask.height = height;
+  coverage_mask.stride = stride;
+  coverage_mask.pixels = coverage.data();
+  verify(rect_ok && comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 1,
+         "comp_selection_get_active() == 1 after a rect shape");
+  verify(comp_selection_get_coverage(document, &coverage_mask) == COMP_OK,
+         "comp_selection_get_coverage()");
+  verify(rect_ok && coverage[static_cast<size_t>(20) * stride + 20u] == 255 &&
+             coverage[static_cast<size_t>(2) * stride + 2u] == 0,
+         "coverage is 255 inside the rect and 0 outside");
+
+  /* 蚂蚁线几何：矩形选区应得到 4 条边界；覆盖率全 0 时一条都不画。 */
+  comp_ui::BoundarySegment ants[16];
+  verify(comp_ui::selection_boundary_segments(coverage.data(), width, height, stride, 128,
+                                              ants, 16) == 4,
+         "selection_boundary_segments(rect) == 4 (what the shell draws)");
+
+  verify(comp_document_undo(document) == COMP_OK, "comp_document_undo(selection step)");
+  verify(comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "undoing the selection shape clears the ants");
+
+  int32_t select_all_changed = 0;
+  const bool select_all_ok =
+      comp_selection_select_all(document, &select_all_changed) == COMP_OK &&
+      comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(63) * stride + 63u] == 255;
+  verify(select_all_ok, "comp_selection_select_all() covers the canvas");
+
+  /*
+   * 反选「全选」得到的是**无选区**而不是显式空选区（ABI 契约，见
+   * comp_selection.h）：此后 get_coverage 会返回 COMP_ERR_STATE，所以壳层
+   * refresh_selection 必须先查 active 再决定要不要取覆盖率。
+   */
+  int32_t invert_changed = 0;
+  verify(comp_selection_invert(document, &invert_changed) == COMP_OK &&
+             comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "comp_selection_invert() of a full selection means no selection");
+
+  int32_t deselect_changed = 0;
+  verify(comp_selection_deselect(document, &deselect_changed) == COMP_OK &&
+             comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "comp_selection_deselect() returns to the no-selection state");
+
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 
@@ -2721,6 +3308,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   g_shell = &shell;
   shell.window = window; /* 视图命令需要客户区矩形，必须早于首次绘制设置 */
   create_document(shell);
+  /* 蚂蚁线相位定时器：无选区时处理函数直接返回，不产生重绘。 */
+  SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);
   ShowWindow(window, show);
   UpdateWindow(window);
 
