@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **368 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **373 用例 0 失败**；Windows 外壳实机自检 **41 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -97,6 +97,17 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   [`docs/filters.md`](docs/filters.md) 与 [`docs/tool-ops.md`](docs/tool-ops.md) §4.9。
   基线 352 → **368 用例**（16 例护栏：11 滤镜 + 5 模糊），口径 B ≈48% → **≈52%**。
   详见 §6.12。
+  2026-10-18 第十三轮（P1 UI 接线：Filter 菜单 / 面板 + Blur 工具）：把上一轮的
+  `comp_filter_apply` 接到 Windows 壳——「滤镜(&F)」菜单按 `filter_table` 动态生成
+  4 个条目，右侧面板切换为参数面板（Tab 选行、`-`/`=` 调值、数字键入、回车应用、
+  Esc 关闭），值与行序由 `build_filter_desc` 一处映射进 `comp_filter_desc`；
+  恒等设置如实提示「未改动」，越界值在面板侧就被夹住。Blur 工具（`R` 循环
+  Blur/Smudge/Liquify）的 Blur 模式接上画布折线 → `COMP_TOOL_BLUR`，
+  `Alt+[` / `Alt+]` 调半径（避开 `[`/`]` 笔刷直径与 `Ctrl+[`/`]` 不透明度）；
+  失焦 / 捕获丢失一律取消未完成的笔迹。平台无关部分仍在 `ui_core.h`，
+  新增 5 例护栏（滤镜表量程/缺省、面板夹取与焦点、行命中几何、retouch 循环与
+  半径量程、笔迹去抖）。基线 368 → **373 用例**，Windows 壳自检 27 → **41 项**，
+  6/6 回归全绿。详见 §6.13。
 
 ## 1. M1 目标与范围
 
@@ -1969,6 +1980,69 @@ note 写明），撤销恢复 16 位资产；RGBA16F 与组 / 无像素图层一
 
 **9. 仍不在本轮**：Remove Background（依赖 ML / 分割）、滤镜的实时预览缓存、
 上游 Bloom 的 16 位逐位对齐。
+
+### 6.13 P1 UI 接线：Filter 菜单 / 参数面板 + Blur 工具（2026-10-18，Claude）
+
+**1. 分工没有变化。** 引擎侧 API 在 §6.12 已收口；本轮只做「壳把消息翻译成
+`ui_core` 调用，再把结果画出来」。`ui_core.h` 仍然不 include Windows 头、
+不 include `engine/` 头、不分配内存——滤镜表、面板状态机、行几何、retouch
+循环都留在这一层，`main.cpp` 只负责 ABI 映射与 GDI 绘制。
+
+**2. Filter 菜单与面板。**
+
+- 菜单「滤镜(&F)」的 4 个条目由 `comp_ui::filter_table()` **动态生成**，菜单 id
+  用 `kCmdFilterBase + 索引` 区间承接；「应用 / 重置参数 / 关闭面板」是固定项。
+  新增滤镜只改 `ui_core.h` 一张表，菜单与面板同时跟上，不存在第三份清单。
+- 选中滤镜时 `FilterPanel::select()` 把值重置为 **上游面板缺省**
+  （Vignette midpoint 50 / roundness 100 / feather 60 / highlights 25；
+  Tonal radius 16 / shadows 40 / midtones 60 / highlights 30；Bloom radius 24）。
+  注意 ABI 的零初始化是**恒等**（amount 0），两者刻意不同：面板负责给
+  「打开即有可见效果」的默认值，ABI 不替宿主决定缺省。
+- `FilterPanel::values[]` → `comp_filter_desc` 的映射只写在 `build_filter_desc()`
+  一处，顺序与面板行序一致；`FilterId` 与 `comp_filter_kind` 的数值对齐由
+  `main.cpp` 的 `static_assert` 钉死（头文件之间不能互相 include）。
+- 交互：`Tab` / `Shift+Tab` 换行（夹在 `[0, param_count-1]`，不环绕）、
+  `-` / `=` 按 `spec.step` 调值、数字/`.`/`-` 键入后回车提交并应用、`Esc` 关闭。
+  键入解析用 `strtod`，拒绝空串、尾部残留和非有限值；面板侧
+  `clamp_filter_param` 保证永远不会向 ABI 送出越界参数（ABI 的规矩仍是
+  **越界拒绝**，不是静默 clamp）。
+- 一次 `comp_filter_apply` 调用完成：`note` 用固定 512 字节缓冲，**不做
+  size-probe 两次调用**——该函数先执行后写 note，探长度会把滤镜应用两遍。
+  返回 `changed == 0` 时如实显示「参数为恒等，未改动」，不伪造成功。
+
+**3. Blur 工具。**
+
+- `R` 在 Blur / Smudge / Liquify 之间循环（对齐上游 retouch 组）；只有 Blur
+  已接内核，另外两个模式状态栏明确写「尚未接内核」，不假装能用。
+- 半径 `Alt+[` / `Alt+]`（`WM_SYSKEYDOWN`）：`[`/`]` 已属笔刷直径、
+  `Ctrl+[`/`]` 已属图层不透明度，Alt 组合是唯一不冲突且与上游手感接近的键位。
+- 笔迹：`WM_LBUTTONDOWN` 转文档坐标后 `SetCapture`，`WM_MOUSEMOVE` 按
+  `stroke_point_should_append`（0.75 px 欧氏距离去抖）追加，`WM_LBUTTONUP`
+  把整条折线一次 `COMP_TOOL_BLUR` 提交。`WM_KILLFOCUS` / `WM_CAPTURECHANGED`
+  取消未完成笔迹，不会留下「粘住」的画笔。
+- 半径量程 0.5..50 与 `comp_tool_blur.radius` 同口径；工具条与状态栏显示
+  `Retouch / <模式> / 半径 N px`。
+
+**4. 自检（`--selftest`）。** 新增 14 项，全部只走 C ABI：恒等滤镜是**真 no-op**
+（字节、事务、历史深度都不动）、越界 amount 在事务前拒绝、Vignette 改变展平输出、
+一步撤销逐字节还原；棋盘图上 `COMP_TOOL_BLUR` 沿笔迹改变像素、撤销逐字节还原、
+`radius = 0` 拒绝。仍有一个易踩的观测前提：Vignette 在 `fillsClear = 0` 下逐像素
+跳过全透明像素，因此自检必须先铺一张**不透明**图（与 `tests/test_filters.cpp`
+同口径），空图层上「成功但字节不变」是正确行为。
+
+**5. 验证。** `scripts/run_regression.py --require-ohos` **6/6 PASS，0 skipped**：
+步骤 ① **373 cases / 0 failed**（新增 5 例 `test_ui_core`）；步骤 ② Windows 壳
+**41 项** `failures=0`、SHA256 `739f4e7c20257af9…` 与仓内基线逐字节一致
+（基线已随自检项同步更新）；步骤 ⑤ 共享 DLL 真实加载；步骤 ⑥ OHOS aarch64
+交叉编译 + NAPI rc=0。
+
+**6. 如实说明的边界。** 本轮所有 Win32 交互路径（菜单点击、参数面板键盘、
+真实鼠标落笔）**没有经过人手实测**——无窗口环境下只能验证到 ABI 层与
+`ui_core` 数学层；`tests/test_ui_core.cpp` 钉住的是几何与状态机，不是
+「画得对不对」。Vignette 的边缘色选择器、Smudge / Liquify 的壳层接线、
+滤镜预览缓存仍不在本轮。
+
+报告：`../report/P1b-ui-filter-blur-20261018-claude.md`。
 
 ## 7. 许可
 

@@ -24,6 +24,8 @@ compositor-ng 是「同引擎、两壳」结构：
 | 图层增删改查 | 图层面板（增/选/显隐/不透明度） | （未接 UI） | `comp_layer_*` | **部分达成**：Windows 面板仅接 `add`/`get_visible`/`set_visible`/`set_opacity`；`remove`/`reorder`/`set_blend`/`set_transform`/`set_mask`/`set_clipping_source` 无调用点（仅 selftest 覆盖 `set_pixels`） |
 | 调整图层参数编辑 | 调整面板 | （未接 UI） | 调整 ABI 全套 | 已达成（鸿蒙无面板） |
 | 调整控件元数据 | `refresh_adjustments` | 预留 | `comp_layer_adjustment_param_at` 等 | 已达成 |
+| 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
+| Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 编解码能力查询 | 导入/导出菜单 | 预留 | `comp_io_codec_support` | 已达成 |
 | PNG 导入/导出 | 可用 | 可用 | `comp_io_import` / `comp_io_export` | 已达成（libpng+zlib） |
 | JPEG 导入/导出 | 可用（有损） | 可用 | 同上 | 已达成（stb） |
@@ -91,7 +93,7 @@ compositor-ng 是「同引擎、两壳」结构：
 上游 `Compositor` 只有 macOS 应用层，**没有 Windows 版可供参照**，故 Windows 壳的
 编辑器界面是自建的。为让 UI 数学可回归，平台无关部分被抽到
 `shells/windows/src/ui_core.h`（header-only，不 include Windows 头、不 include `engine/` 头、
-不分配内存），由 `tests/test_ui_core.cpp` 的 8 例覆盖；`main.cpp` 只做
+不分配内存），由 `tests/test_ui_core.cpp` 的 12 例覆盖；`main.cpp` 只做
 「消息 → ui_core 调用 → 绘制」。**绘制与命中测试共用同一套几何函数**，这是本层的第一原则。
 
 ### 5.1 冻结的布局常量
@@ -105,6 +107,8 @@ compositor-ng 是「同引擎、两壳」结构：
 | `Layout::kMinCanvasWidth` | 180 | 画布保底宽度，不足则先收右面板、再收左面板 |
 | `kToolButtonSize` / `kToolButtonGap` / `kToolButtonLeft` | 32 / 6 / 10 | 工具条按钮几何 |
 | `kLayerHeaderHeight` / `kLayerRowHeight` | 30 / 22 | 图层面板表头与行高 |
+| `kFilterRowsTop` / `kFilterRowHeight` | 54 / 20 | 滤镜参数面板行几何（绘制与命中共用） |
+| `kMinBlurRadius` / `kMaxBlurRadius` | 0.5 / 50 | 与 `comp_tool_blur.radius` 同量程 |
 | `CanvasView::kMinZoom` / `kMaxZoom` | 0.02 / 32.0 | 缩放夹取范围 |
 
 不变量（测试钉死）：任意宽度 × 高度下所有矩形非负、互不重叠、三块横向拼接**正好**铺满
@@ -124,14 +128,34 @@ compositor-ng 是「同引擎、两壳」结构：
 `Ctrl+[` / `Ctrl+]`（`[` `]` 改为笔刷直径、`Shift+[` `]` 为硬度）；新建/打开/保存改
 `Ctrl+N` / `Ctrl+O` / `Ctrl+S`。
 
-### 5.3 未达成的 UI 项
+### 5.3 滤镜面板与 Blur 工具（2026-10-18 追加）
+
+面板字段与量程全部来自 `ui_core.h` 的 `filter_table()`，逐项对齐
+[`filters.md`](filters.md) §3；`FilterId` 的数值由 `main.cpp` 的 `static_assert`
+与 ABI `comp_filter_kind` 锁死。几点容易踩的口径：
+
+- **ABI 零初始化 = 恒等，面板缺省 ≠ 恒等**：`comp_filter_desc{}` 的 amount 是 0
+  （不动像素）；面板在选中滤镜时用上游默认值（如 Vignette midpoint 50），
+  让「打开面板」就有可见效果。两个缺省各管一层，不互相冒充。
+- **一次调用，不做 note 长度探测**：`comp_filter_apply` 先执行、后写 note，
+  探长度会把滤镜应用两遍；壳用固定 512 字节缓冲一次调用。
+- **面板夹取，ABI 拒绝**：键入手输先用 `clamp_filter_param` 夹到量程内，
+  ABI 侧仍是越界拒绝（不静默 clamp）。
+- **`Alt+[` / `Alt+]` 调模糊半径**：`[`/`]` 已属笔刷直径、`Ctrl+[`/`]` 已属
+  不透明度；Blur 半径 0.5..50。
+- **笔迹去抖**：点间距小于 `kStrokeMinDistance`（0.75 文档像素）不追加，
+  整笔在 `WM_LBUTTONUP` 一次提交；失焦/捕获丢失取消未完成笔迹。
+
+### 5.4 未达成的 UI 项
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|
 | Move 工具拖拽平移图层 | 未做 | 需图层 transform 写入侧与像素回读配合；现有 `comp_layer_*` 不足以在不猜语义的前提下实现 |
 | 工具按钮图标 | 未做 | 当前为文字快捷键字母，避免引入图标资源/字体 |
 | 画布上的选区 / 蚂蚁线 / 裁剪手柄 | 未做 | 选区 ABI 已具备（README §6.7），交互层待补 |
-| 笔刷落笔 | 未做 | `comp_tool_apply` 已具备，外壳尚无可视笔迹预览与撤销粒度控制 |
+| 笔刷落笔 | 部分做 | Blur 已接「折线 → `COMP_TOOL_BLUR`」；Brush/Eraser 等仍缺可视笔迹预览与逐笔撤销粒度 |
+| 滤镜实时预览 | 未做 | 当前是「回车应用一次」，无拖动滑杆的增量预览缓存 |
+| Smudge / Liquify 壳层接线 | 未做 | 内核与 `COMP_TOOL_SMUDGE`/`LIQUIFY` 已具备，状态栏如实显示「尚未接内核」 |
 | 面板缩放 / 停靠 | 未做 | 固定布局，窄窗口按规则收起 |
 
 以上均为**外壳交互**缺口，不涉及引擎核与两壳共享语义。

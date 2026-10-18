@@ -231,3 +231,10 @@ coverage 把样本盖回当前像素。
   （[`docs/filters.md`](filters.md)）同时落地，基线 352 → **368 用例 0 失败**
   （16 例新增：11 滤镜 + 5 模糊）。`comp_tool_op_desc.blur` 是**尾部追加**字段，
   既有字段偏移不变。
+- P1 UI 接线（2026-10-18）：Blur 模式接上 Windows 壳的画布折线——`R` 在
+  Blur/Smudge/Liquify 间循环（后两者状态栏如实标注「尚未接内核」），
+  `Alt+[` / `Alt+]` 调半径，`WM_LBUTTONUP` 把整条折线一次 `comp_tool_apply`
+  提交；失焦 / 捕获丢失取消未完成笔迹。基线 368 → **373 用例 0 失败**
+  （5 例 `test_ui_core`：滤镜表、面板状态机、行几何、retouch 循环、笔迹去抖），
+  Windows 壳自检 27 → **41 项**。Win32 交互路径未经人手实测，只验证到 ABI 与
+  `ui_core` 数学层。

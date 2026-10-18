@@ -312,6 +312,219 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
   COMP_CHECK(comp_ui::tool_button_at(toolbar, count, 10.0, -5.0) == -1);
 }
 
+COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
+  size_t count = 0;
+  const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
+  COMP_CHECK(count == 4);
+  COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
+
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..3 一一对齐（main.cpp 里也有 static_assert）。 */
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::LensCorrection) == 3);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 4);
+
+  /* 面板行数：docs/filters.md §3 各表的数据行数。 */
+  const int row_counts[] = {5, 5, 2, 1};
+  for (size_t i = 0; i < count; ++i) {
+    COMP_CHECK_MSG(table[i].param_count == row_counts[i], "panel row count");
+    COMP_CHECK_MSG(table[i].param_count > 0 &&
+                       table[i].param_count <= comp_ui::FilterSpec::kMaxParams,
+                   "param_count must fit the fixed array");
+    for (int row = 0; row < table[i].param_count; ++row) {
+      const comp_ui::FilterParamSpec& spec = table[i].params[row];
+      COMP_CHECK_MSG(spec.label != nullptr && spec.label[0] != '\0', "row needs a label");
+      COMP_CHECK_MSG(spec.min_value < spec.max_value, "row range must be ordered");
+      COMP_CHECK_MSG(spec.step > 0.0, "row step must advance");
+      COMP_CHECK_MSG(spec.default_value >= spec.min_value &&
+                         spec.default_value <= spec.max_value,
+                     "default must lie inside the range");
+    }
+    /* 未使用行的量程必须保持零（绘制层靠 param_count 截断，不读到垃圾值）。 */
+    for (int row = table[i].param_count; row < comp_ui::FilterSpec::kMaxParams; ++row) {
+      COMP_CHECK(table[i].params[row].label != nullptr && table[i].params[row].label[0] == '\0');
+      COMP_CHECK(near_value(table[i].params[row].min_value, 0.0));
+      COMP_CHECK(near_value(table[i].params[row].max_value, 0.0));
+    }
+  }
+
+  /* 缺省值逐项对齐上游面板（docs/filters.md §3）。 */
+  const comp_ui::FilterSpec* vignette = comp_ui::filter_spec(comp_ui::FilterId::Vignette);
+  COMP_CHECK(vignette != nullptr && std::string(vignette->name) == "Vignette");
+  COMP_CHECK(near_value(vignette->params[0].default_value, 0.0));   /* Amount */
+  COMP_CHECK(near_value(vignette->params[1].default_value, 50.0));  /* Midpoint */
+  COMP_CHECK(near_value(vignette->params[2].default_value, 100.0)); /* Roundness */
+  COMP_CHECK(near_value(vignette->params[3].default_value, 60.0));  /* Feather */
+  COMP_CHECK(near_value(vignette->params[4].default_value, 25.0));  /* Highlights */
+
+  const comp_ui::FilterSpec* tonal = comp_ui::filter_spec(comp_ui::FilterId::TonalContrast);
+  COMP_CHECK(tonal != nullptr && near_value(tonal->params[1].min_value, 1.0));
+  COMP_CHECK(near_value(tonal->params[1].default_value, 16.0)); /* Radius */
+  COMP_CHECK(near_value(tonal->params[2].default_value, 40.0)); /* Shadows */
+  COMP_CHECK(near_value(tonal->params[3].default_value, 60.0)); /* Midtones */
+  COMP_CHECK(near_value(tonal->params[4].default_value, 30.0)); /* Highlights */
+
+  const comp_ui::FilterSpec* bloom = comp_ui::filter_spec(comp_ui::FilterId::Bloom);
+  COMP_CHECK(bloom != nullptr && near_value(bloom->params[1].max_value, 150.0));
+  COMP_CHECK(near_value(bloom->params[1].default_value, 24.0)); /* Radius */
+
+  const comp_ui::FilterSpec* lens = comp_ui::filter_spec(comp_ui::FilterId::LensCorrection);
+  COMP_CHECK(lens != nullptr && near_value(lens->params[0].min_value, -100.0) &&
+             near_value(lens->params[0].max_value, 100.0));
+  COMP_CHECK(near_value(lens->params[0].default_value, 0.0)); /* 恒等 */
+
+  COMP_CHECK(comp_ui::filter_spec_at(-1) == nullptr);
+  COMP_CHECK(comp_ui::filter_spec_at(static_cast<int>(count)) == nullptr);
+}
+
+COMP_TEST(ui_core_filter_panel_clamps_steps_and_resets) {
+  comp_ui::FilterPanel panel;
+
+  /* 默认构造 = 零初始化：amount 0 因此是恒等，但中点不是上游缺省 50。 */
+  COMP_CHECK(panel.id == comp_ui::FilterId::Vignette);
+  COMP_CHECK(panel.param_count() == 5);
+  COMP_CHECK(near_value(panel.value(0), 0.0));
+
+  /* 打开面板走 select()：值回到该滤镜的上游缺省，焦点回到第一行。 */
+  panel.select(comp_ui::FilterId::Vignette);
+  COMP_CHECK(near_value(panel.value(1), 50.0));
+  COMP_CHECK(near_value(panel.value(2), 100.0));
+  COMP_CHECK(panel.focused == 0);
+
+  panel.select(comp_ui::FilterId::Bloom);
+  COMP_CHECK(panel.param_count() == 2);
+  COMP_CHECK(near_value(panel.value(0), 0.0));
+  COMP_CHECK(near_value(panel.value(1), 24.0));
+  /* 超出本滤镜行数的槽位必须是 0，不能被别的滤镜的缺省值污染。 */
+  COMP_CHECK(near_value(panel.value(2), 0.0));
+  COMP_CHECK(near_value(panel.value(5), 0.0));
+  COMP_CHECK(panel.value(-1) == 0.0 && panel.value(6) == 0.0);
+  COMP_CHECK(panel.param_at(2) == nullptr);
+
+  /* 步进：按 spec.step 加一档，越界夹住并报告「没变化」。 */
+  panel.focus(0);
+  COMP_CHECK(panel.focused == 0);
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(near_value(panel.value(0), 1.0));
+
+  panel.set_value(0, 1e9);
+  COMP_CHECK(near_value(panel.value(0), 100.0));
+  COMP_CHECK(!panel.step(1));
+  COMP_CHECK(near_value(panel.value(0), 100.0));
+
+  panel.set_value(0, -5.0);
+  COMP_CHECK(near_value(panel.value(0), 0.0));
+  COMP_CHECK(!panel.step(-1));
+
+  /* NaN 回落到该行的下限（Bloom Radius 下限 = 1，不是 0）。 */
+  panel.set_value(1, std::nan(""));
+  COMP_CHECK(near_value(panel.value(1), 1.0));
+
+  /* 焦点夹在 [0, param_count-1]，不环绕。 */
+  panel.focus(99);
+  COMP_CHECK(panel.focused == 1);
+  panel.focus(-99);
+  COMP_CHECK(panel.focused == 0);
+
+  panel.select(comp_ui::FilterId::LensCorrection);
+  COMP_CHECK(panel.param_count() == 1);
+  panel.focus(1);
+  COMP_CHECK(panel.focused == 0);
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(near_value(panel.value(0), 1.0));
+  COMP_CHECK(panel.step(-1));
+  COMP_CHECK(near_value(panel.value(0), 0.0));
+
+  /* reset_values() 可以把用户调乱的行恢复成缺省。 */
+  panel.select(comp_ui::FilterId::Vignette);
+  panel.set_value(0, 77.0);
+  panel.focus(3);
+  panel.reset_values();
+  COMP_CHECK(near_value(panel.value(0), 0.0));
+  COMP_CHECK(panel.focused == 0);
+}
+
+COMP_TEST(ui_core_filter_rows_hit_test_matches_geometry) {
+  const Rect panel{248, Layout::kToolbarHeight, Layout::kAdjustPanelWidth, 600};
+  const int param_count = 5;
+
+  /* 行矩形：起点 = 面板顶 + kFilterRowsTop，等高 kFilterRowHeight。 */
+  for (int row = 0; row < param_count; ++row) {
+    const Rect rect = comp_ui::filter_param_row_rect(panel, row);
+    COMP_CHECK(rect.x == panel.x && rect.w == panel.w);
+    COMP_CHECK(rect.y == panel.y + comp_ui::kFilterRowsTop + row * comp_ui::kFilterRowHeight);
+    COMP_CHECK(rect.h == comp_ui::kFilterRowHeight);
+    /* 行矩形内首尾 y 都必须命中同一行（绘制与命中共用一套常量）。 */
+    COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, rect.x + 4.0, rect.y) == row);
+    COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, rect.x + 4.0,
+                                            rect.bottom() - 1.0) == row);
+  }
+
+  /* 行区上方（标题 / 滤镜名）不命中。 */
+  COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, panel.x + 4.0,
+                                          panel.y + comp_ui::kFilterRowsTop - 1.0) == -1);
+  /* 行数之外、面板外、param_count 为 0 都不命中。 */
+  COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, panel.x + 4.0,
+                                          panel.y + comp_ui::kFilterRowsTop +
+                                              param_count * comp_ui::kFilterRowHeight) == -1);
+  COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, panel.x - 1.0,
+                                          panel.y + comp_ui::kFilterRowsTop + 1.0) == -1);
+  COMP_CHECK(comp_ui::filter_param_row_at(panel, 0, panel.x + 4.0,
+                                          panel.y + comp_ui::kFilterRowsTop + 1.0) == -1);
+}
+
+COMP_TEST(ui_core_retouch_modes_cycle_and_blur_radius_is_bounded) {
+  /* R 键循环：Blur -> Smudge -> Liquify -> Blur（对齐上游 retouch 组）。 */
+  COMP_CHECK(comp_ui::kRetouchModeCount == 3);
+  COMP_CHECK(comp_ui::kRetouchBlur == 0);
+  COMP_CHECK(comp_ui::next_retouch_mode(0) == 1);
+  COMP_CHECK(comp_ui::next_retouch_mode(1) == 2);
+  COMP_CHECK(comp_ui::next_retouch_mode(2) == 0);
+  /* 越界/负数一律回到第一个模式，不越界读名字表。 */
+  COMP_CHECK(comp_ui::next_retouch_mode(-1) == 0);
+  COMP_CHECK(comp_ui::next_retouch_mode(7) == 0);
+
+  COMP_CHECK(std::string(comp_ui::retouch_mode_name(0)) == "Blur");
+  COMP_CHECK(std::string(comp_ui::retouch_mode_name(1)) == "Smudge");
+  COMP_CHECK(std::string(comp_ui::retouch_mode_name(2)) == "Liquify");
+  COMP_CHECK(std::string(comp_ui::retouch_mode_name(3)) == "?");
+  COMP_CHECK(std::string(comp_ui::retouch_mode_name(-1)) == "?");
+
+  /* 半径量程对齐 ABI comp_tool_blur.radius 的 0.5..50。 */
+  COMP_CHECK(near_value(comp_ui::clamp_blur_radius(0.0), comp_ui::kMinBlurRadius));
+  COMP_CHECK(near_value(comp_ui::clamp_blur_radius(-2.0), comp_ui::kMinBlurRadius));
+  COMP_CHECK(near_value(comp_ui::clamp_blur_radius(std::nan("")), comp_ui::kMinBlurRadius));
+  COMP_CHECK(near_value(comp_ui::clamp_blur_radius(1e9), comp_ui::kMaxBlurRadius));
+
+  COMP_CHECK(near_value(comp_ui::step_blur_radius(10.0, 1), 12.0));
+  COMP_CHECK(near_value(comp_ui::step_blur_radius(10.0, -1), 10.0 / 1.2));
+  COMP_CHECK(near_value(comp_ui::step_blur_radius(10.0, 0), 10.0));
+
+  double radius = comp_ui::kMinBlurRadius;
+  for (int i = 0; i < 200; ++i) radius = comp_ui::step_blur_radius(radius, 1);
+  COMP_CHECK(near_value(radius, comp_ui::kMaxBlurRadius));
+  for (int i = 0; i < 200; ++i) radius = comp_ui::step_blur_radius(radius, -1);
+  COMP_CHECK(near_value(radius, comp_ui::kMinBlurRadius));
+}
+
+COMP_TEST(ui_core_stroke_points_are_debounced) {
+  /* 阈值内（含）不追加，避免每个像素事件都变成折点。 */
+  COMP_CHECK(!comp_ui::stroke_point_should_append(10.0, 10.0, 10.0, 10.0));
+  COMP_CHECK(!comp_ui::stroke_point_should_append(10.0, 10.0,
+                                                  10.0 + comp_ui::kStrokeMinDistance * 0.5, 10.0));
+  /* 恰好等于阈值即追加（>= 口径，边界不含混）。 */
+  COMP_CHECK(comp_ui::stroke_point_should_append(10.0, 10.0,
+                                                 10.0 + comp_ui::kStrokeMinDistance, 10.0));
+  COMP_CHECK(comp_ui::stroke_point_should_append(10.0, 10.0, 10.0,
+                                                 10.0 + comp_ui::kStrokeMinDistance * 2.0));
+  /* 距离是欧氏距离，不按单轴判断。 */
+  COMP_CHECK(!comp_ui::stroke_point_should_append(
+      0.0, 0.0, comp_ui::kStrokeMinDistance * 0.7, comp_ui::kStrokeMinDistance * 0.7));
+  COMP_CHECK(comp_ui::stroke_point_should_append(
+      0.0, 0.0, comp_ui::kStrokeMinDistance * 0.8, comp_ui::kStrokeMinDistance * 0.8));
+}
+
 COMP_TEST(ui_core_brush_steps_are_geometric_and_bounded) {
   COMP_CHECK(near_value(comp_ui::clamp_brush_size(0.0), comp_ui::kMinBrushSize));
   COMP_CHECK(near_value(comp_ui::clamp_brush_size(-4.0), comp_ui::kMinBrushSize));

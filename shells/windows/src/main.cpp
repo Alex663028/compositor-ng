@@ -32,6 +32,7 @@
 #include <compositor/comp_command.h>
 #include <compositor/comp_core.h>
 #include <compositor/comp_engine.h>
+#include <compositor/comp_filter.h>
 #include <compositor/comp_io.h>
 #include <compositor/comp_layer.h>
 #include <compositor/comp_render.h>
@@ -82,6 +83,10 @@ constexpr UINT kCmdViewActual = 1028;
 constexpr UINT kCmdViewZoomIn = 1029;
 constexpr UINT kCmdViewZoomOut = 1030;
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
+constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
+constexpr UINT kCmdFilterApply = 1210;
+constexpr UINT kCmdFilterReset = 1211;
+constexpr UINT kCmdFilterClose = 1212;
 
 struct LayerRow {
   comp_layer_id id = 0;
@@ -116,6 +121,16 @@ struct ShellState {
   comp_ui::ToolId tool = comp_ui::ToolId::Select;
   double brush_size = 24.0;
   double brush_hardness = 0.75;
+  /* Retouch 工具（R 循环）：0 = 模糊（走 COMP_TOOL_BLUR）/ 1 涂抹 / 2 液化。 */
+  int retouch_mode = comp_ui::kRetouchBlur;
+  double blur_radius = 8.0;
+  /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
+  comp_ui::FilterPanel filter;
+  bool filter_open = false;
+  std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
+  /* 进行中的模糊笔迹（文档像素折线）。 */
+  bool stroke_active = false;
+  std::vector<float> stroke_points;
   bool space_down = false; /* 按住空格 = 临时抓手 */
   bool panning = false;
   POINT pan_anchor{};
@@ -701,6 +716,269 @@ void panel_remove_adjustment(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 滤镜面板 */
+
+/*
+ * ui_core.h 出于「不 include 引擎头」的约束，只能自带一份滤镜枚举。
+ * 两边数值必须一一对应；这里用编译期断言把漂移挡在构建阶段。
+ */
+static_assert(static_cast<int>(comp_ui::FilterId::Vignette) == COMP_FILTER_VIGNETTE,
+              "FilterId::Vignette must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::TonalContrast) == COMP_FILTER_TONAL_CONTRAST,
+              "FilterId::TonalContrast must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Bloom) == COMP_FILTER_BLOOM,
+              "FilterId::Bloom must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::LensCorrection) == COMP_FILTER_LENS_CORRECTION,
+              "FilterId::LensCorrection must match comp_filter_kind");
+
+std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
+  const comp_ui::FilterParamSpec* spec = panel.param_at(panel.focused);
+  if (spec == nullptr) return std::wstring();
+  return widen_ascii(spec->label) + L" = " +
+         widen_ascii(number_text(panel.value(panel.focused)).c_str());
+}
+
+void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
+  shell.filter.select(id);
+  shell.filter_open = true;
+  shell.filter_input.clear();
+  const comp_ui::FilterSpec* spec = shell.filter.spec();
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"滤镜：%s（Tab 选参数 · -/= 调值 · 数字键入 · 回车应用 · Esc 关闭）",
+            widen_ascii(spec != nullptr ? spec->name : "?").c_str());
+  set_status(shell, buffer);
+}
+
+void close_filter_panel(ShellState& shell) {
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  set_status(shell, L"已关闭滤镜面板");
+}
+
+void filter_reset_values(ShellState& shell) {
+  shell.filter_input.clear();
+  shell.filter.reset_values();
+  set_status(shell, L"滤镜参数已重置为默认值");
+}
+
+void filter_focus_row(ShellState& shell, int delta) {
+  if (!shell.filter_open) return;
+  shell.filter.focus(delta);
+  const std::wstring text = param_status_text(shell.filter);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"参数 %d/%d：%s", shell.filter.focused + 1, shell.filter.param_count(),
+            text.c_str());
+  set_status(shell, buffer);
+}
+
+void filter_step_value(ShellState& shell, int direction) {
+  if (!shell.filter_open) return;
+  const comp_ui::FilterParamSpec* spec = shell.filter.param_at(shell.filter.focused);
+  if (spec == nullptr) return;
+  shell.filter.step(direction);
+  const std::wstring text = param_status_text(shell.filter);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s（步长 %s）", text.c_str(),
+            widen_ascii(number_text(spec->step).c_str()).c_str());
+  set_status(shell, buffer);
+}
+
+void filter_begin_input(ShellState& shell, wchar_t character) {
+  if (!shell.filter_open) return;
+  shell.filter_input.push_back(character);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"输入中：%s", shell.filter_input.c_str());
+  set_status(shell, buffer);
+}
+
+void filter_backspace(ShellState& shell) {
+  if (shell.filter_input.empty()) return;
+  shell.filter_input.pop_back();
+}
+
+/* 键入值先夹到面板量程再落值：面板永不产生越界参数（ABI 仍会拒绝越界）。 */
+void filter_commit_input(ShellState& shell) {
+  if (shell.filter_input.empty()) return;
+  const std::string text(shell.filter_input.begin(), shell.filter_input.end());
+  char* end = nullptr;
+  const double value = std::strtod(text.c_str(), &end);
+  if (end == text.c_str() || end == nullptr || *end != '\0' || !std::isfinite(value)) {
+    set_status(shell, L"输入不是合法数值，未提交");
+    return;
+  }
+  shell.filter.set_value(shell.filter.focused, value);
+  shell.filter_input.clear();
+  const std::wstring shown = param_status_text(shell.filter);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已设置 %s", shown.c_str());
+  set_status(shell, buffer);
+}
+
+/* 面板值按固定行序搬进 ABI 结构（唯一映射点；顺序见 ui_core 的 filter_table）。 */
+void build_filter_desc(const comp_ui::FilterPanel& panel, comp_filter_desc* out) {
+  comp_filter_desc desc{};
+  desc.kind = static_cast<comp_filter_kind>(static_cast<int>(panel.id));
+  switch (panel.id) {
+    case comp_ui::FilterId::Vignette:
+      desc.vignette.amount = panel.value(0);
+      desc.vignette.midpoint = panel.value(1);
+      desc.vignette.roundness = panel.value(2);
+      desc.vignette.feather = panel.value(3);
+      desc.vignette.highlights = panel.value(4);
+      /* 面板 v1 不暴露边缘色：固定黑（与上游默认色一致），已在文档记边界。 */
+      desc.vignette.color[0] = 0.0;
+      desc.vignette.color[1] = 0.0;
+      desc.vignette.color[2] = 0.0;
+      break;
+    case comp_ui::FilterId::TonalContrast:
+      desc.tonal_contrast.amount = panel.value(0);
+      desc.tonal_contrast.radius = panel.value(1);
+      desc.tonal_contrast.shadows = panel.value(2);
+      desc.tonal_contrast.midtones = panel.value(3);
+      desc.tonal_contrast.highlights = panel.value(4);
+      break;
+    case comp_ui::FilterId::Bloom:
+      desc.bloom.amount = panel.value(0);
+      desc.bloom.radius = panel.value(1);
+      break;
+    case comp_ui::FilterId::LensCorrection:
+      desc.lens_correction.distortion = panel.value(0);
+      break;
+    default:
+      break;
+  }
+  *out = desc;
+}
+
+void apply_filter(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"请先用 ↑↓ 选择一个图层");
+    return;
+  }
+  const comp_ui::FilterSpec* spec = shell.filter.spec();
+  if (spec == nullptr) return;
+
+  comp_filter_desc desc{};
+  build_filter_desc(shell.filter, &desc);
+
+  int32_t changed = 0;
+  char note[512] = {0};
+  size_t note_size = 0;
+  /* 全分辨率渲染，scale = 1：高斯半径不缩放。 */
+  const comp_result result = comp_filter_apply(shell.document, id, &desc, 1.0, &changed, note,
+                                               sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[768];
+  const std::wstring name = widen_ascii(spec->name);
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"%s 失败", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  if (changed == 0) {
+    /* 恒等（例如 Amount 仍为 0）：引擎不碰像素、不开事务，这里如实回报。 */
+    wsprintfW(buffer, L"%s：参数为恒等，未改动", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"%s：已应用｜%s", name.c_str(), widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"%s：已应用", name.c_str());
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------------------ 模糊工具笔迹 */
+
+bool blur_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Retouch &&
+         shell.retouch_mode == comp_ui::kRetouchBlur;
+}
+
+void blur_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!blur_stroke_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.stroke_points.clear();
+  shell.stroke_points.push_back(static_cast<float>(doc.x));
+  shell.stroke_points.push_back(static_cast<float>(doc.y));
+  shell.stroke_active = true;
+  SetCapture(window);
+  set_status(shell, L"模糊笔迹…（松开鼠标应用）");
+}
+
+void blur_stroke_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.stroke_active) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const size_t count = shell.stroke_points.size();
+  const double last_x = count >= 2 ? shell.stroke_points[count - 2] : doc.x;
+  const double last_y = count >= 2 ? shell.stroke_points[count - 1] : doc.y;
+  if (!comp_ui::stroke_point_should_append(last_x, last_y, doc.x, doc.y)) return;
+  shell.stroke_points.push_back(static_cast<float>(doc.x));
+  shell.stroke_points.push_back(static_cast<float>(doc.y));
+}
+
+void blur_stroke_cancel(ShellState& shell) {
+  shell.stroke_active = false;
+  shell.stroke_points.clear();
+}
+
+void blur_stroke_end(HWND window, ShellState& shell) {
+  if (!shell.stroke_active) return;
+  shell.stroke_active = false;
+  ReleaseCapture();
+
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  if (points.empty()) return;
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"模糊：请先选择一个图层");
+    return;
+  }
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_BLUR;
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  desc.brush.flow = 1.0f;
+  desc.brush.seed = 0; /* 模糊不用随机数；固定值保证同参数同结果 */
+  desc.blur.radius = static_cast<float>(shell.blur_radius);
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"模糊失败（半径 %.1f px）", shell.blur_radius);
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"模糊：已应用 %d 个折点｜%s", desc.stroke_point_count,
+              widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"模糊：已应用 %d 个折点（半径 %d px）", desc.stroke_point_count,
+              static_cast<int>(shell.blur_radius + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 文件与命令 */
 
 bool create_document(ShellState& shell) {
@@ -729,6 +1007,11 @@ bool create_document(ShellState& shell) {
   shell.needs_render = true;
   shell.needs_fit = true;
   shell.visibility.clear();
+  /* 新文档没有「之前的滤镜面板/未完成笔迹」可言，一并复位，避免跨文档误应用。 */
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.filter.select(comp_ui::FilterId::Vignette);
+  blur_stroke_cancel(shell);
   refresh_layers(shell);
   refresh_history_status(shell, L"已新建文档");
   return true;
@@ -754,6 +1037,10 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.needs_render = true;
   shell.needs_fit = true;
   shell.visibility.clear();
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.filter.select(comp_ui::FilterId::Vignette);
+  blur_stroke_cancel(shell);
   refresh_layers(shell);
   refresh_history_status(shell, L"已打开 .comp");
   return true;
@@ -954,10 +1241,24 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdAdjRemove:
       panel_remove_adjustment(shell);
       break;
+    case kCmdFilterApply:
+      apply_filter(shell);
+      break;
+    case kCmdFilterReset:
+      filter_reset_values(shell);
+      break;
+    case kCmdFilterClose:
+      close_filter_panel(shell);
+      break;
     case kCmdExit:
       PostMessageW(window, WM_CLOSE, 0, 0);
       return;
     default:
+      /* 滤镜菜单项：kCmdFilterBase + 滤镜序号。 */
+      if (id >= kCmdFilterBase && id < kCmdFilterBase + comp_ui::filter_count()) {
+        open_filter_panel(shell, static_cast<comp_ui::FilterId>(id - kCmdFilterBase));
+        break;
+      }
       return;
   }
   InvalidateRect(window, nullptr, FALSE);
@@ -1007,13 +1308,19 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     DrawTextW(dc, letter, 1, &button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   }
 
-  /* 右侧读数：缩放与笔刷（按钮里只放键位，工具名交给状态栏）。 */
-  wchar_t info_text[128];
-  wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%",
+  /* 右侧读数：缩放、笔刷，Retouch 工具再带上子模式与模糊半径。 */
+  wchar_t extra[96] = L"";
+  if (shell.tool == comp_ui::ToolId::Retouch) {
+    wsprintfW(extra, L"   %s / 半径 %d px",
+              widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
+              static_cast<int>(shell.blur_radius + 0.5));
+  }
+  wchar_t info_text[192];
+  wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%%s",
             static_cast<int>(shell.view.zoom * 100.0 + 0.5),
             static_cast<int>(shell.brush_size + 0.5),
-            static_cast<int>(shell.brush_hardness * 100.0 + 0.5));
-  RECT info_rect{bar.right() - 300, bar.y, bar.right() - 10, bar.bottom()};
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5), extra);
+  RECT info_rect{bar.right() - 460, bar.y, bar.right() - 10, bar.bottom()};
   SetTextColor(dc, RGB(172, 176, 188));
   DrawTextW(dc, info_text, -1, &info_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
@@ -1027,15 +1334,26 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
   SetBkMode(dc, TRANSPARENT);
 
   const comp_ui::ToolInfo* info = comp_ui::tool_info(shell.tool);
+  wchar_t tool_name[96];
+  if (shell.tool == comp_ui::ToolId::Retouch) {
+    /* R 键在同一工具内循环：状态栏必须显示当前子模式，否则用户不知道自己拿的是哪个。 */
+    wsprintfW(tool_name, L"Retouch / %s",
+              widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  } else {
+    wsprintfW(tool_name, L"%s", info != nullptr ? widen_ascii(info->name).c_str() : L"?");
+  }
+  wchar_t extra[64] = L"";
+  if (shell.tool == comp_ui::ToolId::Retouch) {
+    wsprintfW(extra, L" · 模糊半径 %d px", static_cast<int>(shell.blur_radius + 0.5));
+  }
   wchar_t line[768];
-  wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%% · %s",
-            info != nullptr ? widen_ascii(info->name).c_str() : L"?",
+  wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%%%s · %s", tool_name,
             info != nullptr && info->shortcut != 0
                 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A')
                 : L' ',
             static_cast<int>(shell.view.zoom * 100.0 + 0.5),
             static_cast<int>(shell.brush_size + 0.5),
-            static_cast<int>(shell.brush_hardness * 100.0 + 0.5), shell.status.c_str());
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5), extra, shell.status.c_str());
   RECT text_rect{bar.x + 12, bar.y, bar.right() - 10, bar.bottom()};
   SetTextColor(dc, RGB(220, 222, 228));
   DrawTextW(dc, line, -1, &text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1177,6 +1495,70 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   }
 }
 
+/*
+ * 滤镜面板。行几何来自 ui_core.h 的 filter_param_row_rect——绘制与命中同源，
+ * 避免「看得见点不中」。
+ */
+void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"滤镜（Filter）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+  y += 22;
+
+  const comp_ui::FilterSpec* spec = shell.filter.spec();
+  SetTextColor(dc, RGB(150, 210, 255));
+  wsprintfW(line, L"%d/%d：%s", static_cast<int>(shell.filter.id) + 1,
+            comp_ui::filter_count(), spec != nullptr ? widen_ascii(spec->name).c_str() : L"?");
+  TextOutW(dc, left + 10, y, line, lstrlenW(line));
+
+  for (int row = 0; row < shell.filter.param_count(); ++row) {
+    const comp_ui::FilterParamSpec* parameter = shell.filter.param_at(row);
+    if (parameter == nullptr) break;
+    const comp_ui::Rect row_rect = comp_ui::filter_param_row_rect(panel_rect, row);
+    const bool focused = row == shell.filter.focused;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6,
+                     row_rect.bottom() + 2};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    wsprintfW(line, L"%s = %s", widen_ascii(parameter->label).c_str(),
+              widen_ascii(number_text(shell.filter.value(row)).c_str()).c_str());
+    TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
+  }
+
+  if (!shell.filter_input.empty()) {
+    SetTextColor(dc, RGB(255, 240, 160));
+    wsprintfW(line, L"输入中：%s", shell.filter_input.c_str());
+    TextOutW(dc, left + 10, bottom - 130, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"Tab / Shift+Tab 切参数",
+      L"- / = 调值 · 数字键输入",
+      L"回车应用 · Esc 关闭",
+      L"Amount = 0 时滤镜为恒等（不改像素）",
+  };
+  int hint_y = bottom - 104;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -1261,7 +1643,13 @@ void present(HWND window, ShellState& shell) {
 
   draw_toolbar(memory_dc, shell, layout.toolbar);
   if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
-  if (layout.adjust_panel.w > 0) draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
+  if (layout.adjust_panel.w > 0) {
+    if (shell.filter_open) {
+      draw_filter_panel(memory_dc, shell, layout.adjust_panel);
+    } else {
+      draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
+    }
+  }
   draw_status_bar(memory_dc, shell, layout.status);
 
   BitBlt(dc, 0, 0, client_width, client_height, memory_dc, 0, 0, SRCCOPY);
@@ -1278,8 +1666,28 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
   wchar_t buffer[128];
-  wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
-            info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
+  if (id == comp_ui::ToolId::Retouch) {
+    wsprintfW(buffer, L"工具：Retouch / %s（再按 R 循环）",
+              widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  } else {
+    wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
+              info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
+  }
+  set_status(shell, buffer);
+}
+
+/* R 键循环 Blur / Smudge / Liquify；只有 Blur 接了内核，其余如实说明。 */
+void set_retouch_mode(ShellState& shell, int mode) {
+  shell.retouch_mode = mode;
+  shell.tool = comp_ui::ToolId::Retouch;
+  wchar_t buffer[160];
+  if (mode == comp_ui::kRetouchBlur) {
+    wsprintfW(buffer, L"工具：Retouch / Blur（Alt+[ / ] 调半径，当前 %d px）",
+              static_cast<int>(shell.blur_radius + 0.5));
+  } else {
+    wsprintfW(buffer, L"工具：Retouch / %s（尚未接内核）",
+              widen_ascii(comp_ui::retouch_mode_name(mode)).c_str());
+  }
   set_status(shell, buffer);
 }
 
@@ -1355,6 +1763,75 @@ void canvas_click(ShellState& shell, int x, int y, const Layout& layout) {
 }
 
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
+  /* 滤镜面板输入态：与调整面板同一套输入规矩，但目标值是滤镜参数。 */
+  if (!shell.filter_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.filter_input.clear();
+      set_status(shell, L"已取消输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      filter_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      /* 键入 + 回车 = 落值并立刻应用，少一次按键。 */
+      filter_commit_input(shell);
+      apply_filter(shell);
+      return;
+    }
+    if (key == VK_TAB) {
+      shell.filter_input.clear();
+      filter_focus_row(shell, shift ? -1 : 1);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      filter_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    if (key == VK_OEM_PERIOD) {
+      filter_begin_input(shell, L'.');
+      return;
+    }
+    if (key == VK_OEM_MINUS) {
+      filter_begin_input(shell, L'-');
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* 滤镜面板打开时，键盘归面板：Esc 只关面板（不关窗），Ctrl 组合仍可穿透。 */
+  if (shell.filter_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        close_filter_panel(shell);
+        return;
+      case VK_TAB:
+        filter_focus_row(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        apply_filter(shell);
+        return;
+      case VK_OEM_MINUS:
+        filter_step_value(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        filter_step_value(shell, 1);
+        return;
+      case VK_BACK:
+        filter_reset_values(shell);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      filter_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键在面板打开时吞掉：避免按工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
   /* 调整面板输入态优先：Esc 取消输入（不关窗）、退格删字符、回车提交、数字/./- 进缓冲。 */
   if (!shell.adj_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -1515,7 +1992,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       }
       if (key < 128) {
         const comp_ui::ToolId id = comp_ui::tool_for_shortcut(static_cast<char>(key));
-        if (id != comp_ui::ToolId::Count) set_tool(shell, id);
+        if (id == comp_ui::ToolId::Retouch) {
+          /* 重复按 R 在同一工具内循环 Blur -> Smudge -> Liquify（对齐上游）。 */
+          set_retouch_mode(shell, shell.tool == comp_ui::ToolId::Retouch
+                                      ? comp_ui::next_retouch_mode(shell.retouch_mode)
+                                      : comp_ui::kRetouchBlur);
+        } else if (id != comp_ui::ToolId::Count) {
+          set_tool(shell, id);
+        }
       }
       break;
   }
@@ -1582,9 +2066,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
+          if (shell->filter_open && layout.adjust_panel.w > 0) {
+            /* 点参数行 = 聚焦到该行；行几何与绘制共用 filter_param_row_rect。 */
+            const int row = comp_ui::filter_param_row_at(
+                layout.adjust_panel, shell->filter.param_count(), mouse_x, mouse_y);
+            if (row >= 0) {
+              shell->filter_input.clear();
+              filter_focus_row(*shell, row - shell->filter.focused);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
+            } else if (blur_stroke_available(*shell)) {
+              blur_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else {
               canvas_click(*shell, mouse_x, mouse_y, layout);
             }
@@ -1604,6 +2101,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      if (shell != nullptr && shell->stroke_active) {
+        blur_stroke_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr) end_pan(window, *shell);
+      break;
     case WM_MBUTTONUP:
       if (shell != nullptr) end_pan(window, *shell);
       break;
@@ -1612,18 +2116,44 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         shell->space_down = false;
         end_pan(window, *shell);
+        blur_stroke_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
-      if (shell != nullptr) end_pan(window, *shell);
+      if (shell != nullptr) {
+        end_pan(window, *shell);
+        blur_stroke_cancel(*shell);
+      }
       break;
     case WM_MOUSEMOVE:
-      if (shell != nullptr && shell->panning) {
+      if (shell != nullptr && shell->stroke_active) {
+        Layout layout{};
+        if (client_layout(*shell, &layout)) {
+          blur_stroke_extend(*shell, mouse_x, mouse_y, layout);
+          InvalidateRect(window, nullptr, FALSE);
+        }
+      } else if (shell != nullptr && shell->panning) {
         shell->view.pan_by(static_cast<double>(mouse_x - shell->pan_anchor.x),
                            static_cast<double>(mouse_y - shell->pan_anchor.y));
         shell->pan_anchor.x = mouse_x;
         shell->pan_anchor.y = mouse_y;
         InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_SYSKEYDOWN:
+      /*
+       * Alt+[ / Alt+] 调模糊半径。普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，
+       * 因此把模糊半径放到 Alt 组合，且必须在这里吞掉，否则 DefWindowProc 会响铃。
+       */
+      if (shell != nullptr && (wparam == VK_OEM_4 || wparam == VK_OEM_6)) {
+        const double next = comp_ui::step_blur_radius(
+            shell->blur_radius, wparam == VK_OEM_6 ? 1 : -1);
+        shell->blur_radius = next;
+        wchar_t buffer[96];
+        wsprintfW(buffer, L"模糊半径 %d px", static_cast<int>(next + 0.5));
+        set_status(*shell, buffer);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
       }
       break;
     case WM_MOUSEWHEEL:
@@ -1747,6 +2277,21 @@ HMENU build_menu() {
   AppendMenuW(adjust_menu, MF_STRING, kCmdAdjApply, L"应用到选中调整(&U)\tCtrl+Shift+U");
   AppendMenuW(adjust_menu, MF_STRING, kCmdAdjRemove, L"删除选中调整(&D)\tCtrl+Shift+D");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(adjust_menu), L"调整(&J)");
+
+  /* 滤镜菜单与面板参数表共用 ui_core.h 的 filter_table（量程与 comp_filter.h 对齐）。 */
+  HMENU filter_menu = CreatePopupMenu();
+  for (int i = 0; i < comp_ui::filter_count(); ++i) {
+    const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(i);
+    if (spec == nullptr) continue;
+    wchar_t label[128];
+    wsprintfW(label, L"%s", widen_ascii(spec->name).c_str());
+    AppendMenuW(filter_menu, MF_STRING, kCmdFilterBase + static_cast<UINT>(i), label);
+  }
+  AppendMenuW(filter_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(filter_menu, MF_STRING, kCmdFilterApply, L"应用(&A)\t回车");
+  AppendMenuW(filter_menu, MF_STRING, kCmdFilterReset, L"重置参数(&R)");
+  AppendMenuW(filter_menu, MF_STRING, kCmdFilterClose, L"关闭面板(&C)\tEsc");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(filter_menu), L"滤镜(&F)");
 
   return menu;
 }
@@ -1975,6 +2520,147 @@ int run_selftest(const wchar_t* out_path) {
   verify(remove_ok && comp_layer_adjustment_count(document, layer, &after_remove) == COMP_OK &&
              after_remove == 0,
          "comp_layer_adjustment_count() == 0 after remove");
+
+  /*
+   * 滤镜面板链路：面板按 ui_core.h 的行序把值搬进 comp_filter_desc，这里走同一条
+   * ABI。要点：零初始化 = 恒等（不碰像素、不开事务）；越界在事务之前拒绝；
+   * 真应用后一步撤销可逐字节还原。
+   */
+  /*
+   * 滤镜观测必须先有像素：本段之前的 `comp_document_undo()` 已经把 selftest 图层的
+   * 半透明红退回空像素，而 Vignette 在 `fillsClear = 0` 下逐像素跳过全透明像素
+   * （AdjustPixels.c），因此空图层上「应用成功但字节不变」是正确行为、看不到效果。
+   * 重新铺一张不透明灰图，与 tests/test_filters.cpp 的观测口径一致。
+   */
+  std::vector<uint8_t> opaque(stride * static_cast<size_t>(height), 0);
+  for (size_t i = 0; i < opaque.size(); i += 4) {
+    opaque[i + 0] = 200;
+    opaque[i + 1] = 200;
+    opaque[i + 2] = 200;
+    opaque[i + 3] = 255;
+  }
+  comp_image opaque_image{};
+  opaque_image.width = width;
+  opaque_image.height = height;
+  opaque_image.format = COMP_PIXEL_RGBA8;
+  opaque_image.stride = stride;
+  opaque_image.pixels = opaque.data();
+  verify(add_ok && comp_layer_set_pixels(document, layer, &opaque_image) == COMP_OK,
+         "comp_layer_set_pixels(opaque gray)");
+
+  std::vector<uint8_t> flatten_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, flatten_before.data(), COMP_PIXEL_RGBA8, stride);
+  size_t depth_before = 0;
+  comp_document_history_stats(document, &depth_before, &redo_depth);
+
+  comp_filter_desc identity{};
+  identity.kind = COMP_FILTER_VIGNETTE; /* 其余字段零初始化 -> amount 0 = 恒等 */
+  int32_t changed = -1;
+  char filter_note[256] = {0};
+  size_t filter_note_size = 0;
+  const bool identity_ok =
+      comp_filter_apply(document, layer, &identity, 1.0, &changed, filter_note,
+                        sizeof(filter_note), &filter_note_size) == COMP_OK &&
+      changed == 0;
+  verify(identity_ok, "comp_filter_apply(identity) is a no-op");
+  size_t depth_after_identity = 0;
+  comp_document_history_stats(document, &depth_after_identity, &redo_depth);
+  verify(depth_after_identity == depth_before, "identity filter leaves history untouched");
+
+  comp_filter_desc bad_filter{};
+  bad_filter.kind = COMP_FILTER_VIGNETTE;
+  bad_filter.vignette.amount = 101.0; /* 量程 0..100 */
+  verify(add_ok && comp_filter_apply(document, layer, &bad_filter, 1.0, &changed, filter_note,
+                                     sizeof(filter_note), &filter_note_size) ==
+                      COMP_ERR_INVALID_ARGUMENT,
+         "comp_filter_apply(out-of-range amount) rejected");
+
+  comp_filter_desc vignette{};
+  vignette.kind = COMP_FILTER_VIGNETTE;
+  vignette.vignette.amount = 100.0;
+  vignette.vignette.midpoint = 50.0;
+  vignette.vignette.roundness = 100.0;
+  vignette.vignette.feather = 60.0;
+  vignette.vignette.highlights = 25.0;
+  vignette.vignette.color[0] = 0.0;
+  vignette.vignette.color[1] = 0.0;
+  vignette.vignette.color[2] = 0.0;
+  changed = 0;
+  const bool vignette_ok =
+      add_ok && comp_filter_apply(document, layer, &vignette, 1.0, &changed, filter_note,
+                                  sizeof(filter_note), &filter_note_size) == COMP_OK &&
+      changed == 1;
+  verify(vignette_ok, "comp_filter_apply(vignette amount=100) changed pixels");
+
+  std::vector<uint8_t> flatten_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, flatten_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(vignette_ok && flatten_after != flatten_before,
+         "vignette changes the flattened output");
+  verify(vignette_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(filter step)");
+  std::vector<uint8_t> flatten_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, flatten_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(vignette_ok && flatten_restored == flatten_before,
+         "filter undo restores pixels byte-for-byte");
+
+  /*
+   * 模糊工具（COMP_TOOL_BLUR）：窗口路径是「鼠标折线 -> comp_tool_apply」。
+   * 先铺一张棋盘让模糊有内容可抹（纯色图模糊前后字节相同，测不出东西）。
+   */
+  std::vector<uint8_t> pattern(stride * static_cast<size_t>(height), 0);
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      const bool red = ((x / 8) + (y / 8)) % 2 == 0;
+      uint8_t* pixel = pattern.data() + static_cast<size_t>(y) * stride +
+                       static_cast<size_t>(x) * 4u;
+      pixel[0] = red ? 255 : 0;
+      pixel[1] = 0;
+      pixel[2] = red ? 0 : 255;
+      pixel[3] = 255;
+    }
+  }
+  comp_image patched{};
+  patched.width = width;
+  patched.height = height;
+  patched.format = COMP_PIXEL_RGBA8;
+  patched.stride = stride;
+  patched.pixels = pattern.data();
+  verify(comp_layer_set_pixels(document, layer, &patched) == COMP_OK,
+         "comp_layer_set_pixels(checkerboard)");
+
+  std::vector<uint8_t> blur_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, blur_before.data(), COMP_PIXEL_RGBA8, stride);
+  const float stroke[] = {8.0f, 32.0f, 20.0f, 32.0f, 32.0f, 32.0f,
+                          44.0f, 32.0f, 56.0f, 32.0f};
+  comp_tool_op_desc blur_desc{};
+  blur_desc.kind = COMP_TOOL_BLUR;
+  blur_desc.stroke_points = stroke;
+  blur_desc.stroke_point_count = 5;
+  blur_desc.brush.diameter = 24.0f;
+  blur_desc.brush.hardness = 0.75f;
+  blur_desc.brush.pressure = 1.0f;
+  blur_desc.brush.flow = 1.0f;
+  blur_desc.blur.radius = 6.0f;
+  char tool_note[256] = {0};
+  size_t tool_note_size = 0;
+  const bool blur_ok =
+      comp_tool_apply(document, layer, &blur_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(blur_ok, "comp_tool_apply(COMP_TOOL_BLUR)");
+  std::vector<uint8_t> blur_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, blur_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(blur_ok && blur_after != blur_before, "blur tool changes pixels along the stroke");
+  verify(blur_ok && comp_document_undo(document) == COMP_OK, "comp_document_undo(blur step)");
+  std::vector<uint8_t> blur_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, blur_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(blur_ok && blur_restored == blur_before,
+         "blur undo restores pixels byte-for-byte");
+
+  comp_tool_op_desc bad_blur = blur_desc;
+  bad_blur.blur.radius = 0.0f; /* 量程 0.5..50 */
+  verify(comp_tool_apply(document, layer, &bad_blur, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_ERR_INVALID_ARGUMENT,
+         "COMP_TOOL_BLUR(radius=0) rejected");
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

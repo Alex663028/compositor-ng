@@ -10,7 +10,9 @@
  * 设计约束：
  *   1. 不 include 任何 Windows 头、不 include 任何 engine/ 头；
  *   2. 不分配内存、不抛异常（全部 inline、无状态或值语义）；
- *   3. 工具键位逐字对齐上游 `UI/KeyboardShortcuts.swift` 的 ShortcutDefinition.all。
+ *   3. 工具键位逐字对齐上游 `UI/KeyboardShortcuts.swift` 的 ShortcutDefinition.all；
+ *   4. 滤镜参数表与 `comp_filter.h` 的量程逐项一致，`tests/test_ui_core.cpp`
+ *      把两侧数值钉死（头文件之间不能互相 include，只能靠测试对齐）。
  *
  * 坐标系（三种，壳内必须分清）：
  *   - 文档像素坐标：图层/工具算子的口径，原点在画布左上；
@@ -351,6 +353,270 @@ inline double step_brush_hardness(double current, int direction) {
   const double base = clamp_brush_hardness(current);
   const double next = base + (direction > 0 ? 0.1 : (direction < 0 ? -0.1 : 0.0));
   return clamp_brush_hardness(next);
+}
+
+/* ------------------------------------------------------------ 滤镜面板 */
+
+/*
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..3，尾部追加）；
+ * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
+ */
+enum class FilterId : int {
+  Vignette = 0,
+  TonalContrast = 1,
+  Bloom = 2,
+  LensCorrection = 3,
+  Count
+};
+
+/* 面板上一行参数。量程 / 步长 / 缺省值逐项对齐 docs/filters.md §3 的表。 */
+struct FilterParamSpec {
+  const char* label; /* 英文名；外壳负责转宽字符 */
+  double min_value;
+  double max_value;
+  double step;
+  double default_value;
+};
+
+/*
+ * 一个滤镜的面板定义。`params` 顺序 = 面板行序，也是壳层把 values[] 搬进
+ * `comp_filter_desc` 的顺序（映射写在 main.cpp，一处）。
+ *
+ * 能力边界：Vignette 的边缘色 `color[3]` 不在面板上（v1 固定 0,0,0），
+ * 这不是遗漏——面板行模型只承载标量，颜色选择器属后续 UI 轮次。
+ */
+struct FilterSpec {
+  static constexpr int kMaxParams = 6;
+  FilterId id;
+  const char* name;
+  int param_count;
+  FilterParamSpec params[kMaxParams];
+};
+
+inline const FilterSpec* filter_table(size_t* out_count) {
+  static const FilterSpec kFilters[] = {
+      {FilterId::Vignette,
+       "Vignette",
+       5,
+       {{"Amount", 0.0, 100.0, 1.0, 0.0},
+        {"Midpoint", 0.0, 100.0, 1.0, 50.0},
+        {"Roundness", -100.0, 100.0, 1.0, 100.0},
+        {"Feather", 0.0, 100.0, 1.0, 60.0},
+        {"Highlights", 0.0, 100.0, 1.0, 25.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::TonalContrast,
+       "Tonal Contrast",
+       5,
+       {{"Amount", 0.0, 100.0, 1.0, 0.0},
+        {"Radius", 1.0, 100.0, 1.0, 16.0},
+        {"Shadows", -100.0, 100.0, 1.0, 40.0},
+        {"Midtones", -100.0, 100.0, 1.0, 60.0},
+        {"Highlights", -100.0, 100.0, 1.0, 30.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::Bloom,
+       "Bloom / Glow",
+       2,
+       {{"Amount", 0.0, 100.0, 1.0, 0.0},
+        {"Radius", 1.0, 150.0, 1.0, 24.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::LensCorrection,
+       "Lens Correction",
+       1,
+       {{"Distortion", -100.0, 100.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+  };
+  if (out_count != nullptr) {
+    *out_count = sizeof(kFilters) / sizeof(kFilters[0]);
+  }
+  return kFilters;
+}
+
+inline int filter_count() {
+  size_t count = 0;
+  filter_table(&count);
+  return static_cast<int>(count);
+}
+
+inline const FilterSpec* filter_spec_at(int index) {
+  size_t count = 0;
+  const FilterSpec* table = filter_table(&count);
+  if (index < 0 || static_cast<size_t>(index) >= count) return nullptr;
+  return &table[index];
+}
+
+inline const FilterSpec* filter_spec(FilterId id) {
+  return filter_spec_at(static_cast<int>(id));
+}
+
+/*
+ * 参数夹取：NaN / 无穷回落到下限（与 clamp_zoom 的 NaN 口径一致），
+ * 越界夹到区间。面板只在键入文本时用它；A-BI 侧仍然是「越界拒绝」，
+ * 面板保证自己永远不产生越界值。
+ */
+inline double clamp_filter_param(const FilterParamSpec& spec, double value) {
+  if (!(value == value)) return spec.min_value; /* NaN */
+  if (value < spec.min_value) return spec.min_value;
+  if (value > spec.max_value) return spec.max_value;
+  return value;
+}
+
+inline double step_filter_param(const FilterParamSpec& spec, double current, int direction) {
+  const double base = clamp_filter_param(spec, current);
+  if (direction == 0) return base;
+  return clamp_filter_param(spec, base + spec.step * static_cast<double>(direction));
+}
+
+/*
+ * 滤镜面板状态：值语义、定长数组、无堆分配。壳层只把它画出来，
+ * 并把 values[] 按固定顺序搬进 comp_filter_desc。
+ */
+struct FilterPanel {
+  static constexpr int kMaxParams = FilterSpec::kMaxParams;
+
+  FilterId id = FilterId::Vignette;
+  int focused = 0;
+  double values[kMaxParams] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+  const FilterSpec* spec() const { return filter_spec(id); }
+
+  int param_count() const {
+    const FilterSpec* definition = spec();
+    return definition != nullptr ? definition->param_count : 0;
+  }
+
+  const FilterParamSpec* param_at(int row) const {
+    const FilterSpec* definition = spec();
+    if (definition == nullptr || row < 0 || row >= definition->param_count) return nullptr;
+    return &definition->params[row];
+  }
+
+  double value(int row) const {
+    return (row >= 0 && row < kMaxParams) ? values[row] : 0.0;
+  }
+
+  /* 切到某个滤镜：值回到该滤镜的缺省值，焦点回到第一行。 */
+  void select(FilterId next) {
+    id = next;
+    reset_values();
+  }
+
+  void reset_values() {
+    focused = 0;
+    const FilterSpec* definition = spec();
+    for (int i = 0; i < kMaxParams; ++i) {
+      values[i] = (definition != nullptr && i < definition->param_count)
+                      ? definition->params[i].default_value
+                      : 0.0;
+    }
+  }
+
+  /* 焦点移动：夹在 [0, param_count-1]，不环绕（与面板观感一致）。 */
+  void focus(int delta) {
+    const int count = param_count();
+    if (count <= 0) {
+      focused = 0;
+      return;
+    }
+    focused += delta;
+    if (focused < 0) focused = 0;
+    if (focused >= count) focused = count - 1;
+  }
+
+  /* 调整焦点行的值；返回是否真的变化。 */
+  bool step(int direction) {
+    const FilterParamSpec* parameter = param_at(focused);
+    if (parameter == nullptr) return false;
+    const double next = step_filter_param(*parameter, values[focused], direction);
+    if (next == values[focused]) return false;
+    values[focused] = next;
+    return true;
+  }
+
+  /* 键入提交：先夹取再落值；非法文本由调用方在解析阶段拒绝。 */
+  void set_value(int row, double value) {
+    const FilterParamSpec* parameter = param_at(row);
+    if (parameter == nullptr) return;
+    values[row] = clamp_filter_param(*parameter, value);
+  }
+};
+
+/* 面板参数行几何：与 draw_filter_panel 共用，绘制与命中共用一套常量。 */
+inline constexpr int kFilterRowHeight = 20;
+inline constexpr int kFilterRowsTop = 54; /* 标题 + 滤镜名两行 + 间距 */
+
+inline Rect filter_param_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kFilterRowsTop + row * kFilterRowHeight, panel.w,
+              kFilterRowHeight};
+}
+
+inline int filter_param_row_at(const Rect& panel, int param_count, double x, double y) {
+  if (param_count <= 0 || !panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kFilterRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kFilterRowHeight)));
+  if (row < 0 || row >= param_count) return -1;
+  return row;
+}
+
+/* ------------------------------------------------------------ Retouch 工具模式 */
+
+/*
+ * 上游把 Blur / Smudge / Liquify 收在同一个 R 键上循环
+ * （`KeyboardShortcuts.swift` 的 retouch 组）。本仓用同一模型：
+ * 重复按 R 依次切换，模式名进状态栏。
+ */
+inline constexpr int kRetouchModeCount = 3;
+inline constexpr int kRetouchBlur = 0; /* 0 = 模糊，走 COMP_TOOL_BLUR */
+
+inline const char* retouch_mode_name(int mode) {
+  switch (mode) {
+    case 0: return "Blur";
+    case 1: return "Smudge";
+    case 2: return "Liquify";
+    default: return "?";
+  }
+}
+
+inline int next_retouch_mode(int mode) {
+  if (mode < 0 || mode >= kRetouchModeCount - 1) return 0;
+  return mode + 1;
+}
+
+/* 模糊半径（comp_tool_blur.radius 的 0.5..50 与上游 blurRadius 同量程）。 */
+inline constexpr double kMinBlurRadius = 0.5;
+inline constexpr double kMaxBlurRadius = 50.0;
+
+inline double clamp_blur_radius(double value) {
+  if (!(value > 0.0)) return kMinBlurRadius; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinBlurRadius), kMaxBlurRadius);
+}
+
+inline double step_blur_radius(double current, int direction) {
+  const double base = clamp_blur_radius(current);
+  if (direction > 0) return clamp_blur_radius(base * 1.2);
+  if (direction < 0) return clamp_blur_radius(base / 1.2);
+  return base;
+}
+
+/* ------------------------------------------------------------ 笔迹采样 */
+
+/*
+ * 笔迹去抖：文档坐标下两点距离小于 kStrokeMinDistance 时不追加，
+ * 避免鼠标每像素事件都变成折点（一笔几千点会拖慢内核）。
+ */
+inline constexpr double kStrokeMinDistance = 0.75;
+
+inline bool stroke_point_should_append(double last_x, double last_y, double x, double y) {
+  const double dx = x - last_x;
+  const double dy = y - last_y;
+  return dx * dx + dy * dy >= kStrokeMinDistance * kStrokeMinDistance;
 }
 
 }  // namespace comp_ui

@@ -161,3 +161,26 @@ note 写明 `document selection is empty`。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
+
+## 8. Windows 外壳接线
+
+「滤镜(&F)」菜单的条目由 `shells/windows/src/ui_core.h` 的 `filter_table()` 动态生成，
+右侧面板的每一行也来自同一张表——**菜单、面板、值映射不各写一份清单**。
+
+| 面板行 | ABI 字段 | 面板缺省 |
+|--------|---------|---------|
+| Vignette 0..4 | `vignette.amount/midpoint/roundness/feather/highlights` | 0 / 50 / 100 / 60 / 25 |
+| Tonal 0..4 | `tonal_contrast.amount/radius/shadows/midtones/highlights` | 0 / 16 / 40 / 60 / 30 |
+| Bloom 0..1 | `bloom.amount/radius` | 0 / 24 |
+| Lens 0 | `lens_correction.distortion` | 0 |
+
+- **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
+  值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。
+- **一次调用**：壳用固定 512 字节 note 缓冲调用一次 `comp_filter_apply`，不做
+  `note_capacity = 0` 的长度探测（该函数先执行后写 note，探测会应用两遍）。
+- **恒等如实回报**：`out_changed == 0` 时状态栏写「参数为恒等，未改动」。
+- **边缘色**：`vignette.color[3]` 固定 0,0,0（面板行模型只承载标量，颜色选择器
+  属后续 UI 轮次，见 §3.1）。
+
+面板的交互键位、几何常量与「哪些 Win32 路径未经人手实测」记在
+[`docs/shell-parity.md`](shell-parity.md) §5.3。

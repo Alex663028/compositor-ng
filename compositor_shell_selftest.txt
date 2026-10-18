@@ -31,6 +31,20 @@
 [OK] comp_layer_remove_adjustment(out of range) rejected
 [OK] comp_layer_remove_adjustment(0)
 [OK] comp_layer_adjustment_count() == 0 after remove
+[OK] comp_layer_set_pixels(opaque gray)
+[OK] comp_filter_apply(identity) is a no-op
+[OK] identity filter leaves history untouched
+[OK] comp_filter_apply(out-of-range amount) rejected
+[OK] comp_filter_apply(vignette amount=100) changed pixels
+[OK] vignette changes the flattened output
+[OK] comp_document_undo(filter step)
+[OK] filter undo restores pixels byte-for-byte
+[OK] comp_layer_set_pixels(checkerboard)
+[OK] comp_tool_apply(COMP_TOOL_BLUR)
+[OK] blur tool changes pixels along the stroke
+[OK] comp_document_undo(blur step)
+[OK] blur undo restores pixels byte-for-byte
+[OK] COMP_TOOL_BLUR(radius=0) rejected
 
 [summary] failures = 0
 [PASS] compositor-shell selftest
