@@ -722,3 +722,56 @@ COMP_TEST(tool_ops_blur_rejects_a_zero_radius_before_opening_the_transaction) {
   COMP_CHECK(comp_document_history_stats(fx.doc, &undo_ok, nullptr) == COMP_OK);
   COMP_CHECK_MSG(undo_ok > undo_before, "the legal radius goes through and records history");
 }
+
+/* ================================================== 6. S5：橡皮擦模式 */
+
+COMP_TEST(tool_ops_eraser_subtracts_coverage_instead_of_painting) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(0, 0, 0);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[4] = {2.0f, 8.0f, 6.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_STROKE);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 2;
+  desc.brush.color[0] = 255;
+  desc.brush.color[1] = 255;
+  desc.brush.color[2] = 255;
+  desc.brush.diameter = 4.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.brush.grain_amount = 75.0f; /* 橡皮擦必须忽略颗粒：没有像素可叠 */
+  desc.erase = 1;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_OK, "erase the midline");
+
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(alpha_at(after, 4, 8) == 0, "the centerline is fully erased");
+  COMP_CHECK_MSG(after[(static_cast<size_t>(8) * kW + 4) * 4 + 0] == 0,
+                 "the eraser never paints color");
+  COMP_CHECK_MSG(alpha_at(after, 4, 2) == 255, "far from the stroke the layer stays opaque");
+
+  /* 一步撤销 ⇒ 逐字节回到擦除前。 */
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the erased pixels exactly");
+}
+
+COMP_TEST(tool_ops_eraser_with_zero_pressure_is_a_no_op) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(30, 60, 90);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_STROKE);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 1;
+  desc.brush.diameter = 8.0f;
+  desc.brush.pressure = 0.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.erase = 1;
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "pressure 0 erases nothing");
+}

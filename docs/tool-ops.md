@@ -74,6 +74,13 @@
   这让「同参数两次调用逐字节相同」成立——若改成累加，可重复性就没了。
 - `pressure * flow == 0` ⇒ 逐字节不变。
 - `seed` 保留在结构里以固定契约；当前圆头笔形状是解析式的（不采样噪声），故不参与计算。
+- `erase != 0`（S5 尾部追加之字段）= **橡皮擦模式**：同一支笔的形状与 coverage，
+  但合成方向反过来，对**预乘**像素做 destination-out——
+  `px[c] = px[c] * (1 - coverage)`，四个通道一起乘，alpha 归零时颜色也随之归零
+  （在直通色上只减 alpha 会留下「透明却发亮」的脏数据）。
+  因此它擦掉的正是 Paint 模式同一笔会盖上去的那一份。橡皮擦**忽略 `brush.grain_*`**
+  （颗粒是「落墨」的噪声，擦除没有对应语义）；`pressure * flow == 0` 依旧是逐字节 no-op。
+  只有 `COMP_TOOL_STROKE` 读这个字段，其余算子不受影响。
 
 ### 4.3 Heal（`COMP_TOOL_HEAL`）
 
@@ -243,3 +250,7 @@ coverage 把样本盖回当前像素。
   （5 例 `test_ui_core`：滤镜表、面板状态机、行几何、retouch 循环、笔迹去抖），
   Windows 壳自检 27 → **41 项**。Win32 交互路径未经人手实测，只验证到 ABI 与
   `ui_core` 数学层。
+- S5 追加（2026-10-18）：Stroke 增加 `erase` 尾部字段（§4.2，destination-out），
+  新增 2 例：擦除按 coverage 做减法而非覆盖、零压力 no-op。按老板指示本轮
+  **只做编译检查**（`build.py --no-run` exit 0），用例总数待下一次全量回归确认。
+  选区侧的载入/平移/像素搬移与吸管不走 `comp_tool_apply`，见 README §6.15。

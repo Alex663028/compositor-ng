@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <utility>
@@ -922,6 +923,188 @@ bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, boo
   if (!resize_base(*selection, delta, &next)) return false;
   if (masks_equal(next, selection->base.pixel_data())) return true; /* 等值短路 */
   store_base(selection, selection->base.width, selection->base.height, std::move(next));
+  if (changed != nullptr) *changed = true;
+  return true;
+}
+
+/* ------------------------------------------------------------ 载入 / 平移 */
+
+/*
+ * 图层像素（alpha）或蒙版灰度在文档坐标 (doc_x, doc_y) 处的值。
+ * 映射与 compositing/resample.cpp 的逆变换逐字一致：归一化 -> 逆旋转 ->
+ * 翻转 -> 图层像素坐标；采样用最近邻（选区是硬边蒙版，插值只会把边缘
+ * 抹成半选，语义上不该发生）。图层外返回 0。
+ */
+uint8_t sample_layer_source(const Layer& layer, bool use_mask, double doc_x, double doc_y) {
+  const int32_t sw = use_mask ? layer.mask.width : layer.pixels.width;
+  const int32_t sh = use_mask ? layer.mask.height : layer.pixels.height;
+  if (sw <= 0 || sh <= 0) return 0;
+
+  int32_t ix = 0;
+  int32_t iy = 0;
+  if (!layer.document_to_pixel(sw, sh, doc_x, doc_y, &ix, &iy)) return 0;
+
+  if (use_mask) {
+    return layer.mask.pixel_data()[static_cast<size_t>(iy) * static_cast<size_t>(sw) +
+                                   static_cast<size_t>(ix)];
+  }
+
+  const std::vector<uint8_t>& px = layer.pixels.pixel_data();
+  const size_t offset = static_cast<size_t>(iy) * layer.pixels.stride() +
+                        static_cast<size_t>(ix) * static_cast<size_t>(bytes_per_pixel(layer.pixels.format));
+  if (offset + static_cast<size_t>(bytes_per_pixel(layer.pixels.format)) > px.size()) return 0;
+
+  switch (layer.pixels.format) {
+    case COMP_PIXEL_RGBA8:
+      return px[offset + 3];
+    case COMP_PIXEL_RGBA16: {
+      uint16_t value = 0;
+      std::memcpy(&value, px.data() + offset + 6, sizeof(value));
+      return static_cast<uint8_t>((static_cast<uint32_t>(value) * 255u + 32767u) / 65535u);
+    }
+    case COMP_PIXEL_RGBA16F: {
+      uint16_t bits = 0;
+      std::memcpy(&bits, px.data() + offset + 6, sizeof(bits));
+      /* half -> 0..1：符号位/指数/尾数手工展开。NaN 记 0，超白截到 1。 */
+      const uint32_t sign = bits >> 15;
+      const uint32_t exponent = (bits >> 10) & 0x1fu;
+      const uint32_t mantissa = bits & 0x3ffu;
+      double value = 0.0;
+      if (sign == 0) {
+        if (exponent == 0) {
+          value = static_cast<double>(mantissa) * std::ldexp(1.0, -24);
+        } else if (exponent != 31) {
+          value = (1.0 + static_cast<double>(mantissa) / 1024.0) *
+                  std::ldexp(1.0, static_cast<int>(exponent) - 15);
+        } else if (mantissa == 0) {
+          value = 65504.0; /* +inf：按超白处理 */
+        }
+      }
+      if (!(value > 0.0)) return 0;
+      if (value >= 1.0) return 255;
+      return static_cast<uint8_t>(std::lround(value * 255.0));
+    }
+    default:
+      return 0;
+  }
+}
+
+/* 与 apply_contours 同款的叠加语义，但输入已经是文档分辨率的 coverage。 */
+bool apply_coverage_mask(SelectionState* selection, int32_t canvas_width, int32_t canvas_height,
+                         std::vector<uint8_t>&& coverage, int32_t combine, bool* changed) {
+  const size_t pixel_count =
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  const bool same_grid = selection->active && selection->base.width == canvas_width &&
+                         selection->base.height == canvas_height &&
+                         selection->base.pixel_data().size() == pixel_count;
+  const std::vector<uint8_t>* current = same_grid ? &selection->base.pixel_data() : nullptr;
+
+  /* subtract 没有基础选区时什么都不做（与形状叠加一致）。 */
+  if (combine == kSelectionSubtract && !same_grid) return true;
+
+  std::vector<uint8_t> next;
+  switch (combine) {
+    case kSelectionAdd: {
+      next.assign(pixel_count, 0);
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const uint8_t base_value = current != nullptr ? (*current)[i] : 0;
+        next[i] = std::max(base_value, coverage[i]);
+      }
+      break;
+    }
+    case kSelectionSubtract: {
+      next.assign(pixel_count, 0);
+      for (size_t i = 0; i < pixel_count; ++i) {
+        const double keep = 255.0 - static_cast<double>(coverage[i]);
+        next[i] = static_cast<uint8_t>(
+            std::lround(static_cast<double>((*current)[i]) * keep / 255.0));
+      }
+      break;
+    }
+    default:
+      next = std::move(coverage);
+      break;
+  }
+
+  bool next_changed = !same_grid || selection->feather != 0.0f;
+  if (!next_changed) next_changed = !masks_equal(next, *current);
+  if (!next_changed) return true;
+
+  selection->active = true;
+  selection->feather = 0.0f;
+  store_base(selection, canvas_width, canvas_height, std::move(next));
+  if (changed != nullptr) *changed = true;
+  return true;
+}
+
+bool selection_load_layer(SelectionState* selection, int32_t canvas_width, int32_t canvas_height,
+                          const Layer& layer, int32_t source, int32_t combine, int32_t threshold,
+                          bool* changed) {
+  if (changed != nullptr) *changed = false;
+  if (selection == nullptr) return false;
+  if (canvas_width <= 0 || canvas_height <= 0) return false;
+  if (source != kSelectionLoadPixels && source != kSelectionLoadMask) return false;
+  if (combine < kSelectionReplace || combine > kSelectionSubtract) return false;
+  if (threshold < 0 || threshold > 255) return false;
+
+  const size_t pixel_count =
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  std::vector<uint8_t> coverage(pixel_count, 0);
+
+  const bool use_mask = source == kSelectionLoadMask;
+  const int32_t sw = use_mask ? layer.mask.width : layer.pixels.width;
+  const int32_t sh = use_mask ? layer.mask.height : layer.pixels.height;
+  const comp_rect bounds = layer.effective_bounds();
+
+  if (sw > 0 && sh > 0 && bounds.w > 0 && bounds.h > 0) {
+    /* 只在图层覆盖的文档矩形里采样：矩形外一定为 0，跳过可以省掉整幅遍历。 */
+    const int32_t left = std::max(0, bounds.x);
+    const int32_t top = std::max(0, bounds.y);
+    const int64_t right = std::min<int64_t>(canvas_width, static_cast<int64_t>(bounds.x) + bounds.w);
+    const int64_t bottom = std::min<int64_t>(canvas_height, static_cast<int64_t>(bounds.y) + bounds.h);
+    for (int32_t y = top; y < bottom; ++y) {
+      uint8_t* row = coverage.data() + static_cast<size_t>(y) * static_cast<size_t>(canvas_width);
+      for (int32_t x = left; x < right; ++x) {
+        const uint8_t value =
+            sample_layer_source(layer, use_mask, static_cast<double>(x), static_cast<double>(y));
+        row[x] = value > threshold ? value : 0;
+      }
+    }
+  }
+
+  return apply_coverage_mask(selection, canvas_width, canvas_height, std::move(coverage), combine,
+                             changed);
+}
+
+bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed) {
+  if (changed != nullptr) *changed = false;
+  if (selection == nullptr) return false;
+  if (!selection->active) return true;
+
+  const int32_t width = selection->base.width;
+  const int32_t height = selection->base.height;
+  if (width <= 0 || height <= 0) return true;
+  const std::vector<uint8_t>& base = selection->base.pixel_data();
+  if (base.size() != static_cast<size_t>(width) * static_cast<size_t>(height)) return true;
+
+  std::vector<uint8_t> next(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+  if (dx == 0 && dy == 0) {
+    next = base;
+  } else {
+    const int64_t left = std::max<int64_t>(0, -static_cast<int64_t>(dx));
+    const int64_t right = std::min<int64_t>(width, static_cast<int64_t>(width) - dx);
+    const int64_t top = std::max<int64_t>(0, -static_cast<int64_t>(dy));
+    const int64_t bottom = std::min<int64_t>(height, static_cast<int64_t>(height) - dy);
+    for (int64_t y = top; y < bottom; ++y) {
+      const uint8_t* src = base.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+      uint8_t* dst = next.data() + static_cast<size_t>(y + dy) * static_cast<size_t>(width) +
+                     static_cast<size_t>(dx);
+      std::memcpy(dst, src + left, static_cast<size_t>(right - left));
+    }
+  }
+
+  if (masks_equal(next, base)) return true; /* 等值短路：空选区 / 原地平移 */
+  store_base(selection, width, height, std::move(next));
   if (changed != nullptr) *changed = true;
   return true;
 }

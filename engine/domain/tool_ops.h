@@ -99,6 +99,13 @@ struct BrushStrokeParams {
   float grain_amount = 0.0f;
   int32_t grain_gaussian = 0;
   int32_t grain_monochromatic = 0;
+
+  /*
+   * S5：1 = 橡皮擦（destination-out），0 = 画笔（source-over）。
+   * 擦除只改 alpha 与颜色（预乘空间同步乘 1 - coverage），不碰其它通道语义；
+   * 这是「同一支笔刷 + 一个模式位」的上游口径（B / E 共用一个笔刷面板）。
+   */
+  int32_t erase = 0;
 };
 
 /* ============================================================== 修补 */

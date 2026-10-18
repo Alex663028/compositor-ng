@@ -116,6 +116,34 @@ bool selection_invert(SelectionState* selection, bool* changed);
  * 没有选区或显式空选区时无操作（changed = false）。 */
 bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, bool* changed);
 
+/* 载入选区来源：0 = 图层像素（取其 alpha），1 = 图层蒙版。 */
+enum SelectionLoadSource {
+  kSelectionLoadPixels = 0,
+  kSelectionLoadMask = 1
+};
+
+/*
+ * 从图层生成文档分辨率选区（上游「Load a layer's pixels or a mask as a selection」）。
+ *
+ * 图层像素/蒙版都按 `Layer::effective_bounds()` 的放置映射回文档坐标：偏移、
+ * 缩放、旋转与翻转全部反向求逆，采样用最近邻（选区是硬边蒙版，不做插值）。
+ *   - source = kSelectionLoadPixels 取像素 alpha；kSelectionLoadMask 取蒙版灰度；
+ *   - threshold 0..255：采样值 <= threshold 记为 0，其余保留原值（保留半透明边）；
+ *   - combine 语义与形状叠加一致：replace / add（max）/ subtract（按 8 位乘法擦除）；
+ *   - 与形状操作一样，成功的载入把 feather 归 0；源为空时 replace 得到显式空选区。
+ *
+ * 失败（画布非法、来源/叠加枚举未知、threshold 越界）返回 false 且不改状态。
+ */
+bool selection_load_layer(SelectionState* selection, int32_t canvas_width, int32_t canvas_height,
+                          const Layer& layer, int32_t source, int32_t combine, int32_t threshold,
+                          bool* changed);
+
+/*
+ * 平移选区轮廓（像素，正数向右/向下）。画布外的部分被裁掉，feather 保留。
+ * 结果与旧蒙版逐字节一致时 changed = false（例如空选区或 dx = dy = 0）。
+ */
+bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed);
+
 /* 有效 coverage（画布分辨率，白 = 选中）：base 按 feather 高斯模糊。
  * selection 不活跃或基础蒙版为空时 out 清空（调用方必须先看 active）。 */
 void selection_effective_coverage(const SelectionState& selection, std::vector<uint8_t>* out);

@@ -23,6 +23,8 @@
 
 #include "compositor/comp_core.h"
 #include "compositor/comp_engine.h"
+#include "compositor/comp_layer.h"
+#include "compositor/comp_render.h"
 #include "compositor/comp_selection.h"
 #include "compositor/comp_undo.h"
 #include "test_framework.h"
@@ -599,4 +601,322 @@ COMP_TEST(selection_transactions_group_and_roll_back) {
   COMP_CHECK(undo_depth_of(fixture.document) == base_depth + 1);
   COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
   COMP_CHECK(active_of(fixture.document) == 0);
+}
+
+/* ============================================ S5: 载入 / 平移 / 像素搬移 */
+
+namespace {
+
+comp_layer_id add_source_layer(comp_document document, comp_rect transform, int32_t group = 0) {
+  comp_layer_desc desc{};
+  desc.name = "s5-source";
+  desc.blend = COMP_BLEND_NORMAL;
+  desc.opacity = 1.0f;
+  desc.transform = transform;
+  desc.is_group = static_cast<uint8_t>(group);
+  desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add(document, &desc, &id) == COMP_OK);
+  return id;
+}
+
+void set_layer_pixels(comp_document document, comp_layer_id id, int32_t width, int32_t height,
+                      std::vector<uint8_t>& pixels) {
+  comp_image image{};
+  image.width = width;
+  image.height = height;
+  image.format = COMP_PIXEL_RGBA8;
+  image.stride = static_cast<size_t>(width) * 4u;
+  image.pixels = pixels.data();
+  COMP_CHECK(comp_layer_set_pixels(document, id, &image) == COMP_OK);
+}
+
+/* 8 x 6 的图层：左半 alpha 255、右半 alpha 128。 */
+std::vector<uint8_t> split_alpha_pixels() {
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      px[0] = 200;
+      px[3] = x < 4 ? 255 : 128;
+    }
+  }
+  return pixels;
+}
+
+std::vector<uint8_t> flatten_document(comp_document document) {
+  std::vector<uint8_t> out(static_cast<size_t>(kWidth) * kHeight * 4u);
+  COMP_CHECK(comp_render_flatten(document, out.data(), COMP_PIXEL_RGBA8,
+                                 static_cast<size_t>(kWidth) * 4u) == COMP_OK);
+  return out;
+}
+
+uint8_t channel_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y, int32_t channel) {
+  return buf[(static_cast<size_t>(y) * kWidth + static_cast<size_t>(x)) * 4u +
+             static_cast<size_t>(channel)];
+}
+
+}  // namespace
+
+COMP_TEST(selection_load_layer_pixels_and_threshold) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = split_alpha_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  const size_t base_depth = undo_depth_of(fixture.document);
+  int32_t changed = -1;
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 0,
+                                       &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == base_depth + 1);
+
+  /* 图层按 transform 映射到文档坐标：图层像素 (0,0) 就是文档 (10,6)。 */
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 10, 6) == 255, "the layer origin maps to its transform origin");
+  COMP_CHECK_MSG(at(mask, 13, 11) == 255, "opaque half keeps its alpha");
+  COMP_CHECK_MSG(at(mask, 14, 6) == 128, "semi-transparent half keeps its alpha");
+  COMP_CHECK_MSG(at(mask, 9, 6) == 0, "left of the layer is unselected");
+  COMP_CHECK_MSG(at(mask, 18, 6) == 0, "right of the layer is unselected");
+
+  /* threshold 只抬高下限：128 被丢掉，255 保留。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 200,
+                                       &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> thresholded = coverage(fixture.document);
+  COMP_CHECK(at(thresholded, 10, 6) == 255);
+  COMP_CHECK(at(thresholded, 14, 6) == 0);
+
+  /* subtract 是「从现有选区里减掉载入的形状」。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 0,
+                                       &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_SUBTRACT, 200,
+                                       &changed) == COMP_OK);
+  const std::vector<uint8_t> subtracted = coverage(fixture.document);
+  COMP_CHECK_MSG(at(subtracted, 10, 6) == 0, "the subtracted opaque half is gone");
+  COMP_CHECK_MSG(at(subtracted, 14, 6) == 128,
+                 "pixels below the threshold keep their original coverage under subtract");
+}
+
+COMP_TEST(selection_load_layer_mask_ignores_pixel_alpha) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (size_t i = 0; i < 8u * 6u; ++i) pixels[i * 4u + 3] = 255; /* 像素全不透明 */
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  std::vector<uint8_t> mask_bytes(8u * 6u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      mask_bytes[static_cast<size_t>(y) * 8u + static_cast<size_t>(x)] = x < 4 ? 200 : 100;
+    }
+  }
+  comp_mask mask{};
+  mask.width = 8;
+  mask.height = 6;
+  mask.stride = 8;
+  mask.pixels = mask_bytes.data();
+  COMP_CHECK(comp_layer_set_mask(fixture.document, id, &mask) == COMP_OK);
+
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_MASK,
+                                       COMP_SELECTION_REPLACE, 150,
+                                       &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+
+  /* mask 的灰度是选区来源：200 保留、100 被 threshold 丢掉——与像素 alpha 无关。 */
+  const std::vector<uint8_t> selection = coverage(fixture.document);
+  COMP_CHECK(at(selection, 10, 6) == 200);
+  COMP_CHECK(at(selection, 13, 11) == 200);
+  COMP_CHECK(at(selection, 14, 6) == 0);
+}
+
+COMP_TEST(selection_load_layer_rejects_bad_arguments) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = split_alpha_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+  const size_t base_depth = undo_depth_of(fixture.document);
+
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id,
+                                       static_cast<comp_selection_load_source>(9),
+                                       COMP_SELECTION_REPLACE, 0,
+                                       &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       static_cast<comp_selection_combine>(9), 0,
+                                       &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, -1,
+                                       &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_selection_load_layer(fixture.document, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 256,
+                                       &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_selection_load_layer(fixture.document, 424242, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 0,
+                                       &changed) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_selection_load_layer(nullptr, id, COMP_SELECTION_LOAD_PIXELS,
+                                       COMP_SELECTION_REPLACE, 0,
+                                       &changed) == COMP_ERR_INVALID_ARGUMENT);
+
+  int32_t active = -1;
+  COMP_CHECK(comp_selection_get_active(fixture.document, &active) == COMP_OK);
+  COMP_CHECK_MSG(active == 0, "rejected loads never install a selection");
+  COMP_CHECK(undo_depth_of(fixture.document) == base_depth);
+}
+
+COMP_TEST(selection_translate_moves_outline_and_clips_to_canvas) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 4, &changed) == COMP_OK);
+
+  const size_t depth = undo_depth_of(fixture.document);
+  COMP_CHECK(comp_selection_translate(fixture.document, 5, -3, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(feather_of(fixture.document) == 4.0f, "translation keeps the feather");
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+
+  const std::vector<uint8_t> moved = coverage(fixture.document);
+  /* feather = 4 ⇒ 高斯 sigma = 2、支撑半径 = ceil(3σ) = 6；距边 5 像素处仍有约 2 级衰减，
+   * 所以这里判「接近满值」而不是逐字节 255。 */
+  COMP_CHECK_MSG(at(moved, 18, 10) >= 250, "the interior followed the outline");
+  COMP_CHECK_MSG(at(moved, 6, 12) == 0,
+                 "beyond the 3-sigma support of the feather the old outline is gone");
+
+  /* 原地平移：无变化、不产生撤销步。 */
+  const size_t before_noop = undo_depth_of(fixture.document);
+  COMP_CHECK(comp_selection_translate(fixture.document, 0, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == before_noop);
+
+  /* 推出画布：选区仍是「有选区」状态，但内容空。 */
+  COMP_CHECK(comp_selection_translate(fixture.document, 1000, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 0);
+
+  /* 一次平移一步撤销。 */
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(mask_sum(coverage(fixture.document)) > 0);
+}
+
+COMP_TEST(selection_move_pixels_cuts_and_expands_the_layer) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, 16, 16});
+  std::vector<uint8_t> pixels(16u * 16u * 4u, 0u);
+  for (int32_t y = 2; y < 6; ++y) {
+    for (int32_t x = 2; x < 6; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * 4u;
+      px[0] = 255;
+      px[3] = 255;
+    }
+  }
+  set_layer_pixels(fixture.document, id, 16, 16, pixels);
+
+  const std::vector<uint8_t> before = flatten_document(fixture.document);
+  COMP_CHECK(channel_at(before, 3, 3, 0) == 255);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 0, 0, 8, 8, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const size_t depth = undo_depth_of(fixture.document);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, id, 4, 0, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+
+  const std::vector<uint8_t> cut = flatten_document(fixture.document);
+  COMP_CHECK_MSG(channel_at(cut, 6, 3, 0) == 255, "the pixels landed at the destination");
+  COMP_CHECK_MSG(channel_at(cut, 3, 3, 3) == 0, "the cut cleared the source pixels");
+
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK_MSG(flatten_document(fixture.document) == before, "one undo restores pixels and geometry");
+
+  /* 落点在图层矩形之外：扩层，像素仍然可见。 */
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, id, 20, 0, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> expanded = flatten_document(fixture.document);
+  COMP_CHECK_MSG(channel_at(expanded, 22, 3, 0) == 255, "moving past the old bounds expands the layer");
+  COMP_CHECK_MSG(channel_at(expanded, 3, 3, 3) == 0, "the source was cleared by the expansion move");
+}
+
+COMP_TEST(selection_move_pixels_duplicate_keeps_the_source) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, 16, 16});
+  std::vector<uint8_t> pixels(16u * 16u * 4u, 0u);
+  for (int32_t y = 2; y < 6; ++y) {
+    for (int32_t x = 2; x < 6; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * 4u;
+      px[1] = 255;
+      px[3] = 255;
+    }
+  }
+  set_layer_pixels(fixture.document, id, 16, 16, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 0, 0, 8, 8, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, id, 4, 0, 1, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+
+  const std::vector<uint8_t> after = flatten_document(fixture.document);
+  COMP_CHECK_MSG(channel_at(after, 3, 3, 1) == 255, "duplicate keeps the source pixels");
+  COMP_CHECK_MSG(channel_at(after, 7, 3, 1) == 255, "duplicate also paints the destination");
+}
+
+COMP_TEST(selection_move_pixels_rejects_unsupported_layers) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  /* 没有选区：成功但什么都没改。 */
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, 16, 16});
+  std::vector<uint8_t> pixels(16u * 16u * 4u, 0u);
+  for (size_t i = 0; i < 16u * 16u; ++i) pixels[i * 4u + 3] = 255;
+  set_layer_pixels(fixture.document, id, 16, 16, pixels);
+  int32_t changed = -1;
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, id, 2, 2, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+
+  /* 组图层 / 缺图层。 */
+  const comp_layer_id group = add_source_layer(fixture.document, comp_rect{0, 0, 8, 8}, 1);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, group, 2, 2, 0, &changed) ==
+             COMP_ERR_STATE);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, 424242, 2, 2, 0, &changed) ==
+             COMP_ERR_NOT_FOUND);
+
+  /* 旋转图层：拒绝而不是悄悄重采样。 */
+  COMP_CHECK(comp_layer_set_transform(fixture.document, id, comp_rect{0, 0, 16, 16}, 30.0f) ==
+             COMP_OK);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, id, 2, 2, 0, &changed) ==
+             COMP_ERR_STATE);
+
+  /* 16 位图层：拒绝（8 位通路）。 */
+  const comp_layer_id deep = add_source_layer(fixture.document, comp_rect{0, 0, 16, 16});
+  std::vector<uint16_t> wide(16u * 16u * 4u, 0u);
+  for (size_t i = 0; i < 16u * 16u; ++i) wide[i * 4u + 3] = 65535u;
+  comp_image image{};
+  image.width = 16;
+  image.height = 16;
+  image.format = COMP_PIXEL_RGBA16;
+  image.stride = static_cast<size_t>(16u) * 4u * sizeof(uint16_t);
+  image.pixels = wide.data();
+  COMP_CHECK(comp_layer_set_pixels(fixture.document, deep, &image) == COMP_OK);
+  COMP_CHECK(comp_selection_move_pixels(fixture.document, deep, 2, 2, 0, &changed) ==
+             COMP_ERR_STATE);
 }

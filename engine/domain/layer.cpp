@@ -2,6 +2,7 @@
 #include "domain/layer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "imaging/comp_imaging.h"
@@ -199,6 +200,48 @@ comp_rect Layer::effective_bounds() const {
    * 但原点 (x, y) 始终以 transform 为准——它表达图层在画布上的落位，
    * 不能随尺寸回落一起被清零，否则带偏移的图层会被错误地画到左上角。 */
   return comp_rect{transform.x, transform.y, pixels.width, pixels.height};
+}
+
+bool Layer::document_to_pixel(int32_t source_width, int32_t source_height, double doc_x,
+                              double doc_y, int32_t* out_x, int32_t* out_y) const {
+  if (out_x == nullptr || out_y == nullptr) return false;
+  if (source_width <= 0 || source_height <= 0) return false;
+  const comp_rect bounds = effective_bounds();
+  if (bounds.w <= 0 || bounds.h <= 0) return false;
+
+  const double ud = (doc_x + 0.5 - static_cast<double>(bounds.x)) /
+                        static_cast<double>(bounds.w) * 2.0 - 1.0;
+  const double vd = (doc_y + 0.5 - static_cast<double>(bounds.y)) /
+                        static_cast<double>(bounds.h) * 2.0 - 1.0;
+
+  double us = ud;
+  double vs = vd;
+  if (std::fabs(static_cast<double>(rotation)) > 1e-9) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double rad = static_cast<double>(rotation) * kPi / 180.0;
+    const double cos_t = std::cos(rad);
+    const double sin_t = std::sin(rad);
+    us = ud * cos_t + vd * sin_t;
+    vs = -ud * sin_t + vd * cos_t;
+  }
+  if (flip_x) us = -us;
+  if (flip_y) vs = -vs;
+
+  const double sx = (us + 1.0) * 0.5 * static_cast<double>(source_width) - 0.5;
+  const double sy = (vs + 1.0) * 0.5 * static_cast<double>(source_height) - 0.5;
+  if (sx < -0.5 || sy < -0.5 || sx > static_cast<double>(source_width) - 0.5 ||
+      sy > static_cast<double>(source_height) - 0.5) {
+    return false;
+  }
+  int32_t ix = static_cast<int32_t>(std::lround(sx));
+  int32_t iy = static_cast<int32_t>(std::lround(sy));
+  if (ix < 0) ix = 0;
+  if (iy < 0) iy = 0;
+  if (ix >= source_width) ix = source_width - 1;
+  if (iy >= source_height) iy = source_height - 1;
+  *out_x = ix;
+  *out_y = iy;
+  return true;
 }
 
 }  // namespace compositor

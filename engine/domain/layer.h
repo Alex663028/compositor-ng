@@ -249,6 +249,15 @@ struct Layer {
    * 与「transform 未指定尺寸」区分开，否则会被上面的回落逻辑放大回来）。 */
   comp_rect effective_bounds() const;
 
+  /*
+   * 文档像素坐标 → 图层/蒙版像素坐标（最近邻）。source_width/height 是目标
+   * 缓冲的尺寸（像素用 pixels.width/height，蒙版用 mask.width/height）。
+   * 映射与 compositing/resample.cpp 的逆变换一致：归一化 → 逆旋转 → 翻转。
+   * 落在源缓冲外返回 false。
+   */
+  bool document_to_pixel(int32_t source_width, int32_t source_height, double doc_x,
+                         double doc_y, int32_t* out_x, int32_t* out_y) const;
+
   bool has_pixels() const { return !pixels.empty(); }
 };
 

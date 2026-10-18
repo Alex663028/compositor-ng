@@ -968,6 +968,7 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.brush.grain_amount = desc->brush.grain_amount;
   params.brush.grain_gaussian = desc->brush.grain_gaussian;
   params.brush.grain_monochromatic = desc->brush.grain_monochromatic;
+  params.brush.erase = desc->erase;
   params.points = desc->stroke_points;
   params.point_count = desc->stroke_point_count;
   params.heal.opacity = desc->heal.opacity;

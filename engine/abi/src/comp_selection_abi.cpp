@@ -13,12 +13,15 @@
  */
 #include "compositor/comp_selection.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "comp_abi_internal.h"
+#include "domain/layer.h"
 #include "domain/selection.h"
+#include "domain/selection_pixels.h"
 
 namespace {
 
@@ -274,5 +277,90 @@ comp_result comp_selection_get_coverage(comp_document document, comp_mask* out_m
                 static_cast<size_t>(state.width));
   }
   return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/* ------------------------------------------- 载入 / 平移 / 像素搬移（S5） */
+
+comp_result comp_selection_load_layer(comp_document document, comp_layer_id layer_id,
+                                      comp_selection_load_source source,
+                                      comp_selection_combine combine, int32_t threshold,
+                                      int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (source != COMP_SELECTION_LOAD_PIXELS && source != COMP_SELECTION_LOAD_MASK) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection load source");
+  }
+  if (combine < COMP_SELECTION_REPLACE || combine > COMP_SELECTION_SUBTRACT) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if (threshold < 0 || threshold > 255) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "threshold out of 0..255");
+  }
+  compositor::Layer* layer = doc->find(layer_id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "selection source layer was not found");
+  }
+
+  const DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, "Load Selection");
+  bool changed = false;
+  if (!compositor::selection_load_layer(&doc->selection(), state.width, state.height, *layer,
+                                        source, combine, threshold, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "invalid selection load request");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_translate(comp_document document, int32_t dx, int32_t dy,
+                                     int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (std::abs(static_cast<int64_t>(dx)) > 1000000 ||
+      std::abs(static_cast<int64_t>(dy)) > 1000000) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "selection offset out of range");
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Move Selection");
+  bool changed = false;
+  if (!compositor::selection_translate(&doc->selection(), dx, dy, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "selection translate failed");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_move_pixels(comp_document document, comp_layer_id layer_id, int32_t dx,
+                                       int32_t dy, int32_t duplicate, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  compositor::Layer* layer = doc->find(layer_id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "move pixels target layer was not found");
+  }
+
+  const DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, duplicate != 0 ? "Duplicate Selection Pixels"
+                                                       : "Move Selection Pixels");
+  bool changed = false;
+  std::string note;
+  std::string error;
+  if (!compositor::selection_move_pixels(layer, state.width, state.height, state.selection, dx, dy,
+                                          duplicate != 0, &changed, &note, &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, error);
+  }
+  return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)
 }

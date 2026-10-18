@@ -512,6 +512,12 @@ typedef struct comp_tool_op_desc {
    * 模糊工具用 `stroke_points`、`brush` 与 `blur.radius`。
    */
   comp_tool_blur   blur;
+  /*
+   * S5 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * 仅 COMP_TOOL_STROKE 读取：非 0 = 橡皮擦（destination-out，只减不增），
+   * 0 = 画笔（source-over）。橡皮擦忽略 `brush.grain_*`（颗粒无像素可叠）。
+   */
+  int32_t          erase;
 } comp_tool_op_desc;
 
 /*

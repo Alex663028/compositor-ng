@@ -219,6 +219,15 @@ void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
           shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
       if (cov <= 0.0f) continue;
       uint8_t* px = row + static_cast<size_t>(x) * 4;
+      if (brush.erase != 0) {
+        /* 橡皮擦 = destination-out：预乘 RGBA 一起乘 (1 - coverage)。 */
+        const double keep = 1.0 - static_cast<double>(cov);
+        for (int c = 0; c < 4; ++c) {
+          px[c] = static_cast<uint8_t>(
+              std::lround(std::min(std::max(static_cast<double>(px[c]) * keep, 0.0), 255.0)));
+        }
+        continue;
+      }
       /* 图层是预乘的：笔色直通 sRGB 先乘 coverage 得预乘值，再 source-over。 */
       const double sa = cov;
       const double ba = px[3] / 255.0;
@@ -970,7 +979,7 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
        * alpha 不动、全透明像素不动。origin 取 effective_bounds 的原点，使噪声
        * 钉在**文档坐标系**上——同一笔在图层平移后得到同样的颗粒。
        */
-      if (params.brush.grain_amount > 0.0f) {
+      if (params.brush.grain_amount > 0.0f && params.brush.erase == 0) {
         noise_add_at(target_layer->pixels.writable_pixels().data(), target_layer->pixels.width,
                      target_layer->pixels.height, target_layer->pixels.stride(),
                      params.brush.grain_amount, params.brush.grain_gaussian,

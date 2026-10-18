@@ -150,6 +150,47 @@ COMP_API comp_result comp_selection_get_bounds(comp_document document, comp_rect
  */
 COMP_API comp_result comp_selection_get_coverage(comp_document document, comp_mask* out_mask);
 
+/* ------------------------------------------------- 载入 / 平移 / 像素搬移（S5） */
+
+/* 载入来源：0 = 图层像素（alpha），1 = 图层蒙版。 */
+typedef enum comp_selection_load_source {
+  COMP_SELECTION_LOAD_PIXELS = 0,
+  COMP_SELECTION_LOAD_MASK   = 1
+} comp_selection_load_source;
+
+/*
+ * 把图层的像素 alpha 或蒙版载入为选区（上游「Load a layer's pixels or a mask
+ * as a selection」）。图层按 transform 映射回文档坐标（偏移/缩放/旋转/翻转）；
+ * threshold 0..255：采样值 <= threshold 记为 0，其余保留原值。
+ * 叠加语义与形状操作一致（replace / add / subtract），成功后 feather 归 0。
+ * 图层不存在 -> COMP_ERR_NOT_FOUND；来源/叠加枚举或 threshold 越界 ->
+ * COMP_ERR_INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_selection_load_layer(comp_document document, comp_layer_id layer,
+                                               comp_selection_load_source source,
+                                               comp_selection_combine combine, int32_t threshold,
+                                               int32_t* out_changed);
+
+/*
+ * 平移选区轮廓 (dx, dy) 像素：移出画布的部分被裁掉，羽化保留。
+ * 宿主应在**一次拖拽结束时**调用一次（拖拽中的预览由宿主自己按原蒙版平移绘制），
+ * 否则每次鼠标移动都会产生一条撤销步。起点为空选区或位移为 0 时 out_changed = 0。
+ */
+COMP_API comp_result comp_selection_translate(comp_document document, int32_t dx, int32_t dy,
+                                              int32_t* out_changed);
+
+/*
+ * 搬移选区内的像素（上游「move and duplicate the pixels inside」）。
+ *   - duplicate = 0：剪切语义（原位置按 coverage 擦除）；非 0：复制语义；
+ *   - 目标越出图层像素矩形时扩层（transform 原点/尺寸随之外移），越出画布丢弃；
+ *   - 仅支持 8 位、未旋转/翻转、1:1 缩放的图层；其它情况返回 COMP_ERR_STATE；
+ *   - 一步撤销；没有可搬的不透明像素时 out_changed = 0。
+ * 图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_selection_move_pixels(comp_document document, comp_layer_id layer,
+                                                int32_t dx, int32_t dy, int32_t duplicate,
+                                                int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

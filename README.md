@@ -1371,10 +1371,10 @@ Windows 侧推荐编译器仍是 clang-cl。
 
 - **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈97%**。
 - **口径 B：分母 = 上游产品功能条目**（上游 README 的 48 条）。回答「能当 Photoshop 用吗」
-  → **≈45%**（命中约 20 条）。
+  → **≈56%**（命中约 27 条）。
 
 AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Compositor/UI` 9.3k 行 +
-`ContentView`），因此「90% vs 45%」不矛盾。
+`ContentView`），因此「90% vs 56%」不矛盾。
 
 #### 口径 A：引擎核
 
@@ -1407,20 +1407,25 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 |---------|---------|
 | Layers（图层/组/不透明度/全混合模式/图层蒙版/剪贴蒙版/调整层 12 kind/图层效果 6 kind/合并/重排嵌套） | ✓ |
 | Transform（仿射 move·scale·rotate / distort / 精确值） | ✓ |
-| Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样） |
+| Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样；**S5 补上 Erase 模式**——同一支笔的 destination-out，§6.15） |
 | Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
+| **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；缺的只有外壳的拖拽手势，属接线不属算法 |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 25/48 命中 ≈ 52%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
+即 **约 27/48 命中 ≈ 56%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
 Lens Correction 是同一 `Filters.swift` 通路的附加值，不额外抬高条数；选区几何按
 「部分命中」计，未抬高条数——缺的 Select Subject / 抠图正是该条的主要工作量；
-Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
+Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。S5 只抬高**两条**：
+Selections 的「加选/减选 + 移动轮廓 + 搬移/复制像素」与「载入图层像素或蒙版」。
+Painting 的 Erase 模式算进已计数的笔刷条目，**吸管（Painting #7）仍不计入**——
+引擎与 ABI 已就绪（`comp_eyedropper_sample`），但外壳还没有取色工具和颜色模型，
+按「用户能做的事」口径不能算命中。其余约 4,800 行 Swift **完全没有对应物**，
 且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1441,6 +1446,8 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 → Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能；**像素管线 2026-10-18 已交付，见 §6.10**）
 → 滤镜 / Blur（`Filters.swift` 四条滤镜 + `BlurToolMode` 的 Blur；复用现有像素内核；
   **2026-10-18 已交付，见 §6.12**）
+→ 选区运算 + 橡皮擦 + 吸管（把已有像素/蒙版/笔刷内核换成用户可做的东西；
+  **2026-10-18 已交付引擎与 ABI，见 §6.15**；外壳手势/取色 UI 待接）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
 
 ### 6.5 工具算子（Tool ops）已接入产品通路（2026-10-16 起）
@@ -2098,6 +2105,81 @@ Liquify `strength = 0` 是**逐字节 no-op**、`strength = 0.8` 改变像素；
 魔棒仍在后续；滤镜实时预览、面板缩放/停靠未变。
 
 报告：`../report/S4-shell-interaction-20261018-claude.md`。
+
+### 6.15 S5 选区运算 / 像素搬移 / 橡皮擦 / 吸管（2026-10-18，Claude）
+
+S5 的目标是把上游 README 里三条「要有、但还没有」的能力补进引擎与 ABI：
+**加选/减选并搬移选区像素**、**把图层像素或蒙版载入为选区**、**Paint/Erase 双模式**
+以及**吸管取色**。五个入口全部按既有口径交付：领域层实现 + C ABI + 单元测试 +
+文档，不引入新依赖，`.comp` 格式不变。
+
+**1. 载入选区（`comp_selection_load_layer`）。** 两种源：
+
+- `COMP_SELECTION_SOURCE_PIXELS`：取图层的 **alpha**，经 `document_to_pixel()`
+  逐像素映射回文档坐标——与合成、吸管同一套「文档坐标 ↔ 图层像素」公式，因此
+  缩放/旋转/翻转的图层也能正确投影（旋转/翻转不重采样：每个文档像素查一次最近源像素）。
+- `COMP_SELECTION_SOURCE_MASK`：取图层蒙版的灰度。**没有蒙版的图层取到空选区**
+  （没有可载入的数据，不做「全不透明」的臆测）；蒙版与像素矩形同尺寸这一约束由
+  `comp_layer_set_mask` 保证。阈值与叠加口径同下。
+
+阈值是**严格大于**：`value > threshold ? value : 0`，`threshold ∈ [0, 255]`。
+叠加沿用 `comp_selection_apply_shape` 的三则口径（replace / add / subtract），
+并且**任何载入都会把 feather 归零**——羽化是几何形状的属性，不是像素的属性；
+保留旧 feather 会让载入结果被一圈无来源的模糊污染。结果与当前选区逐字节相同时
+`changed = 0`，不产生撤销步。
+
+**2. 平移轮廓（`comp_selection_translate`）。** 整张覆盖率缓冲按整数偏移平移，
+越出画布的部分直接裁掉（不扩画布、不环绕）；feather **保留**（轮廓只是搬家，
+软边跟着走）。`|dx| / |dy| > 1e6` 在事务之前拒绝，非法参数不留半成品。
+
+**3. 搬移/复制选区像素（`comp_selection_move_pixels`）。** 这是「剪切并粘贴到偏移处」
+的引擎版，一次调用完成：
+
+- 只处理**图层 ∩ 画布 ∩ 选区包围盒**内、coverage > 0 且 alpha > 0 的像素；
+  搬移量按 coverage 缩放（半选中像素只搬一半，预乘空间里减/加都是线性的）。
+- 默认是**剪切**（源处减掉搬走的那一份）；`duplicate != 0` 时源像素保留。
+- 落点在画布外：丢弃并写 `note`，**不把图层撑到画布之外**；落点仍在画布内但
+  超出图层矩形时，按需扩层，transform 与像素矩形同步更新。
+- 蒙版随像素矩形平移，新增区域填 255（未蒙）。
+- 一次调用 = **一个撤销步**；`dx == dy == 0` 直接返回 `changed = 0`
+  （原地「复制」会把像素加到自己身上、把 alpha 叠满，那是数据损坏不是复制）。
+- 明确拒绝：组图层、无像素、非 RGBA8（16 位/HDR 待后续）、带旋转/翻转、
+  非 1:1 缩放、蒙版与像素不同尺寸。都是 `COMP_ERR_STATE`，不静默降级。
+
+**4. 橡皮擦（`comp_tool_op_desc.erase`）。** 尾部追加字段，既有偏移不变；只有
+`COMP_TOOL_STROKE` 读它。语义是**预乘空间的 destination-out**：
+`px[c] = px[c] * (1 - coverage)`，四通道同乘——直通色上只减 alpha 会留下
+「透明却发亮」的脏数据。笔形、hardness、`pressure * flow` 与 Paint 模式完全一致，
+所以擦掉的正是同一笔会盖上去的那一份；橡皮擦**忽略 `brush.grain_*`**，
+`pressure * flow == 0` 依旧逐字节 no-op。
+
+**5. 吸管（`comp_eyedropper_sample`）。** 输出是**非预乘 sRGB 0..1**（不透明红 =
+`{1,0,0,1}`），不是 0..255，也不是预乘值。
+
+- 窗口 **N×N 按预乘值平均后再反预乘**：半透明边缘不会因 alpha 加权而发亮，也不是
+  「先平均直通色再乘 alpha」那种会被透明黑拉暗的写法。
+- 窗口越出画布/图层时只统计真实存在的像素；整窗落空返回透明 `{0,0,0,0}`。
+- 源两种：`COMP_EYEDROPPER_LAYER` 读目标图层（**忽略可见性**）；
+  `COMP_EYEDROPPER_MERGED` 读整篇合成（隐藏图层取不到）。
+- 16 位 / HDR 图层走既有的 8 位工作副本（`deep_to_rgba8` / `hdr_to_rgba8`），
+  取到的是屏幕上那个颜色。
+- **纯只读**：不开事务、不产生撤销步、不改像素；参数错误分派
+  `INVALID_ARGUMENT`（坐标出界、窗口非奇数/越界、空指针、未知 source）/
+  `NOT_FOUND`（图层不存在）/ `STATE`（组图层或无像素）。
+
+**6. 测试。** 新增 14 例：`tests/test_eyedropper.cpp` 5 例（直通色 + 只读、
+预乘平均、合并源 vs 图层源、16 位工作副本、错误码分派），`tests/test_selection.cpp`
+7 例（载入像素 + 阈值、蒙版忽略像素 alpha、参数拒绝、平移裁剪、剪切并扩层、
+复制保留源、不支持图层拒绝），`tests/test_tool_ops.cpp` 2 例（橡皮擦按 coverage
+做减法而非覆盖、零压力 no-op）。
+
+**7. 验证与边界。** 按老板指示，本轮**只做编译检查**
+（`scripts/build.py --no-run`，exit 0、`[build] OK`），全量回归留到口径 B ≥ 90%
+之后统一跑。**外壳尚未接线**：Windows 壳还没有取色工具、前景色模型、拖拽移动
+选区/搬移像素的手势，M 框选之外的载入/搬移只能走 ABI。因此口径 B 只抬高 2 条
+（Selections 的两条），吸管按「用户能做的事」不计入。
+
+报告：`../report/S5-selection-pixels-eyedropper-20261018-claude.md`。
 
 ## 7. 许可
 
