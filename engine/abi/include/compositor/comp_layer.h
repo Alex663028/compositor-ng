@@ -366,7 +366,14 @@ typedef enum comp_tool_op {
   COMP_TOOL_HEAL   = 3, /* 修补 -> 按 coverage 替换图层像素 */
   COMP_TOOL_DITHER = 4, /* 抖动 / 半调 -> 图层像素 */
   COMP_TOOL_LENS   = 5, /* 透镜畸变 -> 图层像素 */
-  COMP_TOOL_DEEP   = 6  /* 深度保持 -> 16 位资产降位 */
+  COMP_TOOL_DEEP   = 6, /* 深度保持 -> 16 位资产降位 */
+  /*
+   * F3 修饰类工具。数值从 9 起：7/8 已被域层的 scanlines/chunky 占用但未进
+   * ABI，复用会造成「同一数值在两层指不同算子」。
+   */
+  COMP_TOOL_CLONE    = 9,  /* 仿制图章 -> 从快照（当前层或整篇合成）拷贝像素 */
+  COMP_TOOL_SMUDGE   = 10, /* 涂抹 -> carried 缓冲拖色 */
+  COMP_TOOL_LIQUIFY  = 11  /* 液化 Push -> 前向位移重采样 */
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -433,6 +440,36 @@ typedef struct comp_tool_dither {
 typedef struct comp_tool_lens { double k; } comp_tool_lens;
 
 /*
+ * 仿制图章参数（字义见 domain/tool_ops.h 的 CloneParams）。
+ *
+ * `source_x/source_y` 是文档像素坐标的吸管落点。一次笔画的首笔偏移 =
+ * `round(source - first_point)`（x、y 各自取整）；`aligned != 0 && has_offset != 0`
+ * 时改用宿主带回的 `offset_x/offset_y`，于是同一会话的后续笔画保持首笔偏移。
+ * 源快照在笔画开始时取好：`sample_all_layers` 取整篇合成，否则取目标图层。
+ *
+ * 笔刷直径/硬度/pressure/flow 复用 `brush`；`opacity` 再乘进 coverage 峰值。
+ * 源像素越界时跳过（不会把图层擦出洞）。零初始化 = opacity 0 = 不动。
+ */
+typedef struct comp_tool_clone {
+  double  source_x;
+  double  source_y;
+  int32_t has_source;      /* 1 = source_x/y 有效（否则必须已有 carried offset） */
+  double  offset_x;        /* aligned 时沿用的「源 - 首笔落点」偏移（文档像素） */
+  double  offset_y;
+  int32_t has_offset;      /* 1 = offset_x/y 有效 */
+  int32_t aligned;         /* 1 = 同一会话保持首笔偏移；0 = 每笔按 source 现算 */
+  int32_t sample_all_layers; /* 1 = 整篇合成取样；0 = 只取目标图层 */
+  float   opacity;         /* 0..1，笔迹总强度 */
+} comp_tool_clone;
+
+/*
+ * Smudge / Liquify（Push）参数。直径与硬度取 `brush.diameter` / `brush.hardness`
+ * （上游夹到 0.98），`strength` 是推动/拖色的强度（上游 settings.opacity）。
+ * 零初始化 = strength 0 = 逐字节不动。
+ */
+typedef struct comp_tool_warp { float strength; } comp_tool_warp;
+
+/*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
  * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
@@ -449,6 +486,13 @@ typedef struct comp_tool_op_desc {
   size_t           heal_coverage_stride;
   comp_tool_dither dither;
   comp_tool_lens   lens;
+  /*
+   * F3 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * clone 用 `stroke_points`（文档像素折线）与 `brush`；smudge/liquify 只需
+   * `stroke_points`、`brush.diameter/hardness` 与 `warp.strength`。
+   */
+  comp_tool_clone  clone;
+  comp_tool_warp   warp;
 } comp_tool_op_desc;
 
 /*

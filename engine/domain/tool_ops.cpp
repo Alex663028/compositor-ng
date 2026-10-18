@@ -25,7 +25,9 @@
 
 #include "core/comp_geometry.h"
 #include "compositing/adjustment_eval.h"
+#include "compositing/compositor.h"
 #include "domain/document.h"
+#include "domain/retouch.h"
 #include "imaging/comp_imaging.h"
 #include "imaging/deep_round_trip.h"
 
@@ -38,7 +40,16 @@ constexpr int32_t kMaxRangeColors = 8;
 /* 半径/直径/点数上限：防止宿主传进来一个把缓冲写爆的值。 */
 constexpr int32_t kMaxSelectRadius = 512;
 constexpr float kMaxBrushDiameter = 8192.0f;
+/*
+ * Smudge/Liquify 的直径上限**低于**画笔：它们的 carried/scratch 缓冲是
+ * O(diameter²) 个 float。8192 直径时单是 carried 就约 1 GB（side ≈ 8193，
+ * 8193² × 4 × 4 B），宿主一个误传就能把进程打死。上游没有显式上限，但上游
+ * 的 UI 滑块也不会给到 8192；本仓取 1024（carried ≈ 16 MB）作为可验收的上界。
+ */
+constexpr float kMaxWarpDiameter = 1024.0f;
 constexpr int32_t kMaxStrokePoints = 1 << 16;
+/* 工具坐标（文档像素）的绝对值上限：与 transform 原点上限同口径，防止取整溢出。 */
+constexpr double kMaxToolCoordinate = 1e6;
 /*
  * 颗粒百分比上限。上游 Grain 面板最大 100（Photoshop 的 Noise 面板也是 0..100），
  * 但内核把 amount 当“半程百分比”放大到整程，>100 会让噪声幅度超过信号本身；
@@ -58,6 +69,9 @@ std::string label(uint32_t kind) {
     case kToolOpDeep: return "deep";
     case kToolOpScanlines: return "scanlines";
     case kToolOpChunky: return "chunky";
+    case kToolOpClone: return "clone";
+    case kToolOpSmudge: return "smudge";
+    case kToolOpLiquify: return "liquify";
     default: return "none";
   }
 }
@@ -502,6 +516,62 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       break;
     }
 
+    case kToolOpClone:
+    case kToolOpSmudge:
+    case kToolOpLiquify: {
+      const bool is_clone = params.kind == kToolOpClone;
+      if (params.point_count <= 0 || params.point_count > kMaxStrokePoints) {
+        return bad_arg("retouch stroke needs 1..65536 points");
+      }
+      if (params.points == nullptr) return bad_arg("retouch points are null");
+      const float diameter = params.brush.diameter;
+      const float max_diameter = is_clone ? kMaxBrushDiameter : kMaxWarpDiameter;
+      if (!std::isfinite(diameter) || diameter <= 0.0f || diameter > max_diameter) {
+        return bad_arg(is_clone ? "clone brush diameter out of range"
+                                : "smudge/liquify diameter out of range (max 1024)");
+      }
+      if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
+      /*
+       * 坐标上界不只是「防呆」：落笔包围盒、dab 中心与 Liquify 的位移余量都会
+       * 走 int32 取整，1e30 这类有限但离谱的值在取整处是 UB（既有 Stroke 闸只
+       * 查了 isfinite）。新算子按 transform 原点同款上限（1e6）拒绝。
+       */
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i]) ||
+            std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
+          return bad_arg("retouch point is not finite or out of range");
+        }
+      }
+      if (is_clone) {
+        if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
+        if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+        if (!finite01(params.clone.opacity)) return bad_arg("clone opacity out of 0..1");
+        const bool carried = params.clone.aligned != 0 && params.clone.has_offset != 0;
+        if (!params.clone.has_source && !carried) {
+          return bad_state("clone has no source point and no carried offset");
+        }
+        if (params.clone.has_source) {
+          if (!std::isfinite(params.clone.source_x) ||
+              !std::isfinite(params.clone.source_y) ||
+              std::fabs(params.clone.source_x) > kMaxToolCoordinate ||
+              std::fabs(params.clone.source_y) > kMaxToolCoordinate) {
+            return bad_arg("clone source point is not finite or out of range");
+          }
+        }
+        if (carried) {
+          if (!std::isfinite(params.clone.offset_x) ||
+              !std::isfinite(params.clone.offset_y) ||
+              std::fabs(params.clone.offset_x) > kMaxToolCoordinate ||
+              std::fabs(params.clone.offset_y) > kMaxToolCoordinate) {
+            return bad_arg("clone carried offset is not finite or out of range");
+          }
+        }
+      } else {
+        if (!finite01(params.warp.strength)) return bad_arg("warp strength out of 0..1");
+      }
+      break;
+    }
+
     case kToolOpHeal: {
       if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
       if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
@@ -718,6 +788,117 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
                      params.brush.grain_monochromatic, params.brush.seed,
                      static_cast<int64_t>(b.x), static_cast<int64_t>(b.y));
       }
+      break;
+    }
+
+    case kToolOpClone: {
+      /* 文档 → 图层像素坐标平移（与 Stroke 同口径：只认 effective_bounds 原点）。 */
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        local[i] = static_cast<float>(params.points[i] - ((i & 1) ? b.y : b.x));
+      }
+
+      /*
+       * 偏移口径（上游 cloneStrokeOffset）：
+       *   aligned && carried -> 沿用宿主带回的偏移；否则 round(source - 首笔落点)。
+       * 整段折线共用这一个偏移：上游的 clone 是「整笔跟着同一个源走」。
+       */
+      int32_t offset_x = 0;
+      int32_t offset_y = 0;
+      if (params.clone.aligned != 0 && params.clone.has_offset != 0) {
+        offset_x = static_cast<int32_t>(std::llround(params.clone.offset_x));
+        offset_y = static_cast<int32_t>(std::llround(params.clone.offset_y));
+      } else {
+        offset_x = static_cast<int32_t>(
+            std::llround(params.clone.source_x - static_cast<double>(params.points[0])));
+        offset_y = static_cast<int32_t>(
+            std::llround(params.clone.source_y - static_cast<double>(params.points[1])));
+      }
+
+      /*
+       * 源快照：**一笔开始前**取好，整笔只读它。
+       *   - 只取当前层：直接复制图层原始像素，不经过 blend/opacity；
+       *   - 整篇合成：composite_document 给的是画布尺寸的表面，这里按目标图层
+       *     的包围盒原点逐像素搬进图层空间。HDR 文档的表面是 RGBA16F，先走
+       *     hdr_to_rgba8（与显示口径一致，高光按白截断）。
+       */
+      std::vector<uint8_t> snapshot(static_cast<size_t>(target_layer->pixels.width) *
+                                        static_cast<size_t>(target_layer->pixels.height) * 4u,
+                                    0u);
+      if (params.clone.sample_all_layers == 0) {
+        for (int32_t y = 0; y < target_layer->pixels.height; ++y) {
+          std::memcpy(snapshot.data() +
+                          static_cast<size_t>(y) * static_cast<size_t>(target_layer->pixels.width) * 4u,
+                      target_layer->pixels.row(y),
+                      static_cast<size_t>(target_layer->pixels.width) * 4u);
+        }
+      } else {
+        ImageBuffer composite;
+        std::string comp_error;
+        if (!composite_document(*document, &composite, &comp_error)) {
+          ok = fail(COMP_ERR_INTERNAL, "clone could not compose the document: " + comp_error);
+          break;
+        }
+        ImageBuffer converted;
+        const ImageBuffer* display = &composite;
+        if (composite.format == COMP_PIXEL_RGBA16F) {
+          if (!hdr_to_rgba8(composite, &converted)) {
+            ok = fail(COMP_ERR_INTERNAL, "clone could not flatten the HDR composite");
+            break;
+          }
+          display = &converted;
+        }
+        for (int32_t y = 0; y < target_layer->pixels.height; ++y) {
+          const int32_t doc_y = b.y + y;
+          if (doc_y < 0 || doc_y >= display->height) continue;
+          const uint8_t* src_row = display->row(doc_y);
+          uint8_t* dst_row = snapshot.data() +
+                             static_cast<size_t>(y) *
+                                 static_cast<size_t>(target_layer->pixels.width) * 4u;
+          for (int32_t x = 0; x < target_layer->pixels.width; ++x) {
+            const int32_t doc_x = b.x + x;
+            if (doc_x < 0 || doc_x >= display->width) continue;
+            std::memcpy(dst_row + static_cast<size_t>(x) * 4u,
+                        src_row + static_cast<size_t>(doc_x) * 4u, 4u);
+          }
+        }
+      }
+
+      /* 上游 CloneSettings.opacity 与画笔 pressure × flow 一起构成覆盖率峰值。 */
+      const float peak = std::min(std::max(params.brush.pressure * params.brush.flow *
+                                               params.clone.opacity,
+                                           0.0f),
+                                  1.0f);
+      if (!clone_stamp_paint(target_layer->pixels.writable_pixels().data(),
+                             target_layer->pixels.stride(), target_layer->pixels.width,
+                             target_layer->pixels.height, snapshot.data(), offset_x, offset_y,
+                             local.data(), params.point_count, params.brush.diameter,
+                             params.brush.hardness, peak)) {
+        ok = oom("clone ran out of memory");
+      }
+      break;
+    }
+
+    case kToolOpSmudge:
+    case kToolOpLiquify: {
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        local[i] = static_cast<float>(params.points[i] - ((i & 1) ? b.y : b.x));
+      }
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const bool ok_paint =
+          params.kind == kToolOpSmudge
+              ? smudge_paint(pixels, target_layer->pixels.stride(), target_layer->pixels.width,
+                             target_layer->pixels.height, local.data(), params.point_count,
+                             params.brush.diameter, params.brush.hardness, params.warp.strength)
+              : liquify_push_paint(pixels, target_layer->pixels.stride(),
+                                   target_layer->pixels.width, target_layer->pixels.height,
+                                   local.data(), params.point_count, params.brush.diameter,
+                                   params.brush.hardness, params.warp.strength);
+      if (!ok_paint) ok = oom(params.kind == kToolOpSmudge ? "smudge ran out of memory"
+                                                           : "liquify ran out of memory");
       break;
     }
 

@@ -66,6 +66,12 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   画布外内容保留；框不变则不进历史）。选区随坐标系变更丢弃，整次裁剪一步撤销。
   顺带修正 Canvas Size：尺寸真的变化时丢弃选区（此前只有 Image Size 丢）。
   基线 304 → **316 用例**（12 例护栏），6/6 回归全绿。详见 §6.8。
+  2026-10-18 第九轮（F3 修饰类工具）：`comp_tool_apply` 追加 `COMP_TOOL_CLONE`(9) /
+  `COMP_TOOL_SMUDGE`(10) / `COMP_TOOL_LIQUIFY`(11)——仿制图章按「一笔开始时的快照」取样、
+  `aligned` 跨笔保留首笔偏移、`sample_all_layers` 取整篇合成；涂抹用跨 dab 的 carried
+  缓冲拖色；液化（Push）用 dab 前 scratch 做前向位移重采样。参数闸仍在事务之前，
+  一步撤销，`out_code` 成功也写 `COMP_OK`。基线 316 → **326 用例**（10 例护栏），
+  6/6 回归全绿。详见 §6.9。
 
 ## 1. M1 目标与范围
 
@@ -320,7 +326,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 78（38 个 `.c` + 40 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 316 cases, 0 failed, 0 check failures`（当前基线；§6.8 起） |
+| 测试 | `summary: 326 cases, 0 failed, 0 check failures`（当前基线；§6.9 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：40 `.cpp` / 38 `.c`（含 vendored 26）/ 78 `.h`；tests：29 `.cpp` |
 
@@ -1291,13 +1297,13 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Camera Raw**（6 文件 1,708 行） | **零** |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
-| **Clone Stamp / Smudge / Liquify**（400+ 行） | **零** |
+| **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式未做 |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 21/48 命中 ≈ 44%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
-抠图正是该条的主要工作量；Crop 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
+即 **约 22/48 命中 ≈ 46%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
+抠图正是该条的主要工作量；Crop 与 Clone/Smudge/Liquify 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
 且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1314,7 +1320,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 **功能面推进顺序**（边际成本从低到高）：
 选区几何（1,000+ 行，但它是几乎所有下游编辑的入口；**2026-10-18 已交付，见 §6.7**）
 → Crop 工具（249 行，解锁导出打印尺寸；**2026-10-18 已交付，见 §6.8**）
-→ Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用）
+→ Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用；**2026-10-18 已交付，见 §6.9**）
 → Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
 
@@ -1543,6 +1549,92 @@ OHOS aarch64 交叉编译）。详见
 - **选区丢弃而非缩放**：缩放 0/255 蒙版会把边缘糊成半选，上游同样不保留。
 - **极负原点可能被拒**：本仓在写入侧拒绝 |origin| > 1e6 的 transform，
   这类裁剪返回 `COMP_ERR_INVALID_ARGUMENT` 且文档不变（比静默写入坏值安全）。
+
+### 6.9 F3 仿制图章 / 涂抹 / 液化（2026-10-18，Claude）
+
+**交付物**：`engine/domain/retouch.{h,cpp}`（93 / 362 行，纯像素算法）、
+`ToolOpParams` 追加 `clone` / `warp` 两组参数、
+`comp_tool_op` 追加 3 个 kind、`comp_tool_apply` 的派发与参数闸、
+`tests/test_retouch.cpp`（10 例）。**没有新增导出符号**——F3 走既有的
+`comp_tool_apply`，事务、撤销、`note`/`out_code` 与 16 位工作副本的既有契约原样继承。
+
+#### 为什么 kind 从 9 起
+
+域层 `ToolOpKind` 里的 7/8 已被 `scanlines` / `chunky` 占用，但这两个算子当时
+没有进 ABI（宿主无入口）。F3 若「补齐枚举」把 CLONE 填成 7，同一个数值在域层
+与 ABI 就会指向两个不同算子。ABI 与域层都从 **9** 起追加：
+
+| ABI | 域层 | 含义 |
+|-----|------|------|
+| `COMP_TOOL_CLONE = 9` | `kToolOpClone` | 仿制图章 |
+| `COMP_TOOL_SMUDGE = 10` | `kToolOpSmudge` | 涂抹 |
+| `COMP_TOOL_LIQUIFY = 11` | `kToolOpLiquify` | 液化（Push） |
+
+`tests/test_retouch.cpp` 用 `static_assert` 把这三个数值连同 `COMP_TOOL_DEEP == 6`
+一起钉死；同时确认既有数值不变。
+
+#### 语义逐条对齐
+
+| 上游行为 | ng 实现 | 护栏 |
+|----------|---------|------|
+| `cloneStrokeOffset`：`offset = round(source - 首笔落点)` | `llround(source - points[0..1])`，整条折线共用一个偏移 | `retouch_clone_aligned_keeps_the_first_offset_and_unaligned_recomputes` |
+| `aligned` 时沿用宿主带回的首笔偏移 | `aligned && has_offset` 直接用 `offset_x/y`；否则重算 | 同上 |
+| `sampleAllLayers` 取整篇实时合成 | `composite_document` + 按图层包围盒原点搬进图层空间；HDR 合成先 `hdr_to_rgba8` | `retouch_clone_sample_all_layers_uses_the_composite_snapshot` |
+| 一笔内既画又采样会吃到自己 | **开工前**取快照，整笔只读快照 | 同上（源像素在落笔后仍保持原值） |
+| 没有源 → "Nothing to copy until a source is set" | `COMP_ERR_STATE`，且不进撤销栈 | `retouch_clone_without_source_is_a_state_error_and_leaves_no_history` |
+| Smudge 首点只 `pickUp`，不落笔 | 首点读进 carried，dab 从第一个移动采样开始 | `retouch_smudge_single_point_only_picks_up_colour` |
+| Smudge `painted = under + (carried - under) × w × strength` | 同一式；carried 在 dab 后同步为 painted | `retouch_smudge_drags_colour_across_a_boundary` |
+| Smudge 间距 `max(1, diameter × 0.005)` | 同式 | 同上 |
+| Liquify `move = (to - from) × strength`，从 dab 前像素重采样 | 每 dab 先复制 scratch 再双线性采样，避免自反馈 | `retouch_liquify_pushes_pixels_forward` |
+| Liquify 间距 `max(1, diameter × 0.025)` | 同式 | 同上 |
+| 笔刷权重 `u <= hardness ? 1 : smoothstep((1-u)/(1-hardness))`；hardness 上限 0.98 | 同一式，hardness 显式夹到 0.98 | 涂抹/液化两例 |
+
+坐标口径与既有 Stroke 完全一致：ABI 收**文档像素**折点，引擎按
+`effective_bounds()` 原点平移到**图层像素**后再落笔；不缩放、不旋转。
+
+#### 参数闸与内存安全
+
+闸仍在 `txn_begin` **之前**，拒绝路径不产生历史、不改像素：
+
+- 折线 1..65536 点、指针非空；所有坐标必须有限且 `|v| <= 1e6`（否则
+  `lround` 会 UB——这是新算子显式加的闸，既有 Stroke 未改）；
+- Clone 要求 `has_source` 或 `aligned && has_offset`，否则 `COMP_ERR_STATE`；
+  `pressure` / `flow` / `opacity` 必须落在 0..1；
+- Smudge/Liquify 的 `strength` 必须有限且 0..1；
+- 笔刷直径沿用 Stroke 的 8192 上限；warp 另设 **1024** 上限——carried/scratch
+  是 O(diameter²) 个 float，8192 直径仅 carried 就约 1 GB。这是本仓显式收紧的
+  一处上界（上游没有这个闸），越界返回 `COMP_ERR_INVALID_ARGUMENT`。
+
+#### 与上游的两处显式分歧
+
+1. **`strength = 0` 允许且逐字节不动**：上游把 opacity 夹到 0.01..1；本仓允许
+   0，宿主可以用它做「强度 0 预览」，并在实现里短路成完全无操作。
+   `retouch_warp_strength_zero_is_a_byte_identical_no_op` 钉住这一点。
+2. **warp 直径上限 1024**（见上），属内存安全取舍，不是像素语义差异。
+
+#### 护栏与基线
+
+`tests/test_retouch.cpp` 的 10 例覆盖：仿制图章取样与源不变、aligned/非 aligned
+的偏移语义、`sampleAllLayers` 与仅当前层的差异、缺源的 `COMP_ERR_STATE` 零副作用；
+涂抹跨色块拖色、单点只拾色；液化把白色条纹向下游推移（`x=40` 变黑、`x=60` 变白、
+`x=75` 不变）；`strength = 0` 逐字节恒等；非法直径 / 越界 strength / NaN 与 1e7 坐标 /
+空指针全部在事务前拒绝；同一组参数的重复回放逐字节一致且恰好一步撤销。
+
+基线 316 → **326 cases, 0 failed**；`run_regression.py` 6/6 PASS、0 skipped
+（构建 + 单元测试、Windows 壳 27 项、编解码交叉、`.comp` 双向、ctypes 真实调用、
+OHOS aarch64 交叉编译）。详见 `../report/F3-clone-smudge-liquify-20261018-claude.md`。
+
+#### 明示边界
+
+- **`sampleAllLayers` 只按包围盒原点映射**：图层的 scale / rotation 不参与采样
+  坐标换算，与既有 Stroke 的边界相同；1:1 无变换图层逐像素精确。
+- **源越界跳过**：仿制图章的源点落在图层外时不落笔（不取透明），否则会在图层
+  上擦出洞，与「没有可复制的像素」语义不同。
+- **16 位 / HDR**：16 位图层与其他 8 位工具一样先走 `use_rgba8_working_copy`；
+  HDR 图层明确拒绝（8 位工具无法保真，等 S4 的 tile+coverage 模型）。
+- **Blur 模式未做**：上游 `BlurToolMode` 的 liquify / smudge 已交付，同一枚举里的
+  `blur` 仍是零通路。
+- **无 UI**：交互（笔刷光标、源点十字、realignment 快捷键）属外壳职责。
 
 ## 7. 许可
 

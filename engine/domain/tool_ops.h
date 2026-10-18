@@ -153,6 +153,46 @@ struct LensParams {
   double k = 0.0;
 };
 
+/* ============================================================== 修饰 */
+
+/*
+ * 仿制图章参数（上游 CloneStamp.swift 的 CloneSettings + cloneStrokeOffset）。
+ *
+ * 笔刷形状复用 `BrushStrokeParams`（diameter / hardness / pressure / flow），
+ * 本结构只承载**源**与采样策略：
+ *   - `source_x/y` 是宿主吸管落点（文档像素）。`has_source` 为 0 且没有可用的
+ *     历史偏移时，按上游「Nothing to copy until a source is set」拒绝；
+ *   - `offset_x/y` 是「源 - 首笔落点」的整数像素偏移。`aligned` 且
+ *     `has_offset` 时沿用它（同一会话内保持首笔偏移，上游 `cloneOffset`）；
+ *     否则按 `round(source - first_point)` 现算；
+ *   - `sample_all_layers` 非 0 时源快照取整篇实时合成（上游 drawLiveComposite），
+ *     否则取目标图层自身的原始像素；
+ *   - `opacity` 0..1，乘进 coverage 峰值（上游 CloneSettings.opacity）。
+ *
+ * 快照在**一笔开始时**取好：上游在同一笔里既画又采样会吃到自己刚画的像素，
+ * 那不是仿制图章的行为。
+ */
+struct CloneParams {
+  double source_x = 0.0;
+  double source_y = 0.0;
+  int32_t has_source = 0;
+  double offset_x = 0.0;
+  double offset_y = 0.0;
+  int32_t has_offset = 0;
+  int32_t aligned = 0;
+  int32_t sample_all_layers = 0;
+  float opacity = 1.0f;
+};
+
+/*
+ * Smudge / Liquify（Push）参数。笔刷直径与硬度同样复用 `BrushStrokeParams`；
+ *   - `strength` = 上游 settings.opacity（上游夹到 0.01..1；本仓显式允许 0，
+ *     0 即逐字节不动，便于宿主实现「强度 0 预览」）。
+ */
+struct WarpParams {
+  float strength = 1.0f;
+};
+
 /* ============================================================== 扫描线 */
 
 /*
@@ -252,6 +292,14 @@ enum ToolOpKind {
   kToolOpDeep = 6,        /* 深度保持 -> 16 位资产降位或往返 */
   kToolOpScanlines = 7,   /* 扫描线 -> 图层像素（CRT 形态） */
   kToolOpChunky = 8,      /* 像素化 -> 抖动后放大并补 dot 间隙 */
+  /*
+   * F3 的修饰类工具。**数值从 9 起，刻意跳过 7/8**：7/8 已被域层的
+   * scanlines/chunky 占用但未进 ABI（宿主没有入口）。若这里复用 7/8，
+   * 同一个数值在域层与 ABI 会指两个不同的算子——那是最难查的一类错误。
+   */
+  kToolOpClone = 9,       /* 仿制图章 -> 从快照拷贝像素 */
+  kToolOpSmudge = 10,     /* 涂抹 -> carried 缓冲拖色 */
+  kToolOpLiquify = 11,    /* 液化（Push）-> 前向位移重采样 */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -272,10 +320,15 @@ struct ToolOpParams {
   const uint8_t* exclude = nullptr;
   int32_t exclude_count = 0;
 
-  /* Stroke 用。points 为文档像素坐标的折线折点（x, y 成对，共 point_count*2 个）。 */
+  /* Stroke / Clone / Smudge / Liquify 用。points 为文档像素坐标的折线折点
+   * （x, y 成对，共 point_count*2 个）；后三者与 Stroke 共用同一套笔刷几何。 */
   BrushStrokeParams brush;
   const float* points = nullptr;
   int32_t point_count = 0;
+
+  /* Clone / Smudge / Liquify 用（定义见各自的参数结构）。 */
+  CloneParams clone;
+  WarpParams warp;
 
   /* Heal 用。coverage 为 8 位灰度蒙版（0..255，255 = 待修补），尺寸须等于图层像素。 */
   HealParams heal;

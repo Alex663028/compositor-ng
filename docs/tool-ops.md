@@ -122,6 +122,44 @@
 - `.comp` 存盘：RGBA16 / RGBA16F 图层写成 `<uuid>.exr` 资产（C3b）；只有宿主明确
   要求 8 位资产时才需要先 quantize（见 §6）。
 
+### 4.7 Clone Stamp（`COMP_TOOL_CLONE`）
+
+笔刷形状与 Stroke 同源（`brush.diameter / pressure / hardness / flow`），
+`clone` 子结构只承载**源**与采样策略：
+
+| 字段 | 语义 |
+|------|------|
+| `source_x/y` + `has_source` | 宿主吸管落点（文档像素）。没有源且没有可沿用的偏移 ⇒ `COMP_ERR_STATE` |
+| `offset_x/y` + `has_offset` | 「源 − 首笔落点」的整数像素偏移，由宿主在两次落笔之间带回 |
+| `aligned` | 非 0 且 `has_offset` 非 0 时沿用带回来的偏移；否则按 `round(source − points[0])` 现算 |
+| `sample_all_layers` | 非 0 = 源快照取整篇实时合成；0 = 只取目标图层自身像素 |
+| `opacity` | 0..1，与 `pressure × flow` 相乘作为 coverage 峰值 |
+
+**快照在整笔开始前取好**：同一笔里既画又采样会吃到自己刚画的像素，这不是仿制
+图章的行为。源点落在图层外时**跳过**该像素（不落透明——那会在图层上擦出洞）。
+`sample_all_layers` 只按图层包围盒原点把合成面搬进图层空间；scale / rotation
+不参与换算（与 Stroke 相同的边界）。
+
+### 4.8 Smudge / Liquify（`COMP_TOOL_SMUDGE` / `COMP_TOOL_LIQUIFY`）
+
+`warp.strength` 为 0..1；笔刷直径与硬度同样来自 `brush`。两者共用上游的间距与
+权重口径：
+
+- Smudge 间距 `max(1, diameter × 0.005)`：首点只把像素读进 carried 缓冲
+  （`pickUp`），不落笔；之后每个 dab 做
+  `painted = under + (carried − under) × weight × strength`，并把 painted 写回
+  carried，于是颜色被一路拖走。
+- Liquify（Push）间距 `max(1, diameter × 0.025)`：每个 dab 先把覆盖区复制成
+  scratch，再按 `move = (to − from) × strength` 做**前向**双线性重采样；
+  读 scratch 而非当前像素，避免自反馈。
+- 权重 `u <= hardness ? 1 : smoothstep((1−u)/(1−hardness))`，hardness 夹到 0.98
+  （上游上限）。
+- `strength = 0` ⇒ 逐字节不变（本仓显式允许 0，便于宿主做「强度 0 预览」；
+  上游把 opacity 夹在 0.01..1）。
+- **warp 直径上限 1024**：carried / scratch 是 O(diameter²) 个 float，
+  8192 直径仅 carried 就约 1 GB；越界在参数闸返回 `COMP_ERR_INVALID_ARGUMENT`。
+- 折点坐标必须有限且 `|v| <= 1e6`（否则取整 UB）；点数 1..65536。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。

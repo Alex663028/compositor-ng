@@ -985,6 +985,16 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.dither.light_on_dark = desc->dither.light_on_dark;
   params.dither.original_colors = desc->dither.original_colors;
   params.lens.k = desc->lens.k;
+  params.clone.source_x = desc->clone.source_x;
+  params.clone.source_y = desc->clone.source_y;
+  params.clone.has_source = desc->clone.has_source;
+  params.clone.offset_x = desc->clone.offset_x;
+  params.clone.offset_y = desc->clone.offset_y;
+  params.clone.has_offset = desc->clone.has_offset;
+  params.clone.aligned = desc->clone.aligned;
+  params.clone.sample_all_layers = desc->clone.sample_all_layers;
+  params.clone.opacity = desc->clone.opacity;
+  params.warp.strength = desc->warp.strength;
 
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;
