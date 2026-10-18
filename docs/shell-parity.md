@@ -30,6 +30,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | PSD 只读导入 | 可用 | 可用 | `comp_io_import` | 已达成（stb） |
 | 窗口表面上屏 | AUTO 回落 CPU；HWND 返回 `UNSUPPORTED` | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) | **有边界**：设备侧交换链未落地，两壳均如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
+| 工具条 / 画布导航 | 17 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
 `COMP_ERR_UNSUPPORTED`**，不伪造成功。一旦窗口交换链落地，两壳无需改动调用点。
@@ -74,10 +75,63 @@ compositor-ng 是「同引擎、两壳」结构：
 
 ## 4. 边界与未达成项（如实记录）
 
-1. **设备侧上屏**：Windows 无 `d3d12.h`（SDK 仅 8.1），D3D12 真实路径不可编译；鸿蒙无在线设备
+1. **设备侧上屏**：D3D12 代码可在本机 SDK（VS 2022 / Windows SDK 10.0.26100）下编译，
+   但 `render_document` 仍走 CPU，交换链未接主渲染路径；鸿蒙无在线设备
    （`hdc list targets` 为空），Vulkan 交换链未落地。故两壳窗口表面统一 `UNSUPPORTED`。
 2. **鸿蒙 UI 面板**：鸿蒙壳目前只有 `startup/shutdown/backendName/flatten/surfaceInfo/presentSurface`
    六个桥函数，尚未接图层/调整面板 UI；能力矩阵中标注为「未接 UI」，非能力缺失。
 3. **鸿蒙 HAP 真机验证**：交叉编译（aarch64 / x86_64）均可产出 `.so`，但无设备可上机。
 
 以上三项均属**环境边界**，不涉及两壳语义分叉；共享回归护栏已把可离线验证的部分全部锁死。
+
+---
+
+## 5. Windows 壳 UI 地基（2026-10-18）
+
+上游 `Compositor` 只有 macOS 应用层，**没有 Windows 版可供参照**，故 Windows 壳的
+编辑器界面是自建的。为让 UI 数学可回归，平台无关部分被抽到
+`shells/windows/src/ui_core.h`（header-only，不 include Windows 头、不 include `engine/` 头、
+不分配内存），由 `tests/test_ui_core.cpp` 的 8 例覆盖；`main.cpp` 只做
+「消息 → ui_core 调用 → 绘制」。**绘制与命中测试共用同一套几何函数**，这是本层的第一原则。
+
+### 5.1 冻结的布局常量
+
+| 常量 | 值 | 说明 |
+|------|----|------|
+| `Layout::kToolbarHeight` | 46 | 顶部工具条 |
+| `Layout::kStatusHeight` | 26 | 底部状态栏 |
+| `Layout::kLayerPanelWidth` | 248 | 左侧图层面板 |
+| `Layout::kAdjustPanelWidth` | 330 | 右侧调整面板 |
+| `Layout::kMinCanvasWidth` | 180 | 画布保底宽度，不足则先收右面板、再收左面板 |
+| `kToolButtonSize` / `kToolButtonGap` / `kToolButtonLeft` | 32 / 6 / 10 | 工具条按钮几何 |
+| `kLayerHeaderHeight` / `kLayerRowHeight` | 30 / 22 | 图层面板表头与行高 |
+| `CanvasView::kMinZoom` / `kMaxZoom` | 0.02 / 32.0 | 缩放夹取范围 |
+
+不变量（测试钉死）：任意宽度 × 高度下所有矩形非负、互不重叠、三块横向拼接**正好**铺满
+客户区；`pan = 0` 时文档中心恒在画布中心；以光标为锚缩放前后，光标下的文档像素不漂移。
+
+### 5.2 工具与快捷键（对齐上游 `UI/KeyboardShortcuts.swift`）
+
+`A` Select · `V` Move/Transform · `M` Marquee · `L` Lasso · `W` Magic Wand · `C` Crop ·
+`I` Eyedropper · `B` Brush · `E` Eraser · `J` Spot Healing · `S` Clone Stamp ·
+`R` Blur/Smudge/Liquify · `G` Gradient · `U` Shape · `T` Type · `H` Hand · `Z` Zoom
+
+- 大写字母与小写等价（`WM_KEYDOWN` 不区分大小写）；
+- 未占用键显式返回 `ToolId::Count`，**不静默回落到第一个工具**；
+- 默认键不重复；工具条、工具菜单、快捷键共用 `tool_table` 一张表。
+
+为对齐上游而挤出的键位：图层可见性 `V` → `Ctrl+Shift+V`；图层不透明度 `[` `]` →
+`Ctrl+[` / `Ctrl+]`（`[` `]` 改为笔刷直径、`Shift+[` `]` 为硬度）；新建/打开/保存改
+`Ctrl+N` / `Ctrl+O` / `Ctrl+S`。
+
+### 5.3 未达成的 UI 项
+
+| 缺口 | 状态 | 原因 |
+|------|------|------|
+| Move 工具拖拽平移图层 | 未做 | 需图层 transform 写入侧与像素回读配合；现有 `comp_layer_*` 不足以在不猜语义的前提下实现 |
+| 工具按钮图标 | 未做 | 当前为文字快捷键字母，避免引入图标资源/字体 |
+| 画布上的选区 / 蚂蚁线 / 裁剪手柄 | 未做 | 选区 ABI 已具备（README §6.7），交互层待补 |
+| 笔刷落笔 | 未做 | `comp_tool_apply` 已具备，外壳尚无可视笔迹预览与撤销粒度控制 |
+| 面板缩放 / 停靠 | 未做 | 固定布局，窄窗口按规则收起 |
+
+以上均为**外壳交互**缺口，不涉及引擎核与两壳共享语义。

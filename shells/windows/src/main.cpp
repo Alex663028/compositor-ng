@@ -37,17 +37,17 @@
 #include <compositor/comp_render.h>
 #include <compositor/comp_undo.h>
 
+#include "ui_core.h" /* 平台无关的视图变换 / 布局 / 命中 / 工具表 */
+
 namespace {
 
 constexpr int kDefaultWidth = 1280;
 constexpr int kDefaultHeight = 720;
 
-/* 图层面板几何（像素）与行高。 */
-constexpr int kPanelWidth = 248;
-constexpr int kPanelRowHeight = 22;
+/* 面板几何统一由 ui_core.h 提供：绘制与命中测试必须共用同一套常量。 */
+using comp_ui::Layout;
 
-/* 调整面板几何（右侧）：列宽与行高。 */
-constexpr int kAdjustPanelWidth = 330;
+/* 调整面板的行高（仅是排版密度，不参与命中测试）。 */
 constexpr int kAdjustRowHeight = 20;
 
 /* 菜单命令 id（与快捷键一一对应，见 run_shell_command）。 */
@@ -77,6 +77,11 @@ constexpr UINT kCmdAdjApply = 1023;
 constexpr UINT kCmdAdjRemove = 1024;
 constexpr UINT kCmdLayerMergeDown = 1025;
 constexpr UINT kCmdLayerFlatten = 1026;
+constexpr UINT kCmdViewFit = 1027;
+constexpr UINT kCmdViewActual = 1028;
+constexpr UINT kCmdViewZoomIn = 1029;
+constexpr UINT kCmdViewZoomOut = 1030;
+constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 
 struct LayerRow {
   comp_layer_id id = 0;
@@ -106,6 +111,16 @@ struct ShellState {
   int32_t adj_param = 0;                 /* 聚焦的可编辑参数序号 */
   std::vector<std::string> adj_values;   /* 与参数表对齐的 ASCII 编辑值 */
   std::wstring adj_input;                /* 键入缓冲；非空 = 输入态 */
+  /* 画布视图与工具状态：几何/变换全部来自 ui_core.h，壳内不重复实现。 */
+  comp_ui::CanvasView view;
+  comp_ui::ToolId tool = comp_ui::ToolId::Select;
+  double brush_size = 24.0;
+  double brush_hardness = 0.75;
+  bool space_down = false; /* 按住空格 = 临时抓手 */
+  bool panning = false;
+  POINT pan_anchor{};
+  bool needs_fit = true; /* 新文档/打开文档后，下一次绘制时适配窗口 */
+  HWND window = nullptr;
 };
 
 ShellState* g_shell = nullptr;  /* 单窗口外壳，生命周期与窗口一致 */
@@ -712,6 +727,7 @@ bool create_document(ShellState& shell) {
   shell.rgba.assign(pixel_count * 4, 0);
   shell.framebuffer.assign(pixel_count, 0);
   shell.needs_render = true;
+  shell.needs_fit = true;
   shell.visibility.clear();
   refresh_layers(shell);
   refresh_history_status(shell, L"已新建文档");
@@ -736,6 +752,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.rgba.assign(pixel_count * 4, 0);
   shell.framebuffer.assign(pixel_count, 0);
   shell.needs_render = true;
+  shell.needs_fit = true;
   shell.visibility.clear();
   refresh_layers(shell);
   refresh_history_status(shell, L"已打开 .comp");
@@ -838,6 +855,15 @@ void save_document_dialog(HWND window, ShellState& shell) {
   save_document(shell, utf8);
 }
 
+/* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：
+ * run_shell_command 是菜单与快捷键的唯一入口，不能被定义顺序卡住。 */
+void set_tool(ShellState& shell, comp_ui::ToolId id);
+void brush_step(ShellState& shell, int direction, bool hardness);
+bool client_layout(const ShellState& shell, Layout* out);
+void view_fit(ShellState& shell);
+void view_actual(ShellState& shell);
+void view_zoom_step(ShellState& shell, double factor);
+
 /* 菜单与快捷键共用同一入口，保证两条路径行为不分叉。 */
 void run_shell_command(HWND window, ShellState& shell, UINT id) {
   switch (id) {
@@ -867,6 +893,18 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdLayerFlatten:
       panel_flatten(shell);
+      break;
+    case kCmdViewFit:
+      view_fit(shell);
+      break;
+    case kCmdViewActual:
+      view_actual(shell);
+      break;
+    case kCmdViewZoomIn:
+      view_zoom_step(shell, 1.2);
+      break;
+    case kCmdViewZoomOut:
+      view_zoom_step(shell, 1.0 / 1.2);
       break;
     case kCmdLayerSelectUp:
       panel_move_selection(shell, 1); /* 面板自上而下：上移一行 = 索引 +1 */
@@ -945,9 +983,67 @@ void render_canvas(ShellState& shell) {
   shell.needs_render = false;
 }
 
+/* 工具条：按钮几何与命中共享 ui_core.h，壳只负责把选中态画出来。 */
+void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
+  RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(44, 46, 52));
+  FillRect(dc, &background_rect, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  const int count = comp_ui::tool_count();
+  for (int i = 0; i < count; ++i) {
+    const comp_ui::ToolInfo* info = comp_ui::tool_info_at(i);
+    if (info == nullptr) continue;
+    const comp_ui::Rect rect = comp_ui::tool_button_rect(bar, i);
+    RECT button{rect.x, rect.y, rect.right(), rect.bottom()};
+    const bool selected = info->id == shell.tool;
+    HBRUSH fill = CreateSolidBrush(selected ? RGB(70, 104, 168) : RGB(58, 60, 68));
+    FillRect(dc, &button, fill);
+    DeleteObject(fill);
+    SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(198, 200, 208));
+    const wchar_t letter[2] = {
+        info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ', 0};
+    DrawTextW(dc, letter, 1, &button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  }
+
+  /* 右侧读数：缩放与笔刷（按钮里只放键位，工具名交给状态栏）。 */
+  wchar_t info_text[128];
+  wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%",
+            static_cast<int>(shell.view.zoom * 100.0 + 0.5),
+            static_cast<int>(shell.brush_size + 0.5),
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5));
+  RECT info_rect{bar.right() - 300, bar.y, bar.right() - 10, bar.bottom()};
+  SetTextColor(dc, RGB(172, 176, 188));
+  DrawTextW(dc, info_text, -1, &info_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+}
+
+/* 状态栏：工具 / 缩放 / 历史，加上壳层最近一条反馈。 */
+void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
+  RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(26, 28, 32));
+  FillRect(dc, &background_rect, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  const comp_ui::ToolInfo* info = comp_ui::tool_info(shell.tool);
+  wchar_t line[768];
+  wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%% · %s",
+            info != nullptr ? widen_ascii(info->name).c_str() : L"?",
+            info != nullptr && info->shortcut != 0
+                ? static_cast<wchar_t>(info->shortcut - 'a' + 'A')
+                : L' ',
+            static_cast<int>(shell.view.zoom * 100.0 + 0.5),
+            static_cast<int>(shell.brush_size + 0.5),
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5), shell.status.c_str());
+  RECT text_rect{bar.x + 12, bar.y, bar.right() - 10, bar.bottom()};
+  SetTextColor(dc, RGB(220, 222, 228));
+  DrawTextW(dc, line, -1, &text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 /* 图层面板：GDI 文本绘制（外壳不读像素，只呈现引擎的属性查询结果）。 */
-void draw_layer_panel(HDC dc, const ShellState& shell, int height) {
-  RECT panel{0, 0, kPanelWidth, height};
+void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  RECT panel{panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(24, 26, 30));
   FillRect(dc, &panel, background);
   DeleteObject(background);
@@ -956,15 +1052,15 @@ void draw_layer_panel(HDC dc, const ShellState& shell, int height) {
   SetTextColor(dc, RGB(240, 240, 244));
   wchar_t title[64];
   wsprintfW(title, L"图层（%u）", static_cast<unsigned>(shell.layers.size()));
-  TextOutW(dc, 10, 10, title, static_cast<int>(wsprintfW(title, L"图层（%u）",
-                                                        static_cast<unsigned>(shell.layers.size()))));
+  TextOutW(dc, panel_rect.x + 10, panel_rect.y + 8, title, lstrlenW(title));
 
   const int32_t count = static_cast<int32_t>(shell.layers.size());
   for (int32_t line = 0; line < count; ++line) {
+    const comp_ui::Rect row_rect = comp_ui::layer_row_rect(panel_rect, line);
     const LayerRow& row = shell.layers[static_cast<size_t>(count - 1 - line)];
-    const int top = 40 + line * kPanelRowHeight;
     if (line == shell.selected_layer) {
-      RECT highlight{0, top - 2, kPanelWidth, top + kPanelRowHeight - 2};
+      RECT highlight{row_rect.x + 2, row_rect.y + 1, row_rect.right() - 2,
+                     row_rect.bottom() - 1};
       HBRUSH selected = CreateSolidBrush(RGB(56, 76, 120));
       FillRect(dc, &highlight, selected);
       DeleteObject(selected);
@@ -976,26 +1072,28 @@ void draw_layer_panel(HDC dc, const ShellState& shell, int height) {
     wsprintfW(line_text, L"%s #%I64u  混合#%d  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
               static_cast<unsigned long long>(row.id), row.blend,
               static_cast<int>(row.opacity * 100.0f + 0.5f));
-    TextOutW(dc, 10, top, line_text, lstrlenW(line_text));
+    TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
-  const wchar_t* hint = L"↑↓ 选择 · V 显隐 · [ ] 不透明度";
-  TextOutW(dc, 10, height - 46, hint, lstrlenW(hint));
+  const wchar_t* hint = L"点击选中 · Ctrl+Shift+V 显隐 · Ctrl+[ ] 不透明度";
+  TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 46, hint, lstrlenW(hint));
   const wchar_t* hint2 = L"Ctrl+Shift+N 新建图层";
-  TextOutW(dc, 10, height - 26, hint2, lstrlenW(hint2));
+  TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
 /* 调整面板：控件完全由 ABI 元数据生成（外壳不复制键名表、不解析 JSON）。 */
-void draw_adjust_panel(HDC dc, const ShellState& shell, int left, int height) {
-  RECT panel{left, 0, left + kAdjustPanelWidth, height};
+void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int height = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
   FillRect(dc, &panel, background);
   DeleteObject(background);
   SetBkMode(dc, TRANSPARENT);
 
   wchar_t line[256];
-  int y = 10;
+  int y = panel_rect.y + 8;
   SetTextColor(dc, RGB(240, 240, 244));
   const wchar_t* title = L"调整（Adjustment）";
   TextOutW(dc, left + 10, y, title, lstrlenW(title));
@@ -1023,7 +1121,7 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, int left, int height) {
       }
       const bool focused = static_cast<int32_t>(i) == shell.adj_param;
       if (focused) {
-        RECT highlight{left + 4, y - 2, left + kAdjustPanelWidth - 6, y + kAdjustRowHeight - 4};
+        RECT highlight{left + 4, y - 2, panel_rect.right() - 6, y + kAdjustRowHeight - 4};
         HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
         FillRect(dc, &highlight, brush);
         DeleteObject(brush);
@@ -1088,13 +1186,15 @@ void present(HWND window, ShellState& shell) {
   GetClientRect(window, &client);
   const int client_width = client.right - client.left;
   const int client_height = client.bottom - client.top;
-  /* 画布区 = 客户区去掉左侧图层面板与右侧调整面板。 */
-  const int canvas_left = client_width > kPanelWidth ? kPanelWidth : 0;
-  const int right_panel =
-      client_width > kPanelWidth + kAdjustPanelWidth ? kAdjustPanelWidth : 0;
-  const int canvas_width =
-      client_width > kPanelWidth + right_panel ? client_width - kPanelWidth - right_panel : client_width;
-  const int canvas_height = client_height;
+  const Layout layout = comp_ui::compute_layout(client_width, client_height);
+
+  /* 新文档 / 打开文档后按窗口适配一次；之后缩放与平移完全由用户操作决定。 */
+  if (shell.needs_fit) {
+    if (shell.document != nullptr && !layout.canvas.empty()) {
+      shell.view.fit(shell.width, shell.height, layout.canvas);
+    }
+    shell.needs_fit = false;
+  }
 
   HDC memory_dc = CreateCompatibleDC(dc);
   HBITMAP bitmap = CreateCompatibleBitmap(dc, client_width, client_height);
@@ -1105,46 +1205,153 @@ void present(HWND window, ShellState& shell) {
   FillRect(memory_dc, &fill, background);
   DeleteObject(background);
 
-  if (!shell.framebuffer.empty() && shell.width > 0 && shell.height > 0 && canvas_width > 0) {
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = shell.width;
-    info.bmiHeader.biHeight = -shell.height; /* 负值 = 自顶向下，与引擎缓冲一致 */
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
+  /*
+   * 画布上屏：视图变换给出文档 (0,0)/(w,h) 的屏幕位置，与画布矩形求交后
+   * 只把可见部分交给 GDI。不能直接传整幅目标矩形——32x 放大时它会达到
+   * 数万像素，既慢又可能触发 GDI 坐标上限。
+   */
+  if (!shell.framebuffer.empty() && shell.width > 0 && shell.height > 0 &&
+      !layout.canvas.empty()) {
+    const comp_ui::Point top_left = shell.view.doc_to_screen(
+        0.0, 0.0, layout.canvas, shell.width, shell.height);
+    const comp_ui::Point bottom_right = shell.view.doc_to_screen(
+        shell.width, shell.height, layout.canvas, shell.width, shell.height);
+    const double clip_left = std::max<double>(top_left.x, layout.canvas.x);
+    const double clip_top = std::max<double>(top_left.y, layout.canvas.y);
+    const double clip_right = std::min<double>(bottom_right.x, layout.canvas.right());
+    const double clip_bottom = std::min<double>(bottom_right.y, layout.canvas.bottom());
 
-    const double scale_x = static_cast<double>(canvas_width) / shell.width;
-    const double scale_y = static_cast<double>(canvas_height) / shell.height;
-    const double scale = scale_x < scale_y ? scale_x : scale_y;
-    const int draw_width = static_cast<int>(shell.width * scale);
-    const int draw_height = static_cast<int>(shell.height * scale);
-    const int offset_x = canvas_left + (canvas_width - draw_width) / 2;
-    const int offset_y = (canvas_height - draw_height) / 2;
+    if (clip_right > clip_left && clip_bottom > clip_top) {
+      const int dst_x = static_cast<int>(std::floor(clip_left));
+      const int dst_y = static_cast<int>(std::floor(clip_top));
+      const int dst_w = std::max(1, static_cast<int>(std::ceil(clip_right)) - dst_x);
+      const int dst_h = std::max(1, static_cast<int>(std::ceil(clip_bottom)) - dst_y);
 
-    SetStretchBltMode(memory_dc, HALFTONE);
-    StretchDIBits(memory_dc, offset_x, offset_y, draw_width, draw_height, 0, 0, shell.width,
-                  shell.height, shell.framebuffer.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+      int src_x = static_cast<int>(std::floor((clip_left - top_left.x) / shell.view.zoom));
+      int src_y = static_cast<int>(std::floor((clip_top - top_left.y) / shell.view.zoom));
+      int src_w = static_cast<int>(std::ceil(static_cast<double>(dst_w) / shell.view.zoom)) + 1;
+      int src_h = static_cast<int>(std::ceil(static_cast<double>(dst_h) / shell.view.zoom)) + 1;
+      if (src_x < 0) src_x = 0;
+      if (src_y < 0) src_y = 0;
+      if (src_x > shell.width) src_x = shell.width;
+      if (src_y > shell.height) src_y = shell.height;
+      if (src_x + src_w > shell.width) src_w = shell.width - src_x;
+      if (src_y + src_h > shell.height) src_h = shell.height - src_y;
+
+      if (src_w > 0 && src_h > 0) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = shell.width;
+        info.bmiHeader.biHeight = -shell.height; /* 负值 = 自顶向下，与引擎缓冲一致 */
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        const int saved = SaveDC(memory_dc);
+        IntersectClipRect(memory_dc, layout.canvas.x, layout.canvas.y, layout.canvas.right(),
+                          layout.canvas.bottom());
+        SetStretchBltMode(memory_dc, HALFTONE);
+        SetBrushOrgEx(memory_dc, 0, 0, nullptr);
+        StretchDIBits(memory_dc, dst_x, dst_y, dst_w, dst_h, src_x, src_y, src_w, src_h,
+                      shell.framebuffer.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+        RestoreDC(memory_dc, saved);
+      }
+    }
   }
 
-  draw_layer_panel(memory_dc, shell, client_height);
-  if (right_panel > 0) {
-    draw_adjust_panel(memory_dc, shell, client_width - kAdjustPanelWidth, client_height);
-  }
-
-  /* 状态栏：撤销深度等壳层反馈（引擎不提供 UI，由外壳呈现）。 */
-  if (!shell.status.empty()) {
-    SetBkMode(memory_dc, TRANSPARENT);
-    SetTextColor(memory_dc, RGB(226, 226, 230));
-    TextOutW(memory_dc, canvas_left + 12, 10, shell.status.c_str(),
-             static_cast<int>(shell.status.size()));
-  }
+  draw_toolbar(memory_dc, shell, layout.toolbar);
+  if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
+  if (layout.adjust_panel.w > 0) draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
+  draw_status_bar(memory_dc, shell, layout.status);
 
   BitBlt(dc, 0, 0, client_width, client_height, memory_dc, 0, 0, SRCCOPY);
   SelectObject(memory_dc, old_bitmap);
   DeleteObject(bitmap);
   DeleteDC(memory_dc);
   EndPaint(window, &paint);
+}
+
+/* ------------------------------------------------------------ 工具 / 视图 / 鼠标 */
+
+void set_tool(ShellState& shell, comp_ui::ToolId id) {
+  shell.tool = id;
+  const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
+  if (info == nullptr) return;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
+            info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
+  set_status(shell, buffer);
+}
+
+void brush_step(ShellState& shell, int direction, bool hardness) {
+  wchar_t buffer[96];
+  if (hardness) {
+    shell.brush_hardness = comp_ui::step_brush_hardness(shell.brush_hardness, direction);
+    wsprintfW(buffer, L"笔刷硬度 %d%%",
+              static_cast<int>(shell.brush_hardness * 100.0 + 0.5));
+  } else {
+    shell.brush_size = comp_ui::step_brush_size(shell.brush_size, direction);
+    wsprintfW(buffer, L"笔刷直径 %d px", static_cast<int>(shell.brush_size + 0.5));
+  }
+  set_status(shell, buffer);
+}
+
+bool client_layout(const ShellState& shell, Layout* out) {
+  RECT client{};
+  if (shell.window == nullptr || !GetClientRect(shell.window, &client)) return false;
+  *out = comp_ui::compute_layout(client.right - client.left, client.bottom - client.top);
+  return true;
+}
+
+void view_fit(ShellState& shell) {
+  Layout layout{};
+  if (!client_layout(shell, &layout)) return;
+  shell.view.fit(shell.width, shell.height, layout.canvas);
+  shell.needs_fit = false;
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"适合窗口：%d%%", static_cast<int>(shell.view.zoom * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void view_actual(ShellState& shell) {
+  shell.view.actual_pixels();
+  shell.needs_fit = false;
+  set_status(shell, L"实际像素：100%");
+}
+
+void view_zoom_step(ShellState& shell, double factor) {
+  Layout layout{};
+  if (!client_layout(shell, &layout) || layout.canvas.empty()) return;
+  const comp_ui::Point center = comp_ui::CanvasView::canvas_center(layout.canvas);
+  shell.view.zoom_by(factor, center.x, center.y, layout.canvas);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"缩放 %d%%", static_cast<int>(shell.view.zoom * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void begin_pan(HWND window, ShellState& shell, int x, int y) {
+  shell.panning = true;
+  shell.pan_anchor.x = x;
+  shell.pan_anchor.y = y;
+  SetCapture(window);
+  SetCursor(LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_SIZEALL)));
+}
+
+void end_pan(HWND window, ShellState& shell) {
+  if (!shell.panning) return;
+  shell.panning = false;
+  ReleaseCapture();
+  SetCursor(LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW)));
+}
+
+void canvas_click(ShellState& shell, int x, int y, const Layout& layout) {
+  if (shell.document == nullptr) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"画布 (%d, %d)", static_cast<int>(std::floor(doc.x)),
+            static_cast<int>(std::floor(doc.y)));
+  set_status(shell, buffer);
 }
 
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
@@ -1240,6 +1447,31 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       case 'S':
         run_shell_command(window, shell, kCmdSave);
         return;
+      case 'V':
+        /* V 已是 Move 工具的键位，图层显隐改走 Ctrl+Shift+V。 */
+        if (shift) {
+          run_shell_command(window, shell, kCmdLayerToggleVisible);
+          return;
+        }
+        break;
+      case '0':
+        run_shell_command(window, shell, kCmdViewFit);
+        return;
+      case '1':
+        run_shell_command(window, shell, kCmdViewActual);
+        return;
+      case VK_OEM_PLUS:
+        run_shell_command(window, shell, kCmdViewZoomIn);
+        return;
+      case VK_OEM_MINUS:
+        run_shell_command(window, shell, kCmdViewZoomOut);
+        return;
+      case VK_OEM_4: /* Ctrl+[ = 图层不透明度 -10% */
+        run_shell_command(window, shell, kCmdLayerOpacityDown);
+        return;
+      case VK_OEM_6: /* Ctrl+] = 图层不透明度 +10% */
+        run_shell_command(window, shell, kCmdLayerOpacityUp);
+        return;
       default:
         break;
     }
@@ -1251,23 +1483,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_DOWN:
       run_shell_command(window, shell, kCmdLayerSelectDown);
       break;
-    case 'V':
-      run_shell_command(window, shell, kCmdLayerToggleVisible);
+    case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低 */
+      brush_step(shell, -1, shift);
       break;
-    case VK_OEM_4: /* '[' */
-      run_shell_command(window, shell, kCmdLayerOpacityDown);
-      break;
-    case VK_OEM_6: /* ']' */
-      run_shell_command(window, shell, kCmdLayerOpacityUp);
-      break;
-    case 'N':
-      run_shell_command(window, shell, kCmdNew);
-      break;
-    case 'O':
-      run_shell_command(window, shell, kCmdOpen);
-      break;
-    case 'S':
-      run_shell_command(window, shell, kCmdSave);
+    case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高 */
+      brush_step(shell, 1, shift);
       break;
     case VK_TAB:
       panel_move_param(shell, shift ? -1 : 1);
@@ -1288,9 +1508,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       panel_step_value(shell, 1);
       break;
     default:
-      /* 数字键在调整面板里开始键入数值。 */
+      /* 数字键在调整面板里开始键入数值；其余字母按上游工具键位映射。 */
       if (key >= '0' && key <= '9') {
         panel_begin_input(shell, static_cast<wchar_t>(key));
+        break;
+      }
+      if (key < 128) {
+        const comp_ui::ToolId id = comp_ui::tool_for_shortcut(static_cast<char>(key));
+        if (id != comp_ui::ToolId::Count) set_tool(shell, id);
       }
       break;
   }
@@ -1298,6 +1523,8 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   ShellState* shell = g_shell;
+  const int mouse_x = static_cast<int>(static_cast<short>(LOWORD(lparam)));
+  const int mouse_y = static_cast<int>(static_cast<short>(HIWORD(lparam)));
   switch (message) {
     case WM_CREATE:
       return 0;
@@ -1306,14 +1533,131 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_KEYDOWN:
       if (shell != nullptr) {
+        if (wparam == VK_SPACE) {
+          /* 空格 = 临时抓手：按下不重复触发，松开才结束。 */
+          if (!shell->space_down) {
+            shell->space_down = true;
+            set_status(*shell, L"按住空格拖动画布（或中键拖动）");
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          break;
+        }
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         handle_key(window, *shell, wparam, ctrl, shift);
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_KEYUP:
+      if (shell != nullptr && wparam == VK_SPACE) {
+        shell->space_down = false;
+        end_pan(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_LBUTTONDOWN:
+      if (shell != nullptr) {
+        Layout layout{};
+        if (client_layout(*shell, &layout)) {
+          const int button =
+              comp_ui::tool_button_at(layout.toolbar, comp_ui::tool_count(), mouse_x, mouse_y);
+          if (button >= 0) {
+            const comp_ui::ToolInfo* info = comp_ui::tool_info_at(button);
+            if (info != nullptr) set_tool(*shell, info->id);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          const int row = comp_ui::layer_row_at(
+              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y);
+          if (row >= 0) {
+            shell->selected_layer = row;
+            refresh_adjustments(*shell);
+            const LayerRow* selected = selected_row(*shell);
+            if (selected != nullptr) {
+              wchar_t buffer[128];
+              wsprintfW(buffer, L"已选中图层 #%I64u（第 %d 行）",
+                        static_cast<unsigned long long>(selected->id), row + 1);
+              set_status(*shell, buffer);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          if (layout.canvas.contains(mouse_x, mouse_y)) {
+            if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
+              begin_pan(window, *shell, mouse_x, mouse_y);
+            } else {
+              canvas_click(*shell, mouse_x, mouse_y, layout);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        }
+      }
+      break;
+    case WM_MBUTTONDOWN:
+      if (shell != nullptr) {
+        Layout layout{};
+        if (client_layout(*shell, &layout) && layout.canvas.contains(mouse_x, mouse_y)) {
+          begin_pan(window, *shell, mouse_x, mouse_y);
+          return 0;
+        }
+      }
+      break;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+      if (shell != nullptr) end_pan(window, *shell);
+      break;
+    case WM_KILLFOCUS:
+      /* 失焦后收不到 KEYUP / MOUSEUP：必须主动清状态，否则会「粘住」。 */
+      if (shell != nullptr) {
+        shell->space_down = false;
+        end_pan(window, *shell);
+      }
+      break;
+    case WM_CAPTURECHANGED:
+      if (shell != nullptr) end_pan(window, *shell);
+      break;
+    case WM_MOUSEMOVE:
+      if (shell != nullptr && shell->panning) {
+        shell->view.pan_by(static_cast<double>(mouse_x - shell->pan_anchor.x),
+                           static_cast<double>(mouse_y - shell->pan_anchor.y));
+        shell->pan_anchor.x = mouse_x;
+        shell->pan_anchor.y = mouse_y;
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
+    case WM_MOUSEWHEEL:
+      if (shell != nullptr) {
+        /* WM_MOUSEWHEEL 的坐标是屏幕坐标，先换算到客户区。 */
+        POINT cursor{mouse_x, mouse_y};
+        ScreenToClient(window, &cursor);
+        Layout layout{};
+        if (client_layout(*shell, &layout) && layout.canvas.contains(cursor.x, cursor.y)) {
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const double factor = delta > 0 ? 1.2 : 1.0 / 1.2;
+            shell->view.zoom_by(factor, cursor.x, cursor.y, layout.canvas);
+            wchar_t buffer[96];
+            wsprintfW(buffer, L"缩放 %d%%",
+                      static_cast<int>(shell->view.zoom * 100.0 + 0.5));
+            set_status(*shell, buffer);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+        }
+        return 0;
       }
       break;
     case WM_COMMAND:
       /* lparam != 0 表示控件通知，本骨架无子控件，直接忽略。 */
       if (shell != nullptr && lparam == 0) {
+        if (LOWORD(wparam) >= kCmdToolBase &&
+            LOWORD(wparam) < kCmdToolBase + comp_ui::tool_count()) {
+          const comp_ui::ToolInfo* info =
+              comp_ui::tool_info_at(static_cast<int>(LOWORD(wparam) - kCmdToolBase));
+          if (info != nullptr) set_tool(*shell, info->id);
+          InvalidateRect(window, nullptr, FALSE);
+          return 0;
+        }
         run_shell_command(window, *shell, LOWORD(wparam));
         return 0;
       }
@@ -1333,7 +1677,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
-/* 菜单结构：文件 / 编辑 / 图层；快捷键提示文本与 handle_key 的映射保持一致。 */
+/* 菜单结构：文件 / 编辑 / 图层 / 视图 / 工具 / 调整；快捷键提示文本与 handle_key
+ * 的映射保持一致，工具菜单直接取自 ui_core.h 的 tool_table。 */
 HMENU build_menu() {
   HMENU menu = CreateMenu();
 
@@ -1359,11 +1704,31 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectUp, L"选择上一图层(&U)\t↑");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectDown, L"选择下一图层(&D)\t↓");
-  AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleVisible, L"切换可见性(&V)\tV");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleVisible, L"切换可见性(&V)\tCtrl+Shift+V");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityDown, L"降低不透明度(&-)\t[");
-  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\t]");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityDown, L"降低不透明度(&-)\tCtrl+[");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\tCtrl+]");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
+
+  HMENU view_menu = CreatePopupMenu();
+  AppendMenuW(view_menu, MF_STRING, kCmdViewFit, L"适合窗口(&F)\tCtrl+0");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewActual, L"实际像素(&1)\tCtrl+1");
+  AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(view_menu, MF_STRING, kCmdViewZoomIn, L"放大(&I)\tCtrl+=");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewZoomOut, L"缩小(&O)\tCtrl+-");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view_menu), L"视图(&V)");
+
+  /* 工具菜单与工具条、快捷键共用同一张表（tool_table），不另抄一份键位。 */
+  HMENU tool_menu = CreatePopupMenu();
+  for (int i = 0; i < comp_ui::tool_count(); ++i) {
+    const comp_ui::ToolInfo* info = comp_ui::tool_info_at(i);
+    if (info == nullptr) continue;
+    wchar_t label[128];
+    wsprintfW(label, L"%s\t%c", widen_ascii(info->name).c_str(),
+              info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
+    AppendMenuW(tool_menu, MF_STRING, kCmdToolBase + static_cast<UINT>(i), label);
+  }
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tool_menu), L"工具(&T)");
 
   HMENU adjust_menu = CreatePopupMenu();
   AppendMenuW(adjust_menu, MF_STRING, kCmdAdjKindPrev, L"上一类型(&P)\tCtrl+Shift+J");
@@ -1668,6 +2033,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   }
 
   g_shell = &shell;
+  shell.window = window; /* 视图命令需要客户区矩形，必须早于首次绘制设置 */
   create_document(shell);
   ShowWindow(window, show);
   UpdateWindow(window);

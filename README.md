@@ -12,7 +12,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
   另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
   vendoring 进 `engine/third_party/`）。
-  全量 **249 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
+  全量 **352 用例 0 失败**；Windows 外壳实机自检 **27 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -342,9 +342,9 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 82（38 个 `.c` + 44 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 344 cases, 0 failed, 0 check failures`（当前基线；§6.1.21 起） |
+| 测试 | `summary: 352 cases, 0 failed, 0 check failures`（当前基线；§6.11 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：44 `.cpp` / 38 `.c`（含 vendored 26）/ 82 `.h`；tests：31 `.cpp` |
+| 源码规模 | engine：44 `.cpp` / 38 `.c`（含 vendored 26）/ 82 `.h`；tests：32 `.cpp` |
 
 blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
 `_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
@@ -1826,6 +1826,78 @@ folded / per-pixel 两条通路、note 两段式拷贝、颗粒 seed 确定性�
 基线 326 → **341 cases, 0 failed**；`run_regression.py` 6/6 PASS、0 skipped。
 完整接口与键表见 [`docs/camera-raw.md`](docs/camera-raw.md)，报告见
 `../report/F4-camera-raw-20261018-claude.md`。
+
+### 6.11 F5 Windows 壳 UI 地基（2026-10-18，Claude）
+
+**背景**：上游 `Compositor` 只有 macOS 应用层（SwiftUI），**没有 Windows 版**
+（`Compositor.xcodeproj` 仅 macOS 目标，无 CMake / Win 目标 / 平台抽象层），因此
+Windows 壳无法「参考」任何现成 UI 代码，只能自建。栈的选择沿用既定结论：
+**零外部依赖的 Win32 + GDI**（不加 Qt/Electron，不为 UI 引依赖），代价是 UI 迭代比
+声明式框架慢。
+
+**交付物**（两层，均不含像素处理）：
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `shells/windows/src/ui_core.h` | 358 | 平台无关 UI 核心：视图变换 / 布局 / 命中 / 工具表。**不 include 任何 Windows 头、不 include `engine/` 头、不分配内存、不抛异常** |
+| `tests/test_ui_core.cpp` | 335 | 8 例回归护栏，随 `scripts/build.py` 一起跑，无窗口也能判定 |
+| `shells/windows/src/main.cpp` | 改造 | 只做「消息 → ui_core 调用 → 绘制」的翻译；绘制与命中共用同一套几何常量 |
+
+`ui_core.h` 是 header-only：`build.py` / `CMakeLists.txt` **一行未改**，
+测试直接 `#include "../shells/windows/src/ui_core.h"`。
+
+#### 视图变换的锚点口径
+
+统一用「文档中心」为缩放锚点，而不是用户滚动位置：
+
+```
+screen = canvas_center + pan + (doc - doc_center) * zoom
+```
+
+好处是 `pan = 0` 时无论缩放级别，文档恒在画布正中（`fit` 与 `actual_pixels`
+都只需清零 pan）。以光标为锚的缩放走另一条公式：
+
+```
+ratio   = new_zoom / zoom          // new_zoom 先夹到 [0.02, 32]
+pan     = pan * ratio + (cursor - center) * (1 - ratio)
+```
+
+**先夹取再计算**，所以「已在 32× 还继续放大」不会偷偷平移画布——这一条与
+「夹取后光标下的文档像素不漂移」都写成了断言（4 组锚点 × 4 档目标缩放）。
+
+#### 键位冲突的处理（对齐上游 `KeyboardShortcuts.swift`）
+
+工具快捷键逐字对齐上游的 17 个默认键，因此挤掉了壳里原来的三处单键：
+
+| 原键 | 现在 | 理由 |
+|------|------|------|
+| `V` 切换图层可见性 | `V` = Move 工具；可见性改 `Ctrl+Shift+V` | 上游 `V` 是 Move/Transform |
+| `[` / `]` 图层不透明度 | `[` / `]` = 笔刷直径、硬度（`Shift`）；不透明度改 `Ctrl+[` / `Ctrl+]` | 上游 `[ ]` 属笔刷 |
+| `N` / `O` / `S` 新建/打开/保存 | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | `S` 被 Clone Stamp 占用 |
+
+工具表、工具条按钮、工具菜单、快捷键**共用同一张 `tool_table`**，不存在「菜单提示与
+实际行为不一致」的第三份键位表；测试同时钉住「默认键不重复」与「未占用键返回
+`ToolId::Count` 而不是静默回落到第一个工具」。
+
+#### 壳侧接线
+
+- **工具条**：17 个按钮（`tool_button_rect`/`tool_button_at`），选中态高亮，右侧显示缩放与笔刷读数；
+- **鼠标**：左键命中顺序 工具条 → 图层面板 → 画布；图层面板行命中与行矩形共用
+  `layer_row_rect`，绘制/命中的边界不会各算各的；
+- **滚轮**：在画布内以光标为锚 ×1.2 / ÷1.2，`1e9` 目标被夹到 32×；
+- **平移**：中键拖动，或按住空格 + 左键拖动（`Hand` 工具同理）；`WM_KEYUP`/失焦都会结束平移，不会「粘住」；
+- **视图命令**：`Ctrl+0` 适合窗口、`Ctrl+1` 实际像素、`Ctrl+=` / `Ctrl+-` 缩放；
+- **窗口变窄**：右侧调整面板先收起，再收起左侧图层面板，画布保底 180 px；11 种宽度 × 8 种高度下断言「任意矩形不重叠」且「三块横向正好铺满客户区」；
+- **画布上屏**：先按 `layout.canvas` 求交，再由裁剪后的目标矩形反推源子矩形，最后 `StretchDIBits`——32× 下不会产生数十万像素的目标矩形。
+
+**明确没做的**（不是漏掉，是当前 ABI 不够）：Move 工具的**拖拽平移图层**需要图层
+transform 写入侧与像素回读的配合，现有 `comp_layer_*` 只暴露尺寸/不透明度/可见性等，
+无法在不猜语义的前提下实现；工具条按钮也仍是纯文字（无图标字体/位图资源，避免引入
+资源文件）。二者记在 `docs/shell-parity.md` 的缺口表里。
+
+基线 344 → **352 cases, 0 failed**（8 例新增）；Windows 壳实机自检仍
+**27 项全 OK**，SHA256 与仓内基线**逐字节相同**（本轮只改 UI 层，未触碰 `run_selftest()`）；
+`run_regression.py --require-ohos` **6/6 PASS，0 skipped**。
 
 ## 7. 许可
 
