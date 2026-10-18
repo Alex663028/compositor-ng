@@ -140,6 +140,28 @@ inline bool is_hdr_format(comp_pixel_format fmt) {
   return fmt == COMP_PIXEL_RGBA16F;
 }
 
+/* ---------------------------------------------------------------------------
+ * C 方案 C3：宽位深文件（浮点解码）的入库判决——上游 `DeepLayer.wideAsset`
+ * （DeepLayers.swift:164-178）那一步。
+ *
+ * 输入是文件解出来的**线性光**直通 alpha 浮点 RGBA（4 个 float 一像素、行紧排），
+ * 也就是 EXR / Radiance HDR 的原生取值。判决与上游同口径：
+ *   1. 先按 HDR 图层的布局收一遍（`deep_hdr_take_linear`：sRGB 曲线过白点延伸、
+ *      乘 alpha、写 half）；
+ *   2. 对结果取 `deep_half_peak`（反预乘后的最亮分量）；
+ *   3. `peak > 1.001` -> **HDR 图层**（COMP_PIXEL_RGBA16F），高光留住；
+ *      否则 -> **16 位图层**（COMP_PIXEL_RGBA16，`deep_half_to_u16` 取值）。
+ *
+ * 为什么要有 1.001 这道闸（上游原话，DeepLayers.swift:173「A thousandth over:
+ * a file brushing white through rounding isn't HDR.」）：只在取整处蹭到白点的文件
+ * 不是 HDR 素材，按 HDR 图层收会让它丢掉「整数 16 位」这份更细的存储，
+ * 而它本来没有高光可保。
+ *
+ * 空/非正尺寸/空指针返回 false 且不写 out。注意 out 会被**整体重置**，
+ * 包括它原有的共享像素（走 writable_pixels 的 COW 语义）。
+ */
+bool wide_asset_from_linear(const float* rgba, int32_t width, int32_t height, ImageBuffer* out);
+
 /* 8 位灰度蒙版：1 字节/像素，0 = 全透明，255 = 完全不透明。
  * 资产模型同 ImageBuffer（共享 + COW）。 */
 struct MaskBuffer {

@@ -137,6 +137,47 @@ bool rgba8_to_hdr(const ImageBuffer& src, ImageBuffer* dst) {
   return true;
 }
 
+/*
+ * `DeepLayer.wideAsset`（DeepLayers.swift:174）那道闸的值：白点以上千分之一。
+ * 上游原话：「A thousandth over: a file brushing white through rounding isn't HDR.」
+ */
+constexpr float kWideAssetPeak = 1.001f;
+
+bool wide_asset_from_linear(const float* rgba, int32_t width, int32_t height, ImageBuffer* out) {
+  if (out == nullptr || rgba == nullptr) return false;
+  if (width <= 0 || height <= 0) return false;
+  const size_t w = static_cast<size_t>(width);
+  const size_t h = static_cast<size_t>(height);
+
+  /* 第一趟：按 HDR 图层的布局收一遍（sRGB 曲线过白点延伸、乘 alpha、写 half）。
+   * 两个中间缓冲都先落在本地：调用方的浮点源缓冲可能正来自 out 之外的文件缓冲，
+   * 而且 out 会被 resize 重置，先算完再重置才不会边读边写。 */
+  std::vector<uint16_t> half(w * h * 4u, 0u);
+  deep_hdr_take_linear(rgba, w * 16u, half.data(), w * 8u, width, height);
+
+  /* 判决在这份 half 上做，与上游一致：`deep_half_peak` 取的是反预乘后的最亮分量
+   * （white = 1），对同一份像素做判决与做存储，不会出现「判成 HDR 但峰值为 1」。 */
+  const float peak = deep_half_peak(half.data(), w * 8u, width, height);
+  if (peak > kWideAssetPeak) {
+    out->resize(width, height, COMP_PIXEL_RGBA16F);
+    for (int32_t y = 0; y < height; ++y) {
+      std::memcpy(out->writable_row(y), half.data() + static_cast<size_t>(y) * w * 4u, w * 4u * sizeof(uint16_t));
+    }
+    return true;
+  }
+
+  /* 不到 1.001：不是 HDR 素材，按 16 位整数层收——上游 else 支的
+   * `asset(image(pixels))`（同一份 half 按 0..65535 取值，white 处即 65535），
+   * 保留它比 half 更细的整数存储，而它本来没有高光可保（见层头注释）。 */
+  std::vector<uint16_t> wide(w * h * 4u, 0u);
+  deep_half_to_u16(half.data(), w * 8u, wide.data(), w * 8u, width, height);
+  out->resize(width, height, COMP_PIXEL_RGBA16);
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(out->writable_row(y), wide.data() + static_cast<size_t>(y) * w * 4u, w * 4u * sizeof(uint16_t));
+  }
+  return true;
+}
+
 void MaskBuffer::resize(int32_t w, int32_t h, uint8_t fill_value) {
   width = std::max(0, w);
   height = std::max(0, h);

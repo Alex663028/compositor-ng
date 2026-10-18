@@ -321,6 +321,26 @@ void deep_hdr_exposure(uint16_t *hdr, size_t stride, size_t width, size_t height
     });
 }
 
+void deep_hdr_take_linear(const float *linear, size_t linearStride, uint16_t *out, size_t outStride,
+                          size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const float *in = (const float *)((const uint8_t *)linear + y * linearStride);
+            uint16_t *o = (uint16_t *)((uint8_t *)out + y * outStride);
+            for (size_t x = 0; x < width; ++x, in += 4, o += 4) {
+                // Alpha is coverage, not light: it stays within white whatever the file says. fminf/fmaxf return the
+                // non-NaN operand, so a NaN alpha lands on 0 rather than travelling on.
+                float alpha = fminf(1, fmaxf(0, in[3]));
+                for (int c = 0; c < 3; ++c) {
+                    // A NaN sample lands on 0: the C0/C1 convention, so a bad pixel can't become a bright speck.
+                    o[c] = deep_to_half(in[c] == in[c] ? deep_encoded(in[c]) * alpha : 0.0f);
+                }
+                o[3] = deep_to_half(alpha);
+            }
+        }
+    });
+}
+
 void deep_take_painted_hdr(uint16_t *hdr, size_t hdrStride, const uint8_t *painted, const uint8_t *base, size_t stride,
                            size_t width, size_t height) {
     deep_rows(height, ^(size_t first, size_t last) {

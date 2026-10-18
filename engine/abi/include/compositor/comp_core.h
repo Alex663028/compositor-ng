@@ -82,7 +82,11 @@ typedef enum comp_pixel_format {
    * 16-bit, rows packed」）。合成与 8 位工具通过它的 8 位副本工作（见
    * comp_layer_set_pixels 的格式契约）。 */
   COMP_PIXEL_RGBA16   = 1,
-  COMP_PIXEL_RGBA16F  = 2  /* 半精度浮点，8 字节/像素；本构建无半精度像素路径，入口拒绝 */
+  /* 半精度浮点（HDR 图层，C1 起为真通路）：同样预乘、8 字节/像素、native-endian，
+   * 但每通道是 IEEE 754 half 且处于 **extended sRGB** 编码（白 = 1.0，高光可 > 1.0）。
+   * `comp_layer_set_pixels` 接受它，引擎为它维护一份 8 位工作副本；
+   * 「合成表面按文档深度携带 half」是 C5，在那之前合成走那份 8 位副本。 */
+  COMP_PIXEL_RGBA16F  = 2
 } comp_pixel_format;
 
 /* 内存布局：行优先、自上而下、stride 以字节计。 */

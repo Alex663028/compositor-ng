@@ -102,6 +102,24 @@ void deep_half_to_u16(const uint16_t *half, size_t halfStride, uint16_t *out, si
  * 白点仍为 1.0——这是**存储/合成**用的，不是 normalize（后者会把高光除下来）。 */
 void deep_u16_to_half(const uint16_t *wide, size_t wideStride, uint16_t *out, size_t outStride, size_t width, size_t height);
 
+/* C 方案 C3 新增：文件里的浮点像素进 HDR 图层的入库通道。
+ *
+ * `deep_hdr_take_linear` 把**线性光**的直通 alpha 浮点 RGBA（EXR / Radiance 这类
+ * 文件的原生取值）写进 HDR 图层的像素布局：每个颜色分量过 sRGB 曲线（`deep_encoded`，
+ * 白点以上照常延伸），再乘自己的 alpha；alpha 夹进 0..1（它是覆盖率，不是亮度）。
+ * 这一步对应上游 ImageImporter 里 `wideContext`（workingColorSpace =
+ * extendedLinearSRGB，workingFormat = RGBAh）渲染进 `DeepLayer.hdrSpace`
+ * （extendedSRGB，DeepLayers.swift:85）时 Core Image 做的那次色彩空间转换。
+ *
+ * 输入：`linear` 直通 alpha、线性光、4 个 float 一像素、行步长以**字节**计；
+ *       `out` 预乘 half、extended sRGB、4 个 uint16 一像素、行步长以字节计。
+ * NaN 落 0 而不是留在结果里（坏采样不该变成亮点）；±Inf 照常走曲线，
+ * 由 `deep_half_peak`（跳过 Inf）与显示侧的夹白各自处理。
+ *
+ * 判决「这文件是不是 HDR」不在内核里：调用方对结果跑 `deep_half_peak`，
+ * 与 `DeepLayer.wideAsset`（DeepLayers.swift:174）同口径地比 `peak > 1.001`。 */
+void deep_hdr_take_linear(const float *linear, size_t linearStride, uint16_t *out, size_t outStride, size_t width, size_t height);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

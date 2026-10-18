@@ -16,12 +16,13 @@
 namespace compositor {
 namespace {
 
-constexpr size_t kEntryCount = 7u;
+constexpr size_t kEntryCount = 8u;
 
 struct CodecTable {
   std::string png_note;
   std::string jpeg_note;
   std::string psd_note;
+  std::string hdr_note;
   CodecEntry entries[kEntryCount];
   CodecTable();
 };
@@ -46,6 +47,13 @@ CodecTable::CodecTable() {
                        "); READ-ONLY: import supported, export unsupported"
                  : "no PSD reader available on host";
 
+  hdr_note = has_stb
+                 ? std::string("vendored real library (") + codec_lib_stb_backend() +
+                       "); READ-ONLY: Radiance RGBE (.hdr/.pic) import, decoded as linear-light floats "
+                       "and taken in as an HDR layer when brighter than white, else as a 16-bit layer; "
+                       "export unsupported"
+                 : "no Radiance HDR reader available on host";
+
   entries[0] = CodecEntry{1u, "PNG", has_png ? kCodecVendored : kCodecBuiltIn,
                           has_png ? codec_lib_png_backend() : "built-in", png_note.c_str(), true,
                           true};
@@ -67,6 +75,14 @@ CodecTable::CodecTable() {
   entries[6] = CodecEntry{7u, "PSD", has_stb ? kCodecVendored : kCodecUnavailable,
                           has_stb ? codec_lib_stb_backend() : "custom/libpsd", psd_note.c_str(),
                           has_stb, false};
+  /*
+   * C3 追加：Radiance。可读性取自浮点通道的真实探测（codec_lib_can_decode_float），
+   * 不是「有 stb 就等于能读」——那是把能力推断当事实。
+   */
+  const bool has_hdr = codec_lib_can_decode_float(8u);
+  entries[7] = CodecEntry{8u, "Radiance", has_hdr ? kCodecVendored : kCodecUnavailable,
+                          has_hdr ? codec_lib_stb_backend() : "stb_image (no float channel)",
+                          hdr_note.c_str(), has_hdr, false};
 }
 
 const CodecTable& codec_table() {

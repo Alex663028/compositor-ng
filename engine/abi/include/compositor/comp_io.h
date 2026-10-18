@@ -28,7 +28,16 @@ typedef enum comp_image_format {
   COMP_FORMAT_HEIF    = 4,
   COMP_FORMAT_WEBP    = 5,
   COMP_FORMAT_EXR     = 6,
-  COMP_FORMAT_PSD     = 7
+  COMP_FORMAT_PSD     = 7,
+  /*
+   * C 方案 C3 追加：Radiance（.hdr / .pic，RGBE，线性光）。
+   * 追加在末尾而不是插入中间——0..7 的取值已经写进宿主（Swift / ArkTS / C#）
+   * 与 .comp 的互操作约定，重排即为破坏性变更。
+   * 它与 EXR/TIFF 同属上游的「浮点来源」（ImageImporter.swift:114
+   * `.floatComponents` 那一支）：解出来是线性光浮点，进 HDR 图层还是 16 位图层
+   * 由 `wideAsset` 的 peak > 1.001 判决（见 comp_io_import 的说明）。
+   */
+  COMP_FORMAT_HDR     = 8
 } comp_image_format;
 
 /* 按扩展名推断格式；无法识别返回 COMP_FORMAT_UNKNOWN。 */

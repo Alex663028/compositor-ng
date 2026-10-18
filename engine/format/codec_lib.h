@@ -35,6 +35,29 @@ struct CodecImage {
   bool empty() const { return width <= 0 || height <= 0 || rgba.empty(); }
 };
 
+/* 浮点解码结果（C 方案 C3）：**直通 alpha、线性光**，4 个 float 一像素、行紧排
+ * （stride = width * 4）。与 CodecImage 的差别不是位深而是**口径**：CodecImage 是
+ * 「引擎内部像素」（预乘 RGBA8），这里是**文件的原生取值**——Radiance .hdr 的
+ * RGBE 与 EXR 的 half/float 本来就是线性光、直通 alpha。曲线（sRGB）与预乘是
+ * 「进 HDR 图层」那一步的事，统一由 domain 的 wide_asset_from_linear 加，
+ * 编解码层不许自己动手，否则同一份文件会因入口不同得到两种颜色。 */
+struct CodecFloatImage {
+  int32_t width = 0;
+  int32_t height = 0;
+  std::vector<float> rgba;
+
+  bool empty() const { return width <= 0 || height <= 0 || rgba.empty(); }
+};
+
+/* 该 format 是否有浮点解码通道（C3 起：Radiance .hdr 走 stb_image）。
+ * 与 codec_lib_can_decode 分开：同一个格式可能只有 8 位通道（如 JPEG），
+ * 也可能两条都有（如将来的 EXR：8 位通道走量化、浮点通道走原生 half）。 */
+bool codec_lib_can_decode_float(uint32_t format);
+
+/* 浮点解码入口。失败一律 false + error（不假装成功）。 */
+bool codec_lib_decode_float(const uint8_t* data, size_t size, uint32_t format, CodecFloatImage* out,
+                            std::string* error);
+
 /* 编译期能力探测（third_party 目录存在且头文件可包含时为真）。 */
 bool codec_lib_has_png();
 bool codec_lib_has_stb();

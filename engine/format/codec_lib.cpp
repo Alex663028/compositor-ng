@@ -50,6 +50,7 @@ namespace {
 constexpr uint32_t kFormatPng = 1u;
 constexpr uint32_t kFormatJpeg = 2u;
 constexpr uint32_t kFormatPsd = 7u;
+constexpr uint32_t kFormatHdr = 8u; /* C3：Radiance .hdr / .pic（浮点通道） */
 
 int g_png_compression_level = 6;
 
@@ -377,6 +378,44 @@ bool stb_decode_impl(const uint8_t* data, size_t size, CodecImage* out, std::str
   return true;
 }
 
+/*
+ * C3 浮点通道：Radiance .hdr（RGBE，线性光）。
+ *
+ * 先用 stbi_is_hdr_from_memory 确认**这确实是 Radiance**：stbi_loadf 对非 HDR
+ * 输入会静默走「8 位解码 + 转浮点」那条路（stb_image.h:1472-1474），
+ * 把一个 .png 改名成 .hdr 就会得到一份看起来合法、实则 8 位量化的"浮点"像素
+ * ——那是假装成功。这里必须让它在门口失败。
+ *
+ * 输出是**直通 alpha、线性光**，与文件一致（stb 的 RGBE -> float 不施加任何
+ * 曲线；req_comp=4 让无 alpha 的文件补 1.0）。曲线与预乘由 wide_asset_from_linear
+ * 统一加，编解码层不碰（见 codec_lib.h 的口径说明）。
+ */
+bool stb_decode_float_impl(const uint8_t* data, size_t size, CodecFloatImage* out,
+                           std::string* error) {
+  if (data == nullptr || size == 0u) return fail(error, "image buffer is empty");
+  if (stbi_is_hdr_from_memory(data, static_cast<int>(size)) == 0) {
+    return fail(error, "stb_image: not a Radiance HDR file");
+  }
+  int width = 0;
+  int height = 0;
+  int channels = 0;
+  float* pixels = stbi_loadf_from_memory(data, static_cast<int>(size), &width, &height, &channels, 4);
+  if (pixels == nullptr) {
+    const char* reason = stbi_failure_reason();
+    if (error != nullptr) {
+      *error = std::string("stb_image: ") + (reason != nullptr ? reason : "decode failed");
+    }
+    return false;
+  }
+  CodecFloatImage image;
+  image.width = width;
+  image.height = height;
+  image.rgba.assign(pixels, pixels + static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+  stbi_image_free(pixels);
+  *out = std::move(image);
+  return true;
+}
+
 void stb_write_sink(void* context, void* data, int size) {
   std::vector<uint8_t>* out = static_cast<std::vector<uint8_t>*>(context);
   if (out == nullptr || data == nullptr || size <= 0) return;
@@ -474,6 +513,9 @@ bool codec_lib_can_decode(uint32_t format) {
     case kFormatJpeg:
     case kFormatPsd:
       return codec_lib_has_stb();
+    case kFormatHdr:
+      /* Radiance 只有浮点通道：能读与否就是浮点通道能读与否（单一真源）。 */
+      return codec_lib_can_decode_float(format);
     default:
       return false;
   }
@@ -488,6 +530,16 @@ bool codec_lib_can_encode(uint32_t format) {
     default:
       return false; /* PSD 只读 */
   }
+}
+
+bool codec_lib_can_decode_float(uint32_t format) {
+#ifdef COMPOSITOR_CODEC_STB
+  /* 目前只有 Radiance 走浮点通道。EXR 的浮点通道见 C3b（自研解析 + vendored zlib）。 */
+  return format == kFormatHdr && codec_lib_has_stb();
+#else
+  (void)format;
+  return false; /* stb 缺失：浮点通道如实不可用，不回落成「8 位当浮点」 */
+#endif
 }
 
 bool codec_lib_decode(const uint8_t* data, size_t size, uint32_t format, CodecImage* out,
@@ -515,6 +567,18 @@ bool codec_lib_encode(const uint8_t* premultiplied_rgba, int32_t width, int32_t 
     default:
       return fail(error, "no vendored encoder for this format");
   }
+}
+
+bool codec_lib_decode_float(const uint8_t* data, size_t size, uint32_t format, CodecFloatImage* out,
+                            std::string* error) {
+  if (out == nullptr) return fail(error, "out is null");
+#ifdef COMPOSITOR_CODEC_STB
+  if (format == kFormatHdr) return stb_decode_float_impl(data, size, out, error);
+#endif
+  (void)data;
+  (void)size;
+  (void)format;
+  return fail(error, "no float decoder for this format");
 }
 
 }  // namespace compositor
