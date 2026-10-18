@@ -9,6 +9,7 @@
  *             PNG  -> libpng + zlib（真实 deflate 压缩、全位深/色彩类型归一）
  *             JPEG -> stb_image / stb_image_write（读写）
  *             PSD  -> stb_image（只读）
+ *             EXR  -> 自研 scanline 读取器（engine/format/exr_codec，C3b）
  *
  * 预乘约定与 comp_png 完全一致：引擎内部是预乘 RGBA8，文件内是直通（非预乘）颜色；
  * 因此解码后预乘、编码前反预乘，保证与上游 macOS 版颜色一致。
@@ -49,9 +50,10 @@ struct CodecFloatImage {
   bool empty() const { return width <= 0 || height <= 0 || rgba.empty(); }
 };
 
-/* 该 format 是否有浮点解码通道（C3 起：Radiance .hdr 走 stb_image）。
+/* 该 format 是否有浮点解码通道（C3：Radiance .hdr 走 stb_image；C3b：EXR 走自研读取器）。
  * 与 codec_lib_can_decode 分开：同一个格式可能只有 8 位通道（如 JPEG），
- * 也可能两条都有（如将来的 EXR：8 位通道走量化、浮点通道走原生 half）。 */
+ * 也可能只有浮点通道（EXR / Radiance：8 位通道会把白点以上的光抹平，
+ * 因此 decode_raster_bytes 明确拒绝它们）。 */
 bool codec_lib_can_decode_float(uint32_t format);
 
 /* 浮点解码入口。失败一律 false + error（不假装成功）。 */
@@ -65,6 +67,8 @@ bool codec_lib_has_stb();
 /* 真实后端标识（含实际版本号，由库自身 API 提供，不写死），供登记表 note 使用。 */
 const char* codec_lib_png_backend();
 const char* codec_lib_stb_backend();
+/* EXR 走自研 scanline 读取器（C3b），标识里带树内 zlib 的实际版本。 */
+const char* codec_lib_exr_backend();
 
 /* PNG 导出压缩级别（0..9；越界按缺省 6 处理）。 */
 void codec_lib_set_png_compression(int level);

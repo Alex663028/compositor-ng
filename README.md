@@ -246,9 +246,9 @@ bash scripts/build_ohos_shell.sh      # NAPI 共享库 libcompositor_ohos.so
 | 撤销 | 整篇 `DocumentState` 快照，默认 200 步 | 视内存占用评估差分/命令式撤销 |
 | 合成 | W3C 合成公式 + 蒙版/剪贴近似；**合成路径已升级为 FilterGraph 有向图**：图层树按节点递归求值，组默认**穿透**（组内子层混合模式穿透组边界、组不透明度乘进子层，对齐上游 `LayerGroups.swift`），`isolated` 组先把子树自合成到透明缓冲、再作为单元参与混合；悬空父级 / 成环 / 超深 64 一律显式报错 | 组级裁剪与组级效果、GPU 侧求值 |
 | 变换 | **平移/缩放/旋转/翻转统一走逆映射重采样**（`compositing/resample`）：目标像素反解源坐标后取样，采样模式 `Nearest` / `Smooth`（双线性）/ `High quality`（Catmull-Rom，缺省），对齐上游 `LayerTransform.sampling`；恒等变换在整数对齐下**逐字节精确**；旋转按目标矩形裁剪（不做包围盒扩张） | 与 macOS 参考输出逐像素基准比对；透视/网格变形 |
-| 图像格式 | `.comp` 内图层像素以 **PNG** 落盘，布局 `images/<uuid>.png` / `images/<uuid>.mask.png`；灰度蒙版用 8 位灰度 PNG（符合上游 `LayerMask.isValid`） | 更大色深 / 硬件编解码 |
+| 图像格式 | `.comp` 内图层像素按位深落盘：RGBA8 → `images/<uuid>.png`，RGBA16/RGBA16F → `images/<uuid>.exr`（线性光、直通 alpha；16 位用 FLOAT 通道保低位，HDR 用 HALF 通道逐位精确）；蒙版用 8 位灰度 `images/<uuid>.mask.png`（符合上游 `LayerMask.isValid`） | 更大色深 / 硬件编解码 |
 | 交换格式键名 | 完整对齐上游 `ProjectManifest` / `ProjectLayerRecord`：`format`/`version`(13)/`supported`/`colorSpace`/`resolution`/`documentID`/`width`/`height`/`activeLayerID`/`layers`；图层 id 与 `parentID`/`maskSourceID` 用 UUID，`transform` 为六键形态（`origin`/`size`/`rotation`/`flipX`/`flipY`/`sampling`）。引擎自有键一律 **`engine` 前缀**（`engineLayerID`/`enginePixelFormat`/`engineClippingSourceID`/`engineAdjustments`/`engineEffects`/`engineIsolated`），避免与上游对象型键（`effects`/`text`/`shape`/`adjustment`）同名冲突 | 上游未建模字段（`guides`、live-mask 启用态等）按原样保真 |
-| 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走 stb（只读）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。EXR 与 32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF；EXR 待 C3b，zlib 已在树内）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
+| 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走 stb（只读）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。**EXR 已由树内自研 scanline 读取器接入**（C3b，§6.1.18：NONE/RLE/ZIPS/ZIP 可读，PIZ/PXR24/B44/DWA 与 tiled/deep/multipart 如实拒绝，写侧仍 `UNSUPPORTED`）；32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
 | 调整图层参数 | 面板控件与 JSON **都由引擎元数据驱动**：键名表 `engine/domain/adjustment_table.cpp` 是唯一真源（12 种 kind，点分 `json_path` 逐字沿用上游字段名），外壳经 ABI 取 `label` / `min` / `max` / `default`；settings JSON 由 `comp_layer_adjustment_build_settings` 组装（**壳内不拼、不解析 JSON**）；写入口 `add` / `update` / `update_at` 一律校验，`.comp` 读取路径不校验以保真 | Curves / Levels 需专用曲线编辑器（当前 `editable=false`，仅白名单放行）；删除接口 `comp_layer_remove_adjustment` 已补（面板 `Ctrl+Shift+D`） |
 
 | 后端 | **④ 接口切片已落地**：`rhi.h` 定义 `RenderBackend` + `BackendCaps` + 工厂；`AUTO` 按平台择优，GPU 后端不可用则**显式回落 CPU** 并在 error 写明原因 | 接入真实设备路径（`COMP_HAS_D3D12` / `COMPOSITOR_ENABLE_VULKAN_COMPUTE` 已在代码中预留开关） |
@@ -328,7 +328,8 @@ python scripts/build.py --clean
   隐藏组跳过整棵子树；悬空父级被显式拒绝。
 - `test_format.cpp`：PNG RGBA/灰度往返、外部真实 deflate PNG 解码、损坏输入被拒、UUID 文本/派生、
   manifest 上游键名护栏、`documentID` 跨保存稳定、组隔离（`engineIsolated`，缺键即穿透）的
-  「存盘 → 打开 → 合成语义不变」往返、`.exr` 图层显式拒绝。
+  「存盘 → 打开 → 合成语义不变」往返；EXR 资产与 manifest 声明不一致时显式拒绝（声明 RGBA8 却给
+  `.exr`、声明 16 位却没有资产），合法 EXR 往返见 `test_exr.cpp`。
 - `test_resample.cpp`：恒等变换逐字节精确（默认 High quality 不漂移）、整数倍放大象限映射、
   顺时针 90 度像素级映射、水平翻转、Smooth 与 Nearest 在非整数倍缩放下的差异、采样模式的
   `.comp` manifest 往返、非法采样值被拒。
@@ -337,7 +338,8 @@ python scripts/build.py --clean
   越界/类型错/未知顶层键被拒；ABI 元数据（`param_count` / `param_at` / `validate`）与
   `.comp` 往返后「kind 与 settings 逐字节回读」护栏。
 - `test_codec.cpp`：能力表只陈述事实（PNG = `VENDORED`/`BUILTIN`、JPEG = `VENDORED` 且 note 含
-  `stb_image`、EXR 原因含 `OpenEXR`、未知格式 `NOT_FOUND`、截断读取仍以 `'\0'` 收尾）；
+  `stb_image`、EXR = `BUILTIN` 且 note 写明 scanline 与 export unsupported、未知格式 `NOT_FOUND`、
+  截断读取仍以 `'\0'` 收尾）；另有 `test_exr.cpp` 覆盖自研 EXR 读写器（见 §6.1.18）；
   PNG 导出→导入**往返逐字节精确**；JPEG 往返**有损但一致**；`import_layer` 恰好追加一层；
   文件缺失是 IO 错误而非「不支持」；不可用格式（如 TIFF）显式 `UNSUPPORTED`；
   **P1-2 负向入库**：伪造 IHDR（`40000x40000` 与 `1000000x4`，CRC 重算）在 C ABI（libpng 路径）
@@ -398,7 +400,7 @@ python scripts/build.py --clean
 | 面板控件由引擎驱动 | 外壳经 `comp_layer_adjustment_param_count` / `param_at` 取控件元数据，经 `comp_layer_adjustment_build_settings` 组装 settings JSON（壳内不拼、不解析 JSON）；实机自检回读 `{"exposureSettings":{"exposure":1.5,"offset":0.25,"gamma":2.2}}` |
 | 调整图层回读 | `.comp` 往返后 `comp_layer_adjustment_count == 1`，kind 与 settings 逐字节一致（`tests/test_adjustment.cpp`） |
 | 外壳实机自检 | `build/compositor_shell.exe --selftest=<报告文件路径>` 实机 **rc = 0**，**27 项全 OK**（本轮新增调整面板 7 项 + 删除 3 项） |
-| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（只读）；EXR 原因含 `OpenEXR`；未知格式 = `COMP_ERR_NOT_FOUND` |
+| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（只读）；EXR = `BUILTIN`（树内 scanline 读取器，note 写明只读与支持的压缩）；未知格式 = `COMP_ERR_NOT_FOUND` |
 | 真实导入 / 导出 | `comp_io_export` / `comp_io_import` / `comp_io_import_layer` 已打通：PNG 8x6 全不透明像素往返 **diffs = 0、worst = 0 LSB**；JPEG 往返有损但一致 |
 | 独立解码器交叉 | `scripts/crosscheck_codec.py` 用 PIL 12.3.0 回读引擎产物：`round_trip.png` / `layer_source.png` / `round_trip.jpg` 全部 `[OK]`、`failures = 0` |
 | 回归（M5 当时） | `summary: 83 cases, 0 failed, 0 check failures`；累计到最新为 **106**（见 §6.1.6） |
@@ -950,6 +952,69 @@ Windows 壳 27 项 SHA256 与基线一致。报告：`report/C3-hdr-float-decode
 **未交付的一半**：32 位 float TIFF——本机与本仓都没有 TIFF 解码器（树内 stb 无 TIFF，登记表里
 TIFF 是 `kCodecUnavailable`），它不是「接一根线」能补的，见报告 §6/§10。
 
+### 6.1.18 C 方案 C3b：自研 EXR 读取器 + 16 位资产存盘闭环（2026-10-18，Claude 接手）
+
+C3 留下了两件事：`.comp` 存盘仍只收 RGBA8（HDR / 16 位图层一存盘就明确失败），以及 EXR
+仍无解码器。C3b 把两件一起收掉，**不依赖 C5**——资产级 `<uuid>.exr` 读写的是图层自己的
+像素，不是合成表面。
+
+**读侧（`engine/format/exr_codec.*`）**：手写 scanline 读取器，只依赖树内 zlib。
+
+- 容器：magic/version、flags、属性表、uint64 偏移表、chunk = `int32 y + int32 dataSize + payload`。
+  tiled / deep / multipart 在头部按标志位拒绝；UINT、子采样通道、RANDOM_Y 同样带名字拒绝。
+- 压缩：NONE / RLE / ZIPS（1 行块）/ ZIP（16 行块）；PIZ / PXR24 / B44 / B44A / DWAA / DWAB
+  一律 `"<名字> compression is not supported"`，**不做近似解码**。
+- 两个会静默毁像素的前置步骤：RLE/ZIP 写侧先做**偶奇字节重排**、再做**预测器**
+  （`d = cur - prev + 384`）；读侧顺序必须完全相反：解压 → 逆预测 → 逆重排。
+- `dataSize == rawSize` 是 OpenEXR 的「压缩无收益就存原样」约定：块内就是像素，**不能再解压**。
+- 行语义：chunk 的 y 是块内**最低**行，块向上覆盖 `min(linesPerBlock, max_y - y + 1)`；
+  DECREASING_Y 只改偏移表顺序，块内行仍自下而上。
+- 尺寸闸在**任何面积分配之前**：`is_valid_canvas`（侧长 30000、总像素 1e8）；dataWindow 的
+  闭区间跨度先按 int64 算，防止 `max - min + 1` 回绕成小尺寸。
+- 写侧 `exr_encode_float` 只写 scanline / NONE / HALF|FLOAT，供 `.comp` 资产使用。
+
+**资产化（`engine/format/comp_file.cpp`）**：
+
+- 存盘：RGBA8 → `.png`；RGBA16 → `<uuid>.exr` + **FLOAT** 通道（half 只有 11 位尾数，会把
+  16 位资产降成 11 位）；RGBA16F → HALF 通道（逐位精确）。文件内是线性光、直通 alpha，转换
+  只用同一对曲线（`deep_u16_to_linear` / `deep_hdr_to_linear` 与其反向 `*_take_linear`）。
+- 新增 C 内核 `deep_u16_to_linear` / `deep_u16_take_linear`：16 位整数的反预乘/预乘与
+  sRGB 编解码，**不借道 half**。
+- 读盘：`enginePixelFormat` 在**分配缓冲之前**解析；声明与资产必须一致（RGBA8 + `.exr`、
+  16/16F + `.png` 都拒绝）。这条判定**先于文件 IO**——否则资产恰好缺失时，IO 错误会盖掉
+  真正的错因。无 `enginePixelFormat` 的 `.exr`（上游只给扩展名）按内容峰值判决：`>1.001`
+  走 RGBA16F，否则 RGBA16。
+
+**护栏（`tests/test_exr.cpp`，16 个用例；总数 260 → 276）**：EXR 夹具全部手写（本机没有
+EXR 工具/样本），期望值来自测试内**独立实现**的半精度编码与 OpenEXR 前置变换，绝不复用
+被测实现。覆盖：NONE/HALF/FLOAT 逐位往返、RLE 与 ZIP/ZIPS 的逆重排+逆预测、16 行块与
+1 行块、raw 块、DECREASING_Y 按 chunk y 落行、未知压缩/容器特性逐项拒绝、伪造 dataWindow
+（30000×30000 与 int32 跨度回绕）在分配前拒绝、Y-only 与 `beauty.R/G/B/A` 通道选择、
+写侧 HALF 精确 + FLOAT 保尾数、`.comp` 的 RGBA16 与 RGBA16F 存盘→读回逐值/逐位相等、
+无 `enginePixelFormat` 的 EXR 峰值判决、u16 内核夹紧与往返。
+
+**反向注入（6 轮，各自只打红该打红的用例）**：I1 去掉逆重排 + 关掉原样块分支 → 5 cases；
+I2 去掉逆预测 + 按块序号放行 + 未知压缩按原样拷贝 → 5 cases；I3 关掉容器特性六道闸 →
+1 case / 6 checks；I4 关掉画布尺寸闸（临时把夹具缩到 40000×8，避免注入时真去分配 GB 级
+缓冲）→ 1 case / 3 checks；I5a 漏乘 alpha、I5b 漏除 alpha、I5c RGBA16 改走 HALF → 各自
+打红 u16 内核或 16 位往返。manifest「声明与资产不匹配」这道守卫**首次就是红的**（错误
+优先级 bug，见上），修好才绿。还原后 `grep -rn INJECT` 零残留。
+
+**第 7 次「护栏报绿，先怀疑护栏本身」——RLE 夹具根本没走 RLE。** 最初的夹具只发字面量
+游程，payload 必然大于 raw，`build_exr` 按 OpenEXR 的 raw 回退规则把它存成原样块；于是
+I1 拿掉逆重排时用例**仍然是绿的**。改成真正的重复游程编码（样本逐行常量 → 预测后整块
+几乎全是 `0x80`，payload 远小于 raw）后 I1/I2 才稳定打红。**压缩格式的护栏必须能证明
+夹具真的产生了压缩块，否则测到的是 raw 回退。**
+
+**实测**：`276 cases, 0 failed, 0 check failures`；`run_regression.py --require-ohos`
+**6/6 PASS**；OHOS aarch64 交叉编译 **73 单元 fail=0**；Windows 壳 27 项 SHA256 与基线
+一致；PIL 交叉验证 rc=0。报告：`report/C3b-exr-reader-20261018-claude.md`。
+
+**如实边界**：EXR **只读不写**——`comp_io_export(EXR)` 仍是 `UNSUPPORTED`（合成结果导出是
+C4）；只做 scanline（tile/deep/multipart 未实现）；PIZ/PXR24/B44/DWA 需要对应编解码器，
+明确拒绝；不解析 chromaticities 等色彩属性，按 sRGB 口径；ZIP 的 16 字节前缀变体只在两个
+长度字段都精确匹配时才跳过。
+
 ### 6.2 尚未验证的部分（证据边界）
 
 - **CMake 路径未实测**：本机无 CMake，`CMakeLists.txt` 与 `build.py` 已按同一源集合/标准/开关对齐，
@@ -980,9 +1045,12 @@ TIFF 是 `kCodecUnavailable`），它不是「接一根线」能补的，见报�
   做更严格的运行期校验；静态证据为 glslang 编译 + 真机管线创建成功。
 - **第三方编解码库：部分已接入，其余仍未链接**。PNG（libpng 1.6.44 + zlib 1.3.1）、
   JPEG（stb，有损）、PSD（stb，只读）的真实源码已 vendoring 到 `engine/third_party/` 并真实可用；
-  TIFF / HEIF / WebP / EXR 在本机**无任何可链接依赖**（无 cmake / make / gcc / clang /
+  TIFF / HEIF / WebP 在本机**无任何可链接依赖**（无 cmake / make / gcc / clang /
   pkg-config / vcpkg，全盘常见根目录下未找到 `jpeglib.h` / `lcms2.h` / `ImfHeader.h`），
-  故仍如实 `UNSUPPORTED` 并写明原因；后续接入步骤见 `docs/codec-migration.md` 第 6 节。
+  故仍如实 `UNSUPPORTED` 并写明原因。**EXR 例外**：C3b 用树内 zlib 自己写了 scanline
+  读取器（不复用 OpenEXR 库），只解 NONE/RLE/ZIPS/ZIP；PIZ/PXR24/B44/B44A/DWAA/DWAB、
+  tiled、deep、multipart、UINT、子采样通道、RANDOM_Y 一律带名字拒绝。后续接入步骤见
+  `docs/codec-migration.md` 第 6 节。
   Python 侧 PIL 只作交叉验证参照，不可链接进 C++ 引擎。
 - **调整面板的 GUI 交互未经人手实测**：面板所走的 ABI 链路已由实机自检逐项覆盖（取控件元数据 /
   组装 JSON / 新增 / 回读 / 按索引更新 / 越界拒绝），但「用鼠标键盘点按面板」这一交互路径

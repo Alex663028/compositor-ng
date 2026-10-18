@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ std::string hdr_workspace_file(const char* name) {
   std::error_code ec;
   std::filesystem::create_directories("build/codec", ec);
   return std::string("build/codec/") + name;
+}
+
+std::string read_text(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return std::string();
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
 bool write_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
@@ -471,9 +478,9 @@ COMP_TEST(hdr_declared_size_is_gated_before_the_decoder_allocates) {
  *   - 登记表如实说「可读不可写」；
  *   - 导出该格式必须 UNSUPPORTED（Radiance 只读），不是静默写个 8 位图；
  *   - 文档确实建成了（画布 = 图像尺寸），且这一层**不是 RGBA8**：
- *     .comp 的写侧只认 RGBA8 资产（comp_file.cpp 的 PNG 资产路径），
- *     所以保存必须失败——这是当前真实的边界，不是通过。
- *     对比组：同样大小的一张 8 位 PNG 导入后保存必须成功。
+ *     .comp 把它存成 images/<uuid>.exr（C3b），manifest 声明 RGBA16F，
+ *     再加载回来尺寸不变——存盘环闭合，而不是"保存必须失败"。
+ *     对比组：同样大小的一张 8 位 PNG 仍然走 PNG 资产路径。
  */
 COMP_TEST(hdr_import_end_to_end_takes_a_radiance_file_as_a_hdr_layer) {
   COMP_CHECK(comp_io_format_from_path("a.hdr") == COMP_FORMAT_HDR);
@@ -525,12 +532,31 @@ COMP_TEST(hdr_import_end_to_end_takes_a_radiance_file_as_a_hdr_layer) {
                COMP_ERR_UNSUPPORTED);
     COMP_CHECK(std::strstr(comp_engine_last_error(engine), "export is unsupported") != nullptr);
 
-    /* 边界：HDR 图层目前写不出 .comp（写侧只认 RGBA8 的 PNG 资产）。 */
+    /*
+     * C3b：HDR 图层现在能存进 .comp 了——资产是 images/<uuid>.exr
+     * （线性光、直通 alpha，half 通道），manifest 声明 enginePixelFormat=2。
+     * 存盘与再加载必须双通；这里只验「存得下、读得回、尺寸对」，
+     * 像素精度的逐项核对在 test_exr.cpp 里对着解码器做。
+     */
     const std::string project = hdr_workspace_file("hdr_project.comp");
-    COMP_CHECK_MSG(comp_io_save_project(document, project.c_str()) == COMP_ERR_IO,
-                   "an HDR document is not writable yet: .comp needs an EXR asset writer");
-    COMP_CHECK(std::strstr(comp_engine_last_error(engine), "RGBA8") != nullptr);
+    COMP_CHECK_MSG(comp_io_save_project(document, project.c_str()) == COMP_OK,
+                   "HDR layers must be stored as EXR assets in .comp");
+    const std::string manifest = read_text(project + "/manifest.json");
+    COMP_CHECK_MSG(manifest.find("\"enginePixelFormat\": 2") != std::string::npos,
+                   "the manifest must declare the HDR layer as RGBA16F");
+    COMP_CHECK_MSG(manifest.find(".exr") != std::string::npos,
+                   "the manifest must point imageFile at the EXR asset");
     comp_document_destroy(document);
+
+    comp_document reloaded = nullptr;
+    COMP_CHECK_MSG(comp_io_load_project(engine, project.c_str(), &reloaded) == COMP_OK,
+                   "a saved HDR document must load back");
+    if (reloaded != nullptr) {
+      comp_size reloaded_size{};
+      COMP_CHECK(comp_document_size(reloaded, &reloaded_size) == COMP_OK);
+      COMP_CHECK(reloaded_size.width == 4 && reloaded_size.height == 2);
+      comp_document_destroy(reloaded);
+    }
   }
 
   /* 对比组：8 位 PNG 走同一条保存路径必须成功（证明上面那次失败是图层位深引起的）。 */

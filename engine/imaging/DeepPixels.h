@@ -120,6 +120,34 @@ void deep_u16_to_half(const uint16_t *wide, size_t wideStride, uint16_t *out, si
  * 与 `DeepLayer.wideAsset`（DeepLayers.swift:174）同口径地比 `peak > 1.001`。 */
 void deep_hdr_take_linear(const float *linear, size_t linearStride, uint16_t *out, size_t outStride, size_t width, size_t height);
 
+/* C 方案 C3b：`deep_hdr_take_linear` 的逆——HDR 图层的预乘 half（extended sRGB）
+ * 回到文件里的**线性光、直通 alpha** float RGBA（4 个 float 一像素，行步长以
+ * 字节计）。写 EXR 时必须走这一趟：文件是线性光，图层是 extended sRGB 预乘，
+ * 两个方向必须出自同一对曲线（`deep_linear` / `deep_encoded`），否则同一份素材
+ * 存盘再读回来会偏色。
+ *
+ * 口径：alpha 夹进 0..1；alpha 为 0 的像素颜色写 0（预乘关系下它没有意义），
+ * NaN 分量写 0，±Inf 照常过曲线（EXR 的 float 通道能表示）。 */
+void deep_hdr_to_linear(const uint16_t *hdr, size_t hdrStride, float *linear, size_t linearStride,
+                        size_t width, size_t height);
+
+/* C 方案 C3b：同一对转换的 16 位整数版本。16 位图层存的是 0..65535 的
+ * extended sRGB 预乘值，与 HDR 的 half 只差存储单位；因此**不能**借道 half
+ * 往返（half 只有 11 位有效位，会把 16 位的低位抹掉——那是把 16 位资产降成
+ * 11 位）。写 EXR 前 `deep_u16_to_linear` 反预乘并过 sRGB 曲线得到线性光；
+ * 读 EXR 后 `deep_u16_take_linear` 编码、预乘、取整回 0..65535。
+ * 取整与夹紧口径与 `deep_half_to_u16` 相同（负值/NaN 落 0，白点以上饱和）。 */
+void deep_u16_to_linear(const uint16_t *wide, size_t wideStride, float *linear, size_t linearStride,
+                        size_t width, size_t height);
+void deep_u16_take_linear(const float *linear, size_t linearStride, uint16_t *out, size_t outStride,
+                          size_t width, size_t height);
+
+/* 半精度的原子转换：IEEE binary16 位模式 <-> float 值（最近偶数舍入）。
+ * EXR 以 half 为存储单位，读写都要这一对；算法与引擎内其它 half 通路同源，
+ * 不在编解码层另写一份，避免舍入规则分叉。 */
+float deep_half_value(uint16_t bits);
+uint16_t deep_half_bits(float value);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

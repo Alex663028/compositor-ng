@@ -10,6 +10,7 @@
  */
 #include "core/comp_geometry.h"
 #include "format/codec_lib.h"
+#include "format/exr_codec.h"
 
 #include <csetjmp>
 #include <cstdio>
@@ -50,6 +51,7 @@ namespace {
 constexpr uint32_t kFormatPng = 1u;
 constexpr uint32_t kFormatJpeg = 2u;
 constexpr uint32_t kFormatPsd = 7u;
+constexpr uint32_t kFormatExr = 6u; /* C3b：OpenEXR（浮点通道，自研 scanline 读取器） */
 constexpr uint32_t kFormatHdr = 8u; /* C3：Radiance .hdr / .pic（浮点通道） */
 
 int g_png_compression_level = 6;
@@ -131,6 +133,8 @@ bool codec_lib_has_stb() {
   return false;
 #endif
 }
+
+const char* codec_lib_exr_backend() { return exr_codec_backend(); }
 
 const char* codec_lib_png_backend() {
 #ifdef COMPOSITOR_CODEC_LIBPNG
@@ -513,8 +517,9 @@ bool codec_lib_can_decode(uint32_t format) {
     case kFormatJpeg:
     case kFormatPsd:
       return codec_lib_has_stb();
+    case kFormatExr:
     case kFormatHdr:
-      /* Radiance 只有浮点通道：能读与否就是浮点通道能读与否（单一真源）。 */
+      /* EXR / Radiance 只有浮点通道：能读与否就是浮点通道能读与否（单一真源）。 */
       return codec_lib_can_decode_float(format);
     default:
       return false;
@@ -533,8 +538,12 @@ bool codec_lib_can_encode(uint32_t format) {
 }
 
 bool codec_lib_can_decode_float(uint32_t format) {
+  if (format == kFormatExr) {
+    /* 自研读取器始终编进构建（NONE/RLE 不依赖第三方；ZIP/ZIPS 另行探测 zlib）。 */
+    return exr_codec_available();
+  }
 #ifdef COMPOSITOR_CODEC_STB
-  /* 目前只有 Radiance 走浮点通道。EXR 的浮点通道见 C3b（自研解析 + vendored zlib）。 */
+  /* Radiance 走 stb 的浮点通道。 */
   return format == kFormatHdr && codec_lib_has_stb();
 #else
   (void)format;
@@ -572,6 +581,7 @@ bool codec_lib_encode(const uint8_t* premultiplied_rgba, int32_t width, int32_t 
 bool codec_lib_decode_float(const uint8_t* data, size_t size, uint32_t format, CodecFloatImage* out,
                             std::string* error) {
   if (out == nullptr) return fail(error, "out is null");
+  if (format == kFormatExr) return exr_decode_float(data, size, out, error);
 #ifdef COMPOSITOR_CODEC_STB
   if (format == kFormatHdr) return stb_decode_float_impl(data, size, out, error);
 #endif

@@ -23,6 +23,7 @@ struct CodecTable {
   std::string jpeg_note;
   std::string psd_note;
   std::string hdr_note;
+  std::string exr_note;
   CodecEntry entries[kEntryCount];
   CodecTable();
 };
@@ -70,8 +71,21 @@ CodecTable::CodecTable() {
                           "host has no libwebp headers/libs; only a non-linkable bundled copy "
                           "inside the DevEco plugin directory was found",
                           false, false};
-  entries[5] = CodecEntry{6u, "EXR", kCodecUnavailable, "OpenEXR",
-                          "host has no OpenEXR headers/libs (ImfHeader.h not found)", false, false};
+  /*
+   * C3b 追加：EXR 走树内自研 scanline 编解码器（不 vendor OpenEXR：它带 Imath
+   * 一串依赖）。能读与否取自 codec_lib_can_decode_float 的真实探测，不写死
+   * 「有代码就等于能读」。压缩不支持的要**写进 note**，让前端知道边界在哪，
+   * 而不是等用户打开 PIZ 文件时才收到一句笼统的失败。
+   */
+  const bool has_exr = codec_lib_can_decode_float(6u);
+  exr_note =
+      has_exr ? std::string("in-tree scanline codec (") + codec_lib_exr_backend() +
+                    "); NONE/RLE/ZIPS/ZIP only, PIZ/PXR24/B44/DWA are rejected with a reason; "
+                    "tiled/deep/multipart/UINT/subsampled files rejected; export unsupported"
+              : "in-tree EXR codec is not compiled into this build";
+  entries[5] = CodecEntry{6u, "EXR", has_exr ? kCodecBuiltIn : kCodecUnavailable,
+                          has_exr ? codec_lib_exr_backend() : "in-tree scanline codec",
+                          exr_note.c_str(), has_exr, false};
   entries[6] = CodecEntry{7u, "PSD", has_stb ? kCodecVendored : kCodecUnavailable,
                           has_stb ? codec_lib_stb_backend() : "custom/libpsd", psd_note.c_str(),
                           has_stb, false};

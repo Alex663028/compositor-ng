@@ -508,10 +508,17 @@ COMP_TEST(format_comp_document_id_stable_across_saves) {
   comp_engine_destroy(engine);
 }
 
-COMP_TEST(format_comp_rejects_exr_layers) {
-  std::error_code ec;
-  std::filesystem::create_directories("build/format_exr.comp/images", ec);
-  const std::string root = "build/format_exr.comp";
+/*
+ * C3b 起 EXR 资产**可读**（自研 scanline 读取器），所以这里守的不再是
+ * 「EXR 一律拒绝」，而是「声明与资产必须对得上」：
+ *   - enginePixelFormat 说 RGBA8，imageFile 却是 .exr -> 明确拒绝（不按 8 位近似）；
+ *   - 声明 RGBA16 却没有资产文件 -> IO 失败（不静默产出空白图层）。
+ * 合法 EXR 图层的往返在 test_exr.cpp 里正面验证。
+ */
+namespace {
+
+void write_exr_layer_manifest(const std::string& root, const char* image_file,
+                              const char* extra_key_line) {
   write_text(root + "/manifest.json",
              std::string("{\n"
                          "  \"format\": \"com.compositor.project\",\n"
@@ -528,17 +535,41 @@ COMP_TEST(format_comp_rejects_exr_layers) {
                          "      \"isVisible\": true,\n"
                          "      \"transform\": {\"origin\":[0,0],\"size\":[4,4],\"rotation\":0,"
                          "\"flipX\":false,\"flipY\":false,\"sampling\":\"High quality\"},\n"
-                         "      \"imageFile\": \"5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D.exr\",\n"
-                         "      \"isGroup\": false\n"
-                         "    }\n"
-                         "  ]\n"
-                         "}\n"));
+                         "      \"imageFile\": \"") +
+                 image_file + "\",\n" + extra_key_line +
+                 "      \"isGroup\": false\n"
+                 "    }\n"
+                 "  ]\n"
+                 "}\n");
+}
+
+}  // namespace
+
+COMP_TEST(format_comp_rejects_exr_assets_that_disagree_with_manifest) {
+  std::error_code ec;
+  std::filesystem::remove_all("build/format_exr.comp", ec);
+  std::filesystem::create_directories("build/format_exr.comp/images", ec);
+  const std::string root = "build/format_exr.comp";
 
   comp_engine engine = make_engine();
+
+  /* 声明 RGBA8，资产却是 .exr：这是声明与资产打架，不能按任何一种去猜。 */
+  write_exr_layer_manifest(root, "5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D.exr",
+                           "      \"enginePixelFormat\": 0,\n");
   comp_document loaded = nullptr;
-  /* 本构建不含 OpenEXR：必须显式失败，不能静默产出空白图层。 */
   COMP_CHECK(comp_io_load_project(engine, root.c_str(), &loaded) != COMP_OK);
   COMP_CHECK(loaded == nullptr);
+  COMP_CHECK_MSG(std::strstr(comp_engine_last_error(engine), "EXR") != nullptr,
+                 "the reason must name the EXR/RGBA8 mismatch");
+  comp_document_destroy(loaded);
+
+  /* 声明 RGBA16、资产缺失：失败必须来自缺失本身，而不是被当成空图层。 */
+  write_exr_layer_manifest(root, "5F2B1C4A-1D3E-4A6B-8C9D-0E1F2A3B4C5D.exr",
+                           "      \"enginePixelFormat\": 1,\n");
+  COMP_CHECK(comp_io_load_project(engine, root.c_str(), &loaded) != COMP_OK);
+  COMP_CHECK(loaded == nullptr);
+  comp_document_destroy(loaded);
+
   comp_engine_destroy(engine);
 }
 

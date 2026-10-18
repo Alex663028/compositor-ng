@@ -18,6 +18,8 @@
 #include "format/comp_json.h"
 #include "format/comp_png.h"
 #include "format/comp_uuid.h"
+#include "format/exr_codec.h"
+#include "imaging/DeepPixels.h"
 
 namespace fs = std::filesystem;
 
@@ -125,9 +127,23 @@ bool read_bytes_file(const fs::path& path, std::vector<uint8_t>* bytes, std::str
 
 /* ------------------------------------------------------- 资产路径与命名 */
 
-/* 上游把图层资产放在 images/ 子目录，且文件名必须由该图层自己的 uuid 构成。 */
-std::string pixel_file_name(const std::string& uuid) { return uuid + ".png"; }
+/* 上游把图层资产放在 images/ 子目录，且文件名必须由该图层自己的 uuid 构成。
+ *
+ * 像素资产的扩展名由**像素格式**决定（不是「有什么编码器就用什么」）：
+ *   RGBA8      -> .png  自研 PNG 解码器，无需第三方；
+ *   RGBA16/16F -> .exr  树内自研 scanline 编解码器，像素口径是线性光直通 alpha。
+ * 二者不互换：PNG 存不了 16 位预乘的精度，EXR 的浮点口径也不是 8 位层要的。
+ * 蒙版始终是 8 位灰度 PNG（掩码是覆盖率，不是宽位深颜色）。 */
+std::string pixel_file_name(const std::string& uuid, comp_pixel_format format) {
+  if (format == COMP_PIXEL_RGBA16 || format == COMP_PIXEL_RGBA16F) return uuid + ".exr";
+  return uuid + ".png";
+}
 std::string mask_file_name(const std::string& uuid) { return uuid + ".mask.png"; }
+
+bool ends_with(const std::string& text, const char* suffix) {
+  const size_t length = std::strlen(suffix);
+  return text.size() >= length && text.compare(text.size() - length, length, suffix) == 0;
+}
 
 fs::path manifest_path_of(const fs::path& root) { return root / "manifest.json"; }
 fs::path images_dir_of(const fs::path& root) { return root / "images"; }
@@ -259,7 +275,7 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
   j.set("transform", transform_to_json(layer));
   /* 只有像素图层写 imageFile；上游规定「组层不得带 imageFile」。 */
   if (!layer.pixels.empty() && !layer.is_group) {
-    j.set("imageFile", JsonValue::string(pixel_file_name(uuid)));
+    j.set("imageFile", JsonValue::string(pixel_file_name(uuid, layer.pixels.format)));
   }
   j.set("isGroup", JsonValue::boolean(layer.is_group));
 
@@ -380,20 +396,61 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
     const std::string uuid = layer_uuid[layer.id];
 
     if (!layer.pixels.empty()) {
-      if (layer.pixels.format != COMP_PIXEL_RGBA8) {
-        if (error != nullptr) {
-          *error = "only RGBA8 layers can be written as PNG (layer id " +
-                   std::to_string(static_cast<unsigned long long>(layer.id)) + ")";
+      const comp_pixel_format format = layer.pixels.format;
+      const int32_t pixel_width = layer.pixels.width;
+      const int32_t pixel_height = layer.pixels.height;
+      if (!is_valid_canvas(comp_size{pixel_width, pixel_height})) {
+        if (error != nullptr) *error = "layer pixel size out of range";
+        return false;
+      }
+
+      if (format == COMP_PIXEL_RGBA8) {
+        std::vector<uint8_t> png;
+        if (!png_encode_rgba8(layer.pixels.pixel_data().data(), pixel_width, pixel_height, &png,
+                              error)) {
+          return false;
         }
-        return false;
-      }
-      std::vector<uint8_t> png;
-      if (!png_encode_rgba8(layer.pixels.pixel_data().data(), layer.pixels.width, layer.pixels.height,
-                            &png, error)) {
-        return false;
-      }
-      if (!write_bytes_file(images_dir / fs::u8path(pixel_file_name(uuid)), png.data(), png.size(),
-                            error)) {
+        if (!write_bytes_file(images_dir / fs::u8path(pixel_file_name(uuid, format)), png.data(),
+                              png.size(), error)) {
+          return false;
+        }
+      } else if (format == COMP_PIXEL_RGBA16 || format == COMP_PIXEL_RGBA16F) {
+        /*
+         * 宽位深图层落成 EXR：文件里是**线性光、直通 alpha** 的浮点（外部
+         * 看图软件按 EXR 惯例读到的就是对的颜色），图层内存里是 extended sRGB
+         * 预乘的 16 位整数或 half。转换必须与读入侧同一对曲线：
+         *   RGBA16F -> deep_hdr_to_linear；RGBA16 -> deep_u16_to_linear。
+         * 采样类型：RGBA16F 用 HALF（与图层同精度，往返逐位一致）；RGBA16 用
+         * FLOAT——half 只有 11 位尾数，存不下 16 位整数的低 5 位。
+         */
+        const size_t pixels = static_cast<size_t>(pixel_width) * static_cast<size_t>(pixel_height);
+        const size_t float_stride = static_cast<size_t>(pixel_width) * 4u * sizeof(float);
+        std::vector<float> linear(pixels * 4u);
+        if (format == COMP_PIXEL_RGBA16F) {
+          deep_hdr_to_linear(reinterpret_cast<const uint16_t*>(layer.pixels.pixel_data().data()),
+                             layer.pixels.stride(), linear.data(), float_stride, pixel_width,
+                             pixel_height);
+        } else {
+          deep_u16_to_linear(reinterpret_cast<const uint16_t*>(layer.pixels.pixel_data().data()),
+                             layer.pixels.stride(), linear.data(), float_stride, pixel_width,
+                             pixel_height);
+        }
+        const ExrSampleType sample_type =
+            format == COMP_PIXEL_RGBA16F ? kExrSampleHalf : kExrSampleFloat;
+        std::vector<uint8_t> exr;
+        if (!exr_encode_float(linear.data(), pixel_width, pixel_height, sample_type, &exr, error)) {
+          return false;
+        }
+        if (!write_bytes_file(images_dir / fs::u8path(pixel_file_name(uuid, format)), exr.data(),
+                              exr.size(), error)) {
+          return false;
+        }
+      } else {
+        if (error != nullptr) {
+          *error = "layer id " +
+                   std::to_string(static_cast<unsigned long long>(layer.id)) +
+                   " has a pixel format .comp cannot store (RGBA8/RGBA16/RGBA16F only)";
+        }
         return false;
       }
     }
@@ -427,27 +484,109 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
 
 namespace {
 
-/* 读取一个图层的像素（PNG）。uuid 为该层 UUID，用于定位资产文件。 */
+/* 读取一个图层的像素。uuid 为该层 UUID，用于定位资产文件。
+ *
+ * 资产格式由 manifest 的 enginePixelFormat 决定，**不由扩展名猜**：
+ *   RGBA8 + .png        -> 自研 PNG 解码（预乘 RGBA8，原样入层）；
+ *   RGBA16 + .exr       -> 线性光浮点 -> deep_u16_take_linear（不经 half，保 16 位精度）；
+ *   RGBA16F + .exr      -> 线性光浮点 -> deep_hdr_take_linear（half，逐位往返）；
+ *   无 enginePixelFormat + .exr -> wide_asset_from_linear（按内容判 HDR/16 位，
+ *                          与外部导入同一口径；上游风格的工程没有本引擎的扩展键）。
+ * 声明与扩展名不符、或声明了本引擎不存的格式，一律带原因失败——绝不按
+ * 另一种格式「近似读一下」。
+ */
 bool read_layer_pixels(const JsonValue& entry, const fs::path& root, const std::string& uuid,
-                       Layer* layer, std::string* error) {
+                       long long pixel_format, bool has_pixel_format, Layer* layer,
+                       std::string* error) {
   const std::string image_file = entry.string_or("imageFile", "");
   if (image_file.empty()) return true;
-  /* 上游规定 imageFile 只能是 "<uuid>.png"（version 13 亦可为 .exr，但内核不支持 EXR）。 */
-  if (image_file.size() >= 4 && image_file.compare(image_file.size() - 4, 4, ".exr") == 0) {
-    if (error != nullptr) *error = "EXR layers are not supported by this build: " + image_file;
+
+  const bool is_exr = ends_with(image_file, ".exr");
+  const bool is_png = ends_with(image_file, ".png");
+  if (!is_exr && !is_png) {
+    if (error != nullptr) *error = "unsupported layer asset type: " + image_file;
     return false;
   }
+
+  /* 声明与资产打架是 manifest 契约问题，必须先于 IO 判定：否则资产恰好缺失时，
+   * IO 错误会盖掉真正的错因（守卫就只测到了「文件不存在」）。 */
+  if (is_exr && has_pixel_format && pixel_format == static_cast<long long>(COMP_PIXEL_RGBA8)) {
+    if (error != nullptr) {
+      *error = "layer " + uuid + ": imageFile is EXR but enginePixelFormat is RGBA8";
+    }
+    return false;
+  }
+  if (!is_exr && has_pixel_format && pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8)) {
+    if (error != nullptr) {
+      *error = "layer " + uuid + ": enginePixelFormat " + std::to_string(pixel_format) +
+               " needs an EXR asset, but imageFile is " + image_file;
+    }
+    return false;
+  }
+
   std::vector<uint8_t> bytes;
   if (!read_bytes_file(images_dir_of(root) / fs::u8path(image_file), &bytes, error)) return false;
 
-  PngImage decoded;
-  if (!png_decode_rgba8(bytes.data(), bytes.size(), &decoded, error)) return false;
+  if (!is_exr) {
+    PngImage decoded;
+    if (!png_decode_rgba8(bytes.data(), bytes.size(), &decoded, error)) return false;
+    if (!is_valid_canvas(comp_size{decoded.width, decoded.height})) {
+      if (error != nullptr) *error = "layer pixel size out of range";
+      return false;
+    }
 
-  layer->pixels.resize(decoded.width, decoded.height, COMP_PIXEL_RGBA8);
-  if (!decoded.rgba.empty()) {
-    std::memcpy(layer->pixels.writable_pixels().data(), decoded.rgba.data(), decoded.rgba.size());
+    layer->pixels.resize(decoded.width, decoded.height, COMP_PIXEL_RGBA8);
+    if (!decoded.rgba.empty()) {
+      std::memcpy(layer->pixels.writable_pixels().data(), decoded.rgba.data(), decoded.rgba.size());
+    }
+    return true;
   }
-  return true;
+
+  CodecFloatImage floats;
+  if (!exr_decode_float(bytes.data(), bytes.size(), &floats, error) || floats.empty()) {
+    if (error != nullptr && error->empty()) *error = "EXR layer decode failed";
+    return false;
+  }
+  /* 解码器已按 dataWindow 做过尺寸闸；这里仍按**实际出图**再核一次，
+   * 因为下面的转换会按声明尺寸分配整幅缓冲。 */
+  if (!is_valid_canvas(comp_size{floats.width, floats.height})) {
+    if (error != nullptr) *error = "layer pixel size out of range";
+    return false;
+  }
+  const int32_t width = floats.width;
+  const int32_t height = floats.height;
+  const size_t float_stride = static_cast<size_t>(width) * 4u * sizeof(float);
+
+  if (!has_pixel_format) {
+    ImageBuffer wide;
+    if (!wide_asset_from_linear(floats.rgba.data(), width, height, &wide)) {
+      if (error != nullptr) *error = "wide asset conversion failed";
+      return false;
+    }
+    layer->pixels = std::move(wide);
+    return true;
+  }
+
+  if (pixel_format == static_cast<long long>(COMP_PIXEL_RGBA16)) {
+    layer->pixels.resize(width, height, COMP_PIXEL_RGBA16);
+    deep_u16_take_linear(floats.rgba.data(), float_stride,
+                         reinterpret_cast<uint16_t*>(layer->pixels.writable_pixels().data()),
+                         layer->pixels.stride(), width, height);
+    return true;
+  }
+  if (pixel_format == static_cast<long long>(COMP_PIXEL_RGBA16F)) {
+    layer->pixels.resize(width, height, COMP_PIXEL_RGBA16F);
+    deep_hdr_take_linear(floats.rgba.data(), float_stride,
+                         reinterpret_cast<uint16_t*>(layer->pixels.writable_pixels().data()),
+                         layer->pixels.stride(), width, height);
+    return true;
+  }
+
+  if (error != nullptr) {
+    *error = "layer " + uuid + ": enginePixelFormat " + std::to_string(pixel_format) +
+             " is not a pixel format this build stores";
+  }
+  return false;
 }
 
 bool read_layer_mask(const JsonValue& entry, const fs::path& root, Layer* layer,
@@ -602,26 +741,34 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       transform_from_json(entry, &layer);
       layer.mask_source_uuid = entry.string_or("maskSourceID", "");
 
-      if (!read_layer_pixels(entry, root, uuid, &layer, error)) return false;
-      if (!read_layer_mask(entry, root, &layer, error)) return false;
-
-      /* 引擎扩展：格式、调整、效果。
-       * PNG 解码路径（read_layer_pixels）只产 RGBA8：缓冲按 4 字节/像素
-       * resize 后 memcpy 4 字节/像素数据。若此时把 format 覆写成 8 字节/像素
-       * 的 16 位格式，stride()/byte_size() 翻倍而缓冲容量不变，row(y) 与
-       * writable_row(y) 对 y >= h/2 越界读写——一个畸形文件即可读坏堆。
-       * 保存侧（save_project）同样拒绝非 RGBA8，故合法往返永远写不出非
-       * RGBA8 声明；读侧一律明确报错，不静默按 RGBA8 近似。 */
+      /*
+       * 引擎扩展：像素格式、调整、效果。
+       *
+       * enginePixelFormat 必须在**解码之前**读到：它决定资产按哪条路读
+       * （PNG 8 位 / EXR 16 位 / EXR half），以及缓冲要用哪种 stride 分配。
+       * 从前是「先按 RGBA8 读，再把 format 覆写成 8 字节/像素」——那会让
+       * stride()/byte_size() 翻倍而缓冲容量不变，row(y) 对 y >= h/2 越界读写。
+       *
+       * 缺键 = RGBA8（老工程的语义）；键存在时只接受本构建真能存的三种格式，
+       * 其余明确报错，不静默按 RGBA8 近似。
+       */
+      const JsonValue* format_value = entry.find("enginePixelFormat");
+      const bool has_pixel_format = format_value != nullptr;
       const long long pixel_format = entry.integer_or("enginePixelFormat", COMP_PIXEL_RGBA8);
-      if (pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8)) {
+      if (has_pixel_format && pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8) &&
+          pixel_format != static_cast<long long>(COMP_PIXEL_RGBA16) &&
+          pixel_format != static_cast<long long>(COMP_PIXEL_RGBA16F)) {
         if (error != nullptr) {
-          *error = "layer " + layer.name +
-                   ": enginePixelFormat must be RGBA8 (PNG decode path); "
-                   "16-bit and HDR assets need a 16-bit-capable decoder (EXR/Radiance), "
-                   "which this build does not support yet";
+          *error = "layer " + uuid + ": unknown enginePixelFormat " + std::to_string(pixel_format);
         }
         return false;
       }
+
+      if (!read_layer_pixels(entry, root, uuid, pixel_format, has_pixel_format, &layer, error)) {
+        return false;
+      }
+      if (!read_layer_mask(entry, root, &layer, error)) return false;
+
       const JsonValue* adjustments = entry.find("engineAdjustments");
       if (adjustments != nullptr && adjustments->is_array()) {
         for (const JsonValue& a : adjustments->as_array()) {

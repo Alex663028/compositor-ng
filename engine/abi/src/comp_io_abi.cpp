@@ -7,9 +7,10 @@
  *   外部图像导入/导出  由 codec_lib 分派到 vendor 的真实库（PNG=libpng+zlib，
  *                      JPEG=stb_image/stb_image_write，PSD=stb_image 只读）；
  *                      第三方缺失时 PNG 回落到自研 comp_png，其余如实 UNSUPPORTED。
- *   浮点来源（C3）     Radiance .hdr/.pic 走 stb_image 的浮点通道，解出的是
- *                      **线性光浮点**；进 HDR 图层还是 16 位图层由 wideAsset
- *                      判决（peak > 1.001），与上游 ImageImporter.swift:114 同口径。
+ *   浮点来源（C3/C3b） Radiance .hdr/.pic 走 stb_image 的浮点通道，EXR 走树内
+ *                      自研 scanline 读取器；两者解出的都是**线性光浮点**；进
+ *                      HDR 图层还是 16 位图层由 wideAsset 判决（peak > 1.001），
+ *                      与上游 ImageImporter.swift:114 同口径。
  *
  * 失败语义（可解释、可测试）：
  *   文件不存在 / 内容损坏 / 写盘失败 -> COMP_ERR_IO
@@ -36,6 +37,7 @@
 #include "format/codec_lib.h"
 #include "format/codec_registry.h"
 #include "format/comp_file.h"
+#include "format/exr_codec.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
 
@@ -236,12 +238,17 @@ bool radiance_declared_size(const uint8_t* data, size_t size, int32_t* out_width
 }
 
 /*
- * 浮点来源的声明尺寸（进解码器之前的预检用）。目前只有 Radiance；
- * C3b 的 EXR 接入后在此补它自己的头解析（attribute 里的 dataWindow）。
+ * 浮点来源的声明尺寸（进解码器之前的预检用）：Radiance 读 "-Y <h> +X <w>"，
+ * EXR 读头部 attribute 里的 dataWindow（exr_declared_size 只解析头部，不分配像素）。
  */
 bool float_source_declared_size(comp_image_format format, const uint8_t* data, size_t size,
                                int32_t* out_width, int32_t* out_height) {
   if (format == COMP_FORMAT_HDR) return radiance_declared_size(data, size, out_width, out_height);
+  if (format == COMP_FORMAT_EXR) {
+    /* 原因由后面真正的解码器给出（同一份头解析），这里只需要尺寸。 */
+    std::string detail;
+    return compositor::exr_declared_size(data, size, out_width, out_height, &detail);
+  }
   return false;
 }
 

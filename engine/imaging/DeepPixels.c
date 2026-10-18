@@ -341,6 +341,69 @@ void deep_hdr_take_linear(const float *linear, size_t linearStride, uint16_t *ou
     });
 }
 
+void deep_hdr_to_linear(const uint16_t *hdr, size_t hdrStride, float *linear, size_t linearStride,
+                        size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const uint16_t *in = (const uint16_t *)((const uint8_t *)hdr + y * hdrStride);
+            float *o = (float *)((uint8_t *)linear + y * linearStride);
+            for (size_t x = 0; x < width; ++x, in += 4, o += 4) {
+                // fminf/fmaxf return the non-NaN operand: a NaN alpha lands on 0.
+                float alpha = fminf(1, fmaxf(0, deep_half(in[3])));
+                for (int c = 0; c < 3; ++c) {
+                    float premultiplied = deep_half(in[c]);
+                    // Alpha 0 has no colour to recover; a NaN sample stays out of the file too.
+                    o[c] = alpha > 0 && premultiplied == premultiplied ? deep_linear(premultiplied / alpha) : 0;
+                }
+                o[3] = alpha;
+            }
+        }
+    });
+}
+
+void deep_u16_to_linear(const uint16_t *wide, size_t wideStride, float *linear, size_t linearStride,
+                        size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const uint16_t *in = (const uint16_t *)((const uint8_t *)wide + y * wideStride);
+            float *o = (float *)((uint8_t *)linear + y * linearStride);
+            for (size_t x = 0; x < width; ++x, in += 4, o += 4) {
+                float alpha = fminf(1, fmaxf(0, (float)in[3] * (1.0f / 65535.0f)));
+                for (int c = 0; c < 3; ++c) {
+                    float encoded = (float)in[c] * (1.0f / 65535.0f);
+                    o[c] = alpha > 0 ? deep_linear(encoded / alpha) : 0;
+                }
+                o[3] = alpha;
+            }
+        }
+    });
+}
+
+void deep_u16_take_linear(const float *linear, size_t linearStride, uint16_t *out, size_t outStride,
+                          size_t width, size_t height) {
+    deep_rows(height, ^(size_t first, size_t last) {
+        for (size_t y = first; y < last; ++y) {
+            const float *in = (const float *)((const uint8_t *)linear + y * linearStride);
+            uint16_t *o = (uint16_t *)((uint8_t *)out + y * outStride);
+            for (size_t x = 0; x < width; ++x, in += 4, o += 4) {
+                float alpha = fminf(1, fmaxf(0, in[3]));
+                for (int c = 0; c < 3; ++c) {
+                    // Same convention as deep_half_to_u16: NaN -> 0, white and above -> white.
+                    float encoded = in[c] == in[c] ? deep_encoded(in[c]) * alpha : 0;
+                    float scaled = encoded * 65535.0f;
+                    if (!(scaled > 0.0f)) scaled = 0;
+                    else if (scaled > 65535.0f) scaled = 65535.0f;
+                    o[c] = (uint16_t)lroundf(scaled);
+                }
+                o[3] = (uint16_t)lroundf(alpha * 65535.0f);
+            }
+        }
+    });
+}
+
+float deep_half_value(uint16_t bits) { return deep_half(bits); }
+uint16_t deep_half_bits(float value) { return deep_to_half(value); }
+
 void deep_take_painted_hdr(uint16_t *hdr, size_t hdrStride, const uint8_t *painted, const uint8_t *base, size_t stride,
                            size_t width, size_t height) {
     deep_rows(height, ^(size_t first, size_t last) {

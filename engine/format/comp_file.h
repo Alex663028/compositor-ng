@@ -5,14 +5,19 @@
  * 布局（对齐上游 macOS 版的 .comp 目录包）：
  *   <project>.comp/
  *     manifest.json               格式标识 / 版本 / 画布 / 图层元数据
- *     images/<uuid>.png           图层像素（PNG，8 位 RGBA）
+ *     images/<uuid>.png           图层像素（RGBA8 图层；PNG，8 位预乘 RGBA）
+ *     images/<uuid>.exr           图层像素（RGBA16 / RGBA16F 图层；未压缩 scanline
+ *                                 EXR，文件内为线性光、直通 alpha；RGBA16 用 FLOAT
+ *                                 通道保 16 位精度，RGBA16F 用 HALF 通道）
  *     images/<uuid>.mask.png      图层蒙版（PNG，8 位灰度，可选）
  *
  * 互通约定（M2 收口，硬约束，均由测试护栏固定）：
  *   - manifest 顶层与图层记录的键名、取值域与上游 ProjectStore.swift 一致：
  *     format="com.compositor.project"、version=13、colorSpace="sRGB"、
  *     documentID / layers[].id / parentID 均为大写 UUID 文本；
- *     imageFile 只能是 "<该层 uuid>.png"，maskFile 只能是 "<该层 uuid>.mask.png"。
+ *     imageFile 只能是 "<该层 uuid>.png"（RGBA8）或 "<该层 uuid>.exr"
+ *     （RGBA16/RGBA16F，格式由 enginePixelFormat 声明），
+ *     maskFile 只能是 "<该层 uuid>.mask.png"。
  *   - transform 必须是上游 LayerTransform 的六键形态：
  *     {"origin":[x,y],"size":[w,h],"rotation":0,"flipX":false,"flipY":false,
  *      "sampling":"High quality"}；写成 {x,y,w,h} 会让上游解码失败。
