@@ -76,7 +76,11 @@ COMP_API comp_result comp_document_save(comp_document document, const char* comp
 /* 销毁文档。传入 NULL 为无操作。 */
 COMP_API void comp_document_destroy(comp_document document);
 
-/* 画布尺寸查询与调整；缩小时超出部分被裁剪。 */
+/* 画布尺寸查询与调整；缩小时超出部分被裁剪。
+ *
+ * set_size 是 M1 的 Canvas Size：只改画布并把图层包围盒裁回画布范围，不做
+ * 内容偏移、不重采样（Crop 请用 comp_crop_apply）。尺寸真的变化时选区被丢弃
+ * ——上游 Canvas Size / Crop 都重建 CanvasDocument，选区不随新坐标系走。 */
 COMP_API comp_result comp_document_size(comp_document document, comp_size* out_size);
 COMP_API comp_result comp_document_set_size(comp_document document, comp_size size);
 
@@ -84,8 +88,9 @@ COMP_API comp_result comp_document_set_size(comp_document document, comp_size si
  * 整篇重采样到新画布尺寸（对齐上游 Image Size）：每层像素/掩版按比例重采样、
  * transform 同步缩放；旋转层光栅化后转为 identity 几何（上游同策略——非均匀
  * 缩放的旋转矩形无法用 origin/size/rotation 表示）。1x1 的 uniform 掩版保持
- * 原样。尺寸不变为无操作。效果参数（JSON 透传、求值未实现）不随尺寸缩放，
- * 这是已记录的能力边界。一步撤销。
+ * 原样。尺寸不变为无操作。选区随之丢弃（换画布 = 换坐标系，上游同口径）。
+ * 效果参数（JSON 透传、求值未实现）不随尺寸缩放，这是已记录的能力边界。
+ * 一步撤销。
  */
 COMP_API comp_result comp_document_resize_image(comp_document document, comp_size size);
 

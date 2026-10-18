@@ -60,6 +60,12 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   于是事务快照、撤销/重做与回滚自动覆盖；写操作一步撤销，**状态没变就不进历史**；
   参数闸全部先于隐式事务。基线 292 → **304 用例**（12 例护栏，含 2 轮反向注入），
   6/6 回归全绿。详见 §6.7。
+  2026-10-18 第八轮（F2 Crop）：新增 `comp_crop_*` 5 个 ABI，把上游 `Crop.swift` 的
+  裁剪工具补成产品通路——拖拽生成框（比例约束 / Option 对称）、保留宽度的比例切换、
+  四边取整、可提交性判定，以及**提交时平移图层 + 换画布**（不重采样、不裁像素，
+  画布外内容保留；框不变则不进历史）。选区随坐标系变更丢弃，整次裁剪一步撤销。
+  顺带修正 Canvas Size：尺寸真的变化时丢弃选区（此前只有 Image Size 丢）。
+  基线 304 → **316 用例**（12 例护栏），6/6 回归全绿。详见 §6.8。
 
 ## 1. M1 目标与范围
 
@@ -312,11 +318,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **76**（38 个 `.c` + 38 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 78（38 个 `.c` + 40 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 304 cases, 0 failed, 0 check failures`（当前基线；§6.7 起） |
+| 测试 | `summary: 316 cases, 0 failed, 0 check failures`（当前基线；§6.8 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：38 `.cpp` / 38 `.c`（含 vendored 26）/ 76 `.h`；tests：28 `.cpp` |
+| 源码规模 | engine：40 `.cpp` / 38 `.c`（含 vendored 26）/ 78 `.h`；tests：29 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
@@ -1262,7 +1268,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
-| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 97 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 102 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~97%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）。余 `deep_take_painted` 与 `take_painted_hdr` 一对（同被 S4 仿制笔刷 tile 模型阻塞）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
@@ -1286,13 +1292,13 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | **零** |
-| **Crop 工具**（`Crop.swift` 249 行） | **零**（只有 canvas resize，非裁剪工具） |
+| **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 20/48 命中 ≈ 45%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
-抠图正是该条的主要工作量）。其余约 5,000+ 行 Swift **完全没有对应物**，且这些**不属于「接线」
-范畴，属新增功能**——不是把孤立内核接出去能解决的。
+即 **约 21/48 命中 ≈ 44%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
+抠图正是该条的主要工作量；Crop 按已交付计入）。其余约 4,800 行 Swift **完全没有对应物**，
+且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
 
@@ -1307,7 +1313,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 
 **功能面推进顺序**（边际成本从低到高）：
 选区几何（1,000+ 行，但它是几乎所有下游编辑的入口；**2026-10-18 已交付，见 §6.7**）
-→ Crop 工具（249 行，解锁导出打印尺寸）
+→ Crop 工具（249 行，解锁导出打印尺寸；**2026-10-18 已交付，见 §6.8**）
 → Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用）
 → Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
@@ -1451,6 +1457,92 @@ undo 后状态变红（证明「没改不进历史」的护栏真的在起作用
 - **`.comp` 不落选区**：当前保存器只写图层与文档元数据，重新打开文档后无选区。
 - **本仓无 UI**：选区 ABI 已可供两壳调用，但 Marquee/Lasso 的交互（拖拽矩形、
   套索采样、蚂蚁线）属外壳职责。
+
+### 6.8 F2 Crop 工具（2026-10-18，Claude）
+
+**交付物**：`engine/domain/crop.{h,cpp}`（104 / 170 行）、
+`engine/abi/src/comp_crop_abi.cpp`、`engine/abi/include/compositor/comp_crop.h`
+（5 个 ABI）、`tests/test_crop.cpp`（12 例）。
+
+#### 为什么不能复用 `comp_document_set_size`
+
+`set_size` 是 **Canvas Size**：它只改画布并把图层包围盒**裁剪**回画布范围，
+没有 content offset。上游 `commitCrop` 走的是 `CanvasResizer.resize(contentOffset:)`——
+**平移所有图层原点、不裁像素**，画布外的内容保留（渲染时被画布边界裁掉）。
+两者语义正交，复用会把内容永久裁掉。因此 F2 在域层单独实现 `crop_apply`：
+换画布 + 平移 transform，不重采样、不重排缓冲。
+
+#### ABI
+
+| 函数 | 语义 | 是否写文档 |
+|------|------|-----------|
+| `comp_crop_snap_rect` | 标准化负宽高 → 四边各自取整 → 宽高最小 1 | 否（纯几何） |
+| `comp_crop_create_frame` | 由拖拽起止点成框；`ratio > 0` 约束比例，`symmetric` 以起点为中心展开 | 否 |
+| `comp_crop_change_ratio` | 保宽、高度 = 宽 / 比例、垂直居中；取整后不合法则原样保留 | 否 |
+| `comp_crop_is_valid` | 可提交性查询（先取整，与 apply 同一判据） | 否 |
+| `comp_crop_apply` | 平移图层 + 换画布 + 丢弃选区，**一步撤销** | 是 |
+
+纯几何函数只借 `comp_engine` 上报 `last_error`，不需要文档句柄。
+`comp_crop_rect` 用 `double`（与上游 `CGFloat` 同宽），避免在 1e6 原点附近因
+`float` 精度把边界挪掉半像素。
+
+#### 语义逐条对齐
+
+| 上游行为 | ng 实现 | 护栏 |
+|----------|---------|------|
+| `snapped`：四边各自 `round`（.5 远离零），宽高最小 1 | `std::llround`（同 Swift `.rounded()`），负宽高先标准化 | `crop_snap_rounds_each_edge_and_enforces_minimum_size` |
+| `create`：比例修正向量（宽优先或高优先两分支） | 与上游同式，`ratio <= 0` = 无约束 | `crop_create_frame_follows_drag_ratio_and_symmetry` |
+| Option 拖拽以起点为中心 | `symmetric` 分支等距展开 | 同上 |
+| `changeCropRatio` 保持宽度、垂直居中；不合法不赋值 | `height = w / ratio`，中心不变；不合法回填原框 | `crop_change_ratio_keeps_width_and_centers_vertically` |
+| `valid`：宽高 1..maxSide，`abs(x)`、`abs(y)` ≤ 1e6 | 另加本仓 1 亿像素画布预算 | `crop_is_valid_matches_commit_rules` |
+| `commitCrop` → `CanvasResizer` 平移图层、换画布、**不裁像素** | `crop_apply` 平移 `transform.x/y`，不碰 `w/h` 与像素 | `crop_translates_layers_and_resizes_canvas`、`crop_is_non_destructive_and_restores_by_expanding_back` |
+| 负原点裁剪扩大可视范围（画布外内容重新露出） | 平移后 origin 变负，合成时按画布边界裁剪 | `crop_to_negative_origin_extends_canvas_with_transparent_border` |
+| 尺寸与偏移都没变 → 无操作 | 框恰为 `(0,0,w,h)` 时 `out_changed = 0`，不 commit | `crop_noop_does_not_add_history` |
+| 换画布 = 换坐标系，选区不随行 | 提交丢弃 `SelectionState`，与裁剪同属一步撤销 | `crop_drops_selection_in_the_same_undo_step` |
+| 非法框 / transform 溢出 → 文档不变 | 两遍扫描：先校验所有图层的新 transform，再统一写入 | `crop_rejects_invalid_inputs_without_side_effects` |
+
+#### 事务与失败语义
+
+- **参数闸先于事务**：句柄、输出指针、非有限坐标/比例、取整后合法性全部在
+  `ImplicitTxn` 生效前或 `commit()` 前判完；失败路径不 commit、不改状态。
+- **apply 内部先取整**：宿主可以直接传拖拽中的浮点框，不需要自己 snap；
+  `is_valid` 同样先取整，因此它的判定与 apply 完全一致。
+- **两遍写入**：裁剪把每个图层原点减去 rect 原点，极端情况下可能越过
+  `is_valid_transform` 的 1e6 上限。第一遍只算新值并校验，第二遍才写入——
+  拒绝时零副作用，不会留下「改了一半」的文档。
+- **没变就不进历史**：`changed == false` 时不 commit（上游 `CanvasResizer`
+  对尺寸与偏移都未变的请求同样短路）。
+- **显式事务内**：`ImplicitTxn` 不占事务，`commit()` 被抑制，由外层事务产出
+  恰好一步；abort 时整体回滚（护栏钉住撤销深度与像素）。
+
+#### 同轮修正：Canvas Size 也丢选区
+
+§6.7 只让 Image Size 丢弃选区，而 Canvas Size（`comp_document_set_size`）此前
+保留选区——换画布同样换坐标系，旧分辨率的蒙版留下就是错位。上游
+`applyDocumentSize` 对两者都重建 `CanvasDocument`，选区自然不存在。现在
+`set_size` 只在**尺寸真的变化**时丢弃选区，并补了
+`canvas_size_change_drops_selection` 护栏。
+
+#### 护栏与基线
+
+`tests/test_crop.cpp` 的 12 例覆盖：四边取整 / .5 远离零 / 最小 1 像素 / NaN 拒绝；
+拖拽成框的正反向、比例两分支与 Option 对称；比例切换的保宽与垂直居中；
+合法性三条上限；提交后的画布尺寸、图层平移与**子矩形逐字节相等**；负原点扩展
+出的透明边；裁出去再扩回来的**非破坏性逐字节还原**；无操作不进历史；选区丢弃
+与裁剪同属一步撤销；非法输入与 transform 溢出零副作用；显式事务的分组与 abort。
+
+基线 304 → **316 cases, 0 failed**；`run_regression.py --require-ohos` 6/6 PASS
+（构建 + 单元测试、Windows 壳 27 项、编解码交叉、`.comp` 双向、ctypes 真实调用、
+OHOS aarch64 交叉编译）。详见
+`../report/F2-crop-20261018-claude.md`。
+
+#### 明示边界
+
+- **手柄、蚂蚁线、吸附参考线属外壳**：ABI 只提供几何与提交。
+- **不重采样**：裁剪不缩放像素；需要缩放请用 `comp_document_resize_image`。
+- **选区丢弃而非缩放**：缩放 0/255 蒙版会把边缘糊成半选，上游同样不保留。
+- **极负原点可能被拒**：本仓在写入侧拒绝 |origin| > 1e6 的 transform，
+  这类裁剪返回 `COMP_ERR_INVALID_ARGUMENT` 且文档不变（比静默写入坏值安全）。
 
 ## 7. 许可
 
