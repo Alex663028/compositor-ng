@@ -53,6 +53,13 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   基线 207 → **212 用例**，6/6 回归全绿。
   同轮产出**双口径完成度对标**：引擎核内 **≈92%**、作为「Photoshop 替代品」的产品口径 **≈45%**
   （详见 §6.4 与 `../report/AUDIT9-compositor-ng-20261017-pi.md`）。
+  2026-10-18 第七轮（F1 选区几何）：新增 `comp_selection_*` 一族 10 个 ABI，把上游
+  `Document/Selection.swift` 的产品通路补上——矩形/椭圆/多边形/三次贝塞尔路径栅格化
+  （非零缠绕，反向子路径成洞）、replace/add/subtract、全选/取消/反选、feather/expand/contract。
+  选区存**文档分辨率 8 位蒙版 + 羽化参数**（不是路径），并并入 `DocumentState`，
+  于是事务快照、撤销/重做与回滚自动覆盖；写操作一步撤销，**状态没变就不进历史**；
+  参数闸全部先于隐式事务。基线 292 → **304 用例**（12 例护栏，含 2 轮反向注入），
+  6/6 回归全绿。详见 §6.7。
 
 ## 1. M1 目标与范围
 
@@ -305,11 +312,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **74**（38 个 `.c` + 36 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 83（38 个 `.c` + 45 个 `.cpp`；其中 vendored 第三方 26 个 `.c`）→ **76**（38 个 `.c` + 38 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 292 cases, 0 failed, 0 check failures`（当前基线；§6.1.20 起） |
+| 测试 | `summary: 304 cases, 0 failed, 0 check failures`（当前基线；§6.7 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：36 `.cpp` / 38 `.c`（含 vendored 26）/ 74 `.h`；tests：27 `.cpp` |
+| 源码规模 | engine：38 `.cpp` / 38 `.c`（含 vendored 26）/ 76 `.h`；tests：28 `.cpp` |
 
 已知非致命告警：链接期 `lld-link` 报若干 `LNK4217`（`_NSConcreteStackBlock` 等 blocks 运行时符号
 在镜像内本地定义、同时被按导入符号引用）。这是 clang 在 Windows 目标上对 blocks 符号的默认
@@ -1255,7 +1262,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
-| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 89 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 97 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~97%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）。余 `deep_take_painted` 与 `take_painted_hdr` 一对（同被 S4 仿制笔刷 tile 模型阻塞）；`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~80%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；扣分项：无真机验证、无 CMake/MSVC 实测 |
@@ -1276,14 +1283,15 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Painting（笔刷 / Spot Heal / Content-Aware Fill） | ✓（笔刷为解析式，噪声未采样） |
 | Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
 | **Camera Raw**（6 文件 1,708 行） | **零** |
-| **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | **零**（ng 只有 `wand_mask` 选颜色 + `wand_trace` 轮廓查询） |
+| **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | **零** |
 | **Crop 工具**（`Crop.swift` 249 行） | **零**（只有 canvas resize，非裁剪工具） |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | **零** |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **20/48 命中 ≈ 45%**。缺的约 5,000+ 行 Swift **完全没有对应物**，且这些**不属于「接线」
+即 **约 20/48 命中 ≈ 45%**（选区几何按「部分命中」计，未抬高条数——缺的 Select Subject /
+抠图正是该条的主要工作量）。其余约 5,000+ 行 Swift **完全没有对应物**，且这些**不属于「接线」
 范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1297,8 +1305,9 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 `adjust_camera_raw_shadows`），已于 §6.1.15 全部补齐——补完后 10 组的**函数名差集为零**，
 AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 
-**功能面推进顺序建议**（边际成本从低到高）：
-选区几何（1,000+ 行，但它是几乎所有下游编辑的入口）→ Crop 工具（249 行，解锁导出打印尺寸）
+**功能面推进顺序**（边际成本从低到高）：
+选区几何（1,000+ 行，但它是几乎所有下游编辑的入口；**2026-10-18 已交付，见 §6.7**）
+→ Crop 工具（249 行，解锁导出打印尺寸）
 → Clone Stamp + Smudge/Liquify（已有 `PatchPixels`/`HealPixels` 基础设施可复用）
 → Camera Raw（1,708 行 + RAW 解码，投入最大，但是上游招牌功能）
 → 格式导入（需第三方库，与「零依赖自研」取向冲突，**需先定策略**）。
@@ -1341,6 +1350,107 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19） | `deep_take_painted`（语义已定，等 S4 仿制笔刷的 tile+coverage 模型）、`take_painted_hdr`（阻塞点 = S4） |
 | HDR | `comp_layer_set_pixels`（RGBA16F 放行）+ `flatten`（`resample.cpp:171` 分流） | **`hdr_to_rgba8`**（C1）+ **HDR 图层上的 deep round trip**（C2：`hdr_normalize` → 8 位操作 → `hdr_restore`，`tool_ops.cpp:323`）+ **half 合成表面与 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5，§6.1.19；`rgba8_to_hdr` 由 CPU 后端消费）+ **浮点解码器**（C3，Radiance `.hdr`/`.pic`）+ **`.comp` 的 `<uuid>.exr` 资产读写**（C3b，§6.1.18）+ **合成结果导出 EXR**（C4，`comp_io_export` 全深度 flatten → 线性光 HALF，§6.1.20） | `take_painted_hdr`（阻塞点 = S4）；float TIFF 无解码器、如实不支持 |
 | Adjust | **零产品通路**（`adjust_*` 一族无任何工具/命令消费） | 内核 62 个函数已与上游对齐（§6.1.15） | 整族无产品通路；属 F4 Camera Raw 产品通路 |
+
+### 6.7 F1 选区几何（2026-10-18，Claude）
+
+**交付物**：`engine/domain/selection.{h,cpp}`（域层，984 行）、
+`engine/abi/src/comp_selection_abi.cpp`、`engine/abi/include/compositor/comp_selection.h`
+（10 个 ABI）、`tests/test_selection.cpp`（12 例）。
+
+#### 为什么存蒙版而不是路径
+
+上游 `DocumentSelection` 的唯一真源是 `CGPath`，coverage 在使用时才由 CoreGraphics
+栅格化；本仓不引入路径库，改为在**文档分辨率**上存一张 8 位灰度蒙版
+（`MaskBuffer`，0 = 不选中，255 = 全选中）+ 一个羽化参数：
+
+- 每个消费点（画笔/橡皮裁剪、内容感知填充、Crop 之后的重建）本来就要逐像素
+  coverage，路径每次现场栅格化只会把同一份工作重复多遍；
+- 蒙版与图层蒙版同构，直接复用 `MaskBuffer` 的 shared_ptr + COW 资产模型，
+  「整篇快照」的撤销因此自动成立，不需要给选区单开一套历史钩子；
+- 选中 0/N 像素这件事与「用过哪条贝塞尔曲线」无关。
+
+**「无选区」与「显式空选区」必须区分**：`active = 0` 是无选区（编辑不受限）；
+`active = 1` 且蒙版全 0 是显式空选区（合法但落空的形状，编辑结果为空）。
+上游用 `nil` 与空 `CGPath` 区分，这里用 `active` 区分，`comp_selection_get_active`
+是唯一判据。全选后反选得到的是**无选区**，Contract 缩到没有得到的是**显式空选区**。
+
+#### ABI
+
+| 函数 | 语义 |
+|------|------|
+| `comp_selection_apply_shape` | 矩形/椭圆（两个对角点）/多边形（≥3 点）栅格化并叠加 |
+| `comp_selection_apply_path` | 三次贝塞尔路径（`new_subpath` 对齐 CGPath 的 current point 语义） |
+| `comp_selection_select_all` / `deselect` / `invert` | 全选 / 取消 / 反选 |
+| `comp_selection_modify` | `FEATHER`(1..250) / `EXPAND`(1..500) / `CONTRACT`(1..500) |
+| `comp_selection_get_active` / `get_feather` / `get_bounds` | 只读查询 |
+| `comp_selection_get_coverage` | 有效 coverage（含羽化）拷进调用方缓冲 |
+
+所有写函数都带 `int32_t* out_changed`（可为 NULL）：状态**真的变了**才写 1。
+枚举类型名 `comp_selection_modify_op` 带 `_op` 后缀——C 里 typedef 与函数名共用
+普通标识符命名空间，`comp_selection_modify` 已被函数占用。
+
+#### 数值口径
+
+- **栅格化**：4 行超采样 + 水平方向解析覆盖率（非 AA 时取每像素中心一票，
+  阈值 128）；非零缠绕（`CGPath.fillPath(using: .winding)`），反向子路径是洞、
+  同向自交不会互相抵消。曲线按容差 0.1 px / 最大 20 层递归扁平化。
+- **叠加**：replace / add / subtract 在**未羽化**的 base 上做——羽化是形状的参数，
+  不烘焙进蒙版，否则反复叠选会越叠越糊。任何成功的形状操作都把 feather 重置为 0
+  （上游 `applySelection` 新建 `DocumentSelection` 时没有传 feather）。
+- **羽化**：高斯 σ = feather / 2；σ ≤ 2.5 走精确可分离高斯（半径 `ceil(3σ)`，
+  uint16 中间缓冲），否则 3 遍箱式滤波（`r = lround((sqrt(4σ²+1)-1)/2)`，滑动窗口
+  O(1)/px）。边界钳到画布（全选羽化不会在画布边缘变淡）。再次羽化按
+  `sqrt(f1² + f2²)` 叠加、上限 250。
+- **扩缩**：精确欧氏距离场（Felzenszwalb & Huttenlocher，O(n)），在非零包围盒
+  外扩 `|delta| + 2` 的窗口里算，窗口外视为未选中。深度模型让**整像素选区的边界
+  落在整像素上**：外扩 N 后第 N 个外层整像素恰好 255、再外一层恰好 0；外扩被
+  画布裁掉，内缩连画布边缘一起缩。
+- **包围盒**：非零像素 bbox 外扩 `ceil(2 * feather)` 再裁到画布；无选区或显式空
+  选区返回 `{0,0,0,0}`。
+
+#### 事务、历史与参数闸
+
+- **校验先行、失败无副作用**：句柄、枚举、空输入、amount 范围与输出指针在 ABI 层
+  先校验；点数/段数上限与坐标有限性由域函数统一校验（单点真源，不重复实现）。
+  所有失败路径都不 commit、不改状态（`comp_txn_active == 0`、撤销深度不变，有护栏钉住）。
+- **没改就不进历史**：域函数用 `masks_equal` 做等值短路，ABI 层 `changed` 为假
+  时不 commit——上游 `setSelection` 对相同值不产生撤销步，这里同口径。
+- **一步撤销**：ABI 在未处于显式事务时补一个 `ImplicitTxn`；显式事务内各次调用的
+  commit 被抑制，由外层 commit 产出恰好一步。
+- **选区是 `DocumentState` 的成员**（不是 `Document` 的旁路成员）：事务快照、
+  撤销/重做、回滚自动覆盖；历史字节账本把选区蒙版与图层资产记在同一本账上。
+- **Image Size 丢弃选区**：换画布 = 换文档坐标系，蒙版随之失效；上游
+  `ImageResizer` 直接构造新 `CanvasDocument`，选区自然不存在。这里同样丢弃而不是
+  缩放（缩放 0/255 蒙版会把边缘糊成半选），与尺寸变更同属一步撤销。
+
+#### 上限与护栏
+
+| 项 | 上限 |
+|----|------|
+| 形状点数 | 2^18（262,144） |
+| 路径段数 | 2^16（65,536；扁平化后的顶点总数同样受 2^18 约束） |
+| Feather | 1..250 |
+| Expand / Contract | 1..500 |
+
+`tests/test_selection.cpp` 的 12 例覆盖：矩形精确像素/等值短路的撤销深度、add 与
+subtract（含无选区时 subtract 无操作）、椭圆抗锯齿与面积、路径洞的非零缠绕、
+真实贝塞尔曲线的扁平化边界、全选/反选/取消的状态迁移与往返、羽化的软边与叠加、
+扩缩的整像素边界与 Contract 到空、画布裁剪（不环绕）、非法参数不留事务、
+coverage 缓冲校验（尺寸/stride/行内 padding 不被写）、显式事务的分组与 abort 回滚。
+
+**反向注入（2 轮，各自只打红该打红的用例）**：
+① `finish()` 无条件 commit → `selection_rect_hits_exact_pixels` 的撤销深度与
+undo 后状态变红（证明「没改不进历史」的护栏真的在起作用）；
+② 扩缩的整像素深度 `- 0.5` 改成 `- 0.0` → `selection_expand_and_contract_keep_pixel_edges`
+5 条断言变红（四条边界像素 + 面积）。两轮均已还原。
+
+#### 明示边界
+
+- **Select Subject / 抠图不在本仓范围**：依赖 ML 推理，无法用「零依赖自研」方式
+  复刻；口径 B 的该条只按「部分命中」计。
+- **`.comp` 不落选区**：当前保存器只写图层与文档元数据，重新打开文档后无选区。
+- **本仓无 UI**：选区 ABI 已可供两壳调用，但 Marquee/Lasso 的交互（拖拽矩形、
+  套索采样、蚂蚁线）属外壳职责。
 
 ## 7. 许可
 

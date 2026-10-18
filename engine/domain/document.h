@@ -48,8 +48,10 @@ class Document {
   DocumentState& state() noexcept { return state_; }
   const DocumentState& state() const noexcept { return state_; }
 
-  SelectionState& selection() noexcept { return selection_; }
-  const SelectionState& selection() const noexcept { return selection_; }
+  /* 选区是文档状态的一部分（见 SelectionState）：事务快照、撤销/重做与
+   * 回滚都自动覆盖它。这里只做转发，不另存一份。 */
+  SelectionState& selection() noexcept { return state_.selection; }
+  const SelectionState& selection() const noexcept { return state_.selection; }
 
   History& history() noexcept { return history_; }
   const History& history() const noexcept { return history_; }
@@ -153,7 +155,6 @@ class Document {
 
   Engine* engine_ = nullptr;
   DocumentState state_{};
-  SelectionState selection_{};
   History history_{};
   bool dirty_ = false;
 

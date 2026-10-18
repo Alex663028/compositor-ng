@@ -641,6 +641,13 @@ bool Document::resize_image(comp_size size, std::string* error) {
 
   state_.width = size.width;
   state_.height = size.height;
+  /*
+   * 换画布 = 换文档坐标系，选区蒙版（文档分辨率）随之失效。上游 ImageResizer
+   * 直接构造一个新的 CanvasDocument，选区自然不存在；这里同样**丢弃**而不是
+   * 缩放——缩放一张 0/255 的选区会把边缘糊成半选，而上游没有这条通路。
+   * 与尺寸变更同属一步撤销：撤销后选区回来，重做后再次消失。
+   */
+  state_.selection = SelectionState{};
   if (!owns_txn) return true;
   /* commit 失败时已自行回滚到快照（见 txn_commit），失败即未发生。 */
   return txn_commit(error) == COMP_OK;

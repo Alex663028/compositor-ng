@@ -14,19 +14,27 @@ std::size_t string_bytes(const std::string& s) { return s.capacity() + sizeof(st
 /* 单个像素/蒙版资产的估算占用：数据容量 + vector 头 + shared_ptr 控制块。 */
 constexpr std::size_t kAssetOverheadBytes = sizeof(std::vector<uint8_t>) + 48;
 
+void account_asset(const std::shared_ptr<std::vector<uint8_t>>& asset,
+                   std::set<const void*>* seen, std::size_t* bytes) {
+  if (asset == nullptr || asset->empty()) return;
+  /* bytes 为 nullptr 时仅做「已见」标记（用于先登记活文档资产）。 */
+  if (seen->insert(asset.get()).second && bytes != nullptr) {
+    *bytes += asset->capacity() + kAssetOverheadBytes;
+  }
+}
+
 void collect_state_assets(const DocumentState& state, std::set<const void*>* seen,
                           std::size_t* bytes) {
   for (const Layer& layer : state.layers) {
-    const std::shared_ptr<std::vector<uint8_t>> assets[] = {layer.pixels.pixels,
-                                                            layer.mask.pixels};
-    for (const std::shared_ptr<std::vector<uint8_t>>& asset : assets) {
-      if (asset == nullptr || asset->empty()) continue;
-      /* bytes 为 nullptr 时仅做「已见」标记（用于先登记活文档资产）。 */
-      if (seen->insert(asset.get()).second && bytes != nullptr) {
-        *bytes += asset->capacity() + kAssetOverheadBytes;
-      }
-    }
+    account_asset(layer.pixels.pixels, seen, bytes);
+    account_asset(layer.mask.pixels, seen, bytes);
   }
+  /*
+   * 选区蒙版（文档分辨率的 8 位灰度）与图层资产走同一本账：一次形状操作
+   * 产出一张新蒙版，旧蒙版随历史快照保留——它是画布级缓冲，漏记的话
+   * 一张 30000×30000 的选区就是约 900 MB 不计入预算。
+   */
+  account_asset(state.selection.base.pixels, seen, bytes);
 }
 
 }  // namespace
@@ -52,6 +60,8 @@ std::size_t document_state_bytes(const DocumentState& state) {
       total += string_bytes(effect.settings_json);
     }
   }
+  /* 选区蒙版（深拷贝口径，与图层像素/蒙版一致）。 */
+  total += state.selection.base.pixel_data().capacity();
   return total;
 }
 
