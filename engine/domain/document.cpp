@@ -136,6 +136,7 @@ Layer* Document::create_layer(const comp_layer_desc& desc, comp_layer_id* out_id
   const comp_layer_id id = layer.id;
   state_.layers.push_back(std::move(layer));
   if (state_.active_layer == 0) state_.active_layer = id;
+  invalidate_composite();
 
   if (out_id != nullptr) *out_id = id;
   return find(id);
@@ -177,6 +178,7 @@ bool Document::remove_subtree(comp_layer_id id) {
   if (state_.active_layer == id) {
     state_.active_layer = state_.layers.empty() ? 0 : state_.layers.back().id;
   }
+  invalidate_composite();
   return true;
 }
 
@@ -240,6 +242,7 @@ bool Document::reorder_layer(comp_layer_id id, comp_layer_id before) {
       if (l.parent == parent) p->children.push_back(l.id);
     }
   }
+  invalidate_composite();
   return true;
 }
 
@@ -520,6 +523,7 @@ bool Document::merge_down(comp_layer_id id, std::string* error) {
 
   state_.layers = std::move(next);
   state_.active_layer = merged_layer.id;
+  invalidate_composite();
   if (!owns_txn) return true;
   /*
    * commit 内部要拷贝两份整篇 DocumentState 进历史栈，分配失败时它已自行
@@ -648,6 +652,7 @@ bool Document::resize_image(comp_size size, std::string* error) {
    * 与尺寸变更同属一步撤销：撤销后选区回来，重做后再次消失。
    */
   state_.selection = SelectionState{};
+  invalidate_composite();
   if (!owns_txn) return true;
   /* commit 失败时已自行回滚到快照（见 txn_commit），失败即未发生。 */
   return txn_commit(error) == COMP_OK;
@@ -663,9 +668,11 @@ bool Document::flatten_image(std::string* error) {
   for (const Layer& layer : state_.layers) all.push_back(layer.id);
   if (!merge_subset_is_bakeable(*this, all, error)) return false;
 
-  /* 拼合即整篇合成：直接复合活文档，无需子集临时文档。 */
-  ImageBuffer canvas;
-  if (!composite_document(*this, &canvas, error)) return false;
+  /* 拼合即整篇合成：优先复用画布级合成缓存（MERGED）。像素按共享快照接过来，
+   * 之后对该层写像素会触发 COW，不会污染缓存。 */
+  const ImageBuffer* view = nullptr;
+  if (!composite_document_cached(*this, &view, error)) return false;
+  ImageBuffer canvas = *view;
 
   Layer flat;
   flat.name = "Background";
@@ -687,6 +694,7 @@ bool Document::flatten_image(std::string* error) {
   state_.layers.clear();
   state_.layers.push_back(std::move(flat));
   state_.active_layer = state_.layers.front().id;
+  invalidate_composite();
   if (!owns_txn) return true;
   /* commit 失败（历史栈分配失败）时 txn_commit 已自行回滚，避免「报失败但文档已改」。 */
   return txn_commit(error) == COMP_OK;
@@ -707,6 +715,8 @@ comp_result Document::txn_begin(std::string label, std::string* error) {
   txn_active_ = true;
   txn_label_ = std::move(label);
   txn_snapshot_ = std::move(snapshot);
+  /* 事务一开始缓存就不可再采信：事务内看到的是中间态，提交/回滚都可能换掉整份状态。 */
+  invalidate_composite();
   return COMP_OK;
 }
 
@@ -716,6 +726,8 @@ comp_result Document::txn_commit(std::string* error) {
     return COMP_ERR_STATE;
   }
   txn_active_ = false;
+  /* 提交后状态已定型，但缓存记的是事务前/中间态：作废，下次渲染重算。 */
+  invalidate_composite();
   /*
    * 压历史可能抛 bad_alloc（两份整篇状态进撤销栈）。此前异常直接逃出：
    * 状态已改、事务已关闭、历史里却没有这条记录——「报失败但改动生效且撤不回」，
@@ -749,6 +761,8 @@ comp_result Document::txn_abort(std::string* error) {
     return COMP_ERR_STATE;
   }
   txn_active_ = false;
+  /* 回滚 = 换掉整份状态，缓存同样作废。 */
+  invalidate_composite();
   /*
    * 与 txn_commit 的回滚同一把尺子：swap 是 noexcept 的，且把「待回滚的新状态」
    * 装进 txn_snapshot_ 后随临时量销毁——不用可能抛 bad_alloc 的拷贝赋值。
@@ -762,6 +776,7 @@ comp_result Document::txn_abort(std::string* error) {
 void Document::commit_implicit(const std::string& label, DocumentState before) {
   history_.push(label, std::move(before), state_);
   dirty_ = true;
+  invalidate_composite();
 }
 
 bool Document::undo() {
@@ -775,6 +790,7 @@ bool Document::undo() {
   if (!history_.undo(&restored)) return false;
   state_ = std::move(restored);
   dirty_ = true;
+  invalidate_composite();
   return true;
 }
 
@@ -784,6 +800,7 @@ bool Document::redo() {
   if (!history_.redo(&restored)) return false;
   state_ = std::move(restored);
   dirty_ = true;
+  invalidate_composite();
   return true;
 }
 

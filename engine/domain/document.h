@@ -5,6 +5,7 @@
 #ifndef COMPOSITOR_DOMAIN_DOCUMENT_H
 #define COMPOSITOR_DOMAIN_DOCUMENT_H
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -114,7 +115,40 @@ class Document {
   bool resize_image(comp_size size, std::string* error);
 
   bool is_dirty() const noexcept { return dirty_; }
-  void mark_dirty(bool value) noexcept { dirty_ = value; }
+  void mark_dirty(bool value) noexcept {
+    /* mark_dirty(true) 是「宿主直接改了像素但没走事务」的兜底信号，缓存随之作废；
+       mark_dirty(false) 只是存盘后清标记，像素没动，没必要让缓存重算。 */
+    if (value) invalidate_composite();
+    dirty_ = value;
+  }
+
+  /* ------------------------------------------- 合成缓存（MERGED，S12 追加） */
+  /*
+   * 画布级合成结果缓存。它是**派生数据**，不属于文档状态：
+   *   - 不进事务快照、不进历史、不参与 .comp 序列化；
+   *   - 随时可以丢弃，丢了只会多算一次合成，不影响任何可观察结果。
+   *
+   * 键 = content_serial()。任何可能改变合成结果的写入都必须让序列号 +1
+   * （事务提交/回滚、隐式提交、撤销/重做、图层结构增删挪、画布重采样、
+   * 显式 mark_dirty(true)）——加错了只多算一次，漏加才会读到旧画面。
+   *
+   * 活跃事务期间缓存不得被采信（事务是中间态），这条由取值方
+   * composite_document_cached 负责，不在这里强制。
+   */
+  uint64_t content_serial() const noexcept { return content_serial_; }
+  void invalidate_composite() noexcept {
+    ++content_serial_;
+    composite_cache_valid_ = false;
+  }
+  bool composite_cache_valid() const noexcept { return composite_cache_valid_; }
+  uint64_t composite_cache_serial() const noexcept { return composite_cache_serial_; }
+  ImageBuffer& composite_buffer() noexcept { return composite_cache_; }
+  const ImageBuffer& composite_buffer() const noexcept { return composite_cache_; }
+  /* 调用方刚把「当前状态的合成结果」写进 composite_buffer()，登记缓存键。 */
+  void mark_composite_cache_valid() noexcept {
+    composite_cache_serial_ = content_serial_;
+    composite_cache_valid_ = true;
+  }
 
   /*
    * 句柄有效性（与 Engine 同一套轻量方案，见 engine.h 文件头）：
@@ -162,6 +196,13 @@ class Document {
   std::string txn_label_;
   DocumentState txn_snapshot_{};
   std::vector<void*> txn_slots_{};
+
+  /* 合成缓存（派生数据，见 public 区的说明）。 */
+  uint64_t content_serial_ = 0;
+  uint64_t composite_cache_serial_ = 0;
+  bool composite_cache_valid_ = false;
+  ImageBuffer composite_cache_{};
+
   uint32_t handle_magic_ = kDocumentMagic;
 };
 

@@ -401,3 +401,7 @@ coverage 把样本盖回当前像素。
   点阵 95 字形 + 字号/行距/字距排版 + 精确面积覆盖率 AA / 像素中心硬边）。基线
   424 → **431 用例**（`test_tool_ops` 4 + `test_tool_ops_domain` 2 + `test_ui_core` 1），
   壳自检 137 → **150 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.21。
+- S12 追加（2026-10-18）：内部 C++ 画布级合成缓存（`composite_document_cached`，
+  派生数据，不进 `DocumentState`/历史/`.comp`），**不新增算子、不改 ABI**（仍 112 个
+  导出）。基线 431 → **435 用例**（`test_composite_cache` 4），壳自检 150 → **155 项**，
+  `run_regression.py --require-ohos` 6/6 PASS。见 README §6.22。

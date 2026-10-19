@@ -44,6 +44,22 @@ comp_pixel_format composite_surface_format(const Document& doc);
 bool composite_document(const Document& doc, ImageBuffer* out, std::string* error);
 
 /*
+ * 带画布级缓存的整篇合成（MERGED，S12 追加）。
+ *
+ * 缓存存在 Document 里，键 = Document::content_serial()：任何可能改变合成结果的
+ * 写入都会让序列号 +1（事务提交/回滚、隐式提交、撤销/重做、图层增删挪、画布重采样）。
+ * 命中时零合成、零像素拷贝——直接返回文档持有的只读缓冲。
+ *
+ * 契约：
+ *   - 返回的指针归文档所有，**下一次文档变更或下一次本函数调用后即可能失效**，
+ *     调用方不得跨变更持有；需要留存请拷一份 ImageBuffer（shared_ptr 只增引用）。
+ *   - 活跃事务期间**绝不返回缓存内容**：事务是未定型的中间态，此时照常求值到
+ *     文档的缓存槽并把它标成无效（求值结果供本次使用，不做缓存命中）。
+ *   - 失败时不改缓存；error 与 composite_document 同口径。
+ */
+bool composite_document_cached(Document& doc, const ImageBuffer** out, std::string* error);
+
+/*
  * 仅合成单个图层（含其剪贴基底），用于图层缩略图。
  * 内部按图层深度求值（half 图层在 half 表面上合成），输出始终是 RGBA8 的
  * 显示副本——缩略图的调用契约不变，高光只在这最后一步按白显示截断。

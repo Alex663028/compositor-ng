@@ -37,8 +37,17 @@ bool CpuRenderBackend::render_document(Document& doc, const comp_render_target& 
     return false;
   }
 
-  ImageBuffer composite;
-  if (!composite_document(doc, &composite, error)) return false;
+  /*
+   * MERGED：走画布级合成缓存。同一文档在事务外连续渲染（外壳每次 WM_PAINT、
+   * 自检连续拍快照）只合成一次；缓存失效后由这里重算并回填。
+   * 注意返回的是文档持有的只读视图，下面不再修改它，只做深度转换与拷贝。
+   */
+  const ImageBuffer* composite = nullptr;
+  if (!composite_document_cached(doc, &composite, error)) return false;
+  if (composite == nullptr) {
+    if (error != nullptr) *error = "composite view is null";
+    return false;
+  }
 
   /*
    * C5：目标深度与合成表面深度不一致时显式转换一次。
@@ -51,17 +60,17 @@ bool CpuRenderBackend::render_document(Document& doc, const comp_render_target& 
    * 同深度时零拷贝直通：8 位文档的既有输出逐字节不变。
    */
   ImageBuffer converted;
-  const ImageBuffer* source = &composite;
-  if (target.format == COMP_PIXEL_RGBA8 && composite.format != COMP_PIXEL_RGBA8) {
-    if (!hdr_to_rgba8(composite, &converted)) {
+  const ImageBuffer* source = composite;
+  if (target.format == COMP_PIXEL_RGBA8 && composite->format != COMP_PIXEL_RGBA8) {
+    if (!hdr_to_rgba8(*composite, &converted)) {
       if (error != nullptr) *error = "failed to build an 8-bit view of the HDR composite";
       return false;
     }
     source = &converted;
-  } else if (target.format == COMP_PIXEL_RGBA16F && composite.format != COMP_PIXEL_RGBA16F) {
+  } else if (target.format == COMP_PIXEL_RGBA16F && composite->format != COMP_PIXEL_RGBA16F) {
     ImageBuffer hdr;
-    hdr.resize(composite.width, composite.height, COMP_PIXEL_RGBA16F);
-    if (!rgba8_to_hdr(composite, &hdr)) {
+    hdr.resize(composite->width, composite->height, COMP_PIXEL_RGBA16F);
+    if (!rgba8_to_hdr(*composite, &hdr)) {
       if (error != nullptr) *error = "failed to build a half view of the 8-bit composite";
       return false;
     }

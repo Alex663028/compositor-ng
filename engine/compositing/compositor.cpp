@@ -58,6 +58,34 @@ bool composite_document(const Document& doc, ImageBuffer* out, std::string* erro
   return execute_filter_graph(doc, graph, out, error);
 }
 
+bool composite_document_cached(Document& doc, const ImageBuffer** out, std::string* error) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "out view is null";
+    return false;
+  }
+  *out = nullptr;
+
+  /*
+   * 活跃事务是未定型的中间态：照常求值供本次使用，但不读也不写缓存键，
+   * 避免「事务内的半成品」被当成交付状态在事务外复用。
+   */
+  const bool in_txn = doc.txn_active();
+  if (!in_txn && doc.composite_cache_valid() &&
+      doc.composite_cache_serial() == doc.content_serial()) {
+    *out = &doc.composite_buffer();
+    return true;
+  }
+
+  /* 缓存槽同时也是求值目标：未命中时复用同一块画布级缓冲，避免每次渲染重新分配。 */
+  ImageBuffer& buffer = doc.composite_buffer();
+  if (!composite_document(doc, &buffer, error)) return false;
+  if (!in_txn) {
+    doc.mark_composite_cache_valid();
+  }
+  *out = &buffer;
+  return true;
+}
+
 bool composite_layer(const Document& doc, comp_layer_id id, ImageBuffer* out, std::string* error) {
   if (out == nullptr) {
     if (error != nullptr) *error = "out buffer is null";

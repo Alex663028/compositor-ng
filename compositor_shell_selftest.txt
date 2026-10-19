@@ -99,6 +99,11 @@
 [OK] text entirely outside the layer succeeds as a no-op
 [OK] an off-canvas text box leaves no empty undo step
 [OK] an off-canvas text box leaves the render byte-identical
+[OK] two consecutive renders are byte-identical (MERGED cache hit)
+[OK] comp_tool_apply(COMP_TOOL_TYPE "A") for the MERGED cache check
+[OK] an edit invalidates the MERGED cache (the next frame shows the new pixels)
+[OK] comp_document_undo(MERGED cache step)
+[OK] undo invalidates the MERGED cache and restores the pixels byte-for-byte
 [OK] comp_selection_get_active() starts at 0 (no selection)
 [OK] comp_selection_apply_shape(rect)
 [OK] comp_selection_get_active() == 1 after a rect shape

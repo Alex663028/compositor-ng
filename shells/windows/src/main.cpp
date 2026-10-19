@@ -5219,6 +5219,34 @@ int run_selftest(const wchar_t* out_path) {
          "an off-canvas text box leaves the render byte-identical");
 
   /*
+   * 合成缓存（MERGED，S12）：外壳每次 WM_PAINT 都走 comp_render_flatten，
+   * 缓存命中与否**不得改变画面**，而任何一次编辑都必须立刻反映到下一帧。
+   * 这里用「连拍两张 + 编辑后一张 + 撤销后一张」把这三件事钉在 ABI 层。
+   */
+  std::vector<uint8_t> merged_first(stride * static_cast<size_t>(height), 0);
+  std::vector<uint8_t> merged_second(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, merged_first.data(), COMP_PIXEL_RGBA8, stride);
+  comp_render_flatten(document, merged_second.data(), COMP_PIXEL_RGBA8, stride);
+  verify(merged_first == merged_second,
+         "two consecutive renders are byte-identical (MERGED cache hit)");
+
+  comp_tool_op_desc merged_desc = type_desc;
+  merged_desc.type.origin_x = 8.0;
+  merged_desc.type.origin_y = 8.0;
+  verify(comp_tool_apply(document, layer, &merged_desc, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_OK,
+         "comp_tool_apply(COMP_TOOL_TYPE \"A\") for the MERGED cache check");
+  std::vector<uint8_t> merged_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, merged_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(merged_after != merged_first,
+         "an edit invalidates the MERGED cache (the next frame shows the new pixels)");
+  verify(comp_document_undo(document) == COMP_OK, "comp_document_undo(MERGED cache step)");
+  std::vector<uint8_t> merged_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, merged_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(merged_restored == merged_first,
+         "undo invalidates the MERGED cache and restores the pixels byte-for-byte");
+
+  /*
    * 选区：壳层蚂蚁线的数据源就是这条「有效 coverage」查询。这里冻结三件事：
    * 契约里「无选区」与「显式空选区」不同、覆盖率为文档分辨率、选区变更是一步撤销。
    */

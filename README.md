@@ -180,6 +180,18 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Type/Shape/Gradient 一行三个子项全部交付 → **29/48 ≈ 60%**（Type 为 ASCII 点阵，
   边界见 §6.21）。详见 §6.21。
 
+  2026-10-18 第二十二轮（S12 合成缓存 MERGED：`composite_document_cached`）：把「每次
+  渲染都整篇重算」改成**文档级画布缓存**。`Document` 增加派生状态（内容序列号 +
+  `ImageBuffer` 缓存槽 + 有效标记/键），任何可能改变合成结果的写入都让序列号 +1
+  （事务提交/回滚/隐式提交、撤销/重做、图层增删挪、合并/拼合/改画布、显式
+  `mark_dirty(true)`）；`compositing/compositor.h` 新增 `composite_document_cached`，
+  命中时零合成、零像素拷贝，直接返回文档持有的只读视图；活跃事务期间**绝不供缓存**
+  （中间态照常求值但不入缓存键）。`CpuRenderBackend::render_document` 改走该入口再做
+  深度转换，拼合（Flatten）复用缓存并把像素 `shared_ptr` 直接接管（后续写入走 COW，
+  不复制整幅画布）。**不新增导出 ABI**（仍 **112** 个）、不改任何 ABI 结构体与工具算子。
+  基线 431 → **435 用例**（新增 `tests/test_composite_cache.cpp` 4 例），Windows 壳自检
+  150 → **155 项**；口径 B 计分不变 **29/48 ≈ 60%**（内部实现不计分）。详见 §6.22。
+
 ## 1. M1 目标与范围
 
 | 项目 | 内容 |
@@ -433,9 +445,9 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 90（38 个 `.c` + 52 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 431 cases, 0 failed, 0 check failures`（当前基线；§6.21 起） |
+| 测试 | `summary: 435 cases, 0 failed, 0 check failures`（当前基线；§6.22 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：52 `.cpp` / 38 `.c`（含 vendored 26）/ 90 `.h`（含 vendored）；tests：34 `.cpp` |
+| 源码规模 | engine：52 `.cpp` / 38 `.c`（含 vendored 26）/ 90 `.h`（含 vendored）；tests：35 `.cpp` |
 
 blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
 `_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
@@ -450,6 +462,9 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
   `.comp` 存取往返 → 缩略图），全程只用 C ABI；另含组隔离 `set/get_isolated` 的 ABI 往返
   与「穿透=黑 / 隔离=绿」的合成语义钉死。
 - `test_compositing.cpp`：把 24 种混合模式的清单字符串与上游枚举逐字锁定。
+- `test_composite_cache.cpp`：画布级合成缓存（MERGED）——事务外连拍命中同一块缓冲且与现算
+  逐字节一致、图层结构/像素写入/撤销/重做都会失效重算、活跃事务期间不供缓存（事务内渲染
+  看到未提交像素，提交/回滚后各自正确）、拼合复用缓存且零拷贝接管像素。
 - `test_parallel.cpp`：区间调度「恰好覆盖一次」（6 种规模 × 5 种线程数）、退化输入不改内存、
   band 线程数默认 1，以及两个走 band 调度的内核在 threads=1 与 =4 下输出逐字节一致。
 - `test_filter_graph.cpp`：建图的节点/边与 backdrop 链；穿透组的「混合穿透 + 组不透明度乘进
@@ -1457,7 +1472,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **150 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **155 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
 + ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
@@ -2696,6 +2711,60 @@ Gradient 三个子项全部有产品通路，该条从「部分命中」升为**
 「该条不再缺子项」。
 
 报告：`../report/S11-type-20261018-dsh.md`。
+
+### 6.22 S12 合成缓存：`composite_document_cached`（2026-10-18，DSH）
+
+S11 收口后，编辑链路（工具算子、撤销/重做、图层结构）已全部落地，但每次 `WM_PAINT`
+与每次 `comp_render_flatten` 都从零建 FilterGraph、整篇重算——外壳连续重绘同一画面时
+这笔账被重复支付。这一轮只做**派生数据缓存**，不碰任何 ABI，也不改变任何像素结果。
+
+**1. 缓存放哪、键是什么。** `Document` 新增四个私有字段：`content_serial_`（内容序列号）、
+`composite_cache_`（画布级 `ImageBuffer`）、`composite_cache_serial_`（缓存对应的序列号）、
+`composite_cache_valid_`。它们是**派生状态**：不进 `DocumentState`、不进事务快照、
+不进撤销栈、不参与 `.comp` 序列化——丢了只会多算一次合成，对任何可观察结果零影响。
+
+**2. 失效（invalidate）在哪。** 所有能改变合成结果的入口都让序列号 +1：
+`txn_begin` / `txn_commit` / `txn_abort` / `commit_implicit` / `undo` / `redo`、
+`create_layer` / `remove_subtree` / `reorder_layer` / `merge_down` / `flatten_image` /
+`resize_image`，以及宿主兜底的 `mark_dirty(true)`。约束是**宁可多算一次**：漏加会读到旧
+画面，多加只多算一次。ABI 侧所有写入都包在 `ImplicitTxn` 里（提交即 `commit_implicit`），
+显式事务走 `txn_commit`——两族入口都已覆盖，因此**没有**给逐算子增加 hook。
+唯一不经过序列号的是**域内代码/域测试直接改 `layer->pixels`**：那条路没有事件可挂，域测试
+要么用 `composite_document` 现算，要么显式 `mark_dirty(true)` 标记；ABI 与外壳没有这条路径。
+
+**3. 取值契约。** `composite_document_cached(Document&, const ImageBuffer**, std::string*)`：
+- 命中（有效 且 键 == 当前序列号 且 不在事务内）→ 直接返回文档持有的只读视图；
+- 未命中 → 以文档的缓存槽为目标求值 `composite_document`（同一条 FilterGraph 通路），
+  成功后才登记缓存键；
+- **活跃事务期间不命中、也不登记**：事务是未定型的中间态，照常求值供本次使用，但绝不让
+  「事务内的半成品」在事务外被复用；
+- 返回指针的生存期到下一次文档变更或下一次本函数调用为止；要留存就拷 `ImageBuffer`
+  （`shared_ptr` 只增引用，不复制像素）。
+
+**4. 接进渲染与拼合。** `CpuRenderBackend::render_document` 从「先 `composite_document`
+到局部变量」改为「取缓存视图 → 按目标深度转换（`hdr_to_rgba8` / `rgba8_to_hdr`）→ 逐行
+`memcpy`」；同深度时仍是零拷贝直通，8 位输出逐字节不变。`flatten_image` 直接复用缓存：
+`ImageBuffer` 结构拷贝接走 `shared_ptr`，拼合层之后写像素触发 COW，不复制整幅画布。
+D3D12 / Vulkan 的 GPU 路径不经过 `compositing/compositor`，本轮不接（它们本来就是每次
+重画，语义不变）。
+
+**5. 测试与基线。** 新增 `tests/test_composite_cache.cpp` 4 例：① 事务外连拍命中同一块
+缓冲（指针相同、序列号不变、内容与现算逐字节一致）；② 图层结构变化 / 显式像素写入 /
+撤销 / 重做都会失效重算，且撤销到底回到最初画面；③ 活跃事务期间不供缓存（事务内渲染看到
+未提交像素、两次事务内渲染一致、提交/回滚后各自正确）；④ 拼合复用缓存且像素零拷贝接管。
+基线 431 → **435 用例 0 失败**；`--selftest` 新增 5 项（连拍逐字节相同、编辑后下一帧
+变化、撤销后逐字节还原），150 → **155 项**，`compositor_shell_selftest.txt` 同步重新生成
+（SHA256 `483e8883dc5bcb9d…`）；`run_regression.py --require-ohos` **6/6 PASS
+（0 skipped）**，含 OHOS aarch64 交叉编译 rc=0。
+
+**6. 事实边界与代价。** 缓存是**一条**画布级缓冲（RGBA8 或 RGBA16F，跟
+`composite_surface_format` 走），不进 512 MB 历史预算、也不算进历史内存记账——它的大小
+恒等于一张画布，不随编辑步数增长。缓存命中/失效都发生在同一次渲染调用栈内，**同一文档的
+并发渲染仍不是线程安全的**（与既有 `comp_render_*` 契约一致）。它不改变任何像素结果、
+不改变任何 ABI、不改变口径 B——**29/48 ≈ 60%** 不动。性能收益本机只做了「连续两次渲染
+第二次不再走 FilterGraph」的定性验证，没有做基准计时，不宣称倍数。
+
+报告：`../report/S12-merged-20261018-dsh.md`。
 
 ## 7. 许可
 
