@@ -13,7 +13,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **447 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
+  全量 **457 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -207,6 +207,18 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   `docs/gpu-layer-revision.md`（只设计不实施：`Layer` 无修订号、`ImageBuffer` 是
   `shared_ptr` + COW，原地写会让缓存静默过期，故先定 `content_revision` + 分配点 + 缓存键
   + 验收口径）。基线 447 → **451 用例**（+4）；详见 §6.27。
+
+  2026-10-19 第二十四轮（S18 逐层内容修订号 R1 落地）：S17 的设计稿只差实施。这一轮把
+  **R1** 做完——`Layer::content_revision`（文档内唯一、单调、同值⟺同内容、不进 `.comp`）+
+  `Document::allocate_revision()` / `touch_layer()` / `touch_all_layers()`，并在**所有**能改
+  图层内容的入口换号：14 个 `comp_layer_*` 写入口、`selection_move_pixels`（changed 时）、
+  `crop_apply` / `document_set_size`（整篇）、`create_layer` / `merge_down` / `flatten_image` /
+  `resize_image` / `load_project`，以及三个**领域自管事务**的入口（`run_tool_op`、
+  `filter_apply`、`camera_raw_apply`）。换号一律发生在 `txn_commit()` **之前**——否则重做会
+  带着编辑后的内容却拿到编辑前的号，R2 的缓存会静默供应旧纹理；这条由「笔刷 → 撤销 → 重做」
+  用例直接钉住。纯结构变更（增删/排序/选中/剪贴源）与 undo/redo 刻意不换号。**不新增导出
+  ABI**（仍 **112**），不动 `.comp`，不动 D3D12。基线 451 → **457 用例**（+6，新的
+  `tests/test_layer_revision.cpp`）；**不宣称加速**（本轮还没有缓存）。详见 §6.28。
 
 ## 1. M1 目标与范围
 
@@ -462,11 +474,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 90（38 个 `.c` + 52 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 91（38 个 `.c` + 53 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 435 cases, 0 failed, 0 check failures`（当前基线；§6.22 起） |
+| 测试 | `summary: 457 cases, 0 failed, 0 check failures`（当前基线；§6.28 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：52 `.cpp` / 38 `.c`（含 vendored 26）/ 90 `.h`（含 vendored）；tests：35 `.cpp` |
+| 源码规模 | engine：53 `.cpp` / 38 `.c`（含 vendored 26）/ 91 `.h`（含 vendored）；tests：37 `.cpp` |
 
 blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
 `_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
@@ -1502,8 +1514,9 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 - ① 契约面 1.5 个点：`run_tool_op` 之外的少量诊断/边界口径；
 - ③ 合成与渲染 0.4 个点：GPU 子集已从「整篇全有或全无」拆到**按合成单元**（裁剪/蒙版/
-  效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27），但仍有两条整篇回落（调整层、
-  HDR 表面），且逐层上传仍是瓶颈、纹理缓存只出了设计稿（`docs/gpu-layer-revision.md`），
+  效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27），**S18 补上逐层纹理缓存的
+  前提**（每层 `content_revision` + 全部写入口换号 + 6 例不变量测试，§6.28），但仍有两条
+  整篇回落（调整层、HDR 表面），且纹理缓存本身（R2）还没做——逐层上传仍是瓶颈，
   直呈只比 CPU flatten+GDI 快 1.18–1.29×（§6.26）；
 - ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
 
@@ -3162,6 +3175,102 @@ S13/S16 的实测已经证明瓶颈是**逐层上传**（1024²/4 层≈3 ms）�
   的 M1–M16 保持未勾选，ALEX 已推迟这项）。
 
 报告：`../report/S17-gpu-per-unit-20261019-dsh.md`。
+
+### 6.28 S18 逐层内容修订号（R1）落地（2026-10-19，DSH）
+
+S17 的结论是：S13/S16 的实测已经把瓶颈指到**逐层上传**（1024²/4 层≈3 ms），要真正拉开
+差距必须做逐层纹理缓存；但当时没有任何东西能告诉缓存「这层内容变没变」，所以 S17 只交付了
+设计稿。S18 把设计稿的 **R1** 实施完：号发了、全部写入点接了、不变量被测试钉住了。
+**本轮还没有缓存，因此一个加速数字都不宣称。**
+
+**1. 为什么三个现成候选键都不能用。**
+
+| 候选键 | 为什么不行 |
+|--------|-----------|
+| `ImageBuffer::pixels` 地址 | `shared_ptr` + COW：图层是唯一持有者时画笔/滤镜/液化**原地写**，地址不变 → 缓存命中旧像素（静默出错） |
+| 像素哈希 | 1024² RGBA8 全量读一遍 ≈ 4 MB，成本约等于上传的一半，收益归零 |
+| `Document::content_serial_` | **整篇**序号：随便动一层全篇失效 → 逐层缓存零收益 |
+
+**2. 数据与发号器。**
+
+```cpp
+struct Layer { uint64_t content_revision = 0; /* 0 = 尚未分配 */ };
+
+// Document
+uint64_t allocate_revision() noexcept { return next_revision_++; }  // 只增，从 1 起
+uint64_t touch_layer(comp_layer_id id) noexcept;                    // 找不到返回 0
+void     touch_all_layers() noexcept;                               // 换画布 / 加载工程
+```
+
+三条不变量（写进 `layer.h` / `document.h` 注释，测试逐条验）：
+
+- **单调**：`next_revision_` 只增不减，撤销/重做不让计数器回落；
+- **同值 ⟺ 同内容**：一个号只对应一份内容，内容再变必须换号。这是缓存唯一的安全前提，
+  所以「同值重写也换号」的过失效是刻意允许的；反向（换号 ⟹ 内容不同）**不**保证；
+- **不序列化**：不进 `.comp`、不进 `DocumentState` 的语义比较——它是会话内派生数据，
+  同一份工程两次加载拿到不同的号完全正常。
+
+`next_revision_` 与合成缓存的 `content_serial_` 并列放在 `Document` 私有区，不进
+`DocumentState`，所以历史/事务/`.comp` 的可观察语义一个字节都没变。
+
+**3. 换号点（22 个调用点 + 3 个新建路径）。** 逐层换号的是 14 个 `comp_layer_*` 写入口
+（`set_pixels`/`set_mask`/`set_blend`/`set_opacity`/`set_transform`/`set_visible`/
+`set_sampling`/`add_adjustment`/`update_adjustment`/`update_adjustment_at`/
+`remove_adjustment`/`set_effect`/`remove_effect`/`set_isolated`）、`selection_move_pixels`
+（仅 `changed` 时）、`resize_image` 与 `load_project`（整篇）、`create_layer` / `merge_down` /
+`flatten_image`（新内容拿新号）；整篇换号的是 `crop_apply`、`document_set_size`（仅
+`changed`/`resized` 时）。三个**领域自管事务**的入口——`run_tool_op`、`filter_apply`、
+`camera_raw_apply`——必须自己在 commit 前换号：它们不能在外面再包 `ImplicitTxn`，否则双记历史。
+
+`load_project` 特意整篇发号而不是留 0：留 0 会让所有层撞同一个缓存键、跨层串纹理，是 R2
+上线后最难查的一类 bug。
+
+**4. 换号必须在 `txn_commit()` 之前（本轮最容易写错的一点）。** 提交时历史栈压入的是
+`state_` 的 after 快照（含 `content_revision`）。若先 commit 再换号：撤销正确（快照把内容与
+旧号一起恢复），但**重做**会把「编辑后的内容」和「编辑前的号」凑在一起 → 违反「同值⟺同内容」
+→ R2 的缓存静默供应旧纹理，表现为「重做没生效」。测试用「笔刷（领域自管事务）→ 撤销 → 重做」
+直接钉住：重做后必须拿到落笔后的号。
+
+**5. 刻意不换号。** 纯结构变更（`layer_add`/`remove`/`reorder`/`set_active`/
+`set_clipping_source`）不换：单层像素没变，纹理可以留；合成计划是每帧从文档重建
+（`build_gpu_plan`），没有需要失效的计划缓存。`undo`/`redo` 不换：快照恢复天然带回正确号。
+失败的写入、恒等滤镜、空选区滤镜、完全落在图层外的**形状**（契约里的 noop）不换号。
+注意**笔刷落空不在此列**——笔刷走「成功且记一步」的既有语义（只有形状/修复/克隆有 noop
+判定），用例里用落空形状验 noop，不是笔刷。
+
+**6. 护栏（`tests/test_layer_revision.cpp`，+6 例，562 行，默认构建即跑）。**
+
+| 用例 | 钉住的不变量 |
+|------|-------------|
+| `layer_revision_is_unique_and_ignores_structure_edits` | 建层即发号、文档内唯一、与创建序同向；reorder/active/clipping/remove 不动既有号 |
+| `layer_revision_bumps_on_every_content_write_entry` | 14 个写入口逐个「目标层换号、隔壁层不动」；只读查询与失败写入（blend 越界、adjustment kind 越界、NOT_FOUND）不换号 |
+| `layer_revision_tracks_undo_and_redo` | 撤销/重做恢复「字节 + 号」；笔刷（领域自管事务）同理；整幅 `comp_render_flatten` 逐字节比对 |
+| `layer_revision_is_per_layer_not_per_buffer` | 两层共享同一 `ImageBuffer`：改一层只换那层的号、另一层字节不动、COW 后地址分离 → 缓存键必须是 `(图层, 修订号)` 而非缓冲地址 |
+| `layer_revision_covers_canvas_tool_filter_and_selection_edits` | 重采样/笔刷/真滤镜/选区搬移换号并可撤销回退；恒等滤镜与落空形状不换号且不加撤销步 |
+| `layer_revision_feeds_gpu_plan_recompute` | 与 `build_gpu_plan` 对齐：整幅原生 → 裁剪变烘焙（号变）→ 改回整幅不复用旧号；穿透组↔隔离组的单元序列与组号同步变化 |
+
+**7. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py`（默认） | **457 cases, 0 failed, 0 check failures**（451 → 457，+6） |
+| `python scripts/build.py --gpu` | **457 cases, 0 failed, 0 check failures** |
+| `python scripts/build_windows_shell.py` + `compositor_shell.exe --selftest=<报告>` | **164 项 0 失败**；报告 SHA256 `AA2E2754…` 与仓内基线 `compositor_shell_selftest.txt` **逐字节一致**（壳代码未改；默认构建 AUTO 走 CPU） |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 `compile ok=91 fail=0`；§6.27 表里记的 90 漏计了 S17 自己新增的 `gpu_plan.cpp`） |
+| ABI 导出 | **112**（未新增；本轮只加引擎内部 C++ 接口） |
+
+**8. 边界（如实记录）。**
+
+- **不宣称加速**：本轮没有缓存，逐帧上传一点没变；S13 离屏 3.01 ms / S16 直呈
+  3.04–3.27 ms 的基线未重测（改动不触及热路径）。
+- 只覆盖**单层**纹理缓存的前提：烘焙单元（组/剪贴/蒙版/效果合成的结果）的缓存键需要
+  「子树修订号集合 + 组结构签名」，是设计稿里的 v2，本轮不做。
+- 事务中途渲染的缓存安全（设计稿 §4.2 第 4 条）属于 R2——现在没有缓存，也就无从违反。
+- 仍整篇回落：调整层、HDR/RGBA16F 表面；Vulkan 文档路径仍未接线。
+- 交互壳主画布仍走 CPU 展平 + GDI；**Win32 人工目视仍未做**（`docs/manual-test.md`
+  的 M1–M16 保持未勾选，ALEX 已推迟这项）。
+
+报告：`../report/S18-layer-revision-20261019-dsh.md`。
 
 ## 7. 许可
 

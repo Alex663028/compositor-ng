@@ -1925,6 +1925,8 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
     }
     target_layer->pixels = std::move(deep_paint.deep);
   }
+  /* S18：像素真的被改过（noop 已在上面整步撤回）→ 换号；**在 commit 之前**。 */
+  document->touch_layer(target);
   if (owns_txn) {
     std::string commit_error;
     if (document->txn_commit(&commit_error) != COMP_OK) {

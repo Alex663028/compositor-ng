@@ -184,6 +184,12 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
       return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
     }
   }
+  /*
+   * S18：内容变了 → 换修订号。**在 txn.commit() 之前**——历史 after 快照要带着
+   * 新号一起入栈，否则重做恢复的是新像素 + 旧号，GPU 会静默读到旧纹理。
+   * 以下所有写入口同此顺序，不再逐处重复说明。
+   */
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -210,6 +216,7 @@ comp_result comp_layer_set_mask(comp_document document, comp_layer_id id, const 
       return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
     }
   }
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -262,6 +269,7 @@ comp_result comp_layer_set_blend(comp_document document, comp_layer_id id,
 
   compositor::abi::ImplicitTxn txn(doc, "Set Blend Mode");
   layer->blend = blend;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -281,6 +289,7 @@ comp_result comp_layer_set_opacity(comp_document document, comp_layer_id id, flo
 
   compositor::abi::ImplicitTxn txn(doc, "Set Opacity");
   layer->opacity = clamp_opacity(opacity);
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -316,6 +325,7 @@ comp_result comp_layer_set_transform(comp_document document, comp_layer_id id,
    * 否则 effective_bounds 会一直返回空矩形。 */
   layer->clipped_empty = false;
   layer->rotation = rotation;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -335,6 +345,7 @@ comp_result comp_layer_set_visible(comp_document document, comp_layer_id id, int
 
   compositor::abi::ImplicitTxn txn(doc, "Set Visibility");
   layer->visible = visible != 0;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -376,6 +387,7 @@ comp_result comp_layer_set_sampling(comp_document document, comp_layer_id id,
 
   compositor::abi::ImplicitTxn txn(doc, "Set Sampling");
   layer->sampling = sampling;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -424,6 +436,7 @@ comp_result comp_layer_add_adjustment(comp_document document, comp_layer_id targ
   adjustment.kind = kind;
   adjustment.settings_json = settings;
   layer->adjustments.push_back(std::move(adjustment));
+  doc->touch_layer(target);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -455,6 +468,7 @@ comp_result comp_layer_update_adjustment(comp_document document, comp_layer_id i
 
   compositor::abi::ImplicitTxn txn(doc, "Update Adjustment");
   layer->adjustments.front().settings_json = settings;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -485,6 +499,7 @@ comp_result comp_layer_update_adjustment_at(comp_document document, comp_layer_i
   compositor::abi::ImplicitTxn txn(doc, "Update Adjustment");
   layer->adjustments[index].kind = kind;
   layer->adjustments[index].settings_json = settings;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -507,6 +522,7 @@ comp_result comp_layer_remove_adjustment(comp_document document, comp_layer_id i
 
   compositor::abi::ImplicitTxn txn(doc, "Remove Adjustment");
   layer->adjustments.erase(layer->adjustments.begin() + static_cast<std::ptrdiff_t>(index));
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -688,6 +704,7 @@ comp_result comp_layer_set_effect(comp_document document, comp_layer_id id, uint
     created.settings_json = settings;
     layer->effects.push_back(std::move(created));
   }
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -722,6 +739,7 @@ comp_result comp_layer_remove_effect(comp_document document, comp_layer_id id, u
       std::remove_if(layer->effects.begin(), layer->effects.end(),
                      [effect](const compositor::Effect& e) { return e.effect == effect; }),
       layer->effects.end());
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -809,6 +827,7 @@ comp_result comp_layer_set_isolated(comp_document document, comp_layer_id id, in
 
   compositor::abi::ImplicitTxn txn(doc, "Set Isolation");
   layer->isolated = isolated != 0;
+  doc->touch_layer(id);
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)

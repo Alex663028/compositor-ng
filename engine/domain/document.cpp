@@ -94,6 +94,17 @@ const Layer* Document::find(comp_layer_id id) const {
   return nullptr;
 }
 
+uint64_t Document::touch_layer(comp_layer_id id) noexcept {
+  Layer* layer = find(id);
+  if (layer == nullptr) return 0;
+  layer->content_revision = allocate_revision();
+  return layer->content_revision;
+}
+
+void Document::touch_all_layers() noexcept {
+  for (Layer& layer : state_.layers) layer.content_revision = allocate_revision();
+}
+
 Layer* Document::create_layer(const comp_layer_desc& desc, comp_layer_id* out_id) {
   Layer layer;
   /*
@@ -107,6 +118,8 @@ Layer* Document::create_layer(const comp_layer_desc& desc, comp_layer_id* out_id
   }
 
   layer.id = state_.next_layer_id++;
+  /* S18：新图层的修订号在同一个「不可见中间态」里一起分配（id 与号都只增）。 */
+  layer.content_revision = allocate_revision();
   layer.name = (desc.name != nullptr && desc.name[0] != '\0') ? desc.name : std::string();
   layer.blend = desc.blend;
   layer.opacity = std::min(1.0f, std::max(0.0f, desc.opacity));
@@ -472,6 +485,9 @@ bool Document::merge_down(comp_layer_id id, std::string* error) {
     return false;
   }
   merged_layer.id = state_.next_layer_id++;
+  /* S18：结果层是一份新内容，必须拿新号（沿用锚点层的旧号会让 GPU 缓存把
+   * 「合并前那一层」的纹理当成本层的）。同在 txn 内、commit 之前。 */
+  merged_layer.content_revision = allocate_revision();
 
   std::vector<Layer> next;
   next.reserve(state_.layers.size());
@@ -563,6 +579,14 @@ bool Document::resize_image(comp_size size, std::string* error) {
     if (error != nullptr) *error = txn_error;
     return false;
   }
+
+  /*
+   * S18：换画布 = 换坐标系，所有层的几何/像素都可能变，整篇换号。
+   * 放在循环之前而不是之后：中途重采样失败时要么 abort（快照把旧号整份恢复），
+   * 要么在调用方显式事务里留下「改了一半」的状态——两种情况下新号都只会
+   * 多失效一次缓存，绝不会漏失效。
+   */
+  touch_all_layers();
 
   for (Layer& layer : state_.layers) {
     if (layer.clipped_empty) continue; /* 已被裁空的层没有内容可缩放 */
@@ -691,6 +715,8 @@ bool Document::flatten_image(std::string* error) {
     return false;
   }
   flat.id = state_.next_layer_id++;
+  /* S18：拼合结果是一份新内容 → 新号。 */
+  flat.content_revision = allocate_revision();
   state_.layers.clear();
   state_.layers.push_back(std::move(flat));
   state_.active_layer = state_.layers.front().id;

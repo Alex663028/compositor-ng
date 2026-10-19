@@ -132,6 +132,9 @@ comp_result comp_crop_apply(comp_document document, comp_crop_rect rect, int32_t
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
                                  "invalid crop rect or layer transform overflow");
   }
+  /* S18：换画布 = 换坐标系（每层 transform 都平移了），整篇换号。changed=0 时
+   * 上面什么都没动、也不会 commit，此时不换号。 */
+  if (changed) doc->touch_all_layers();
   if (changed) txn.commit();
   if (out_changed != nullptr) *out_changed = changed ? 1 : 0;
   return compositor::abi::ok(engine);

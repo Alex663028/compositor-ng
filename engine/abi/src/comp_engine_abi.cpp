@@ -302,6 +302,9 @@ comp_result comp_document_set_size(comp_document document, comp_size size) {
       layer.transform = clipped;
     }
   }
+  /* S18：尺寸变了 = 换坐标系（超界层的 transform 被裁），整篇换号；尺寸没变时
+   * 上面只是原样写回，不换号。 */
+  if (resized) doc->touch_all_layers();
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)

@@ -1341,6 +1341,8 @@ bool camera_raw_apply(Document* document, comp_layer_id target, const CameraRawS
     abort_txn();
     return fail(status, failure);
   }
+  /* S18：像素真的被改过 → 换号；**在 commit 之前**（历史 after 快照要带新号）。 */
+  document->touch_layer(target);
   if (owns_txn) {
     std::string commit_error;
     if (document->txn_commit(&commit_error) != COMP_OK) {

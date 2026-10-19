@@ -1,9 +1,15 @@
 # GPU 逐层纹理缓存的修订号设计（S17 设计稿）
 
-状态：**设计，未实施**。本文只确定数据结构、修订号分配点、缓存键与验收口径；
+状态：**R1 已实施（S18），R2 待做**。本文确定数据结构、修订号分配点、缓存键与验收口径；
 不修改 C ABI（导出仍 112 个）、不改 `.comp` 格式、不动事务/历史语义。
 
-关联：§6.23（S13 GPU 设备侧接入）、§6.26（S16 DXGI 直呈）、§6.27（S17 按单元拆细）。
+- **R1 已落地**：`Layer::content_revision`、`Document::allocate_revision()` /
+  `touch_layer()` / `touch_all_layers()`、全部写入口换号（含 3 个领域自管事务入口）、
+  §4.1 的 1–5 条验收测试（`tests/test_layer_revision.cpp` 6 例，默认构建 457 例全绿）。
+- **R2 未做**：D3D12 持久纹理缓存、`texture_uploads()` 计数、§4.2 的真机测试与基准复测。
+
+关联：§6.23（S13 GPU 设备侧接入）、§6.26（S16 DXGI 直呈）、§6.27（S17 按单元拆细）、
+§6.28（S18 R1 落地）。
 
 ---
 
@@ -87,28 +93,34 @@ class Document {
 | 结构 | `set_parent`、`set_isolated`、`set_clipping_source`、`reorder`、`remove`、`add` | 单元序列/子树归属变了；单层纹理可留，**计划**必须重算 |
 | 画布 | Image Size / Canvas Size / `resize_image` | 所有层像素被重采样 → 全部换号（或把 `doc.width/height` 放进缓存键，双保险） |
 
-实施落点（按顺序）：
+实施落点（**S18 / R1 已按此落地**；与最初草案不同的地方标了「实测修正」）：
 
-1. `Layer::content_revision` + `Document::allocate_revision()` + `Layer::touch()`；
-   新建图层时在 `Document::create_layer` 里分配。
-2. **ABI 写入口统一 bump**：`comp_layer_*` 的 setter、`comp_tool_apply`、
-   `comp_filter_apply`、`comp_crop_*`、`comp_io_import*`、`comp_layer_merge_down`、
-   撤销/重做、事务提交/回滚。放在 ABI 层的好处是「一个用户操作 = 一次 bump」，
-   不会因为 domain 内部多段写而重复推进。
-3. **直接写像素的 domain 路径必须自查**。`grep -n "writable_pixels()\|writable_row("`
-   当前有 **61 处**，集中在：
-   `domain/tool_ops.cpp`（笔刷/克隆/涂抹/液化/修复/噪声，约 20 处）、
-   `domain/filters.cpp`、`domain/camera_raw.cpp`、`domain/selection_pixels.cpp`、
-   `format/comp_file.cpp`（导入）、`compositing/resample.cpp`、
-   `compositing/compositor.cpp`、`compositing/composite_ops.cpp`。
-   规则：这些函数**不各自 bump**，由调用它们的 ABI/事务入口统一 bump；纯内部
-   派生缓冲（`out`、临时 surface）不 bump——它们不是图层内容。
-4. **事务/撤销**：
-   - `txn_commit` 已有整篇 `invalidate_composite()`；逐层修订号在提交后按
-     「快照差异」推进（或简单地在提交时对本次事务触碰过的层统一 `touch()`）。
-   - 撤销/重做恢复快照时**保留快照里的修订号**（见 3.1 不变量）；只要写路径没漏 bump，
-     旧号对应的内容与恢复后的内容逐位相同，缓存命中是安全的。
-   - 活跃事务期间（`txn_active()`）GPU 后端不得采信缓存——与 S12 合成缓存同一条规则。
+1. `Layer::content_revision` + `Document::allocate_revision()` / `touch_layer(id)` /
+   `touch_all_layers()`；新建图层在 `Document::create_layer` 里分配，`merge_down` /
+   `flatten_image` 的结果层也分配新号（新内容不能沿用旧号）。
+2. **写入口统一 bump**：14 个 `comp_layer_*` setter、`comp_selection_move_pixels`
+   （仅 `changed`）、`comp_crop_apply` / `comp_document_set_size`（整篇，仅真的变了时）。
+   ABI 层 bump 的好处是「一个用户操作 = 一次 bump」，domain 内部多段写不会重复推进。
+   **实测修正**：`comp_tool_apply` / `comp_filter_apply` / `comp_camera_raw_apply` 走的是
+   领域自管事务（外面再包 `ImplicitTxn` 会双记历史），所以这三处由 domain 函数自己在
+   `txn_commit()` **之前** bump。
+3. **直接写像素的 domain 路径自查结论**：`writable_pixels()` 的 61 处写点全部要么被上面
+   的入口覆盖（tool_ops / filters / camera_raw / selection_pixels / comp_file / crop），
+   要么写的是临时派生缓冲（`compositing/*` 的 out/临时 surface、`layer_merge` 的临时
+   文档）——**没有漏网**，纯内部派生缓冲不 bump。
+4. **事务/撤销（实测修正：不按快照差异推进，也不在 undo/redo 时 bump）**：
+   - 换号发生在 `txn_commit()` **之前**：提交压入的 after 快照因此带上新号；
+   - 撤销/重做只恢复快照，**保留快照里的号**（不额外 bump）：内容确实回到了那一份，
+     缓存命中安全；在 undo/redo 时再 bump 只会制造「同内容两个号」的假失效；
+   - 若在 commit **之后** bump，重做会把「编辑后的内容 + 编辑前的号」凑在一起，违反
+     「同值 ⟺ 同内容」，缓存会**静默供应旧纹理**——所以顺序是硬约束，测试用
+     「笔刷 → 撤销 → 重做」钉住；
+   - 活跃事务期间（`txn_active()`）GPU 后端不得采信缓存——与 S12 合成缓存同一条规则
+     （R2 实现）。
+5. **结构变更不发号（实测修正）**：`add` / `remove` / `reorder` / `set_active` /
+   `set_clipping_source` 只改堆叠序或编辑器状态，单层像素没变，纹理可留；合成计划每帧
+   从文档重建（`build_gpu_plan`），不存在需要失效的计划缓存。`set_isolated` 是例外——
+   §3.2 表里列在「结构」，但它改变该组的合成贡献，因此**要**换号。
 
 ### 3.3 缓存键与失效策略
 
@@ -143,7 +155,9 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 
 ## 4. 验收与测试计划
 
-### 4.1 不需要 GPU 的测试（默认构建）
+### 4.1 不需要 GPU 的测试（默认构建）——**S18 已全部落地**
+
+落点：`tests/test_layer_revision.cpp`（6 例）；下面 1–5 条都有对应断言，映射见 S18 报告 §3。
 
 1. **单调性**：对每个 ABI 写入口调用一次，断言目标层 `content_revision` 严格变大；
    未触碰的层不变。
@@ -178,9 +192,9 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
   回读/分段提交，属于独立一轮，不与本设计混做。
 - 不改 C ABI、不改 `.comp` 格式、不改事务/历史可观察语义。
 
-## 6. 建议实施顺序（两轮）
+## 6. 实施顺序（两轮）
 
-| 轮次 | 内容 | 验收 |
-|------|------|------|
-| R1 | `Layer::content_revision` + `Document::allocate_revision()` + ABI 写入口 bump + 4.1 的 1–4 | 默认构建全绿，用例数增加 |
-| R2 | D3D12 持久纹理 + `texture_uploads()` + 4.2 + 真机基准复测 | `--gpu` 全绿，报告实测 |
+| 轮次 | 内容 | 验收 | 状态 |
+|------|------|------|------|
+| R1 | `Layer::content_revision` + `Document::allocate_revision()` + 全部写入口 bump + 4.1 的 1–5 | 默认构建全绿，用例数增加 | **已落地（S18）**：451 → 457 例，默认/`--gpu`/壳自检/OHOS 回归全绿 |
+| R2 | D3D12 持久纹理 + `texture_uploads()` + 4.2 + 真机基准复测 | `--gpu` 全绿，报告实测 | 待做 |

@@ -244,6 +244,25 @@ struct Layer {
   std::vector<Adjustment> adjustments;
   std::vector<Effect> effects;
 
+  /*
+   * 内容修订号（S18 / R1，设计见 docs/gpu-layer-revision.md §3）。
+   *
+   * 标识「这一层的图形输入」（像素 / 蒙版 / 效果 / 调整 / 几何 / 混合参数）处于哪个
+   * 版本。0 = 尚未分配（新建图层由 Document::create_layer 立即分配，正常运行看不到 0）。
+   *
+   * 不变量：
+   *   - **单调**：Document::allocate_revision() 只增不减；回滚/撤销/重做不让计数器回落。
+   *   - **同值 ⟺ 同内容**：一个号一旦分配就只对应那一份内容；内容再变必须换号。
+   *     推论：撤销/重做把快照里的号原样恢复是**安全**的（内容确实回到了那一份）。
+   *   - **不参与序列化**：不进 `.comp`、不进事务/历史的语义比较；历史快照带它只是因为
+   *     快照是 DocumentState 的整份拷贝。
+   *
+   * 为什么不能拿 pixels 地址/哈希当缓存键：ImageBuffer 是 shared_ptr + COW，图层是唯一
+   * 持有者时画笔/滤镜/液化全是**原地写**，地址不变；哈希则要每帧全量读一遍 4 MB。
+   * 所以必须由写路径显式推进，见 Document::touch_layer()。
+   */
+  uint64_t content_revision = 0;
+
   /* 图层在文档像素空间的包围盒：transform 未指定时取像素尺寸 + 原点 (0,0)。
    * clipped_empty 为真时返回空矩形（缩画布把图层整个裁掉的显式标记，
    * 与「transform 未指定尺寸」区分开，否则会被上面的回落逻辑放大回来）。 */

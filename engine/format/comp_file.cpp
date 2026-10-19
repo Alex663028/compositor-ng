@@ -829,6 +829,14 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
     if (parent != nullptr && parent->is_group) parent->children.push_back(layer.id);
   }
 
+  /*
+   * S18：加载进来的每一层都要有内容修订号。修订号是**会话内**派生数据，不进
+   * `.comp`——同一份工程两次加载得到不同的号是完全正常的（缓存只关心「本次会话
+   * 里这份内容有没有变」）。这里必须发新号而不是留 0：留 0 会让所有层撞同一个
+   * 缓存键，跨层串纹理。
+   */
+  doc->touch_all_layers();
+
   doc->mark_dirty(false);
   doc->history().clear();
   *out = doc.release(); /* 所有权移交调用方；失败路径由 unique_ptr 自动 destroy */

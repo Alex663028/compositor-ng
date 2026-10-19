@@ -383,6 +383,9 @@ comp_result comp_selection_move_pixels(comp_document document, comp_layer_id lay
                                           duplicate != 0, &changed, &note, &error)) {
     return compositor::abi::fail(engine, COMP_ERR_STATE, error);
   }
+  /* S18：只有真的搬了像素才换号；changed=0 时 finish 不会 commit，此时换号会
+   * 让「同号⟺同内容」变成「同一份内容占了两个号」——错方向但无害，仍然不做。 */
+  if (changed) doc->touch_layer(layer_id);
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)
 }

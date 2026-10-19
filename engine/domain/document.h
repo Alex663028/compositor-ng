@@ -150,6 +150,28 @@ class Document {
     composite_cache_valid_ = true;
   }
 
+  /* ------------------------------------- 逐层内容修订号（S18 / R1 追加） */
+  /*
+   * 单调分配器：返回一个文档内唯一、永不复用的修订号。
+   * 只增不减——回滚/撤销不让它回落（历史快照恢复的是**旧号**，见 Layer::content_revision）。
+   */
+  uint64_t allocate_revision() noexcept { return next_revision_++; }
+
+  /*
+   * 把某一层的修订号推进到新值并返回它（图层不存在返回 0）。
+   *
+   * 调用规则（与设计稿 §3.2 对应）：**在事务提交之前调用**。写路径推进的是
+   * 「当前 state_ 里的这个图层」，历史栈随后压入的 after 快照才会带上新号；
+   * 若在 commit 之后推进，重做恢复的 after 快照仍带旧号，缓存会读到旧内容。
+   *
+   * 纯结构变更（add / remove / reorder / clipping_source）不调它：单层纹理可以留，
+   * 合成计划每帧从文档重建（gpu_plan），不存在需要失效的计划缓存。
+   */
+  uint64_t touch_layer(comp_layer_id id) noexcept;
+
+  /* 整篇所有层换新号：画布尺寸变化（Image Size / Canvas Size / Crop / 加载）用。 */
+  void touch_all_layers() noexcept;
+
   /*
    * 句柄有效性（与 Engine 同一套轻量方案，见 engine.h 文件头）：
    * 构造期置 kDocumentMagic，析构期 poison。abi 层 as_document 据此
@@ -196,6 +218,12 @@ class Document {
   std::string txn_label_;
   DocumentState txn_snapshot_{};
   std::vector<void*> txn_slots_{};
+
+  /*
+   * 逐层内容修订号发号器（S18 / R1）。从 1 起，0 保留给「尚未分配」。
+   * 不进 .comp、不进 DocumentState 的语义比较：它是会话内的派生数据。
+   */
+  uint64_t next_revision_ = 1;
 
   /* 合成缓存（派生数据，见 public 区的说明）。 */
   uint64_t content_serial_ = 0;
