@@ -1228,3 +1228,71 @@ COMP_TEST(ui_core_type_metrics_and_ascii_key_mapping_match_the_kernel) {
   COMP_CHECK(type_info != nullptr && std::string(type_info->name) == "Type" &&
              type_info->shortcut == 't');
 }
+
+/*
+ * S14 文字属性面板：行表、量纲映射、步进、命中几何。面板与壳共用这些函数，
+ * 因此这里钉住的是「面板显示的值 = 引擎接受的值」这条口径。
+ */
+COMP_TEST(ui_core_type_panel_rows_steps_and_hit_testing) {
+  COMP_CHECK(comp_ui::kTypePanelRowCount == 3);
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontSizeRow)) ==
+             "Font Size");
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLineHeightRow)) ==
+             "Line Height");
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLetterSpacingRow)) ==
+             "Letter Spacing");
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(-1)).empty());
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(3)).empty());
+  COMP_CHECK(comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLineHeightRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelFontSizeRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLetterSpacingRow));
+
+  /* 行距 5% 一步，夹在 1.0..8.0（面板与 Alt+[ / ] 共用）。 */
+  COMP_CHECK(near_value(comp_ui::step_type_line_height(1.25, 1), 1.30));
+  COMP_CHECK(near_value(comp_ui::step_type_line_height(1.25, -1), 1.20));
+  COMP_CHECK(comp_ui::step_type_line_height(1.0, -1) == 1.0);
+  COMP_CHECK(comp_ui::step_type_line_height(8.0, 1) == 8.0);
+  /* 非正值不是合法行距：回落到默认 1.25（与 clamp_type_line_height 同口径）。 */
+  COMP_CHECK(near_value(comp_ui::step_type_line_height(0.0, 0),
+                        comp_ui::kDefaultTypeLineHeight));
+
+  /* 字号行：乘性步进（×/÷1.25）；字距行：线性 1 px；行距行：5%。 */
+  COMP_CHECK(near_value(comp_ui::type_panel_step_value(comp_ui::kTypePanelFontSizeRow, 32.0,
+                                                       32.0, 1),
+                        comp_ui::step_type_font_size(32.0, 1)));
+  COMP_CHECK(near_value(comp_ui::type_panel_step_value(comp_ui::kTypePanelLetterSpacingRow,
+                                                       0.0, 32.0, 1),
+                        1.0));
+  COMP_CHECK(near_value(comp_ui::type_panel_step_value(comp_ui::kTypePanelLineHeightRow, 1.25,
+                                                       32.0, 1),
+                        1.30));
+
+  /* 夹取：字号 6..2048；字距下限随字号变化（步距 >= 0.5 px）。 */
+  COMP_CHECK(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelFontSizeRow, 1.0, 32.0) == 6.0);
+  COMP_CHECK(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelFontSizeRow, 5000.0, 32.0) ==
+             2048.0);
+  COMP_CHECK(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelLineHeightRow, 0.1, 32.0) == 1.0);
+  COMP_CHECK(near_value(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelLetterSpacingRow,
+                                                        -999.0, 32.0),
+                        comp_ui::type_letter_spacing_min(32.0)));
+  /* 同一 -10 px：小字号下被下限抬起，大字号下原样保留。 */
+  COMP_CHECK(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelLetterSpacingRow, -10.0, 7.0) >
+             -10.0);
+  COMP_CHECK(comp_ui::type_panel_clamp_value(comp_ui::kTypePanelLetterSpacingRow, -10.0,
+                                             2048.0) == -10.0);
+
+  /* 命中几何与绘制常量同源：行高 20、首行距面板顶 54。 */
+  const comp_ui::Rect panel{1000, 46, 330, 600};
+  COMP_CHECK(comp_ui::kTypeRowHeight == 20 && comp_ui::kTypeRowsTop == 54);
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 101.0) == 0);
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 121.0) == 1);
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 141.0) == 2);
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 161.0) == -1); /* 第四行不存在 */
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 99.0) == -1);  /* 标题区 */
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 500.0, 121.0) == -1);  /* 面板外 */
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1330.0, 121.0) == -1); /* 右边界开区间 */
+
+  const comp_ui::Rect row_rect = comp_ui::type_param_row_rect(panel, 2);
+  COMP_CHECK(row_rect.x == 1000 && row_rect.y == 46 + 54 + 2 * 20 && row_rect.w == 330 &&
+             row_rect.h == 20);
+}

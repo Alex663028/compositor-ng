@@ -2849,6 +2849,52 @@ HEIC/WebP/SVG/PSB 的判定链（magic → 注册表 → 扩展名 → 显式拒
 
 报告：`../report/S13-gpu-device-backend-20261018-dsh.md`。
 
+### 6.24 S14 文字属性面板 + 行距快捷键（2026-10-19，Claude）
+
+S11 报告 §5 留了一条明确的缺口：「没有文字属性面板：字号/行距/字距只能快捷键改；
+行距只有 1..8 的夹取函数，壳里尚未提供改行距的按键（默认 1.25）」。本轮只补这一条，
+**引擎核与 C ABI 零改动**（导出仍 112 个，`COMP_TOOL_TYPE = 15`、`comp_tool_op_desc.type`
+布局不变）。
+
+**1. 面板模型（`ui_core.h`，纯函数、可单测）。** 三行固定行表
+`Font Size / Line Height / Letter Spacing`（`kTypePanelRowCount = 3`），
+行高 20、首行距面板顶 54（`kTypeRowHeight` / `kTypeRowsTop`），
+`type_param_row_rect` 与 `type_param_row_at` 供绘制与命中共用——与滤镜面板同一套
+「看得见就点得中」的口径。夹取/步进按行分派到既有量纲：
+字号乘性 ×/÷1.25（6..2048），字距线性 ±1 px 且下限仍是
+`0.5 - 6 × font_size / 7`，行距新增 `step_type_line_height`（**5% 一步，夹在 1.0..8.0**）。
+
+**2. 外壳（`main.cpp`）。** `ShellState` 增 `type_panel_focused` / `type_input`；
+`present()` 在 `tool == Type` 且滤镜面板未打开时把右侧面板切到 `draw_type_panel`
+（标题、三行值、文本框度量、输入回显、快捷键提示）。交互：
+
+- 鼠标点行 = 聚焦（`type_param_row_at`，与绘制同源）；
+- `Tab / Shift+Tab` 切行，`- / =` 调当前行，数字键开始键入，`Enter` 提交
+  （`strtod` 必须完全消费且 `isfinite`，再夹到量纲内），`Esc` / 退格回退；
+- `Alt+[ / ]` 调行距（`WM_SYSKEYDOWN`），**键入文字时也可用**——这是 S11 缺的那条按键；
+- 面板数字输入为**非负值**：空缓冲时 `-` 是「步进」快捷键，负字距请用 `Shift+[`（与滤镜/调整面板现有输入规矩一致，已记入边界）；
+- 切到 Type 会清掉调整面板的数值缓冲，离开 Type 会清掉面板输入并丢弃未提交文字，
+  两个面板不会同时处于输入态；
+- 状态栏文案同步补上面板与 `Alt+[ / ]` 提示。
+
+**3. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py` | 444 → **445 cases, 0 failed, 0 check failures**（新增 1 例面板行表/夹取/步进/命中） |
+| `python scripts/build_windows_shell.py` | 通过，无 error |
+| `compositor_shell.exe --selftest` | 160 → **164 项 0 失败**，基线重新生成（SHA256 `aa2e2754122d5d5d…`） |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 `compile ok=90 fail=0`） |
+| ABI 导出 | **112**（未新增） |
+
+**4. 边界（如实记录）。** 仍然**未经人手 Win32 目视实测**（ALEX 明确推迟）：
+面板布局、点击命中、键入回显只验证到 `ui_core` 数学层、壳自检与编译期；
+「面板长得好不好看、点得准不准」需要开窗确认。面板值随会话保留，**不写进 `.comp`**；
+字体仍是 ASCII 点阵、画布仍不预演字形（S11 边界不变）；行距在面板上以整数百分比显示
+（内部是 double，`Alt+[ / ]` 与数值键入都走同一夹取）。
+
+报告：`../report/S14-type-panel-20261019-claude.md`。
+
 ## 7. 许可
 
 上游 `robbietilton/Compositor` 为 MIT 许可；本仓沿用 MIT，并保留上游版权声明。

@@ -224,6 +224,9 @@ struct ShellState {
   double type_font_size = comp_ui::kDefaultTypeFontSize;
   double type_line_height = comp_ui::kDefaultTypeLineHeight;
   double type_letter_spacing = 0.0;
+  /* 文字属性面板（S14）：三行（字号/行距/字距）；type_input 非空 = 数值键入态。 */
+  int type_panel_focused = comp_ui::kTypePanelFontSizeRow;
+  std::wstring type_input;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
@@ -1685,7 +1688,7 @@ void type_refresh_status(ShellState& shell) {
     wsprintfW(buffer,
               L"文字：插入点 (%d, %d)｜字号 %d px，行距 %d%%，字距 %d px｜"
               L"键入 ASCII，Shift+Enter 换行，回车提交，Esc 取消；"
-              L"[ / ] 调字号，Shift+[ / ] 调字距",
+              L"[ / ] 字号，Shift+[ / ] 字距，Alt+[ / ] 行距",
               static_cast<int>(std::floor(shell.type_origin.x)),
               static_cast<int>(std::floor(shell.type_origin.y)), size_px, line_pct, spacing_px);
   } else {
@@ -1712,6 +1715,8 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
   shell.type_origin = shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   shell.type_active = true;
   shell.type_text.clear();
+  /* 落插入点即离开属性面板的数值键入态，否则数字键会被面板缓冲吃掉。 */
+  shell.type_input.clear();
   type_refresh_status(shell);
 }
 
@@ -1791,12 +1796,128 @@ void type_step_param(ShellState& shell, int direction, bool spacing) {
     type_refresh_status(shell);
   } else {
     wchar_t buffer[192];
-    wsprintfW(buffer, L"文字：字号 %d px，行距 %d%%，字距 %d px（[ / ] 调字号，Shift+[ / ] 调字距）",
+    wsprintfW(buffer,
+              L"文字：字号 %d px，行距 %d%%，字距 %d px（[ / ] 字号，Shift+[ / ] 字距，"
+              L"Alt+[ / ] 行距）",
               static_cast<int>(shell.type_font_size + 0.5),
               static_cast<int>(shell.type_line_height * 100.0 + 0.5),
               static_cast<int>(std::lround(shell.type_letter_spacing)));
     set_status(shell, buffer);
   }
+}
+
+/* ------------------------------------------------------------ 文字属性面板（S14） */
+
+/*
+ * 三行属性面板（字号 / 行距 / 字距）。值仍写回 ShellState 的 type_* 字段，
+ * 面板只是第二条操作通路：引擎参数、状态栏、文本框预览都读同一组值。
+ * 行几何、夹取、步进全部来自 ui_core.h，绘制与命中不会漂移。
+ */
+bool type_panel_visible(const ShellState& shell) {
+  return shell.tool == comp_ui::ToolId::Type && !shell.filter_open;
+}
+
+double type_panel_value(const ShellState& shell, int row) {
+  switch (row) {
+    case comp_ui::kTypePanelFontSizeRow: return shell.type_font_size;
+    case comp_ui::kTypePanelLineHeightRow: return shell.type_line_height;
+    case comp_ui::kTypePanelLetterSpacingRow: return shell.type_letter_spacing;
+    default: return 0.0;
+  }
+}
+
+std::wstring type_panel_value_text(const ShellState& shell, int row) {
+  wchar_t buffer[48];
+  if (row == comp_ui::kTypePanelLineHeightRow) {
+    wsprintfW(buffer, L"%d%%", static_cast<int>(shell.type_line_height * 100.0 + 0.5));
+  } else if (row == comp_ui::kTypePanelFontSizeRow) {
+    wsprintfW(buffer, L"%d px", static_cast<int>(shell.type_font_size + 0.5));
+  } else {
+    wsprintfW(buffer, L"%d px", static_cast<int>(std::lround(shell.type_letter_spacing)));
+  }
+  return std::wstring(buffer);
+}
+
+/*
+ * 写值的唯一入口：改字号后必须重新夹字距（字号变小会让原字距压碎步距），
+ * 与 type_step_param 的规则保持一致。
+ */
+void type_panel_set(ShellState& shell, int row, double value) {
+  switch (row) {
+    case comp_ui::kTypePanelFontSizeRow:
+      shell.type_font_size = comp_ui::clamp_type_font_size(value);
+      shell.type_letter_spacing =
+          comp_ui::clamp_type_letter_spacing(shell.type_letter_spacing, shell.type_font_size);
+      break;
+    case comp_ui::kTypePanelLineHeightRow:
+      shell.type_line_height = comp_ui::clamp_type_line_height(value);
+      break;
+    case comp_ui::kTypePanelLetterSpacingRow:
+      shell.type_letter_spacing =
+          comp_ui::clamp_type_letter_spacing(value, shell.type_font_size);
+      break;
+    default:
+      break;
+  }
+}
+
+/* 键入中的文字也用这组值：此时状态栏走 type_refresh_status，不另写一套数字。 */
+void type_panel_status(ShellState& shell, const wchar_t* prefix) {
+  if (shell.type_active) {
+    type_refresh_status(shell);
+    return;
+  }
+  const int row = shell.type_panel_focused;
+  wchar_t buffer[256];
+  wsprintfW(buffer, L"%s%s = %s", prefix,
+            widen_ascii(comp_ui::type_panel_row_label(row)).c_str(),
+            type_panel_value_text(shell, row).c_str());
+  set_status(shell, buffer);
+}
+
+void type_panel_focus(ShellState& shell, int delta) {
+  int next = shell.type_panel_focused + delta;
+  if (next < 0) next = 0;
+  if (next >= comp_ui::kTypePanelRowCount) next = comp_ui::kTypePanelRowCount - 1;
+  shell.type_panel_focused = next;
+  type_panel_status(shell, L"文字属性 ");
+}
+
+void type_panel_step(ShellState& shell, int direction) {
+  const int row = shell.type_panel_focused;
+  const double before = type_panel_value(shell, row);
+  const double next = comp_ui::type_panel_step_value(row, before, shell.type_font_size, direction);
+  type_panel_set(shell, row, next);
+  type_panel_status(shell, type_panel_value(shell, row) == before ? L"已到边界：" : L"");
+}
+
+void type_panel_begin_input(ShellState& shell, wchar_t character) {
+  if (shell.type_active) return;
+  shell.type_input.push_back(character);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"输入中：%s", shell.type_input.c_str());
+  set_status(shell, buffer);
+}
+
+void type_panel_backspace(ShellState& shell) {
+  if (shell.type_input.empty()) return;
+  shell.type_input.pop_back();
+  if (shell.type_input.empty()) set_status(shell, L"已取消输入");
+}
+
+/* 键入值先夹到面板量程再落值（与滤镜面板同一套输入规矩）。 */
+void type_panel_commit_input(ShellState& shell) {
+  if (shell.type_input.empty()) return;
+  const std::string text(shell.type_input.begin(), shell.type_input.end());
+  char* end = nullptr;
+  const double value = std::strtod(text.c_str(), &end);
+  if (end == text.c_str() || end == nullptr || *end != '\0' || !std::isfinite(value)) {
+    set_status(shell, L"输入不是合法数值，未提交");
+    return;
+  }
+  type_panel_set(shell, shell.type_panel_focused, value);
+  shell.type_input.clear();
+  type_panel_status(shell, L"已设置 ");
 }
 
 /* ------------------------------------------------------------ 框选（Marquee） */
@@ -2880,6 +3001,79 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
 }
 
 /*
+ * 文字属性面板。行几何来自 ui_core.h 的 type_param_row_rect——绘制与命中同源，
+ * 避免「看得见点不中」。面板改的是「下一段文字」的参数；键入态仍照常显示，
+ * 因为键入中的文字也读同一组值（状态栏数字与预览框会立刻跟着变）。
+ */
+void draw_type_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"文字（Type）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+  y += 22;
+
+  SetTextColor(dc, RGB(150, 210, 255));
+  const wchar_t* sub = shell.type_active ? L"键入中（回车提交 · Esc 取消）" : L"属性写入下一段文字";
+  TextOutW(dc, left + 10, y, sub, lstrlenW(sub));
+
+  for (int row = 0; row < comp_ui::kTypePanelRowCount; ++row) {
+    const comp_ui::Rect row_rect = comp_ui::type_param_row_rect(panel_rect, row);
+    const bool focused = row == shell.type_panel_focused;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6,
+                     row_rect.bottom() + 2};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    wsprintfW(line, L"%s = %s", widen_ascii(comp_ui::type_panel_row_label(row)).c_str(),
+              type_panel_value_text(shell, row).c_str());
+    TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
+  }
+
+  /* 文本框度量与引擎 build_layout 同一公式（ui_core::type_block_metrics）。 */
+  const comp_ui::TypeBlockMetrics metrics =
+      comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
+                                  shell.type_letter_spacing, shell.type_text.c_str());
+  SetTextColor(dc, RGB(170, 174, 186));
+  y = comp_ui::type_param_row_rect(panel_rect, comp_ui::kTypePanelRowCount - 1).bottom() + 8;
+  wsprintfW(line, L"文本框 %d×%d px｜%d 行｜步距 %d px",
+            static_cast<int>(std::lround(metrics.width)),
+            static_cast<int>(std::lround(metrics.height)), metrics.line_count,
+            static_cast<int>(std::lround(metrics.advance)));
+  TextOutW(dc, left + 10, y, line, lstrlenW(line));
+
+  if (!shell.type_input.empty()) {
+    SetTextColor(dc, RGB(255, 240, 160));
+    wsprintfW(line, L"输入中：%s", shell.type_input.c_str());
+    TextOutW(dc, left + 10, bottom - 130, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"Tab / Shift+Tab 切参数",
+      L"- / = 调值 · 数字键输入",
+      L"Alt+[ / ] 调行距（键入中也可用）",
+      L"点画布落插入点 · 回车提交 · Esc 取消",
+  };
+  int hint_y = bottom - 104;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 画布叠加层（选区蚂蚁线 / 框选矩形 / 笔迹预览 / 笔尖轮廓）。
  *
  * 只画在画布矩形内：先把轴对齐线段裁到画布，再生成虚线段，避免 32 倍缩放
@@ -3411,6 +3605,8 @@ void present(HWND window, ShellState& shell) {
   if (layout.adjust_panel.w > 0) {
     if (shell.filter_open) {
       draw_filter_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.tool == comp_ui::ToolId::Type) {
+      draw_type_panel(memory_dc, shell, layout.adjust_panel);
     } else {
       draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
     }
@@ -3439,10 +3635,13 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (shell.tool == comp_ui::ToolId::Shape && id != comp_ui::ToolId::Shape) {
     shape_cancel(shell);
   }
-  /* 离开文字工具 = 放弃未提交的键入（只丢预览，不产生撤销步）。 */
+  /* 离开文字工具 = 放弃未提交的键入与属性键入（面板本身不是模态，不产生撤销步）。 */
   if (shell.tool == comp_ui::ToolId::Type && id != comp_ui::ToolId::Type) {
     type_cancel(shell);
+    shell.type_input.clear();
   }
+  /* 切到文字工具时丢掉调整面板的数值缓冲：两个面板共用 Tab/数字键，不能同时有输入态。 */
+  if (id == comp_ui::ToolId::Type) shell.adj_input.clear();
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
@@ -3473,7 +3672,8 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   } else if (id == comp_ui::ToolId::Type) {
     wsprintfW(buffer,
               L"工具：Type（画布点击落插入点，键入 ASCII；Shift+Enter 换行，回车提交，Esc 取消；"
-              L"字号 %d px，行距 %d%%，字距 %d px；[ / ] 调字号，Shift+[ / ] 调字距）",
+              L"字号 %d px，行距 %d%%，字距 %d px；右侧面板 Tab/-=/数字键；"
+              L"[ / ] 字号，Shift+[ / ] 字距，Alt+[ / ] 行距）",
               static_cast<int>(shell.type_font_size + 0.5),
               static_cast<int>(shell.type_line_height * 100.0 + 0.5),
               static_cast<int>(std::lround(shell.type_letter_spacing)));
@@ -3737,6 +3937,41 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return;
   }
 
+  /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
+  if (!shell.type_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.type_input.clear();
+      set_status(shell, L"已取消输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      type_panel_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      type_panel_commit_input(shell);
+      return;
+    }
+    if (key == VK_TAB) {
+      shell.type_input.clear();
+      type_panel_focus(shell, shift ? -1 : 1);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      type_panel_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    if (key == VK_OEM_PERIOD) {
+      type_panel_begin_input(shell, L'.');
+      return;
+    }
+    if (key == VK_OEM_MINUS) {
+      type_panel_begin_input(shell, L'-');
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
   /* 调整面板输入态优先：Esc 取消输入（不关窗）、退格删字符、回车提交、数字/./- 进缓冲。 */
   if (!shell.adj_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -3808,6 +4043,30 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         type_refresh_status(shell);
       }
       return; /* 键入态下屏蔽其它快捷键，避免误触发 */
+    }
+  }
+
+  /*
+   * 文字属性面板（Type 工具、未在键入文字时）：Tab 切行、- / = 调值、数字键输入。
+   * [ / ] 仍走下面的 type_step_param（字号/字距），Alt+[ / ] 走 WM_SYSKEYDOWN（行距）。
+   */
+  if (shell.tool == comp_ui::ToolId::Type && !ctrl) {
+    switch (key) {
+      case VK_TAB:
+        type_panel_focus(shell, shift ? -1 : 1);
+        return;
+      case VK_OEM_MINUS:
+        type_panel_step(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        type_panel_step(shell, 1);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      type_panel_begin_input(shell, static_cast<wchar_t>(key));
+      return;
     }
   }
 
@@ -4143,6 +4402,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (type_panel_visible(*shell) && layout.adjust_panel.w > 0) {
+            /* 点属性行 = 聚焦到该行；行几何与绘制共用 type_param_row_rect。 */
+            const int row =
+                comp_ui::type_param_row_at(layout.adjust_panel, mouse_x, mouse_y);
+            if (row >= 0) {
+              shell->type_input.clear();
+              type_panel_focus(*shell, row - shell->type_panel_focused);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
@@ -4350,7 +4620,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         const int direction = wparam == VK_OEM_6 ? 1 : -1;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         wchar_t buffer[128];
-        if (shell->tool == comp_ui::ToolId::Wand) {
+        if (shell->tool == comp_ui::ToolId::Type) {
+          /* S14：Alt+[ / ] 调行距（5% 一步，夹在 100%..800%）；键入态也可用。 */
+          shell->type_line_height =
+              comp_ui::step_type_line_height(shell->type_line_height, direction);
+          if (shell->type_active) {
+            type_refresh_status(*shell);
+          } else {
+            wsprintfW(buffer, L"文字行距 %d%%（Alt+[ / ] 调整）",
+                      static_cast<int>(shell->type_line_height * 100.0 + 0.5));
+            set_status(*shell, buffer);
+          }
+        } else if (shell->tool == comp_ui::ToolId::Wand) {
           /* S8：魔棒的取样窗口是 (2r+1)²，0 = 只取种子像素（S7 行为）。 */
           shell->wand_radius = comp_ui::step_wand_radius(shell->wand_radius, direction);
           wsprintfW(buffer, L"魔棒取样窗口 %d×%d（半径 %d px）",
@@ -5236,6 +5517,44 @@ int run_selftest(const wchar_t* out_path) {
   comp_render_flatten(document, type_restored.data(), COMP_PIXEL_RGBA8, stride);
   verify(type_restored == type_before,
          "an off-canvas text box leaves the render byte-identical");
+
+  /*
+   * 文字属性面板（S14）：行表、步进与命中几何都来自 ui_core.h，
+   * 与 draw_type_panel / WM_LBUTTONDOWN 共用同一份常量。
+   */
+  verify(comp_ui::kTypePanelRowCount == 3 &&
+             std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontSizeRow)) ==
+                 "Font Size" &&
+             std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLineHeightRow)) ==
+                 "Line Height" &&
+             std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLetterSpacingRow)) ==
+                 "Letter Spacing" &&
+             comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLineHeightRow) &&
+             !comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelFontSizeRow),
+         "ui_core type panel row table (3 rows, line height is a percentage)");
+
+  verify(std::fabs(comp_ui::step_type_line_height(1.25, 1) - 1.30) < 1e-9 &&
+             std::fabs(comp_ui::step_type_line_height(1.25, -1) - 1.20) < 1e-9 &&
+             comp_ui::step_type_line_height(1.0, -1) == 1.0 &&
+             comp_ui::step_type_line_height(8.0, 1) == 8.0,
+         "ui_core type line-height steps 5% and clamps to 1..8");
+
+  verify(comp_ui::type_panel_step_value(comp_ui::kTypePanelFontSizeRow, 32.0, 32.0, 1) ==
+                 comp_ui::step_type_font_size(32.0, 1) &&
+             comp_ui::type_panel_step_value(comp_ui::kTypePanelLetterSpacingRow, 0.0, 32.0, 1) ==
+                 1.0 &&
+             comp_ui::type_panel_clamp_value(comp_ui::kTypePanelLetterSpacingRow, -999.0,
+                                             32.0) == comp_ui::type_letter_spacing_min(32.0),
+         "ui_core type panel steps use each row's own units");
+
+  const comp_ui::Rect type_panel_rect{1000, 46, 330, 600};
+  verify(comp_ui::type_param_row_at(type_panel_rect, 1010.0, 101.0) == 0 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 121.0) == 1 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 141.0) == 2 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 161.0) == -1 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 99.0) == -1 &&
+             comp_ui::type_param_row_at(type_panel_rect, 500.0, 121.0) == -1,
+         "ui_core type panel rows hit-test with the drawn geometry");
 
   /*
    * 合成缓存（MERGED，S12）：外壳每次 WM_PAINT 都走 comp_render_flatten，

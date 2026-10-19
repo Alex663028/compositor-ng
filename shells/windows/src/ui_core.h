@@ -1148,6 +1148,78 @@ inline double type_caret_height(double font_size, double zoom) {
   return height < 1.0 ? 1.0 : height;
 }
 
+/* ------------------------------------------------------------ 文字属性面板（S14） */
+
+/*
+ * 文字属性面板只有三行：字号 / 行距 / 字距。值本身仍存在 ShellState（与键入态
+ * 共用），这里只负责「行号 <-> 量纲」的映射、夹取与步进，保证面板、快捷键、
+ * 引擎三处用的是同一套量程（与 engine 的 TypeRasterStyle 一致）。
+ */
+inline constexpr int kTypePanelRowCount = 3;
+inline constexpr int kTypePanelFontSizeRow = 0;
+inline constexpr int kTypePanelLineHeightRow = 1;
+inline constexpr int kTypePanelLetterSpacingRow = 2;
+
+/* 行距是倍率（1.0..8.0，界面显示为百分比）；面板一次步进 5%。 */
+inline constexpr double kTypeLineHeightStep = 0.05;
+
+inline const char* type_panel_row_label(int row) {
+  switch (row) {
+    case kTypePanelFontSizeRow: return "Font Size";
+    case kTypePanelLineHeightRow: return "Line Height";
+    case kTypePanelLetterSpacingRow: return "Letter Spacing";
+    default: return "";
+  }
+}
+
+/* 行距按百分比显示，字号/字距按像素显示。 */
+inline bool type_panel_row_is_percent(int row) { return row == kTypePanelLineHeightRow; }
+
+/* 按行夹取；字距的下限依赖当前字号，所以 font_size 必须一起传。 */
+inline double type_panel_clamp_value(int row, double value, double font_size) {
+  switch (row) {
+    case kTypePanelFontSizeRow: return clamp_type_font_size(value);
+    case kTypePanelLineHeightRow: return clamp_type_line_height(value);
+    case kTypePanelLetterSpacingRow: return clamp_type_letter_spacing(value, font_size);
+    default: return value;
+  }
+}
+
+/* Alt+[ / ]：行距线性步进 5%（面板的主路径，键入态也可用）。 */
+inline double step_type_line_height(double current, int direction) {
+  const double base = clamp_type_line_height(current);
+  if (direction > 0) return clamp_type_line_height(base + kTypeLineHeightStep);
+  if (direction < 0) return clamp_type_line_height(base - kTypeLineHeightStep);
+  return base;
+}
+
+inline double type_panel_step_value(int row, double value, double font_size, int direction) {
+  switch (row) {
+    case kTypePanelFontSizeRow: return step_type_font_size(value, direction);
+    case kTypePanelLineHeightRow: return step_type_line_height(value, direction);
+    case kTypePanelLetterSpacingRow:
+      return step_type_letter_spacing(value, font_size, direction);
+    default: return value;
+  }
+}
+
+/* 面板行几何：与 draw_type_panel 共用，绘制与命中共用一套常量（同滤镜面板）。 */
+inline constexpr int kTypeRowHeight = 20;
+inline constexpr int kTypeRowsTop = 54; /* 标题 + 工具名两行 + 间距 */
+
+inline Rect type_param_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kTypeRowsTop + row * kTypeRowHeight, panel.w, kTypeRowHeight};
+}
+
+inline int type_param_row_at(const Rect& panel, double x, double y) {
+  if (!panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kTypeRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kTypeRowHeight)));
+  if (row < 0 || row >= kTypePanelRowCount) return -1;
+  return row;
+}
+
 /* ------------------------------------------------------------ 笔迹采样 */
 
 /*
