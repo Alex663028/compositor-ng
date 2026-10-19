@@ -1,7 +1,7 @@
 # GPU 逐层纹理缓存的修订号设计（S17 设计稿）
 
-状态：**R1 已实施（S18），R2 已实施（S19）**。本文确定数据结构、修订号分配点、缓存键与验收口径；
-不修改 C ABI（导出仍 112 个）、不改 `.comp` 格式、不动事务/历史语义。
+状态：**R1 已实施（S18），R2 已实施（S19），v2 烘焙单元缓存已实施（S20）**。本文确定数据结构、
+修订号分配点、缓存键与验收口径；不修改 C ABI（导出仍 112 个）、不改 `.comp` 格式、不动事务/历史语义。
 
 - **R1 已落地**：`Layer::content_revision`、`Document::allocate_revision()` /
   `touch_layer()` / `touch_all_layers()`、全部写入口换号（含 3 个领域自管事务入口）、
@@ -9,6 +9,10 @@
 - **R2 已落地（S19）**：`d3d12_backend` 的持久逐层纹理（原生单元）+ `texture_uploads()`
   计数，§4.2 的 4 条真机用例 + 跨文档隔离 1 例（`tests/test_rhi.cpp`），1024²/4 层真机基准复测见 §4.3。
   默认构建 457 → 462 例、`--gpu` 462 例全绿；ABI 仍 112、`.comp` 不变。
+- **v2 已落地（S20）**：同一 64 位缓存键同时服务 CPU 烘焙表面缓存（`GpuBakeCache`）与
+  D3D12 烘焙纹理缓存（`baked_textures`）；键 = 文档实例号 + 画布尺寸 + 累积不透明度 +
+  子树结构签名 + 每层 `content_revision`。新增 8 例（5 例默认构建 + 3 例 `--gpu`），
+  默认构建 462 → 470 例、`--gpu` 470 例全绿；壳自检 164 项、ABI 112、`.comp` 均未变。
 
 关联：§6.23（S13 GPU 设备侧接入）、§6.26（S16 DXGI 直呈）、§6.27（S17 按单元拆细）、
 §6.28（S18 R1 落地）、§6.29（S19 R2 落地）。
@@ -144,11 +148,38 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
   文档时 `(id, revision)` 会撞车；用实例号而不是对象地址（地址会被分配器复用）。
 - 纹理走**持久堆 + 按尺寸空闲链**复用，避免每次 `CreateCommittedResource` 抖动；
   上限按显存预算（例如 512 MB）LRU 淘汰，淘汰只影响性能。
-- **只缓存原生单元**（`GpuUnit::is_native()`）。烘焙单元先不做：它的键需要子树
-  所有层修订号的集合 + 组结构，属于 v2。
+- **原生单元**（`GpuUnit::is_native()`）用上表的 `(id, revision)` 键；**烘焙单元**
+  （裁剪/蒙版/效果/旋转翻转/16 位源层/隔离组/剪贴栈）用 v2 的 64 位结构键，见下。
 - 缓存是派生数据：不进事务快照/历史/`.comp`；文档销毁、设备丢失、尺寸变化即整体丢弃。
 - 诊断：加 `texture_uploads()` 计数（每创建/重传一张纹理 +1），**仅供测试**，
   不进 C ABI、不进 `BackendCaps`。
+
+**v2 烘焙单元缓存（S20，已实施）**：
+
+烘焙单元的像素不来自单层，而是 CPU 预乘后的**画布单元**，因此键不能只看一层。
+实施用 FNV-1a 64（非安全边界，只要求输入不同则键几乎必然不同）：
+
+```
+key = FNV1a( 文档实例号, 画布 w/h, 用途标签(源层=|子树=),
+             累积不透明度 opacity_scale,
+             源层: layer.id, layer.content_revision
+             子树: 有序 DFS 的 (深度, 累积不透明度, 节点类型, isolated 标志,
+                                 layer.id, layer.content_revision, 子节点数) )
+```
+
+- **为什么带深度**：`reorder` / 换父级 / 改剪贴基底都不发修订号（§3.2 第 5 条），
+  但会改变 DFS 的成员顺序或深度，键随之改变；测试用「交换两个兄弟后必然重烘焙」钉住。
+- **为什么带累积不透明度**：穿越组的不透明度被折进每个子层的烘焙像素（与
+  `Planner::append_units` 同一算式），改组不透明度必须重烘焙。
+- **为什么带文档实例号**：图层 id 与修订号只是文档内唯一；两个文档可以有完全相同的
+  `(id, revision)`，不带实例号会把 A 的烘焙表面供给 B（静默错图）。
+- 两层缓存共用同一个键：`GpuBakeCache` 存 CPU 烘焙表面（`ImageBuffer` 浅拷贝 COW，
+  512 MiB LRU），D3D12 侧 `baked_textures` 存对应的持久纹理；命中 CPU 缓存但纹理被
+  淘汰时只重传、不重烘焙。
+- 预算与淘汰同原生缓存：只淘汰**本帧未使用**的条目，淘汰只影响性能；单面超过总预算
+  则永不入缓存（否则缓存永远超预算），每帧重烘焙但结果正确。
+- 事务期间整段旁路（既不读也不写），理由同 R2；`bake_cache_hits()/misses()` 是新的
+  测试诊断计数，不进 C ABI。
 
 **R2 实施事实（S19，与上面草案的差异）**：
 
@@ -186,7 +217,7 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 5. **计划重算**：改 `transform`/`blend`/`visible`/`parent` 后 `build_gpu_plan`
    的单元序列随之变化（现有 S17 计划测试可扩展）。
 
-### 4.2 需要 GPU 的测试（`--gpu` + 真机）——**S19 已全部落地**
+### 4.2 需要 GPU 的测试（`--gpu` + 真机）——**S19 已全部落地，S20 增补烘焙单元**
 
 落点：`tests/test_rhi.cpp` 的 5 个用例（`rhi_gpu_layer_textures_are_reused_across_identical_frames`、
 `rhi_gpu_layer_texture_cache_uploads_only_changed_layers`、
@@ -194,6 +225,20 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 `rhi_gpu_layer_texture_cache_is_bypassed_inside_a_transaction`、
 `rhi_gpu_layer_texture_cache_is_not_shared_between_documents`）；
 无 D3D12 / 无设备时整例跳过（与既有 GPU 用例同一口径）。场景统一是 32²、4 个整幅画布原生单元。
+
+S20 增补 5 个默认构建用例（`gpu_bake_cache_*`：跨帧命中、只失效改动层、组结构变化失效、
+跨文档隔离、预算上限）与 3 个真机用例
+（`rhi_gpu_baked_textures_are_reused_across_identical_frames`、
+`rhi_gpu_baked_texture_cache_uploads_only_changed_units`、
+`rhi_gpu_baked_texture_cache_is_bypassed_inside_a_transaction`）。真机场景统一是
+32²：1 个原生背景 + 2 个带蒙版的烘焙层（NORMAL 1.0 / MULTIPLY 0.75）。验收口径：
+
+1. 连渲两帧不变：第二帧 `texture_uploads()` 增量 **0**、`bake_cache_hits()` **+2**、
+   两帧逐字节相同、与 CPU 基准 ≤2 LSB。→ 实测一致。
+2. 只改一个烘焙层：`texture_uploads()` 恰好 **+1**、烘焙命中 **+1** / 未命中 **+1**，
+   画面变化且与 CPU 基准 ≤2 LSB。→ 实测一致。
+3. 事务内连渲两帧：每帧 **+3** 次上传（全量），`bake_cache_hits/misses` **不变**；
+   提交后只重传被改的那 **1** 个烘焙单元，与 CPU 基准 ≤2 LSB。→ 实测一致。
 
 1. 连续两次 `render_document`（不改文档）：第二次 `texture_uploads()` 不增，
    像素与 CPU 基准仍 ≤1 LSB。→ 实测第二次增量 **0**，两帧逐字节相同。
@@ -223,17 +268,24 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 解决的，所以没有把它吹成「数量级提升」。离屏（CPU_BUFFER）路径仍需整幅回读，本轮未改，
 其耗时不以本表推断。
 
+**S20（v2）复测**：1.365 / 1.390 / 1.421 ms（三次），CPU 2.145–2.233 ms，比值 1.56–1.61×，
+与 S19 持平。**这张表不使用烘焙单元**（场景是背景 + 3 个整幅画布层），所以它只能说明
+「v2 没有引入回退」；v2 的收益以 `texture_uploads()` / `bake_cache_hits()` 计数为准
+（§4.2 的 3 条），没有换算成毫秒。
+
 ## 5. 明确不做 / 后续项
 
 - 不做像素哈希、不做内容比较上传、不做跨文档/跨后端共享。
-- 不做烘焙单元缓存（需求：子树修订号集合 + 组结构签名，v2）。
+- ~~不做烘焙单元缓存（需求：子树修订号集合 + 组结构签名，v2）~~ → **v2 已落地（S20）**，
+  键与验收见 §3.3 / §4.2。
 - 不做「调整层分段回读」：调整层作用于「已合成画布」，要上 GPU 就得把画布分段
   回读/分段提交，属于独立一轮，不与本设计混做。
 - 不改 C ABI、不改 `.comp` 格式、不改事务/历史可观察语义。
 
-## 6. 实施顺序（两轮）
+## 6. 实施顺序（三轮）
 
 | 轮次 | 内容 | 验收 | 状态 |
 |------|------|------|------|
 | R1 | `Layer::content_revision` + `Document::allocate_revision()` + 全部写入口 bump + 4.1 的 1–5 | 默认构建全绿，用例数增加 | **已落地（S18）**：451 → 457 例，默认/`--gpu`/壳自检/OHOS 回归全绿 |
 | R2 | D3D12 持久纹理 + `texture_uploads()` + 4.2 + 真机基准复测 | `--gpu` 全绿，报告实测 | **已落地（S19）**：457 → 462 例，窗口直呈 3.04–3.27 → 1.39–1.41 ms（§4.3）；ABI 112、`.comp` 未变、壳自检 164 项逐字节不变 |
+| v2 | 烘焙单元缓存：64 位结构键 + CPU 烘焙表面缓存 + D3D12 烘焙纹理缓存 + 4.2 增补 | 默认/`--gpu` 全绿，真机逐帧上传增量可证 | **已落地（S20）**：462 → 470 例，见 `report/S20-baked-unit-cache-20261019-claude.md`；ABI 112、`.comp` 未变、壳自检 164 项不变 |

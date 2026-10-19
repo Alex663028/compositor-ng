@@ -10,11 +10,12 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   图层 id（打通上游互通）均已落地。**M3 进行中**——渲染后端接口切片（`rhi.h` + CPU/D3D12/Vulkan
   三后端）、SPIR-V 构建链路、Vulkan 计算管线设备侧实现（opt-in）、
   **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成；S16：DXGI 交换链直呈已接；
-  S19：逐层纹理跨帧常驻，1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms）**、
+  S19：逐层纹理跨帧常驻，1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms；
+  S20：烘焙单元也按子树结构键缓存，CPU 烘焙与纹理上传都能跨帧省掉）**、
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **462 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
+  全量 **470 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -234,6 +235,18 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   窗口直呈 3.04–3.27 → **1.41 ms**，相对 CPU flatten+GDI 从 1.18–1.29× 扩到 **1.58–1.60×**。
   **不新增导出 ABI**（仍 **112**）、`.comp` 未变、壳/鸿蒙代码零改动、壳自检 164 项逐字节不变。
   基线 457 → **462 用例**（+5）。详见 §6.29。
+
+  2026-10-19 第二十六轮（S20 烘焙单元缓存 v2 落地）：S19 只缓存原生单元，裁剪/蒙版/效果/
+  旋转翻转/16 位源层/隔离组/剪贴栈这些**烘焙单元**仍每帧在 CPU 上重烘焙、再重传纹理。这一轮
+  把设计稿的 **v2** 做完：一个 64 位 FNV-1a 结构键同时服务**两层**缓存——CPU 烘焙表面缓存
+  `GpuBakeCache`（存预乘画布单元，512 MiB 预算 LRU，浅拷贝 COW）与 D3D12 烘焙纹理缓存
+  `baked_textures`。键 = 文档实例号 + 画布尺寸 + 累积不透明度 + **有序 DFS 子树结构签名**
+  （深度/节点类型/isolated/图层 id/每层 content_revision/子节点数）+ 用途标签。深度进键是
+  关键：`reorder`/换父级/改剪贴基底**不发修订号**，但会改变成员顺序或深度，因此键必然改变
+  （测试用「交换兄弟 → 必须重烘焙」钉住）。活跃事务期间 CPU 与 GPU 两层缓存整段旁路；
+  换文档/换画布/设备丢失整体丢弃。新增 `bake_cache_hits()/misses()` 诊断计数（不进 C ABI）。
+  **不新增导出 ABI**（仍 **112**）、`.comp` 未变、壳/鸿蒙代码零改动、壳自检 164 项不变。
+  基线 462 → **470 用例**（+8）。详见 §6.30。
 
 ## 1. M1 目标与范围
 
@@ -1519,7 +1532,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
-| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20）；**S17：GPU 子集按合成单元拆细**（裁蒙/效果/变换/组/剪贴烘焙后上 GPU，调整层与 HDR 仍整篇回落，§6.27）；**S19：D3D12 逐层纹理跨帧常驻（原生单元），1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms（§6.29）** |
+| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20）；**S17：GPU 子集按合成单元拆细**（裁蒙/效果/变换/组/剪贴烘焙后上 GPU，调整层与 HDR 仍整篇回落，§6.27）；**S19：D3D12 逐层纹理跨帧常驻（原生单元），1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms（§6.29）**；**S20：烘焙单元（蒙版/裁剪/效果/变换/隔离组/剪贴栈）也按子树结构键缓存，CPU 烘焙与纹理上传均跨帧省掉（§6.30）** |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~91%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）；**2026-10-19 S16 补上 Windows 窗口 DXGI 交换链直呈 + 真机基准**（§6.26）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
@@ -1532,8 +1545,9 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
   效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27）；**S18 补上逐层纹理缓存的前提**
   （每层 `content_revision` + 全部写入口换号，§6.28），**S19 把纹理缓存本身（R2）做完**
   （原生单元跨帧常驻，§6.29），窗口直呈 1024²/4 层从 3.04–3.27 ms 降到 **1.41 ms**、
-  比 CPU flatten+GDI 快 **1.58–1.60×**；仍剩两条整篇回落（调整层、HDR 表面）与烘焙单元
-  的逐帧上传，故仍扣分；
+  比 CPU flatten+GDI 快 **1.58–1.60×**；**S20 再把烘焙单元也纳入缓存**（子树结构键 +
+  CPU 烘焙表面缓存 + D3D12 烘焙纹理缓存，§6.30），文档不动时烘焙与上传都为 0；
+  仍剩调整层、HDR 表面两条整篇回落，故仍扣分；
 - ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
 
 上一轮记的「`deep_take_painted` 被 S4 仿制笔刷阻塞」已证伪：上游 `BrushStroke.swift:1097`
@@ -3383,6 +3397,98 @@ std::unordered_map<comp_layer_id, LayerTexture> layer_textures;
   的 M1–M16 保持未勾选，留给 ALEX 真机测试）。
 
 报告：`../report/S19-layer-texture-cache-20261019-dsh.md`。
+
+### 6.30 S20 烘焙单元缓存（v2）落地（2026-10-19，Claude）
+
+S19 只缓存原生单元；裁剪/蒙版/效果/旋转翻转/16 位源层/隔离组/剪贴栈这些**烘焙单元**仍每帧
+在 CPU 上重烘焙、再整幅上传。S20 把设计稿的 **v2** 做完：一个 64 位结构键同时服务
+**CPU 烘焙表面缓存**与 **D3D12 烘焙纹理缓存**。**本轮不宣称新的毫秒级加速**——收益由
+上传/烘焙计数证明，见第 6 条。
+
+**1. 缓存键（FNV-1a 64，仅区分输入，不是安全边界）。**
+
+```
+key = FNV1a(文档实例号, 画布 w/h, 用途标签(源层=|子树=), 累积不透明度,
+            源层: layer.id, content_revision
+            子树: 有序 DFS 逐节点 (深度, 累积不透明度, 节点类型, isolated,
+                                     layer.id, content_revision, 子节点数))
+```
+
+- **深度 + 有序 DFS 是必需的**：`reorder` / 换父级 / 改剪贴基底**不发修订号**（S18 的
+  设计），但它们会改变 DFS 的成员顺序或深度，键因此必然改变。测试用「交换两个兄弟 →
+  必须重烘焙」钉住。
+- **累积不透明度**：穿透组的不透明度被折进每个子层的烘焙像素（与 `Planner::append_units`
+  同一算式），改组不透明度必须重烘焙。
+- **文档实例号**：图层 id 与修订号只是文档内唯一，两个文档可以有完全相同的
+  `(id, revision)`；不带实例号会静默贴上另一文档的表面。
+- 源层与子树用不同用途标签分流；`cache_key == 0` 约定为「无键」，实际键永不为 0。
+
+**2. CPU 烘焙表面缓存 `GpuBakeCache`。** 存预乘画布单元的 `ImageBuffer` **浅拷贝**
+（shared_ptr COW，从不 `writable_pixels()`）。512 MiB 预算 + `last_used_frame` LRU，
+**只淘汰本帧未使用的条目**；单面超过预算则永不入缓存（每帧重烘焙但结果正确）。
+缓存自身不加锁，由后端独立的 `bake_cache_mutex_` 串行化——计划构建在设备互斥量之前，
+两把锁不嵌套。
+
+**3. D3D12 烘焙纹理缓存。** `unordered_map<uint64_t, BakedTexture>`，键与 CPU 缓存相同；
+命中省上传，新建/重传走 `COMMON → COPY_DEST → UNORDERED_ACCESS`，命中后直接以 UAV 状态复用。
+两层缓存命中与否互不影响正确性。
+
+**4. 自查修掉一处悬垂引用。** 淘汰函数会 `erase` 条目：若先把新键的占位项插进表再淘汰，
+占位项（`last_used_frame == 0`）可能被选中并 `erase`，随后返回的引用指向已释放节点。
+改为**先淘汰 → 创建 → `insert_or_assign`**，失败分支用键重新查迭代器。
+
+**5. 事务 / 换文档 / 尺寸。** 活跃事务期间 CPU 与 GPU 两层缓存**整段旁路**（不读不写，
+回到共享 `src_tex` 逐帧上传）；换文档清空 CPU 缓存（键已含实例号，第二道保险）；
+画布尺寸变化 `drop_targets()` 整体丢弃两张纹理表。
+
+**6. 护栏（+8 例：5 默认 + 3 真机）。**
+
+| 用例 | 钉住的行为 |
+|------|-----------|
+| `gpu_bake_cache_reuses_surfaces_across_identical_plans` | 同文档两次计划 2 miss → 2 hit，取回像素逐字节相同；原生单元键为 0 |
+| `gpu_bake_cache_invalidates_only_the_changed_layer` | 只改一层：恰好 1 个键变化，未变层缓存取回像素不变 |
+| `gpu_bake_cache_invalidates_when_group_structure_changes` | 交换兄弟（不发修订号）→ 键必变、必须重烘焙 |
+| `gpu_bake_cache_is_not_shared_between_documents` | id/修订号完全相同的两个文档 → 键全不同、全 miss |
+| `gpu_bake_cache_respects_budget` | 1 字节预算 → 永不入缓存、每轮 miss、计划仍成功 |
+| `rhi_gpu_baked_textures_are_reused_across_identical_frames` | 第二帧 **+0 上传**、**+2 烘焙命中**、两帧逐字节相同、与 CPU ≤2 LSB |
+| `rhi_gpu_baked_texture_cache_uploads_only_changed_units` | 改一个烘焙层：**+1 上传**、命中/未命中各 **+1**、与 CPU ≤2 LSB |
+| `rhi_gpu_baked_texture_cache_is_bypassed_inside_a_transaction` | 事务内每帧 **+3 上传**、烘焙计数不变；提交后只重传 **1** 个单元 |
+
+**7. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py`（默认） | **470 cases, 0 failed, 0 check failures**（462 → 470，+8；GPU 用例跳过） |
+| `python scripts/build.py --gpu` | **470 cases, 0 failed, 0 check failures**（3 个 v2 真机用例在 RX 6800 上真跑） |
+| `compositor_shell.exe --selftest=<报告>` | **164 项 0 失败**（`--gpu` 构建 `path = gpu`） |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**；壳自检 SHA256 与基线逐字节一致；OHOS `compile ok=91 fail=0` |
+| ABI 导出 | **112**（未变）；`.comp` 格式未变 |
+
+验证中曾出现一次无法复现的 `0xC0000005`（`rhi_gpu_renders_group_and_clipping_units_like_cpu`，
+该用例本轮未改）；随后连续 13 次重跑均 470/0。
+
+**8. 真机基准（同机同场景，`--present-bench=60`，1024²、4 层，连跑三次）。**
+
+| 项 | S19 | S20 |
+|----|-----|-----|
+| GPU 窗口直呈均值 | 1.389 / 1.406 / 1.413 ms | **1.365 / 1.390 / 1.421 ms** |
+| 同帧最优 | 1.040–1.081 ms | 1.055 / 1.078 / 1.083 ms |
+| CPU flatten+RGBA→BGRA+StretchDIBits | 2.205–2.266 ms | 2.145 / 2.233 / 2.216 ms |
+| GPU / CPU 帧耗时比 | 1.58–1.60× | 1.56–1.61× |
+
+**这张表不能用来读 v2 的收益**：基准场景（背景 + 3 个整幅画布层）全部是原生单元，
+烘焙缓存根本不参与；它只证明没有回退。v2 的收益是计数意义上的：文档不变时烘焙单元
+从「每帧 2 次 CPU 烘焙 + 2 次上传」变为第二帧 **0 + 0**；只改一层时从全量重做变为
+**1 次烘焙 + 1 次上传**。
+
+**9. 边界（如实记录）。**
+
+- 调整层仍整篇回落 CPU（它重着色下方已合成画布，不是独立每层贡献）；HDR/RGBA16F 同理。
+- 两层缓存各 512 MiB 上限，实际显存是两者之和；不跨文档/跨后端共享。
+- 离屏路径仍是「GPU 合成 → 整幅回读」；交互壳主画布仍走 CPU 展平 + GDI。
+- **Win32 人工目视仍未做**：`docs/manual-test.md` 的 M1–M16 保持未勾选，留给 ALEX 真机测试。
+
+报告：`../report/S20-baked-unit-cache-20261019-claude.md`。
 
 ## 7. 许可
 

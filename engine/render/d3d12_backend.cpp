@@ -196,8 +196,8 @@ struct D3d12RenderBackend::GpuContext {
    *
    * 键 = (图层 id, content_revision, 画布尺寸, 格式)；格式固定 R8G8B8A8_UNORM，
    * 画布尺寸变化时 drop_targets() 整体丢弃，所以表里按 id 索引后只需再验 revision
-   * 与宽高。**只缓存原生单元**：烘焙单元的内容键是「子树修订号集合 + 组结构签名」，
-   * 属设计稿里的 v2，本轮逐帧上传。
+   * 与宽高。S20 / v2 起烘焙单元另走 baked_textures（键 = GpuUnit::cache_key），
+   * 两张表都由 drop_cached_textures() 统一丢弃。
    *
    * 缓存是派生数据：不进事务快照、不进历史、不进 .comp；丢了只会多传一次纹理。
    * 活跃事务期间整段旁路（事务是中间态），画布尺寸/设备上下文变化时整体丢弃。
@@ -212,6 +212,22 @@ struct D3d12RenderBackend::GpuContext {
   };
   std::unordered_map<comp_layer_id, LayerTexture> layer_textures;
   uint64_t layer_texture_bytes = 0;
+
+  /*
+   * 烘焙单元纹理缓存（S20 / v2）。
+   *
+   * 键 = GpuUnit::cache_key（文档实例号 + 画布尺寸 + 累积不透明度 + 子树结构签名
+   * + 各层 content_revision），与 CPU 烘焙表面缓存同键。烘焙表面永远是画布尺寸，
+   * 画布尺寸变化经 drop_targets() 整体丢弃，所以这里不必再存宽高。
+   * CPU 缓存命中省掉烘焙，这里命中再省掉上传；两者命中与否互不影响正确性。
+   */
+  struct BakedTexture {
+    ID3D12Resource* texture = nullptr;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    uint64_t last_used_frame = 0;
+  };
+  std::unordered_map<uint64_t, BakedTexture> baked_textures;
+  uint64_t baked_texture_bytes = 0;
   uint64_t frame_counter = 0;
   /*
    * 当前缓存所属的文档实例号（S19 / R2）。
@@ -228,11 +244,16 @@ struct D3d12RenderBackend::GpuContext {
    * 不影响任何可观察结果。
    */
   static constexpr uint64_t kLayerTextureBudgetBytes = 512ull * 1024ull * 1024ull;
+  /*
+   * 烘焙纹理预算与逐层纹理各自独立（两块表各自 512 MiB 上限）。烘焙表面和逐层
+   * 纹理同为画布尺寸 RGBA8，实际显存是两者之和。
+   */
+  static constexpr uint64_t kBakedTextureBudgetBytes = 512ull * 1024ull * 1024ull;
 
   explicit GpuContext(std::atomic<unsigned long long>* counter) : upload_counter(counter) {}
 
   ~GpuContext() {
-    drop_layer_textures();
+    drop_cached_textures();
     if (upload != nullptr && upload_mapped != nullptr) upload->Unmap(0, nullptr);
     upload_mapped = nullptr;
     for (ID3D12Resource*& buffer : window_buffers) release(buffer);
@@ -256,10 +277,13 @@ struct D3d12RenderBackend::GpuContext {
     release(device);
   }
 
-  void drop_layer_textures() {
+  void drop_cached_textures() {
     for (auto& item : layer_textures) release(item.second.texture);
     layer_textures.clear();
     layer_texture_bytes = 0;
+    for (auto& item : baked_textures) release(item.second.texture);
+    baked_textures.clear();
+    baked_texture_bytes = 0;
   }
 
   /* 画布尺寸的原生单元纹理 / 目标纹理共用同一份描述。 */
@@ -345,6 +369,70 @@ struct D3d12RenderBackend::GpuContext {
         release(it->second.texture);
       }
       layer_textures.erase(it);
+    }
+  }
+
+  /*
+   * 取（必要时创建）某个烘焙单元的持久纹理。
+   *
+   * 键不变 ⟺ 计划里的烘焙输入没变（子树结构、各层修订号、累积不透明度、画布
+   * 尺寸、文档实例号全都进键），所以命中时预乘像素逐字节相同，无需再传。
+   * 创建失败的分支必须 erase，避免留下 texture == nullptr 的幽灵项。
+   */
+  BakedTexture* acquire_baked_texture(uint64_t key, UINT w, UINT h, bool* needs_upload,
+                                      std::string* error) {
+    auto found = baked_textures.find(key);
+    if (found != baked_textures.end() && found->second.texture != nullptr) {
+      found->second.last_used_frame = frame_counter;
+      *needs_upload = false;
+      return &found->second;
+    }
+    /*
+     * 先淘汰再插入：trim_baked_textures 会遍历并 erase 条目，若先把新键的
+     * 占位项塞进表再 trim，返回的引用可能指向已 erase 的节点（悬垂写入）。
+     * 同理，这里不再持有淘汰前的迭代器，失败分支用键重新查。
+     */
+    const uint64_t bytes = static_cast<uint64_t>(w) * h * 4ull;
+    trim_baked_textures(bytes);
+    ID3D12Resource* fresh = nullptr;
+    HRESULT hr = create_canvas_texture(w, h, &fresh);
+    if (FAILED(hr) || fresh == nullptr) {
+      auto stale = baked_textures.find(key);
+      if (stale != baked_textures.end() && stale->second.texture == nullptr) {
+        baked_textures.erase(stale);
+      }
+      if (error != nullptr) *error = hresult_text("create baked texture failed", hr);
+      return nullptr;
+    }
+    BakedTexture entry;
+    entry.texture = fresh;
+    entry.last_used_frame = frame_counter;
+    auto inserted = baked_textures.insert_or_assign(key, std::move(entry));
+    baked_texture_bytes += bytes;
+    if (upload_counter != nullptr) upload_counter->fetch_add(1, std::memory_order_relaxed);
+    *needs_upload = true;
+    return &inserted.first->second;
+  }
+
+  /* 按 LRU 淘汰到预算内；本帧刚用过的条目不动。 */
+  void trim_baked_textures(uint64_t incoming_bytes) {
+    if (baked_texture_bytes + incoming_bytes <= kBakedTextureBudgetBytes) return;
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    order.reserve(baked_textures.size());
+    for (const auto& item : baked_textures) {
+      order.emplace_back(item.second.last_used_frame, item.first);
+    }
+    std::sort(order.begin(), order.end());
+    for (const auto& item : order) {
+      if (baked_texture_bytes + incoming_bytes <= kBakedTextureBudgetBytes) break;
+      if (item.first == frame_counter && frame_counter != 0) continue; /* 本帧在用 */
+      auto it = baked_textures.find(item.second);
+      if (it == baked_textures.end()) continue;
+      if (it->second.texture != nullptr) {
+        baked_texture_bytes -= static_cast<uint64_t>(width) * height * 4ull;
+        release(it->second.texture);
+      }
+      baked_textures.erase(it);
     }
   }
 
@@ -554,10 +642,10 @@ struct D3d12RenderBackend::GpuContext {
     release(dst_tex);
     release(src_tex);
     /*
-     * 画布尺寸变了：逐层纹理的尺寸/内容键一并作废，整体丢弃（设计稿 §4.2 第 3 条）。
-     * 只影响性能（下次全量重传），不影响画面。
+     * 画布尺寸变了：逐层纹理与烘焙纹理的尺寸/内容键一并作废，整体丢弃
+     * （设计稿 §4.2 第 3 条）。只影响性能（下次全量重烘焙+重传），不影响画面。
      */
-    drop_layer_textures();
+    drop_cached_textures();
     width = height = aligned_row = 0;
     upload_blocks = 0;
     src_state = D3D12_RESOURCE_STATE_COMMON;
@@ -863,7 +951,28 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
    */
   std::vector<GpuUnit> units;
   GpuPlanStats plan_stats;
-  if (!build_gpu_plan(doc, &units, &plan_stats, error)) return false;
+  {
+    /*
+     * CPU 烘焙表面缓存（S20 / v2）：计划构建在设备互斥量之前完成（不可渲染的
+     * 文档连设备都不必初始化），所以用独立互斥量串行化，缓存本身不内部加锁。
+     * 换文档时整体清空——缓存键已含文档实例号，这里是第二道保险并顺带释放内存。
+     */
+    std::lock_guard<std::mutex> cache_lock(bake_cache_mutex_);
+    const uint64_t plan_document_serial = doc.instance_serial();
+    if (plan_document_serial != bake_cache_document_serial_) {
+      bake_cache_.clear();
+      bake_cache_document_serial_ = plan_document_serial;
+    }
+    const uint64_t hits_before = bake_cache_.hits();
+    const uint64_t misses_before = bake_cache_.misses();
+    /* 事务中途是中间态：既不读也不写 CPU 烘焙缓存（与逐层纹理同口径）。 */
+    GpuBakeCache* bake_cache = doc.txn_active() ? nullptr : &bake_cache_;
+    const bool planned = build_gpu_plan(doc, &units, &plan_stats, error, bake_cache);
+    bake_cache_hits_.fetch_add(bake_cache_.hits() - hits_before, std::memory_order_relaxed);
+    bake_cache_misses_.fetch_add(bake_cache_.misses() - misses_before,
+                                 std::memory_order_relaxed);
+    if (!planned) return false;
+  }
 
   const DocumentState& state = doc.state();
   /*
@@ -951,7 +1060,7 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
    */
   const uint64_t document_serial = doc.instance_serial();
   if (document_serial != gpu_->cached_document_serial) {
-    gpu_->drop_layer_textures();
+    gpu_->drop_cached_textures();
     gpu_->cached_document_serial = document_serial;
   }
 
@@ -1096,9 +1205,10 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
     const UINT64 offset = block_size * static_cast<UINT64>(i + 1);
 
     /*
-     * 源纹理选择（R2）：
-     *   - 原生单元 + 事务外：用持久逐层纹理；修订号没变就直接命中，一次上传都不做。
-     *   - 其余（烘焙单元、活跃事务期间）：共享 src_tex 逐帧上传，与 S17 行为一致。
+     * 源纹理选择（S20 / v2）：
+     *   - 原生单元 + 事务外：持久逐层纹理；修订号没变就直接命中，一次上传都不做。
+     *   - 烘焙单元 + 事务外 + 有内容键：持久烘焙纹理；键不变就命中，连上传都省掉。
+     *   - 其余（活跃事务期间、无键）：共享 src_tex 逐帧上传，与 S17 行为一致。
      */
     ID3D12Resource* source_texture = gpu_->src_tex;
     if (unit.is_native() && texture_cache_enabled) {
@@ -1122,6 +1232,27 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         cached->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         cached->revision = layer.content_revision;
+      }
+      source_texture = cached->texture;
+    } else if (!unit.is_native() && unit.cache_key != 0 && texture_cache_enabled) {
+      bool needs_upload = false;
+      GpuContext::BakedTexture* cached =
+          gpu_->acquire_baked_texture(unit.cache_key, width, height, &needs_upload, error);
+      if (cached == nullptr) {
+        built = false;
+        build_error = (error != nullptr) ? *error : "d3d12 backend: baked texture unavailable";
+        break;
+      }
+      if (needs_upload) {
+        if (!stage_unit_pixels(i, unit)) {
+          built = false;
+          break;
+        }
+        barrier(cached->texture, cached->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_into(cached->texture, gpu_->upload, offset);
+        barrier(cached->texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cached->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
       }
       source_texture = cached->texture;
     } else {

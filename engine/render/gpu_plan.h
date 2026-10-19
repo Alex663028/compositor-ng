@@ -29,8 +29,10 @@
 #ifndef COMPOSITOR_RENDER_GPU_PLAN_H
 #define COMPOSITOR_RENDER_GPU_PLAN_H
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "compositor/comp_core.h"
@@ -53,6 +55,13 @@ struct GpuUnit {
   const Layer* native_layer = nullptr;
   /* 烘焙单元：画布尺寸的预乘 RGBA8；原生单元为空。 */
   ImageBuffer baked;
+  /*
+   * 烘焙内容的缓存键（S20 / v2）；0 = 无键（原生单元）。
+   * 键覆盖「文档实例号 + 画布尺寸 + 累积不透明度 + 子树结构 + 每个节点的
+   * content_revision」，同键 ⟺ 同一份烘焙输入。CPU 烘焙缓存与 D3D12 烘焙
+   * 纹理缓存都用它，**不能**只拿图层 id 做键（跨文档/跨结构会撞车）。
+   */
+  uint64_t cache_key = 0;
 
   bool is_native() const { return native_layer != nullptr; }
 };
@@ -67,14 +76,84 @@ struct GpuPlanStats {
 };
 
 /*
+ * CPU 烘焙表面缓存（S20 / v2，设计稿 §3.3 的「烘焙单元」部分）。
+ *
+ * 键由 build_gpu_plan 计算：文档实例号 + 画布尺寸 + 累积不透明度 +
+ * 子树结构签名（深度/节点类型/隔离标志/图层 id/图层 content_revision）。
+ * 这样：
+ *   - 只改一层 → 只有包含该层的单元换键；
+ *   - reorder / set_parent / set_clipping_source 这类**不发修订号**的结构变更
+ *     → 树结构（成员、顺序、深度）变了，键自然不同；
+ *   - 换文档 → 实例号不同，键不同（不依赖调用方记得清空）。
+ *
+ * 缓存里存的是 ImageBuffer 的**浅拷贝**（shared_ptr + COW）：命中时复制共享
+ * 像素，不做 4 MB 深拷贝；缓存只读，绝不 writable_pixels()，因此不会触发复制。
+ * 预算按 LRU 淘汰，淘汰只影响下一次是否要重烘焙，不影响任何可观察结果。
+ * 本类**不内部加锁**：调用方负责串行访问（D3D12 后端用一把独立互斥量）。
+ */
+class GpuBakeCache {
+ public:
+  /* 512 MiB：1024² 一张表面 4 MB ≈ 128 个烘焙单元，与 GPU 纹理预算同口径。 */
+  static constexpr size_t kDefaultBudgetBytes = 512ull * 1024ull * 1024ull;
+
+  explicit GpuBakeCache(size_t budget_bytes = kDefaultBudgetBytes);
+  ~GpuBakeCache() = default;
+  GpuBakeCache(const GpuBakeCache&) = delete;
+  GpuBakeCache& operator=(const GpuBakeCache&) = delete;
+
+  /* 每次构建计划开始新的一帧（LRU 用；由 build_gpu_plan 调用）。 */
+  void begin_frame();
+
+  /*
+   * 查缓存。命中时把表面浅拷贝到 *surface 并计 hit，返回 true；
+   * 未命中（或 key == 0 / surface == nullptr）计 miss，返回 false。
+   * 每个烘焙单元恰好查一次，所以 hit + miss = 本轮烘焙单元数。
+   */
+  bool lookup(uint64_t key, ImageBuffer* surface);
+
+  /* 存入烘焙结果（浅拷贝）；键已存在时替换。超过预算的单个表面不存。 */
+  void store(uint64_t key, const ImageBuffer& surface);
+
+  void clear();
+  void set_budget_bytes(size_t bytes);
+  size_t budget_bytes() const { return budget_; }
+  size_t bytes() const { return bytes_; }
+  size_t entries() const { return entries_.size(); }
+  /* 诊断计数只增不清（clear() 不影响），便于跨帧差值断言。 */
+  uint64_t hits() const { return hits_; }
+  uint64_t misses() const { return misses_; }
+  uint64_t evictions() const { return evictions_; }
+
+ private:
+  struct Entry {
+    ImageBuffer surface;
+    uint64_t last_used_frame = 0;
+  };
+
+  void trim(size_t incoming_bytes);
+
+  std::unordered_map<uint64_t, Entry> entries_;
+  size_t budget_ = kDefaultBudgetBytes;
+  size_t bytes_ = 0;
+  uint64_t frame_ = 0;
+  uint64_t hits_ = 0;
+  uint64_t misses_ = 0;
+  uint64_t evictions_ = 0;
+};
+
+/*
  * 构建合成计划。
  *
  * units 非空时生成单元序列（会做 CPU 烘焙，按画布尺寸分配缓冲）；
  * units 为空时只做分类与可行性判定（can_render_document 用它，不分配像素）。
  * stats 可为空。失败返回 false 并写 error——ABI 层据此整篇回落 CPU。
+ *
+ * cache 非空时烘焙单元先查/写烘焙表面缓存，并按缓存键填写 GpuUnit::cache_key；
+ * 传 nullptr（或活跃事务期间）则每帧重新烘焙，且 GpuUnit::cache_key 仍会计算
+ * （D3D12 后端据此决定是否复用烘焙纹理——事务期间它同样会旁路）。
  */
 bool build_gpu_plan(const Document& doc, std::vector<GpuUnit>* units, GpuPlanStats* stats,
-                    std::string* error);
+                    std::string* error, GpuBakeCache* cache = nullptr);
 
 }  // namespace compositor
 

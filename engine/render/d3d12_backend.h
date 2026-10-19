@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "render/gpu_plan.h"
 #include "render/rhi.h"
 
 namespace compositor {
@@ -36,10 +37,12 @@ namespace compositor {
  * 回读。离屏（CPU_BUFFER）路径保持原语义不变。
  *
  * S19 / R2 起原生单元走**持久逐层纹理**：缓存键 = (layer.id, layer.content_revision,
- * 画布尺寸, 格式)，命中时整块 CPU→GPU 上传都省掉；烘焙单元仍逐帧上传（其内容键
- * 需要子树修订集合 + 组结构签名，留给 v2）。活跃事务期间整段旁路缓存（事务是中间
- * 态，不采信也不写入）；画布尺寸变化 / 设备上下文重建时整体丢弃。缓存是派生数据，
- * 不进历史、事务快照或 .comp。
+ * 画布尺寸, 格式)，命中时整块 CPU→GPU 上传都省掉。S20 / v2 把同一套路扩到**烘焙
+ * 单元**：CPU 烘焙表面缓存（GpuBakeCache）用 64 位键（文档实例号 + 画布尺寸 +
+ * 累积不透明度 + 子树结构签名 + 每层 content_revision），命中则连 CPU 烘焙都省掉；
+ * D3D12 侧再按同一个 cache_key 缓存烘焙纹理，命中则不重传。活跃事务期间整段旁路
+ * 缓存（事务是中间态，不采信也不写入）；画布尺寸变化 / 换文档 / 设备上下文重建时
+ * 整体丢弃。缓存是派生数据，不进历史、事务快照或 .comp。
  */
 class D3d12RenderBackend final : public RenderBackend {
  public:
@@ -75,6 +78,14 @@ class D3d12RenderBackend final : public RenderBackend {
   unsigned long long texture_uploads() const { return texture_uploads_.load(); }
 
   /*
+   * 仅供测试/诊断（S20 / v2）：计划构建期间 CPU 烘焙表面缓存的命中/未命中累计。
+   * 命中 + 未命中 = 本轮「需要烘焙的单元数」，因此差值可证明「逐帧烘焙真的被省掉」。
+   * 同样不进 C ABI、不进 BackendCaps。
+   */
+  unsigned long long bake_cache_hits() const { return bake_cache_hits_.load(); }
+  unsigned long long bake_cache_misses() const { return bake_cache_misses_.load(); }
+
+  /*
    * 仅供测试：打开后，窗口渲染会在后备缓冲交给 Present **之前**多拷一份到回读
    * 缓冲，可用 take_window_readback() 取回该帧像素与 CPU 基准对拍。
    * 默认关闭——它不是渲染路径的一部分，也不改变上屏语义。
@@ -93,6 +104,15 @@ class D3d12RenderBackend final : public RenderBackend {
   std::atomic<unsigned long long> readback_frames_{0};
   /* 逐层纹理上传计数（派生数据，见 texture_uploads 的说明）。 */
   std::atomic<unsigned long long> texture_uploads_{0};
+  /*
+   * CPU 烘焙表面缓存（S20 / v2）。计划构建在 mutex_ 之前完成（设备可能还没
+   * 初始化），所以用独立的互斥量串行化；缓存本身不内部加锁。
+   */
+  GpuBakeCache bake_cache_;
+  mutable std::mutex bake_cache_mutex_;
+  uint64_t bake_cache_document_serial_ = 0;
+  std::atomic<unsigned long long> bake_cache_hits_{0};
+  std::atomic<unsigned long long> bake_cache_misses_{0};
   bool verify_window_readback_ = false; /* 仅 set_window_readback_verification 可改 */
   bool window_readback_ready_ = false;  /* 上一次窗口渲染是否留下了可取的验证回读 */
 };

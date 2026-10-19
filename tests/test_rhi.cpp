@@ -1658,3 +1658,531 @@ COMP_TEST(rhi_gpu_layer_texture_cache_is_not_shared_between_documents) {
                               ", first_byte=" + std::to_string(first_diff) + ")";
   COMP_CHECK_MSG(!second_pixels.empty() && max_diff <= 1, message.c_str());
 }
+
+/* ==================================================================
+ * S20 / v2：烘焙单元缓存（CPU 表面缓存 + D3D12 烘焙纹理缓存）
+ * ================================================================== */
+
+namespace {
+
+/* 追加一个「整幅画布 + 蒙版」的图层：蒙版让 is_native_layer 为假 → 烘焙单元。 */
+comp_layer_id add_baked_layer(Document& document, int32_t size, comp_blend_mode blend,
+                              float opacity, int32_t seed) {
+  Layer* layer =
+      add_test_layer(document, "baked", blend, opacity, comp_rect{0, 0, size, size}, 0, false);
+  if (layer == nullptr) return 0;
+  layer->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&layer->pixels, seed);
+  layer->mask.resize(size, size, 255);
+  for (int32_t y = 0; y < size; ++y) {
+    for (int32_t x = 0; x < size; ++x) {
+      layer->mask.writable_pixels()[static_cast<size_t>(y) * size + x] =
+          static_cast<uint8_t>((x * 8 + seed * 3) & 0xFF);
+    }
+  }
+  return layer->id;
+}
+
+/* 1 个原生底 + 2 个烘焙蒙版层：一次全量渲染 = 3 次源纹理上传。 */
+bool build_baked_scene(Document& document, int32_t size, std::vector<comp_layer_id>* ids,
+                       int32_t seed_offset = 0) {
+  if (ids == nullptr) return false;
+  ids->clear();
+  Layer* background = add_test_layer(document, "bg", COMP_BLEND_NORMAL, 1.0f,
+                                     comp_rect{0, 0, size, size}, 0, false);
+  if (background == nullptr) return false;
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 24, 96, 168, 255);
+  ids->push_back(background->id);
+  const comp_blend_mode blends[2] = {COMP_BLEND_NORMAL, COMP_BLEND_MULTIPLY};
+  const float opacities[2] = {1.0f, 0.75f};
+  for (int32_t i = 0; i < 2; ++i) {
+    const comp_layer_id id =
+        add_baked_layer(document, size, blends[i], opacities[i], seed_offset + 3 + i);
+    if (id == 0) return false;
+    ids->push_back(id);
+  }
+  return true;
+}
+
+/* 逐行拼成一维字节序列（忽略 stride 差异，只比较有效像素）。 */
+std::vector<uint8_t> buffer_bytes(const ImageBuffer& buffer) {
+  std::vector<uint8_t> out;
+  if (buffer.empty()) return out;
+  out.reserve(buffer.byte_size());
+  const size_t row_bytes = static_cast<size_t>(buffer.width) * 4u;
+  for (int32_t y = 0; y < buffer.height; ++y) {
+    const uint8_t* row = buffer.row(static_cast<size_t>(y));
+    out.insert(out.end(), row, row + row_bytes);
+  }
+  return out;
+}
+
+std::vector<uint64_t> baked_keys(const std::vector<GpuUnit>& units) {
+  std::vector<uint64_t> keys;
+  for (const GpuUnit& unit : units) {
+    if (!unit.is_native()) keys.push_back(unit.cache_key);
+  }
+  return keys;
+}
+
+}  // namespace
+
+/*
+ * v2 验收 1：文档没变时重建计划，每个烘焙单元都必须命中 CPU 烘焙缓存，
+ * 且缓存里取回的像素与首次烘焙逐字节一致（缓存没有把内容改坏）。
+ */
+COMP_TEST(gpu_bake_cache_reuses_surfaces_across_identical_plans) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+
+  GpuBakeCache cache;
+  std::string error;
+  std::vector<GpuUnit> first;
+  GpuPlanStats stats{};
+  COMP_CHECK_MSG(build_gpu_plan(document, &first, &stats, &error, &cache), error.c_str());
+  COMP_CHECK_MSG(stats.native_units == 1 && stats.baked_units == 2,
+                 "the scene must contain one native and two baked units");
+  COMP_CHECK_MSG(cache.hits() == 0 && cache.misses() == 2,
+                 "the first plan must miss the cache once per baked unit");
+  COMP_CHECK_MSG(cache.entries() == 2u, "both baked surfaces must be stored");
+  for (const GpuUnit& unit : first) {
+    if (unit.is_native()) {
+      COMP_CHECK_MSG(unit.cache_key == 0, "native units carry no bake key");
+    } else {
+      COMP_CHECK_MSG(unit.cache_key != 0, "baked units must carry a cache key");
+      COMP_CHECK(!unit.baked.empty());
+    }
+  }
+
+  std::vector<GpuUnit> second;
+  error.clear();
+  COMP_CHECK_MSG(build_gpu_plan(document, &second, &stats, &error, &cache), error.c_str());
+  COMP_CHECK_MSG(cache.hits() == 2 && cache.misses() == 2,
+                 "an unchanged plan must hit the bake cache for every baked unit");
+  COMP_CHECK_MSG(second.size() == first.size(), "the plan shape must be unchanged");
+  COMP_CHECK_MSG(baked_keys(first) == baked_keys(second), "cache keys must be stable");
+  for (size_t i = 0; i < first.size(); ++i) {
+    COMP_CHECK_MSG(buffer_bytes(first[i].baked) == buffer_bytes(second[i].baked),
+                   "a cache hit must return pixel-identical surfaces");
+  }
+}
+
+/*
+ * v2 验收 2：只改一层并标脏，重建计划时恰好只有该单元未命中；其余单元命中，
+ * 且取回像素逐字节不变。
+ */
+COMP_TEST(gpu_bake_cache_invalidates_only_the_changed_layer) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+  COMP_CHECK(ids.size() == 3u);
+
+  GpuBakeCache cache;
+  std::string error;
+  std::vector<GpuUnit> before;
+  COMP_CHECK_MSG(build_gpu_plan(document, &before, nullptr, &error, &cache), error.c_str());
+  COMP_CHECK(cache.misses() == 2);
+
+  Layer* changed = document.find(ids[2]);
+  COMP_CHECK_MSG(changed != nullptr, "the edited layer must exist");
+  if (changed == nullptr) return;
+  changed->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 100, 20, 60, 160);
+  COMP_CHECK_MSG(document.touch_layer(ids[2]) != 0, "touch_layer must allocate a new revision");
+
+  error.clear();
+  std::vector<GpuUnit> after;
+  COMP_CHECK_MSG(build_gpu_plan(document, &after, nullptr, &error, &cache), error.c_str());
+  COMP_CHECK_MSG(cache.hits() == 1 && cache.misses() == 3,
+                 "only the changed baked layer may miss the bake cache");
+
+  const std::vector<uint64_t> before_keys = baked_keys(before);
+  const std::vector<uint64_t> after_keys = baked_keys(after);
+  COMP_CHECK(before_keys.size() == 2u && after_keys.size() == 2u);
+  if (before_keys.size() != 2u || after_keys.size() != 2u) return;
+  size_t changed_units = 0;
+  for (size_t i = 0; i < before_keys.size(); ++i) {
+    if (before_keys[i] != after_keys[i]) ++changed_units;
+  }
+  COMP_CHECK_MSG(changed_units == 1u, "exactly one bake key may change");
+  /* 未变的那一层：缓存取回像素必须与首次烘焙完全一致。 */
+  size_t baked_index = 0;
+  for (size_t i = 0; i < before.size() && i < after.size(); ++i) {
+    /* 计划形状不变：同一下标在两轮里必须是同一类单元。 */
+    COMP_CHECK(before[i].is_native() == after[i].is_native());
+    if (before[i].is_native()) continue;
+    COMP_CHECK(baked_index < before_keys.size() && baked_index < after_keys.size());
+    if (baked_index >= before_keys.size() || baked_index >= after_keys.size()) return;
+    if (before_keys[baked_index] == after_keys[baked_index]) {
+      COMP_CHECK_MSG(buffer_bytes(before[i].baked) == buffer_bytes(after[i].baked),
+                     "the untouched baked unit must come back byte-identical");
+    }
+    ++baked_index;
+  }
+  COMP_CHECK(baked_index == 2u);
+}
+
+/*
+ * v2 验收 3：不改任何图层内容、只重排组内顺序（S18 明确不给结构变更发修订号），
+ * 子树键仍必须变化——否则缓存会把旧顺序的画面留在屏上。
+ */
+COMP_TEST(gpu_bake_cache_invalidates_when_group_structure_changes) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+
+  Layer* group = add_test_layer(document, "isolated", COMP_BLEND_NORMAL, 1.0f,
+                                comp_rect{0, 0, 0, 0}, 0, true);
+  COMP_CHECK(group != nullptr);
+  if (group == nullptr) return;
+  group->isolated = true;
+  Layer* first_child = add_test_layer(document, "child-a", COMP_BLEND_NORMAL, 1.0f,
+                                      comp_rect{0, 0, size, size}, group->id, false);
+  Layer* second_child = add_test_layer(document, "child-b", COMP_BLEND_NORMAL, 1.0f,
+                                       comp_rect{0, 0, size, size}, group->id, false);
+  COMP_CHECK(first_child != nullptr && second_child != nullptr);
+  if (first_child == nullptr || second_child == nullptr) return;
+  first_child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&first_child->pixels, 31);
+  second_child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&second_child->pixels, 41);
+
+  GpuBakeCache cache;
+  std::string error;
+  std::vector<GpuUnit> before;
+  GpuPlanStats stats{};
+  COMP_CHECK_MSG(build_gpu_plan(document, &before, &stats, &error, &cache), error.c_str());
+  COMP_CHECK(stats.isolated_groups == 1);
+  COMP_CHECK(before.size() == 1u);
+  COMP_CHECK(cache.hits() == 0 && cache.misses() == 1);
+  const uint64_t key_before = before[0].cache_key;
+  COMP_CHECK(key_before != 0);
+
+  /*
+   * reorder_layer 会 erase/insert state_.layers，先前拿到的 Layer* 随即失效；
+   * 之后一律按 id 重新查，避免读悬垂指针。
+   */
+  const comp_layer_id child_a = first_child->id;
+  const comp_layer_id child_b = second_child->id;
+  const uint64_t revision_a = first_child->content_revision;
+  const uint64_t revision_b = second_child->content_revision;
+  COMP_CHECK_MSG(document.reorder_layer(child_b, child_a), "reordering siblings must succeed");
+  const Layer* moved_a = document.find(child_a);
+  const Layer* moved_b = document.find(child_b);
+  COMP_CHECK(moved_a != nullptr && moved_b != nullptr);
+  if (moved_a == nullptr || moved_b == nullptr) return;
+  COMP_CHECK_MSG(moved_a->content_revision == revision_a &&
+                     moved_b->content_revision == revision_b,
+                 "reorder must not bump layer revisions (this is the point of the structure key)");
+
+  error.clear();
+  std::vector<GpuUnit> after;
+  COMP_CHECK_MSG(build_gpu_plan(document, &after, nullptr, &error, &cache), error.c_str());
+  COMP_CHECK(after.size() == 1u);
+  COMP_CHECK_MSG(after[0].cache_key != key_before,
+                 "a group structure change must change the subtree bake key");
+  COMP_CHECK_MSG(cache.hits() == 0 && cache.misses() == 2,
+                 "the reordered subtree must be rebaked, not served from the cache");
+}
+
+/*
+ * v2 补充：两个文档的图层 id 与修订号完全相同、像素不同；同一个缓存不得把
+ * A 的烘焙表面供给 B（键里必须带文档实例号）。
+ */
+COMP_TEST(gpu_bake_cache_is_not_shared_between_documents) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document first(&engine, size, size, 72.0f, "sRGB");
+  Document second(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> first_ids;
+  std::vector<comp_layer_id> second_ids;
+  COMP_CHECK_MSG(build_baked_scene(first, size, &first_ids, 0), "build the first document");
+  COMP_CHECK_MSG(build_baked_scene(second, size, &second_ids, 50), "build the second document");
+  COMP_CHECK_MSG(first_ids == second_ids, "both documents must use the same layer ids");
+  for (const comp_layer_id id : first_ids) {
+    const Layer* a = first.find(id);
+    const Layer* b = second.find(id);
+    COMP_CHECK_MSG(a != nullptr && b != nullptr, "both layers must exist");
+    if (a == nullptr || b == nullptr) return;
+    COMP_CHECK_MSG(a->content_revision == b->content_revision,
+                   "the two documents must have colliding revisions for this test to mean anything");
+  }
+
+  GpuBakeCache cache;
+  std::string error;
+  std::vector<GpuUnit> first_units;
+  COMP_CHECK_MSG(build_gpu_plan(first, &first_units, nullptr, &error, &cache), error.c_str());
+  COMP_CHECK(cache.misses() == 2);
+
+  error.clear();
+  std::vector<GpuUnit> second_units;
+  COMP_CHECK_MSG(build_gpu_plan(second, &second_units, nullptr, &error, &cache), error.c_str());
+  COMP_CHECK_MSG(cache.hits() == 0 && cache.misses() == 4,
+                 "switching documents must miss the bake cache for every baked unit");
+  const std::vector<uint64_t> first_keys = baked_keys(first_units);
+  const std::vector<uint64_t> second_keys = baked_keys(second_units);
+  COMP_CHECK(first_keys.size() == 2u && second_keys.size() == 2u);
+  for (size_t i = 0; i < first_keys.size() && i < second_keys.size(); ++i) {
+    COMP_CHECK_MSG(first_keys[i] != second_keys[i],
+                   "the document instance serial must change every bake key");
+  }
+}
+
+/*
+ * v2 补充：单个表面比预算还大时永不入缓存（否则缓存永远超预算），
+ * 每帧都重新烘焙但结果仍然正确。
+ */
+COMP_TEST(gpu_bake_cache_respects_budget) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+
+  GpuBakeCache cache(1); /* 1 字节预算：任何画布表面都放不下 */
+  std::string error;
+  for (int round = 0; round < 2; ++round) {
+    std::vector<GpuUnit> units;
+    error.clear();
+    COMP_CHECK_MSG(build_gpu_plan(document, &units, nullptr, &error, &cache), error.c_str());
+  }
+  COMP_CHECK_MSG(cache.entries() == 0u, "oversized surfaces must never be stored");
+  COMP_CHECK_MSG(cache.bytes() == 0u, "the cache must not retain any bytes");
+  COMP_CHECK_MSG(cache.hits() == 0 && cache.misses() == 4,
+                 "an unbudgetable surface must miss on every frame");
+}
+
+/* ------------------------------------------------------------------
+ * D3D12：烘焙纹理缓存（真机；未编入 / 无设备 → 跳过）
+ * ------------------------------------------------------------------ */
+
+/*
+ * v2 验收 4：文档没变时连渲两帧，第二帧不得再上传任何源纹理（原生 + 烘焙），
+ * 且两帧逐字节一致、与 CPU 基准差 ≤2 LSB（烘焙量化口径同 S17）。
+ */
+COMP_TEST(rhi_gpu_baked_textures_are_reused_across_identical_frames) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long uploads_before = d3d12->texture_uploads();
+  const unsigned long long bake_misses_before = d3d12->bake_cache_misses();
+  std::string why;
+  std::vector<uint8_t> first;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &first, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the first frame must reach the device");
+  const unsigned long long uploads_after_first = d3d12->texture_uploads();
+  COMP_CHECK_MSG(uploads_after_first - uploads_before == 3u,
+                 "the first frame must create one texture per unit (1 native + 2 baked)");
+  COMP_CHECK_MSG(d3d12->bake_cache_misses() - bake_misses_before == 2u,
+                 "the first plan must bake both baked units");
+
+  const unsigned long long bake_hits_before = d3d12->bake_cache_hits();
+  why.clear();
+  std::vector<uint8_t> second;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &second, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the second frame must still reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() == uploads_after_first,
+                 "an unchanged document must not upload any source texture again");
+  COMP_CHECK_MSG(d3d12->bake_cache_hits() - bake_hits_before == 2u,
+                 "the second plan must hit the CPU bake cache for both baked units");
+  COMP_CHECK_MSG(first == second, "two identical frames must be byte-identical");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, second, &max_diff, &diff_count, &first_diff);
+  const std::string message = "baked-cache CPU parity (max_diff=" + std::to_string(max_diff) +
+                              ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!second.empty() && max_diff <= 2, message.c_str());
+}
+
+/*
+ * v2 验收 5：只改一个烘焙层，下一帧恰好 +1 次上传（该层的烘焙纹理），
+ * 未变的烘焙层与原生层都不得重传；画面反映改动且与 CPU 一致。
+ */
+COMP_TEST(rhi_gpu_baked_texture_cache_uploads_only_changed_units) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+
+  std::string why;
+  std::vector<uint8_t> warm;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &warm, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the warm-up frame must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long uploads_after_warm = d3d12->texture_uploads();
+  const unsigned long long hits_after_warm = d3d12->bake_cache_hits();
+  const unsigned long long misses_after_warm = d3d12->bake_cache_misses();
+
+  Layer* changed = document.find(ids[2]);
+  COMP_CHECK_MSG(changed != nullptr, "the edited layer must exist");
+  if (changed == nullptr) return;
+  changed->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 100, 20, 60, 160);
+  COMP_CHECK_MSG(document.touch_layer(ids[2]) != 0, "touch_layer must allocate a new revision");
+
+  why.clear();
+  std::vector<uint8_t> edited;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &edited, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the edited frame must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - uploads_after_warm == 1u,
+                 "only the changed baked unit may be uploaded again");
+  COMP_CHECK_MSG(d3d12->bake_cache_hits() - hits_after_warm == 1u,
+                 "the untouched baked unit must hit the CPU bake cache");
+  COMP_CHECK_MSG(d3d12->bake_cache_misses() - misses_after_warm == 1u,
+                 "the changed baked unit must be rebaked");
+  COMP_CHECK_MSG(edited != warm, "the new frame must reflect the edited layer content");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, edited, &max_diff, &diff_count, &first_diff);
+  const std::string message = "edited baked-frame CPU parity (max_diff=" +
+                              std::to_string(max_diff) + ", diffs=" +
+                              std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!edited.empty() && max_diff <= 2, message.c_str());
+}
+
+/*
+ * v2 验收 6：活跃事务期间烘焙缓存整段旁路——每帧按单元数上传，且不读写
+ * CPU 烘焙缓存；提交后只有真正改过的烘焙层重传一次。
+ */
+COMP_TEST(rhi_gpu_baked_texture_cache_is_bypassed_inside_a_transaction) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_baked_scene(document, size, &ids), "build the baked scene");
+
+  std::string why;
+  std::vector<uint8_t> warm;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &warm, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the pre-transaction frame must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long uploads_after_warm = d3d12->texture_uploads();
+  const unsigned long long hits_after_warm = d3d12->bake_cache_hits();
+  const unsigned long long misses_after_warm = d3d12->bake_cache_misses();
+
+  std::string txn_error;
+  COMP_CHECK_MSG(document.txn_begin("v2 bake cache bypass", &txn_error) == COMP_OK,
+                 txn_error.c_str());
+  COMP_CHECK_MSG(document.txn_active(), "the transaction must be active");
+  Layer* edited = document.find(ids[2]);
+  COMP_CHECK_MSG(edited != nullptr, "the edited layer must exist");
+  if (edited == nullptr) return;
+  edited->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 40, 120, 200, 220);
+  document.touch_layer(ids[2]);
+
+  for (int round = 0; round < 2; ++round) {
+    const unsigned long long before_round = d3d12->texture_uploads();
+    why.clear();
+    std::vector<uint8_t> in_txn;
+    COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &in_txn, &why), why.c_str());
+    COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                   "a frame inside a transaction must still reach the device");
+    COMP_CHECK_MSG(d3d12->texture_uploads() - before_round == 3u,
+                   "transaction frames must bypass both texture caches entirely");
+  }
+  COMP_CHECK_MSG(d3d12->texture_uploads() - uploads_after_warm == 6u,
+                 "two transaction frames must upload every unit twice");
+  COMP_CHECK_MSG(d3d12->bake_cache_hits() == hits_after_warm &&
+                     d3d12->bake_cache_misses() == misses_after_warm,
+                 "transaction frames must not touch the CPU bake cache");
+
+  COMP_CHECK_MSG(document.txn_commit(&txn_error) == COMP_OK, txn_error.c_str());
+  COMP_CHECK(!document.txn_active());
+
+  const unsigned long long uploads_after_commit = d3d12->texture_uploads();
+  why.clear();
+  std::vector<uint8_t> committed;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &committed, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the post-commit frame must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - uploads_after_commit == 1u,
+                 "after the commit only the touched baked unit may be uploaded again");
+  COMP_CHECK_MSG(committed != warm, "the committed frame must reflect the edited layer");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, committed, &max_diff, &diff_count, &first_diff);
+  const std::string message = "post-commit baked CPU parity (max_diff=" +
+                              std::to_string(max_diff) + ", diffs=" +
+                              std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!committed.empty() && max_diff <= 2, message.c_str());
+}
