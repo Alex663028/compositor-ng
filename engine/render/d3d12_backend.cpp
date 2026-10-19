@@ -6,6 +6,7 @@
 
 #include "core/comp_geometry.h"
 #include "render/gpu_kernel.h"
+#include "render/gpu_plan.h"
 
 #if defined(COMP_HAS_D3D12)
 
@@ -125,70 +126,13 @@ std::string hresult_text(const char* what, HRESULT hr) {
 }
 
 /*
- * GPU 能力闸门：把「这个文档能不能交给 D3D12 的逐层混合」说清楚。
+ * GPU 能力判定与单元划分已迁到 render/gpu_plan.{h,cpp}（S17）。
  *
- * 目前的着色器只做「整张画布、RGBA8、逐层 blend」；组语义、蒙版、剪贴、
- * 调整/效果、变换（缩放/旋转/翻转/裁剪）都还在 CPU 的 FilterGraph 里。
- * 任何一项不满足都必须整篇回落 CPU——绝不能只画一部分层就交出画面。
- *
- * paint 为 nullptr 时只判定不收集。
+ * 旧版这里是 gpu_document_ready：只要有一层带蒙版 / 效果 / 组 / 剪贴 / 调整 /
+ * 非全画布，就把整篇文档回落 CPU。现在由 build_gpu_plan 按合成单元分类：
+ * 能直接上传的层走原生纹理，裁剪/蒙版/效果/变换/隔离组/剪贴栈在 CPU 上烘焙成
+ * 画布单元后照常交给 GPU 混合；只有「调整层」和 HDR 表面继续整篇回落。
  */
-bool gpu_document_ready(const Document& doc, std::vector<const Layer*>* paint,
-                        std::string* why) {
-  const DocumentState& state = doc.state();
-  if (state.width <= 0 || state.height <= 0) {
-    if (why != nullptr) *why = "gpu backend: empty canvas";
-    return false;
-  }
-  for (const Layer& layer : state.layers) {
-    if (layer.parent != 0) {
-      if (why != nullptr) *why = "gpu backend: nested/group layers are not supported yet";
-      return false;
-    }
-    if (!layer.visible) continue; /* 不可见图层不参与合成（CPU 同口径） */
-    if (layer.is_group) {
-      if (why != nullptr) *why = "gpu backend: layer groups are not supported yet";
-      return false;
-    }
-    if (layer.clipping_source != 0) {
-      if (why != nullptr) *why = "gpu backend: clipping masks are not supported yet";
-      return false;
-    }
-    if (!layer.mask.empty()) {
-      if (why != nullptr) *why = "gpu backend: layer masks are not baked yet";
-      return false;
-    }
-    if (!layer.adjustments.empty()) {
-      if (why != nullptr) *why = "gpu backend: adjustments are not evaluated yet";
-      return false;
-    }
-    if (!layer.effects.empty()) {
-      if (why != nullptr) *why = "gpu backend: effects are not evaluated yet";
-      return false;
-    }
-    if (layer.rotation != 0.0f || layer.flip_x || layer.flip_y) {
-      if (why != nullptr) *why = "gpu backend: layer transforms are not supported yet";
-      return false;
-    }
-    if (!layer.has_pixels()) continue; /* 无像素 = 不贡献画面（CPU 同口径） */
-    if (layer.pixels.width != state.width || layer.pixels.height != state.height ||
-        layer.pixels.format != COMP_PIXEL_RGBA8) {
-      if (why != nullptr) {
-        *why = "gpu backend: needs full-canvas RGBA8 layers (no crop/resample yet)";
-      }
-      return false;
-    }
-    /* 变换必须是「整幅画布、无偏移」：采样/裁剪/缩放都在 CPU 路径里。 */
-    const comp_rect bounds = layer.effective_bounds();
-    if (bounds.x != 0 || bounds.y != 0 || bounds.w != state.width ||
-        bounds.h != state.height) {
-      if (why != nullptr) *why = "gpu backend: layer bounds must equal the canvas";
-      return false;
-    }
-    if (paint != nullptr) paint->push_back(&layer);
-  }
-  return true;
-}
 
 }  // namespace
 
@@ -764,8 +708,9 @@ BackendCaps D3d12RenderBackend::caps() const {
   if (c.device_available && c.window_present) {
     c.note =
         "D3D12 offscreen compute + readback, and HWND present via DXGI flip-model swap "
-        "chain (persistent device/PSO, HLSL compiled at runtime; falls back to CPU for "
-        "documents outside the simple-stack subset)";
+        "chain (persistent device/PSO, HLSL compiled at runtime; layer units are uploaded "
+        "natively or CPU-baked for crop/mask/effects/transforms/groups/clipping, adjustment "
+        "layers and HDR surfaces still fall back to CPU)";
   } else if (c.device_available) {
     c.note =
         "D3D12 offscreen compute + readback (persistent device/PSO, HLSL compiled at "
@@ -777,14 +722,20 @@ BackendCaps D3d12RenderBackend::caps() const {
 }
 
 bool D3d12RenderBackend::can_render_document(const Document& doc, std::string* error) const {
-  return gpu_document_ready(doc, nullptr, error);
+  /* 只做分类与可行性判定，不分配烘焙缓冲（S17：粒度见 gpu_plan.h）。 */
+  return build_gpu_plan(doc, nullptr, nullptr, error);
 }
 
 bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target& target,
                                          std::string* error) {
-  /* 先把「文档是否属于 GPU 子集」判掉：不满足时连设备都不必初始化。 */
-  std::vector<const Layer*> paint;
-  if (!gpu_document_ready(doc, &paint, error)) return false;
+  /*
+   * 先把文档拆成合成单元：不满足 GPU 子集时连设备都不必初始化。
+   * 单元 = 一张画布尺寸的预乘源 + 混合模式 + 不透明度；原生单元直接引用
+   * 图层像素，其余（裁剪/蒙版/效果/变换/隔离组/剪贴栈）已由 CPU 烘焙。
+   */
+  std::vector<GpuUnit> units;
+  GpuPlanStats plan_stats;
+  if (!build_gpu_plan(doc, &units, &plan_stats, error)) return false;
 
   const DocumentState& state = doc.state();
   /*
@@ -846,10 +797,10 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
   const UINT64 block_size = static_cast<UINT64>(aligned_row) * height;
 
   /*
-   * 先把所有图层像素铺进上传缓冲（1 块清屏 + 每层 1 块），再录制拷贝命令。
-   * 命令是执行时才读缓冲的，共用一块会让先录的拷贝读到最后一层的数据。
+   * 先把所有单元源铺进上传缓冲（1 块清屏 + 每单元 1 块），再录制拷贝命令。
+   * 命令是执行时才读缓冲的，共用一块会让先录的拷贝读到最后一个单元的数据。
    */
-  if (!gpu_->ensure_upload_blocks(static_cast<UINT>(paint.size()) + 1u, error)) {
+  if (!gpu_->ensure_upload_blocks(static_cast<UINT>(units.size()) + 1u, error)) {
     return false;
   }
 
@@ -932,22 +883,40 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   gpu_->dst_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
-  /* 逐层：上传源像素 -> UAV -> 计算混合 -> 回到可再次上传的状态。 */
+  /* 逐单元：上传源像素 -> UAV -> 计算混合 -> 回到可再次上传的状态。 */
   const UINT groups_x = (width + 7u) / 8u;
   const UINT groups_y = (height + 7u) / 8u;
-  for (size_t i = 0; i < paint.size(); ++i) {
-    const Layer* layer = paint[i];
-    const uint8_t* pixels = layer->pixels.pixel_data().data();
-    if (pixels == nullptr) {
-      build_error = "d3d12 backend: layer pixel buffer inconsistent";
-      built = false;
-      break;
-    }
+  for (size_t i = 0; i < units.size(); ++i) {
+    const GpuUnit& unit = units[i];
     const UINT64 offset = block_size * static_cast<UINT64>(i + 1);
     uint8_t* upload_target = gpu_->upload_mapped + static_cast<size_t>(offset);
-    for (UINT y = 0; y < height; ++y) {
-      std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
-                  pixels + static_cast<size_t>(y) * row_bytes, row_bytes);
+    /*
+     * 原生单元：图层像素就是整幅画布（gpu_plan 已保证 RGBA8 + 恒等几何）；
+     * 烘焙单元：画布尺寸的预乘 RGBA8，逐行拷进上传块。
+     */
+    if (unit.is_native()) {
+      const uint8_t* pixels = unit.native_layer->pixels.pixel_data().data();
+      if (pixels == nullptr) {
+        build_error = "d3d12 backend: layer pixel buffer inconsistent";
+        built = false;
+        break;
+      }
+      for (UINT y = 0; y < height; ++y) {
+        std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
+                    pixels + static_cast<size_t>(y) * row_bytes, row_bytes);
+      }
+    } else {
+      if (unit.baked.empty() || unit.baked.width != static_cast<int32_t>(width) ||
+          unit.baked.height != static_cast<int32_t>(height) ||
+          unit.baked.format != COMP_PIXEL_RGBA8) {
+        build_error = "d3d12 backend: baked unit has an inconsistent surface";
+        built = false;
+        break;
+      }
+      for (UINT y = 0; y < height; ++y) {
+        std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
+                    unit.baked.row(static_cast<size_t>(y)), row_bytes);
+      }
     }
     barrier(gpu_->src_tex, gpu_->src_state, D3D12_RESOURCE_STATE_COPY_DEST);
     copy_into(gpu_->src_tex, gpu_->upload, offset);
@@ -957,8 +926,8 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
 
     list->SetComputeRootSignature(gpu_->root);
     list->SetPipelineState(gpu_->pso);
-    UINT constants[8] = {static_cast<UINT>(layer->blend), width, height, 0, 0, 0, 0, 0};
-    float alpha = layer->opacity;
+    UINT constants[8] = {static_cast<UINT>(unit.blend), width, height, 0, 0, 0, 0, 0};
+    float alpha = unit.opacity;
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
     std::memcpy(&constants[4], &alpha, sizeof(float));

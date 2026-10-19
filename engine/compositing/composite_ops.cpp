@@ -453,6 +453,39 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
   return true;
 }
 
+bool bake_layer_contribution(const Document& doc, const Layer& layer, double opacity_scale,
+                             ImageBuffer* out, std::string* error) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "bake destination is null";
+    return false;
+  }
+  const DocumentState& state = doc.state();
+  if (state.width <= 0 || state.height <= 0) {
+    if (error != nullptr) *error = "document canvas is empty";
+    return false;
+  }
+
+  /*
+   * 图层组不持有像素：组单元的烘焙走 filter_graph 的「隔离组 / 剪贴栈表面」，
+   * 这里必须明确拒绝，而不是静默返回一张透明画布（那会让上层画面少一块）。
+   */
+  if (layer.is_group) {
+    if (error != nullptr) *error = "bake_layer_contribution does not bake layer groups";
+    return false;
+  }
+
+  Layer contribution_layer = layer;
+  contribution_layer.blend = COMP_BLEND_NORMAL;
+  ImageBuffer canvas;
+  canvas.resize(state.width, state.height, COMP_PIXEL_RGBA8);
+  canvas.clear_transparent();
+  if (!blend_layer_into(&canvas, doc, contribution_layer, opacity_scale, error)) {
+    return false;
+  }
+  *out = std::move(canvas);
+  return true;
+}
+
 bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode mode, double opacity) {
   if (dst == nullptr) return false;
   if (dst->width != src.width || dst->height != src.height) return false;

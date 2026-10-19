@@ -77,6 +77,25 @@ bool build_filter_graph(const Document& doc, FilterGraph* graph, std::string* er
 bool execute_filter_graph(const Document& doc, const FilterGraph& graph, ImageBuffer* out,
                           std::string* error);
 
+/*
+ * S17：求值一个「独立合成单元」的表面（不与 backdrop 混合）。
+ *
+ * 目前支持两类节点：
+ *   - 隔离组（kGroup && isolated）：返回子树在透明画布上的合成结果；
+ *   - 剪贴栈（kClippingStack）：返回 extract → 成员 → restore 之后的栈表面。
+ * 其他节点（普通像素层、穿透组）明确失败——它们不是独立单元，应由调用方
+ * 按自己的几何/混合语义处理。
+ *
+ * 用途：GPU 后端把「不能直接逐层上传」的复杂节点（组 / 剪贴栈）在 CPU 上烘焙
+ * 成画布单元，再按节点自身的混合模式与不透明度交给设备合成。这保证 CPU 求值
+ * 与 GPU 单元烘焙共用同一份公式，不会出现两套实现漂移。
+ *
+ * 表面深度跟文档走（有 HDR 图层即 RGBA16F）；无贡献（隐藏 / 空 bounds）时
+ * 返回**空缓冲**并返回 true。失败时写 error 并返回 false。
+ */
+bool bake_filter_unit_surface(const Document& doc, const FilterGraph& graph, int32_t node_index,
+                              double opacity_scale, ImageBuffer* out, std::string* error);
+
 }  // namespace compositor
 
 #endif /* COMPOSITOR_COMPOSITING_FILTER_GRAPH_H */

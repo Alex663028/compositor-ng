@@ -31,6 +31,7 @@
 #include "engine.h"
 #include "render/d3d12_backend.h"
 #include "render/gpu_kernel.h"
+#include "render/gpu_plan.h"
 #include "render/rhi.h"
 
 #if defined(_WIN32)
@@ -868,4 +869,412 @@ COMP_TEST(rhi_hwnd_target_is_rejected_without_gpu_backend) {
   }
   comp_document_destroy(doc);
   comp_engine_destroy(cpu_engine);
+}
+
+/* ==================================================================
+ * S17：GPU 子集分层（按合成单元分类 + CPU 烘焙）
+ * ================================================================== */
+
+namespace {
+
+/* 生成一张「预乘合法」的测试图案（颜色分量不超过 alpha）。 */
+void fill_test_pattern(ImageBuffer* buffer, int32_t seed) {
+  if (buffer == nullptr || buffer->empty()) return;
+  for (int32_t y = 0; y < buffer->height; ++y) {
+    uint8_t* row = buffer->writable_row(static_cast<size_t>(y));
+    for (int32_t x = 0; x < buffer->width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4;
+      const uint32_t alpha =
+          (static_cast<uint32_t>(x * 9 + y * 5 + seed * 17) % 180u) + 60u;
+      p[0] = static_cast<uint8_t>(((x * 21 + seed * 13) % 255) * alpha / 255);
+      p[1] = static_cast<uint8_t>(((y * 19 + seed * 7) % 255) * alpha / 255);
+      p[2] = static_cast<uint8_t>((((x + y) * 11 + seed * 3) % 255) * alpha / 255);
+      p[3] = static_cast<uint8_t>(alpha);
+    }
+  }
+}
+
+Layer* add_test_layer(Document& doc, const char* name, comp_blend_mode blend, float opacity,
+                      comp_rect bounds, comp_layer_id parent, bool group) {
+  comp_layer_desc desc{};
+  desc.name = name;
+  desc.blend = blend;
+  desc.opacity = opacity;
+  desc.transform = bounds;
+  desc.is_group = group ? 1 : 0;
+  desc.parent = parent;
+  comp_layer_id id = 0;
+  return doc.create_layer(desc, &id);
+}
+
+std::unique_ptr<RenderBackend> make_backend(Engine* engine, comp_backend kind,
+                                            std::string* error) {
+  comp_backend actual = COMP_BACKEND_AUTO;
+  return create_backend(engine, kind, error, &actual);
+}
+
+bool render_to_buffer(RenderBackend& backend, Document& doc, int32_t size,
+                      std::vector<uint8_t>* pixels, std::string* error) {
+  if (pixels == nullptr) return false;
+  pixels->assign(static_cast<size_t>(size) * static_cast<size_t>(size) * 4, 0);
+  comp_render_target target{};
+  target.size = comp_size{size, size};
+  target.format = COMP_PIXEL_RGBA8;
+  target.kind = COMP_SURFACE_CPU_BUFFER;
+  target.stride = static_cast<size_t>(size) * 4;
+  target.pixels = pixels->data();
+  return backend.render_document(doc, target, error);
+}
+
+/*
+ * S17 场景：一个把「旧闸门会拒绝的全部形态」塞在一起的文档。
+ * 期望：build_gpu_plan 不再整篇拒绝，而是把它拆成原生/烘焙单元。
+ */
+void build_layered_scene(Document& document, int32_t size) {
+  Layer* background =
+      add_test_layer(document, "bg", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(background != nullptr);
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 24, 96, 168, 255);
+
+  /* 裁剪 + 偏移：像素只有 8x6，落在 (7,9)。 */
+  Layer* cropped =
+      add_test_layer(document, "crop", COMP_BLEND_MULTIPLY, 0.75f, comp_rect{7, 9, 8, 6}, 0, false);
+  COMP_CHECK(cropped != nullptr);
+  cropped->pixels.resize(8, 6, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&cropped->pixels, 3);
+
+  /* 蒙版：整幅画布像素 + 同尺寸渐变蒙版。 */
+  Layer* masked = add_test_layer(document, "masked", COMP_BLEND_SCREEN, 0.8f,
+                                 comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(masked != nullptr);
+  masked->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&masked->pixels, 5);
+  masked->mask.resize(size, size, 255);
+  for (int32_t y = 0; y < size; ++y) {
+    for (int32_t x = 0; x < size; ++x) {
+      masked->mask.writable_pixels()[static_cast<size_t>(y) * size + x] =
+          static_cast<uint8_t>((x * 8) & 0xFF);
+    }
+  }
+
+  /* 穿透组：两个整幅子层；组不透明度 0.8 乘进每个子层（0.9 x 0.8 = 0.72）。 */
+  Layer* pass_group =
+      add_test_layer(document, "pass-through", COMP_BLEND_NORMAL, 0.8f, comp_rect{0, 0, 0, 0}, 0, true);
+  COMP_CHECK(pass_group != nullptr);
+  for (int32_t i = 0; i < 2; ++i) {
+    Layer* child = add_test_layer(document, "pass-child",
+                                  i == 0 ? COMP_BLEND_MULTIPLY : COMP_BLEND_NORMAL, 0.9f,
+                                  comp_rect{0, 0, size, size}, pass_group->id, false);
+    COMP_CHECK(child != nullptr);
+    child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+    fill_test_pattern(&child->pixels, 9 + i);
+  }
+
+  /* 隔离组：子树烘焙成单个单元，组自身的混合模式与不透明度作用在单元上。 */
+  Layer* isolated_group = add_test_layer(document, "isolated", COMP_BLEND_SCREEN, 0.6f,
+                                         comp_rect{0, 0, 0, 0}, 0, true);
+  COMP_CHECK(isolated_group != nullptr);
+  isolated_group->isolated = true;
+  for (int32_t i = 0; i < 2; ++i) {
+    Layer* child = add_test_layer(document, "iso-child", COMP_BLEND_NORMAL, 0.85f,
+                                  comp_rect{0, 0, size, size}, isolated_group->id, false);
+    COMP_CHECK(child != nullptr);
+    child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+    fill_test_pattern(&child->pixels, 13 + i);
+  }
+
+  /* 剪贴栈：基底 + 紧跟的被剪成员。 */
+  Layer* clip_base = add_test_layer(document, "clip-base", COMP_BLEND_NORMAL, 0.9f,
+                                    comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(clip_base != nullptr);
+  clip_base->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&clip_base->pixels, 21);
+  Layer* clipped = add_test_layer(document, "clipped", COMP_BLEND_MULTIPLY, 1.0f,
+                                  comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(clipped != nullptr);
+  clipped->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&clipped->pixels, 23);
+  clipped->clipping_source = clip_base->id;
+}
+
+}  // namespace
+
+/*
+ * 计划分类：裁剪/蒙版/组/剪贴不再让整篇回落，而是按单元分类。
+ *
+ * 这里不依赖 GPU：分类与 CPU 烘焙都是平台无关的，所以默认构建也能钉住
+ * 「回落粒度已拆细」这件事。额外用「单元序列 + 同一条 CPU 混合公式」重组出
+ * 一张图，与 CPU 合成器整篇结果对拍——证明计划没有漏掉或重复任何贡献。
+ */
+COMP_TEST(rhi_gpu_plan_classifies_units_instead_of_rejecting_documents) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 2;
+  Engine engine(desc);
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  build_layered_scene(document, size);
+
+  std::string error;
+  GpuPlanStats stats{};
+  COMP_CHECK_MSG(build_gpu_plan(document, nullptr, &stats, &error), error.c_str());
+  COMP_CHECK_MSG(stats.native_units == 3, "background + two pass-through children upload natively");
+  COMP_CHECK_MSG(stats.baked_units == 2, "cropped and masked layers must be baked, not rejected");
+  COMP_CHECK_MSG(stats.isolated_groups == 1, "the isolated group is one baked unit");
+  COMP_CHECK_MSG(stats.clipping_stacks == 1, "the clipping stack is one baked unit");
+  COMP_CHECK_MSG(stats.pass_through_groups == 1, "the pass-through group is expanded");
+
+  std::vector<GpuUnit> units;
+  GpuPlanStats built{};
+  error.clear();
+  COMP_CHECK_MSG(build_gpu_plan(document, &units, &built, &error), error.c_str());
+  COMP_CHECK(units.size() == 7u);
+  COMP_CHECK(built.native_units == 3 && built.baked_units == 2);
+
+  int32_t baked_count = 0;
+  bool saw_pass_through_opacity = false;
+  for (const GpuUnit& unit : units) {
+    if (unit.is_native()) {
+      COMP_CHECK(unit.native_layer != nullptr);
+      if (std::abs(unit.opacity - 0.72f) < 1e-4f) saw_pass_through_opacity = true;
+      continue;
+    }
+    ++baked_count;
+    COMP_CHECK(unit.native_layer == nullptr);
+    COMP_CHECK(!unit.baked.empty());
+    COMP_CHECK(unit.baked.width == size && unit.baked.height == size);
+    COMP_CHECK(unit.baked.format == COMP_PIXEL_RGBA8);
+  }
+  COMP_CHECK(baked_count == 4);
+  COMP_CHECK_MSG(saw_pass_through_opacity,
+                 "pass-through group opacity must multiply into each child unit");
+
+  /*
+   * 用计划自己的单元序列重组整篇：原生单元 = 图层像素，烘焙单元 = 预乘贡献；
+   * 每个单元都用同一套 blend_buffer_into 叠加。与 CPU 合成器整篇结果对比，
+   * 差异只允许来自烘焙的 8 位量化（≤1 LSB）。
+   */
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &error);
+  COMP_CHECK_MSG(cpu != nullptr, error.c_str());
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &error), error.c_str());
+
+  ImageBuffer assembled;
+  assembled.resize(size, size, COMP_PIXEL_RGBA8);
+  assembled.clear_transparent();
+  for (const GpuUnit& unit : units) {
+    const ImageBuffer& source = unit.is_native() ? unit.native_layer->pixels : unit.baked;
+    COMP_CHECK(blend_buffer_into(&assembled, source, unit.blend, unit.opacity));
+  }
+  std::vector<uint8_t> planned_pixels(static_cast<size_t>(size) * size * 4, 0);
+  for (int32_t y = 0; y < size; ++y) {
+    std::memcpy(planned_pixels.data() + static_cast<size_t>(y) * size * 4,
+                assembled.row(static_cast<size_t>(y)), static_cast<size_t>(size) * 4);
+  }
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, planned_pixels, &max_diff, &diff_count, &first_diff);
+  const std::string message = "plan units must reproduce the CPU composite (max_diff=" +
+                              std::to_string(max_diff) + ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!cpu_pixels.empty() && max_diff <= 1, message.c_str());
+}
+
+/*
+ * 剩余回落必须具名：调整层（作用于已合成画布）与 HDR 表面仍然整篇回落 CPU。
+ * 这两条是「拆细」之后的真实边界，不能悄悄近似。
+ */
+COMP_TEST(rhi_gpu_plan_names_remaining_fallbacks) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.backend = COMP_BACKEND_CPU;
+  Engine engine(desc);
+  const int32_t size = 16;
+
+  Document adjusted(&engine, size, size, 72.0f, "sRGB");
+  Layer* background =
+      add_test_layer(adjusted, "bg", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(background != nullptr);
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 10, 20, 30, 255);
+  Layer* top =
+      add_test_layer(adjusted, "top", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(top != nullptr);
+  top->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 40, 50, 60, 200);
+  Adjustment exposure{};
+  exposure.kind = COMP_ADJUSTMENT_EXPOSURE;
+  exposure.settings_json = "{\"exposureSettings\":{\"exposure\":0.2}}";
+  top->adjustments.push_back(exposure);
+
+  std::string error;
+  COMP_CHECK(!build_gpu_plan(adjusted, nullptr, nullptr, &error));
+  COMP_CHECK_MSG(error.find("adjustment") != std::string::npos,
+                 "the rejection must name the adjustment layer");
+
+  Document hdr(&engine, size, size, 72.0f, "sRGB");
+  Layer* hdr_layer =
+      add_test_layer(hdr, "hdr", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(hdr_layer != nullptr);
+  hdr_layer->pixels.resize(size, size, COMP_PIXEL_RGBA16F);
+  error.clear();
+  COMP_CHECK(!build_gpu_plan(hdr, nullptr, nullptr, &error));
+  COMP_CHECK_MSG(error.find("HDR") != std::string::npos,
+                 "the rejection must name the half-float surface");
+}
+
+/*
+ * S17 GPU 一致性：裁剪 + 蒙版图层（旧闸门整篇回落的形态）在真实设备上必须
+ * 走 GPU 且与 CPU 基准一致（±1 LSB）。未编入 D3D12 / 无设备 → 跳过。
+ */
+COMP_TEST(rhi_gpu_renders_cropped_and_masked_layers_like_cpu) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::string error;
+  std::unique_ptr<RenderBackend> gpu = make_backend(&engine, COMP_BACKEND_D3D12, &error);
+  if (gpu == nullptr || gpu->kind() != COMP_BACKEND_D3D12 || !gpu->usable()) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  Layer* background =
+      add_test_layer(document, "bg", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(background != nullptr);
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 24, 96, 168, 255);
+
+  Layer* cropped =
+      add_test_layer(document, "crop", COMP_BLEND_MULTIPLY, 0.75f, comp_rect{7, 9, 8, 6}, 0, false);
+  COMP_CHECK(cropped != nullptr);
+  cropped->pixels.resize(8, 6, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&cropped->pixels, 3);
+
+  Layer* masked = add_test_layer(document, "masked", COMP_BLEND_SCREEN, 0.8f,
+                                 comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(masked != nullptr);
+  masked->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&masked->pixels, 5);
+  /* 蒙版比画布小：蒙版坐标要经文档逆映射采样，烘焙路径必须沿用 CPU 的同一套。 */
+  masked->mask.resize(16, 16, 255);
+  for (int32_t y = 0; y < 16; ++y) {
+    for (int32_t x = 0; x < 16; ++x) {
+      masked->mask.writable_pixels()[static_cast<size_t>(y) * 16 + x] =
+          static_cast<uint8_t>((x * 16) & 0xFF);
+    }
+  }
+
+  std::string why;
+  COMP_CHECK_MSG(gpu->can_render_document(document, &why), why.c_str());
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &error);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  std::vector<uint8_t> gpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  why.clear();
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &gpu_pixels, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                 "cropped/masked layers must reach the device (baked unit), not fall back");
+
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, gpu_pixels, &max_diff, &diff_count, &first_diff);
+  /*
+   * 烘焙单元与原生单元的口径不同：原生单元逐位上传像素，GPU 混合结果与 CPU 基准
+   * 只差舍入（≤1 LSB）；烘焙单元要先把「蒙版 x 不透明度」乘进预乘色并量化成 8 位，
+   * 再做一次混合，量化误差经 MULTIPLY/SCREEN 的颜色乘积项最多放大到 2 LSB。
+   * 实测（32x32、裁剪 MULTIPLY 0.75 + 蒙版 SCREEN 0.8）最大差 2、约 13% 字节不同。
+   * 这是「少一次上传 vs 一次量化」的显式取舍，不是画面错误，故这里按 2 断言。
+   */
+  const std::string message = "crop+mask GPU parity (max_diff=" + std::to_string(max_diff) +
+                              ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!gpu_pixels.empty() && max_diff <= 2, message.c_str());
+}
+
+/*
+ * S17 GPU 一致性：隔离组 / 穿透组 / 剪贴栈在真实设备上与 CPU 基准一致（±1 LSB）。
+ * 未编入 D3D12 / 无设备 → 跳过。
+ */
+COMP_TEST(rhi_gpu_renders_group_and_clipping_units_like_cpu) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::string error;
+  std::unique_ptr<RenderBackend> gpu = make_backend(&engine, COMP_BACKEND_D3D12, &error);
+  if (gpu == nullptr || gpu->kind() != COMP_BACKEND_D3D12 || !gpu->usable()) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  Layer* background =
+      add_test_layer(document, "bg", COMP_BLEND_NORMAL, 1.0f, comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(background != nullptr);
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 24, 96, 168, 255);
+
+  Layer* pass_group =
+      add_test_layer(document, "pass-through", COMP_BLEND_NORMAL, 0.8f, comp_rect{0, 0, 0, 0}, 0, true);
+  COMP_CHECK(pass_group != nullptr);
+  for (int32_t i = 0; i < 2; ++i) {
+    Layer* child = add_test_layer(document, "pass-child",
+                                  i == 0 ? COMP_BLEND_MULTIPLY : COMP_BLEND_NORMAL, 0.9f,
+                                  comp_rect{0, 0, size, size}, pass_group->id, false);
+    COMP_CHECK(child != nullptr);
+    child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+    fill_test_pattern(&child->pixels, 9 + i);
+  }
+
+  Layer* isolated_group = add_test_layer(document, "isolated", COMP_BLEND_SCREEN, 0.6f,
+                                         comp_rect{0, 0, 0, 0}, 0, true);
+  COMP_CHECK(isolated_group != nullptr);
+  isolated_group->isolated = true;
+  for (int32_t i = 0; i < 2; ++i) {
+    Layer* child = add_test_layer(document, "iso-child", COMP_BLEND_NORMAL, 0.85f,
+                                  comp_rect{0, 0, size, size}, isolated_group->id, false);
+    COMP_CHECK(child != nullptr);
+    child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+    fill_test_pattern(&child->pixels, 13 + i);
+  }
+
+  Layer* clip_base = add_test_layer(document, "clip-base", COMP_BLEND_NORMAL, 0.9f,
+                                    comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(clip_base != nullptr);
+  clip_base->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&clip_base->pixels, 21);
+  Layer* clipped = add_test_layer(document, "clipped", COMP_BLEND_MULTIPLY, 1.0f,
+                                  comp_rect{0, 0, size, size}, 0, false);
+  COMP_CHECK(clipped != nullptr);
+  clipped->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&clipped->pixels, 23);
+  clipped->clipping_source = clip_base->id;
+
+  std::string why;
+  COMP_CHECK_MSG(gpu->can_render_document(document, &why), why.c_str());
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &error);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  std::vector<uint8_t> gpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  why.clear();
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &gpu_pixels, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                 "group/clipping units must reach the device, not fall back to CPU");
+
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, gpu_pixels, &max_diff, &diff_count, &first_diff);
+  const std::string message = "group/clipping GPU parity (max_diff=" +
+                              std::to_string(max_diff) + ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!gpu_pixels.empty() && max_diff <= 1, message.c_str());
 }

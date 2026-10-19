@@ -25,8 +25,11 @@ namespace compositor {
  * 上传与回读缓冲只在画布尺寸变化时重建），不再每次渲染重新创建设备与管线；
  * 那正是此前「GPU 单帧比 CPU 还慢」的主因。
  *
- * 能力闸门：只接受 can_render_document 认可的简单文档（全画布 RGBA8、无组/
- * 蒙版/剪贴/调整/效果/变换）。ABI 层据此按文档回落 CPU，不会输出错误画面。
+ * 能力边界（S17 起按合成单元划分，见 render/gpu_plan.h）：整幅 RGBA8、无蒙版/
+ * 效果/变换的像素层直接上传；裁剪/偏移、蒙版、效果、旋转翻转缩放、16 位源图层、
+ * 隔离组与剪贴栈在 CPU 上烘焙成画布单元后照常交给 GPU 混合。仍整篇回落 CPU 的
+ * 只有「调整层」（作用于已合成画布）与 HDR（RGBA16F）表面。ABI 层据此按文档
+ * 回落，不会输出错误画面。
  *
  * S16 起支持窗口直呈：target.kind == COMP_SURFACE_HWND 时合成结果直接拷进
  * DXGI flip-model 交换链后备缓冲，comp_render_present 才真正 Present——不再整幅

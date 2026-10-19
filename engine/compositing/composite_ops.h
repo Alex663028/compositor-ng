@@ -88,6 +88,25 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
 bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode mode, double opacity);
 
 /*
+ * S17：把**单个图层**的贡献烘焙成画布空间的预乘 RGBA8 缓冲（不与任何现有画面混合）。
+ *
+ * 用途：GPU 后端只接受「整幅画布、无蒙版/效果/变换」的图层直接上传；其余图层
+ * （裁剪到画布一部分、带蒙版、带效果、旋转/翻转/缩放、16 位/HDR 源）在 CPU 上
+ * 先烘焙成画布单元，再由 GPU 按**原来的混合模式**参与合成。这样「不能直接上传
+ * 的图层」不再把整篇文档拖回 CPU。
+ *
+ * 口径：等价于在透明画布上以 Normal 语义调用 blend_layer_into——对透明底色，
+ * W3C 公式只剩 src 项，所以 Normal 不丢颜色；结果 = 图层预乘像素 ×（蒙版 ×
+ * 效果 × 不透明度 × 剪贴系数）。调用方随后用原混合模式 + alpha=1 合成，
+ * 与 blend_pixels 的逐像素公式等价（差别只在 8 位量化带来的 ≤1 LSB）。
+ *
+ * opacity_scale 为穿透组累积的不透明度系数（顶层传 1.0）。out 会被重置为
+ * 画布尺寸的 RGBA8。失败时写 error 并返回 false。
+ */
+bool bake_layer_contribution(const Document& doc, const Layer& layer, double opacity_scale,
+                             ImageBuffer* out, std::string* error);
+
+/*
  * 剪贴栈的 alpha 拆合（上游 LiveMaskRenderer.drawComposite:110-150 的口径）：
  *   extract → 把基底 alpha 存进 coverage、颜色拉成不透明；
  *   restore → 把 coverage 放回。

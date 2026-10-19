@@ -193,6 +193,21 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   基线 431 → **435 用例**（新增 `tests/test_composite_cache.cpp` 4 例），Windows 壳自检
   150 → **155 项**；口径 B 计分不变 **29/48 ≈ 60%**（内部实现不计分）。详见 §6.22。
 
+  2026-10-19 第二十三轮（S17 GPU 子集按单元拆细 + 逐层纹理缓存修订号设计）：S13/S16 的
+  能力闸门是**整篇布尔**——文档里只要有一层带蒙版/效果/组/剪贴/调整/非全画布，就整篇回落
+  CPU。S17 把它拆成**按合成单元**：整幅 RGBA8、恒等几何的层直接上传（原生单元）；裁剪/
+  偏移、蒙版、效果、旋转翻转缩放、16 位源图层、隔离组、剪贴栈在 CPU 上用**与 CPU 合成器
+  相同的函数**烘焙成画布尺寸的预乘 RGBA8（烘焙单元），GPU 再按原混合模式混合。新增内部
+  入口 `bake_layer_contribution`（`compositing/composite_ops`）、`bake_filter_unit_surface`
+  （`compositing/filter_graph`，隔离组/剪贴栈）与 `render/gpu_plan.{h,cpp}`（`build_gpu_plan`
+  分类 + 统计）；`d3d12_backend` 的整篇闸门删除，改为遍历单元上传。**不新增导出 ABI**
+  （仍 **112** 个）。精度口径：原生单元与 CPU 基准 ≤1 LSB；烘焙单元把「蒙版 x 不透明度 x
+  效果」量化进 8 位预乘色，最多 **2 LSB**（测试按 2 断言并写明原因）。仍整篇回落：调整层
+  （作用于已合成画布）、HDR（RGBA16F）表面。同时交付**逐层纹理缓存修订号设计稿**
+  `docs/gpu-layer-revision.md`（只设计不实施：`Layer` 无修订号、`ImageBuffer` 是
+  `shared_ptr` + COW，原地写会让缓存静默过期，故先定 `content_revision` + 分配点 + 缓存键
+  + 验收口径）。基线 447 → **451 用例**（+4）；详见 §6.27。
+
 ## 1. M1 目标与范围
 
 | 项目 | 内容 |
@@ -1477,7 +1492,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
-| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
+| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20）；**S17：GPU 子集按合成单元拆细**（裁蒙/效果/变换/组/剪贴烘焙后上 GPU，调整层与 HDR 仍整篇回落，§6.27） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~91%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）；**2026-10-19 S16 补上 Windows 窗口 DXGI 交换链直呈 + 真机基准**（§6.26）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
@@ -1486,8 +1501,10 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 **剩下的 3% 按层拆开，全部有明确归属**（不再是「被上游工具面阻塞」）：
 
 - ① 契约面 1.5 个点：`run_tool_op` 之外的少量诊断/边界口径；
-- ③ 合成与渲染 0.4 个点：GPU 子集仍是全有或全无（组/蒙版/调整/非全画布回落 CPU），
-  且直呈只比 CPU flatten+GDI 快 1.18–1.29×（瓶颈是逐层上传，§6.26）；
+- ③ 合成与渲染 0.4 个点：GPU 子集已从「整篇全有或全无」拆到**按合成单元**（裁剪/蒙版/
+  效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27），但仍有两条整篇回落（调整层、
+  HDR 表面），且逐层上传仍是瓶颈、纹理缓存只出了设计稿（`docs/gpu-layer-revision.md`），
+  直呈只比 CPU flatten+GDI 快 1.18–1.29×（§6.26）；
 - ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
 
 上一轮记的「`deep_take_painted` 被 S4 仿制笔刷阻塞」已证伪：上游 `BrushStroke.swift:1097`
@@ -3047,6 +3064,104 @@ GPU 子集允许的形态）、预热 3 帧、默认 20 帧，结果写 `present
 - 鸿蒙壳的窗口表面仍如实返回 `UNSUPPORTED`；OHOS 真机 `hdc list targets` 仍为空。
 
 报告：`../report/S16-dxgi-present-20261019-dsh.md`。
+
+### 6.27 S17 GPU 子集按单元拆细 + 逐层纹理缓存修订号设计（2026-10-19，DSH）
+
+S13 把设备接进离屏路径、S16 打通窗口直呈，但两者共用同一道**整篇闸门**
+（`gpu_document_ready`）：文档里只要有一层带蒙版/效果/组/剪贴/调整/旋转/非全画布，
+就把**整篇**文档回落 CPU。用户只要给一张图层加个蒙版，整份文档的 GPU 加速就没了。
+S17 把闸门拆成**按合成单元**：能被 GPU 独立混合的部分照常上设备，只有真正做不到的
+才回落。引擎核与 C ABI 零改动（导出仍 112 个）。
+
+**1. 单元分类（`engine/render/gpu_plan.{h,cpp}`，新增）。** 按 `FilterGraph` 的绘制序
+走一遍文档，产出 `std::vector<GpuUnit>`：每个单元是「画布尺寸的预乘源 + 混合模式 +
+不透明度」。分类规则：
+
+| 形态 | 单元 | 做法 |
+|------|------|------|
+| 整幅画布、RGBA8、无蒙版/效果/调整、旋转=0、无翻转、几何恒等 | **原生** | 图层像素直接上传 |
+| 裁剪/偏移（`effective_bounds` ≠ 画布） | 烘焙 | CPU 合成到透明画布 → 上传 |
+| 带蒙版 | 烘焙 | 蒙版在烘焙时乘进预乘色 |
+| 带效果（含多层效果链） | 烘焙 | 效果在烘焙时求值 |
+| 旋转 / 翻转 / 缩放 / 非整幅采样 | 烘焙 | 变换在烘焙时完成 |
+| 16 位（RGBA16）源图层落在 8 位画布 | 烘焙 | 深度转换 + 量化一次 |
+| 隔离组 | 烘焙（整组一个单元） | 子树先自合成到透明缓冲，再按组的混合模式/不透明度混合 |
+| 剪贴栈 | 烘焙（整栈一个单元） | 基底 + 成员按 CPU 剪贴语义烘焙成一个贡献 |
+| 穿透组 | 展开（不产生单元） | 组不透明度乘进每个子层，组混合模式不参与（与 CPU 同口径） |
+| 调整层 | **整篇回落** | 调整作用于「已合成画布」，不是图层自身贡献 |
+| HDR（RGBA16F）文档表面 | **整篇回落** | D3D12 路径只实现 8 位目标 |
+
+关键技巧：`bake_layer_contribution`（`compositing/composite_ops`，新增）把图层复制成
+`COMP_BLEND_NORMAL`、混合进一张**全透明**画布。W3C 混合公式在 dst=0 时正好退化为
+「源的贡献」（预乘色 × 蒙版 × 效果 × 不透明度 × 剪贴因子），GPU 随后用**原混合模式**
+和 alpha=1 混合这个贡献，就等价于 CPU 的一次 `blend_pixels`。隔离组与剪贴栈复用
+`filter_graph` 里已有的求值函数（`build_isolated_group_surface` /
+`build_clipping_stack_surface` 从 `eval_node` 里提出来共享），新增
+`bake_filter_unit_surface` 作为统一入口——CPU 合成与 GPU 烘焙**同一份代码**，不会漂移。
+
+**2. 后端接线（`engine/render/d3d12_backend.cpp`）。** 删除 `gpu_document_ready` 与
+「收集整幅图层」的 `paint` 数组：`can_render_document` = `build_gpu_plan(doc, nullptr,
+nullptr, error)`（只分类、不分配像素）；`render_document` 先建计划，再
+`ensure_upload_blocks(units.size()+1)`，逐单元上传（原生拷图层行、烘焙拷
+`unit.baked` 行）并用 `unit.blend` / `unit.opacity` 作 dispatch 常量。窗口直呈与
+离屏回读两条路径都不变。`caps().note`、`d3d12_backend.h`、`rhi.h` 的能力说明同步改成
+「按单元」口径，不再写「simple stack subset」。
+
+**3. 精度口径（如实记录，不混用 ±1）。**
+
+| 单元类型 | 与 CPU 基准的偏差 | 原因 |
+|----------|------------------|------|
+| 原生 | **≤1 LSB**（既有口径） | 像素逐位上传，只差 GPU 混合的整数舍入 |
+| 烘焙 | **≤2 LSB**（实测 2） | 「蒙版 × 不透明度 × 效果」乘进预乘色时量化一次 8 位，经 MULTIPLY/SCREEN 的颜色乘积项放大到 2 |
+
+这是「少一次逐像素 CPU 混合 vs 一次 8 位量化」的显式取舍，不是画面错误；测试里按 2
+断言并把原因写进用例注释，不假装还是 ±1。
+
+**4. 护栏（`tests/test_rhi.cpp`，+4 例）。**
+
+- `rhi_gpu_plan_classifies_units_instead_of_rejecting_documents`（默认构建也跑）：一个
+  塞满裁剪/蒙版/穿透组/隔离组/剪贴栈的文档必须分类成功（原生 3 / 烘焙 2 / 隔离组 1 /
+  剪贴栈 1 / 穿透组 1），并把**计划自己的单元序列**用同一条 CPU 混合公式重组整篇，
+  与 CPU 合成器结果对拍（≤1 LSB）——证明计划没漏、没重、没乱序。
+- `rhi_gpu_plan_names_remaining_fallbacks`：调整层与 HDR 表面仍整篇回落，且错误信息
+  必须**具名**（`adjustment` / `HDR`），不能笼统说「不支持」。
+- `rhi_gpu_renders_cropped_and_masked_layers_like_cpu`（真机）：32²、裁剪 MULTIPLY
+  0.75 + 16×16 蒙版 SCREEN 0.8，断言真的上设备（`last_render_offloaded()`）且与 CPU
+  基准 ≤2 LSB。
+- `rhi_gpu_renders_group_and_clipping_units_like_cpu`（真机）：穿透组 + 隔离组 + 剪贴栈
+  同一文档，断言上设备且 ≤1 LSB。
+
+**5. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py`（默认） | **451 cases, 0 failed, 0 check failures**（+4） |
+| `python scripts/build.py --gpu` | **451 cases, 0 failed, 0 check failures** |
+| `python scripts/build_windows_shell.py` + `compositor_shell.exe --selftest` | **164 项 0 失败**；默认构建自检产物 SHA256 `AA2E2754…` 与 S16 基线逐字节一致（壳代码未改），`--gpu` 构建项数不变、仅能力说明文本随 `caps().note` 更新 |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 `compile ok=90 fail=0`） |
+| ABI 导出 | **112**（未新增；S17 只动引擎内部合成/渲染） |
+
+**6. 逐层纹理缓存修订号设计稿（`docs/gpu-layer-revision.md`，只设计不实施）。**
+S13/S16 的实测已经证明瓶颈是**逐层上传**（1024²/4 层≈3 ms），S17 之后 CPU 侧还多一次
+烘焙，缓存收益更大。但现在没法安全缓存：`Document` 只有**整篇** `content_serial_`
+（任何一层动一下全篇失效），`Layer` 没有修订号，`ImageBuffer` 是 `shared_ptr` + COW
+（唯一持有者时画笔原地写，指针不变 → 缓存会静默读到旧画面）。设计稿给出：
+`Layer::content_revision` + `Document::allocate_revision()`（单调、文档内唯一、同值⟺同内容）、
+必须 bump 的写入清单（像素/蒙版/效果/调整/几何/混合/结构/画布 + 快照恢复保留旧号）、
+缓存键 `(layer.id, revision, w, h, format)` + 持久堆复用 + LRU、以及两轮验收计划
+（R1 修订号与失效测试走默认构建；R2 纹理缓存 + `texture_uploads()` 计数 + 真机基准复测）。
+本轮**不实施**，不宣称任何加速。
+
+**7. 边界（如实记录）。**
+
+- 仍整篇回落：**调整层**（需要分段回读已合成画布，独立一轮）、**HDR/RGBA16F 表面**。
+- 烘焙单元有 **≤2 LSB** 量化差（见上表），原生单元仍是 ≤1 LSB。
+- **不宣称加速**：S17 只扩展覆盖面；烘焙本身是 CPU 成本，逐帧上传未变，真机基准未重测。
+- Vulkan 的文档路径仍未接线（`can_render_document` 恒 false）。
+- 交互壳主画布仍走 CPU 展平 + GDI；**Win32 人工目视仍未做**（`docs/manual-test.md`
+  的 M1–M16 保持未勾选，ALEX 已推迟这项）。
+
+报告：`../report/S17-gpu-per-unit-20261019-dsh.md`。
 
 ## 7. 许可
 

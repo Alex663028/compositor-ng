@@ -335,6 +335,21 @@ bool blend_adjusted_in_blend_mode_hdr(const ImageBuffer& adjusted, const ImageBu
   return true;
 }
 
+/*
+ * S17：两个「独立合成单元」的表面求值入口，供 eval_node 与 GPU 后端的单元烘焙共用。
+ *
+ * 它们与 eval_node 的对应分支**同源**：把表面算出来、但不与 backdrop 做最后一步
+ * 整单元混合（那一步的混合模式/不透明度属于调用方语义）。抽出来是为了让
+ * 「CPU 求值」与「GPU 后端把复杂节点烘焙成单元再交给设备」不会各写一份公式。
+ */
+bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
+               const ImageBuffer& backdrop, double opacity_scale, ImageBuffer* out,
+               std::string* error);
+bool build_clipping_stack_surface(const Document& doc, const FilterGraph& graph, int32_t index,
+                                  double opacity_scale, ImageBuffer* out, std::string* error);
+bool build_isolated_group_surface(const Document& doc, const FilterGraph& graph, int32_t index,
+                                  double opacity_scale, ImageBuffer* out, std::string* error);
+
 bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
                const ImageBuffer& backdrop, double opacity_scale, ImageBuffer* out,
                std::string* error) {
@@ -391,94 +406,14 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
    *   5. 整个栈以**基底的**混合模式与不透明度参与叠加（上游 `stackModes[id]`）。
    */
   if (node.kind == FilterNodeKind::kClippingStack) {
-    if (node.inputs.empty()) {
-      set_error(error, "clipping stack has no base input");
-      return false;
-    }
-    const comp_rect stack_bounds = layer->effective_bounds();
-    if (is_empty(stack_bounds)) {
-      /* 基底为空（隐藏 / 无像素 / 空 transform）：整个栈无贡献。 */
-      *out = backdrop;
-      return true;
-    }
-
-    /*
-     * 第一步：基底。
-     *
-     * 栈内成员节点的 backdrop 是 -1（它们**不**互为下层，只过 extract/restore）。
-     * eval_node 对 backdrop < 0 返回空缓冲，因此这里显式给一张画布大小的透明图
-     * 当基底的下层——否则基底自己没像素，栈就空了。
-     */
-    ImageBuffer base_backdrop;
-    base_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
-    base_backdrop.clear_transparent();
-    ImageBuffer base_surface;
-    if (!eval_node(doc, graph, node.inputs[0], base_backdrop, opacity_scale, &base_surface,
-                   error)) {
-      return false;
-    }
-
+    /* 剪贴栈表面：extract → 成员 → restore 由共用实现算好（S17 抽出）。 */
     ImageBuffer surface;
-    if (base_surface.empty() || base_surface.width != doc.state().width ||
-        base_surface.height != doc.state().height) {
-      set_error(error, "clipping stack base produced an empty surface");
+    if (!build_clipping_stack_surface(doc, graph, index, opacity_scale, &surface, error)) {
       return false;
     }
-    surface = base_surface;
-
-    /* 第二步：取走 alpha、颜色拉成不透明（coverage 容器与表面同深度）。 */
-    std::vector<uint16_t> coverage;
-    std::vector<float> coverage_hdr;
-    const bool extracted = half_surface ? extract_stack_alpha(&surface, &coverage_hdr, error)
-                                        : extract_stack_alpha(&surface, &coverage, error);
-    if (!extracted) return false;
-
-    /* 第三步：成员在**不透明**基底上按各自模式叠（成员自起透明画布）。 */
-    ImageBuffer member_backdrop;
-    member_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
-    member_backdrop.clear_transparent();
-    for (size_t i = 1; i < node.inputs.size(); ++i) {
-      ImageBuffer member_surface;
-      if (!eval_node(doc, graph, node.inputs[i], member_backdrop, opacity_scale, &member_surface,
-                     error)) {
-        return false;
-      }
-      /*
-       * 成员深度必须与栈表面一致：不同深度按同一 stride 混合会把 half 的
-       * 8 字节行当 RGBA8 的 4 字节行读成垃圾。宁可具名失败，也不静默出错色。
-       */
-      if (member_surface.format != surface.format) {
-        set_error(error, "clipping stack member depth does not match the stack surface");
-        return false;
-      }
-      const comp_blend_mode mode = node_blend_mode(doc, graph, node.inputs[i]);
-      const int32_t bpp = half_surface ? 8 : 4;
-      for (int32_t y = 0; y < surface.height; ++y) {
-        uint8_t* dst_row = surface.writable_row(static_cast<size_t>(y));
-        const uint8_t* src_row = member_surface.row(static_cast<size_t>(y));
-        if (half_surface) {
-          for (int32_t x = 0; x < surface.width; ++x) {
-            blend_pixels_half(reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * bpp),
-                              reinterpret_cast<const uint16_t*>(src_row +
-                                                                static_cast<size_t>(x) * bpp),
-                              mode, 1.0);
-          }
-        } else {
-          for (int32_t x = 0; x < surface.width; ++x) {
-            blend_pixels(dst_row + static_cast<size_t>(x) * bpp,
-                         src_row + static_cast<size_t>(x) * bpp, mode, 1.0);
-          }
-        }
-      }
-    }
-
-    /* 第四步：还原 alpha。 */
-    const bool restored = half_surface ? restore_stack_alpha(&surface, coverage_hdr, error)
-                                       : restore_stack_alpha(&surface, coverage, error);
-    if (!restored) return false;
-
     /* 第五步：整个栈以基底的模式与不透明度参与。 */
     *out = backdrop;
+    if (surface.empty()) return true; /* 隐藏 / 空 bounds：整个栈无贡献 */
     const double stack_opacity = static_cast<double>(layer->opacity) * opacity_scale;
     if (!blend_buffer_into(out, surface, layer->blend, stack_opacity)) {
       set_error(error, "blend clipping stack failed");
@@ -596,12 +531,8 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
 
   /* 隔离：子树先合成到透明缓冲，再作为整体按组的混合模式与不透明度叠加。 */
   ImageBuffer internal;
-  internal.resize(doc.state().width, doc.state().height, canvas_format);
-  internal.clear_transparent();
-  for (int32_t input : node.inputs) {
-    ImageBuffer next;
-    if (!eval_node(doc, graph, input, internal, opacity_scale, &next, error)) return false;
-    internal = std::move(next);
+  if (!build_isolated_group_surface(doc, graph, index, opacity_scale, &internal, error)) {
+    return false;
   }
   *out = backdrop;
   const comp_blend_mode group_blend = layer != nullptr ? layer->blend : COMP_BLEND_NORMAL;
@@ -612,7 +543,185 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
   return true;
 }
 
+/*
+ * S17：剪贴栈表面（第一步基底 → 第二步 extract → 第三步成员 → 第四步 restore）。
+ *
+ * 与 eval_node 的 kClippingStack 分支同源；差别只有：本函数**不做第五步**
+ * （整栈与 backdrop 的混合），因为调用方要用自己的混合模式/不透明度来做。
+ * 无贡献（隐藏基底 / 空 bounds）时返回**空缓冲**而不是 backdrop。
+ */
+bool build_clipping_stack_surface(const Document& doc, const FilterGraph& graph, int32_t index,
+                                  double opacity_scale, ImageBuffer* out, std::string* error) {
+  if (out == nullptr) {
+    set_error(error, "clipping stack surface destination is null");
+    return false;
+  }
+  if (index < 0 || index >= static_cast<int32_t>(graph.nodes.size())) {
+    set_error(error, "graph node index out of range");
+    return false;
+  }
+  const FilterNode& node = graph.nodes[index];
+  if (node.kind != FilterNodeKind::kClippingStack) {
+    set_error(error, "graph node is not a clipping stack");
+    return false;
+  }
+  const Layer* layer = doc.find(node.layer);
+  if (layer == nullptr) {
+    set_error(error, "clipping stack references a missing base layer");
+    return false;
+  }
+  out->resize(0, 0, COMP_PIXEL_RGBA8);
+  if (!layer->visible) return true;
+  if (node.inputs.empty()) {
+    set_error(error, "clipping stack has no base input");
+    return false;
+  }
+  const comp_rect stack_bounds = layer->effective_bounds();
+  if (is_empty(stack_bounds)) return true; /* 基底为空：整个栈无贡献 */
+
+  const comp_pixel_format canvas_format = composite_surface_format(doc);
+  const bool half_surface = canvas_format == COMP_PIXEL_RGBA16F;
+
+  /*
+   * 第一步：基底。栈内成员节点的 backdrop 是 -1（它们不互为下层，只过
+   * extract/restore），所以这里显式给一张画布大小的透明图当基底的下层。
+   */
+  ImageBuffer base_backdrop;
+  base_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
+  base_backdrop.clear_transparent();
+  ImageBuffer base_surface;
+  if (!eval_node(doc, graph, node.inputs[0], base_backdrop, opacity_scale, &base_surface, error)) {
+    return false;
+  }
+  if (base_surface.empty() || base_surface.width != doc.state().width ||
+      base_surface.height != doc.state().height) {
+    set_error(error, "clipping stack base produced an empty surface");
+    return false;
+  }
+  ImageBuffer surface = std::move(base_surface);
+
+  /* 第二步：取走 alpha、颜色拉成不透明（coverage 容器与表面同深度）。 */
+  std::vector<uint16_t> coverage;
+  std::vector<float> coverage_hdr;
+  const bool extracted = half_surface ? extract_stack_alpha(&surface, &coverage_hdr, error)
+                                      : extract_stack_alpha(&surface, &coverage, error);
+  if (!extracted) return false;
+
+  /* 第三步：成员在**不透明**基底上按各自模式叠（成员自起透明画布）。 */
+  ImageBuffer member_backdrop;
+  member_backdrop.resize(doc.state().width, doc.state().height, canvas_format);
+  member_backdrop.clear_transparent();
+  for (size_t i = 1; i < node.inputs.size(); ++i) {
+    ImageBuffer member_surface;
+    if (!eval_node(doc, graph, node.inputs[i], member_backdrop, opacity_scale, &member_surface,
+                   error)) {
+      return false;
+    }
+    /*
+     * 成员深度必须与栈表面一致：不同深度按同一 stride 混合会把 half 的
+     * 8 字节行当 RGBA8 的 4 字节行读成垃圾。宁可具名失败，也不静默出错色。
+     */
+    if (member_surface.format != surface.format) {
+      set_error(error, "clipping stack member depth does not match the stack surface");
+      return false;
+    }
+    const comp_blend_mode mode = node_blend_mode(doc, graph, node.inputs[i]);
+    const int32_t bpp = half_surface ? 8 : 4;
+    for (int32_t y = 0; y < surface.height; ++y) {
+      uint8_t* dst_row = surface.writable_row(static_cast<size_t>(y));
+      const uint8_t* src_row = member_surface.row(static_cast<size_t>(y));
+      if (half_surface) {
+        for (int32_t x = 0; x < surface.width; ++x) {
+          blend_pixels_half(reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * bpp),
+                            reinterpret_cast<const uint16_t*>(src_row +
+                                                              static_cast<size_t>(x) * bpp),
+                            mode, 1.0);
+        }
+      } else {
+        for (int32_t x = 0; x < surface.width; ++x) {
+          blend_pixels(dst_row + static_cast<size_t>(x) * bpp,
+                       src_row + static_cast<size_t>(x) * bpp, mode, 1.0);
+        }
+      }
+    }
+  }
+
+  /* 第四步：还原 alpha。 */
+  const bool restored = half_surface ? restore_stack_alpha(&surface, coverage_hdr, error)
+                                     : restore_stack_alpha(&surface, coverage, error);
+  if (!restored) return false;
+  *out = std::move(surface);
+  return true;
+}
+
+/*
+ * S17：隔离组的内部表面（子树合成到透明画布）。组自身的混合模式与不透明度
+ * 不在这里作用——那一步归调用方（eval_node 或 GPU 后端）。
+ * 组不可见时返回空缓冲（整棵子树不参与求值）。
+ */
+bool build_isolated_group_surface(const Document& doc, const FilterGraph& graph, int32_t index,
+                                  double opacity_scale, ImageBuffer* out, std::string* error) {
+  if (out == nullptr) {
+    set_error(error, "group surface destination is null");
+    return false;
+  }
+  if (index < 0 || index >= static_cast<int32_t>(graph.nodes.size())) {
+    set_error(error, "graph node index out of range");
+    return false;
+  }
+  const FilterNode& node = graph.nodes[index];
+  if (node.kind != FilterNodeKind::kGroup || !node.isolated) {
+    set_error(error, "graph node is not an isolated layer group");
+    return false;
+  }
+  const Layer* layer = doc.find(node.layer);
+  if (layer == nullptr) {
+    set_error(error, "isolated group references a missing layer");
+    return false;
+  }
+  out->resize(0, 0, COMP_PIXEL_RGBA8);
+  if (!layer->visible) return true;
+
+  const comp_pixel_format canvas_format = composite_surface_format(doc);
+  ImageBuffer internal;
+  internal.resize(doc.state().width, doc.state().height, canvas_format);
+  internal.clear_transparent();
+  for (int32_t input : node.inputs) {
+    ImageBuffer next;
+    if (!eval_node(doc, graph, input, internal, opacity_scale, &next, error)) return false;
+    internal = std::move(next);
+  }
+  *out = std::move(internal);
+  return true;
+}
+
 }  // namespace
+
+bool bake_filter_unit_surface(const Document& doc, const FilterGraph& graph, int32_t node_index,
+                              double opacity_scale, ImageBuffer* out, std::string* error) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "bake destination is null";
+    return false;
+  }
+  if (node_index < 0 || node_index >= static_cast<int32_t>(graph.nodes.size())) {
+    if (error != nullptr) *error = "graph node index out of range";
+    return false;
+  }
+  out->resize(0, 0, COMP_PIXEL_RGBA8);
+  const FilterNode& node = graph.nodes[static_cast<size_t>(node_index)];
+  if (node.kind == FilterNodeKind::kClippingStack) {
+    return build_clipping_stack_surface(doc, graph, node_index, opacity_scale, out, error);
+  }
+  if (node.kind == FilterNodeKind::kGroup && node.isolated) {
+    return build_isolated_group_surface(doc, graph, node_index, opacity_scale, out, error);
+  }
+  if (error != nullptr) {
+    *error =
+        "node is not an independent compositing unit (only isolated groups and clipping stacks "
+        "can be baked as a whole)";
+  }
+  return false;
+}
 
 bool build_filter_graph(const Document& doc, FilterGraph* graph, std::string* error) {
   if (graph == nullptr) {
