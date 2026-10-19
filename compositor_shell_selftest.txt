@@ -52,6 +52,16 @@
 [OK] comp_tool_apply(COMP_TOOL_LIQUIFY)
 [OK] liquify moves pixels along the stroke
 [OK] comp_document_undo(liquify step)
+[OK] COMP_TOOL_GRADIENT stays at 13
+[OK] comp_tool_apply(COMP_TOOL_GRADIENT)
+[OK] gradient tool paints the layer
+[OK] the gradient starts at the first stop (red)
+[OK] the gradient ends at the second stop (blue)
+[OK] comp_document_undo(gradient step)
+[OK] gradient undo restores pixels byte-for-byte
+[OK] COMP_TOOL_GRADIENT(coincident endpoints) rejected
+[OK] the rejected gradient leaves no undo step
+[OK] the rejected gradient leaves the render byte-identical
 [OK] comp_selection_get_active() starts at 0 (no selection)
 [OK] comp_selection_apply_shape(rect)
 [OK] comp_selection_get_active() == 1 after a rect shape

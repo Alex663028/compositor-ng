@@ -146,6 +146,15 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   N×N 取样窗口（0 = 只取种子像素，状态栏显示 `(2r+1)×(2r+1)`）。基线 408 →
   **414 用例**，Windows 壳自检 90 → **103 项**；口径 B 保持 **28/48 ≈ 58%**
   （钢笔是既有选区几何的可视化入口，不新增计分项）。详见 §6.18。
+  2026-10-18 第十九轮（S9 渐变工具：`COMP_TOOL_GRADIENT = 13`）：
+  在 `comp_tool_apply` 家族尾部追加**整幅渐变算子**（线性 / 径向、两个直通 RGBA 色标、
+  不透明度、选区 coverage 混合；参数闸全在 `txn_begin` 之前，端点重合 / 双色标全透明 /
+  opacity 0 一律 `COMP_ERR_INVALID_ARGUMENT`）；`comp_tool_op_desc.gradient` 是尾部追加
+  字段，导出 ABI 仍是 **112** 个。Windows 壳接上 `G` 渐变（再按 `G` 切线性/径向、
+  拖拽两端点松开提交、色标固定「前景 → 透明」、`Shift` 反向、失焦取消预览）。
+  基线 414 → **418 用例**，Windows 壳自检 103 → **113 项**；口径 B 的
+  Type/Shape/Gradient 一行由「零」改为「部分：Gradient 已交付」，计分仍 **28/48 ≈ 58%**
+  （Type/Shape 仍是零，凑不满一整条）。详见 §6.19。
 
 ## 1. M1 目标与范围
 
@@ -400,7 +409,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 87（38 个 `.c` + 49 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 414 cases, 0 failed, 0 check failures`（当前基线；§6.18 起） |
+| 测试 | `summary: 418 cases, 0 failed, 0 check failures`（当前基线；§6.19 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：49 `.cpp` / 38 `.c`（含 vendored 26）/ 87 `.h`（含 vendored）；tests：34 `.cpp` |
 
@@ -1450,7 +1459,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee（矩形/椭圆）/Lasso（多边形）/魔棒、形状叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7 / §6.17）；Pen 工具手势与 Select Subject / 抠图仍缺（后两者依赖 ML，不在本仓范围） |
 | **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；**S6 补上外壳的拖拽手势**（`V`，Alt = 复制，一步撤销，§6.16） |
-| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
+| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **部分：Gradient 已交付**（线性 / 径向 + 双色标 + 选区混合，`COMP_TOOL_GRADIENT = 13`，§6.19）；Type / Shape 仍为零 |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
@@ -1465,7 +1474,9 @@ S6 再抬高**一条**：**吸管（Painting #7）**——前景色模型与取�
 按「用户能做的事」口径从此命中（§6.16）。Painting 的 Erase 模式仍算进已计数的
 笔刷条目，不额外抬高条数。**S7 也不抬高条数**：它补的是已计数的「选区几何」条目
 里的 Marquee(椭圆)/Lasso/Magic Wand 子项与外壳手势，该条目仍缺 Pen 工具、
-Select Subject 与抠图，不足以从「部分命中」升为整条命中（§6.17）。其余约 4,800 行 Swift
+Select Subject 与抠图，不足以从「部分命中」升为整条命中（§6.17）。**S9 也不抬高条数**：
+渐变只是同一条「Type / Shape / Gradient」三个子项里的一个，剩余 Type（472 行）与 Shape
+仍为零，整条按「部分命中」计（§6.19）。其余约 4,800 行 Swift
 **完全没有对应物**，且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -2433,6 +2444,60 @@ S7 报告 §5 剩余项（Shape / Gradient / Type 内核、MERGED 合成缓存�
 不在本轮范围。
 
 报告：`../report/S8-selection-polish-20261018-dsh.md`。
+
+### 6.19 S9 渐变工具：`COMP_TOOL_GRADIENT`（2026-10-18，DSH）
+
+S8 收口后，S7 报告 §5 的下一个产品条目是 Type / Shape / Gradient 一行。按边际成本
+从低到高先做 **Gradient**：它是纯像素算子，不依赖字体栅格化也不依赖矢量填充几何，
+而且能直接复用既有选区 coverage 通路。
+
+**1. ABI。** 新增 `COMP_TOOL_GRADIENT = 13`（`comp_layer.h`，枚举尾部追加）；
+`comp_tool_op_desc` 尾部追加 `comp_tool_gradient gradient`（`type` / 两个文档像素端点 /
+`color0[4]` / `color1[4]` / `opacity`，色标是**直通 sRGB + alpha**）。**不新增导出函数**，
+仍是 **112** 个：渐变是既有 `comp_tool_apply` 的第 13 种算子。既有字段偏移全部不变。
+
+**2. 求值口径。** 图层像素 → 文档坐标用 `effective_bounds()` 的原点平移（与
+Stroke / Clone 同一套口径；缩放/旋转不做逆变换，如实记为边界）。线性
+`t = dot(p − start, end − start) / |end − start|²`，径向 `t = |p − start| / |end − start|`，
+都夹到 0..1（端点外是纯色带，不回绕）；两色标按 `t` 直通插值，再按**预乘 source-over**
+混合（所以「不透明 → 透明」只叠色、不挖洞）。`opacity` 与活跃选区的
+`selection_effective_coverage` 逐像素相乘作为覆盖率，**覆盖率 0 的像素逐字节不动**。
+它不读 `stroke_points`，不属于落笔族。
+
+**3. 参数闸（全在 `txn_begin` 之前）。** 未知 `type`、非有限或 `|v| > 1e6` 的端点、
+端点重合（`|end − start| < 1e-3`）、`opacity` 越界或 0、两个色标全透明——一律
+`COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。拒绝「端点重合」而不是静默画纯色：
+后者会让宿主以为方向生效了；拒绝「双色标全透明」而不是记一步恒等撤销，同上。
+
+**4. 16 位 / HDR。** 整幅算子写 8 位工作副本：RGBA16 先降到 8 位再写回（与
+Dither / Lens 同口径），RGBA16F 直接 `COMP_ERR_STATE`。
+
+**5. 外壳（`G`）。** `ui_core.h` 新增 `kGradientLinear / kGradientRadial`、
+`gradient_type_name`（未知值如实返回 `?`，不猜）、`next_gradient_type`（未知值收敛回
+线性，不产生第三态）、`kGradientMinLength = 1.0` 与 `gradient_drag_is_usable`。
+手势：`G` 选渐变工具、已在该工具时再按 `G` 切线性/径向；拖出两个端点后松开一次性
+`comp_tool_apply` 提交；色标固定「前景 → 透明」（第二色标没有 UI 可调，不编造背景色），
+`Shift` 反向为「透明 → 前景」；短于 1 px 的拖拽外壳直接放弃并提示，不把一次手抖变成
+参数错误；失焦 / 捕获丢失 / 切走工具只丢预览，不产生撤销步。画布预览：方向线 +
+起点空框/终点实心块，径向额外画半径虚圆（只画几何，不预演颜色）。
+
+**6. 测试。** `test_tool_ops` 新增 3 例：线性红→蓝渐变的通道单调 + 垂直方向恒定 +
+一步撤销逐字节回滚；径向渐变的中心/半径外/中间 ramp + 选区左半遮罩（右半逐字节不动）；
+四类非法参数（端点重合、双色标全透明、未知 type、opacity 0）不留撤销步且合法参数
+照样成功。`test_ui_core` 新增 1 例（类型镜像数值/命名/循环 + 拖拽下限含恰好 1 px 边界）。
+基线 414 → **418 用例 0 失败**。
+
+**7. 自检与边界。** `--selftest` 新增 10 项：枚举值冻结、`comp_tool_apply`、左右端点
+颜色、单步撤销、逐字节回滚、端点重合拒绝、拒绝后无撤销步 / 渲染不变。103 → **113 项**，
+`compositor_shell_selftest.txt` 同步重新生成（SHA256 `ceea1ab3b3855940…`）。
+`scripts/build.py` → **418 cases, 0 failed, 0 check failures**；`build_windows_shell.py` +
+`--selftest` → `failures = 0`、`[PASS]`、113 项 OK。仍然**没有经过人手 Win32 实测**：
+无窗口环境下只验证到 ABI、`ui_core` 数学层与自检驱动序列。明确边界：没有第二色标
+取色 UI / 渐变预设 / 抖动；色标 alpha 按直通线性插值，不做「透明色 → 前景色」的特殊
+插值；不做缩放/旋转逆变换；`MERGED` 每次点击仍整篇合成。Type / Shape 内核与 S7 报告
+§5 其余项（MERGED 合成缓存、格式导入策略矩阵、人工 Win32 清单）不在本轮范围。
+
+报告：`../report/S9-gradient-20261018-dsh.md`。
 
 ## 7. 许可
 

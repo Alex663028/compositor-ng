@@ -28,6 +28,7 @@
 #include "compositing/compositor.h"
 #include "domain/document.h"
 #include "domain/retouch.h"
+#include "domain/selection.h"
 #include "imaging/comp_imaging.h"
 #include "imaging/deep_round_trip.h"
 
@@ -56,6 +57,12 @@ constexpr double kMaxToolCoordinate = 1e6;
  * 取 100 作为闸，与上游面板量程一致。
  */
 constexpr float kMaxGrainAmount = 100.0f;
+/*
+ * 渐变两端点的最小距离（文档像素）。只用来拒绝「端点重合」——那不是可定义的
+ * 方向/半径，静默画成纯色会让宿主以为方向生效了。比 1 小得多，因此亚像素拖拽
+ * 仍然可用；贴在一起的两个端点才被判为非法。
+ */
+constexpr double kMinGradientLength = 1e-3;
 
 bool finite01(float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; }
 
@@ -73,6 +80,7 @@ std::string label(uint32_t kind) {
     case kToolOpSmudge: return "smudge";
     case kToolOpLiquify: return "liquify";
     case kToolOpBlur: return "blur";
+    case kToolOpGradient: return "gradient";
     default: return "none";
   }
 }
@@ -762,6 +770,32 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       break;
     }
 
+    case kToolOpGradient: {
+      const GradientParams& gradient = params.gradient;
+      if (gradient.type != kGradientLinear && gradient.type != kGradientRadial) {
+        return bad_arg("gradient type must be 0 (linear) or 1 (radial)");
+      }
+      const double endpoints[4] = {gradient.start_x, gradient.start_y, gradient.end_x,
+                                   gradient.end_y};
+      for (double coordinate : endpoints) {
+        if (!std::isfinite(coordinate) || std::fabs(coordinate) > kMaxToolCoordinate) {
+          return bad_arg("gradient endpoint is not finite or out of range");
+        }
+      }
+      const double dx = gradient.end_x - gradient.start_x;
+      const double dy = gradient.end_y - gradient.start_y;
+      if (std::sqrt(dx * dx + dy * dy) < kMinGradientLength) {
+        return bad_arg("gradient endpoints coincide (zero-length direction/radius)");
+      }
+      if (!finite01(gradient.opacity) || gradient.opacity <= 0.0f) {
+        return bad_arg("gradient opacity must be within 0..1 and non-zero");
+      }
+      if (gradient.color0[3] == 0 && gradient.color1[3] == 0) {
+        return bad_arg("gradient has no visible color (both stops are fully transparent)");
+      }
+      break;
+    }
+
     case kToolOpHeal: {
       if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
       if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
@@ -1135,6 +1169,100 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
                        target_layer->pixels.stride(), target_layer->pixels.width,
                        target_layer->pixels.height, blurred, local.data(), params.point_count,
                        params.brush);
+      break;
+    }
+
+    case kToolOpGradient: {
+      const GradientParams& gradient = params.gradient;
+      /*
+       * 选区活跃时按有效 coverage 混合（含羽化），与像素滤镜同一口径；不活跃时
+       * 覆盖率恒 255。coverage 是**文档分辨率**，图层像素按 effective_bounds 的
+       * 原点平移到文档坐标后取样，落在画布外一律视为 0（选区之外）。
+       */
+      const bool masked = document->selection().active;
+      std::vector<uint8_t> coverage;
+      int32_t canvas_width = document->state().width;
+      int32_t canvas_height = document->state().height;
+      if (masked) {
+        selection_effective_coverage(document->selection(), &coverage);
+        if (coverage.size() != static_cast<size_t>(canvas_width) *
+                                    static_cast<size_t>(canvas_height)) {
+          ok = bad_state("active selection has no coverage at the document resolution");
+          break;
+        }
+      }
+
+      const comp_rect b = target_layer->effective_bounds();
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const size_t stride = target_layer->pixels.stride();
+      const double dx = gradient.end_x - gradient.start_x;
+      const double dy = gradient.end_y - gradient.start_y;
+      const double length_sq = dx * dx + dy * dy;
+      const double length = std::sqrt(length_sq);
+      const double opacity = static_cast<double>(gradient.opacity);
+
+      for (int32_t y = 0; y < target_layer->pixels.height; ++y) {
+        const double document_y = static_cast<double>(b.y) + static_cast<double>(y);
+        uint8_t* row = pixels + static_cast<size_t>(y) * stride;
+        for (int32_t x = 0; x < target_layer->pixels.width; ++x) {
+          const double document_x = static_cast<double>(b.x) + static_cast<double>(x);
+          double t = 0.0;
+          if (gradient.type == kGradientLinear) {
+            t = ((document_x - gradient.start_x) * dx + (document_y - gradient.start_y) * dy) /
+                length_sq;
+          } else {
+            const double px = document_x - gradient.start_x;
+            const double py = document_y - gradient.start_y;
+            t = std::sqrt(px * px + py * py) / length;
+          }
+          if (t < 0.0) {
+            t = 0.0;
+          } else if (t > 1.0) {
+            t = 1.0;
+          }
+
+          double weight = opacity;
+          if (masked) {
+            const int32_t canvas_x = static_cast<int32_t>(document_x);
+            const int32_t canvas_y = static_cast<int32_t>(document_y);
+            if (canvas_x < 0 || canvas_y < 0 || canvas_x >= canvas_width ||
+                canvas_y >= canvas_height) {
+              continue; /* 画布外 = 选区之外：逐字节不动 */
+            }
+            weight *= static_cast<double>(
+                          coverage[static_cast<size_t>(canvas_y) *
+                                       static_cast<size_t>(canvas_width) +
+                                   static_cast<size_t>(canvas_x)]) /
+                      255.0;
+          }
+          if (weight <= 0.0) continue;
+
+          /* 色标（直通 sRGB + alpha）按 t 线性插值，乘 weight 得到本像素 alpha。 */
+          double color[4];
+          for (int c = 0; c < 4; ++c) {
+            color[c] = static_cast<double>(gradient.color0[c]) * (1.0 - t) +
+                       static_cast<double>(gradient.color1[c]) * t;
+          }
+          const double alpha = (color[3] / 255.0) * weight;
+          if (alpha <= 0.0) continue;
+
+          uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+          const double inverse = 1.0 - alpha;
+          for (int c = 0; c < 3; ++c) {
+            /* 图层像素是**预乘** RGBA8：源色先乘 alpha 再按 source-over 叠加。 */
+            const double blended = color[c] * alpha + static_cast<double>(pixel[c]) * inverse;
+            const long value = std::lround(blended);
+            pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+          }
+          const long out_alpha =
+              std::lround(alpha * 255.0 + static_cast<double>(pixel[3]) * inverse);
+          pixel[3] = static_cast<uint8_t>(out_alpha < 0 ? 0 : (out_alpha > 255 ? 255
+                                                                            : out_alpha));
+        }
+      }
+      if (masked && note != nullptr) {
+        *note += "gradient is masked by the active selection (coverage 0 pixels are unchanged); ";
+      }
       break;
     }
 

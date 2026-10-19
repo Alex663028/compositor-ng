@@ -997,6 +997,16 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.clone.opacity = desc->clone.opacity;
   params.warp.strength = desc->warp.strength;
   params.blur.radius = desc->blur.radius;
+  params.gradient.type = desc->gradient.type;
+  params.gradient.start_x = desc->gradient.start_x;
+  params.gradient.start_y = desc->gradient.start_y;
+  params.gradient.end_x = desc->gradient.end_x;
+  params.gradient.end_y = desc->gradient.end_y;
+  for (int i = 0; i < 4; ++i) {
+    params.gradient.color0[i] = desc->gradient.color0[i];
+    params.gradient.color1[i] = desc->gradient.color1[i];
+  }
+  params.gradient.opacity = desc->gradient.opacity;
 
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;

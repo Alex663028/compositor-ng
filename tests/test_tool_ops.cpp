@@ -32,6 +32,7 @@
 #include "compositor/comp_engine.h"
 #include "compositor/comp_layer.h"
 #include "compositor/comp_render.h"
+#include "compositor/comp_selection.h"
 #include "compositor/comp_undo.h"
 #include "test_framework.h"
 
@@ -807,4 +808,170 @@ COMP_TEST(tool_ops_eraser_with_zero_pressure_is_a_no_op) {
   desc.erase = 1;
   COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
   COMP_CHECK_MSG(flatten(fx.doc) == before, "pressure 0 erases nothing");
+}
+
+/* ================================================== 7. S9：渐变填充 */
+
+namespace {
+
+uint8_t blue_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
+  return buf[(static_cast<size_t>(y) * kW + x) * 4 + 2];
+}
+
+/* 水平线性渐变（第一色标在左边界、第二色标在右边界像素）。 */
+comp_tool_op_desc linear_gradient(const uint8_t color0[4], const uint8_t color1[4]) {
+  comp_tool_op_desc desc = base(COMP_TOOL_GRADIENT);
+  desc.gradient.type = 0; /* 线性 */
+  desc.gradient.start_x = 0.0;
+  desc.gradient.start_y = 7.5;
+  desc.gradient.end_x = static_cast<double>(kW - 1);
+  desc.gradient.end_y = 7.5;
+  for (int c = 0; c < 4; ++c) {
+    desc.gradient.color0[c] = color0[c];
+    desc.gradient.color1[c] = color1[c];
+  }
+  desc.gradient.opacity = 1.0f;
+  return desc;
+}
+
+}  // namespace
+
+COMP_TEST(tool_ops_gradient_paints_a_linear_ramp_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_GRADIENT) == 13, "COMP_TOOL_GRADIENT stays at 13");
+
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(0, 0, 0); /* 不透明黑：便于看通道叠加 */
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+  comp_tool_op_desc desc = linear_gradient(red, blue);
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  /* 左端 = 第一色标（纯红），右端 = 第二色标（纯蓝），中间单调过渡。 */
+  COMP_CHECK_MSG(red_at(after, 0, 7) == 255 && blue_at(after, 0, 7) == 0,
+                 "the gradient starts at the first stop");
+  COMP_CHECK_MSG(blue_at(after, kW - 1, 7) == 255 && red_at(after, kW - 1, 7) == 0,
+                 "the gradient ends at the second stop");
+  for (int32_t x = 0; x + 1 < kW; ++x) {
+    COMP_CHECK_MSG(red_at(after, x, 7) >= red_at(after, x + 1, 7),
+                   "red decreases monotonically along the gradient axis");
+    COMP_CHECK_MSG(blue_at(after, x, 7) <= blue_at(after, x + 1, 7),
+                   "blue increases monotonically along the gradient axis");
+  }
+  COMP_CHECK_MSG(red_at(after, 1, 3) == red_at(after, 1, 12),
+                 "a linear gradient along x is constant in y");
+  COMP_CHECK_MSG(alpha_at(after, 0, 3) == 255 && alpha_at(after, kW - 1, 12) == 255,
+                 "opaque stops keep the layer opaque");
+
+  /* 一步撤销 ⇒ 逐字节回到渐变前。 */
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after > undo_before, "a gradient adds undo history");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the pixels byte for byte");
+}
+
+COMP_TEST(tool_ops_gradient_radial_fades_out_and_respects_the_selection) {
+  Fixture fx;
+
+  /* 径向：第一色标不透明白、第二色标全透明 ⇒ 中心实、边缘淡出。 */
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+  comp_tool_op_desc radial = base(COMP_TOOL_GRADIENT);
+  radial.gradient.type = 1; /* 径向 */
+  radial.gradient.start_x = 8.0;
+  radial.gradient.start_y = 8.0;
+  radial.gradient.end_x = 15.0;
+  radial.gradient.end_y = 8.0; /* 半径 7 */
+  const uint8_t white[4] = {255, 255, 255, 255};
+  const uint8_t clear[4] = {255, 255, 255, 0};
+  for (int c = 0; c < 4; ++c) {
+    radial.gradient.color0[c] = white[c];
+    radial.gradient.color1[c] = clear[c];
+  }
+  radial.gradient.opacity = 1.0f;
+  COMP_CHECK(apply(fx.doc, fx.layer, radial) == COMP_OK);
+  const std::vector<uint8_t> after_radial = flatten(fx.doc);
+  COMP_CHECK_MSG(alpha_at(after_radial, 8, 8) == 255, "the radial center keeps the first stop");
+  COMP_CHECK_MSG(alpha_at(after_radial, 2, 2) == 0,
+                 "beyond the radial radius the second (transparent) stop wins");
+  COMP_CHECK_MSG(alpha_at(after_radial, 12, 8) > 0 && alpha_at(after_radial, 12, 8) < 255,
+                 "the falloff between the center and the radius is a real ramp");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == std::vector<uint8_t>(static_cast<size_t>(kW) * kH * 4, 0),
+                 "undoing the radial gradient returns to a transparent layer");
+
+  /* 选区：只选左半，渐变就只改左半（右半保持不透明黑）。 */
+  std::vector<uint8_t> black = plain_pixels(0, 0, 0);
+  set_pixels(fx.doc, fx.layer, black);
+  const float rect[4] = {0.0f, 0.0f, 8.0f, 16.0f};
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_apply_shape(fx.doc, COMP_SELECTION_RECT, rect, 2,
+                                        COMP_SELECTION_REPLACE, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed != 0, "the left-half selection really was created");
+
+  const uint8_t green[4] = {0, 255, 0, 255};
+  const uint8_t magenta[4] = {255, 0, 255, 255};
+  comp_tool_op_desc masked = linear_gradient(green, magenta);
+  COMP_CHECK(apply(fx.doc, fx.layer, masked) == COMP_OK);
+  const std::vector<uint8_t> after_masked = flatten(fx.doc);
+  COMP_CHECK_MSG(green_at(after_masked, 1, 8) > 0, "the selection gets the gradient");
+  COMP_CHECK_MSG(green_at(after_masked, 12, 8) == 0 && red_at(after_masked, 12, 8) == 0 &&
+                     blue_at(after_masked, 12, 8) == 0,
+                 "outside the selection the layer stays byte-identical black");
+  COMP_CHECK_MSG(alpha_at(after_masked, 12, 8) == 255, "outside the selection alpha is untouched");
+}
+
+COMP_TEST(tool_ops_gradient_rejects_degenerate_or_invisible_parameters) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(10, 20, 30);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  int32_t can_undo = 0;
+  COMP_CHECK(comp_document_can_undo(fx.doc, &can_undo) == COMP_OK);
+  const int32_t undo_before = can_undo;
+
+  const uint8_t opaque[4] = {255, 255, 255, 255};
+  const uint8_t clear[4] = {0, 0, 0, 0};
+
+  /* 端点重合：没有方向/半径，静默画纯色会让宿主以为方向生效了。 */
+  comp_tool_op_desc coincident = linear_gradient(opaque, clear);
+  coincident.gradient.end_x = coincident.gradient.start_x;
+  coincident.gradient.end_y = coincident.gradient.start_y;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, coincident) == COMP_ERR_INVALID_ARGUMENT,
+                 "coincident gradient endpoints are an argument error");
+
+  /* 两个色标都全透明 = 恒等操作。 */
+  comp_tool_op_desc invisible = linear_gradient(clear, clear);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, invisible) == COMP_ERR_INVALID_ARGUMENT,
+                 "a fully transparent gradient is rejected instead of recording a no-op step");
+
+  /* 未知类型 / opacity 0 同样是参数错误。 */
+  comp_tool_op_desc bad_type = linear_gradient(opaque, opaque);
+  bad_type.gradient.type = 7;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, bad_type) == COMP_ERR_INVALID_ARGUMENT,
+                 "an unknown gradient type is an argument error");
+  comp_tool_op_desc zero_opacity = linear_gradient(opaque, opaque);
+  zero_opacity.gradient.opacity = 0.0f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, zero_opacity) == COMP_ERR_INVALID_ARGUMENT,
+                 "opacity 0 is an argument error rather than a silent no-op");
+
+  /* 闸在事务之前：四次拒绝都不进撤销栈，也不改一个像素。 */
+  COMP_CHECK(comp_document_can_undo(fx.doc, &can_undo) == COMP_OK);
+  COMP_CHECK_MSG(can_undo == undo_before, "rejected gradients must not add an undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "rejected gradients leave the render byte-identical");
+
+  /* 同一份 desc 改成合法端点就必须成功——证明拒绝的是参数而不是整条通路。 */
+  comp_tool_op_desc legal = linear_gradient(opaque, clear);
+  COMP_CHECK(apply(fx.doc, fx.layer, legal) == COMP_OK);
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal gradient undoes exactly");
 }

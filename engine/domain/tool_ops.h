@@ -214,6 +214,42 @@ struct BlurParams {
   float radius = 10.0f;
 };
 
+/* ============================================================== 渐变 */
+
+/* 渐变类型（数值与 ABI `comp_tool_gradient.type` 一一对应）。 */
+enum GradientType {
+  kGradientLinear = 0, /* 线性：t = 端点连线上的投影比例 */
+  kGradientRadial = 1, /* 径向：t = 到起点的距离 / 两端点距离 */
+};
+
+/*
+ * 渐变填充参数（上游 GradientTool 的「线性 / 径向 + 两个色标」子集）。
+ *
+ * 与其余工具算子的根本差别：它**不读笔迹折线**，只要两个文档像素端点和一个
+ * 不透明度。求值口径：
+ *   - 图层像素 -> 文档坐标：p = (effective_bounds.x + x, effective_bounds.y + y)，
+ *     与 stroke/clone 同一套平移口径（缩放/旋转不做逆变换，如实记入边界）；
+ *   - t 线性 = dot(p - start, end - start) / |end - start|²，径向 =
+ *     |p - start| / |end - start|，两者都夹到 0..1；
+ *   - 色标（直通 sRGB + alpha）按 t 线性插值，再按 source-over 预乘混合；
+ *   - 选区活跃时覆盖率 = `selection_effective_coverage` 的逐像素值，
+ *     为 0 的像素**逐字节不动**（与像素滤镜同一口径）；
+ *   - `opacity` 0..1 再乘进覆盖率。
+ *
+ * 端点重合（线性方向长度 0 / 径向半径 0）在参数闸被拒绝：静默画成纯色会让
+ * 宿主以为方向生效了。两个色标全透明同样是恒等操作，一并拒绝。
+ */
+struct GradientParams {
+  int32_t type = kGradientLinear;
+  double start_x = 0.0;
+  double start_y = 0.0;
+  double end_x = 0.0;
+  double end_y = 0.0;
+  uint8_t color0[4] = {0, 0, 0, 255};
+  uint8_t color1[4] = {0, 0, 0, 0};
+  float opacity = 1.0f;
+};
+
 /* ============================================================== 扫描线 */
 
 /*
@@ -322,6 +358,7 @@ enum ToolOpKind {
   kToolOpSmudge = 10,     /* 涂抹 -> carried 缓冲拖色 */
   kToolOpLiquify = 11,    /* 液化（Push）-> 前向位移重采样 */
   kToolOpBlur = 12,       /* 模糊 -> 快照模糊后按笔迹盖回 */
+  kToolOpGradient = 13,   /* 渐变 -> 按两个端点铺一片渐变（S9 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -352,6 +389,9 @@ struct ToolOpParams {
   CloneParams clone;
   WarpParams warp;
   BlurParams blur;
+
+  /* Gradient 用（两个文档像素端点 + 两色标 + 不透明度，见 GradientParams）。 */
+  GradientParams gradient;
 
   /* Heal 用。coverage 为 8 位灰度蒙版（0..255，255 = 待修补），尺寸须等于图层像素。 */
   HealParams heal;
@@ -411,7 +451,9 @@ struct ToolOpParams {
  *   - kToolOpScanlines  按 ScanlinesParams 把图层画成 CRT 扫描线；
  *   - kToolOpChunky   先按 block 降采样抖动，再最近邻放大，可选补 dot 缝隙；
  *   - kToolOpBlur     一笔开始时模糊整层副本，再按笔迹 coverage 盖回（alpha 同样
- *                     按预乘插值，透明边缘会随涂抹变软）。
+ *                     按预乘插值，透明边缘会随涂抹变软）；
+ *   - kToolOpGradient 按两个文档端点铺一片线性/径向渐变，选区活跃时只改选区内
+ *                     像素（覆盖率 0 的像素逐字节不动）。
  */
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
                  comp_result* out_code, std::string* error, std::string* note);

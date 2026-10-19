@@ -839,6 +839,40 @@ inline double step_blur_radius(double current, int direction) {
   return base;
 }
 
+/* ------------------------------------------------------------ 渐变工具（S9） */
+
+/* 渐变类型（镜像 ABI comp_tool_gradient.type；数值必须与 ABI 一致）。 */
+inline constexpr int kGradientLinear = 0; /* 线性：沿两端点连线 */
+inline constexpr int kGradientRadial = 1; /* 径向：以起点为圆心、两端点距离为半径 */
+inline constexpr int kGradientTypeCount = 2;
+
+inline const char* gradient_type_name(int type) {
+  switch (type) {
+    case kGradientLinear: return "Linear";
+    case kGradientRadial: return "Radial";
+    default: return "?";
+  }
+}
+
+/* G 键：已在该工具时在线性/径向之间切换；未知值收敛回线性，不产生第三态。 */
+inline int next_gradient_type(int type) {
+  return type == kGradientLinear ? kGradientRadial : kGradientLinear;
+}
+
+/*
+ * 最小拖拽长度（文档像素）。短于它的拖拽不是可定义的方向/半径：引擎参数闸会
+ * 以「端点重合」拒绝，外壳先在这里判定并给出提示，避免「拖了一下没反应」变成
+ * 一次错误弹窗。阈值取 1 px，与手抖容差同量级。
+ */
+inline constexpr double kGradientMinLength = 1.0;
+
+inline bool gradient_drag_is_usable(double start_x, double start_y, double end_x,
+                                    double end_y) {
+  const double dx = end_x - start_x;
+  const double dy = end_y - start_y;
+  return dx * dx + dy * dy >= kGradientMinLength * kGradientMinLength;
+}
+
 /* ------------------------------------------------------------ 笔迹采样 */
 
 /*

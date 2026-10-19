@@ -203,6 +203,27 @@ coverage 把样本盖回当前像素。
 - 16 位 / HDR：与 Stroke/Clone/Smudge/Liquify 同属落笔族——笔尖盖到的像素写成
   8 位、笔尖之外**保留深像素**（`deep_take_painted` 口径，见 §4.6）。
 
+### 4.10 Gradient（`COMP_TOOL_GRADIENT`，S9 追加）
+
+上游渐变 / 填充工具的**最小闭环**：两个文档像素端点 + 两个色标 + 不透明度，一次性
+铺满整层。它是**整幅算子**，不读 `stroke_points`、不是落笔族。
+
+- 类型：`gradient.type = 0` 线性（`t` = 端点连线上的投影比例）、`1` 径向（`t` = 到
+  起点的距离 / 两端点距离）。`t` 夹到 **0..1**，端点之外是纯色带而不是回绕。
+- 色标：`color0` → `color1`（直通 sRGB + alpha，**非预乘**）按 `t` 线性插值；混合是
+  预乘 **source-over**，因此「不透明 → 透明」只叠颜色、不挖洞。
+- `opacity` 量程 0..1（0 在参数闸被拒绝，而不是静默当恒等）。活跃选区按
+  `selection_effective_coverage` 逐像素乘进覆盖率，**覆盖率 0 的像素逐字节不动**
+  （与像素滤镜同一口径）。
+- 参数闸都在 `txn_begin` **之前**：未知类型、非有限或 `|v| > 1e6` 的端点、端点重合
+  （`|end − start| < 1e-3`，没有方向/半径可言）、`opacity` 越界或 0、两个色标全透明。
+  全部 `COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。
+- 16 位 / HDR：整幅算子写 8 位工作副本——RGBA16 会被降到 8 位再写回（与
+  Dither / Lens 同口径），RGBA16F 直接 `COMP_ERR_STATE`。
+- 外壳（S9）：`G` 选工具、已在该工具时再按 `G` 切线性/径向；拖出两端点后松开提交，
+  色标固定「前景 → 透明」，`Shift` 反向。拖拽短于 1 px 时外壳直接放弃并提示，
+  不把一次手抖变成 `INVALID_ARGUMENT`。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。
@@ -280,3 +301,7 @@ coverage 把样本盖回当前像素。
   **绝对**羽化；§4.1 末的 S8 补充），并把钢笔路径（`comp_selection_apply_path`）与
   魔棒 N×N 窗口接进外壳；不新增 `comp_tool_apply` 算子。基线 408 → **414 用例**
   （`test_selection` 3 + `test_ui_core` 3），壳自检 90 → **103 项**。见 README §6.18。
+- S9 追加（2026-10-18）：新增 `COMP_TOOL_GRADIENT = 13`（§4.10），`comp_tool_op_desc.gradient`
+  是**尾部追加**字段，既有字段偏移不变；不新增导出 ABI（仍是 **112** 个）。基线
+  414 → **418 用例**（`test_tool_ops` 3 + `test_ui_core` 1），壳自检 103 → **113 项**。
+  见 README §6.19。

@@ -187,6 +187,16 @@ struct ShellState {
   bool wand_merged = false;
   /* 魔棒取样窗口半径（S8）：Alt+[ / Alt+] 调，0 = 只取种子像素（S7 行为）。 */
   int wand_radius = comp_ui::kDefaultWandRadius;
+  /*
+   * 渐变工具（S9）：G 切工具，已在该工具时再按 G 在线性/径向之间循环。
+   * 拖拽的两个端点（文档像素）在松开时一次性提交 comp_tool_apply(COMP_TOOL_GRADIENT)；
+   * 色标固定为「前景色 -> 透明」（Photoshop 的 Foreground to Transparent 预设），
+   * 按住 Shift 反向（透明 -> 前景色）。
+   */
+  int gradient_type = comp_ui::kGradientLinear;
+  bool gradient_active = false;
+  comp_ui::Point gradient_start{};
+  comp_ui::Point gradient_current{};
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
@@ -1399,6 +1409,107 @@ void pen_up(HWND window, ShellState& shell) {
   pen_refresh_status(shell);
 }
 
+/* ------------------------------------------------------------ 渐变（S9） */
+
+/*
+ * 渐变工具（COMP_TOOL_GRADIENT）：窗口路径是「拖出两个端点 -> 一次 comp_tool_apply」。
+ *
+ * 为什么不在拖拽过程中反复提交：渐变是一次性铺满整层的像素算子，中途每一步都提交
+ * 会在撤销栈里留下几十步。预览只画方向线（draw_canvas_overlays），松开才算一次操作。
+ *
+ * 色标固定为「前景色 -> 透明」：外壳只有前景色模型（S6），第二色标没有 UI 可调；
+ * 与其编一个宿主不存在的背景色，不如用上游同样存在的这个预设，并如实写进状态栏。
+ * 选区活跃时引擎按 coverage 混合，因此「先套选区再拉渐变」只改选区内。
+ */
+bool gradient_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Gradient;
+}
+
+void gradient_cancel(ShellState& shell) { shell.gradient_active = false; }
+
+void gradient_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!gradient_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.gradient_active = true;
+  shell.gradient_start = doc;
+  shell.gradient_current = doc;
+  SetCapture(window);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"渐变 / %s：拖出方向与长度后松开（再按 G 切换类型；Shift 反向）",
+            widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
+  set_status(shell, buffer);
+}
+
+void gradient_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.gradient_active) return;
+  shell.gradient_current =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+}
+
+void gradient_end(HWND window, ShellState& shell) {
+  if (!shell.gradient_active) return;
+  shell.gradient_active = false;
+  ReleaseCapture();
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"渐变：请先选择一个图层");
+    return;
+  }
+  const comp_ui::Point start = shell.gradient_start;
+  const comp_ui::Point end = shell.gradient_current;
+  if (!comp_ui::gradient_drag_is_usable(start.x, start.y, end.x, end.y)) {
+    set_status(shell, L"渐变：拖拽太短，已放弃（方向/半径需要一个可定义的长度）");
+    return;
+  }
+
+  /*
+   * Shift = 反向：色标顺序翻转成「透明 -> 前景色」。这是拖拽结束后才读的
+   * 修饰键（与框选/套索的 Shift=加选同口径：提交时才决定组合方式）。
+   */
+  const bool reverse = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_GRADIENT;
+  desc.gradient.type = shell.gradient_type;
+  desc.gradient.start_x = start.x;
+  desc.gradient.start_y = start.y;
+  desc.gradient.end_x = end.x;
+  desc.gradient.end_y = end.y;
+  const uint8_t solid[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
+  const uint8_t clear[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 0};
+  const uint8_t* color0 = reverse ? clear : solid;
+  const uint8_t* color1 = reverse ? solid : clear;
+  for (int i = 0; i < 4; ++i) {
+    desc.gradient.color0[i] = color0[i];
+    desc.gradient.color1[i] = color1[i];
+  }
+  desc.gradient.opacity = 1.0f;
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"渐变失败（%d）", static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"渐变 / %s：已应用｜%s",
+              widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str(),
+              widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"渐变 / %s：已应用（%s）",
+              widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str(),
+              reverse ? L"透明 → 前景" : L"前景 → 透明");
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 框选（Marquee） */
 
 bool marquee_available(const ShellState& shell) {
@@ -2602,6 +2713,46 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dotted);
   }
 
+  /*
+   * 渐变预览（S9）：方向线 + 两个端点方块；径向额外画半径圆。只是几何提示，
+   * 不预演颜色渐变——真正的像素在松开时由引擎一次性写出。
+   */
+  if (shell.gradient_active) {
+    const comp_ui::Point a =
+        shell.view.doc_to_screen(shell.gradient_start.x, shell.gradient_start.y,
+                                 layout.canvas, shell.width, shell.height);
+    const comp_ui::Point b =
+        shell.view.doc_to_screen(shell.gradient_current.x, shell.gradient_current.y,
+                                 layout.canvas, shell.width, shell.height);
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dashed = CreatePen(PS_DASH, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    const int ax = static_cast<int>(std::lround(a.x));
+    const int ay = static_cast<int>(std::lround(a.y));
+    const int bx = static_cast<int>(std::lround(b.x));
+    const int by = static_cast<int>(std::lround(b.y));
+    MoveToEx(dc, ax, ay, nullptr);
+    LineTo(dc, bx, by);
+    if (shell.gradient_type == comp_ui::kGradientRadial) {
+      const double dx = b.x - a.x;
+      const double dy = b.y - a.y;
+      const int radius = static_cast<int>(std::lround(std::sqrt(dx * dx + dy * dy)));
+      SelectObject(dc, dashed);
+      Ellipse(dc, ax - radius, ay - radius, ax + radius, ay + radius);
+      SelectObject(dc, solid);
+    }
+    /* 起点 = 空心方框（色标 0），终点 = 实心小方块（色标 1）。 */
+    Rectangle(dc, ax - 3, ay - 3, ax + 4, ay + 4);
+    HGDIOBJ old_fill = SelectObject(dc, GetStockObject(BLACK_BRUSH));
+    Rectangle(dc, bx - 2, by - 2, bx + 3, by + 3);
+    SelectObject(dc, old_fill);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dashed);
+  }
+
   /* 套索预览：沿已采样的折线画一条高对比度细线（闭合边在松开时由引擎生成）。 */
   if (shell.lasso_active && shell.lasso_points.size() >= 4) {
     HPEN trail = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
@@ -2880,6 +3031,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (shell.tool == comp_ui::ToolId::Pen && id != comp_ui::ToolId::Pen) {
     pen_cancel(shell);
   }
+  /* 离开渐变工具 = 放弃进行中的拖拽（只丢预览，不产生撤销步）。 */
+  if (shell.tool == comp_ui::ToolId::Gradient && id != comp_ui::ToolId::Gradient) {
+    gradient_cancel(shell);
+  }
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
@@ -2897,6 +3052,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
     wsprintfW(buffer,
               L"工具：Pen（点击落锚点，拖动拉控制柄；点首锚点闭合，Enter 完成，Esc 取消；羽化 %d px）",
               shell.selection_feather);
+  } else if (id == comp_ui::ToolId::Gradient) {
+    wsprintfW(buffer,
+              L"工具：Gradient / %s（拖出方向与长度后松开；再按 G 切线性/径向；Shift 反向；色标 = 前景 → 透明）",
+              widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
   } else if (id == comp_ui::ToolId::Wand) {
     wsprintfW(buffer,
               L"工具：Magic Wand（容差 %d，窗口 %d×%d，%s取样，%s；[ / ] 调容差，Alt+[ / ] 调窗口，Shift+W 切来源）",
@@ -3395,6 +3554,19 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         }
         break;
       }
+      if (key == 'G' && !ctrl) {
+        /* 重复按 G 在同一工具内循环 Linear -> Radial（对齐上游的同类工具习惯）。 */
+        if (shell.tool == comp_ui::ToolId::Gradient) {
+          shell.gradient_type = comp_ui::next_gradient_type(shell.gradient_type);
+          wchar_t buffer[192];
+          wsprintfW(buffer, L"渐变类型：%s（再按 G 切换；Shift = 反向 前景↔透明）",
+                    widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
+          set_status(shell, buffer);
+        } else {
+          set_tool(shell, comp_ui::ToolId::Gradient);
+        }
+        break;
+      }
       if (key < 128) {
         const comp_ui::ToolId id =
             comp_ui::tool_shortcut_target(shell.tool, static_cast<char>(key));
@@ -3494,6 +3666,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               lasso_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (wand_available(*shell)) {
               wand_click(window, *shell, mouse_x, mouse_y, layout);
+            } else if (gradient_available(*shell)) {
+              gradient_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
@@ -3523,6 +3697,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_LBUTTONUP:
       if (shell != nullptr && shell->pen_dragging) {
         pen_up(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->gradient_active) {
+        gradient_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -3573,6 +3752,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         marquee_cancel(*shell);
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
+        gradient_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
@@ -3584,6 +3764,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         marquee_cancel(*shell);
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
+        gradient_cancel(*shell);
       }
       break;
     case WM_MOUSEMOVE:
@@ -3595,6 +3776,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->pen_dragging) {
             pen_drag(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->gradient_active) {
+            gradient_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->eyedropper_drag) {
             /* 吸管拖动连续取样：只更新前景色与状态栏，不改画布内容。 */
@@ -4240,6 +4424,72 @@ int run_selftest(const wchar_t* out_path) {
   comp_render_flatten(document, liquify_after.data(), COMP_PIXEL_RGBA8, stride);
   verify(liquify_ok && liquify_after != warp_before, "liquify moves pixels along the stroke");
   verify(liquify_ok && comp_document_undo(document) == COMP_OK, "comp_document_undo(liquify step)");
+
+  /*
+   * 渐变（COMP_TOOL_GRADIENT，S9）：窗口路径是「拖出两个端点 -> comp_tool_apply」。
+   * 冻结三件事：枚举值、铺色后逐字节可撤销、端点重合被参数闸拒绝且不留撤销步。
+   */
+  verify(static_cast<int>(COMP_TOOL_GRADIENT) == 13, "COMP_TOOL_GRADIENT stays at 13");
+
+  std::vector<uint8_t> gradient_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, gradient_before.data(), COMP_PIXEL_RGBA8, stride);
+  size_t gradient_undo_before = 0;
+  size_t gradient_redo = 0;
+  comp_document_history_stats(document, &gradient_undo_before, &gradient_redo);
+
+  comp_tool_op_desc gradient_desc{};
+  gradient_desc.kind = COMP_TOOL_GRADIENT;
+  gradient_desc.gradient.type = 0; /* 线性 */
+  gradient_desc.gradient.start_x = 4.0;
+  gradient_desc.gradient.start_y = 32.0;
+  gradient_desc.gradient.end_x = 60.0;
+  gradient_desc.gradient.end_y = 32.0;
+  gradient_desc.gradient.color0[0] = 255; /* 第一色标：不透明红 */
+  gradient_desc.gradient.color0[3] = 255;
+  gradient_desc.gradient.color1[2] = 255; /* 第二色标：不透明蓝 */
+  gradient_desc.gradient.color1[3] = 255;
+  gradient_desc.gradient.opacity = 1.0f;
+  const bool gradient_ok =
+      comp_tool_apply(document, layer, &gradient_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(gradient_ok, "comp_tool_apply(COMP_TOOL_GRADIENT)");
+
+  std::vector<uint8_t> gradient_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, gradient_after.data(), COMP_PIXEL_RGBA8, stride);
+  const size_t left_pixel = static_cast<size_t>(32) * stride + static_cast<size_t>(4) * 4u;
+  const size_t right_pixel = static_cast<size_t>(32) * stride + static_cast<size_t>(60) * 4u;
+  verify(gradient_ok && gradient_after != gradient_before,
+         "gradient tool paints the layer");
+  verify(gradient_ok && gradient_after[left_pixel + 0] == 255 &&
+             gradient_after[left_pixel + 2] == 0,
+         "the gradient starts at the first stop (red)");
+  verify(gradient_ok && gradient_after[right_pixel + 2] == 255 &&
+             gradient_after[right_pixel + 0] == 0,
+         "the gradient ends at the second stop (blue)");
+  verify(gradient_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(gradient step)");
+  std::vector<uint8_t> gradient_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, gradient_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(gradient_ok && gradient_restored == gradient_before,
+         "gradient undo restores pixels byte-for-byte");
+
+  /* 端点重合：参数闸必须在事务之前拒绝，撤销栈与像素都不许动。 */
+  size_t gradient_undo_rejected = 0;
+  comp_document_history_stats(document, &gradient_undo_rejected, &gradient_redo);
+  comp_tool_op_desc bad_gradient = gradient_desc;
+  bad_gradient.gradient.end_x = bad_gradient.gradient.start_x;
+  bad_gradient.gradient.end_y = bad_gradient.gradient.start_y;
+  verify(comp_tool_apply(document, layer, &bad_gradient, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_ERR_INVALID_ARGUMENT,
+         "COMP_TOOL_GRADIENT(coincident endpoints) rejected");
+  size_t gradient_undo_after_reject = 0;
+  comp_document_history_stats(document, &gradient_undo_after_reject, &gradient_redo);
+  verify(gradient_undo_after_reject == gradient_undo_rejected,
+         "the rejected gradient leaves no undo step");
+  std::vector<uint8_t> gradient_after_reject(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, gradient_after_reject.data(), COMP_PIXEL_RGBA8, stride);
+  verify(gradient_after_reject == gradient_restored,
+         "the rejected gradient leaves the render byte-identical");
 
   /*
    * 选区：壳层蚂蚁线的数据源就是这条「有效 coverage」查询。这里冻结三件事：

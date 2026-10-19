@@ -987,3 +987,31 @@ COMP_TEST(ui_core_wand_radius_steps_are_clamped) {
   COMP_CHECK(comp_ui::step_wand_radius(2, -1) == 1);
   COMP_CHECK(comp_ui::step_wand_radius(1, -1) == 0);
 }
+
+COMP_TEST(ui_core_gradient_type_cycles_and_drag_has_a_minimum_length) {
+  /* 数值是 ABI（comp_tool_gradient.type）：外壳的镜像不得漂移。 */
+  COMP_CHECK(comp_ui::kGradientLinear == 0);
+  COMP_CHECK(comp_ui::kGradientRadial == 1);
+  COMP_CHECK(comp_ui::kGradientTypeCount == 2);
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientLinear)) == "Linear");
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientRadial)) == "Radial");
+  /* 未知值如实报 "?"（不猜成 Linear，便于面板暴露状态错乱）。 */
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(7)) == "?");
+
+  /* G 键循环：任意未知值都收敛回合法类型，不产生第三态。 */
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientLinear) == comp_ui::kGradientRadial);
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientRadial) == comp_ui::kGradientLinear);
+  COMP_CHECK(comp_ui::next_gradient_type(7) == comp_ui::kGradientLinear);
+  COMP_CHECK(comp_ui::next_gradient_type(-1) == comp_ui::kGradientLinear);
+
+  /*
+   * 拖拽下限：与引擎参数闸的「端点重合」互补——外壳先挡掉手抖，
+   * 免得一次短拖变成 INVALID_ARGUMENT 弹窗。恰好 1 px 视为可用（>= 语义）。
+   */
+  COMP_CHECK(comp_ui::kGradientMinLength == 1.0);
+  COMP_CHECK(!comp_ui::gradient_drag_is_usable(10.0, 10.0, 10.0, 10.0));
+  COMP_CHECK(!comp_ui::gradient_drag_is_usable(10.0, 10.0, 10.5, 10.5));
+  COMP_CHECK(comp_ui::gradient_drag_is_usable(10.0, 10.0, 11.0, 10.0));
+  COMP_CHECK(comp_ui::gradient_drag_is_usable(10.0, 10.0, 10.0, 11.0));
+  COMP_CHECK(comp_ui::gradient_drag_is_usable(0.0, 0.0, 300.0, 400.0));
+}

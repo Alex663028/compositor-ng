@@ -374,7 +374,14 @@ typedef enum comp_tool_op {
   COMP_TOOL_CLONE    = 9,  /* 仿制图章 -> 从快照（当前层或整篇合成）拷贝像素 */
   COMP_TOOL_SMUDGE   = 10, /* 涂抹 -> carried 缓冲拖色 */
   COMP_TOOL_LIQUIFY  = 11, /* 液化 Push -> 前向位移重采样 */
-  COMP_TOOL_BLUR     = 12  /* 模糊 -> 快照模糊后按笔迹盖回 */
+  COMP_TOOL_BLUR     = 12, /* 模糊 -> 快照模糊后按笔迹盖回 */
+  /*
+   * S9 尾部追加：渐变填充（上游 GradientTool）。
+   * 与前 12 个算子不同的地方：它**不吃笔迹折线**，而是由两个端点定义的
+   * 方向/半径 + 两个色标在图层像素上铺一片渐变；选区活跃时按选区覆盖率
+   * 混合（与像素滤镜同口径）。见 `comp_tool_gradient`。
+   */
+  COMP_TOOL_GRADIENT = 13
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -484,6 +491,32 @@ typedef struct comp_tool_warp { float strength; } comp_tool_warp;
 typedef struct comp_tool_blur { float radius; } comp_tool_blur;
 
 /*
+ * 渐变参数（上游 GradientTool 的「线性 / 径向 + 两个色标」子集）。
+ *
+ * 端点用**文档像素坐标**：`(start_x, start_y)` 是第一色标所在处，
+ * `(end_x, end_y)` 是第二色标（线性）或半径终点（径向）。图层像素按
+ * `effective_bounds()` 的原点换算到文档坐标后求 t（与 stroke/clone 同一套
+ * 平移口径；缩放/旋转图层不做逆变换，与其余工具算子一致）。
+ *
+ * 色标是**直通 sRGB + alpha**（各 4 字节，非预乘），铺到图层时按 source-over
+ * 预乘混合；`opacity` 再乘进覆盖率。选区活跃时覆盖率 = 选区有效 coverage，
+ * 因此「先套选区再拉渐变」只改选区内像素。
+ *
+ * 端点重合（线性方向长度为 0 / 径向半径 0）被参数闸拒绝：那不是一个可定义的
+ * 渐变，静默画成纯色会让宿主以为方向生效了。
+ */
+typedef struct comp_tool_gradient {
+  int32_t type;        /* 0 = 线性，1 = 径向 */
+  double  start_x;     /* 第一色标，文档像素坐标 */
+  double  start_y;
+  double  end_x;       /* 第二色标（线性）/ 半径终点（径向） */
+  double  end_y;
+  uint8_t color0[4];   /* 直通 sRGB + alpha（0..255） */
+  uint8_t color1[4];
+  float   opacity;     /* 0..1，整片渐变的覆盖率上限 */
+} comp_tool_gradient;
+
+/*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
  * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
@@ -518,6 +551,12 @@ typedef struct comp_tool_op_desc {
    * 0 = 画笔（source-over）。橡皮擦忽略 `brush.grain_*`（颗粒无像素可叠）。
    */
   int32_t          erase;
+  /*
+   * S9 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * 仅 COMP_TOOL_GRADIENT 读取：端点、两色标与不透明度，语义见 comp_tool_gradient。
+   * 它不读 `stroke_points`（渐变由两个端点定义，不是折线）。
+   */
+  comp_tool_gradient gradient;
 } comp_tool_op_desc;
 
 /*
