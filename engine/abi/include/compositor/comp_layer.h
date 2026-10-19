@@ -388,7 +388,14 @@ typedef enum comp_tool_op {
    * （对角点 / 两端点 / 路径段），填充与描边是同一份内核产出的两张覆盖率。
    * 见 `comp_tool_shape`。
    */
-  COMP_TOOL_SHAPE = 14
+  COMP_TOOL_SHAPE = 14,
+  /*
+   * S11 尾部追加：文字工具（上游 TypeTool 的 ASCII 子集）。
+   * 与前 14 个算子不同的地方：它不吃笔迹折线也不吃几何，文本 + 字号/行距/字距
+   * 直接排版成覆盖率；字体是**引擎自带的 5×7 位图 ASCII 字体**，UTF-8/CJK
+   * 明确不支持（参数闸拒绝，不静默画方框）。见 `comp_tool_type`。
+   */
+  COMP_TOOL_TYPE = 15
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -603,6 +610,61 @@ typedef struct comp_tool_shape {
   comp_shape_style style;
 } comp_tool_shape;
 
+/* ============================================================== 文字（S11） */
+
+/*
+ * 文字样式（语义见 domain/tool_ops.h 的 `TypeStyle`）。
+ *
+ * `font_size` 是**单元高**（文档像素）：引擎的自带位图字体是 5 列 × 7 行，
+ * 缩放 = font_size / 7。`line_height` 是行距倍数（>= 1，上限 8）；`letter_spacing`
+ * 是附加字距（文档像素，可负，但「6×缩放 + 字距」必须 >= 0.5）。
+ * `antialias` 非 0 = 逐像素精确面积覆盖率；0 = 像素中心一票（硬边）。
+ */
+typedef struct comp_type_style {
+  double font_size;      /* 单元高，文档像素；6..2048 */
+  double line_height;    /* 行距倍数；1..8（< 1 会让相邻两行字身重叠） */
+  double letter_spacing; /* 附加字距，文档像素；|x| <= 4096 且步进为正 */
+  int32_t antialias;     /* 非 0 = 抗锯齿（精确面积） */
+} comp_type_style;
+
+/*
+ * 文字参数（上游 TypeTool.swift 的 ASCII 子集；差异见 domain/tool_ops.h 的
+ * `TypeParams` 注释：画进当前图层而不是新建可再编辑的文字图层、自带位图字体、
+ * 只做左对齐 + 字号/行距/字距）。
+ *
+ * 文本：
+ *   - `text` 是 UTF-8 缓冲区，但**只接受 0x20..0x7E 与 '\n'**；其它字节（含
+ *     UTF-8 多字节 = CJK、Tab 等控制字符）被参数闸以 COMP_ERR_INVALID_ARGUMENT
+ *     拒绝。本仓零依赖、不链接字体引擎，没有 CJK 字形就不假装有；
+ *   - `text_length` 是字节数（ASCII 下等于字符数），上限 65536；
+ *   - `origin_x/origin_y` 是文本框**左上角**（文档像素，可带小数）。
+ *
+ * 排版：单字形步进 = 6×缩放 + letter_spacing；行步进 = font_size × line_height；
+ * 文本框宽 = 最长行的步进宽度，高 = font_size + (行数-1)×行步进。全部坐标是
+ * **文档像素**，引擎减掉图层 `effective_bounds()` 原点后落图层局部像素。
+ *
+ * 颜色是**直通 sRGB + alpha（非预乘）**，铺到图层时按 coverage/255 × color.a/255
+ * × opacity 走预乘 source-over；选区活跃时再乘选区有效 coverage（覆盖率 0 的
+ * 像素逐字节不动）。
+ *
+ * 参数闸（COMP_ERR_INVALID_ARGUMENT，且不留半成品/不进撤销栈）：文本为空、
+ * 只含换行、含非可打印 ASCII、超过 65536 字符、字号/行距/字距越界或非有限、
+ * 字距把步进压到 0.5 px 以下、原点 NaN/Inf 或绝对值 > 1e6、颜色 alpha 为 0、
+ * opacity 不在 0..1 或为 0。
+ *
+ * 与图层完全不相交时：成功、**无像素改动且不产生撤销步**，note 如实说明。
+ * 16 位图层经 8 位工作副本穿过；RGBA16F 拒绝（COMP_ERR_STATE）。
+ */
+typedef struct comp_tool_type {
+  double origin_x;          /* 文本框左上角，文档像素 */
+  double origin_y;
+  const char* text;         /* 仅 0x20..0x7E 与 '\n'；UTF-8 多字节被拒绝 */
+  int32_t text_length;      /* 字节数；1..65536 */
+  comp_type_style style;
+  uint8_t color[4];         /* 直通 sRGB + alpha（0..255） */
+  float opacity;            /* 0..1，再乘进逐像素覆盖率 */
+} comp_tool_type;
+
 /*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
@@ -650,6 +712,12 @@ typedef struct comp_tool_op_desc {
    * 填充/描边样式，语义见 comp_tool_shape。它同样不读 `stroke_points`。
    */
   comp_tool_shape  shape;
+  /*
+   * S11 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * 仅 COMP_TOOL_TYPE 读取：文本框原点、ASCII 文本、字号/行距/字距与颜色，
+   * 语义见 comp_tool_type。它不读 `stroke_points`，也不读 `shape`。
+   */
+  comp_tool_type   type;
 } comp_tool_op_desc;
 
 /*

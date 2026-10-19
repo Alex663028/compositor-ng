@@ -1104,3 +1104,127 @@ COMP_TEST(ui_core_shape_kind_cycles_and_drag_box_matches_modifiers) {
   COMP_CHECK(near_value(comp_ui::shape_effective_corner_radius(50.0, wide), 5.0));
   COMP_CHECK(near_value(comp_ui::shape_effective_corner_radius(-2.0, wide), 0.0));
 }
+
+COMP_TEST(ui_core_type_metrics_and_ascii_key_mapping_match_the_kernel) {
+  /*
+   * 量程是跨层的「第二套真值」：ui_core 不 include engine（零依赖/可交叉编译），
+   * engine/domain/type_raster.h 的量程只能靠这条测试逐项钉死。改了任何一侧，
+   * 这里先红。
+   */
+  COMP_CHECK(comp_ui::kMinTypeFontSize == 6.0);
+  COMP_CHECK(comp_ui::kMaxTypeFontSize == 2048.0);
+  COMP_CHECK(comp_ui::kDefaultTypeFontSize == 32.0);
+  COMP_CHECK(comp_ui::kMinTypeLineHeight == 1.0);
+  COMP_CHECK(comp_ui::kMaxTypeLineHeight == 8.0);
+  COMP_CHECK(comp_ui::kDefaultTypeLineHeight == 1.25);
+  COMP_CHECK(comp_ui::kMinTypeLetterSpacing == -4096.0);
+  COMP_CHECK(comp_ui::kMaxTypeLetterSpacing == 4096.0);
+  COMP_CHECK(comp_ui::kMinTypeAdvance == 0.5);
+
+  /* 字号：乘性步进 1.25；NaN/0/负数回落到下限；上界 2048。 */
+  COMP_CHECK(near_value(comp_ui::clamp_type_font_size(0.0), 6.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_font_size(-10.0), 6.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_font_size(std::nan("")), 6.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_font_size(5000.0), 2048.0));
+  COMP_CHECK(near_value(comp_ui::step_type_font_size(32.0, 1), 40.0));
+  COMP_CHECK(near_value(comp_ui::step_type_font_size(32.0, -1), 25.6));
+  COMP_CHECK(near_value(comp_ui::step_type_font_size(2040.0, 1), 2048.0));
+  COMP_CHECK(near_value(comp_ui::step_type_font_size(6.0, -1), 6.0));
+  COMP_CHECK(near_value(comp_ui::step_type_font_size(32.0, 0), 32.0));
+
+  /* 行距：1..8（小于 1 会让两行重叠，引擎拒绝，外壳不给出这个值）。 */
+  COMP_CHECK(near_value(comp_ui::clamp_type_line_height(0.5), 1.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_line_height(20.0), 8.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_line_height(2.0), 2.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_line_height(std::nan("")), 1.25));
+
+  /*
+   * 字距：线性步进 1 px；负值下限跟着字号走（步进 6*size/7 + spacing 必须 >= 0.5），
+   * 这条下限正是 engine 的 kMinTypeAdvance。
+   */
+  COMP_CHECK(near_value(comp_ui::type_letter_spacing_min(6.0), 0.5 - 6.0 * 6.0 / 7.0));
+  COMP_CHECK(near_value(comp_ui::type_letter_spacing_min(2048.0), 0.5 - 6.0 * 2048.0 / 7.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_letter_spacing(-1000.0, 6.0), 0.5 - 6.0 * 6.0 / 7.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_letter_spacing(-1000.0, 32.0), 0.5 - 6.0 * 32.0 / 7.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_letter_spacing(5000.0, 32.0), 4096.0));
+  COMP_CHECK(near_value(comp_ui::clamp_type_letter_spacing(std::nan(""), 32.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::step_type_letter_spacing(0.0, 32.0, 1), 1.0));
+  COMP_CHECK(near_value(comp_ui::step_type_letter_spacing(0.0, 32.0, -1), -1.0));
+  COMP_CHECK(near_value(comp_ui::step_type_letter_spacing(4096.0, 32.0, 1), 4096.0));
+  COMP_CHECK(near_value(comp_ui::step_type_letter_spacing(0.0, 32.0, 0), 0.0));
+
+  /*
+   * 文本框度量镜像内核 build_layout：字号 7 = 缩放 1、步进 6；
+   * 宽 = 最长行字形数 × 步进，高 = font_size + (行数-1) × font_size × line_height。
+   */
+  comp_ui::TypeBlockMetrics metrics =
+      comp_ui::type_block_metrics(7.0, 1.0, 0.0, "A\nBB");
+  COMP_CHECK(near_value(metrics.advance, 6.0));
+  COMP_CHECK(metrics.line_count == 2);
+  COMP_CHECK(metrics.max_line_glyphs == 2);
+  COMP_CHECK(metrics.last_line_glyphs == 2);
+  COMP_CHECK(near_value(metrics.width, 12.0));
+  COMP_CHECK(near_value(metrics.height, 14.0));
+
+  metrics = comp_ui::type_block_metrics(7.0, 1.5, 0.0, "A\nB");
+  COMP_CHECK(near_value(metrics.height, 7.0 + 7.0 * 1.5));
+
+  metrics = comp_ui::type_block_metrics(7.0, 1.0, 2.0, "AB");
+  COMP_CHECK(near_value(metrics.advance, 8.0));
+  COMP_CHECK(near_value(metrics.width, 16.0));
+
+  /* 空文本 / nullptr：宽 0、高一个字号（插入点光标只画竖线）。 */
+  metrics = comp_ui::type_block_metrics(32.0, 1.25, 0.0, "");
+  COMP_CHECK(near_value(metrics.width, 0.0));
+  COMP_CHECK(near_value(metrics.height, 32.0));
+  metrics = comp_ui::type_block_metrics(32.0, 1.25, 0.0, nullptr);
+  COMP_CHECK(near_value(metrics.width, 0.0));
+  COMP_CHECK(metrics.line_count == 1);
+
+  /* 尾随换行 = 多一个空行（与内核语义一致）。 */
+  metrics = comp_ui::type_block_metrics(7.0, 1.0, 0.0, "A\n");
+  COMP_CHECK(metrics.line_count == 2);
+  COMP_CHECK(near_value(metrics.height, 14.0));
+
+  /*
+   * WM_KEYDOWN -> ASCII：US 布局映射；控制键/功能键返回 0（外壳据此把键让给
+   * 工具快捷键而不是塞进文本）。
+   */
+  COMP_CHECK(comp_ui::type_ascii_from_vk('A', false) == 'a');
+  COMP_CHECK(comp_ui::type_ascii_from_vk('A', true) == 'A');
+  COMP_CHECK(comp_ui::type_ascii_from_vk('Z', false) == 'z');
+  COMP_CHECK(comp_ui::type_ascii_from_vk('0', false) == '0');
+  COMP_CHECK(comp_ui::type_ascii_from_vk('9', true) == '(');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x20, false) == ' ');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x20, true) == ' ');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBA, false) == ';');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBA, true) == ':');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBB, true) == '+');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBC, true) == '<');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBD, true) == '_');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBE, false) == '.');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBF, true) == '?');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xC0, true) == '~');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDB, true) == '{');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDC, true) == '|');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDD, true) == '}');
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDE, true) == '"');
+  /* 回车/退格/Tab/方向键/F 键都不是可键入字符。 */
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x0D, false) == 0);
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x08, false) == 0);
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x09, false) == 0);
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x25, false) == 0);
+  COMP_CHECK(comp_ui::type_ascii_from_vk(0x70, false) == 0);
+
+  /* 插入点光标：文档字号 × 缩放，至少 1 px。 */
+  COMP_CHECK(near_value(comp_ui::type_caret_height(32.0, 0.5), 16.0));
+  COMP_CHECK(near_value(comp_ui::type_caret_height(32.0, 2.0), 64.0));
+  COMP_CHECK(comp_ui::type_caret_height(6.0, 0.0) == 1.0);
+
+  /* 工具表：T 落在文字工具上（表本身是 ui_core 的唯一键位来源）。 */
+  COMP_CHECK(comp_ui::tool_for_shortcut('t') == comp_ui::ToolId::Type);
+  COMP_CHECK(comp_ui::tool_for_shortcut('T') == comp_ui::ToolId::Type);
+  const comp_ui::ToolInfo* type_info = comp_ui::tool_info(comp_ui::ToolId::Type);
+  COMP_CHECK(type_info != nullptr && std::string(type_info->name) == "Type" &&
+             type_info->shortcut == 't');
+}

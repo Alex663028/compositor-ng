@@ -168,6 +168,18 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Type/Shape/Gradient 一行改为「部分：Shape/Gradient 已交付」，计分仍 **28/48 ≈ 58%**
   （Type 仍是零）。详见 §6.20。
 
+  2026-10-18 第二十一轮（S11 文字工具：`COMP_TOOL_TYPE = 15`）：新增零依赖的
+  `domain/type_raster.{h,cpp}`（内置 5×7 列主序 ASCII 点阵 95 字形、字号/行距/字距排版、
+  精确面积覆盖率 AA 与像素中心硬边两档；UTF-8/Tab/控制字节如实拒绝，不画方框顶替），
+  在 `comp_tool_apply` 家族尾部追加**整幅文字算子**（参数闸全在 `txn_begin` 之前；
+  「文本框在图层外」与「一个像素都没落墨」都是成功 no-op、不留空撤销步）；
+  `comp_tool_op_desc.type` 是尾部追加字段，导出 ABI 仍是 **112** 个。Windows 壳接上
+  `T` 文字（画布点击落插入点、键入 ASCII、`Shift+Enter` 换行、回车提交、`Esc`/失焦/
+  切工具取消、`[ / ]` 调字号、`Shift+[ / ]` 调字距，预览只画插入点与文本框）。
+  基线 424 → **431 用例**，Windows 壳自检 137 → **150 项**；口径 B 的
+  Type/Shape/Gradient 一行三个子项全部交付 → **29/48 ≈ 60%**（Type 为 ASCII 点阵，
+  边界见 §6.21）。详见 §6.21。
+
 ## 1. M1 目标与范围
 
 | 项目 | 内容 |
@@ -419,11 +431,11 @@ python scripts/build.py --clean
 
 | 项 | 实测值 |
 |----|--------|
-| 编译单元 | 87（38 个 `.c` + 49 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
+| 编译单元 | 90（38 个 `.c` + 52 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 418 cases, 0 failed, 0 check failures`（当前基线；§6.19 起） |
+| 测试 | `summary: 431 cases, 0 failed, 0 check failures`（当前基线；§6.21 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
-| 源码规模 | engine：49 `.cpp` / 38 `.c`（含 vendored 26）/ 87 `.h`（含 vendored）；tests：34 `.cpp` |
+| 源码规模 | engine：52 `.cpp` / 38 `.c`（含 vendored 26）/ 90 `.h`（含 vendored）；tests：34 `.cpp` |
 
 blocks 运行时符号的 Windows 细节（§6.1.21 收口）：clang 在 Windows 目标上把
 `_NSConcreteStackBlock` / `_Block_object_assign` 等声明成 `__declspec(dllimport)`，引用落在
@@ -1430,10 +1442,10 @@ Windows 侧推荐编译器仍是 clang-cl。
 
 - **口径 A：分母 = 引擎核能力**（引擎 + ABI + 两壳）。回答「引擎核做完了吗」→ **≈97%**。
 - **口径 B：分母 = 上游产品功能条目**（上游 README 的 48 条）。回答「能当 Photoshop 用吗」
-  → **≈58%**（命中约 28 条）。
+  → **≈60%**（命中约 29 条）。
 
 AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Compositor/UI` 9.3k 行 +
-`ContentView`），因此「90% vs 58%」不矛盾。
+`ContentView`），因此「90% vs 60%」不矛盾。
 
 #### 口径 A：引擎核
 
@@ -1445,7 +1457,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **137 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **150 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
 + ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
@@ -1471,13 +1483,13 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee（矩形/椭圆）/Lasso（多边形）/魔棒、形状叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7 / §6.17）；Pen 工具手势与 Select Subject / 抠图仍缺（后两者依赖 ML，不在本仓范围） |
 | **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；**S6 补上外壳的拖拽手势**（`V`，Alt = 复制，一步撤销，§6.16） |
-| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **部分：Shape / Gradient 已交付**（Gradient = 线性/径向 + 双色标 + 选区混合，`COMP_TOOL_GRADIENT = 13`，§6.19；Shape = 矩形/椭圆/直线/贝塞尔路径 + 填充/胶囊描边 + 选区混合，`COMP_TOOL_SHAPE = 14`，§6.20）；Type 仍为零（位图字体内核未做） |
+| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | ✓ **三个子项均已交付**：Gradient = 线性/径向 + 双色标 + 选区混合（`COMP_TOOL_GRADIENT = 13`，§6.19）；Shape = 矩形/椭圆/直线/贝塞尔路径 + 填充/胶囊描边 + 选区混合（`COMP_TOOL_SHAPE = 14`，§6.20）；Type = 内置 5×7 点阵 ASCII 字体 + 字号/行距/字距 + AA（`COMP_TOOL_TYPE = 15`，§6.21）。**边界**：Type 是 ASCII-only 位图字体，没有系统字体/CJK/富文本/可编辑文本对象，与上游 472 行富文本 TypeTool 不等价 |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
 | **格式导入** HEIC/TIFF/WebP/SVG/RAW/PSB | 枚举有 7 种，但 HEIF/WebP、SVG、PSB 无解码器，TIFF=UNAVAILABLE |
 
-即 **约 28/48 命中 ≈ 58%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
+即 **约 29/48 命中 ≈ 60%**（Vignette 与 Bloom 各计一条；Tonal Contrast /
 Lens Correction 是同一 `Filters.swift` 通路的附加值，不额外抬高条数；选区几何按
 「部分命中」计，未抬高条数——缺的 Select Subject / 抠图正是该条的主要工作量；
 Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。S5 抬高**两条**：
@@ -1491,6 +1503,11 @@ Select Subject 与抠图，不足以从「部分命中」升为整条命中（§
 仍为零，整条按「部分命中」计（§6.19）。**S10 同样不抬高条数**：形状补上后该条的三个
 子项只剩 Type 未交付，但 Type 是其中最大的一块（472 行 + 字体栅格化），整条仍按
 「部分命中」计——**28/48 ≈ 58% 不变**，不因为「两个子项都做了」凑整抬高（§6.20）。
+**S11 抬高一条**：「Type / Shape / Gradient」的三个子项终于全部有产品通路——Type 是
+内置 5×7 点阵 ASCII 字体（`COMP_TOOL_TYPE = 15`，§6.21），不再是零。边界如实说明：
+它是 ASCII-only 位图字体（无 CJK / 系统字体 / 粗斜体 / 对齐 / 旋转 / 可编辑文本对象），
+与上游 472 行富文本 TypeTool **不等价**；这个 +1 只表示「该条不再缺子项」，
+不代表 Type 功能面与上游等价。
 其余约 4,800 行 Swift
 **完全没有对应物**，且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
@@ -2605,6 +2622,80 @@ ABI 层只做**结构性守卫**（指针与 1..65536 段数），坐标合法�
 不在本轮。口径 B 仍是 **28/48 ≈ 58%**——Type 未交付，整条不抬。
 
 报告：`../report/S10-shape-20261018-dsh.md`。
+
+### 6.21 S11 文字工具：`COMP_TOOL_TYPE`（2026-10-18，DSH）
+
+S10 之后「Type / Shape / Gradient」只剩 Type。与 Shape 不同，Type 没有可复用的几何设施，
+而本仓**零依赖、不链接系统字体**（Windows 壳也不引 GDI 字体来冒充落笔结果），所以这一轮
+做的是**自带位图字体的栅格化内核**；CJK 明确不做——ASCII 之外的字节由参数闸如实拒绝，
+不画方框顶替。
+
+**1. 字体内核。** 新增 `engine/domain/type_raster.{h,cpp}`：
+- 内置 **5×7 列主序** ASCII 点阵（`0x20`..`0x7E` 共 95 字形，每字形 5 字节、bit0 = 最上行），
+  字距基数 6 列（5 列字形 + 1 列间隙）；95 个字形逐个带 `/* 0xNN 'c' */` 注释便于核对；
+- 排版：`scale = font_size / 7`、水平步距 `6 * scale + letter_spacing`、行距
+  `font_size * line_height`；`\n` 分行且**行尾 `\n` 产生一个额外空行**；文本框宽 =
+  最长行 `字形数 × 步距`、高 = `font_size + (行数-1) × 行距`；
+- 两档栅格化：`antialias != 0` 走**精确面积覆盖率**（字形格与像素格的交集，逐像素累加并
+  饱和到 `uint8`），`0` 走像素中心一票的硬边——小字号不会因采样而整行消失；
+- `TypeRasterStatus` 五态把「文本不合法」（`kBadText` / `kTooLong` / `kBadStyle`）与
+  「文本框在图层外」（`kEmpty`）分开：前者是参数错误，后者是成功 no-op。
+
+**2. ABI。** 新增 `COMP_TOOL_TYPE = 15`（枚举尾部追加）；`comp_tool_op_desc` 尾部追加
+`comp_tool_type type`（`origin_x/y`、`text` + `text_length`、`comp_type_style`
+（`font_size` / `line_height` / `letter_spacing` / `antialias`）、`color[4]`、`opacity`）。
+**不新增导出函数**，仍是 **112** 个：Type 是既有 `comp_tool_apply` 的第 15 种算子，
+既有字段偏移全部不变。
+
+**3. 参数闸（全在 `txn_begin` 之前）。** 空/负文本长度、`0x20..0x7E` 之外的字节
+（UTF-8/CJK、Tab、控制字符）、超过 65536 字符、`font_size` 越出 6..2048、`line_height`
+越出 1..8、`letter_spacing` 把水平步距压到 0.5 px 以下、坐标 NaN/Inf 或 `|v| > 1e6`、
+`opacity` 越界或 0、颜色全透明——一律 `COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。
+「文本框完全落在图层外」以及「一个像素都没落墨」（纯空格文本、或选区覆盖率全 0）都是
+**成功 no-op**：`txn_abort` 整步撤回，不产生空撤销步（note 如实说明）。
+
+**4. 语义与边界。** 合成是预乘 source-over，权重 = 覆盖率 × `opacity` × `color.a`；
+活跃选区按 `selection_effective_coverage` 逐像素乘入，覆盖率为 0 的像素逐字节不动
+（画布外 = 选区之外）；8 位工作副本，RGBA16 经 `merge_deep_paint` 合回，RGBA16F 直接
+`COMP_ERR_STATE`（与 Dither / Lens / Gradient / Shape 同口径）。与上游三处显式差异：
+① 没有系统字体 / 字体选择 / CJK / 富文本（粗体、斜体、对齐、旋转、文字描边都没有）；
+② 文字是**一次性像素**，不是可再编辑的文本对象，提交后不能回改内容（撤销只能整步回滚）；
+③ 上游画完新建图层，本仓写进当前图层（与所有工具算子同一条规矩）。
+
+**5. 外壳（`T`）。** `ui_core.h` 新增 `kDefaultTypeFontSize = 32`、
+`kDefaultTypeLineHeight = 1.25`、字号 6..2048（`×/÷1.25` 步进）、行距 1..8、字距量程
+由「步距 ≥ 0.5 px」反推（`type_letter_spacing_min(font_size) = 0.5 - 6 × font_size / 7`，
+负字距合法）、`type_block_metrics`（与内核 `build_layout` 同公式，状态栏与预览共用）、
+US 布局的 `type_ascii_from_vk`（字母/数字 + 常用标点，Shift 读修饰键）、`type_caret_height`。
+手势：`T` 选工具 → 画布点击落插入点 → 直接键入 ASCII → `Enter` 提交一次
+`comp_tool_apply(COMP_TOOL_TYPE)`；`Shift+Enter` 换行、`Backspace` 删字符、
+`Esc` / 切工具 / 失焦取消（只丢预览，不产生撤销步）；`[ / ]` 调字号、`Shift+[ / ]`
+调字距；已在键入态时再点画布 = 先提交上一段、再在新位置落点。键入态是**模态**的：
+普通字符不再触发工具快捷键（`B` 是字母不是画笔）、空格也不再是临时抓手，只放行 Ctrl
+组合。画布预览只画插入点光标与文本框（白实线 + 黑虚线），**不预演字形**：外壳没有系统
+字体，用 GDI 画一套只会与落笔结果不一致。
+
+**6. 测试与基线。** `test_tool_ops` 新增 4 例（枚举冻结 + 『A』逐像素落墨 + 空首行不动 +
+一步撤销逐字节回滚；`A\nB` 两行行距；AA 半像素覆盖率 + 选区遮罩；七类非法参数拒绝 +
+图层外 no-op + 纯空格 no-op 都不留撤销步）；`test_tool_ops_domain` 新增 2 例（度量与落墨
+面积、拒绝项与图层边界裁剪）；`test_ui_core` 新增 1 例（常量/夹取/步进/字距下限/度量/
+键盘映射/工具表）。基线 424 → **431 用例 0 失败**
+（`build.py` → **431 cases, 0 failed, 0 check failures**）。
+`--selftest` 新增 13 项：枚举冻结、`comp_tool_apply` 落墨与空首行、单步撤销与逐字节
+回滚、多行行距、UTF-8 拒绝且不留撤销步、图层外 no-op 不留空撤销步且渲染不变。
+137 → **150 项**，`compositor_shell_selftest.txt` 同步重新生成
+（SHA256 `b7841a5b72b24250…`）；`scripts/run_regression.py --require-ohos` **6/6 PASS
+（0 skipped）**，含 OHOS aarch64 交叉编译 rc=0。
+
+**7. 事实边界。** 仍然**没有经过人手 Win32 实测**：无窗口环境下只验证到 ABI、`ui_core`
+数学层与自检驱动序列，「打出来的字好不好看、光标位置对不对」仍需开窗目视。明确未做：
+ASCII-only（无 CJK）、无字体选择/粗斜体/对齐/旋转/文字描边、无可编辑文本对象、
+无字形预览、没有文字属性面板（字号/行距/字距只能快捷键改）。口径 B：Type / Shape /
+Gradient 三个子项全部有产品通路，该条从「部分命中」升为**命中**——**29/48 ≈ 60%**。
+边界再强调一次：Type 是 ASCII 点阵，与上游 472 行富文本 TypeTool 不等价，这个 +1 只代表
+「该条不再缺子项」。
+
+报告：`../report/S11-type-20261018-dsh.md`。
 
 ## 7. 许可
 

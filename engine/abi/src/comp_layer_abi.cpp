@@ -1052,6 +1052,24 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.shape.style.opacity = desc->shape.style.opacity;
   params.shape.style.antialias = desc->shape.style.antialias;
 
+  /*
+   * S11：文字的文本指针按原样搬运（零拷贝）。**不在这里读文本**：ASCII 白名单、
+   * 字符数上限与排版量程都由域层/内核的参数闸统一校验（与形状路径段的分工
+   * 一致），ABI 只做结构搬运，不制造第二份阈值。
+   */
+  params.type.origin_x = desc->type.origin_x;
+  params.type.origin_y = desc->type.origin_y;
+  params.type.text = desc->type.text;
+  params.type.text_length = desc->type.text_length;
+  params.type.style.font_size = desc->type.style.font_size;
+  params.type.style.line_height = desc->type.style.line_height;
+  params.type.style.letter_spacing = desc->type.style.letter_spacing;
+  params.type.style.antialias = desc->type.style.antialias;
+  for (int i = 0; i < 4; ++i) {
+    params.type.color[i] = desc->type.color[i];
+  }
+  params.type.opacity = desc->type.opacity;
+
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;
   std::string note_text;

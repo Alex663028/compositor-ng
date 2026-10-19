@@ -1329,3 +1329,149 @@ COMP_TEST(tool_ops_domain_blur_keeps_sixteen_bit_depth_outside_the_stroke) {
                  "undo restores the 16-bit asset");
   COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
 }
+
+/* ============================================================== 文字（S11） */
+
+namespace {
+
+TypeRasterStyle type_style(double font_size, double line_height, double letter_spacing,
+                           bool antialias) {
+  TypeRasterStyle style;
+  style.font_size = font_size;
+  style.line_height = line_height;
+  style.letter_spacing = letter_spacing;
+  style.antialias = antialias;
+  return style;
+}
+
+double coverage_sum(const TypeCoverage& coverage) {
+  double sum = 0.0;
+  for (uint8_t value : coverage.coverage) sum += static_cast<double>(value);
+  return sum / 255.0;
+}
+
+}  // namespace
+
+COMP_TEST(type_raster_measures_lines_and_preserves_ink_area) {
+  /* 字号 7 ⇒ 缩放 1；行距 1 ⇒ 行步进 7。两行文本的度量可以手算。 */
+  const TypeRasterStyle style = type_style(7.0, 1.0, 0.0, true);
+  TypeMeasure measure;
+  TypeRasterReport report = type_measure_text("A\nBB", 4, style, &measure);
+  COMP_CHECK(report.status == TypeRasterStatus::kOk);
+  COMP_CHECK_MSG(measure.line_count == 2, "newlines split the text into two lines");
+  COMP_CHECK_MSG(measure.glyph_count == 3, "the newline itself is not a glyph");
+  COMP_CHECK_MSG(std::fabs(measure.advance - 6.0) < 1e-9,
+                 "advance is 6 font columns at 1:1 scale");
+  COMP_CHECK_MSG(std::fabs(measure.width - 12.0) < 1e-9,
+                 "the text box width follows the widest line");
+  COMP_CHECK_MSG(std::fabs(measure.height - 14.0) < 1e-9,
+                 "the text box height is one font size plus one line step");
+
+  /* 字距是加在每个字形步进上的：2 字形行宽 = 2×(6+2)。 */
+  const TypeRasterStyle spaced = type_style(7.0, 1.0, 2.0, true);
+  report = type_measure_text("AB", 2, spaced, &measure);
+  COMP_CHECK(report.status == TypeRasterStatus::kOk);
+  COMP_CHECK_MSG(std::fabs(measure.width - 16.0) < 1e-9,
+                 "letter spacing widens every glyph advance");
+
+  /* 行距倍数作用在行步进上：1.5 ⇒ 高 = 7 + 7×1.5。 */
+  const TypeRasterStyle loose = type_style(7.0, 1.5, 0.0, true);
+  report = type_measure_text("A\nB", 3, loose, &measure);
+  COMP_CHECK(report.status == TypeRasterStatus::kOk);
+  COMP_CHECK_MSG(std::fabs(measure.height - 17.5) < 1e-9,
+                 "line height multiplies the line step");
+
+  /*
+   * 精确面积不变性：'A' 的点阵有 18 个置位格。缩放 1 时无论原点是否落在半像素
+   * 上，覆盖率总和都必须等于 18（抗锯齿只是把同一块面积切细，不增不减）。
+   */
+  const int kInkCellsOfA = 18;
+  for (const double origin : {0.0, 0.5}) {
+    TypeCoverage coverage;
+    report = type_rasterize("A", 1, style, origin, origin, 0, 0, 16, 16, &coverage);
+    COMP_CHECK(report.status == TypeRasterStatus::kOk);
+    COMP_CHECK_MSG(!coverage.empty(), "the glyph intersects the layer");
+    COMP_CHECK_MSG(std::fabs(coverage_sum(coverage) - kInkCellsOfA) < 0.15,
+                   "antialiased coverage preserves the exact ink area");
+  }
+
+  /* 硬边：像素中心一票 ⇒ 整数对齐时恰好 18 个 255，没有中间值。 */
+  const TypeRasterStyle hard = type_style(7.0, 1.0, 0.0, false);
+  TypeCoverage hard_coverage;
+  report = type_rasterize("A", 1, hard, 0.0, 0.0, 0, 0, 16, 16, &hard_coverage);
+  COMP_CHECK(report.status == TypeRasterStatus::kOk);
+  int full = 0;
+  int partial = 0;
+  for (uint8_t value : hard_coverage.coverage) {
+    if (value == 255) ++full;
+    else if (value != 0) ++partial;
+  }
+  COMP_CHECK_MSG(full == kInkCellsOfA, "hard edges produce exactly the set bitmap cells");
+  COMP_CHECK_MSG(partial == 0, "hard edges never produce intermediate coverage");
+
+  /* 文本框裁到图层：原点在图层外时窗口从 0 开始。 */
+  TypeCoverage clipped;
+  report = type_rasterize("A", 1, style, -2.0, -2.0, 0, 0, 16, 16, &clipped);
+  COMP_CHECK(report.status == TypeRasterStatus::kOk);
+  COMP_CHECK_MSG(clipped.x == 0 && clipped.y == 0, "the coverage window is clipped to the layer");
+}
+
+COMP_TEST(type_raster_rejects_unsupported_text_and_out_of_range_styles) {
+  const TypeRasterStyle style = type_style(16.0, 1.25, 0.0, true);
+  TypeMeasure measure;
+  TypeCoverage coverage;
+
+  /* UTF-8 多字节（CJK）与 Tab 都不是本字体支持的字符。 */
+  COMP_CHECK_MSG(type_measure_text("\xE4\xBD\xA0", 3, style, &measure).status ==
+                     TypeRasterStatus::kBadText,
+                 "UTF-8/CJK text is unsupported");
+  COMP_CHECK_MSG(type_measure_text("A\tB", 3, style, &measure).status ==
+                     TypeRasterStatus::kBadText,
+                 "control characters are unsupported");
+  COMP_CHECK_MSG(type_measure_text("", 0, style, &measure).status == TypeRasterStatus::kBadText,
+                 "empty text has no glyph");
+  COMP_CHECK_MSG(type_measure_text(nullptr, 0, style, &measure).status == TypeRasterStatus::kBadText,
+                 "a null text pointer is rejected");
+  COMP_CHECK_MSG(type_measure_text("\n\n", 2, style, &measure).status == TypeRasterStatus::kBadText,
+                 "text made only of newlines has no printable glyph");
+
+  const char* error = "";
+  COMP_CHECK_MSG(type_text_is_supported("A", 1, &error), "printable ASCII is supported");
+  COMP_CHECK_MSG(!type_text_is_supported("\xE4\xBD\xA0", 3, &error),
+                 "type_text_is_supported reports UTF-8 as unsupported");
+
+  /* 字符数上限（65536）：多一个就是 kTooLong，而不是默默截断。 */
+  const std::string too_long(65537, 'A');
+  COMP_CHECK_MSG(type_measure_text(too_long.data(), too_long.size(), style, &measure).status ==
+                     TypeRasterStatus::kTooLong,
+                 "more than 65536 characters is rejected");
+
+  /* 样式量程。 */
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(5.0, 1.25, 0.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "a font size below 6 is out of range");
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(2049.0, 1.25, 0.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "a font size above 2048 is out of range");
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(16.0, 0.99, 0.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "a line height below 1 would let lines overlap");
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(16.0, 9.0, 0.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "a line height above 8 is out of range");
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(16.0, 1.25, -1000.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "letter spacing that makes the advance non-positive is out of range");
+  COMP_CHECK_MSG(type_measure_text("A", 1, type_style(16.0, 1.25, 5000.0, true), &measure).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "letter spacing beyond 4096 is out of range");
+
+  /* 原点非有限 / 文本框完全在图层外。 */
+  COMP_CHECK_MSG(type_rasterize("A", 1, style, std::nan(""), 0.0, 0, 0, 16, 16, &coverage).status ==
+                     TypeRasterStatus::kBadStyle,
+                 "a NaN origin is rejected");
+  COMP_CHECK_MSG(type_rasterize("A", 1, style, 100.0, 100.0, 0, 0, 16, 16, &coverage).status ==
+                     TypeRasterStatus::kEmpty,
+                 "a text box outside the layer is an empty rasterization");
+  COMP_CHECK_MSG(coverage.empty(), "an empty rasterization leaves the window empty");
+}

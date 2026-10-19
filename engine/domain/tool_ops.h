@@ -31,6 +31,7 @@
 #include "compositor/comp_layer.h"
 #include "domain/layer.h"
 #include "domain/shape_raster.h"
+#include "domain/type_raster.h"
 
 namespace compositor {
 
@@ -323,6 +324,70 @@ struct ShapeParams {
   ShapeStyle style;
 };
 
+/* ============================================================== 文字（S11） */
+
+/*
+ * 文字样式（与 ABI `comp_type_style` 一一对应）。
+ *
+ * 字体是**本仓自带的 5×7 位图 ASCII 字体**：不链接 FreeType/CoreText，也不从
+ * 宿主灌字形图集。因此本算子明确**不支持 UTF-8/CJK**（如实拒绝，不把「你好」
+ * 画成方框），也不支持字体族/粗体/斜体/对齐/旋转——那些都需要真正的字体引擎
+ * 与字形轮廓，本仓零依赖的边界内做不到就不假装做到（见 domain/type_raster.h）。
+ *
+ * 颜色是**直通 sRGB + alpha**（与渐变/形状同一口径），铺到图层时按 coverage
+ * × opacity 走预乘 source-over；选区活跃时再乘选区有效覆盖率。
+ */
+struct TypeStyle {
+  /* 单元高（文档像素），量程 6..2048。缩放 = font_size / 7。 */
+  double font_size = 32.0;
+  /* 行距倍数（>= 1，上限 8）：行步进 = font_size * line_height。 */
+  double line_height = 1.25;
+  /* 附加字距（文档像素）：可负，但 步进 = 6*缩放 + 字距 必须 >= 0.5。 */
+  double letter_spacing = 0.0;
+  /* 非 0 = 抗锯齿（精确面积覆盖率）；0 = 像素中心一票（硬边）。 */
+  int32_t antialias = 1;
+};
+
+/*
+ * 文字参数（上游 TypeTool 的语义，落在本仓的工具算子族里）。
+ *
+ * 与上游的显式差异（不是遗漏）：
+ *   1. 上游新建文字图层并保留**可再编辑的文字对象**；本仓的工具算子族统一
+ *      「把像素画进当前图层」，文字提交后就是像素（再编辑 = 撤销重画）。
+ *      文字对象的持久化属于图层树/工程格式，不在本批范围内。
+ *   2. 上游用系统字体（CoreText 排版、任意字号/字重/语言）；本仓自带 5×7
+ *      点阵 ASCII 字体，**只支持 0x20..0x7E 与 '\n'**，UTF-8/CJK 显式拒绝。
+ *   3. 上游有对齐/行距/字距/描边/变形；本批只做左对齐 + 行距 + 字距 + 字号，
+ *      其余不暴露（宿主拿到的是一行行左对齐文字）。
+ *
+ * 几何口径：
+ *   - `origin_x/origin_y` 是文本框**左上角**（文档像素，可带小数）；
+ *   - 文本按 '\n' 换行；单字形步进 = 6×缩放 + 字距，行步进 = 字号 × 行距；
+ *   - 文本框宽 = 最长行的步进宽度，高 = 字号 + (行数-1)×行步进；
+ *   - 引擎减掉图层 `effective_bounds()` 原点后落图层局部像素；
+ *   - 文本框与图层完全不相交时：成功且**不产生撤销步**，note 如实回报。
+ *
+ * 参数闸（COMP_ERR_INVALID_ARGUMENT，且不留半成品/不进撤销栈）：
+ * 文本为空 / 只有换行 / 含非可打印 ASCII（含 UTF-8、Tab）/ 超过 65536 字符、
+ * 字号/行距/字距越界或非有限、字距把步进压到 0.5 px 以下、原点 NaN/Inf 或
+ * 绝对值 > 1e6、颜色全透明（alpha 0）、opacity 不在 0..1 或为 0。
+ *
+ * 16 位图层：与其余工具算子同口径，经 8 位工作副本穿过（按 merge_deep_paint
+ * 合回）；RGBA16F 拒绝（COMP_ERR_STATE）。
+ */
+struct TypeParams {
+  double origin_x = 0.0;
+  double origin_y = 0.0;
+  /* ASCII 文本（可含 '\n'）；UTF-8 明确不支持，参数闸会拒绝。 */
+  const char* text = nullptr;
+  /* 字节数（ASCII 下等于字符数）。 */
+  int32_t text_length = 0;
+  TypeStyle style;
+  uint8_t color[4] = {0, 0, 0, 255};
+  /* 0..1，再乘进逐像素覆盖率。 */
+  float opacity = 1.0f;
+};
+
 /* ============================================================== 扫描线 */
 
 /*
@@ -433,6 +498,7 @@ enum ToolOpKind {
   kToolOpBlur = 12,       /* 模糊 -> 快照模糊后按笔迹盖回 */
   kToolOpGradient = 13,   /* 渐变 -> 按两个端点铺一片渐变（S9 尾部追加） */
   kToolOpShape = 14,      /* 形状 -> 矩形/椭圆/直线/贝塞尔路径的填充与描边（S10 尾部追加） */
+  kToolOpType = 15,       /* 文字 -> 位图 ASCII 字体排版成像素（S11 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -469,6 +535,9 @@ struct ToolOpParams {
 
   /* Shape 用（矩形/椭圆/直线/路径 + 填充/描边样式，见 ShapeParams）。 */
   ShapeParams shape;
+
+  /* Type 用（文本框原点 + ASCII 文本 + 字号/行距/字距 + 颜色，见 TypeParams）。 */
+  TypeParams type;
 
   /* Heal 用。coverage 为 8 位灰度蒙版（0..255，255 = 待修补），尺寸须等于图层像素。 */
   HealParams heal;
@@ -532,6 +601,8 @@ struct ToolOpParams {
  *   - kToolOpGradient 按两个文档端点铺一片线性/径向渐变，选区活跃时只改选区内
  *                     像素（覆盖率 0 的像素逐字节不动）；
  *   - kToolOpShape    把矩形/椭圆/直线/贝塞尔路径栅格化成覆盖率后按颜色合成，
+ *                     同样按选区覆盖率遮罩；与图层不相交时不产生撤销步。
+ *   - kToolOpType     把 ASCII 文本按自带 5×7 位图字体排版成覆盖率后按颜色合成，
  *                     同样按选区覆盖率遮罩；与图层不相交时不产生撤销步。
  */
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,

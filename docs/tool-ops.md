@@ -268,6 +268,43 @@ coverage 把样本盖回当前像素。
   `Shift+Alt+[` / `Shift+Alt+]` 调矩形圆角；`Esc` / 切工具 / 失焦只丢预览、不产生撤销步；
   拖拽短于 1 px 时外壳先放弃并提示，不把一次手抖变成 `INVALID_ARGUMENT`。
 
+### 4.12 Type（`COMP_TOOL_TYPE`，S11 追加）
+
+上游 `Document/TypeTool.swift`（472 行）是**系统字体 + 富文本**工具；本仓零依赖、不能链接
+系统字体，因此做的是它最有价值的那一半：**内置位图字体的栅格化内核**，输出与其它算子一样
+是「一次 `comp_tool_apply` 落进当前图层」。它也是**整幅算子**：不读 `stroke_points`、
+不是落笔族，提交时一次铺完。
+
+- 字体是编译进内核的 **5×7 列主序** ASCII 点阵（`0x20`..`0x7E` 共 95 字形，
+  每字形 5 字节、bit0 = 最上一行），字距基数为 6 列（5 列字形 + 1 列间隙）。
+  因此**只支持 ASCII**：UTF-8 多字节、Tab、控制字符一律 `kBadText` →
+  `COMP_ERR_INVALID_ARGUMENT`，**不画方框/豆腐块顶替**。
+- 排版（全在 `type_raster.cpp` 的 `build_layout`）：`scale = font_size / 7`，
+  字形水平步距 `6 * scale + letter_spacing`，行距 `font_size * line_height`；
+  `\n` 分行，**行尾 `\n` 产生一个额外空行**（与文本编辑器一致，不偷偷丢掉）；
+  文本框宽度 = 最长行 `字形数 * 步距`，高度 = `font_size + (行数-1) * 行距`。
+- 抗锯齿：`antialias != 0` 时按**精确面积覆盖率**（字形格与像素格的交集面积，
+  逐像素累加并饱和到 `uint8`，不溢出）；`0` 时按像素中心一票取硬边。
+  覆盖率再乘 `opacity` 与 `color.a/255`，用预乘 source-over 落图层。
+- 量程与参数闸（**全在 `txn_begin` 之前**）：文本非空且 ≤ 65536 字符；`font_size`
+  6..2048、`line_height` 1..8、`letter_spacing` 使水平步距 **≥ 0.5 px**（负字距可以，
+  但不能把字形挤到重叠）；坐标 NaN/Inf 或 `|v| > 1e6`、`opacity` 越界或 0、
+  可见色全透明——一律 `COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。
+- 两类**成功 no-op**：文本框完全落在图层外（`kEmpty`），以及一个像素都没落墨
+  （纯空格文本、或活跃选区覆盖率全为 0）。两者都 `txn_abort` 整步撤回、
+  **不产生空撤销步**，note 如实说明。
+- 16 位 / HDR：整幅算子写 8 位工作副本，RGBA16 经 `merge_deep_paint` 合回，
+  RGBA16F 直接 `COMP_ERR_STATE`（与 Dither / Lens / Gradient / Shape 同口径）。
+- 与上游的**显式差异**（不是遗漏）：① 没有系统字体/字体选择/CJK/富文本（粗体、斜体、
+  对齐、旋转、文字描边都没有）；② 文字是**一次性像素**，不是可再编辑的文本对象，
+  提交后无法回改内容（撤销只能整步回滚）；③ 上游画完新建图层，本仓画进当前图层
+  （与所有工具算子同一条规矩）。
+- 外壳（S11，`T`）：点击画布落插入点 → 键入 ASCII → 回车提交；`Shift+Enter` 换行、
+  `Backspace` 删字符、`Esc` / 切工具 / 失焦取消（只丢预览、不产生撤销步）；
+  `[ / ]` 调字号，`Shift+[ / ]` 调字距。画布预览只画插入点光标与文本框
+  （白实线 + 黑虚线），**不预演字形**——外壳没有系统字体，用 GDI 字画一套只会与
+  落笔结果不一致。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。
@@ -357,3 +394,10 @@ coverage 把样本盖回当前像素。
   窗口化覆盖率）。基线 418 → **424 用例**（`test_tool_ops` 5 + `test_ui_core` 1），
   壳自检 113 → **137 项**，`run_regression.py --require-ohos` 6/6 PASS。
   见 README §6.20。
+
+- S11 追加（2026-10-18）：新增 `COMP_TOOL_TYPE = 15`（§4.12），`comp_tool_op_desc.type`
+  是**尾部追加**字段，既有字段偏移不变；不新增导出 ABI（仍是 **112** 个）。
+  同时新增字体内核文件 `engine/domain/type_raster.{h,cpp}`（内置 5×7 列主序 ASCII
+  点阵 95 字形 + 字号/行距/字距排版 + 精确面积覆盖率 AA / 像素中心硬边）。基线
+  424 → **431 用例**（`test_tool_ops` 4 + `test_tool_ops_domain` 2 + `test_ui_core` 1），
+  壳自检 137 → **150 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.21。

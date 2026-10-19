@@ -86,6 +86,19 @@
 [OK] a shape entirely outside the layer succeeds as a no-op
 [OK] an off-canvas shape leaves no empty undo step
 [OK] an off-canvas shape leaves the render byte-identical
+[OK] COMP_TOOL_TYPE stays at 15
+[OK] comp_tool_apply(COMP_TOOL_TYPE "A")
+[OK] the 'A' stem is painted opaque green
+[OK] the empty top row of the glyph stays untouched
+[OK] comp_document_undo(type step)
+[OK] type undo restores pixels byte-for-byte
+[OK] both text lines are painted one line step apart
+[OK] comp_document_undo(multiline type step)
+[OK] COMP_TOOL_TYPE(UTF-8/CJK) rejected
+[OK] the rejected type leaves no undo step
+[OK] text entirely outside the layer succeeds as a no-op
+[OK] an off-canvas text box leaves no empty undo step
+[OK] an off-canvas text box leaves the render byte-identical
 [OK] comp_selection_get_active() starts at 0 (no selection)
 [OK] comp_selection_apply_shape(rect)
 [OK] comp_selection_get_active() == 1 after a rect shape

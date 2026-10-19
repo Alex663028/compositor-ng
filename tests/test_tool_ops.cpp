@@ -1310,3 +1310,230 @@ COMP_TEST(tool_ops_shape_rejects_bad_parameters_and_noops_off_canvas) {
   COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
   COMP_CHECK_MSG(flatten(fx.doc) == before, "the fill-only shape undoes exactly");
 }
+namespace {
+
+/*
+ * 文字 desc：默认「字号 14（缩放 2）+ 行距 1.5 + 硬边 + 不透明红」。
+ * 字号 14 是 7 的整数倍 ⇒ 每个点阵格正好 2×2 像素，像素中心断言可以精确写死。
+ */
+comp_tool_op_desc type_desc(const char* text, int32_t length) {
+  comp_tool_op_desc desc = base(COMP_TOOL_TYPE);
+  desc.type.text = text;
+  desc.type.text_length = length;
+  desc.type.origin_x = 0.0;
+  desc.type.origin_y = 0.0;
+  desc.type.style.font_size = 14.0;
+  desc.type.style.line_height = 1.5;
+  desc.type.style.letter_spacing = 0.0;
+  desc.type.style.antialias = 0;
+  desc.type.color[0] = 255;
+  desc.type.color[1] = 0;
+  desc.type.color[2] = 0;
+  desc.type.color[3] = 255;
+  desc.type.opacity = 1.0f;
+  return desc;
+}
+
+}  // namespace
+
+COMP_TEST(tool_ops_type_paints_a_bitmap_glyph_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_TYPE) == 15, "COMP_TOOL_TYPE is appended as 15");
+
+  Fixture fx;
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  comp_tool_op_desc glyph = type_desc("A", 1);
+  glyph.type.origin_x = 2.0;
+  glyph.type.origin_y = 1.0;
+  COMP_CHECK(apply(fx.doc, fx.layer, glyph) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  /*
+   * 'A' 是 0x7E,0x11,0x11,0x11,0x7E（列优先，bit0 最上行），字号 14 ⇒ 每格 2×2。
+   * 左竖（第 0 列，bit1..6）从 y=3 到 y=15 都该有墨；顶部第 0 行是空的。
+   */
+  COMP_CHECK_MSG(red_at(after, 2, 3) == 255 && alpha_at(after, 2, 3) == 255,
+                 "the left stem of 'A' is painted opaque red");
+  COMP_CHECK_MSG(red_at(after, 2, 6) == 255, "the stem keeps going down the glyph rows");
+  COMP_CHECK_MSG(alpha_at(after, 2, 1) == 0, "the empty top row of 'A' stays untouched");
+  COMP_CHECK_MSG(alpha_at(after, 12, 8) == 0,
+                 "the trailing 1-column gap of the cell stays untouched");
+  COMP_CHECK_MSG(alpha_at(after, 6, 8) == 0, "the hole between the two stems stays untouched");
+  COMP_CHECK_MSG(alpha_at(after, 2, 15) == 0, "below the 7-row block nothing is painted");
+  COMP_CHECK_MSG(red_at(after, 6, 9) == 255, "the crossbar is filled with the requested color");
+
+  /* 一步撤销 ⇒ 逐字节回到文字之前。 */
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1, "type adds exactly one undo step");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the pixels byte for byte");
+}
+
+COMP_TEST(tool_ops_type_multiline_and_font_size_scale_the_block) {
+  Fixture fx;
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+
+  /* 字号 7 ⇒ 缩放 1（点阵 1:1）；行距 1.0 ⇒ 行步进 7，第二行正好下移 7 像素。 */
+  comp_tool_op_desc two_lines = type_desc("A\nB", 3);
+  two_lines.type.origin_x = 1.0;
+  two_lines.type.origin_y = 1.0;
+  two_lines.type.style.font_size = 7.0;
+  two_lines.type.style.line_height = 1.0;
+  COMP_CHECK(apply(fx.doc, fx.layer, two_lines) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  COMP_CHECK_MSG(red_at(after, 1, 2) == 255, "the first line starts at the text box origin");
+  COMP_CHECK_MSG(alpha_at(after, 1, 1) == 0, "row 0 of 'A' is empty at 1:1 scale");
+  COMP_CHECK_MSG(red_at(after, 1, 8) == 255, "the second line is one 7px line step lower");
+  COMP_CHECK_MSG(red_at(after, 1, 14) == 255, "the last row of the second line is inside the layer");
+  COMP_CHECK_MSG(alpha_at(after, 1, 15) == 0, "past the two-line block nothing is painted");
+  /* 文本框宽 = 最长行的步进宽度 = 1 字形 × 6 列 = 6（x=1..7）。 */
+  COMP_CHECK_MSG(alpha_at(after, 7, 8) == 0, "the text box ends after the last glyph advance");
+
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == transparent, "undoing multiline text is exact");
+}
+
+COMP_TEST(tool_ops_type_antialiases_half_pixel_edges_and_respects_the_selection) {
+  Fixture fx;
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+
+  /* 原点落在半像素上 ⇒ 左边缘像素覆盖率约 50%，不是全有或全无。 */
+  comp_tool_op_desc soft = type_desc("A", 1);
+  soft.type.origin_x = 0.5;
+  soft.type.origin_y = 1.0;
+  soft.type.style.antialias = 1;
+  COMP_CHECK(apply(fx.doc, fx.layer, soft) == COMP_OK);
+  const std::vector<uint8_t> antialiased = flatten(fx.doc);
+  const int half = static_cast<int>(red_at(antialiased, 0, 3));
+  COMP_CHECK_MSG(half >= 120 && half <= 136,
+                 "a half-covered edge pixel gets about half the fill color");
+  COMP_CHECK_MSG(red_at(antialiased, 1, 3) == 255, "the fully covered neighbor stays at 255");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+
+  /* 选区：只选左半（x < 8）；两字符文本横跨选区内外。 */
+  const float sel[4] = {0.0f, 0.0f, 8.0f, 16.0f};
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_apply_shape(fx.doc, COMP_SELECTION_RECT, sel, 2,
+                                        COMP_SELECTION_REPLACE, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed != 0, "the left-half selection really was created");
+
+  comp_tool_op_desc masked = type_desc("AB", 2);
+  COMP_CHECK(apply(fx.doc, fx.layer, masked) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(after, 1, 2) == 255, "the selected part of 'A' is painted");
+  COMP_CHECK_MSG(red_at(after, 8, 2) == 0 && alpha_at(after, 8, 2) == 0,
+                 "the same glyph row outside the selection stays byte-identical");
+  COMP_CHECK_MSG(alpha_at(after, 12, 2) == 0 && alpha_at(after, 12, 8) == 0,
+                 "the second glyph is entirely outside the selection and untouched");
+}
+
+COMP_TEST(tool_ops_type_rejects_bad_text_and_noops_off_canvas) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(10, 20, 30);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  /* UTF-8 多字节 = CJK：本仓自带字体只有 ASCII，必须拒绝而不是画方框。 */
+  comp_tool_op_desc cjk = type_desc("\xE4\xBD\xA0\xE5\xA5\xBD", 6);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, cjk) == COMP_ERR_INVALID_ARGUMENT,
+                 "UTF-8/CJK text is rejected instead of painting boxes");
+
+  /* 空文本 / 只有换行 / 空指针 / 负长度。 */
+  comp_tool_op_desc empty = type_desc("", 0);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, empty) == COMP_ERR_INVALID_ARGUMENT,
+                 "empty text is an argument error");
+  comp_tool_op_desc newline_only = type_desc("\n\n", 2);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, newline_only) == COMP_ERR_INVALID_ARGUMENT,
+                 "text made only of newlines has no glyph and is rejected");
+  comp_tool_op_desc null_text = type_desc("A", 1);
+  null_text.type.text = nullptr;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, null_text) == COMP_ERR_INVALID_ARGUMENT,
+                 "a null text pointer is an argument error");
+  comp_tool_op_desc negative = type_desc("A", -3);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, negative) == COMP_ERR_INVALID_ARGUMENT,
+                 "a negative text length is an argument error");
+
+  /* 控制字符（Tab）不是可打印 ASCII。 */
+  comp_tool_op_desc tab = type_desc("A\tB", 3);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, tab) == COMP_ERR_INVALID_ARGUMENT,
+                 "control characters such as Tab are rejected");
+
+  /* 排版量程：字号过小/过大、行距 < 1、字距把步进压成非正、原点非有限。 */
+  comp_tool_op_desc tiny = type_desc("A", 1);
+  tiny.type.style.font_size = 5.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, tiny) == COMP_ERR_INVALID_ARGUMENT,
+                 "a font size below 6 is an argument error");
+  comp_tool_op_desc huge = type_desc("A", 1);
+  huge.type.style.font_size = 2049.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, huge) == COMP_ERR_INVALID_ARGUMENT,
+                 "a font size above 2048 is an argument error");
+  comp_tool_op_desc tight_lines = type_desc("A\nB", 3);
+  tight_lines.type.style.line_height = 0.5;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, tight_lines) == COMP_ERR_INVALID_ARGUMENT,
+                 "line height below 1 is rejected because lines would overlap");
+  comp_tool_op_desc crushed = type_desc("AB", 2);
+  crushed.type.style.letter_spacing = -100.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, crushed) == COMP_ERR_INVALID_ARGUMENT,
+                 "letter spacing that makes the glyph advance non-positive is rejected");
+  comp_tool_op_desc nan_origin = type_desc("A", 1);
+  nan_origin.type.origin_x = std::nan("");
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, nan_origin) == COMP_ERR_INVALID_ARGUMENT,
+                 "a NaN origin is an argument error");
+
+  /* 全透明颜色 / opacity 0 是恒等操作，拒绝而不是记一步空撤销。 */
+  comp_tool_op_desc invisible = type_desc("A", 1);
+  invisible.type.color[3] = 0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, invisible) == COMP_ERR_INVALID_ARGUMENT,
+                 "a fully transparent text color is rejected");
+  comp_tool_op_desc transparent_opacity = type_desc("A", 1);
+  transparent_opacity.type.opacity = 0.0f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, transparent_opacity) == COMP_ERR_INVALID_ARGUMENT,
+                 "opacity 0 is an argument error rather than a silent no-op");
+
+  /* 闸在事务之前：所有拒绝都不进撤销栈，也不改一个像素。 */
+  size_t undo_after_rejects = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after_rejects, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after_rejects == undo_before, "rejected type ops must not add an undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "rejected type ops leave the render byte-identical");
+
+  /* 合法但完全落在图层外：成功、无像素改动、不产生撤销步。 */
+  comp_tool_op_desc outside = type_desc("A", 1);
+  outside.type.origin_x = 100.0;
+  outside.type.origin_y = 100.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, outside) == COMP_OK,
+                 "a text box entirely outside the layer succeeds as a no-op");
+  size_t undo_after_outside = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after_outside, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after_outside == undo_before,
+                 "an off-canvas text box must not leave an empty undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "an off-canvas text box changes no pixel");
+
+  /* 纯空格文本没有墨迹：成功、无像素改动、同样不留空撤销步（noop 口径）。 */
+  comp_tool_op_desc spaces = type_desc("   ", 3);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, spaces) == COMP_OK,
+                 "space-only text succeeds without painting anything");
+  size_t undo_after_spaces = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after_spaces, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after_spaces == undo_before,
+                 "ink-less text must not leave an empty undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "ink-less text changes no pixel");
+
+  /* 改成合法参数就必须成功——证明拒绝的是参数而不是整条通路。 */
+  comp_tool_op_desc legal = type_desc("Hi", 2);
+  COMP_CHECK(apply(fx.doc, fx.layer, legal) == COMP_OK);
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal text undoes exactly");
+}

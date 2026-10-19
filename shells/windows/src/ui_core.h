@@ -993,6 +993,161 @@ inline double shape_effective_corner_radius(double radius, const ShapeDragBox& b
   return clamped > limit ? limit : clamped;
 }
 
+/* ------------------------------------------------------------ 文字工具（S11） */
+
+/*
+ * 文字工具只产出 **ASCII**：本仓自带 5×7 点阵字体，锚定「零依赖、可交叉编译」，
+ * 没有系统字体可借；UTF-8/CJK 由引擎参数闸如实拒绝（不画方框顶替）。
+ *
+ * 这里的三组量程必须与 `engine/domain/type_raster.h` 的 TypeRasterStyle 逐项一致
+ * （字号 6..2048、行距 1..8、字距 ±4096，且步进宽度 >= 0.5 px）：
+ * 外壳先按同一套规则夹取，避免「能调出引擎一定拒绝的值」。
+ */
+inline constexpr double kMinTypeFontSize = 6.0;
+inline constexpr double kMaxTypeFontSize = 2048.0;
+inline constexpr double kDefaultTypeFontSize = 32.0;
+
+inline double clamp_type_font_size(double value) {
+  if (!(value > 0.0)) return kMinTypeFontSize; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinTypeFontSize), kMaxTypeFontSize);
+}
+
+/* Alt+[ / Alt+]：乘性步进（与笔刷直径、形状线宽同款手感）。 */
+inline double step_type_font_size(double current, int direction) {
+  const double base = clamp_type_font_size(current);
+  if (direction > 0) return clamp_type_font_size(base * 1.25);
+  if (direction < 0) return clamp_type_font_size(base / 1.25);
+  return base;
+}
+
+inline constexpr double kMinTypeLineHeight = 1.0;
+inline constexpr double kMaxTypeLineHeight = 8.0;
+inline constexpr double kDefaultTypeLineHeight = 1.25;
+
+inline double clamp_type_line_height(double value) {
+  if (!(value > 0.0)) return kDefaultTypeLineHeight;
+  return std::min(std::max(value, kMinTypeLineHeight), kMaxTypeLineHeight);
+}
+
+/*
+ * 字距（字母间距，文档像素）。负值是合法排版（收紧），但底限由「字形步进
+ * 6*scale + spacing 必须 >= 0.5 px」决定：字号 6 时步进本来只有 ~5.14 px，
+ * 再收紧超过 4.64 px 引擎就会拒绝，所以下限跟着字号走。
+ */
+inline constexpr double kMinTypeLetterSpacing = -4096.0;
+inline constexpr double kMaxTypeLetterSpacing = 4096.0;
+inline constexpr double kMinTypeAdvance = 0.5;
+
+inline double type_letter_spacing_min(double font_size) {
+  const double size = clamp_type_font_size(font_size);
+  const double base_advance = 6.0 * size / 7.0;
+  const double limit = kMinTypeAdvance - base_advance;
+  return limit < kMinTypeLetterSpacing ? kMinTypeLetterSpacing : limit;
+}
+
+inline double clamp_type_letter_spacing(double value, double font_size) {
+  if (!(value > 0.0) && !(value < 0.0)) return 0.0; /* NaN 归零 */
+  return std::min(std::max(value, type_letter_spacing_min(font_size)), kMaxTypeLetterSpacing);
+}
+
+/* Shift+Alt+[ / ]：线性步进 1 px（字距是排版值，乘性步进在 0 附近没手感）。 */
+inline double step_type_letter_spacing(double current, double font_size, int direction) {
+  const double base = clamp_type_letter_spacing(current, font_size);
+  if (direction > 0) return clamp_type_letter_spacing(base + 1.0, font_size);
+  if (direction < 0) return clamp_type_letter_spacing(base - 1.0, font_size);
+  return base;
+}
+
+/*
+ * 文本框度量（文档像素，镜像 engine/domain/type_raster.cpp 的 build_layout）：
+ *   - 步进 = 6 * (font_size/7) + letter_spacing；
+ *   - 宽 = 最长一行的字形数 × 步进（含最后一个字形后的步进侧距）；
+ *   - 高 = font_size + (行数-1) * font_size * line_height。
+ * 只用于「预览框 + 状态栏数字」，不是像素判定的第二套真值——像素在提交时
+ * 由引擎一次写出。text 允许为 nullptr / 空串（此时宽 0、高一个字号）。
+ */
+struct TypeBlockMetrics {
+  double width = 0.0;
+  double height = 0.0;
+  double advance = 0.0;
+  int line_count = 1;
+  int max_line_glyphs = 0;
+  int last_line_glyphs = 0;
+};
+
+inline TypeBlockMetrics type_block_metrics(double font_size, double line_height,
+                                           double letter_spacing, const char* text) {
+  TypeBlockMetrics out{};
+  const double size = clamp_type_font_size(font_size);
+  const double spacing = clamp_type_letter_spacing(letter_spacing, size);
+  const double lh = clamp_type_line_height(line_height);
+  const double scale = size / 7.0;
+  out.advance = 6.0 * scale + spacing;
+  if (out.advance < kMinTypeAdvance) out.advance = kMinTypeAdvance;
+
+  int glyphs = 0;
+  if (text != nullptr) {
+    for (const char* p = text; *p != '\0'; ++p) {
+      if (*p == '\n') {
+        if (glyphs > out.max_line_glyphs) out.max_line_glyphs = glyphs;
+        out.last_line_glyphs = glyphs;
+        glyphs = 0;
+        ++out.line_count;
+      } else {
+        ++glyphs;
+      }
+    }
+  }
+  out.last_line_glyphs = glyphs;
+  if (glyphs > out.max_line_glyphs) out.max_line_glyphs = glyphs;
+  out.width = static_cast<double>(out.max_line_glyphs) * out.advance;
+  out.height = size + static_cast<double>(out.line_count - 1) * size * lh;
+  return out;
+}
+
+/*
+ * WM_KEYDOWN 的虚拟键码 -> 可键入 ASCII（0 = 该键不是文字输入）。
+ *
+ * 布局口径是 **US 键盘**：Win32 的 WM_KEYDOWN 给的是虚拟键码，不含字符本身；
+ * 外壳不调用 ToUnicode（那会随输入法/键盘布局漂移，且中文输入法会产出
+ * UTF-8，而字体只支持 ASCII），因此这里显式列出能产出的字符集。Shift 只
+ * 影响同一键位上的第二个字符（与 US 布局一致）。
+ *
+ * 常量用数值写死以保持 ui_core.h 不 include <windows.h>：
+ * 0x20=Space、0x30..0x39=0..9、0x41..0x5A=A..Z、0xBA..=OEM 标点（US 布局）。
+ */
+inline char type_ascii_from_vk(int vk, bool shift) {
+  if (vk == 0x20) return ' '; /* VK_SPACE */
+  if (vk >= '0' && vk <= '9') {
+    static const char kShiftedDigits[] = ")!@#$%^&*(";
+    return shift ? kShiftedDigits[vk - '0'] : static_cast<char>(vk);
+  }
+  if (vk >= 'A' && vk <= 'Z') {
+    return shift ? static_cast<char>(vk) : static_cast<char>(vk - 'A' + 'a');
+  }
+  switch (vk) {
+    case 0xBA: return shift ? ':' : ';';  /* VK_OEM_1 */
+    case 0xBB: return shift ? '+' : '=';  /* VK_OEM_PLUS */
+    case 0xBC: return shift ? '<' : ',';  /* VK_OEM_COMMA */
+    case 0xBD: return shift ? '_' : '-';  /* VK_OEM_MINUS */
+    case 0xBE: return shift ? '>' : '.';  /* VK_OEM_PERIOD */
+    case 0xBF: return shift ? '?' : '/';  /* VK_OEM_2 */
+    case 0xC0: return shift ? '~' : '`';  /* VK_OEM_3 */
+    case 0xDB: return shift ? '{' : '[';  /* VK_OEM_4 */
+    case 0xDC: return shift ? '|' : '\\'; /* VK_OEM_5 */
+    case 0xDD: return shift ? '}' : ']';  /* VK_OEM_6 */
+    case 0xDE: return shift ? '"' : '\''; /* VK_OEM_7 */
+    default: return 0;                    /* 控制键 / 功能键：不是文字输入 */
+  }
+}
+
+/* 插入点光标在屏幕上的高度（文档字号 × 缩放，至少 1 px 可见）。 */
+inline double type_caret_height(double font_size, double zoom) {
+  const double size = clamp_type_font_size(font_size);
+  const double height = size * (zoom > 0.0 ? zoom : 0.0);
+  return height < 1.0 ? 1.0 : height;
+}
+
 /* ------------------------------------------------------------ 笔迹采样 */
 
 /*

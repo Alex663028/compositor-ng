@@ -27,6 +27,8 @@ compositor-ng 是「同引擎、两壳」结构：
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 渐变工具（S9） | 画布拖拽两端点 → 一次 `COMP_TOOL_GRADIENT` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；线性/径向、Shift 反向） |
+| 形状工具（S10） | 画布拖拽对角点/两端点 → 一次 `COMP_TOOL_SHAPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；矩形/椭圆/直线，Shift 正方、Alt 从中心） |
+| 文字工具（S11） | 点击落插入点 + 键入 ASCII → 一次 `COMP_TOOL_TYPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；内置 5×7 点阵，ASCII-only） |
 | 编解码能力查询 | 导入/导出菜单 | 预留 | `comp_io_codec_support` | 已达成 |
 | PNG 导入/导出 | 可用 | 可用 | `comp_io_import` / `comp_io_export` | 已达成（libpng+zlib） |
 | JPEG 导入/导出 | 可用（有损） | 可用 | 同上 | 已达成（stb） |
@@ -94,7 +96,7 @@ compositor-ng 是「同引擎、两壳」结构：
 上游 `Compositor` 只有 macOS 应用层，**没有 Windows 版可供参照**，故 Windows 壳的
 编辑器界面是自建的。为让 UI 数学可回归，平台无关部分被抽到
 `shells/windows/src/ui_core.h`（header-only，不 include Windows 头、不 include `engine/` 头、
-不分配内存），由 `tests/test_ui_core.cpp` 的 17 例覆盖；`main.cpp` 只做
+不分配内存），由 `tests/test_ui_core.cpp` 的 32 例覆盖；`main.cpp` 只做
 「消息 → ui_core 调用 → 绘制」。**绘制与命中测试共用同一套几何函数**，这是本层的第一原则。
 
 ### 5.1 冻结的布局常量
@@ -233,7 +235,38 @@ Shift 并集 / Alt 差集 / 否则替换。每次写入是一个撤销步；`und
 **事实边界。** 与 §5.5 相同：交互路径**未经真人鼠标实测**；ABI、`ui_core` 数学与
 `--selftest` 驱动序列有覆盖，「画出来对不对」仍需开窗目视。
 
-### 5.7 未达成的 UI 项
+### 5.7 文字工具（`T`）接线（2026-10-18 S11 追加）
+
+工具条里的 `T` 从 S1 起就在 `tool_table` 占位（快捷键与上游一致），S11 才把它接成真工具。
+它是第一条**点击 + 键盘输入**的工具（此前都是拖拽），状态机与几何都在 `ui_core.h`：
+
+- 位置/度量：`TypeBlockMetrics` + `type_block_metrics(font_size, line_height,
+  letter_spacing, text)` 与引擎 `type_raster` 的 `build_layout` **同一公式**
+  （`scale = font_size / 7`、步距 `6 × scale + letter_spacing`、行距
+  `font_size × line_height`、`\n` 分行），因此状态栏尺寸、画布预览框与落笔结果一致；
+- 字距下限由「步距 ≥ 0.5 px」反推：`type_letter_spacing_min(font_size) =
+  0.5 - 6 × font_size / 7`（负字距合法，但不能把字形挤到重叠）；
+  `clamp_type_letter_spacing` / `step_type_letter_spacing` 都带 `font_size` 参数，
+  字号变小后字距会被重新夹取；
+- 键入映射：`type_ascii_from_vk(vk, shift)` 只覆盖 **US 布局**的字母、数字与常用标点
+  （字母区 + `0x30..0x39` + `OEM_*`）；未识别键返回 0，不猜其它布局；
+- 手势：`T` 选工具 → 画布点击落插入点 → 直接键入 ASCII → `Enter` 提交一次
+  `comp_tool_apply(COMP_TOOL_TYPE)`；`Shift+Enter` 换行、`Backspace` 删字符、
+  `Esc` / 切工具 / 失焦取消（只丢预览、不产生撤销步）；`[ / ]` 调字号、
+  `Shift+[ / ]` 调字距；已在键入态时再点画布 = 先提交上一段、再在新位置落点；
+- 键入态是**模态**的：普通字符不再触发工具快捷键（`B` 是字母不是画笔）、
+  空格也不再是临时抓手，只放行 Ctrl 组合（撤销/保存等）；`WM_KILLFOCUS` 取消；
+- 画布预览只画插入点光标 + 文本框（白实线 + 黑虚线双描边），**不预演字形**：
+  外壳没有系统字体（字体是引擎内的点阵），用 GDI 画一套只会与落笔结果不一致；
+  像素在 `Enter` 时由引擎一次写出（与渐变/形状「拖完一次提交」同口径）；
+- 与上游的差异：ASCII-only（无 CJK / 字体选择 / 粗斜体 / 对齐 / 旋转）、
+  文字是**一次性像素**而不是可编辑文本对象、画进当前图层而不是新建图层
+  （见 `docs/tool-ops.md` §4.12）。
+
+**事实边界。** 与 §5.6 相同：交互路径**未经真人键盘/鼠标实测**；ABI、`ui_core`
+数学层与 `--selftest` 驱动序列有覆盖，「打出来的字好不好看、光标位置对不对」仍需开窗目视。
+
+### 5.8 未达成的 UI 项
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|

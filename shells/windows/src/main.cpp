@@ -208,6 +208,18 @@ struct ShellState {
   comp_ui::Point shape_current{};
   double shape_stroke_width = comp_ui::kDefaultShapeStrokeWidth;
   double shape_corner_radius = comp_ui::kDefaultShapeCornerRadius;
+  /*
+   * 文字工具（S11）：T 切工具；在画布上点一下落插入点，随后直接键入 ASCII，
+   * 回车提交一次 comp_tool_apply(COMP_TOOL_TYPE)，Esc / 失焦 / 切工具取消
+   * （只丢预览，不产生撤销步）。字体是引擎内的 5×7 点阵，没有系统字体，
+   * 因此只支持 ASCII；CJK 由引擎参数闸如实拒绝（不画方框顶替）。
+   */
+  bool type_active = false; /* 已落插入点，正在键入/等待提交 */
+  comp_ui::Point type_origin{}; /* 插入点（文档像素，文本框左上角） */
+  std::string type_text;        /* ASCII 键入缓冲，'\n' = 换行（Shift+Enter） */
+  double type_font_size = comp_ui::kDefaultTypeFontSize;
+  double type_line_height = comp_ui::kDefaultTypeLineHeight;
+  double type_letter_spacing = 0.0;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
@@ -1633,6 +1645,156 @@ void shape_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 文字（S11） */
+
+/*
+ * 文字工具（COMP_TOOL_TYPE）：窗口路径是「点击落插入点 -> 键入 ASCII -> 回车提交」。
+ *
+ * 键盘模态：落点后普通字符不再走工具快捷键，而是进 type_text；文本框、插入点光标
+ * 与度量数字只是预览，像素在回车时由引擎一次性写出（与渐变/形状「不在拖拽中反复
+ * 提交」同口径）。Esc / 失焦 / 切工具取消 = 丢弃缓冲，不产生撤销步。
+ *
+ * 为什么没有拖拽：上游文字工具也是「点一下定位、键入、提交」，拖动不产生额外几何；
+ * 位置就取点击处的文档像素（向下/向右排字）。
+ */
+bool type_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Type;
+}
+
+void type_cancel(ShellState& shell) {
+  shell.type_active = false;
+  shell.type_text.clear();
+}
+
+/* 状态栏：空缓冲时给快捷键提示，有内容时给行数/文本框尺寸/排版值。 */
+void type_refresh_status(ShellState& shell) {
+  const comp_ui::TypeBlockMetrics metrics =
+      comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
+                                  shell.type_letter_spacing, shell.type_text.c_str());
+  const int size_px = static_cast<int>(shell.type_font_size + 0.5);
+  const int line_pct = static_cast<int>(shell.type_line_height * 100.0 + 0.5);
+  const int spacing_px = static_cast<int>(std::lround(shell.type_letter_spacing));
+  const int width_px = static_cast<int>(std::lround(metrics.width));
+  const int height_px = static_cast<int>(std::lround(metrics.height));
+  wchar_t buffer[384];
+  if (shell.type_text.empty()) {
+    wsprintfW(buffer,
+              L"文字：插入点 (%d, %d)｜字号 %d px，行距 %d%%，字距 %d px｜"
+              L"键入 ASCII，Shift+Enter 换行，回车提交，Esc 取消；"
+              L"[ / ] 调字号，Shift+[ / ] 调字距",
+              static_cast<int>(std::floor(shell.type_origin.x)),
+              static_cast<int>(std::floor(shell.type_origin.y)), size_px, line_pct, spacing_px);
+  } else {
+    /* 状态栏是单行：把换行显示成 '|'，不把控制字符塞进窗口标题。 */
+    std::string display;
+    display.reserve(shell.type_text.size());
+    for (char ch : shell.type_text) display.push_back(ch == '\n' ? '|' : ch);
+    wsprintfW(buffer, L"文字：%s｜%d 行 %d×%d px，字号 %d，行距 %d%%，字距 %d｜"
+                      L"回车提交，Esc 取消",
+              widen_ascii(display.c_str()).c_str(), metrics.line_count, width_px, height_px,
+              size_px, line_pct, spacing_px);
+  }
+  set_status(shell, buffer);
+}
+
+/* 重新落点前要先提交上一段文字（定义在下方，先声明）。 */
+void type_commit(ShellState& shell);
+
+void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!type_available(shell)) return;
+  (void)window;
+  /* 已经在键入时再点一次 = 先提交上一段文字，再在新位置重新落点（不丢已键入内容）。 */
+  if (shell.type_active && !shell.type_text.empty()) type_commit(shell);
+  shell.type_origin = shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.type_active = true;
+  shell.type_text.clear();
+  type_refresh_status(shell);
+}
+
+/*
+ * 回车提交：一次 comp_tool_apply = 一步撤销。空缓冲不提交（没有可画的字形，
+ * 引擎会以「无字形」拒绝），外壳保持插入点等待输入。
+ */
+void type_commit(ShellState& shell) {
+  if (!shell.type_active) return;
+  if (shell.type_text.empty()) {
+    set_status(shell, L"文字：还没有输入内容（键入 ASCII 后回车提交，Esc 取消）");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"文字：请先选择一个图层");
+    return;
+  }
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_TYPE;
+  desc.type.origin_x = shell.type_origin.x;
+  desc.type.origin_y = shell.type_origin.y;
+  desc.type.text = shell.type_text.c_str();
+  desc.type.text_length = static_cast<int32_t>(shell.type_text.size());
+  desc.type.style.font_size = shell.type_font_size;
+  desc.type.style.line_height = shell.type_line_height;
+  desc.type.style.letter_spacing = shell.type_letter_spacing;
+  desc.type.style.antialias = 1;
+  desc.type.color[0] = shell.foreground.r;
+  desc.type.color[1] = shell.foreground.g;
+  desc.type.color[2] = shell.foreground.b;
+  desc.type.color[3] = 255;
+  desc.type.opacity = 1.0f;
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  /* 无论成功与否都退出键入态：成功已提交，失败也没有可保留的预览语义。 */
+  const int lines = comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
+                                                shell.type_letter_spacing,
+                                                shell.type_text.c_str())
+                        .line_count;
+  shell.type_active = false;
+  shell.type_text.clear();
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"文字失败（%d）", static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"文字：已应用（%d 行）｜%s", lines, widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"文字：已应用（%d 行）", lines);
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/* [ / ] 调字号，Shift+[ / ] 调字距；只在文字工具内生效（其余工具沿用笔刷/魔棒）。 */
+void type_step_param(ShellState& shell, int direction, bool spacing) {
+  if (spacing) {
+    shell.type_letter_spacing =
+        comp_ui::step_type_letter_spacing(shell.type_letter_spacing, shell.type_font_size,
+                                          direction);
+  } else {
+    shell.type_font_size = comp_ui::step_type_font_size(shell.type_font_size, direction);
+    /* 字号变小会让原字距超出「步进 >= 0.5 px」的底限：跟着重新夹取。 */
+    shell.type_letter_spacing =
+        comp_ui::clamp_type_letter_spacing(shell.type_letter_spacing, shell.type_font_size);
+  }
+  if (shell.type_active) {
+    type_refresh_status(shell);
+  } else {
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"文字：字号 %d px，行距 %d%%，字距 %d px（[ / ] 调字号，Shift+[ / ] 调字距）",
+              static_cast<int>(shell.type_font_size + 0.5),
+              static_cast<int>(shell.type_line_height * 100.0 + 0.5),
+              static_cast<int>(std::lround(shell.type_letter_spacing)));
+    set_status(shell, buffer);
+  }
+}
+
 /* ------------------------------------------------------------ 框选（Marquee） */
 
 bool marquee_available(const ShellState& shell) {
@@ -2933,6 +3095,50 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dotted);
   }
 
+  /*
+   * 文字预览（S11）：插入点光标 + 未来文本框（白实线 + 黑虚线双描边）。
+   * 只给位置与尺寸，不预演字形：外壳没有系统字体（字体是引擎内的 5×7 点阵），
+   * 画一套 GDI 字只会与落笔结果不一致；像素在回车时由引擎一次写出（与渐变/
+   * 形状预览同口径）。度量来自 ui_core，与内核 build_layout 同公式。
+   */
+  if (shell.type_active) {
+    const comp_ui::TypeBlockMetrics metrics =
+        comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
+                                    shell.type_letter_spacing, shell.type_text.c_str());
+    const comp_ui::Point origin = shell.view.doc_to_screen(
+        shell.type_origin.x, shell.type_origin.y, layout.canvas, shell.width, shell.height);
+    const comp_ui::Point corner = shell.view.doc_to_screen(
+        shell.type_origin.x + metrics.width, shell.type_origin.y + metrics.height,
+        layout.canvas, shell.width, shell.height);
+    const int left = static_cast<int>(std::lround(std::min(origin.x, corner.x)));
+    const int top = static_cast<int>(std::lround(std::min(origin.y, corner.y)));
+    const int right = static_cast<int>(std::lround(std::max(origin.x, corner.x)));
+    const int bottom = static_cast<int>(std::lround(std::max(origin.y, corner.y)));
+
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    if (right - left >= 1 && bottom - top >= 1) {
+      Rectangle(dc, left, top, right, bottom);
+      SelectObject(dc, dotted);
+      Rectangle(dc, left, top, right, bottom);
+      SelectObject(dc, solid);
+    }
+    /* 插入点光标：从原点向下画一个字号高（文档字号 × 缩放，至少 1 px）。 */
+    const int caret = static_cast<int>(
+        std::lround(comp_ui::type_caret_height(shell.type_font_size, shell.view.zoom)));
+    MoveToEx(dc, left, top, nullptr);
+    LineTo(dc, left, top + caret);
+    SelectObject(dc, dotted);
+    MoveToEx(dc, left + 1, top, nullptr);
+    LineTo(dc, left + 1, top + caret);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+
   /* 套索预览：沿已采样的折线画一条高对比度细线（闭合边在松开时由引擎生成）。 */  if (shell.lasso_active && shell.lasso_points.size() >= 4) {
     HPEN trail = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
     HGDIOBJ old_pen = SelectObject(dc, trail);
@@ -3218,6 +3424,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (shell.tool == comp_ui::ToolId::Shape && id != comp_ui::ToolId::Shape) {
     shape_cancel(shell);
   }
+  /* 离开文字工具 = 放弃未提交的键入（只丢预览，不产生撤销步）。 */
+  if (shell.tool == comp_ui::ToolId::Type && id != comp_ui::ToolId::Type) {
+    type_cancel(shell);
+  }
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
@@ -3245,6 +3455,13 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               L"Alt+[ / ] 调线宽，Shift+Alt+[ / ] 调圆角）",
               widen_ascii(comp_ui::shape_kind_name(shell.shape_kind)).c_str(),
               shell.shape_kind == comp_ui::kShapeLine ? L"两端点" : L"对角点");
+  } else if (id == comp_ui::ToolId::Type) {
+    wsprintfW(buffer,
+              L"工具：Type（画布点击落插入点，键入 ASCII；Shift+Enter 换行，回车提交，Esc 取消；"
+              L"字号 %d px，行距 %d%%，字距 %d px；[ / ] 调字号，Shift+[ / ] 调字距）",
+              static_cast<int>(shell.type_font_size + 0.5),
+              static_cast<int>(shell.type_line_height * 100.0 + 0.5),
+              static_cast<int>(std::lround(shell.type_letter_spacing)));
   } else if (id == comp_ui::ToolId::Wand) {
     wsprintfW(buffer,
               L"工具：Magic Wand（容差 %d，窗口 %d×%d，%s取样，%s；[ / ] 调容差，Alt+[ / ] 调窗口，Shift+W 切来源）",
@@ -3539,6 +3756,46 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     }
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
+
+  /*
+   * 文字键入态：最优先吃掉字符键，避免 'B' 被当成画笔快捷键、空格被当成抓手。
+   * Esc 取消、Enter 提交、Shift+Enter 换行、Backspace 删字符；[ / ] 调字号与字距。
+   * Ctrl 组合放行（撤销/打开等仍可用），其余未识别键一律吞掉（模态输入规矩）。
+   */
+  if (shell.type_active) {
+    if (key == VK_ESCAPE) {
+      type_cancel(shell);
+      set_status(shell, L"已取消文字输入（未产生撤销步）");
+      return;
+    }
+    if (key == VK_RETURN) {
+      if (shift) {
+        shell.type_text.push_back('\n');
+        type_refresh_status(shell);
+      } else {
+        type_commit(shell);
+      }
+      return;
+    }
+    if (key == VK_BACK) {
+      if (!shell.type_text.empty()) shell.type_text.pop_back();
+      type_refresh_status(shell);
+      return;
+    }
+    if (key == VK_OEM_4 || key == VK_OEM_6) {
+      type_step_param(shell, key == VK_OEM_4 ? -1 : 1, shift);
+      return;
+    }
+    if (!ctrl) {
+      const char typed = comp_ui::type_ascii_from_vk(static_cast<int>(key), shift);
+      if (typed != 0) {
+        shell.type_text.push_back(typed);
+        type_refresh_status(shell);
+      }
+      return; /* 键入态下屏蔽其它快捷键，避免误触发 */
+    }
+  }
+
   if (key == VK_ESCAPE) {
     /* 钢笔有未提交路径时 Esc 只取消路径，不关窗（与输入态的 Esc 同规矩）。 */
     if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
@@ -3653,8 +3910,10 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_DOWN:
       run_shell_command(window, shell, kCmdLayerSelectDown);
       break;
-    case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低；Wand = 容差 - */
-      if (shell.tool == comp_ui::ToolId::Wand) {
+    case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低；Wand = 容差 -；Type = 字号/字距 - */
+      if (shell.tool == comp_ui::ToolId::Type) {
+        type_step_param(shell, -1, shift);
+      } else if (shell.tool == comp_ui::ToolId::Wand) {
         shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, -1);
         wchar_t buffer[160];
         wsprintfW(buffer, L"魔棒容差 %d（窗口 %d×%d，逐通道，alpha 参与）", shell.wand_tolerance,
@@ -3664,8 +3923,10 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         brush_step(shell, -1, shift);
       }
       break;
-    case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高；Wand = 容差 + */
-      if (shell.tool == comp_ui::ToolId::Wand) {
+    case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高；Wand = 容差 +；Type = 字号/字距 + */
+      if (shell.tool == comp_ui::ToolId::Type) {
+        type_step_param(shell, 1, shift);
+      } else if (shell.tool == comp_ui::ToolId::Wand) {
         shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, 1);
         wchar_t buffer[160];
         wsprintfW(buffer, L"魔棒容差 %d（窗口 %d×%d，逐通道，alpha 参与）", shell.wand_tolerance,
@@ -3806,7 +4067,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_KEYDOWN:
       if (shell != nullptr) {
-        if (wparam == VK_SPACE) {
+        /* 文字键入态下空格是字符，不是临时抓手。 */
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (wparam == VK_SPACE && !(shell->type_active && !ctrl)) {
           /* 空格 = 临时抓手：按下不重复触发，松开才结束。 */
           if (!shell->space_down) {
             shell->space_down = true;
@@ -3815,7 +4078,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           break;
         }
-        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         handle_key(window, *shell, wparam, ctrl, shift);
         InvalidateRect(window, nullptr, FALSE);
@@ -3881,6 +4143,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               gradient_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (shape_available(*shell)) {
               shape_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (type_available(*shell)) {
+              type_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
@@ -3972,6 +4236,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
         shape_cancel(*shell);
+        type_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
@@ -4865,6 +5130,93 @@ int run_selftest(const wchar_t* out_path) {
   verify(shape_restored == shape_before,
          "an off-canvas shape leaves the render byte-identical");
 
+  /*
+   * 文字（COMP_TOOL_TYPE，S11）：窗口路径是「点击落插入点 -> 键入 ASCII -> 回车提交」。
+   * 冻结：枚举值、硬边落墨与逐字节撤销、多行行距、UTF-8 拒绝且不留撤销步、
+   * 图层外文字成功但不产生空撤销步。字体是引擎内 5×7 点阵，ASCII-only。
+   */
+  verify(static_cast<int>(COMP_TOOL_TYPE) == 15, "COMP_TOOL_TYPE stays at 15");
+
+  std::vector<uint8_t> type_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, type_before.data(), COMP_PIXEL_RGBA8, stride);
+  size_t type_undo_before = 0;
+  size_t type_redo = 0;
+  comp_document_history_stats(document, &type_undo_before, &type_redo);
+
+  comp_tool_op_desc type_desc{};
+  type_desc.kind = COMP_TOOL_TYPE;
+  type_desc.type.origin_x = 8.0;
+  type_desc.type.origin_y = 8.0;
+  type_desc.type.text = "A";
+  type_desc.type.text_length = 1;
+  type_desc.type.style.font_size = 14.0; /* 缩放 2 => 每个点阵格 2x2 像素 */
+  type_desc.type.style.line_height = 1.0;
+  type_desc.type.style.letter_spacing = 0.0;
+  type_desc.type.style.antialias = 0;
+  type_desc.type.color[1] = 255; /* 不透明绿 */
+  type_desc.type.color[3] = 255;
+  type_desc.type.opacity = 1.0f;
+  const bool type_ok =
+      comp_tool_apply(document, layer, &type_desc, tool_note, sizeof(tool_note), &tool_note_size) ==
+      COMP_OK;
+  verify(type_ok, "comp_tool_apply(COMP_TOOL_TYPE \"A\")");
+  std::vector<uint8_t> type_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, type_after.data(), COMP_PIXEL_RGBA8, stride);
+  const auto type_at = [&](int32_t x, int32_t y) {
+    return static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4u;
+  };
+  /* 'A' 第 0 列是 0x7E（bit1..6）：原点 (8,8)、缩放 2 时 x=8..9、y=10..21 有墨。 */
+  verify(type_ok && type_after[type_at(8, 10) + 3] == 255 &&
+             type_after[type_at(8, 10) + 1] == 255,
+         "the 'A' stem is painted opaque green");
+  verify(type_ok && std::memcmp(&type_after[type_at(8, 8)], &type_before[type_at(8, 8)], 4) == 0,
+         "the empty top row of the glyph stays untouched");
+  verify(type_ok && comp_document_undo(document) == COMP_OK, "comp_document_undo(type step)");
+  std::vector<uint8_t> type_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, type_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(type_ok && type_restored == type_before, "type undo restores pixels byte-for-byte");
+
+  /* 多行：字号 7 + 行距 1.0 => 第二行正好下移 7 px。 */
+  comp_tool_op_desc multiline_desc = type_desc;
+  multiline_desc.type.text = "A\nB";
+  multiline_desc.type.text_length = 3;
+  multiline_desc.type.style.font_size = 7.0;
+  const bool multiline_ok =
+      comp_tool_apply(document, layer, &multiline_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  std::vector<uint8_t> multiline_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, multiline_after.data(), COMP_PIXEL_RGBA8, stride);
+  verify(multiline_ok && multiline_after[type_at(8, 9) + 3] == 255 &&
+             multiline_after[type_at(8, 16) + 3] == 255,
+         "both text lines are painted one line step apart");
+  verify(multiline_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(multiline type step)");
+
+  /* UTF-8/CJK：ASCII 字体明确不支持 => 参数闸拒绝且不留撤销步。 */
+  comp_tool_op_desc cjk_desc = type_desc;
+  cjk_desc.type.text = "\xE4\xBD\xA0\xE5\xA5\xBD";
+  cjk_desc.type.text_length = 6;
+  verify(comp_tool_apply(document, layer, &cjk_desc, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_ERR_INVALID_ARGUMENT,
+         "COMP_TOOL_TYPE(UTF-8/CJK) rejected");
+  size_t type_undo_after_reject = 0;
+  comp_document_history_stats(document, &type_undo_after_reject, &type_redo);
+  verify(type_undo_after_reject == type_undo_before, "the rejected type leaves no undo step");
+
+  /* 合法但完全落在图层外：成功、无像素改动、不产生空撤销步。 */
+  comp_tool_op_desc type_outside = type_desc;
+  type_outside.type.origin_x = 100.0;
+  type_outside.type.origin_y = 100.0;
+  verify(comp_tool_apply(document, layer, &type_outside, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_OK,
+         "text entirely outside the layer succeeds as a no-op");
+  size_t type_undo_after_outside = 0;
+  comp_document_history_stats(document, &type_undo_after_outside, &type_redo);
+  verify(type_undo_after_outside == type_undo_before,
+         "an off-canvas text box leaves no empty undo step");
+  comp_render_flatten(document, type_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(type_restored == type_before,
+         "an off-canvas text box leaves the render byte-identical");
 
   /*
    * 选区：壳层蚂蚁线的数据源就是这条「有效 coverage」查询。这里冻结三件事：

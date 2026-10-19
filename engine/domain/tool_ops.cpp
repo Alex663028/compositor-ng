@@ -94,6 +94,7 @@ std::string label(uint32_t kind) {
     case kToolOpBlur: return "blur";
     case kToolOpGradient: return "gradient";
     case kToolOpShape: return "shape";
+    case kToolOpType: return "type";
     default: return "none";
   }
 }
@@ -881,6 +882,43 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       break;
     }
 
+    case kToolOpType: {
+      const TypeParams& type = params.type;
+      if (type.text == nullptr || type.text_length <= 0) {
+        return bad_arg("type text is null or empty");
+      }
+      const double origin[2] = {type.origin_x, type.origin_y};
+      for (double coordinate : origin) {
+        if (!std::isfinite(coordinate) || std::fabs(coordinate) > kMaxToolCoordinate) {
+          return bad_arg("type origin is not finite or out of range");
+        }
+      }
+      if (!finite01(type.opacity) || type.opacity <= 0.0f) {
+        return bad_arg("type opacity must be within 0..1 and non-zero");
+      }
+      /* 看不见的颜色 = 恒等操作：与渐变/形状同口径，拒绝而不是记一步空撤销。 */
+      if (type.color[3] == 0) {
+        return bad_arg("type has no visible color (the color is fully transparent)");
+      }
+      /*
+       * 文本与排版量程统一交给内核校验：字号/行距/字距的上限、ASCII 白名单、
+       * 字符数上限与「字距把步进压成 0」都在 type_measure_text 里，域层不再
+       * 各写一份阈值（两份阈值迟早漂移，是本仓反复踩过的坑）。
+       */
+      TypeRasterStyle style;
+      style.font_size = type.style.font_size;
+      style.line_height = type.style.line_height;
+      style.letter_spacing = type.style.letter_spacing;
+      style.antialias = type.style.antialias != 0;
+      TypeMeasure measure;
+      const TypeRasterReport report =
+          type_measure_text(type.text, static_cast<size_t>(type.text_length), style, &measure);
+      if (report.status != TypeRasterStatus::kOk) {
+        return bad_arg(report.message);
+      }
+      break;
+    }
+
     case kToolOpHeal: {
       if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
       if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
@@ -1060,7 +1098,7 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   }
 
   bool ok = true;
-  /* 形状与图层完全不相交时是「成功但无操作」：不能 commit（那会留下一步空撤销）。 */
+  /* 形状/文字与图层完全不相交时是「成功但无操作」：不能 commit（那会留下一步空撤销）。 */
   bool noop = false;
   switch (params.kind) {
     case kToolOpSelect: {
@@ -1459,6 +1497,113 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       if (stroke) composite(raster.stroke, shape.style.stroke_color);
       if (masked && note != nullptr) {
         *note += "shape is masked by the active selection (coverage 0 pixels are unchanged); ";
+      }
+      break;
+    }
+
+    case kToolOpType: {
+      const TypeParams& type = params.type;
+      /* 选区口径与渐变/形状完全一致：文档分辨率 coverage，画布外 = 选区之外。 */
+      const bool masked = document->selection().active;
+      std::vector<uint8_t> selection_coverage;
+      const int32_t canvas_width = document->state().width;
+      const int32_t canvas_height = document->state().height;
+      if (masked) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+        if (selection_coverage.size() != static_cast<size_t>(canvas_width) *
+                                            static_cast<size_t>(canvas_height)) {
+          ok = bad_state("active selection has no coverage at the document resolution");
+          break;
+        }
+      }
+
+      const comp_rect bounds = target_layer->effective_bounds();
+      TypeRasterStyle style;
+      style.font_size = type.style.font_size;
+      style.line_height = type.style.line_height;
+      style.letter_spacing = type.style.letter_spacing;
+      style.antialias = type.style.antialias != 0;
+
+      TypeCoverage raster;
+      const TypeRasterReport report =
+          type_rasterize(type.text, static_cast<size_t>(type.text_length), style, type.origin_x,
+                         type.origin_y, bounds.x, bounds.y, target_layer->pixels.width,
+                         target_layer->pixels.height, &raster);
+      if (report.status == TypeRasterStatus::kBadText ||
+          report.status == TypeRasterStatus::kTooLong ||
+          report.status == TypeRasterStatus::kBadStyle) {
+        ok = bad_arg(report.message);
+        break;
+      }
+      if (report.status == TypeRasterStatus::kEmpty) {
+        /* 文本框完全落在图层之外：成功但无像素要改，不记撤销步（与形状同口径）。 */
+        noop = true;
+        if (note != nullptr) {
+          *note += "type box does not intersect the layer (no pixels changed); ";
+        }
+        break;
+      }
+
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const size_t stride_bytes = target_layer->pixels.stride();
+      const double opacity = static_cast<double>(type.opacity);
+      bool painted = false;
+      for (int32_t y = 0; y < raster.h; ++y) {
+        const int32_t local_y = raster.y + y;
+        uint8_t* row = pixels + static_cast<size_t>(local_y) * stride_bytes;
+        for (int32_t x = 0; x < raster.w; ++x) {
+          const uint8_t coverage =
+              raster.coverage[static_cast<size_t>(y) * static_cast<size_t>(raster.w) +
+                              static_cast<size_t>(x)];
+          if (coverage == 0) continue;
+          const int32_t local_x = raster.x + x;
+          double weight = (static_cast<double>(coverage) / 255.0) * opacity;
+          if (masked) {
+            const int32_t canvas_x = bounds.x + local_x;
+            const int32_t canvas_y = bounds.y + local_y;
+            if (canvas_x < 0 || canvas_y < 0 || canvas_x >= canvas_width ||
+                canvas_y >= canvas_height) {
+              continue; /* 画布外 = 选区之外：逐字节不动 */
+            }
+            weight *= static_cast<double>(
+                          selection_coverage[static_cast<size_t>(canvas_y) *
+                                                 static_cast<size_t>(canvas_width) +
+                                             static_cast<size_t>(canvas_x)]) /
+                      255.0;
+          }
+          if (weight <= 0.0) continue;
+          const double alpha = (static_cast<double>(type.color[3]) / 255.0) * weight;
+          if (alpha <= 0.0) continue;
+          painted = true;
+
+          uint8_t* pixel = row + static_cast<size_t>(local_x) * 4u;
+          const double inverse = 1.0 - alpha;
+          for (int c = 0; c < 3; ++c) {
+            /* 图层像素是**预乘** RGBA8：源色先乘 alpha 再按 source-over 叠加。 */
+            const double blended =
+                static_cast<double>(type.color[c]) * alpha + static_cast<double>(pixel[c]) * inverse;
+            const long value = std::lround(blended);
+            pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+          }
+          const long out_alpha =
+              std::lround(alpha * 255.0 + static_cast<double>(pixel[3]) * inverse);
+          pixel[3] =
+              static_cast<uint8_t>(out_alpha < 0 ? 0 : (out_alpha > 255 ? 255 : out_alpha));
+        }
+      }
+      /*
+       * 一个像素都没落墨（纯空格文本，或选区覆盖率全为 0）：成功但按 noop 整步撤回，
+       * 不记录空撤销步——与「文本框在图层外」同口径，宿主不该看到一步什么都没做的撤销。
+       */
+      if (!painted) {
+        noop = true;
+        if (note != nullptr) {
+          *note += "type ink covers no pixel (no pixels changed); ";
+        }
+        break;
+      }
+      if (masked && note != nullptr) {
+        *note += "type is masked by the active selection (coverage 0 pixels are unchanged); ";
       }
       break;
     }
