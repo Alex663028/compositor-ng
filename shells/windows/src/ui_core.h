@@ -242,6 +242,7 @@ enum class ToolId : int {
   Move,
   Marquee,
   Lasso,
+  Pen, /* 钢笔路径选区：点击落锚点、拖动拉控制柄 */
   Wand,
   Crop,
   Eyedropper,
@@ -270,6 +271,7 @@ inline const ToolInfo* tool_table(size_t* out_count) {
       {ToolId::Move, "Move/Transform", 'v'},
       {ToolId::Marquee, "Marquee", 'm'},
       {ToolId::Lasso, "Lasso", 'l'},
+      {ToolId::Pen, "Pen", 'p'},
       {ToolId::Wand, "Magic Wand", 'w'},
       {ToolId::Crop, "Crop", 'c'},
       {ToolId::Eyedropper, "Eyedropper", 'i'},
@@ -1070,6 +1072,193 @@ inline int step_selection_feather(int feather, int direction) {
   const int current = clamp_selection_feather(feather);
   const int step = current < 10 ? 1 : (current < 50 ? 5 : 10);
   return clamp_selection_feather(current + (direction > 0 ? step : -step));
+}
+
+/* ------------------------------------------------------------ 钢笔路径（S8） */
+
+/*
+ * 钢笔工具（P）：点击落锚点、按住拖动拉出对称控制柄，点第一个锚点闭合。
+ *
+ * 引擎 comp_selection_apply_path 收的是三次贝塞尔段，所以壳侧只维护锚点与
+ * **相对锚点**的控制柄（装配段时再加回去）。本层不分配内存：锚点数组由
+ * 调用方持有（壳里是 ShellState 的 std::vector），所有函数带容量参数。
+ *
+ * 段语义与引擎一致：选中路径按**闭合**子路径解释（钢笔选区总是闭合）。
+ */
+inline constexpr int kPenMaxAnchors = 2048;
+inline constexpr int kPenPreviewSamples = 12; /* 每段折线采样数（绘制预览用） */
+
+struct PenAnchor {
+  Point position{};   /* 文档坐标 */
+  Point handle_in{};  /* 入向控制柄，相对 position */
+  Point handle_out{}; /* 出向控制柄，相对 position */
+};
+
+struct PenSegment {
+  Point start{};
+  Point control1{};
+  Point control2{};
+  Point end{};
+};
+
+inline bool pen_can_append(int anchor_count) {
+  return anchor_count >= 0 && anchor_count < kPenMaxAnchors;
+}
+
+/* 追加一个直角锚点（无控制柄）；容量满时不改写、返回 false。 */
+inline bool pen_append_anchor(PenAnchor* anchors, int* anchor_count, Point position) {
+  if (anchors == nullptr || anchor_count == nullptr) return false;
+  if (!pen_can_append(*anchor_count)) return false;
+  PenAnchor& anchor = anchors[*anchor_count];
+  anchor.position = position;
+  anchor.handle_in = Point{0.0, 0.0};
+  anchor.handle_out = Point{0.0, 0.0};
+  ++(*anchor_count);
+  return true;
+}
+
+/*
+ * 拖动最后一个锚点的控制柄：pointer 是当前文档坐标。
+ * Photoshop 口径是**对称平滑点**：出向 = pointer - anchor，入向 = -出向。
+ */
+inline void pen_drag_handle(PenAnchor* anchors, int anchor_count, Point pointer) {
+  if (anchors == nullptr || anchor_count <= 0) return;
+  PenAnchor& anchor = anchors[anchor_count - 1];
+  anchor.handle_out = Point{pointer.x - anchor.position.x, pointer.y - anchor.position.y};
+  anchor.handle_in = Point{-anchor.handle_out.x, -anchor.handle_out.y};
+}
+
+/* 闭合判定：光标落在第一个锚点的 radius 文档半径内（至少要 2 个锚点才闭合）。 */
+inline bool pen_hits_first_anchor(const PenAnchor* anchors, int anchor_count, Point pointer,
+                                  double radius) {
+  if (anchors == nullptr || anchor_count < 2 || !(radius >= 0.0)) return false;
+  const double dx = pointer.x - anchors[0].position.x;
+  const double dy = pointer.y - anchors[0].position.y;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+/* 段数：闭合路径 n 个锚点 => n 段（含末锚点回首锚点的闭合段）；开放路径 => n-1 段。 */
+inline int pen_segment_count(int anchor_count, bool closed) {
+  if (anchor_count < 2) return 0;
+  return closed ? anchor_count : anchor_count - 1;
+}
+
+/*
+ * 取第 index 段的几何（index 允许等于 anchor_count-1 表示闭合段）。
+ * 越界返回全零段；供绘制预览时逐段取用，避免为整条路径开大缓冲。
+ */
+inline PenSegment pen_segment_at(const PenAnchor* anchors, int anchor_count, int index) {
+  PenSegment segment{};
+  if (anchors == nullptr || anchor_count < 2 || index < 0 || index >= anchor_count) {
+    return segment;
+  }
+  const PenAnchor& from = anchors[index];
+  const PenAnchor& to = anchors[(index + 1) % anchor_count];
+  segment.start = from.position;
+  segment.control1 =
+      Point{from.position.x + from.handle_out.x, from.position.y + from.handle_out.y};
+  segment.control2 = Point{to.position.x + to.handle_in.x, to.position.y + to.handle_in.y};
+  segment.end = to.position;
+  return segment;
+}
+
+/*
+ * 装配三次贝塞尔段。返回**总段数**（容量不足时只写前 capacity 段），
+ * 计数语义与 selection_boundary_segments 一致，调用方按返回值判断截断。
+ */
+inline int pen_build_segments(const PenAnchor* anchors, int anchor_count, bool closed,
+                              PenSegment* out, int capacity) {
+  const int total = pen_segment_count(anchor_count, closed);
+  if (anchors == nullptr || out == nullptr || capacity <= 0 || total <= 0) return total;
+  const int written = std::min(total, capacity);
+  for (int i = 0; i < written; ++i) {
+    out[i] = pen_segment_at(anchors, anchor_count, i);
+  }
+  return total;
+}
+
+inline Point pen_cubic_at(const PenSegment& segment, double t) {
+  const double u = 1.0 - t;
+  const double w0 = u * u * u;
+  const double w1 = 3.0 * u * u * t;
+  const double w2 = 3.0 * u * t * t;
+  const double w3 = t * t * t;
+  return Point{
+      segment.start.x * w0 + segment.control1.x * w1 + segment.control2.x * w2 +
+          segment.end.x * w3,
+      segment.start.y * w0 + segment.control1.y * w1 + segment.control2.y * w2 +
+          segment.end.y * w3};
+}
+
+/*
+ * 预览折线：每段等分采样（不含 t=0 的重复起点，首点单独写入），
+ * 闭合时把闭合段一起采样。返回**总点数**（容量不足时截断写入）。
+ */
+inline int pen_preview_polyline(const PenAnchor* anchors, int anchor_count, bool closed,
+                                Point* out, int capacity,
+                                int samples_per_segment = kPenPreviewSamples) {
+  const int segments = pen_segment_count(anchor_count, closed);
+  if (anchors == nullptr || out == nullptr || capacity <= 0 || segments <= 0) return 0;
+  if (samples_per_segment < 1) samples_per_segment = 1;
+
+  const int total = 1 + segments * samples_per_segment;
+  int written = 0;
+  if (written < capacity) out[written++] = anchors[0].position;
+  for (int i = 0; i < segments && written < capacity; ++i) {
+    const PenAnchor& from = anchors[i];
+    const PenAnchor& to = anchors[(i + 1) % anchor_count];
+    PenSegment segment{};
+    segment.start = from.position;
+    segment.control1 = Point{from.position.x + from.handle_out.x,
+                             from.position.y + from.handle_out.y};
+    segment.control2 = Point{to.position.x + to.handle_in.x, to.position.y + to.handle_in.y};
+    segment.end = to.position;
+    for (int sample = 1; sample <= samples_per_segment && written < capacity; ++sample) {
+      const double t = static_cast<double>(sample) / static_cast<double>(samples_per_segment);
+      out[written++] = pen_cubic_at(segment, t);
+    }
+  }
+  return total;
+}
+
+/* ------------------------------------------------------------ 魔棒取样窗口（S8） */
+
+/*
+ * 参考色邻域半径（0..512）：引擎按 (2r+1)×(2r+1) 窗口取均值当参考色再泛洪，
+ * 壳层只负责档位与状态栏。0 = 只取种子像素（S7 的行为）。
+ */
+inline constexpr int kMinWandRadius = 0;
+inline constexpr int kMaxWandRadius = 512;
+inline constexpr int kDefaultWandRadius = 0;
+
+inline int clamp_wand_radius(int value) {
+  if (value < kMinWandRadius) return kMinWandRadius;
+  if (value > kMaxWandRadius) return kMaxWandRadius;
+  return value;
+}
+
+/* 半径分档：0,1,2,4,8,16,32,64,128,256,512——每次按键跨一档，够粗也够细。 */
+inline int step_wand_radius(int radius, int direction) {
+  const int current = clamp_wand_radius(radius);
+  int next = current;
+  if (direction > 0) {
+    if (current < 1) {
+      next = 1;
+    } else if (current < 2) {
+      next = 2;
+    } else {
+      next = current * 2;
+    }
+  } else if (direction < 0) {
+    if (current <= 1) {
+      next = 0;
+    } else if (current <= 2) {
+      next = 1;
+    } else {
+      next = current / 2;
+    }
+  }
+  return clamp_wand_radius(next);
 }
 
 }  // namespace comp_ui

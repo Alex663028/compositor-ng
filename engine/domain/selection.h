@@ -119,6 +119,16 @@ bool selection_invert(SelectionState* selection, bool* changed);
  * 没有选区或显式空选区时无操作（changed = false）。 */
 bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, bool* changed);
 
+/*
+ * 把羽化半径**绝对设置**为 feather 像素（0..250）。
+ *
+ * 与 selection_modify(kSelectionFeather) 的 sqrt(f1² + f2²) 叠加明确区分：这里
+ * 是覆盖当前半径，不是「再加一层」。feather = 0 清除羽化。
+ * 只改半径、不动基础蒙版；没有选区或显式空选区时无操作（changed = false）。
+ * 越界返回 false（参数闸与 ABI 同口径）。
+ */
+bool selection_set_feather(SelectionState* selection, int32_t feather, bool* changed);
+
 /* 载入选区来源：0 = 图层像素（取其 alpha），1 = 图层蒙版。 */
 enum SelectionLoadSource {
   kSelectionLoadPixels = 0,

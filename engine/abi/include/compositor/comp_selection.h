@@ -128,6 +128,19 @@ COMP_API comp_result comp_selection_modify(comp_document document,
                                            int32_t amount,
                                            int32_t* out_changed);
 
+/*
+ * 绝对设置羽化半径（0..250 像素）。
+ *
+ * 与 comp_selection_modify(COMP_SELECTION_FEATHER) 的 sqrt(f1² + f2²) **叠加**
+ * 语义明确区分：本入口是**覆盖**——直接把当前选区的羽化半径设成 feather，
+ * 不做累积。feather = 0 清除羽化（有效 coverage 回到硬边蒙版）。
+ *
+ * 只改半径、不动基础蒙版；没有选区或显式空选区时无操作（out_changed = 0，
+ * 不产生撤销步）。feather 越界 -> COMP_ERR_INVALID_ARGUMENT（事务之前拒绝）。
+ */
+COMP_API comp_result comp_selection_set_feather(comp_document document, int32_t feather,
+                                                int32_t* out_changed);
+
 /* --------------------------------------------------------------- 查询 */
 
 /* 是否有选区：1 = 有（含显式空选区），0 = 无。 */

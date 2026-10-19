@@ -67,6 +67,10 @@
   `COMP_SELECTION_WAND_MERGED` 取整篇合成、`LAYER` 要求图层是 1:1 整数平移。
   选中 0 个时两条通路都遵守「无选中即不改变」（不写空蒙版、不清空既有选区）。
   语义与外壳手势见 README §6.17。
+- **S8 外壳补充**：`radius` 的 N×N 取样窗口有了外壳入口（魔棒激活时 `Alt+[` /
+  `Alt+]`，量程 0..512，状态栏显示 `(2r+1)×(2r+1)`）；绝对羽化用
+  `comp_selection_set_feather`（**覆盖**语义），与 `COMP_SELECTION_FEATHER` 的
+  `sqrt(cur² + r²)` **叠加**语义明确分工。见 README §6.18。
 
 ### 4.2 Stroke（`COMP_TOOL_STROKE`）
 
@@ -272,3 +276,7 @@ coverage 把样本盖回当前像素。
   家族的选区构造入口；`COMP_TOOL_SELECT` 的破坏性合同不变。基线 397 → **408 用例**
   （`test_selection` 7 + `test_ui_core` 4），壳自检 71 → **90 项**，6/6 PASS。
   见 README §6.17。
+- S8 追加（2026-10-18）：新增 `comp_selection_set_feather`（第 112 个导出 ABI，
+  **绝对**羽化；§4.1 末的 S8 补充），并把钢笔路径（`comp_selection_apply_path`）与
+  魔棒 N×N 窗口接进外壳；不新增 `comp_tool_apply` 算子。基线 408 → **414 用例**
+  （`test_selection` 3 + `test_ui_core` 3），壳自检 90 → **103 项**。见 README §6.18。

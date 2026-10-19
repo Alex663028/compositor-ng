@@ -196,6 +196,28 @@ comp_result comp_selection_modify(comp_document document, comp_selection_modify_
   COMP_ABI_CATCH(engine)
 }
 
+comp_result comp_selection_set_feather(comp_document document, int32_t feather,
+                                       int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (feather < 0 || feather > compositor::kMaxSelectionFeather) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "selection feather out of range");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Set Selection Feather");
+  bool changed = false;
+  if (!compositor::selection_set_feather(&doc->selection(), feather, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "selection set feather failed");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
 comp_result comp_selection_get_active(comp_document document, int32_t* out_active) {
   Document* doc = nullptr;
   Engine* engine = nullptr;

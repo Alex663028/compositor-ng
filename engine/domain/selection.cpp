@@ -932,6 +932,20 @@ bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, boo
   return true;
 }
 
+bool selection_set_feather(SelectionState* selection, int32_t feather, bool* changed) {
+  if (changed != nullptr) *changed = false;
+  if (selection == nullptr) return false;
+  if (feather < 0 || feather > kMaxSelectionFeather) return false;
+  /* 没有选区或显式空选区：羽化半径没有承载对象，无操作（与 modify 同闸）。 */
+  if (!selection->active || selection_is_empty(*selection)) return true;
+
+  const float next = static_cast<float>(feather);
+  if (next == selection->feather) return true; /* 等值短路：不产生撤销步 */
+  selection->feather = next;
+  if (changed != nullptr) *changed = true;
+  return true;
+}
+
 /* ------------------------------------------------------------ 载入 / 平移 */
 
 /*

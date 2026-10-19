@@ -77,9 +77,22 @@
 [OK] comp_selection_apply_wand(tolerance=256) rejected
 [OK] comp_selection_apply_shape(rect) before the no-match wand probe
 [OK] wand with no matching pixel keeps the old selection and adds no undo step
-[OK] shape + comp_selection_modify(FEATHER) yields feather 4 px
+[OK] shape + comp_selection_set_feather(4) yields feather 4 px
 [OK] shape + feather commit as ONE undo step (finish_new_selection contract)
 [OK] undoing the feathered selection restores the unfeathered previous selection
+[OK] comp_selection_set_feather(8) sets the absolute feather
+[OK] setting the same feather twice is a no-op
+[OK] comp_selection_set_feather(251) rejected before any transaction
+[OK] comp_selection_set_feather(0) clears the feather
+[OK] undoing the feather reset restores 8 px
+[OK] undoing the absolute feather step restores the previous selection
+[OK] wand radius 0 selects the black half from the boundary seed
+[OK] wand radius 1 averages the window, finds no match, and keeps the selection
+[OK] comp_document_undo(wand radius selection step)
+[OK] pen path commits a closed selection through comp_selection_apply_path
+[OK] pen path selection is exactly one undo step
+[OK] pen preview polyline closes back onto the first anchor
+[OK] comp_document_undo(pen path selection step)
 [OK] comp_layer_remove(wand fixture) keeps later flatten assertions honest
 [OK] deselect after the S7 probes restores the S6 precondition
 [OK] ui_core tool_shortcut_target(E) toggles brush/eraser

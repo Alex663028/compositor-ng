@@ -136,6 +136,16 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   基线 397 → **408 用例**，Windows 壳自检 71 → **90 项**；口径 B 保持 **28/48 ≈ 58%**
   （S7 补的是已计数的「选区几何」条目内的 Marquee/Lasso/Magic Wand 子项，未凑整抬高条数）。
   详见 §6.17。
+  2026-10-18 第十八轮（S8 选区工具收尾：钢笔贝塞尔 / 绝对羽化 / 魔棒取样窗口）：
+  新增 `comp_selection_set_feather`（第 112 个导出 ABI，**绝对覆盖**语义；S7 的
+  `COMP_SELECTION_FEATHER` 仍是 `sqrt` 叠加，两者不混用），并复用它修掉一个 S7 缺陷——
+  魔棒点空（0 匹配）时不再因为默认羽化而改写既有选区；`ui_core` 补锚点/贝塞尔段/
+  预览折线数学与魔棒半径步进（0/1/2/4…512）；Windows 壳接上 `P` 钢笔（点击落锚点、
+  拖动拉对称控制柄、点首锚点或 `Enter` 闭合提交为 `COMP_SELECTION_PATH`、`Esc` 取消、
+  `Shift`/`Alt` 加/减选、切工具自动放弃未提交路径）与 `Alt+[` / `Alt+]` 魔棒
+  N×N 取样窗口（0 = 只取种子像素，状态栏显示 `(2r+1)×(2r+1)`）。基线 408 →
+  **414 用例**，Windows 壳自检 90 → **103 项**；口径 B 保持 **28/48 ≈ 58%**
+  （钢笔是既有选区几何的可视化入口，不新增计分项）。详见 §6.18。
 
 ## 1. M1 目标与范围
 
@@ -390,7 +400,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 87（38 个 `.c` + 49 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 408 cases, 0 failed, 0 check failures`（当前基线；§6.17 起） |
+| 测试 | `summary: 414 cases, 0 failed, 0 check failures`（当前基线；§6.18 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：49 `.cpp` / 38 `.c`（含 vendored 26）/ 87 `.h`（含 vendored）；tests：34 `.cpp` |
 
@@ -1411,7 +1421,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
-| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **111 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比 |
@@ -2349,6 +2359,80 @@ ABI 与 UI 两侧都没有通路（S6 报告 §9 的 follow-up）。S7 补这一
 选区工具仍受引擎的 RGBA8 / 1:1 约束，其它图层给明确失败提示而非降级。
 
 报告：`../report/S7-selection-tools-20261018-dsh.md`。
+
+### 6.18 S8 选区工具收尾：钢笔贝塞尔 / 绝对羽化 / 魔棒取样窗口（2026-10-18，DSH）
+
+S7 把 Marquee / Lasso / Wand 接进了外壳，但留了三处「ABI 有、UI 没有」或「口径别着」的
+缺口（S7 报告 §5 的 1–3 项）。S8 按该顺序补齐，并**只补缺口**：不改 S7 已冻结的
+`modify(FEATHER)` 叠加语义，也不改魔棒命中算法。
+
+**1. 新 ABI：`comp_selection_set_feather`（第 112 个导出符号）。** 入参
+`(document, feather, out_changed)`，`feather` 量程 0..250 px。它就是 S7 缺的
+「绝对设置羽化」入口：
+
+- **覆盖 vs 叠加**：`comp_selection_modify(COMP_SELECTION_FEATHER, r)` 保持
+  `sqrt(cur² + r²)` 叠加（S7 已冻结、有测试），本入口是把羽化**设为**给定值；
+  两者互不复用，文档与状态栏都写明是绝对值。
+- `feather == 0` = 清除羽化（有效 coverage 逐字节回到硬边蒙版）；
+- 无活动选区 / 空选区时是 no-op（`COMP_OK` + `changed = 0`），不产生撤销步；
+- 等值设置短路（`changed = 0`）；量程闸在 `ImplicitTxn` 之前，非法值
+  `COMP_ERR_INVALID_ARGUMENT` 且不写 `out_changed`；
+- 只改羽化半径、不重算基础蒙版：与 `modify(FEATHER)` 同一套半径语义。
+
+**2. 修掉 S7 的一个真实缺陷。** S7 的 `finish_new_selection` 对新选区无条件调
+`comp_selection_modify(FEATHER, shell.selection_feather)`。当魔棒点空（0 匹配、
+既有选区原样保留）且默认羽化 > 0 时，这一步会**改写既有选区的羽化**——用户什么都没
+选中却改了选区。S8 改成：仅当 `changed != 0` 且羽化 > 0 时才调
+`comp_selection_set_feather`（绝对值，不再叠加）。
+
+**3. 钢笔工具（`P`）。** `ui_core.h` 新增与平台无关的路径数学：
+`PenAnchor{position, handle_in, handle_out}`、`PenSegment{start, control1, control2, end}`、
+`pen_append_anchor` / `pen_drag_handle`（对称平滑点：`out = pointer - anchor`，
+`in = -out`）/ `pen_segment_count`（闭合 n 段、开放 n−1 段）/ `pen_build_segments`
+（返回总段数、容量不足只写前 capacity 段）/ `pen_segment_at` / `pen_cubic_at` /
+`pen_preview_polyline` / `pen_hits_first_anchor`，上限 `kPenMaxAnchors = 2048`。
+外壳手势：
+
+- 点击落锚点（上限即上表的 2048），按住拖动拉出对称控制柄，松开结束；
+- 点首锚点（屏幕约 6 px 命中圈，按缩放换算）/ `Enter` 提交为
+  `comp_selection_apply_path`（第一个 cubic `new_subpath = 1`，其余接续），
+  钢笔选区**总按闭合子路径**解释——这是选区语义，不是图形路径语义；
+- `Esc` 只取消未提交路径（不关窗），切走工具 / 新建 / 打开文档也会放弃路径；
+- `Shift` = 加选、`Alt` = 减选，与框选/套索同一套修饰键；提交仍走
+  `finish_new_selection`，所以「路径 + 羽化」也是一步撤销；
+- 画布预览：每段按 12 点采样画折线、虚线提示闭合边、锚点方块 + 控制柄线（逐段取
+  几何，不给 2048 锚点的整条路径开大缓冲）。
+
+**4. 魔棒 N×N 取样窗口（`Alt+[` / `Alt+]`）。** 引擎侧 `apply_wand` 的 `radius` 早已
+支持 0..512，缺的只是外壳入口。`ui_core` 补 `clamp_wand_radius` / `step_wand_radius`
+（0, 1, 2, 4, 8 … 512 倍增/减半），`wand_click` 不再硬编码 `radius = 0`，
+`Alt+[` / `Alt+]` 在魔棒激活时调窗口，状态栏显示 `(2r+1)×(2r+1)`。参考色是
+**裁剪到画布/取样面内的 `(2r+1)²` 窗口像素均值**（含 alpha 的取整平均），
+`radius = 0` 即 S7 的单像素行为。
+
+**5. 测试。** 新增 6 例：`test_selection` 3 例（`set_feather` 绝对值覆盖 vs `modify`
+叠加、等值短路、清除后 coverage 逐字节回硬边、撤销链 0→12→30；无选区/非法量程/
+不写 `out_changed`/取消选区后 no-op；魔棒半径 0 与 1 的参考窗口差异、半径 1 容差 0
+的 0 匹配保留旧选区）、`test_ui_core` 3 例（工具表 18 项 + `p`/`pen_index`、锚点
+上限/对称控制柄/段数/容量截断/首锚点命中、闭合预览折线、曲线中点离开弦、魔棒半径步进）。
+基线 408 → **414 用例**。
+
+**6. 自检。** `--selftest` 新增/改写 13 项：形状 + `set_feather` 同事务 = 一步撤销、
+绝对设置 8 / 等值 no-op / 251 越界 / 0 清除 / 撤销回 8、魔棒半径 0 与半径 1 的
+边界种子行为、钢笔路径闭合选区 + 单步撤销 + 预览折线闭合回首锚点。90 → **103 项**，
+`compositor_shell_selftest.txt` 同步重新生成（SHA256 `620f02c6b837b1ca…`）。
+
+**7. 验证与边界。** `scripts/build.py` → **414 cases, 0 failed, 0 check failures**；
+`build_windows_shell.py` + `compositor_shell.exe --selftest` → `failures = 0`、
+`[PASS]`、103 项 OK、SHA256 与仓内基线一致。仍然**没有经过人手实测**：无窗口环境下
+只验证到 ABI、`ui_core` 数学层与自检驱动序列。明确边界：钢笔不做锚点编辑（选中/移动/
+删除已落锚点）、控制柄不与相邻锚点联动锁定、路径只提交为选区（不成为可复用矢量对象）；
+魔棒窗口均值取整后再比，不是逐通道浮点平均；`MERGED` 每次点击仍整篇合成一次
+（大文档缓存留待后续）；`comp_selection_set_feather` 只改半径、不重跑基础蒙版。
+S7 报告 §5 剩余项（Shape / Gradient / Type 内核、MERGED 合成缓存、格式导入策略等）
+不在本轮范围。
+
+报告：`../report/S8-selection-polish-20261018-dsh.md`。
 
 ## 7. 许可
 

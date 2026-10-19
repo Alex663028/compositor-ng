@@ -241,7 +241,7 @@ COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
 COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
   size_t count = 0;
   comp_ui::tool_table(&count);
-  COMP_CHECK(count == 17);
+  COMP_CHECK(count == 18);
   COMP_CHECK(static_cast<int>(ToolId::Count) == static_cast<int>(count));
 
   /* 逐条对齐上游 KeyboardShortcuts.swift 的工具默认键。 */
@@ -256,7 +256,7 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
                   {'u', ToolId::Shape},      {'i', ToolId::Eyedropper},
                   {'m', ToolId::Marquee},    {'w', ToolId::Wand},
                   {'l', ToolId::Lasso},      {'r', ToolId::Retouch},
-                  {'c', ToolId::Crop}};
+                  {'c', ToolId::Crop},       {'p', ToolId::Pen}};
   COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == count);
   for (const auto& entry : expected) {
     COMP_CHECK_MSG(comp_ui::tool_for_shortcut(entry.key) == entry.id,
@@ -283,8 +283,10 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
   COMP_CHECK(comp_ui::tool_info_at(static_cast<int>(count)) == nullptr);
 
   /* 工具名与枚举的往返查询。 */
-  COMP_CHECK(comp_ui::tool_index(ToolId::Clone) == 10);
+  COMP_CHECK(comp_ui::tool_index(ToolId::Clone) == 11);
+  COMP_CHECK(comp_ui::tool_index(ToolId::Pen) == 4);
   COMP_CHECK(std::string(comp_ui::tool_info(ToolId::Clone)->name) == "Clone Stamp");
+  COMP_CHECK(std::string(comp_ui::tool_info(ToolId::Pen)->name) == "Pen");
 }
 
 COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
@@ -876,4 +878,112 @@ COMP_TEST(ui_core_selection_feather_steps_are_clamped) {
   COMP_CHECK(comp_ui::step_selection_feather(50, 1) == 60);
   COMP_CHECK(comp_ui::step_selection_feather(250, 1) == 250);
   COMP_CHECK(comp_ui::step_selection_feather(250, -1) == 240);
+}
+
+/* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
+
+COMP_TEST(ui_core_pen_anchors_build_symmetric_segments) {
+  /* 容量语义：只受 kPenMaxAnchors 约束，负数/越界都不得写入。 */
+  COMP_CHECK(comp_ui::pen_can_append(0));
+  COMP_CHECK(comp_ui::pen_can_append(comp_ui::kPenMaxAnchors - 1));
+  COMP_CHECK(!comp_ui::pen_can_append(comp_ui::kPenMaxAnchors));
+  COMP_CHECK(!comp_ui::pen_can_append(-1));
+
+  comp_ui::PenAnchor anchors[8] = {};
+  int count = 0;
+  COMP_CHECK(comp_ui::pen_append_anchor(anchors, &count,
+                                        comp_ui::Point{0.0, 0.0}));
+  COMP_CHECK(comp_ui::pen_append_anchor(anchors, &count,
+                                        comp_ui::Point{100.0, 0.0}));
+  COMP_CHECK(comp_ui::pen_append_anchor(anchors, &count,
+                                        comp_ui::Point{100.0, 100.0}));
+  COMP_CHECK(count == 3);
+  /* 直角锚点：控制柄为零，段就是直线。 */
+  COMP_CHECK(same_point(anchors[0].handle_in, comp_ui::Point{0.0, 0.0}));
+  COMP_CHECK(same_point(anchors[0].handle_out, comp_ui::Point{0.0, 0.0}));
+
+  /* 拖动最后一个锚点 = 对称平滑点：出向 = pointer - anchor，入向取反。 */
+  comp_ui::pen_drag_handle(anchors, count, comp_ui::Point{110.0, 110.0});
+  COMP_CHECK(same_point(anchors[2].handle_out, comp_ui::Point{10.0, 10.0}));
+  COMP_CHECK(same_point(anchors[2].handle_in, comp_ui::Point{-10.0, -10.0}));
+  /* 其它锚点不受影响。 */
+  COMP_CHECK(same_point(anchors[0].handle_out, comp_ui::Point{0.0, 0.0}));
+
+  /* 段数：闭合 n 段（含闭合段），开放 n-1 段，少于 2 个锚点没有段。 */
+  COMP_CHECK(comp_ui::pen_segment_count(3, /*closed=*/true) == 3);
+  COMP_CHECK(comp_ui::pen_segment_count(3, /*closed=*/false) == 2);
+  COMP_CHECK(comp_ui::pen_segment_count(1, /*closed=*/true) == 0);
+  COMP_CHECK(comp_ui::pen_segment_count(0, /*closed=*/false) == 0);
+
+  comp_ui::PenSegment segments[8] = {};
+  COMP_CHECK(comp_ui::pen_build_segments(anchors, 3, /*closed=*/true, segments, 8) == 3);
+  COMP_CHECK(same_point(segments[0].start, comp_ui::Point{0.0, 0.0}));
+  COMP_CHECK(same_point(segments[0].end, comp_ui::Point{100.0, 0.0}));
+  /* 闭合段：末锚点回到首锚点，控制柄按各自相对量加回去。 */
+  COMP_CHECK(same_point(segments[2].start, comp_ui::Point{100.0, 100.0}));
+  COMP_CHECK(same_point(segments[2].control1, comp_ui::Point{110.0, 110.0}));
+  COMP_CHECK(same_point(segments[2].end, comp_ui::Point{0.0, 0.0}));
+  /* 容量截断：返回总段数，只写前 capacity 段。 */
+  COMP_CHECK(comp_ui::pen_build_segments(anchors, 3, /*closed=*/true, segments, 2) == 3);
+  /* 逐段取几何与整条装配一致；越界返回全零段。 */
+  const comp_ui::PenSegment single = comp_ui::pen_segment_at(anchors, 3, 2);
+  COMP_CHECK(same_point(single.start, comp_ui::Point{100.0, 100.0}));
+  const comp_ui::PenSegment out_of_range = comp_ui::pen_segment_at(anchors, 3, 9);
+  COMP_CHECK(same_point(out_of_range.start, comp_ui::Point{0.0, 0.0}));
+
+  /* 首锚点闭合命中：2 个锚点起才允许闭合，半径按文档距离判。 */
+  COMP_CHECK(!comp_ui::pen_hits_first_anchor(anchors, 1, comp_ui::Point{1.0, 1.0}, 5.0));
+  COMP_CHECK(comp_ui::pen_hits_first_anchor(anchors, 3, comp_ui::Point{2.0, 2.0}, 5.0));
+  COMP_CHECK(!comp_ui::pen_hits_first_anchor(anchors, 3, comp_ui::Point{20.0, 0.0}, 5.0));
+  COMP_CHECK(!comp_ui::pen_hits_first_anchor(anchors, 3, comp_ui::Point{2.0, 2.0}, -1.0));
+}
+
+COMP_TEST(ui_core_pen_preview_samples_the_curve_not_the_chord) {
+  comp_ui::PenAnchor anchors[2] = {};
+  int count = 0;
+  comp_ui::pen_append_anchor(anchors, &count, comp_ui::Point{0.0, 0.0});
+  comp_ui::pen_append_anchor(anchors, &count, comp_ui::Point{100.0, 0.0});
+  /* 拖动第二个锚点：出向 (0, 50) 意味着曲线先往下再回到锚点。 */
+  comp_ui::pen_drag_handle(anchors, count, comp_ui::Point{100.0, 50.0});
+  COMP_CHECK(same_point(anchors[1].handle_out, comp_ui::Point{0.0, 50.0}));
+  COMP_CHECK(same_point(anchors[1].handle_in, comp_ui::Point{0.0, -50.0}));
+
+  const comp_ui::PenSegment segment = comp_ui::pen_segment_at(anchors, 2, 0);
+  /* 直线段中点是 (50, 0)；有控制柄后中点必须离开弦（y = -18.75）： */
+  const comp_ui::Point mid = comp_ui::pen_cubic_at(segment, 0.5);
+  COMP_CHECK(same_point(mid, comp_ui::Point{50.0, -18.75}));
+
+  comp_ui::Point polyline[64] = {};
+  const int total = comp_ui::pen_preview_polyline(anchors, 2, /*closed=*/false, polyline, 64,
+                                                  /*samples_per_segment=*/4);
+  COMP_CHECK(total == 1 + 1 * 4);
+  COMP_CHECK(same_point(polyline[0], comp_ui::Point{0.0, 0.0}));
+  COMP_CHECK(same_point(polyline[4], comp_ui::Point{100.0, 0.0}));
+  /* 曲线中间的采样点确实离开了弦。 */
+  COMP_CHECK(polyline[2].y < -5.0);
+
+  /* 闭合路径的预览会走回首锚点，并多出闭合段。 */
+  const int closed_total = comp_ui::pen_preview_polyline(anchors, 2, /*closed=*/true, polyline,
+                                                         64, /*samples_per_segment=*/4);
+  COMP_CHECK(closed_total == 1 + 2 * 4);
+  COMP_CHECK(same_point(polyline[closed_total - 1], anchors[0].position));
+  /* 容量不足：返回总点数，只写容量内的点。 */
+  comp_ui::Point small[3] = {};
+  COMP_CHECK(comp_ui::pen_preview_polyline(anchors, 2, /*closed=*/false, small, 3, 4) == 5);
+}
+
+COMP_TEST(ui_core_wand_radius_steps_are_clamped) {
+  COMP_CHECK(comp_ui::kDefaultWandRadius == 0);
+  COMP_CHECK(comp_ui::kMaxWandRadius == 512);
+  COMP_CHECK(comp_ui::clamp_wand_radius(-5) == 0);
+  COMP_CHECK(comp_ui::clamp_wand_radius(999) == 512);
+  COMP_CHECK(comp_ui::step_wand_radius(0, -1) == 0);
+  COMP_CHECK(comp_ui::step_wand_radius(0, 1) == 1);
+  COMP_CHECK(comp_ui::step_wand_radius(1, 1) == 2);
+  COMP_CHECK(comp_ui::step_wand_radius(2, 1) == 4);
+  COMP_CHECK(comp_ui::step_wand_radius(256, 1) == 512);
+  COMP_CHECK(comp_ui::step_wand_radius(512, 1) == 512);
+  COMP_CHECK(comp_ui::step_wand_radius(512, -1) == 256);
+  COMP_CHECK(comp_ui::step_wand_radius(2, -1) == 1);
+  COMP_CHECK(comp_ui::step_wand_radius(1, -1) == 0);
 }

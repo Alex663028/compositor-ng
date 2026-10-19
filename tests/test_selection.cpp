@@ -1185,3 +1185,124 @@ COMP_TEST(selection_wand_rejects_bad_arguments) {
   /* 所有失败都不得动选区。 */
   COMP_CHECK(active_of(fixture.document) == 0);
 }
+
+/* ============================================ S8: 绝对羽化 / 魔棒取样窗口 */
+
+COMP_TEST(selection_set_feather_is_absolute_not_additive) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8.0f, 8.0f, 40.0f, 32.0f, COMP_SELECTION_REPLACE,
+                  &changed) == COMP_OK &&
+             changed == 1);
+  const std::vector<uint8_t> hard_edges = coverage(fixture.document);
+  COMP_CHECK(feather_of(fixture.document) < 0.01f);
+  const size_t depth_after_rect = undo_depth_of(fixture.document);
+
+  /* modify(FEATHER) 是叠加：从 0 起算得到 30。 */
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 30, &changed) ==
+                 COMP_OK &&
+             changed == 1);
+  COMP_CHECK(std::fabs(feather_of(fixture.document) - 30.0f) < 0.01f);
+  const size_t depth_after_modify = undo_depth_of(fixture.document);
+  COMP_CHECK(depth_after_modify == depth_after_rect + 1);
+
+  /* 绝对设置 12：是覆盖，不是 sqrt(30² + 12²) ≈ 32.31。 */
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 12, &changed) == COMP_OK &&
+             changed == 1);
+  COMP_CHECK(std::fabs(feather_of(fixture.document) - 12.0f) < 0.01f);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth_after_modify + 1);
+  const std::vector<uint8_t> soft_12 = coverage(fixture.document);
+  COMP_CHECK(soft_12 != hard_edges);
+  bool has_partial = false;
+  for (uint8_t value : soft_12) {
+    if (value > 0 && value < 255) {
+      has_partial = true;
+      break;
+    }
+  }
+  COMP_CHECK_MSG(has_partial, "feather 12 must produce a soft edge, not a hard rectangle");
+
+  /* 等值设回 12：无变化、无撤销步。 */
+  changed = 99;
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 12, &changed) == COMP_OK &&
+             changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth_after_modify + 1);
+
+  /* 0 = 清除羽化：有效 coverage 必须逐字节回到硬边蒙版。 */
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 0, &changed) == COMP_OK &&
+             changed == 1);
+  COMP_CHECK(feather_of(fixture.document) < 0.01f);
+  COMP_CHECK(coverage(fixture.document) == hard_edges);
+
+  /* 撤销链：0 -> 12 -> 30（set_feather 与 modify 各自一步）。 */
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(std::fabs(feather_of(fixture.document) - 12.0f) < 0.01f);
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(std::fabs(feather_of(fixture.document) - 30.0f) < 0.01f);
+}
+
+COMP_TEST(selection_set_feather_rejects_bad_input_and_no_selection) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  /* 没有选区：成功但无变化，也不产生撤销步。 */
+  int32_t changed = 99;
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 8, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == 0);
+  COMP_CHECK(active_of(fixture.document) == 0);
+
+  /* 量程闸在事务之前：非法值返回 INVALID_ARGUMENT 且不写 out_changed。 */
+  changed = 7;
+  COMP_CHECK(comp_selection_set_feather(fixture.document, -1, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 251, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(changed == 7);
+  COMP_CHECK(undo_depth_of(fixture.document) == 0);
+
+  /* 显式取消选区（无活动选区）同样无操作，也不产生撤销步。 */
+  COMP_CHECK(comp_selection_deselect(fixture.document, &changed) == COMP_OK);
+  COMP_CHECK(active_of(fixture.document) == 0);
+  const size_t depth_after_empty = undo_depth_of(fixture.document);
+  changed = 5;
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 40, &changed) == COMP_OK &&
+             changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth_after_empty);
+}
+
+COMP_TEST(selection_wand_radius_averages_the_reference_window) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = ramp_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  /* 半径 0：参考色 = 种子像素 0，容差 16 只匹配灰色 0 的那一列。 */
+  int32_t changed = -1;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 16, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK &&
+             changed == 1);
+  comp_rect bounds{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.w == 1);
+
+  /* 半径 1：参考色是 2×2 窗口均值 (0+32)/2 = 16，容差 16 同时吃到 0 与 32 两列。 */
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 16, 1, 1,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK &&
+             changed == 1);
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK_MSG(bounds.w == 2, "radius 1 averages the reference over the sampling window");
+
+  /* 半径 1 + 容差 0：参考色 16 与任何像素都不等 -> 0 匹配，保留旧选区且不加撤销步。 */
+  const size_t depth_before = undo_depth_of(fixture.document);
+  changed = 99;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 1,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth_before);
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.w == 2);
+}

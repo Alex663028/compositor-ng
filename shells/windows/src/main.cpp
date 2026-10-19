@@ -185,9 +185,17 @@ struct ShellState {
   int wand_tolerance = comp_ui::kDefaultWandTolerance;
   bool wand_contiguous = true;
   bool wand_merged = false;
+  /* 魔棒取样窗口半径（S8）：Alt+[ / Alt+] 调，0 = 只取种子像素（S7 行为）。 */
+  int wand_radius = comp_ui::kDefaultWandRadius;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
+  /*
+   * 钢笔路径（S8）：锚点与控制柄都在文档坐标；pen_dragging = 按下后正在拖
+   * 最后一个锚点的控制柄。路径本身不产生撤销步，Enter/点首锚点才提交选区。
+   */
+  std::vector<comp_ui::PenAnchor> pen_anchors;
+  bool pen_dragging = false;
   /* 鼠标是否停在画布上（决定画不画笔尖轮廓），客户区坐标。 */
   bool cursor_valid = false;
   bool tracking_leave = false;
@@ -1075,11 +1083,13 @@ void finish_new_selection(ShellState& shell, const char* label, const wchar_t* o
   }
   int32_t changed = 0;
   comp_result result = apply(&changed);
-  /* 新选区羽化只作用于本次新建的选区（形状先 reset feather，再叠加一次即精确 r）。 */
-  if (result == COMP_OK && shell.selection_feather > 0) {
+  /* 新选区羽化只作用于**本次真正新建**的选区：形状/路径/魔棒把 feather 归零后
+   * 再用 comp_selection_set_feather 按绝对值设一次（S8 新增的覆盖语义入口）。
+   * changed == 0 表示这次点击什么都没选中（例如魔棒没匹配），此时绝不能去动
+   * 用户已有选区的羽化——那会把「点空处」变成一次羽化修改。 */
+  if (result == COMP_OK && changed != 0 && shell.selection_feather > 0) {
     int32_t feathered = 0;
-    result = comp_selection_modify(shell.document, COMP_SELECTION_FEATHER,
-                                   shell.selection_feather, &feathered);
+    result = comp_selection_set_feather(shell.document, shell.selection_feather, &feathered);
     if (result == COMP_OK && feathered != 0) changed = 1;
   }
   if (result != COMP_OK) {
@@ -1118,9 +1128,9 @@ void begin_feather_input(ShellState& shell) {
 }
 
 /*
- * 回车：写进「新选区羽化」默认值。若已有选区，立即按引擎的 modify(FEATHER)
- * 语义叠加一次（引擎的羽化是 sqrt(current² + requested²) 的**叠加**，不是绝对值
- * 覆盖——ABI 没有「设置羽化」的入口，这里如实呈现，不假装是覆盖）。
+ * 回车：写进「新选区羽化」默认值。若已有选区，用 S8 的
+ * comp_selection_set_feather 按**绝对值覆盖**当前选区的羽化（不是叠加）——
+ * 与新选区提交时同一口径：键入几次都只会得到键入的那个半径，0 即清除羽化。
  */
 void commit_feather_input(ShellState& shell) {
   const int value =
@@ -1129,18 +1139,23 @@ void commit_feather_input(ShellState& shell) {
   shell.selection_feather = value;
 
   wchar_t buffer[224];
-  if (shell.document == nullptr || !shell.selection_active || value <= 0) {
+  if (shell.document == nullptr || !shell.selection_active) {
     wsprintfW(buffer, L"新选区羽化：%d px（对之后新建的选区生效）", value);
     set_status(shell, buffer);
     return;
   }
   int32_t changed = 0;
-  if (comp_selection_modify(shell.document, COMP_SELECTION_FEATHER, value, &changed) != COMP_OK) {
+  if (comp_selection_set_feather(shell.document, value, &changed) != COMP_OK) {
     set_status(shell, L"羽化失败：当前选区不支持羽化");
     return;
   }
   refresh_selection(shell);
-  wsprintfW(buffer, L"已对当前选区叠加羽化 %d px（引擎羽化为叠加语义）", value);
+  if (changed == 0) {
+    wsprintfW(buffer, L"当前选区羽化已是 %d px（无变化）", value);
+    refresh_history_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已把当前选区羽化设为 %d px（绝对值）", value);
   refresh_history_status(shell, buffer);
 }
 
@@ -1246,8 +1261,142 @@ void wand_click(HWND window, ShellState& shell, int x, int y, const Layout& layo
                        fail_text, [&](int32_t* changed) {
                          return comp_selection_apply_wand(
                              shell.document, id, source, doc.x, doc.y, shell.wand_tolerance,
-                             shell.wand_contiguous ? 1 : 0, /*radius=*/0, combine, changed);
+                             shell.wand_contiguous ? 1 : 0, shell.wand_radius, combine,
+                             changed);
                        });
+}
+
+/* ------------------------------------------------------------ 钢笔（S8） */
+
+bool pen_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Pen;
+}
+
+/* 闭合命中半径：屏幕上约 6 px，换算成文档半径，缩放变化不影响手感。 */
+double pen_close_radius(const ShellState& shell) {
+  const double zoom = shell.view.zoom > 1e-6 ? shell.view.zoom : 1.0;
+  return 6.0 / zoom;
+}
+
+void pen_refresh_status(ShellState& shell) {
+  wchar_t buffer[256];
+  wsprintfW(buffer,
+            L"钢笔：%d 个锚点（点击继续 / 拖动拉控制柄 / 点首锚点闭合 / Enter 完成 / Esc 取消）",
+            static_cast<int>(shell.pen_anchors.size()));
+  set_status(shell, buffer);
+}
+
+void pen_cancel_drag(ShellState& shell) { shell.pen_dragging = false; }
+
+void pen_cancel(ShellState& shell) {
+  const bool had_path = !shell.pen_anchors.empty();
+  shell.pen_anchors.clear();
+  shell.pen_dragging = false;
+  if (had_path) set_status(shell, L"钢笔：已取消当前路径");
+}
+
+/*
+ * 提交路径：把锚点 + 控制柄装配成 comp_selection_cubic 段，走
+ * comp_selection_apply_path（与套索/框选共用 finish_new_selection 的事务与
+ * 羽化口径）。钢笔选区总是闭合子路径——这是选区语义，不是图形路径语义。
+ */
+void commit_pen_path(ShellState& shell) {
+  if (shell.document == nullptr) return;
+  const int anchor_count = static_cast<int>(shell.pen_anchors.size());
+  if (anchor_count < 2) {
+    set_status(shell, L"钢笔：至少需要 2 个锚点才能闭合路径");
+    return;
+  }
+
+  const int segment_count = comp_ui::pen_segment_count(anchor_count, /*closed=*/true);
+  std::vector<comp_ui::PenSegment> segments(static_cast<size_t>(segment_count));
+  const int built = comp_ui::pen_build_segments(shell.pen_anchors.data(), anchor_count,
+                                                /*closed=*/true, segments.data(),
+                                                segment_count);
+  if (built <= 0) {
+    set_status(shell, L"钢笔失败：路径没有段");
+    return;
+  }
+  const int path_count = std::min(built, segment_count);
+  std::vector<comp_selection_cubic> cubics(static_cast<size_t>(path_count));
+  for (int i = 0; i < path_count; ++i) {
+    const comp_ui::PenSegment& source = segments[static_cast<size_t>(i)];
+    comp_selection_cubic& target = cubics[static_cast<size_t>(i)];
+    target.start[0] = static_cast<float>(source.start.x);
+    target.start[1] = static_cast<float>(source.start.y);
+    target.control1[0] = static_cast<float>(source.control1.x);
+    target.control1[1] = static_cast<float>(source.control1.y);
+    target.control2[0] = static_cast<float>(source.control2.x);
+    target.control2[1] = static_cast<float>(source.control2.y);
+    target.end[0] = static_cast<float>(source.end.x);
+    target.end[1] = static_cast<float>(source.end.y);
+    /* start 只在第一段（new_subpath = 1）有意义，其余段接着上一段的 end。 */
+    target.new_subpath = i == 0 ? 1 : 0;
+  }
+
+  comp_selection_combine combine = COMP_SELECTION_REPLACE;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+    combine = COMP_SELECTION_ADD;
+  } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+    combine = COMP_SELECTION_SUBTRACT;
+  }
+  const wchar_t* ok_text = combine == COMP_SELECTION_ADD ? L"钢笔：已加选"
+                           : combine == COMP_SELECTION_SUBTRACT ? L"钢笔：已减选"
+                                                                : L"钢笔：已应用闭合选区";
+
+  /* 先清状态再提交：路径已经变成选区参数，失败也不该留下半截预览。 */
+  shell.pen_anchors.clear();
+  shell.pen_dragging = false;
+  ReleaseCapture();
+  finish_new_selection(
+      shell, "Pen Selection", ok_text, L"钢笔：选区未变化", L"钢笔失败：路径无效",
+      [&](int32_t* changed) {
+        return comp_selection_apply_path(shell.document, cubics.data(), path_count, combine,
+                                         /*antialias=*/1, changed);
+      });
+}
+
+void pen_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!pen_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const int anchor_count = static_cast<int>(shell.pen_anchors.size());
+  /* 点第一个锚点 = 闭合（首锚点至少要有 2 个锚点才有闭合路径可言）。 */
+  if (comp_ui::pen_hits_first_anchor(shell.pen_anchors.data(), anchor_count, doc,
+                                     pen_close_radius(shell))) {
+    commit_pen_path(shell);
+    return;
+  }
+  const size_t index = static_cast<size_t>(anchor_count);
+  shell.pen_anchors.resize(index + 1u);
+  int next = anchor_count;
+  if (!comp_ui::pen_append_anchor(shell.pen_anchors.data(), &next, doc)) {
+    shell.pen_anchors.resize(index);
+    wchar_t buffer[160];
+    wsprintfW(buffer, L"钢笔：锚点数已达上限 %d", comp_ui::kPenMaxAnchors);
+    set_status(shell, buffer);
+    return;
+  }
+  shell.pen_anchors.resize(static_cast<size_t>(next));
+  /* 按住不放就进入「拖控制柄」状态；只点不拖时松开即得到直角锚点。 */
+  shell.pen_dragging = true;
+  SetCapture(window);
+  pen_refresh_status(shell);
+}
+
+void pen_drag(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.pen_dragging || shell.pen_anchors.empty()) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  comp_ui::pen_drag_handle(shell.pen_anchors.data(),
+                           static_cast<int>(shell.pen_anchors.size()), doc);
+}
+
+void pen_up(HWND window, ShellState& shell) {
+  if (!shell.pen_dragging) return;
+  shell.pen_dragging = false;
+  ReleaseCapture();
+  pen_refresh_status(shell);
 }
 
 /* ------------------------------------------------------------ 框选（Marquee） */
@@ -1720,6 +1869,8 @@ bool create_document(ShellState& shell) {
   move_cancel(shell);
   eyedropper_cancel(shell);
   marquee_cancel(shell);
+  lasso_cancel(shell);
+  pen_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
   refresh_history_status(shell, L"已新建文档");
@@ -1753,6 +1904,8 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   move_cancel(shell);
   eyedropper_cancel(shell);
   marquee_cancel(shell);
+  lasso_cancel(shell);
+  pen_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
   refresh_history_status(shell, L"已打开 .comp");
@@ -2471,6 +2624,103 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(trail);
   }
 
+  /*
+   * 钢笔预览（S8）：逐段采样折线 + 锚点方块 + 控制柄。闭合段用虚线提示
+   * 「提交时会闭合成选区」——引擎 apply_path 对子路径按闭合解释。
+   * 逐段取几何，避免给 2048 个锚点的整条路径开大缓冲。
+   */
+  if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
+    const int anchor_count = static_cast<int>(shell.pen_anchors.size());
+    const int segment_count = comp_ui::pen_segment_count(anchor_count, /*closed=*/false);
+    HPEN path_pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN handle_pen = CreatePen(PS_DOT, 1, RGB(80, 200, 255));
+    HGDIOBJ old_pen = SelectObject(dc, path_pen);
+
+    comp_ui::Point samples[comp_ui::kPenPreviewSamples + 1];
+    for (int i = 0; i < segment_count; ++i) {
+      const comp_ui::PenSegment segment =
+          comp_ui::pen_segment_at(shell.pen_anchors.data(), anchor_count, i);
+      samples[0] = segment.start;
+      for (int sample = 1; sample <= comp_ui::kPenPreviewSamples; ++sample) {
+        samples[sample] = comp_ui::pen_cubic_at(
+            segment, static_cast<double>(sample) / static_cast<double>(comp_ui::kPenPreviewSamples));
+      }
+      bool started = false;
+      for (int sample = 0; sample <= comp_ui::kPenPreviewSamples; ++sample) {
+        const comp_ui::Point screen =
+            shell.view.doc_to_screen(samples[sample].x, samples[sample].y, layout.canvas,
+                                     shell.width, shell.height);
+        const int px = static_cast<int>(std::lround(screen.x));
+        const int py = static_cast<int>(std::lround(screen.y));
+        if (!started) {
+          MoveToEx(dc, px, py, nullptr);
+          started = true;
+        } else {
+          LineTo(dc, px, py);
+        }
+      }
+    }
+
+    /* 未闭合时用虚线画出「会补上的闭合边」：2 个锚点起就有意义。 */
+    if (anchor_count >= 2) {
+      SelectObject(dc, handle_pen);
+      const comp_ui::PenSegment closing =
+          comp_ui::pen_segment_at(shell.pen_anchors.data(), anchor_count, anchor_count - 1);
+      bool started = false;
+      for (int sample = 0; sample <= comp_ui::kPenPreviewSamples; ++sample) {
+        const comp_ui::Point point =
+            sample == 0 ? closing.start
+                        : comp_ui::pen_cubic_at(
+                              closing, static_cast<double>(sample) /
+                                           static_cast<double>(comp_ui::kPenPreviewSamples));
+        const comp_ui::Point screen = shell.view.doc_to_screen(
+            point.x, point.y, layout.canvas, shell.width, shell.height);
+        const int px = static_cast<int>(std::lround(screen.x));
+        const int py = static_cast<int>(std::lround(screen.y));
+        if (!started) {
+          MoveToEx(dc, px, py, nullptr);
+          started = true;
+        } else {
+          LineTo(dc, px, py);
+        }
+      }
+    }
+
+    /* 锚点与控制柄：锚点是 7×7 白框黑心，控制柄用 1px 虚线连到端点。 */
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    SelectObject(dc, path_pen);
+    for (int i = 0; i < anchor_count; ++i) {
+      const comp_ui::PenAnchor& anchor = shell.pen_anchors[static_cast<size_t>(i)];
+      const comp_ui::Point center = shell.view.doc_to_screen(
+          anchor.position.x, anchor.position.y, layout.canvas, shell.width, shell.height);
+      const int cx = static_cast<int>(std::lround(center.x));
+      const int cy = static_cast<int>(std::lround(center.y));
+      Rectangle(dc, cx - 3, cy - 3, cx + 4, cy + 4);
+      SelectObject(dc, handle_pen);
+      if (anchor.handle_out.x != 0.0 || anchor.handle_out.y != 0.0) {
+        const comp_ui::Point handle = shell.view.doc_to_screen(
+            anchor.position.x + anchor.handle_out.x, anchor.position.y + anchor.handle_out.y,
+            layout.canvas, shell.width, shell.height);
+        MoveToEx(dc, cx, cy, nullptr);
+        LineTo(dc, static_cast<int>(std::lround(handle.x)),
+               static_cast<int>(std::lround(handle.y)));
+      }
+      if (anchor.handle_in.x != 0.0 || anchor.handle_in.y != 0.0) {
+        const comp_ui::Point handle = shell.view.doc_to_screen(
+            anchor.position.x + anchor.handle_in.x, anchor.position.y + anchor.handle_in.y,
+            layout.canvas, shell.width, shell.height);
+        MoveToEx(dc, cx, cy, nullptr);
+        LineTo(dc, static_cast<int>(std::lround(handle.x)),
+               static_cast<int>(std::lround(handle.y)));
+      }
+      SelectObject(dc, path_pen);
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(path_pen);
+    DeleteObject(handle_pen);
+  }
+
   /* 进行中的笔迹折线（文档像素 -> 屏幕）：落色用前景色，重绘用高对比度青。 */
   if (stroke_in_progress(shell) && shell.stroke_points.size() >= 4) {
     const COLORREF trail_color =
@@ -2626,6 +2876,10 @@ void present(HWND window, ShellState& shell) {
 /* ------------------------------------------------------------ 工具 / 视图 / 鼠标 */
 
 void set_tool(ShellState& shell, comp_ui::ToolId id) {
+  /* 离开钢笔工具 = 放弃未提交的路径（与切走套索/marquee 的取消口径一致）。 */
+  if (shell.tool == comp_ui::ToolId::Pen && id != comp_ui::ToolId::Pen) {
+    pen_cancel(shell);
+  }
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
@@ -2639,10 +2893,15 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   } else if (id == comp_ui::ToolId::Lasso) {
     wsprintfW(buffer, L"工具：Lasso（拖出自由选区；Shift 加选 / Alt 减选；羽化 %d px）",
               shell.selection_feather);
+  } else if (id == comp_ui::ToolId::Pen) {
+    wsprintfW(buffer,
+              L"工具：Pen（点击落锚点，拖动拉控制柄；点首锚点闭合，Enter 完成，Esc 取消；羽化 %d px）",
+              shell.selection_feather);
   } else if (id == comp_ui::ToolId::Wand) {
     wsprintfW(buffer,
-              L"工具：Magic Wand（容差 %d，%s取样，%s；[ / ] 调容差，Shift+W 切来源）",
-              shell.wand_tolerance, shell.wand_merged ? L"合并" : L"当前图层",
+              L"工具：Magic Wand（容差 %d，窗口 %d×%d，%s取样，%s；[ / ] 调容差，Alt+[ / ] 调窗口，Shift+W 切来源）",
+              shell.wand_tolerance, shell.wand_radius * 2 + 1, shell.wand_radius * 2 + 1,
+              shell.wand_merged ? L"合并" : L"当前图层",
               shell.wand_contiguous ? L"连通" : L"全图");
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
@@ -2933,6 +3192,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
   if (key == VK_ESCAPE) {
+    /* 钢笔有未提交路径时 Esc 只取消路径，不关窗（与输入态的 Esc 同规矩）。 */
+    if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
+      pen_cancel(shell);
+      return;
+    }
     PostMessageW(window, WM_CLOSE, 0, 0);
     return;
   }
@@ -3038,8 +3302,9 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低；Wand = 容差 - */
       if (shell.tool == comp_ui::ToolId::Wand) {
         shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, -1);
-        wchar_t buffer[128];
-        wsprintfW(buffer, L"魔棒容差 %d（逐通道，alpha 参与）", shell.wand_tolerance);
+        wchar_t buffer[160];
+        wsprintfW(buffer, L"魔棒容差 %d（窗口 %d×%d，逐通道，alpha 参与）", shell.wand_tolerance,
+                  shell.wand_radius * 2 + 1, shell.wand_radius * 2 + 1);
         set_status(shell, buffer);
       } else {
         brush_step(shell, -1, shift);
@@ -3048,8 +3313,9 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高；Wand = 容差 + */
       if (shell.tool == comp_ui::ToolId::Wand) {
         shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, 1);
-        wchar_t buffer[128];
-        wsprintfW(buffer, L"魔棒容差 %d（逐通道，alpha 参与）", shell.wand_tolerance);
+        wchar_t buffer[160];
+        wsprintfW(buffer, L"魔棒容差 %d（窗口 %d×%d，逐通道，alpha 参与）", shell.wand_tolerance,
+                  shell.wand_radius * 2 + 1, shell.wand_radius * 2 + 1);
         set_status(shell, buffer);
       } else {
         brush_step(shell, 1, shift);
@@ -3059,7 +3325,12 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       panel_move_param(shell, shift ? -1 : 1);
       break;
     case VK_RETURN:
-      panel_commit_input(shell);
+      /* 钢笔：回车 = 提交闭合路径；其余工具里回车仍是调整面板的落值键。 */
+      if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
+        commit_pen_path(shell);
+      } else {
+        panel_commit_input(shell);
+      }
       break;
     case VK_OEM_COMMA:
       panel_select_adjustment(shell, -1);
@@ -3215,6 +3486,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
+            } else if (pen_available(*shell)) {
+              pen_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (marquee_available(*shell)) {
               marquee_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (lasso_available(*shell)) {
@@ -3248,6 +3521,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      if (shell != nullptr && shell->pen_dragging) {
+        pen_up(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->marquee_active) {
         marquee_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
@@ -3294,6 +3572,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         lasso_cancel(*shell);
+        pen_cancel_drag(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
@@ -3304,6 +3583,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         lasso_cancel(*shell);
+        pen_cancel_drag(*shell);
       }
       break;
     case WM_MOUSEMOVE:
@@ -3312,6 +3592,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (client_layout(*shell, &layout)) {
           if (shell->move_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->pen_dragging) {
+            pen_drag(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->eyedropper_drag) {
             /* 吸管拖动连续取样：只更新前景色与状态栏，不改画布内容。 */
@@ -3378,9 +3661,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
        */
       if (shell != nullptr && (wparam == VK_OEM_4 || wparam == VK_OEM_6)) {
         const int direction = wparam == VK_OEM_6 ? 1 : -1;
-        wchar_t buffer[96];
-        if (shell->tool == comp_ui::ToolId::Retouch &&
-            shell->retouch_mode != comp_ui::kRetouchBlur) {
+        wchar_t buffer[128];
+        if (shell->tool == comp_ui::ToolId::Wand) {
+          /* S8：魔棒的取样窗口是 (2r+1)²，0 = 只取种子像素（S7 行为）。 */
+          shell->wand_radius = comp_ui::step_wand_radius(shell->wand_radius, direction);
+          wsprintfW(buffer, L"魔棒取样窗口 %d×%d（半径 %d px）",
+                    shell->wand_radius * 2 + 1, shell->wand_radius * 2 + 1, shell->wand_radius);
+        } else if (shell->tool == comp_ui::ToolId::Retouch &&
+                   shell->retouch_mode != comp_ui::kRetouchBlur) {
           shell->retouch_strength =
               comp_ui::step_retouch_strength(shell->retouch_strength, direction);
           wsprintfW(buffer, L"%s强度 %d%%",
@@ -4139,9 +4427,9 @@ int run_selftest(const wchar_t* out_path) {
          "wand with no matching pixel keeps the old selection and adds no undo step");
 
   /*
-   * 新选区羽化：finish_new_selection 把「形状 + comp_selection_modify(FEATHER)」
-   * 包进一个显式事务，因此两步只能算**一步**撤销，且羽化值是本次的绝对值
-   * （apply_shape 已把 feather 归零，modify 的 sqrt 叠加从 0 起算）。
+   * 新选区羽化：finish_new_selection 把「形状 + comp_selection_set_feather」包进
+   * 一个显式事务，因此两步只能算**一步**撤销，且羽化值是本次的绝对值
+   * （apply_shape 已把 feather 归零，set_feather 按覆盖语义写入）。
    */
   comp_txn feather_txn = nullptr;
   size_t depth_before_feather = 0;
@@ -4152,8 +4440,7 @@ int run_selftest(const wchar_t* out_path) {
                comp_selection_apply_shape(document, COMP_SELECTION_RECT, rect_points, 2,
                                           COMP_SELECTION_REPLACE, 1,
                                           &selection_changed) == COMP_OK;
-  feather_ok = feather_ok && comp_selection_modify(document, COMP_SELECTION_FEATHER, 4,
-                                                   &feather_changed) == COMP_OK &&
+  feather_ok = feather_ok && comp_selection_set_feather(document, 4, &feather_changed) == COMP_OK &&
                feather_changed == 1;
   feather_ok = feather_ok && comp_txn_commit(feather_txn) == COMP_OK;
   float feather_value = -1.0f;
@@ -4161,7 +4448,7 @@ int run_selftest(const wchar_t* out_path) {
   comp_selection_get_feather(document, &feather_value);
   comp_document_history_stats(document, &depth_after_feather, &redo_depth);
   verify(feather_ok && std::fabs(feather_value - 4.0f) < 0.01f,
-         "shape + comp_selection_modify(FEATHER) yields feather 4 px");
+         "shape + comp_selection_set_feather(4) yields feather 4 px");
   verify(feather_ok && depth_after_feather == depth_before_feather + 1,
          "shape + feather commit as ONE undo step (finish_new_selection contract)");
   verify(comp_document_undo(document) == COMP_OK &&
@@ -4169,6 +4456,113 @@ int run_selftest(const wchar_t* out_path) {
              selection_active == 1 && comp_selection_get_feather(document, &feather_value) == COMP_OK &&
              std::fabs(feather_value) < 0.01f,
          "undoing the feathered selection restores the unfeathered previous selection");
+
+  /*
+   * S8：绝对羽化 / 魔棒取样窗口 / 钢笔路径。
+   * 按 commit_feather_input / wand_click / commit_pen_path 的真实调用序列走 ABI。
+   */
+  int32_t absolute_changed = 0;
+  float absolute_feather = -1.0f;
+  verify(comp_selection_set_feather(document, 8, &absolute_changed) == COMP_OK &&
+             absolute_changed == 1 &&
+             comp_selection_get_feather(document, &absolute_feather) == COMP_OK &&
+             std::fabs(absolute_feather - 8.0f) < 0.01f,
+         "comp_selection_set_feather(8) sets the absolute feather");
+  absolute_changed = 99;
+  verify(comp_selection_set_feather(document, 8, &absolute_changed) == COMP_OK &&
+             absolute_changed == 0,
+         "setting the same feather twice is a no-op");
+  verify(comp_selection_set_feather(document, 251, &absolute_changed) ==
+             COMP_ERR_INVALID_ARGUMENT,
+         "comp_selection_set_feather(251) rejected before any transaction");
+  verify(comp_selection_set_feather(document, 0, &absolute_changed) == COMP_OK &&
+             absolute_changed == 1 &&
+             comp_selection_get_feather(document, &absolute_feather) == COMP_OK &&
+             std::fabs(absolute_feather) < 0.01f,
+         "comp_selection_set_feather(0) clears the feather");
+  verify(comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_feather(document, &absolute_feather) == COMP_OK &&
+             std::fabs(absolute_feather - 8.0f) < 0.01f,
+         "undoing the feather reset restores 8 px");
+  verify(comp_document_undo(document) == COMP_OK,
+         "undoing the absolute feather step restores the previous selection");
+
+  /* 魔棒取样窗口：边界种子 + 半径 1 的参考色是窗口均值，容差 0 下不再匹配。 */
+  int32_t radius_changed = 0;
+  comp_rect radius_bounds{};
+  const bool radius_zero_ok =
+      wand_fixture_ok &&
+      comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, 32.0, 10.0, 0, 1,
+                                0, COMP_SELECTION_REPLACE, &radius_changed) == COMP_OK &&
+      radius_changed == 1 && comp_selection_get_bounds(document, &radius_bounds) == COMP_OK &&
+      radius_bounds.w == 32;
+  verify(radius_zero_ok, "wand radius 0 selects the black half from the boundary seed");
+  radius_changed = 99;
+  verify(wand_fixture_ok &&
+             comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, 32.0, 10.0,
+                                       0, 1, 1, COMP_SELECTION_REPLACE,
+                                       &radius_changed) == COMP_OK &&
+             radius_changed == 0 &&
+             comp_selection_get_bounds(document, &radius_bounds) == COMP_OK &&
+             radius_bounds.w == 32,
+         "wand radius 1 averages the window, finds no match, and keeps the selection");
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(wand radius selection step)");
+
+  /*
+   * 钢笔路径：ui_core 的锚点/段装配 -> comp_selection_apply_path，与
+   * commit_pen_path 走同一条 ABI。这里用 4 个直角锚点的 24..40 方形。
+   */
+  comp_ui::PenAnchor pen_anchors[4] = {};
+  int pen_anchor_count = 0;
+  bool pen_state_ok = comp_ui::pen_append_anchor(pen_anchors, &pen_anchor_count,
+                                                 comp_ui::Point{24.0, 24.0});
+  pen_state_ok = pen_state_ok && comp_ui::pen_append_anchor(pen_anchors, &pen_anchor_count,
+                                                            comp_ui::Point{40.0, 24.0});
+  pen_state_ok = pen_state_ok && comp_ui::pen_append_anchor(pen_anchors, &pen_anchor_count,
+                                                            comp_ui::Point{40.0, 40.0});
+  pen_state_ok = pen_state_ok && comp_ui::pen_append_anchor(pen_anchors, &pen_anchor_count,
+                                                            comp_ui::Point{24.0, 40.0});
+  comp_ui::PenSegment pen_segments[4] = {};
+  const int pen_segment_count =
+      comp_ui::pen_build_segments(pen_anchors, pen_anchor_count, /*closed=*/true, pen_segments, 4);
+  comp_selection_cubic pen_cubics[4] = {};
+  for (int i = 0; i < pen_segment_count && i < 4; ++i) {
+    pen_cubics[i].start[0] = static_cast<float>(pen_segments[i].start.x);
+    pen_cubics[i].start[1] = static_cast<float>(pen_segments[i].start.y);
+    pen_cubics[i].control1[0] = static_cast<float>(pen_segments[i].control1.x);
+    pen_cubics[i].control1[1] = static_cast<float>(pen_segments[i].control1.y);
+    pen_cubics[i].control2[0] = static_cast<float>(pen_segments[i].control2.x);
+    pen_cubics[i].control2[1] = static_cast<float>(pen_segments[i].control2.y);
+    pen_cubics[i].end[0] = static_cast<float>(pen_segments[i].end.x);
+    pen_cubics[i].end[1] = static_cast<float>(pen_segments[i].end.y);
+    pen_cubics[i].new_subpath = i == 0 ? 1 : 0;
+  }
+  size_t depth_before_pen = 0;
+  comp_document_history_stats(document, &depth_before_pen, &redo_depth);
+  int32_t pen_changed = 0;
+  const bool pen_ok =
+      pen_state_ok && pen_segment_count == 4 &&
+      comp_selection_apply_path(document, pen_cubics, pen_segment_count,
+                                COMP_SELECTION_REPLACE, 1, &pen_changed) == COMP_OK &&
+      pen_changed == 1 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(32) * stride + 32u] == 255 &&
+      coverage[static_cast<size_t>(60) * stride + 60u] == 0;
+  size_t depth_after_pen = 0;
+  comp_document_history_stats(document, &depth_after_pen, &redo_depth);
+  verify(pen_ok, "pen path commits a closed selection through comp_selection_apply_path");
+  verify(pen_ok && depth_after_pen == depth_before_pen + 1,
+         "pen path selection is exactly one undo step");
+  comp_ui::Point pen_preview[1 + 4 * 3] = {};
+  const int pen_preview_count =
+      comp_ui::pen_preview_polyline(pen_anchors, pen_anchor_count, /*closed=*/true, pen_preview,
+                                    1 + 4 * 3, /*samples_per_segment=*/3);
+  verify(pen_preview_count == 1 + 4 * 3 && pen_preview[pen_preview_count - 1].x == 24.0 &&
+             pen_preview[pen_preview_count - 1].y == 24.0,
+         "pen preview polyline closes back onto the first anchor");
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(pen path selection step)");
+
 
   /* 测试图用完即删：它是全画布不透明层，留着会盖住后面 S6 的 flatten 断言。 */
   verify(comp_layer_remove(document, wand_layer) == COMP_OK,
