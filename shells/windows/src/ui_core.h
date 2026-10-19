@@ -873,6 +873,126 @@ inline bool gradient_drag_is_usable(double start_x, double start_y, double end_x
   return dx * dx + dy * dy >= kGradientMinLength * kGradientMinLength;
 }
 
+/* ------------------------------------------------------------ 形状工具（S10） */
+
+/* 形状种类（镜像 ABI `comp_shape_kind` / 域层 `ShapeKind`；数值必须一致）。 */
+inline constexpr int kShapeRect = 0;
+inline constexpr int kShapeEllipse = 1;
+inline constexpr int kShapeLine = 2;
+inline constexpr int kShapePath = 3;
+/* 外壳能从鼠标拖拽产出的只有前三种；Path 只经 ABI（钢笔路径提交选区，不建形状）。 */
+inline constexpr int kShellShapeKindCount = 3;
+
+inline const char* shape_kind_name(int kind) {
+  switch (kind) {
+    case kShapeRect: return "Rectangle";
+    case kShapeEllipse: return "Ellipse";
+    case kShapeLine: return "Line";
+    case kShapePath: return "Path";
+    default: return "?";
+  }
+}
+
+/* U 键：已在该工具时循环 Rectangle -> Ellipse -> Line（与 M/G/R 同款习惯）。 */
+inline int next_shell_shape_kind(int kind) {
+  if (kind < kShapeRect || kind >= kShellShapeKindCount - 1) return kShapeRect;
+  return kind + 1;
+}
+
+/* 描边宽度（comp_shape_style.stroke_width，文档像素全宽）。量程与上游线宽一致。 */
+inline constexpr double kMinShapeStrokeWidth = 0.5;
+inline constexpr double kMaxShapeStrokeWidth = 50.0;
+inline constexpr double kDefaultShapeStrokeWidth = 4.0;
+
+inline double clamp_shape_stroke_width(double value) {
+  if (!(value > 0.0)) return kMinShapeStrokeWidth; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinShapeStrokeWidth), kMaxShapeStrokeWidth);
+}
+
+inline double step_shape_stroke_width(double current, int direction) {
+  const double base = clamp_shape_stroke_width(current);
+  if (direction > 0) return clamp_shape_stroke_width(base * 1.2);
+  if (direction < 0) return clamp_shape_stroke_width(base / 1.2);
+  return base;
+}
+
+/* 圆角半径（矩形专用，文档像素；0 = 直角。引擎再夹到短边一半）。 */
+inline constexpr double kMinShapeCornerRadius = 0.0;
+inline constexpr double kMaxShapeCornerRadius = 256.0;
+inline constexpr double kDefaultShapeCornerRadius = 0.0;
+
+inline double clamp_shape_corner_radius(double value) {
+  if (!(value > 0.0)) return kMinShapeCornerRadius;
+  return std::min(std::max(value, kMinShapeCornerRadius), kMaxShapeCornerRadius);
+}
+
+inline double step_shape_corner_radius(double current, int direction) {
+  const double base = clamp_shape_corner_radius(current);
+  if (direction > 0) return clamp_shape_corner_radius(base + 2.0);
+  if (direction < 0) return clamp_shape_corner_radius(base - 2.0);
+  return base;
+}
+
+/* 拖拽盒（文档坐标，四个值任意顺序）。 */
+struct ShapeDragBox {
+  double x0 = 0.0;
+  double y0 = 0.0;
+  double x1 = 0.0;
+  double y1 = 0.0;
+};
+
+/*
+ * 把「按下点 -> 当前点」变成落笔盒：Shift = 正方形/正圆（取较长边、保留方向），
+ * Alt = 从中心向外（上游 ShapeTool 同款修饰键；两者可叠加）。
+ */
+inline ShapeDragBox shape_drag_box(double start_x, double start_y, double current_x,
+                                   double current_y, bool square, bool from_center) {
+  double dx = current_x - start_x;
+  double dy = current_y - start_y;
+  if (square) {
+    const double extent = std::max(std::fabs(dx), std::fabs(dy));
+    dx = dx < 0.0 ? -extent : extent;
+    dy = dy < 0.0 ? -extent : extent;
+  }
+  ShapeDragBox box{};
+  if (from_center) {
+    box.x0 = start_x - dx;
+    box.y0 = start_y - dy;
+    box.x1 = start_x + dx;
+    box.y1 = start_y + dy;
+  } else {
+    box.x0 = start_x;
+    box.y0 = start_y;
+    box.x1 = start_x + dx;
+    box.y1 = start_y + dy;
+  }
+  return box;
+}
+
+/*
+ * 拖拽是否够大：短于 1 文档像素的盒/线不可定义（引擎参数闸会以「零尺寸/端点重合」
+ * 拒绝，外壳先判定并给提示，避免一次误拖变成错误弹窗）。
+ */
+inline constexpr double kShapeMinExtent = 1.0;
+
+inline bool shape_drag_is_usable(int kind, const ShapeDragBox& box) {
+  if (kind == kShapeLine) {
+    const double dx = box.x1 - box.x0;
+    const double dy = box.y1 - box.y0;
+    return dx * dx + dy * dy >= kShapeMinExtent * kShapeMinExtent;
+  }
+  return std::fabs(box.x1 - box.x0) >= kShapeMinExtent &&
+         std::fabs(box.y1 - box.y0) >= kShapeMinExtent;
+}
+
+/* 矩形圆角半径的上限（引擎夹到短边一半；外壳提示的是用户设定值）。 */
+inline double shape_effective_corner_radius(double radius, const ShapeDragBox& box) {
+  const double limit =
+      std::min(std::fabs(box.x1 - box.x0), std::fabs(box.y1 - box.y0)) * 0.5;
+  const double clamped = clamp_shape_corner_radius(radius);
+  return clamped > limit ? limit : clamped;
+}
+
 /* ------------------------------------------------------------ 笔迹采样 */
 
 /*

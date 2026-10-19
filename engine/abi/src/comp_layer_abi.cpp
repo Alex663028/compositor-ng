@@ -1008,6 +1008,50 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   }
   params.gradient.opacity = desc->gradient.opacity;
 
+  /*
+   * S10：形状的路径段要从 ABI 的 float 布局转成域层/kernel 的 double 布局。
+   * 这里只做**廉价的结构性守卫**（指针与段数范围，避免解引用空指针或巨量分配）；
+   * 坐标的合法性（NaN/Inf/量级）交给域层参数闸，它同时保证「被拒绝时不留半成品」。
+   */
+  std::vector<compositor::ShapeCubic> shape_segments;
+  if (desc->kind == COMP_TOOL_SHAPE && desc->shape.kind == COMP_SHAPE_PATH) {
+    if (desc->shape.segments == nullptr || desc->shape.segment_count <= 0 ||
+        desc->shape.segment_count > 65536) {
+      return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                   "shape path needs 1..65536 segments");
+    }
+    shape_segments.resize(static_cast<size_t>(desc->shape.segment_count));
+    for (int32_t i = 0; i < desc->shape.segment_count; ++i) {
+      const comp_shape_cubic& source = desc->shape.segments[i];
+      compositor::ShapeCubic& segment = shape_segments[static_cast<size_t>(i)];
+      for (int c = 0; c < 2; ++c) {
+        segment.start[c] = source.start[c];
+        segment.control1[c] = source.control1[c];
+        segment.control2[c] = source.control2[c];
+        segment.end[c] = source.end[c];
+      }
+      segment.new_subpath = source.new_subpath != 0;
+    }
+  }
+  params.shape.kind = desc->shape.kind;
+  params.shape.x0 = desc->shape.x0;
+  params.shape.y0 = desc->shape.y0;
+  params.shape.x1 = desc->shape.x1;
+  params.shape.y1 = desc->shape.y1;
+  params.shape.corner_radius = desc->shape.corner_radius;
+  params.shape.segments = shape_segments.empty() ? nullptr : shape_segments.data();
+  params.shape.segment_count = static_cast<int32_t>(shape_segments.size());
+  params.shape.closed = desc->shape.closed;
+  params.shape.style.fill_enabled = desc->shape.style.fill_enabled;
+  params.shape.style.stroke_enabled = desc->shape.style.stroke_enabled;
+  for (int i = 0; i < 4; ++i) {
+    params.shape.style.fill_color[i] = desc->shape.style.fill_color[i];
+    params.shape.style.stroke_color[i] = desc->shape.style.stroke_color[i];
+  }
+  params.shape.style.stroke_width = desc->shape.style.stroke_width;
+  params.shape.style.opacity = desc->shape.style.opacity;
+  params.shape.style.antialias = desc->shape.style.antialias;
+
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;
   std::string note_text;

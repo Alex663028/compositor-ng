@@ -30,6 +30,7 @@
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
 #include "domain/layer.h"
+#include "domain/shape_raster.h"
 
 namespace compositor {
 
@@ -250,6 +251,78 @@ struct GradientParams {
   float opacity = 1.0f;
 };
 
+/* ============================================================== 形状（S10） */
+
+/* 形状种类（数值与 ABI `comp_shape_kind`、形状内核 `ShapeRasterKind` 三方一致；
+ * 这里直接引用内核常量，编译期就不会漂移）。 */
+enum ShapeKind {
+  kShapeRect = kShapeRasterRect,
+  kShapeEllipse = kShapeRasterEllipse,
+  kShapeLine = kShapeRasterLine,
+  kShapePath = kShapeRasterPath,
+};
+
+/* 三次贝塞尔路径段：与形状内核共用同一结构（`ShapeCubic`，文档像素）。 */
+
+/* 形状的填充/描边样式。颜色是**直通 sRGB + alpha**（与渐变色标同一口径），
+ * 合成时再按 coverage × opacity 走预乘 source-over。 */
+struct ShapeStyle {
+  int32_t fill_enabled = 1;
+  int32_t stroke_enabled = 0;
+  uint8_t fill_color[4] = {0, 0, 0, 255};
+  uint8_t stroke_color[4] = {0, 0, 0, 255};
+  /* 描边宽度（文档像素）；`stroke_enabled` 为 0 时忽略，也不做量程校验
+   * （纯填充形状不需要宿主为这个字段编一个数值）。 */
+  double stroke_width = 1.0;
+  /* 0..1，再乘进逐像素覆盖率。 */
+  float opacity = 1.0f;
+  /* 非 0 = 抗锯齿（4 行超采样 + 水平解析覆盖率）；0 = 像素中心一票（硬边）。 */
+  int32_t antialias = 1;
+};
+
+/*
+ * 形状参数（上游 ShapeTool.swift 的语义，落在本仓的工具算子族里）。
+ *
+ * 与上游的三处**显式差异**（不是遗漏，口径写死在这里）：
+ *   1. 上游画完会**新建一个像素图层**（`addPixelLayer`，命名 "<Kind> N"）；
+ *      本仓的工具算子族统一「画进当前图层」，新建图层由宿主自行先做
+ *      （外壳可以「先新建空白层再画」，两个 ABI 调用各自一步撤销）。
+ *      这样做的理由：工具算子不该改变图层树结构，否则 merge/flatten 的
+ *      逐字节契约与撤销粒度都要跟着改。
+ *   2. 上游矩形/椭圆只填充、直线只描边；本仓把填充与描边做成两个独立开关，
+ *      因此「填充 + 描边」是超集能力（外壳仍只暴露上游那三种画法）。
+ *   3. 上游没有通用贝塞尔路径形状（Pen 只产选区）；本仓的 `kShapePath`
+ *      把「路径扁平化 + 填充/描边」作为形状内核的一般情形暴露出来。
+ *
+ * 几何口径：
+ *   - rect / ellipse 用对角点 (x0,y0)-(x1,y1)，坐标顺序任意（内部取 min/max）；
+ *   - rect 的 `corner_radius` 夹到短边一半（上游同款夹取），<= 0 为直角；
+ *   - line 的 (x0,y0)-(x1,y1) 是两端点，**恒为描边**（圆头端点），
+ *     `fill_enabled` 必须为 0（否则参数闸拒绝：画一条「填充的线」没有意义）；
+ *   - path 用 `segments`（`new_subpath` 开新子路径），填充走非零缠绕
+ *     （反向子路径成洞），`closed` 只影响描边是否回到起点；
+ *   - 全部坐标是**文档像素**，引擎减掉 `effective_bounds()` 原点后落到图层局部；
+ *   - 形状与图层不相交时：成功且**不产生撤销步**，note 如实回报。
+ *
+ * 颜色与覆盖率：
+ *   - 每像素 alpha = coverage/255 × color.a/255 × opacity；
+ *   - 笔画先画填充、再画描边（描边在上）；
+ *   - 选区活跃时再乘 `selection_effective_coverage`（与渐变/滤镜同一口径），
+ *     覆盖率 0 的像素**逐字节不动**。
+ */
+struct ShapeParams {
+  int32_t kind = kShapeRect;
+  double x0 = 0.0;
+  double y0 = 0.0;
+  double x1 = 0.0;
+  double y1 = 0.0;
+  double corner_radius = 0.0;
+  const ShapeCubic* segments = nullptr;
+  int32_t segment_count = 0;
+  int32_t closed = 1;
+  ShapeStyle style;
+};
+
 /* ============================================================== 扫描线 */
 
 /*
@@ -359,6 +432,7 @@ enum ToolOpKind {
   kToolOpLiquify = 11,    /* 液化（Push）-> 前向位移重采样 */
   kToolOpBlur = 12,       /* 模糊 -> 快照模糊后按笔迹盖回 */
   kToolOpGradient = 13,   /* 渐变 -> 按两个端点铺一片渐变（S9 尾部追加） */
+  kToolOpShape = 14,      /* 形状 -> 矩形/椭圆/直线/贝塞尔路径的填充与描边（S10 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -392,6 +466,9 @@ struct ToolOpParams {
 
   /* Gradient 用（两个文档像素端点 + 两色标 + 不透明度，见 GradientParams）。 */
   GradientParams gradient;
+
+  /* Shape 用（矩形/椭圆/直线/路径 + 填充/描边样式，见 ShapeParams）。 */
+  ShapeParams shape;
 
   /* Heal 用。coverage 为 8 位灰度蒙版（0..255，255 = 待修补），尺寸须等于图层像素。 */
   HealParams heal;
@@ -453,7 +530,9 @@ struct ToolOpParams {
  *   - kToolOpBlur     一笔开始时模糊整层副本，再按笔迹 coverage 盖回（alpha 同样
  *                     按预乘插值，透明边缘会随涂抹变软）；
  *   - kToolOpGradient 按两个文档端点铺一片线性/径向渐变，选区活跃时只改选区内
- *                     像素（覆盖率 0 的像素逐字节不动）。
+ *                     像素（覆盖率 0 的像素逐字节不动）；
+ *   - kToolOpShape    把矩形/椭圆/直线/贝塞尔路径栅格化成覆盖率后按颜色合成，
+ *                     同样按选区覆盖率遮罩；与图层不相交时不产生撤销步。
  */
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
                  comp_result* out_code, std::string* error, std::string* note);

@@ -1015,3 +1015,92 @@ COMP_TEST(ui_core_gradient_type_cycles_and_drag_has_a_minimum_length) {
   COMP_CHECK(comp_ui::gradient_drag_is_usable(10.0, 10.0, 10.0, 11.0));
   COMP_CHECK(comp_ui::gradient_drag_is_usable(0.0, 0.0, 300.0, 400.0));
 }
+
+COMP_TEST(ui_core_shape_kind_cycles_and_drag_box_matches_modifiers) {
+  /* 种类数值是 ABI（comp_shape_kind）：外壳的镜像不得漂移。 */
+  COMP_CHECK(comp_ui::kShapeRect == 0);
+  COMP_CHECK(comp_ui::kShapeEllipse == 1);
+  COMP_CHECK(comp_ui::kShapeLine == 2);
+  COMP_CHECK(comp_ui::kShapePath == 3);
+  COMP_CHECK(comp_ui::kShellShapeKindCount == 3);
+  COMP_CHECK(std::string(comp_ui::shape_kind_name(comp_ui::kShapeRect)) == "Rectangle");
+  COMP_CHECK(std::string(comp_ui::shape_kind_name(comp_ui::kShapeEllipse)) == "Ellipse");
+  COMP_CHECK(std::string(comp_ui::shape_kind_name(comp_ui::kShapeLine)) == "Line");
+  COMP_CHECK(std::string(comp_ui::shape_kind_name(comp_ui::kShapePath)) == "Path");
+  COMP_CHECK(std::string(comp_ui::shape_kind_name(9)) == "?");
+
+  /* U 键循环：矩形 -> 椭圆 -> 直线 -> 矩形；未知值收敛回矩形。 */
+  COMP_CHECK(comp_ui::next_shell_shape_kind(comp_ui::kShapeRect) == comp_ui::kShapeEllipse);
+  COMP_CHECK(comp_ui::next_shell_shape_kind(comp_ui::kShapeEllipse) == comp_ui::kShapeLine);
+  COMP_CHECK(comp_ui::next_shell_shape_kind(comp_ui::kShapeLine) == comp_ui::kShapeRect);
+  COMP_CHECK(comp_ui::next_shell_shape_kind(comp_ui::kShapePath) == comp_ui::kShapeRect);
+  COMP_CHECK(comp_ui::next_shell_shape_kind(-5) == comp_ui::kShapeRect);
+
+  /* 描边宽度：量程 0.5..50，比值步进；NaN/0/负数回落到下限。 */
+  COMP_CHECK(comp_ui::kDefaultShapeStrokeWidth == 4.0);
+  COMP_CHECK(near_value(comp_ui::clamp_shape_stroke_width(0.0), 0.5));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_stroke_width(-3.0), 0.5));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_stroke_width(std::nan("")), 0.5));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_stroke_width(2.0), 2.0));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_stroke_width(500.0), 50.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_stroke_width(10.0, 1), 12.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_stroke_width(10.0, -1), 10.0 / 1.2));
+  COMP_CHECK(near_value(comp_ui::step_shape_stroke_width(49.0, 1), 50.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_stroke_width(0.5, -1), 0.5));
+  COMP_CHECK(near_value(comp_ui::step_shape_stroke_width(10.0, 0), 10.0));
+
+  /* 圆角半径：0 是合法值（直角），步进 2 px，上限 256。 */
+  COMP_CHECK(comp_ui::kDefaultShapeCornerRadius == 0.0);
+  COMP_CHECK(near_value(comp_ui::clamp_shape_corner_radius(-1.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_corner_radius(std::nan("")), 0.0));
+  COMP_CHECK(near_value(comp_ui::clamp_shape_corner_radius(300.0), 256.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_corner_radius(4.0, 1), 6.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_corner_radius(4.0, -1), 2.0));
+  COMP_CHECK(near_value(comp_ui::step_shape_corner_radius(0.0, -1), 0.0));
+
+  /* 无修饰键：按下点 -> 当前点。 */
+  comp_ui::ShapeDragBox plain = comp_ui::shape_drag_box(10.0, 20.0, 40.0, 50.0, false, false);
+  COMP_CHECK(near_value(plain.x0, 10.0) && near_value(plain.y0, 20.0));
+  COMP_CHECK(near_value(plain.x1, 40.0) && near_value(plain.y1, 50.0));
+
+  /* 反向拖拽保留方向（不归一化）：几何照旧、渲染顺序由引擎处理。 */
+  comp_ui::ShapeDragBox reversed = comp_ui::shape_drag_box(40.0, 50.0, 10.0, 20.0, false, false);
+  COMP_CHECK(near_value(reversed.x0, 40.0) && near_value(reversed.x1, 10.0));
+
+  /* Shift = 正方/正圆：取较长边并保留符号。 */
+  comp_ui::ShapeDragBox square = comp_ui::shape_drag_box(0.0, 0.0, 30.0, 10.0, true, false);
+  COMP_CHECK(near_value(square.x1, 30.0) && near_value(square.y1, 30.0));
+  comp_ui::ShapeDragBox square_negative = comp_ui::shape_drag_box(0.0, 0.0, -10.0, -30.0, true, false);
+  COMP_CHECK(near_value(square_negative.x1, -30.0) && near_value(square_negative.y1, -30.0));
+
+  /* Alt = 从中心向外：按下点是中心。 */
+  comp_ui::ShapeDragBox centered = comp_ui::shape_drag_box(20.0, 20.0, 30.0, 26.0, false, true);
+  COMP_CHECK(near_value(centered.x0, 10.0) && near_value(centered.y0, 14.0));
+  COMP_CHECK(near_value(centered.x1, 30.0) && near_value(centered.y1, 26.0));
+
+  /* Shift+Alt 叠加：先把拖拽量取成正方/正圆，再以按下点为中心。 */
+  comp_ui::ShapeDragBox both = comp_ui::shape_drag_box(20.0, 20.0, 30.0, 26.0, true, true);
+  COMP_CHECK(near_value(both.x0, 10.0) && near_value(both.y0, 10.0));
+  COMP_CHECK(near_value(both.x1, 30.0) && near_value(both.y1, 30.0));
+
+  /*
+   * 拖拽下限：外壳先挡掉手抖，免得一次短拖变成引擎的 INVALID_ARGUMENT。
+   * 直线看两点距离，矩形/椭圆看宽高都至少 1 px。
+   */
+  COMP_CHECK(comp_ui::kShapeMinExtent == 1.0);
+  comp_ui::ShapeDragBox tiny = comp_ui::shape_drag_box(10.0, 10.0, 10.4, 10.4, false, false);
+  COMP_CHECK(!comp_ui::shape_drag_is_usable(comp_ui::kShapeRect, tiny));
+  COMP_CHECK(!comp_ui::shape_drag_is_usable(comp_ui::kShapeEllipse, tiny));
+  COMP_CHECK(!comp_ui::shape_drag_is_usable(comp_ui::kShapeLine, tiny));
+  comp_ui::ShapeDragBox flat = comp_ui::shape_drag_box(10.0, 10.0, 40.0, 10.4, false, false);
+  COMP_CHECK(!comp_ui::shape_drag_is_usable(comp_ui::kShapeRect, flat));
+  COMP_CHECK(comp_ui::shape_drag_is_usable(comp_ui::kShapeLine, flat));
+  comp_ui::ShapeDragBox one_pixel = comp_ui::shape_drag_box(10.0, 10.0, 11.0, 11.0, false, false);
+  COMP_CHECK(comp_ui::shape_drag_is_usable(comp_ui::kShapeRect, one_pixel));
+
+  /* 圆角半径的有效值：夹到用户量程后再夹到短边一半。 */
+  comp_ui::ShapeDragBox wide = comp_ui::shape_drag_box(0.0, 0.0, 40.0, 10.0, false, false);
+  COMP_CHECK(near_value(comp_ui::shape_effective_corner_radius(4.0, wide), 4.0));
+  COMP_CHECK(near_value(comp_ui::shape_effective_corner_radius(50.0, wide), 5.0));
+  COMP_CHECK(near_value(comp_ui::shape_effective_corner_radius(-2.0, wide), 0.0));
+}

@@ -224,6 +224,50 @@ coverage 把样本盖回当前像素。
   色标固定「前景 → 透明」，`Shift` 反向。拖拽短于 1 px 时外壳直接放弃并提示，
   不把一次手抖变成 `INVALID_ARGUMENT`。
 
+### 4.11 Shape（`COMP_TOOL_SHAPE`，S10 追加）
+
+上游 ShapeTool（`Document/ShapeTool.swift`）的**最小闭环**：矩形 / 椭圆 / 直线三种
+拖拽几何 + 通用三次贝塞尔路径，填充与描边是两个独立开关。它也是**整幅算子**：
+不读 `stroke_points`、不是落笔族，松开时一次铺完。
+
+- 几何（全部是**文档像素**，引擎减掉图层 `effective_bounds()` 原点后落图层局部像素）：
+  - `kind = 0` 矩形 / `kind = 1` 椭圆：`(x0,y0)-(x1,y1)` 是对角点，顺序任意；
+    矩形的 `corner_radius` **夹到短边一半**，`<= 0` 为直角（0.5522847498307936 的四段
+    三次贝塞尔近似圆角）。
+  - `kind = 2` 直线：`(x0,y0)-(x1,y1)` 是两端点，**恒为描边**——`fill_enabled` 必须为 0
+    （填一条「实心线」没有定义，显式拒绝而不是静默忽略），`stroke_enabled` 必须非 0。
+  - `kind = 3` 路径：`segments` 是 1..65536 段三次贝塞尔，`fill` 走**非零缠绕**
+    （反向子路径成为洞），`closed` 只影响描边是否回到起点。S10 只有 ABI 通路能产出路径。
+- 抗锯齿：`antialias != 0` 时 4 行超采样 + 水平解析覆盖率（直边是精确的半像素规则）；
+  0 时按像素中心一票取硬边。填充与描边共用同一套覆盖率窗口。
+- 描边 = **胶囊距离并集**：`cov = clamp(0.5 + 半宽 − 距离, 0, 1) × 255`，所以端点/折点是
+  圆头（上游 `line` 的 `.round` 线帽同款）。`stroke_width` 是文档像素**全宽**；
+  共线折线按 ≤32 px 切段，避免长边距离场退化。
+- 合成：`alpha = coverage/255 × color.a/255 × opacity`，**先填充后描边**（描边压在上面），
+  预乘 source-over。颜色是直通 sRGB + alpha（非预乘）。
+- 选区：活跃选区的 `selection_effective_coverage` 逐像素乘进覆盖率，覆盖率 0 的像素
+  **逐字节不动**；图层像素落在画布外视为选区之外（与渐变/滤镜同一口径）。
+- 参数闸都在 `txn_begin` **之前**：kind 越界、填充与描边全关、可见色全透明（alpha 0）、
+  `opacity` 越界或 0、**描边开启时** `stroke_width` 非正、坐标为 NaN/Inf 或 `|v| > 1e6`、
+  矩形/椭圆宽或高为 0、直线两端点重合、路径段数为 0/超限、路径坐标非法。
+  全部 `COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。
+  （纯填充形状**不看** `stroke_width`：0 合法，宿主不必为一个用不到的字段编数值。）
+- 与目标图层**完全不相交**：成功、无像素改动、**不产生撤销步**，note 如实说明
+  （否则宿主会看到一步什么都没做的撤销）。
+- 16 位 / HDR：整幅算子写 8 位工作副本，RGBA16 经 `merge_deep_paint` 合回；
+  RGBA16F 直接 `COMP_ERR_STATE`（与 Dither / Lens / Gradient 同口径）。
+- 与上游的**三处显式差异**（写死在 `engine/domain/tool_ops.h` 的 `ShapeParams` 注释）：
+  1. 上游画完会**新建一个像素图层**，本仓工具算子统一「画进当前图层」（新建图层由宿主
+     先做）；工具算子不该改图层树结构，否则 merge/flatten 的逐字节契约与撤销粒度都要改。
+  2. 上游矩形/椭圆只填充、直线只描边；本仓把填充与描边做成两个独立开关
+     （`fill`+`stroke` 同时开 = 超集能力，先填后描）。
+  3. 路径在本轮只是 ABI 能力，外壳的钢笔仍用于提交选区，不建形状。
+- 外壳（S10，`U`）：矩形 / 椭圆 / 直线三种可拖，已在该工具时再按 `U` 循环；
+  拖对角点（直线拖两端点）后松开提交，矩形/椭圆填充前景色、直线用前景色描边；
+  `Shift` = 正方/正圆，`Alt` = 从中心拉（松开时读修饰键）；`Alt+[` / `Alt+]` 调线宽，
+  `Shift+Alt+[` / `Shift+Alt+]` 调矩形圆角；`Esc` / 切工具 / 失焦只丢预览、不产生撤销步；
+  拖拽短于 1 px 时外壳先放弃并提示，不把一次手抖变成 `INVALID_ARGUMENT`。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。
@@ -305,3 +349,11 @@ coverage 把样本盖回当前像素。
   是**尾部追加**字段，既有字段偏移不变；不新增导出 ABI（仍是 **112** 个）。基线
   414 → **418 用例**（`test_tool_ops` 3 + `test_ui_core` 1），壳自检 103 → **113 项**。
   见 README §6.19。
+- S10 追加（2026-10-18）：新增 `COMP_TOOL_SHAPE = 14`（§4.11），`comp_tool_op_desc.shape`
+  是**尾部追加**字段，既有字段偏移不变；不新增导出 ABI（仍是 **112** 个）。
+  同时新增两个内核文件：`engine/domain/path_raster.{h,cpp}`（把路径基元与
+  扫描线填充从 `selection.cpp` 抽出，行为中立，`selection` 只是改名接线）与
+  `engine/domain/shape_raster.{h,cpp}`（fill/capsule-stroke/圆角矩形/路径扁平化 +
+  窗口化覆盖率）。基线 418 → **424 用例**（`test_tool_ops` 5 + `test_ui_core` 1），
+  壳自检 113 → **137 项**，`run_regression.py --require-ohos` 6/6 PASS。
+  见 README §6.20。

@@ -62,6 +62,30 @@
 [OK] COMP_TOOL_GRADIENT(coincident endpoints) rejected
 [OK] the rejected gradient leaves no undo step
 [OK] the rejected gradient leaves the render byte-identical
+[OK] COMP_TOOL_SHAPE stays at 14
+[OK] comp_tool_apply(COMP_TOOL_SHAPE rect)
+[OK] the rectangle is filled with the shape colour
+[OK] pixels outside the rectangle are untouched
+[OK] comp_document_undo(shape rect step)
+[OK] shape undo restores pixels byte-for-byte
+[OK] comp_tool_apply(COMP_TOOL_SHAPE ellipse)
+[OK] the ellipse centre is filled
+[OK] the ellipse leaves its bounding-box corner untouched
+[OK] comp_document_undo(shape ellipse step)
+[OK] ellipse undo restores pixels byte-for-byte
+[OK] comp_tool_apply(COMP_TOOL_SHAPE line)
+[OK] the line core is opaque
+[OK] a pixel inside half the stroke width is covered
+[OK] a pixel beyond half the stroke width is untouched
+[OK] the round cap extends past the endpoint
+[OK] the cap stops within half the stroke width
+[OK] comp_document_undo(shape line step)
+[OK] line undo restores pixels byte-for-byte
+[OK] COMP_TOOL_SHAPE(line with fill) rejected
+[OK] the rejected line shape leaves no undo step
+[OK] a shape entirely outside the layer succeeds as a no-op
+[OK] an off-canvas shape leaves no empty undo step
+[OK] an off-canvas shape leaves the render byte-identical
 [OK] comp_selection_get_active() starts at 0 (no selection)
 [OK] comp_selection_apply_shape(rect)
 [OK] comp_selection_get_active() == 1 after a rect shape

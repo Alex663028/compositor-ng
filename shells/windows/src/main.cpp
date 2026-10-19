@@ -197,6 +197,17 @@ struct ShellState {
   bool gradient_active = false;
   comp_ui::Point gradient_start{};
   comp_ui::Point gradient_current{};
+  /*
+   * 形状工具（S10）：U 切工具，已在该工具时再按 U 在矩形/椭圆/直线之间循环。
+   * 拖拽的对角点/两端点（文档像素）在松开时一次性提交 comp_tool_apply(COMP_TOOL_SHAPE)；
+   * 矩形/椭圆填充前景色，直线用前景色描边（宽度 = shape_stroke_width）。
+   */
+  int shape_kind = comp_ui::kShapeRect;
+  bool shape_active = false;
+  comp_ui::Point shape_start{};
+  comp_ui::Point shape_current{};
+  double shape_stroke_width = comp_ui::kDefaultShapeStrokeWidth;
+  double shape_corner_radius = comp_ui::kDefaultShapeCornerRadius;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
@@ -1510,6 +1521,118 @@ void gradient_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 形状（S10） */
+
+/*
+ * 形状工具（COMP_TOOL_SHAPE）：窗口路径是「拖出对角点 / 两端点 -> 一次 comp_tool_apply」。
+ *
+ * 与渐变同理，不在拖拽过程中反复提交：形状是一次性铺像素的算子，中途每一步都提交
+ * 会在撤销栈里留下几十步。预览只画几何轮廓（draw_canvas_overlays），松开才算一次操作。
+ *
+ * 外壳能产出的几何：矩形 / 椭圆（填充前景色）与直线（前景色描边，圆头端点）；
+ * 通用贝塞尔路径只经 ABI——本壳的钢笔用来提交选区，不造形状。圆角半径只对矩形
+ * 有效（0 = 直角），引擎再把半径夹到短边一半。Shift = 正方/正圆、Alt = 从中心拉，
+ * 与上游 ShapeTool 的修饰键一致。
+ */
+bool shape_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Shape;
+}
+
+void shape_cancel(ShellState& shell) { shell.shape_active = false; }
+
+void shape_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shape_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.shape_active = true;
+  shell.shape_start = doc;
+  shell.shape_current = doc;
+  SetCapture(window);
+  wchar_t buffer[224];
+  wsprintfW(buffer,
+            L"形状 / %s：拖出%s后松开（Shift = 正方/正圆，Alt = 从中心；再按 U 切种类）",
+            widen_ascii(comp_ui::shape_kind_name(shell.shape_kind)).c_str(),
+            shell.shape_kind == comp_ui::kShapeLine ? L"两端点" : L"对角点");
+  set_status(shell, buffer);
+}
+
+void shape_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.shape_active) return;
+  shell.shape_current =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+}
+
+void shape_end(HWND window, ShellState& shell) {
+  if (!shell.shape_active) return;
+  shell.shape_active = false;
+  ReleaseCapture();
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"形状：请先选择一个图层");
+    return;
+  }
+
+  /* 修饰键在松开时才读：拖动中按下/松开 Shift、Alt 都能改落笔盒（与框选同口径）。 */
+  const bool square = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  const bool from_center = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  const comp_ui::ShapeDragBox box = comp_ui::shape_drag_box(
+      shell.shape_start.x, shell.shape_start.y, shell.shape_current.x, shell.shape_current.y,
+      square, from_center);
+  const int kind = shell.shape_kind;
+  if (!comp_ui::shape_drag_is_usable(kind, box)) {
+    set_status(shell, kind == comp_ui::kShapeLine
+                          ? L"形状：拖拽太短，已放弃（直线需要两个不同端点）"
+                          : L"形状：拖拽太短，已放弃（宽高都至少需要 1 px）");
+    return;
+  }
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_SHAPE;
+  desc.shape.kind = static_cast<comp_shape_kind>(kind);
+  desc.shape.x0 = box.x0;
+  desc.shape.y0 = box.y0;
+  desc.shape.x1 = box.x1;
+  desc.shape.y1 = box.y1;
+  desc.shape.corner_radius =
+      kind == comp_ui::kShapeRect
+          ? comp_ui::shape_effective_corner_radius(shell.shape_corner_radius, box)
+          : 0.0;
+  const bool line = kind == comp_ui::kShapeLine;
+  const uint8_t color[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
+  for (int i = 0; i < 4; ++i) {
+    desc.shape.style.fill_color[i] = color[i];
+    desc.shape.style.stroke_color[i] = color[i];
+  }
+  /* 直线只有描边（引擎会拒绝「填充直线」）：矩形/椭圆的外壳默认是纯填充，与上游一致。 */
+  desc.shape.style.fill_enabled = line ? 0 : 1;
+  desc.shape.style.stroke_enabled = line ? 1 : 0;
+  desc.shape.style.stroke_width = comp_ui::clamp_shape_stroke_width(shell.shape_stroke_width);
+  desc.shape.style.opacity = 1.0f;
+  desc.shape.style.antialias = 1;
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"形状失败（%d）", static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    /* 引擎的 note 会如实说明「被选区遮罩」「与图层不相交」这类非致命情况。 */
+    wsprintfW(buffer, L"形状 / %s：已应用｜%s",
+              widen_ascii(comp_ui::shape_kind_name(kind)).c_str(), widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"形状 / %s：已应用", widen_ascii(comp_ui::shape_kind_name(kind)).c_str());
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 框选（Marquee） */
 
 bool marquee_available(const ShellState& shell) {
@@ -2753,8 +2876,64 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dashed);
   }
 
-  /* 套索预览：沿已采样的折线画一条高对比度细线（闭合边在松开时由引擎生成）。 */
-  if (shell.lasso_active && shell.lasso_points.size() >= 4) {
+  /*
+   * 形状预览（S10）：矩形/椭圆画白实线 + 黑虚线双描边（圆角矩形用 RoundRect），
+   * 直线画一条双线。只是几何提示，不预演颜色——真正的像素在松开时由引擎一次性写出
+   * （与渐变预览同口径）。修饰键（Shift = 正方/正圆、Alt = 从中心）在预览里就生效，
+   * 所见即落笔盒。
+   */
+  if (shell.shape_active) {
+    const bool square = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool from_center = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const comp_ui::ShapeDragBox box = comp_ui::shape_drag_box(
+        shell.shape_start.x, shell.shape_start.y, shell.shape_current.x, shell.shape_current.y,
+        square, from_center);
+    const comp_ui::Point a = shell.view.doc_to_screen(box.x0, box.y0, layout.canvas,
+                                                      shell.width, shell.height);
+    const comp_ui::Point b = shell.view.doc_to_screen(box.x1, box.y1, layout.canvas,
+                                                      shell.width, shell.height);
+    const int left = static_cast<int>(std::lround(std::min(a.x, b.x)));
+    const int top = static_cast<int>(std::lround(std::min(a.y, b.y)));
+    const int right = static_cast<int>(std::lround(std::max(a.x, b.x)));
+    const int bottom = static_cast<int>(std::lround(std::max(a.y, b.y)));
+
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    if (shell.shape_kind == comp_ui::kShapeLine) {
+      MoveToEx(dc, left, top, nullptr);
+      LineTo(dc, right, bottom);
+      SelectObject(dc, dotted);
+      MoveToEx(dc, left, top, nullptr);
+      LineTo(dc, right, bottom);
+    } else if (shell.shape_kind == comp_ui::kShapeEllipse) {
+      Ellipse(dc, left, top, right, bottom);
+      SelectObject(dc, dotted);
+      Ellipse(dc, left, top, right, bottom);
+    } else {
+      /* 圆角半径按同样的屏幕缩放换算，预览与落笔盒一致。 */
+      const double zoom = shell.view.zoom;
+      const int radius = static_cast<int>(
+          std::lround(comp_ui::shape_effective_corner_radius(shell.shape_corner_radius, box) *
+                      (zoom > 0.0 ? zoom : 0.0)));
+      if (radius > 0) {
+        RoundRect(dc, left, top, right, bottom, radius * 2, radius * 2);
+        SelectObject(dc, dotted);
+        RoundRect(dc, left, top, right, bottom, radius * 2, radius * 2);
+      } else {
+        Rectangle(dc, left, top, right, bottom);
+        SelectObject(dc, dotted);
+        Rectangle(dc, left, top, right, bottom);
+      }
+    }
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+
+  /* 套索预览：沿已采样的折线画一条高对比度细线（闭合边在松开时由引擎生成）。 */  if (shell.lasso_active && shell.lasso_points.size() >= 4) {
     HPEN trail = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
     HGDIOBJ old_pen = SelectObject(dc, trail);
     bool started = false;
@@ -3035,6 +3214,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (shell.tool == comp_ui::ToolId::Gradient && id != comp_ui::ToolId::Gradient) {
     gradient_cancel(shell);
   }
+  /* 离开形状工具同理：只丢预览。 */
+  if (shell.tool == comp_ui::ToolId::Shape && id != comp_ui::ToolId::Shape) {
+    shape_cancel(shell);
+  }
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
@@ -3056,6 +3239,12 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
     wsprintfW(buffer,
               L"工具：Gradient / %s（拖出方向与长度后松开；再按 G 切线性/径向；Shift 反向；色标 = 前景 → 透明）",
               widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
+  } else if (id == comp_ui::ToolId::Shape) {
+    wsprintfW(buffer,
+              L"工具：Shape / %s（拖出%s；Shift = 正方/正圆，Alt = 从中心；再按 U 切种类；"
+              L"Alt+[ / ] 调线宽，Shift+Alt+[ / ] 调圆角）",
+              widen_ascii(comp_ui::shape_kind_name(shell.shape_kind)).c_str(),
+              shell.shape_kind == comp_ui::kShapeLine ? L"两端点" : L"对角点");
   } else if (id == comp_ui::ToolId::Wand) {
     wsprintfW(buffer,
               L"工具：Magic Wand（容差 %d，窗口 %d×%d，%s取样，%s；[ / ] 调容差，Alt+[ / ] 调窗口，Shift+W 切来源）",
@@ -3356,6 +3545,12 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       pen_cancel(shell);
       return;
     }
+    /* 形状拖拽中 Esc 只取消这一笔预览，不关窗。 */
+    if (shell.shape_active) {
+      shape_cancel(shell);
+      set_status(shell, L"已取消形状拖拽（未产生撤销步）");
+      return;
+    }
     PostMessageW(window, WM_CLOSE, 0, 0);
     return;
   }
@@ -3567,6 +3762,22 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         }
         break;
       }
+      if (key == 'U' && !ctrl) {
+        /* 重复按 U 在同一工具内循环 Rectangle -> Ellipse -> Line（与 M/G/R 同款习惯）。 */
+        if (shell.tool == comp_ui::ToolId::Shape) {
+          shell.shape_kind = comp_ui::next_shell_shape_kind(shell.shape_kind);
+          wchar_t buffer[224];
+          wsprintfW(buffer, L"形状种类：%s（再按 U 切换；%s）",
+                    widen_ascii(comp_ui::shape_kind_name(shell.shape_kind)).c_str(),
+                    shell.shape_kind == comp_ui::kShapeLine
+                        ? L"Alt+[ / ] 调线宽"
+                        : L"Shift+Alt+[ / ] 调圆角，Alt+[ / ] 调线宽");
+          set_status(shell, buffer);
+        } else {
+          set_tool(shell, comp_ui::ToolId::Shape);
+        }
+        break;
+      }
       if (key < 128) {
         const comp_ui::ToolId id =
             comp_ui::tool_shortcut_target(shell.tool, static_cast<char>(key));
@@ -3668,6 +3879,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               wand_click(window, *shell, mouse_x, mouse_y, layout);
             } else if (gradient_available(*shell)) {
               gradient_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (shape_available(*shell)) {
+              shape_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
@@ -3702,6 +3915,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       if (shell != nullptr && shell->gradient_active) {
         gradient_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->shape_active) {
+        shape_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -3753,6 +3971,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
+        shape_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
@@ -3765,6 +3984,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
+        shape_cancel(*shell);
       }
       break;
     case WM_MOUSEMOVE:
@@ -3779,6 +3999,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->gradient_active) {
             gradient_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->shape_active) {
+            shape_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->eyedropper_drag) {
             /* 吸管拖动连续取样：只更新前景色与状态栏，不改画布内容。 */
@@ -3845,12 +4068,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
        */
       if (shell != nullptr && (wparam == VK_OEM_4 || wparam == VK_OEM_6)) {
         const int direction = wparam == VK_OEM_6 ? 1 : -1;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         wchar_t buffer[128];
         if (shell->tool == comp_ui::ToolId::Wand) {
           /* S8：魔棒的取样窗口是 (2r+1)²，0 = 只取种子像素（S7 行为）。 */
           shell->wand_radius = comp_ui::step_wand_radius(shell->wand_radius, direction);
           wsprintfW(buffer, L"魔棒取样窗口 %d×%d（半径 %d px）",
                     shell->wand_radius * 2 + 1, shell->wand_radius * 2 + 1, shell->wand_radius);
+        } else if (shell->tool == comp_ui::ToolId::Shape && shift &&
+                   shell->shape_kind == comp_ui::kShapeRect) {
+          /* S10：Shift+Alt+[ / ] 调矩形圆角半径（0 = 直角；引擎再夹到短边一半）。 */
+          shell->shape_corner_radius =
+              comp_ui::step_shape_corner_radius(shell->shape_corner_radius, direction);
+          wsprintfW(buffer, L"矩形圆角半径 %d px（0 = 直角）",
+                    static_cast<int>(shell->shape_corner_radius + 0.5));
+        } else if (shell->tool == comp_ui::ToolId::Shape) {
+          /* S10：Alt+[ / ] 调形状描边宽度（直线用；矩形/椭圆的外壳默认纯填充）。 */
+          shell->shape_stroke_width =
+              comp_ui::step_shape_stroke_width(shell->shape_stroke_width, direction);
+          wsprintfW(buffer, L"形状描边宽度 %d px（直线描边用）",
+                    static_cast<int>(shell->shape_stroke_width + 0.5));
         } else if (shell->tool == comp_ui::ToolId::Retouch &&
                    shell->retouch_mode != comp_ui::kRetouchBlur) {
           shell->retouch_strength =
@@ -4490,6 +4727,144 @@ int run_selftest(const wchar_t* out_path) {
   comp_render_flatten(document, gradient_after_reject.data(), COMP_PIXEL_RGBA8, stride);
   verify(gradient_after_reject == gradient_restored,
          "the rejected gradient leaves the render byte-identical");
+
+  /*
+   * 形状（COMP_TOOL_SHAPE，S10）：窗口路径是「拖出对角点 / 两端点 -> comp_tool_apply」。
+   * 冻结：枚举值、矩形填充与逐字节撤销、椭圆不碰包围盒角（椭圆不是矩形）、直线是
+   * 圆头描边而不是填充、带填充的直线被参数闸拒绝且不留撤销步、图层外形状成功但
+   * 不产生空撤销步。
+   */
+  verify(static_cast<int>(COMP_TOOL_SHAPE) == 14, "COMP_TOOL_SHAPE stays at 14");
+
+  std::vector<uint8_t> shape_before(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, shape_before.data(), COMP_PIXEL_RGBA8, stride);
+  size_t shape_undo_before = 0;
+  size_t shape_redo = 0;
+  comp_document_history_stats(document, &shape_undo_before, &shape_redo);
+
+  comp_tool_op_desc shape_rect_desc{};
+  shape_rect_desc.kind = COMP_TOOL_SHAPE;
+  shape_rect_desc.shape.kind = COMP_SHAPE_RECT;
+  shape_rect_desc.shape.x0 = 8.0;
+  shape_rect_desc.shape.y0 = 8.0;
+  shape_rect_desc.shape.x1 = 40.0;
+  shape_rect_desc.shape.y1 = 40.0;
+  shape_rect_desc.shape.style.fill_enabled = 1;
+  shape_rect_desc.shape.style.fill_color[1] = 255; /* 不透明绿 */
+  shape_rect_desc.shape.style.fill_color[3] = 255;
+  shape_rect_desc.shape.style.opacity = 1.0f;
+  shape_rect_desc.shape.style.antialias = 1;
+  const bool shape_rect_ok =
+      comp_tool_apply(document, layer, &shape_rect_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(shape_rect_ok, "comp_tool_apply(COMP_TOOL_SHAPE rect)");
+  std::vector<uint8_t> shape_rect_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, shape_rect_after.data(), COMP_PIXEL_RGBA8, stride);
+  const size_t rect_inside = static_cast<size_t>(20) * stride + static_cast<size_t>(20) * 4u;
+  const size_t rect_outside = static_cast<size_t>(20) * stride + static_cast<size_t>(44) * 4u;
+  verify(shape_rect_ok && shape_rect_after[rect_inside + 1] == 255 && shape_rect_after[rect_inside + 3] == 255,
+         "the rectangle is filled with the shape colour");
+  verify(shape_rect_ok && std::memcmp(&shape_rect_after[rect_outside], &shape_before[rect_outside], 4) == 0,
+         "pixels outside the rectangle are untouched");
+  verify(shape_rect_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(shape rect step)");
+  std::vector<uint8_t> shape_restored(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, shape_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(shape_rect_ok && shape_restored == shape_before,
+         "shape undo restores pixels byte-for-byte");
+
+  /* 椭圆：中心要填，包围盒的角不能填——那正是「椭圆不是矩形」的证据。 */
+  comp_tool_op_desc shape_ellipse_desc = shape_rect_desc;
+  shape_ellipse_desc.shape.kind = COMP_SHAPE_ELLIPSE;
+  shape_ellipse_desc.shape.style.fill_color[0] = 255;
+  shape_ellipse_desc.shape.style.fill_color[1] = 0;
+  const bool shape_ellipse_ok =
+      comp_tool_apply(document, layer, &shape_ellipse_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(shape_ellipse_ok, "comp_tool_apply(COMP_TOOL_SHAPE ellipse)");
+  std::vector<uint8_t> shape_ellipse_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, shape_ellipse_after.data(), COMP_PIXEL_RGBA8, stride);
+  const size_t shape_ellipse_center = static_cast<size_t>(20) * stride + static_cast<size_t>(20) * 4u;
+  const size_t shape_ellipse_corner = static_cast<size_t>(8) * stride + static_cast<size_t>(8) * 4u;
+  verify(shape_ellipse_ok && shape_ellipse_after[shape_ellipse_center] == 255 && shape_ellipse_after[shape_ellipse_center + 3] == 255,
+         "the ellipse centre is filled");
+  verify(shape_ellipse_ok &&
+             std::memcmp(&shape_ellipse_after[shape_ellipse_corner], &shape_before[shape_ellipse_corner], 4) == 0,
+         "the ellipse leaves its bounding-box corner untouched");
+  verify(shape_ellipse_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(shape ellipse step)");
+  comp_render_flatten(document, shape_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(shape_ellipse_ok && shape_restored == shape_before,
+         "ellipse undo restores pixels byte-for-byte");
+
+  /* 直线：只有描边（fill 必须为 0）；圆头端点越过端点半个线宽。 */
+  comp_tool_op_desc shape_line_desc{};
+  shape_line_desc.kind = COMP_TOOL_SHAPE;
+  shape_line_desc.shape.kind = COMP_SHAPE_LINE;
+  shape_line_desc.shape.x0 = 8.0;
+  shape_line_desc.shape.y0 = 32.0;
+  shape_line_desc.shape.x1 = 56.0;
+  shape_line_desc.shape.y1 = 32.0;
+  shape_line_desc.shape.style.fill_enabled = 0;
+  shape_line_desc.shape.style.stroke_enabled = 1;
+  shape_line_desc.shape.style.stroke_color[0] = 255;
+  shape_line_desc.shape.style.stroke_color[1] = 255;
+  shape_line_desc.shape.style.stroke_color[2] = 255;
+  shape_line_desc.shape.style.stroke_color[3] = 255;
+  shape_line_desc.shape.style.stroke_width = 6.0; /* 半宽 3 */
+  shape_line_desc.shape.style.opacity = 1.0f;
+  shape_line_desc.shape.style.antialias = 1;
+  const bool shape_line_ok =
+      comp_tool_apply(document, layer, &shape_line_desc, tool_note, sizeof(tool_note),
+                      &tool_note_size) == COMP_OK;
+  verify(shape_line_ok, "comp_tool_apply(COMP_TOOL_SHAPE line)");
+  std::vector<uint8_t> shape_line_after(stride * static_cast<size_t>(height), 0);
+  comp_render_flatten(document, shape_line_after.data(), COMP_PIXEL_RGBA8, stride);
+  const auto at = [&](int32_t x, int32_t y) {
+    return static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4u;
+  };
+  verify(shape_line_ok && shape_line_after[at(32, 32) + 3] == 255, "the line core is opaque");
+  verify(shape_line_ok && shape_line_after[at(32, 29) + 3] == 255,
+         "a pixel inside half the stroke width is covered");
+  verify(shape_line_ok && std::memcmp(&shape_line_after[at(32, 28)], &shape_before[at(32, 28)], 4) == 0,
+         "a pixel beyond half the stroke width is untouched");
+  verify(shape_line_ok && shape_line_after[at(58, 32) + 3] > 0, "the round cap extends past the endpoint");
+  verify(shape_line_ok && std::memcmp(&shape_line_after[at(60, 32)], &shape_before[at(60, 32)], 4) == 0,
+         "the cap stops within half the stroke width");
+  verify(shape_line_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(shape line step)");
+  comp_render_flatten(document, shape_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(shape_line_ok && shape_restored == shape_before,
+         "line undo restores pixels byte-for-byte");
+
+  /* 「填充直线」没有定义：参数闸必须在事务之前拒绝，撤销栈与像素都不许动。 */
+  comp_tool_op_desc filled_line = shape_line_desc;
+  filled_line.shape.style.fill_enabled = 1;
+  verify(comp_tool_apply(document, layer, &filled_line, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_ERR_INVALID_ARGUMENT,
+         "COMP_TOOL_SHAPE(line with fill) rejected");
+  size_t shape_undo_after_reject = 0;
+  comp_document_history_stats(document, &shape_undo_after_reject, &shape_redo);
+  verify(shape_undo_after_reject == shape_undo_before,
+         "the rejected line shape leaves no undo step");
+
+  /* 合法但完全落在图层外的形状：成功、无像素改动、不产生空撤销步。 */
+  comp_tool_op_desc outside_desc = shape_rect_desc;
+  outside_desc.shape.x0 = 100.0;
+  outside_desc.shape.y0 = 100.0;
+  outside_desc.shape.x1 = 120.0;
+  outside_desc.shape.y1 = 120.0;
+  verify(comp_tool_apply(document, layer, &outside_desc, tool_note, sizeof(tool_note),
+                         &tool_note_size) == COMP_OK,
+         "a shape entirely outside the layer succeeds as a no-op");
+  size_t shape_undo_after_outside = 0;
+  comp_document_history_stats(document, &shape_undo_after_outside, &shape_redo);
+  verify(shape_undo_after_outside == shape_undo_before,
+         "an off-canvas shape leaves no empty undo step");
+  comp_render_flatten(document, shape_restored.data(), COMP_PIXEL_RGBA8, stride);
+  verify(shape_restored == shape_before,
+         "an off-canvas shape leaves the render byte-identical");
+
 
   /*
    * 选区：壳层蚂蚁线的数据源就是这条「有效 coverage」查询。这里冻结三件事：

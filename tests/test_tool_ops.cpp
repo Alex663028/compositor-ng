@@ -975,3 +975,338 @@ COMP_TEST(tool_ops_gradient_rejects_degenerate_or_invisible_parameters) {
   COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
   COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal gradient undoes exactly");
 }
+
+namespace {
+
+/* 形状 desc：几何由调用方填，样式先全部关掉（再按用例打开）。 */
+comp_tool_op_desc shape_desc(comp_shape_kind kind) {
+  comp_tool_op_desc desc = base(COMP_TOOL_SHAPE);
+  desc.shape.kind = kind;
+  desc.shape.style.fill_enabled = 0;
+  desc.shape.style.stroke_enabled = 0;
+  desc.shape.style.opacity = 1.0f;
+  desc.shape.style.antialias = 1;
+  desc.shape.style.stroke_width = 4.0;
+  desc.shape.closed = 1;
+  return desc;
+}
+
+/* 填充与描边同色（用例里通常只开其中一个）。 */
+void shape_color(comp_tool_op_desc* desc, uint8_t r, uint8_t g, uint8_t b, uint8_t a, bool fill,
+                 bool stroke) {
+  desc->shape.style.fill_enabled = fill ? 1 : 0;
+  desc->shape.style.stroke_enabled = stroke ? 1 : 0;
+  const uint8_t color[4] = {r, g, b, a};
+  for (int c = 0; c < 4; ++c) {
+    desc->shape.style.fill_color[c] = color[c];
+    desc->shape.style.stroke_color[c] = color[c];
+  }
+}
+
+comp_shape_cubic shape_cubic(double sx, double sy, double c1x, double c1y, double c2x, double c2y,
+                             double ex, double ey, bool new_subpath) {
+  comp_shape_cubic segment{};
+  segment.start[0] = static_cast<float>(sx);
+  segment.start[1] = static_cast<float>(sy);
+  segment.control1[0] = static_cast<float>(c1x);
+  segment.control1[1] = static_cast<float>(c1y);
+  segment.control2[0] = static_cast<float>(c2x);
+  segment.control2[1] = static_cast<float>(c2y);
+  segment.end[0] = static_cast<float>(ex);
+  segment.end[1] = static_cast<float>(ey);
+  segment.new_subpath = new_subpath ? 1 : 0;
+  return segment;
+}
+
+}  // namespace
+
+COMP_TEST(tool_ops_shape_rectangle_fills_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_SHAPE) == 14, "COMP_TOOL_SHAPE stays at 14");
+
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(0, 0, 0); /* 不透明黑：便于看通道替换 */
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  comp_tool_op_desc rect = shape_desc(COMP_SHAPE_RECT);
+  rect.shape.x0 = 2.0;
+  rect.shape.y0 = 2.0;
+  rect.shape.x1 = 10.0;
+  rect.shape.y1 = 10.0;
+  shape_color(&rect, 255, 0, 0, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, rect) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  COMP_CHECK_MSG(red_at(after, 5, 5) == 255 && green_at(after, 5, 5) == 0 &&
+                     blue_at(after, 5, 5) == 0,
+                 "the rectangle interior is painted with the fill color");
+  COMP_CHECK_MSG(alpha_at(after, 5, 5) == 255, "an opaque fill keeps the layer opaque");
+  COMP_CHECK_MSG(red_at(after, 2, 5) == 255, "an integer-aligned edge is fully covered");
+  COMP_CHECK_MSG(red_at(after, 1, 5) == 0 && red_at(after, 10, 5) == 0,
+                 "the box edges are exclusive for integer-aligned geometry");
+
+  /* 一步撤销 ⇒ 逐字节回到形状之前。 */
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1, "a shape adds exactly one undo step");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the pixels byte for byte");
+
+  /* 半像素边界 ⇒ 覆盖率约 50%（8 位量化允许 ±4 级）。 */
+  comp_tool_op_desc half = shape_desc(COMP_SHAPE_RECT);
+  half.shape.x0 = 3.5;
+  half.shape.y0 = 0.0;
+  half.shape.x1 = 12.5;
+  half.shape.y1 = 16.0;
+  shape_color(&half, 255, 0, 0, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, half) == COMP_OK);
+  const std::vector<uint8_t> edge = flatten(fx.doc);
+  const int half_red = static_cast<int>(red_at(edge, 3, 8));
+  COMP_CHECK_MSG(half_red >= 120 && half_red <= 136,
+                 "a half-covered edge pixel gets about half the fill color");
+  COMP_CHECK_MSG(red_at(edge, 12, 8) >= 120 && red_at(edge, 12, 8) <= 136,
+                 "the antialiased right edge is half covered too");
+  COMP_CHECK_MSG(red_at(edge, 8, 8) == 255, "pixels fully inside the box stay fully covered");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undoing the antialiased edge is exact");
+}
+
+COMP_TEST(tool_ops_shape_ellipse_respects_the_selection) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(0, 0, 0);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  comp_tool_op_desc ellipse = shape_desc(COMP_SHAPE_ELLIPSE);
+  ellipse.shape.x0 = 2.0;
+  ellipse.shape.y0 = 2.0;
+  ellipse.shape.x1 = 14.0;
+  ellipse.shape.y1 = 14.0;
+  shape_color(&ellipse, 0, 255, 0, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, ellipse) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(green_at(after, 8, 8) == 255, "the ellipse center is filled");
+  COMP_CHECK_MSG(green_at(after, 2, 2) == 0, "the box corner outside the ellipse is untouched");
+  COMP_CHECK_MSG(green_at(after, 1, 8) == 0, "left of the ellipse is untouched");
+  COMP_CHECK_MSG(green_at(after, 8, 1) == 0, "above the ellipse is untouched");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undoing the ellipse is exact");
+
+  /* 选区：只选左半；椭圆在右半的部分必须逐字节不动。 */
+  const float sel[4] = {0.0f, 0.0f, 8.0f, 16.0f};
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_apply_shape(fx.doc, COMP_SELECTION_RECT, sel, 2,
+                                        COMP_SELECTION_REPLACE, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed != 0, "the left-half selection really was created");
+
+  comp_tool_op_desc masked = shape_desc(COMP_SHAPE_ELLIPSE);
+  masked.shape.x0 = 2.0;
+  masked.shape.y0 = 2.0;
+  masked.shape.x1 = 14.0;
+  masked.shape.y1 = 14.0;
+  shape_color(&masked, 0, 0, 255, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, masked) == COMP_OK);
+  const std::vector<uint8_t> masked_after = flatten(fx.doc);
+  COMP_CHECK_MSG(blue_at(masked_after, 3, 8) > 0, "the selected half of the ellipse is painted");
+  COMP_CHECK_MSG(blue_at(masked_after, 12, 8) == 0 && green_at(masked_after, 12, 8) == 0,
+                 "outside the selection the layer stays byte-identical black");
+  COMP_CHECK_MSG(alpha_at(masked_after, 12, 8) == 255, "outside the selection alpha is untouched");
+}
+
+COMP_TEST(tool_ops_shape_line_is_a_round_capped_stroke) {
+  Fixture fx;
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+
+  comp_tool_op_desc line = shape_desc(COMP_SHAPE_LINE);
+  line.shape.x0 = 2.0;
+  line.shape.y0 = 8.0;
+  line.shape.x1 = 13.0;
+  line.shape.y1 = 8.0;
+  line.shape.style.stroke_width = 4.0; /* 半宽 2 */
+  shape_color(&line, 255, 255, 255, 255, false, true);
+  COMP_CHECK(apply(fx.doc, fx.layer, line) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  COMP_CHECK_MSG(alpha_at(after, 8, 8) == 255, "the line core is fully covered");
+  COMP_CHECK_MSG(alpha_at(after, 8, 6) == 255, "half the stroke width away is still inside");
+  COMP_CHECK_MSG(alpha_at(after, 8, 5) == 0, "beyond half the stroke width nothing is painted");
+  COMP_CHECK_MSG(alpha_at(after, 8, 12) == 0, "the opposite side of the line is untouched");
+  COMP_CHECK_MSG(alpha_at(after, 14, 8) > 0, "the round cap extends past the endpoint");
+  COMP_CHECK_MSG(alpha_at(after, 15, 8) == 0, "the cap stops within half the stroke width");
+  COMP_CHECK_MSG(alpha_at(after, 0, 8) > 0, "the start cap is round as well");
+
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == transparent, "undoing the line returns to a transparent layer");
+}
+
+COMP_TEST(tool_ops_shape_path_fills_with_a_hole) {
+  Fixture fx;
+  std::vector<uint8_t> transparent(static_cast<size_t>(kW) * kH * 4, 0);
+  set_pixels(fx.doc, fx.layer, transparent);
+
+  /*
+   * 外框顺时针（右 → 下 → 左 → 上），内框逆时针（下 → 右 → 上 → 左）：
+   * 非零缠绕下内框成为洞，正好验证「反向子路径挖洞」这条选中/形状共用的规则。
+   * 每段用共线控制点，扁平化后就是直线段。
+   */
+  const comp_shape_cubic segments[8] = {
+      shape_cubic(2, 2, 6, 2, 10, 2, 14, 2, true),
+      shape_cubic(14, 2, 14, 6, 14, 10, 14, 14, false),
+      shape_cubic(14, 14, 10, 14, 6, 14, 2, 14, false),
+      shape_cubic(2, 14, 2, 10, 2, 6, 2, 2, false),
+      shape_cubic(5, 5, 5, 7, 5, 9, 5, 11, true),
+      shape_cubic(5, 11, 7, 11, 9, 11, 11, 11, false),
+      shape_cubic(11, 11, 11, 9, 11, 7, 11, 5, false),
+      shape_cubic(11, 5, 9, 5, 7, 5, 5, 5, false),
+  };
+
+  comp_tool_op_desc path = shape_desc(COMP_SHAPE_PATH);
+  path.shape.segments = segments;
+  path.shape.segment_count = 8;
+  path.shape.closed = 1;
+  shape_color(&path, 255, 0, 0, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, path) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  COMP_CHECK_MSG(red_at(after, 3, 8) == 255 || red_at(after, 4, 8) == 255,
+                 "the ring between the outer and inner subpaths is filled");
+  COMP_CHECK_MSG(red_at(after, 8, 8) == 0 && alpha_at(after, 8, 8) == 0,
+                 "the reversed inner subpath leaves a real hole");
+  COMP_CHECK_MSG(red_at(after, 8, 3) == 255, "the top band of the ring is filled");
+  COMP_CHECK_MSG(red_at(after, 1, 8) == 0 && alpha_at(after, 1, 8) == 0,
+                 "outside the outer subpath is untouched");
+
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == transparent, "undoing the path returns to a transparent layer");
+}
+
+COMP_TEST(tool_ops_shape_rejects_bad_parameters_and_noops_off_canvas) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(10, 20, 30);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  /* 填充与描边全关：没有可画的样式。 */
+  comp_tool_op_desc neither = shape_desc(COMP_SHAPE_RECT);
+  neither.shape.x0 = 2.0;
+  neither.shape.y0 = 2.0;
+  neither.shape.x1 = 10.0;
+  neither.shape.y1 = 10.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, neither) == COMP_ERR_INVALID_ARGUMENT,
+                 "a shape with neither fill nor stroke is an argument error");
+
+  /* 直线不许填充：填一条「实心线」没有定义。 */
+  comp_tool_op_desc filled_line = shape_desc(COMP_SHAPE_LINE);
+  filled_line.shape.x0 = 2.0;
+  filled_line.shape.y0 = 8.0;
+  filled_line.shape.x1 = 13.0;
+  filled_line.shape.y1 = 8.0;
+  shape_color(&filled_line, 255, 255, 255, 255, true, true);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, filled_line) == COMP_ERR_INVALID_ARGUMENT,
+                 "a filled line shape is rejected instead of silently dropping the fill");
+
+  /* 退化盒（高度 0）与全透明颜色。 */
+  comp_tool_op_desc flat_box = shape_desc(COMP_SHAPE_RECT);
+  flat_box.shape.x0 = 2.0;
+  flat_box.shape.y0 = 8.0;
+  flat_box.shape.x1 = 13.0;
+  flat_box.shape.y1 = 8.0;
+  shape_color(&flat_box, 255, 0, 0, 255, true, false);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, flat_box) == COMP_ERR_INVALID_ARGUMENT,
+                 "a zero-height box is an argument error");
+
+  comp_tool_op_desc invisible = shape_desc(COMP_SHAPE_RECT);
+  invisible.shape.x0 = 2.0;
+  invisible.shape.y0 = 2.0;
+  invisible.shape.x1 = 10.0;
+  invisible.shape.y1 = 10.0;
+  shape_color(&invisible, 255, 255, 255, 0, true, false);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, invisible) == COMP_ERR_INVALID_ARGUMENT,
+                 "a fully transparent fill is rejected instead of recording a no-op step");
+
+  /* 未知种类与空路径。 */
+  comp_tool_op_desc bad_kind = shape_desc(COMP_SHAPE_RECT);
+  bad_kind.shape.kind = static_cast<comp_shape_kind>(9);
+  bad_kind.shape.x0 = 2.0;
+  bad_kind.shape.y0 = 2.0;
+  bad_kind.shape.x1 = 10.0;
+  bad_kind.shape.y1 = 10.0;
+  shape_color(&bad_kind, 255, 0, 0, 255, true, false);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, bad_kind) == COMP_ERR_INVALID_ARGUMENT,
+                 "an unknown shape kind is an argument error");
+
+  comp_tool_op_desc empty_path = shape_desc(COMP_SHAPE_PATH);
+  shape_color(&empty_path, 255, 0, 0, 255, true, false);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, empty_path) == COMP_ERR_INVALID_ARGUMENT,
+                 "a path without segments is an argument error");
+
+  /* 开了描边却给了 0 线宽：这时线宽不再是「用不到的字段」，必须拒绝。 */
+  comp_tool_op_desc no_width = shape_desc(COMP_SHAPE_LINE);
+  no_width.shape.x0 = 2.0;
+  no_width.shape.y0 = 8.0;
+  no_width.shape.x1 = 13.0;
+  no_width.shape.y1 = 8.0;
+  shape_color(&no_width, 255, 255, 255, 255, false, true);
+  no_width.shape.style.stroke_width = 0.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, no_width) == COMP_ERR_INVALID_ARGUMENT,
+                 "a stroked shape with zero stroke width is an argument error");
+
+  /* 闸在事务之前：七次拒绝都不进撤销栈，也不改一个像素。 */
+  size_t undo_after_rejects = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after_rejects, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after_rejects == undo_before, "rejected shapes must not add an undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "rejected shapes leave the render byte-identical");
+
+  /*
+   * 合法但完全落在图层外的形状：成功、无像素改动、**不产生撤销步**
+   * （否则宿主会看到一步什么都没做的撤销）。
+   */
+  comp_tool_op_desc outside = shape_desc(COMP_SHAPE_RECT);
+  outside.shape.x0 = 100.0;
+  outside.shape.y0 = 100.0;
+  outside.shape.x1 = 120.0;
+  outside.shape.y1 = 120.0;
+  shape_color(&outside, 255, 0, 0, 255, true, false);
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, outside) == COMP_OK,
+                 "a shape entirely outside the layer succeeds as a no-op");
+  size_t undo_after_outside = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after_outside, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after_outside == undo_before,
+                 "an off-canvas shape must not leave an empty undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "an off-canvas shape changes no pixel");
+
+  /* 改成合法几何就必须成功——证明拒绝的是参数而不是整条通路。 */
+  comp_tool_op_desc legal = shape_desc(COMP_SHAPE_RECT);
+  legal.shape.x0 = 2.0;
+  legal.shape.y0 = 2.0;
+  legal.shape.x1 = 10.0;
+  legal.shape.y1 = 10.0;
+  shape_color(&legal, 0, 0, 255, 255, true, false);
+  COMP_CHECK(apply(fx.doc, fx.layer, legal) == COMP_OK);
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal shape undoes exactly");
+
+  /*
+   * 纯填充形状不看 stroke_width：宿主没填线宽（0）也必须成功——S10 外壳的
+   * 矩形/椭圆默认只开填充，不能因为一个用不到的字段被参数闸挡下。
+   */
+  comp_tool_op_desc fill_only = shape_desc(COMP_SHAPE_RECT);
+  fill_only.shape.x0 = 2.0;
+  fill_only.shape.y0 = 2.0;
+  fill_only.shape.x1 = 10.0;
+  fill_only.shape.y1 = 10.0;
+  shape_color(&fill_only, 255, 0, 0, 255, true, false);
+  fill_only.shape.style.stroke_width = 0.0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, fill_only) == COMP_OK,
+                 "a fill-only shape ignores stroke_width (0 is legal)");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the fill-only shape undoes exactly");
+}

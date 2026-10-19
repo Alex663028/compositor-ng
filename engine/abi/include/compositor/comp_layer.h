@@ -381,7 +381,14 @@ typedef enum comp_tool_op {
    * 方向/半径 + 两个色标在图层像素上铺一片渐变；选区活跃时按选区覆盖率
    * 混合（与像素滤镜同口径）。见 `comp_tool_gradient`。
    */
-  COMP_TOOL_GRADIENT = 13
+  COMP_TOOL_GRADIENT = 13,
+  /*
+   * S10 尾部追加：形状工具（上游 ShapeTool 的矩形/椭圆/直线 + 通用贝塞尔路径）。
+   * 与前 13 个算子不同的地方：它不吃笔迹折线，几何由 `comp_tool_shape` 直接给出
+   * （对角点 / 两端点 / 路径段），填充与描边是同一份内核产出的两张覆盖率。
+   * 见 `comp_tool_shape`。
+   */
+  COMP_TOOL_SHAPE = 14
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -516,6 +523,86 @@ typedef struct comp_tool_gradient {
   float   opacity;     /* 0..1，整片渐变的覆盖率上限 */
 } comp_tool_gradient;
 
+/* ============================================================== 形状（S10） */
+
+/* 形状种类（数值与域层 `ShapeKind`、形状内核 `ShapeRasterKind` 三方一致）。 */
+typedef enum comp_shape_kind {
+  COMP_SHAPE_RECT = 0,
+  COMP_SHAPE_ELLIPSE = 1,
+  COMP_SHAPE_LINE = 2,
+  COMP_SHAPE_PATH = 3
+} comp_shape_kind;
+
+/*
+ * 三次贝塞尔路径段（文档像素）。`new_subpath` 非 0 表示从 `start` 起一条新子路径，
+ * 否则接着上一条子路径的终点画。坐标是 float（与 `comp_selection_cubic` 同口径），
+ * 引擎侧转 double 后做 de Casteljau 细分，0.1 像素弦高容差。
+ */
+typedef struct comp_shape_cubic {
+  float   start[2];
+  float   control1[2];
+  float   control2[2];
+  float   end[2];
+  int32_t new_subpath;
+} comp_shape_cubic;
+
+/*
+ * 形状样式（语义见 domain/tool_ops.h 的 `ShapeStyle`）。
+ *
+ * 颜色是**直通 sRGB + alpha（非预乘）**，铺到图层时按 source-over 预乘混合；
+ * `opacity` 再乘进逐像素覆盖率；`antialias` 非 0 = 抗锯齿（4 行超采样 +
+ * 水平解析覆盖率），0 = 像素中心一票（硬边）。
+ *
+ * `stroke_width` 是文档像素的**全宽**（胶囊描边半径 = 半宽），圆头端点/圆角连接。
+ * 矩形/椭圆描边的是轮廓本身；直线只有描边。
+ */
+typedef struct comp_shape_style {
+  int32_t fill_enabled;   /* 非 0 = 填充 */
+  int32_t stroke_enabled; /* 非 0 = 描边 */
+  uint8_t fill_color[4];  /* 直通 sRGB + alpha（0..255） */
+  uint8_t stroke_color[4];
+  double  stroke_width;   /* 文档像素全宽；只在 stroke_enabled 非 0 时校验（> 0） */
+  float   opacity;        /* 0..1 */
+  int32_t antialias;      /* 非 0 = 抗锯齿 */
+} comp_shape_style;
+
+/*
+ * 形状参数（上游 ShapeTool.swift 的语义；三处与本仓的显式差异见
+ * domain/tool_ops.h 的 `ShapeParams` 注释：画进当前图层而不是新建图层、
+ * 填充与描边各自独立、多出通用贝塞尔路径）。
+ *
+ * 几何：
+ *   - COMP_SHAPE_RECT / COMP_SHAPE_ELLIPSE 用对角点 (x0,y0)-(x1,y1)，顺序任意；
+ *     rect 的 `corner_radius` 夹到短边一半，<= 0 为直角；
+ *   - COMP_SHAPE_LINE 的 (x0,y0)-(x1,y1) 是两端点，恒为描边：
+ *     `style.fill_enabled` 必须为 0，`style.stroke_enabled` 必须非 0；
+ *   - COMP_SHAPE_PATH 用 `segments`（1..65536 段），填行走非零缠绕（反向子路径成洞），
+ *     `closed` 只影响描边是否回到起点；
+ *   - 全部坐标是**文档像素**，引擎减掉图层 `effective_bounds()` 原点后落图层局部像素；
+ *   - 形状与目标图层完全不相交时：成功、**无像素改动且不产生撤销步**，note 如实说明。
+ *
+ * 参数闸（COMP_ERR_INVALID_ARGUMENT，且不留半成品/不进撤销栈）：kind 越界、
+ * 填充与描边全关、可见色全透明（alpha 0）、opacity 不在 0..1 或为 0、
+ * 描边开启时 stroke_width 非正（纯填充形状不看该字段，0 合法）、
+ * 坐标为 NaN/Inf 或绝对值 > 1e6、rect/ellipse 宽或高为 0、
+ * line 两端点重合、path 段数为 0 或超限、path 坐标非法。
+ *
+ * 16 位图层：与其余工具算子同口径，经 8 位工作副本穿过（不静默降位整层，
+ * 结果按 `merge_deep_paint` 合回）；RGBA16F 拒绝（COMP_ERR_STATE）。
+ */
+typedef struct comp_tool_shape {
+  comp_shape_kind kind;
+  double  x0;             /* rect/ellipse：对角点；line：起点 */
+  double  y0;
+  double  x1;             /* rect/ellipse：对角点；line：终点 */
+  double  y1;
+  double  corner_radius;  /* rect 专用，文档像素；夹到短边一半 */
+  const comp_shape_cubic* segments; /* path 专用 */
+  int32_t segment_count;
+  int32_t closed;         /* path 描边是否闭合（填充总是隐式闭合） */
+  comp_shape_style style;
+} comp_tool_shape;
+
 /*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
@@ -557,6 +644,12 @@ typedef struct comp_tool_op_desc {
    * 它不读 `stroke_points`（渐变由两个端点定义，不是折线）。
    */
   comp_tool_gradient gradient;
+  /*
+   * S10 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * 仅 COMP_TOOL_SHAPE 读取：几何（对角点 / 两端点 / 贝塞尔路径段）与
+   * 填充/描边样式，语义见 comp_tool_shape。它同样不读 `stroke_points`。
+   */
+  comp_tool_shape  shape;
 } comp_tool_op_desc;
 
 /*

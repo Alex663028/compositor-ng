@@ -63,6 +63,18 @@ constexpr float kMaxGrainAmount = 100.0f;
  * 仍然可用；贴在一起的两个端点才被判为非法。
  */
 constexpr double kMinGradientLength = 1e-3;
+/*
+ * 形状的最小可定义尺寸（文档像素）。与渐变同口径：只拒绝「零尺寸」这种没有
+ * 定义的几何（宽/高为 0 的盒、两端点重合的线），亚像素拖拽仍然可用。
+ */
+constexpr double kMinShapeExtent = 1e-3;
+/* 形状路径段数上限：与选区 kMaxSelectionSegments 同量级。 */
+constexpr int32_t kMaxShapeSegments = 1 << 16;
+/*
+ * 描边宽度上限。胶囊描边的成本是「周长 × 宽度」，4096 已远超上游线宽滑块
+ * （ShapeControls 的量程是 1..100），再大属宿主误传。
+ */
+constexpr double kMaxShapeStrokeWidth = 4096.0;
 
 bool finite01(float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; }
 
@@ -81,6 +93,7 @@ std::string label(uint32_t kind) {
     case kToolOpLiquify: return "liquify";
     case kToolOpBlur: return "blur";
     case kToolOpGradient: return "gradient";
+    case kToolOpShape: return "shape";
     default: return "none";
   }
 }
@@ -796,6 +809,78 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       break;
     }
 
+    case kToolOpShape: {
+      const ShapeParams& shape = params.shape;
+      if (shape.kind < kShapeRect || shape.kind > kShapePath) {
+        return bad_arg("shape kind must be 0 (rect), 1 (ellipse), 2 (line) or 3 (path)");
+      }
+      const bool fill = shape.style.fill_enabled != 0;
+      const bool stroke = shape.style.stroke_enabled != 0;
+      if (!fill && !stroke) return bad_arg("shape has neither fill nor stroke enabled");
+      if (!finite01(shape.style.opacity) || shape.style.opacity <= 0.0f) {
+        return bad_arg("shape opacity must be within 0..1 and non-zero");
+      }
+      /*
+       * 线宽只在描边开启时才有意义：纯填充形状不需要宿主填线宽（0 是合法输入），
+       * 否则宿主必须为一个不用的字段编造数值，S10 外壳的矩形/椭圆就会白挂一次。
+       */
+      if (stroke && (!std::isfinite(shape.style.stroke_width) ||
+                     shape.style.stroke_width < kMinShapeExtent ||
+                     shape.style.stroke_width > kMaxShapeStrokeWidth)) {
+        return bad_arg("shape stroke width is out of range");
+      }
+      /* 看不见的颜色 = 恒等操作：与渐变「两个色标全透明」同口径，拒绝而不是
+       * 记一步空撤销（后者会让宿主以为画了东西）。 */
+      const bool fill_visible = fill && shape.style.fill_color[3] != 0;
+      const bool stroke_visible = stroke && shape.style.stroke_color[3] != 0;
+      if (!fill_visible && !stroke_visible) {
+        return bad_arg("shape has no visible color (enabled colors are fully transparent)");
+      }
+      if (shape.kind == kShapeLine) {
+        /* 线是描边成图的：填一条「实心线」没有定义，显式拒绝而不是静默忽略。 */
+        if (fill) return bad_arg("line shapes are stroked; fill_enabled must be 0");
+        if (!stroke) return bad_arg("line shapes need stroke_enabled");
+      }
+      const double coordinates[4] = {shape.x0, shape.y0, shape.x1, shape.y1};
+      for (double coordinate : coordinates) {
+        if (!std::isfinite(coordinate) || std::fabs(coordinate) > kMaxToolCoordinate) {
+          return bad_arg("shape coordinate is not finite or out of range");
+        }
+      }
+      if (!std::isfinite(shape.corner_radius) || shape.corner_radius < 0.0 ||
+          shape.corner_radius > kMaxToolCoordinate) {
+        return bad_arg("shape corner radius is negative, not finite or out of range");
+      }
+      if (shape.kind == kShapePath) {
+        if (shape.segments == nullptr || shape.segment_count <= 0 ||
+            shape.segment_count > kMaxShapeSegments) {
+          return bad_arg("shape path needs 1..65536 segments");
+        }
+        for (int32_t i = 0; i < shape.segment_count; ++i) {
+          const ShapeCubic& segment = shape.segments[i];
+          const double values[8] = {segment.start[0],    segment.start[1],
+                                    segment.control1[0], segment.control1[1],
+                                    segment.control2[0], segment.control2[1],
+                                    segment.end[0],      segment.end[1]};
+          for (double value : values) {
+            if (!std::isfinite(value) || std::fabs(value) > kMaxToolCoordinate) {
+              return bad_arg("shape path segment is not finite or out of range");
+            }
+          }
+        }
+      } else if (shape.kind == kShapeLine) {
+        const double dx = shape.x1 - shape.x0;
+        const double dy = shape.y1 - shape.y0;
+        if (std::sqrt(dx * dx + dy * dy) < kMinShapeExtent) {
+          return bad_arg("line endpoints coincide");
+        }
+      } else if (std::fabs(shape.x1 - shape.x0) < kMinShapeExtent ||
+                 std::fabs(shape.y1 - shape.y0) < kMinShapeExtent) {
+        return bad_arg("shape box has zero width or height");
+      }
+      break;
+    }
+
     case kToolOpHeal: {
       if (params.heal.mode < 0 || params.heal.mode > 2) return bad_arg("heal mode must be 0..2");
       if (!finite01(params.heal.opacity)) return bad_arg("heal opacity out of 0..1");
@@ -975,6 +1060,8 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   }
 
   bool ok = true;
+  /* 形状与图层完全不相交时是「成功但无操作」：不能 commit（那会留下一步空撤销）。 */
+  bool noop = false;
   switch (params.kind) {
     case kToolOpSelect: {
       std::vector<uint8_t> mask(width * height, 0);
@@ -1262,6 +1349,116 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       }
       if (masked && note != nullptr) {
         *note += "gradient is masked by the active selection (coverage 0 pixels are unchanged); ";
+      }
+      break;
+    }
+
+    case kToolOpShape: {
+      const ShapeParams& shape = params.shape;
+      /*
+       * 选区口径与渐变/滤镜完全一致：有效 coverage 是**文档分辨率**，图层像素
+       * 按 effective_bounds 原点平移到文档坐标后取样，画布外视为选区之外。
+       */
+      const bool masked = document->selection().active;
+      std::vector<uint8_t> selection_coverage;
+      const int32_t canvas_width = document->state().width;
+      const int32_t canvas_height = document->state().height;
+      if (masked) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+        if (selection_coverage.size() != static_cast<size_t>(canvas_width) *
+                                            static_cast<size_t>(canvas_height)) {
+          ok = bad_state("active selection has no coverage at the document resolution");
+          break;
+        }
+      }
+
+      const comp_rect bounds = target_layer->effective_bounds();
+      ShapeGeometry geometry;
+      geometry.kind = shape.kind;
+      geometry.x0 = shape.x0;
+      geometry.y0 = shape.y0;
+      geometry.x1 = shape.x1;
+      geometry.y1 = shape.y1;
+      geometry.corner_radius = shape.corner_radius;
+      geometry.segments = shape.segments;
+      geometry.segment_count = shape.segment_count;
+      geometry.closed = shape.closed != 0;
+
+      ShapeCoverage raster;
+      const bool fill = shape.style.fill_enabled != 0;
+      const bool stroke = shape.style.stroke_enabled != 0;
+      const ShapeRasterReport report =
+          shape_rasterize(geometry, bounds.x, bounds.y, target_layer->pixels.width,
+                          target_layer->pixels.height, fill, stroke, shape.style.stroke_width,
+                          shape.style.antialias != 0, &raster);
+      if (report.status == ShapeRasterStatus::kBadGeometry ||
+          report.status == ShapeRasterStatus::kTooComplex) {
+        ok = bad_arg(report.message);
+        break;
+      }
+      if (report.status == ShapeRasterStatus::kEmpty) {
+        /* 形状完全落在图层之外：**成功但没有像素要改**，因此不记撤销步
+         * （与「魔棒选中 0 个像素不写蒙版」同口径，宿主不该看到一步空撤销）。 */
+        noop = true;
+        if (note != nullptr) {
+          *note += "shape does not intersect the layer (no pixels changed); ";
+        }
+        break;
+      }
+
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const size_t stride_bytes = target_layer->pixels.stride();
+      const double opacity = static_cast<double>(shape.style.opacity);
+
+      auto composite = [&](const std::vector<uint8_t>& channel, const uint8_t color[4]) {
+        if (channel.empty()) return;
+        for (int32_t y = 0; y < raster.h; ++y) {
+          const int32_t local_y = raster.y + y;
+          uint8_t* row = pixels + static_cast<size_t>(local_y) * stride_bytes;
+          for (int32_t x = 0; x < raster.w; ++x) {
+            const uint8_t coverage = channel[static_cast<size_t>(y) * static_cast<size_t>(raster.w) +
+                                             static_cast<size_t>(x)];
+            if (coverage == 0) continue;
+            const int32_t local_x = raster.x + x;
+            double weight = (static_cast<double>(coverage) / 255.0) * opacity;
+            if (masked) {
+              const int32_t canvas_x = bounds.x + local_x;
+              const int32_t canvas_y = bounds.y + local_y;
+              if (canvas_x < 0 || canvas_y < 0 || canvas_x >= canvas_width ||
+                  canvas_y >= canvas_height) {
+                continue; /* 画布外 = 选区之外：逐字节不动 */
+              }
+              weight *= static_cast<double>(
+                            selection_coverage[static_cast<size_t>(canvas_y) *
+                                                   static_cast<size_t>(canvas_width) +
+                                               static_cast<size_t>(canvas_x)]) /
+                        255.0;
+            }
+            if (weight <= 0.0) continue;
+            const double alpha = (static_cast<double>(color[3]) / 255.0) * weight;
+            if (alpha <= 0.0) continue;
+
+            uint8_t* pixel = row + static_cast<size_t>(local_x) * 4u;
+            const double inverse = 1.0 - alpha;
+            for (int c = 0; c < 3; ++c) {
+              /* 图层像素是**预乘** RGBA8：源色先乘 alpha 再按 source-over 叠加。 */
+              const double blended =
+                  static_cast<double>(color[c]) * alpha + static_cast<double>(pixel[c]) * inverse;
+              const long value = std::lround(blended);
+              pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+            }
+            const long out_alpha =
+                std::lround(alpha * 255.0 + static_cast<double>(pixel[3]) * inverse);
+            pixel[3] =
+                static_cast<uint8_t>(out_alpha < 0 ? 0 : (out_alpha > 255 ? 255 : out_alpha));
+          }
+        }
+      };
+      /* 先填充、再描边：描边压在上面（与上游「形状是实心的、线是描出来的」一致）。 */
+      if (fill) composite(raster.fill, shape.style.fill_color);
+      if (stroke) composite(raster.stroke, shape.style.stroke_color);
+      if (masked && note != nullptr) {
+        *note += "shape is masked by the active selection (coverage 0 pixels are unchanged); ";
       }
       break;
     }
@@ -1561,6 +1758,17 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
     if (deep_paint.active()) target_layer->pixels = std::move(deep_paint.deep);
     if (owns_txn) document->txn_abort(&txn_error);
     return false;
+  }
+  if (noop) {
+    /*
+     * 成功但一个像素都没改（目前只有「形状与图层不相交」会走到这里）：
+     * 事务整步撤回，撤销栈不增长，dirty 也不置位——宿主不该看到一步空撤销。
+     * 若外层持有事务（owns_txn 为假），这里什么都不做，外层自行决定。
+     */
+    if (deep_paint.active()) target_layer->pixels = std::move(deep_paint.deep);
+    if (owns_txn) document->txn_abort(&txn_error);
+    if (out_code != nullptr) *out_code = COMP_OK;
+    return true;
   }
   if (deep_paint.active()) {
     if (!merge_deep_paint(target_layer->pixels, &deep_paint)) {

@@ -155,6 +155,18 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   基线 414 → **418 用例**，Windows 壳自检 103 → **113 项**；口径 B 的
   Type/Shape/Gradient 一行由「零」改为「部分：Gradient 已交付」，计分仍 **28/48 ≈ 58%**
   （Type/Shape 仍是零，凑不满一整条）。详见 §6.19。
+  2026-10-18 第二十轮（S10 形状工具：`COMP_TOOL_SHAPE = 14`）：把路径基元从
+  `selection.cpp` 抽成中立的 `domain/path_raster.{h,cpp}`（行为中立，仅改名接线），
+  再新增 `domain/shape_raster.{h,cpp}`（矩形 / 椭圆 / 三次贝塞尔路径的填充 + 胶囊距离
+  描边 + 圆角矩形 + 窗口化覆盖率），在 `comp_tool_apply` 家族尾部追加**整幅形状算子**
+  （填充与描边两个独立开关、先填后描、选区 coverage 混合；参数闸全在 `txn_begin` 之前，
+  「填充直线」/ 构造退化 / 不可见色一律 `COMP_ERR_INVALID_ARGUMENT`，形状完全落在图层外
+  则成功但**不留空撤销步**）；`comp_tool_op_desc.shape` 是尾部追加字段，导出 ABI 仍是
+  **112** 个。Windows 壳接上 `U` 形状（再按 `U` 循环矩形/椭圆/直线、拖拽对角点或两端点、
+  `Shift` 正方/正圆、`Alt` 从中心、`Alt+[ / ]` 调线宽、`Shift+Alt+[ / ]` 调圆角、
+  失焦取消预览）。基线 418 → **424 用例**，Windows 壳自检 113 → **137 项**；口径 B 的
+  Type/Shape/Gradient 一行改为「部分：Shape/Gradient 已交付」，计分仍 **28/48 ≈ 58%**
+  （Type 仍是零）。详见 §6.20。
 
 ## 1. M1 目标与范围
 
@@ -1433,7 +1445,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **137 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
 + ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
@@ -1459,7 +1471,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
 | **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee（矩形/椭圆）/Lasso（多边形）/魔棒、形状叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7 / §6.17）；Pen 工具手势与 Select Subject / 抠图仍缺（后两者依赖 ML，不在本仓范围） |
 | **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；**S6 补上外壳的拖拽手势**（`V`，Alt = 复制，一步撤销，§6.16） |
-| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **部分：Gradient 已交付**（线性 / 径向 + 双色标 + 选区混合，`COMP_TOOL_GRADIENT = 13`，§6.19）；Type / Shape 仍为零 |
+| **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **部分：Shape / Gradient 已交付**（Gradient = 线性/径向 + 双色标 + 选区混合，`COMP_TOOL_GRADIENT = 13`，§6.19；Shape = 矩形/椭圆/直线/贝塞尔路径 + 填充/胶囊描边 + 选区混合，`COMP_TOOL_SHAPE = 14`，§6.20）；Type 仍为零（位图字体内核未做） |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
 | **Crop 工具**（`Crop.swift` 249 行） | ✓ 拖拽成框（比例 / Option 对称）、比例切换、取整、可提交性判定与提交（平移图层 + 换画布，一步撤销）已交付（`comp_crop_*`，§6.8）；手柄 / 蚂蚁线 / 吸附参考线属外壳 |
 | **Vignette / Bloom / Remove Background**（`Filters.swift` 1,007 行） | ✓ **部分**：Vignette / Bloom（含 Tonal Contrast、Lens Correction）已交付（`comp_filter_apply`，§6.12）；Remove Background 仍为零（依赖 ML / 分割，不在本仓范围） |
@@ -1476,7 +1488,10 @@ S6 再抬高**一条**：**吸管（Painting #7）**——前景色模型与取�
 里的 Marquee(椭圆)/Lasso/Magic Wand 子项与外壳手势，该条目仍缺 Pen 工具、
 Select Subject 与抠图，不足以从「部分命中」升为整条命中（§6.17）。**S9 也不抬高条数**：
 渐变只是同一条「Type / Shape / Gradient」三个子项里的一个，剩余 Type（472 行）与 Shape
-仍为零，整条按「部分命中」计（§6.19）。其余约 4,800 行 Swift
+仍为零，整条按「部分命中」计（§6.19）。**S10 同样不抬高条数**：形状补上后该条的三个
+子项只剩 Type 未交付，但 Type 是其中最大的一块（472 行 + 字体栅格化），整条仍按
+「部分命中」计——**28/48 ≈ 58% 不变**，不因为「两个子项都做了」凑整抬高（§6.20）。
+其余约 4,800 行 Swift
 **完全没有对应物**，且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
@@ -1525,6 +1540,11 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 - **Blur（P1 追加，kind 12）**：整层模糊样本在**整笔开始前**取好，同一笔的折线不会
   吃到自己刚模糊过的像素；`radius` 0.5..50，`0` 被参数闸拒绝（上游会把 0 抬高到 0.5，
   若按「0 = 恒等」解读会得到相反结果）。细节见 [`docs/tool-ops.md`](docs/tool-ops.md) §4.9。
+- **Shape（S10 追加，kind 14）**：填充与描边是**两个独立开关**（先填后描），直线只准描边；
+  抗锯齿用 4 行超采样 + 水平解析覆盖率，描边是胶囊距离并集（圆头端点/折点）。
+  `stroke_width` 只在描边开启时校验（纯填充形状不需要宿主为不用的字段编数值）；
+  形状与图层完全不相交时**成功但留不下撤销步**。细节见
+  [`docs/tool-ops.md`](docs/tool-ops.md) §4.11。
 
 ### 6.6 内核接线现状（2026-10-18 更新）
 
@@ -1536,6 +1556,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
 | Lens | `COMP_TOOL_LENS` / `COMP_FILTER_LENS_CORRECTION` | `lens_distort`（工具收 `|k| <= 1`，滤镜收 `-100..100` 再换算 `k`） | — |
 | Blur | `COMP_TOOL_BLUR` / Tonal Contrast、Bloom 的 detail 模糊 | `blur_rgba8_copy`（三趟滑动窗口盒式近似，与 Gaussian Blur 调整层同一实现） | — |
+| Shape（S10 新增，非上游 `.c` 内核） | `COMP_TOOL_SHAPE` | `shape_raster::shape_rasterize`（矩形 / 椭圆 / 三次贝塞尔路径的填充 + 胶囊距离描边 + 圆角矩形 + 窗口化覆盖率，4 行超采样 AA）；路径基元来自 S10 抽出的 `path_raster`（与选区共用，行为中立） | 贝塞尔路径只有 ABI 通路（外壳 `U` 只能拖出矩形/椭圆/直线；钢笔仍用于提交选区） |
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
@@ -2498,6 +2519,92 @@ Dither / Lens 同口径），RGBA16F 直接 `COMP_ERR_STATE`。
 §5 其余项（MERGED 合成缓存、格式导入策略矩阵、人工 Win32 清单）不在本轮范围。
 
 报告：`../report/S9-gradient-20261018-dsh.md`。
+
+### 6.20 S10 形状工具：`COMP_TOOL_SHAPE`（2026-10-18，DSH）
+
+S9 之后「Type / Shape / Gradient」一行只剩 Type 与 Shape。按边际成本先做 **Shape**：
+它复用已有的路径/扫描线覆盖率基础设施，不需要字体栅格化，也不依赖外部资源。
+（Type 的位图字体内核与 `MERGED` 合成缓存仍在后续轮次。）
+
+**1. 先拆路径基元，再加形状内核。** `engine/domain/selection.cpp` 里那套「轮廓 →
+扁平化 → 扫描线填充」的代码写死在选区里，形状要用同一套语义。本轮把它抽成
+`engine/domain/path_raster.{h,cpp}`（`PathContour` / `PathContours` / `PathBounds`、
+矩形/椭圆/圆角矩形轮廓、de Casteljau 扁平化（容差 0.1、最大递归 20）、非零缠绕扫描线
+填充），`selection.cpp` 改成只做别名接线（−265 行）。这次抽取是**行为中立**的：抽完先跑
+全量回归 418 用例全绿，再动形状。新增 `engine/domain/shape_raster.{h,cpp}`
+（`ShapeRasterKind` / `ShapeGeometry` / `ShapeCoverage` / `ShapeRasterStatus`）：
+- 填充走 `path_rasterize_contours` 的非零缠绕；
+- 描边是**胶囊距离并集** `cov = clamp(0.5 + 半宽 − 距离, 0, 1) × 255`，因此端点与折点
+  天然是圆的（对齐上游 `line` 的 `.round` 线帽），共线折线按 ≤32 px 切段避免长边距离场退化；
+- 只算几何真正覆盖的窗口（`ShapeCoverage` 带窗口原点与 fill/stroke 两个覆盖率缓冲），
+  4 行超采样 + 水平解析覆盖率做 AA，`antialias = 0` 时退化成像素中心一票；
+- 点数上限 `1<<18`，超限返回 `kTooComplex`（映射成 `COMP_ERR_INVALID_ARGUMENT`），
+  不吃爆内存也不静默截断。
+
+**2. ABI。** 新增 `COMP_TOOL_SHAPE = 14`（`comp_layer.h`，枚举尾部追加）；
+`comp_tool_op_desc` 尾部追加 `comp_tool_shape shape`（`kind` / 对角点或两端点 /
+`corner_radius` / `segments` + `segment_count` + `closed` / `comp_shape_style`）。
+几何种类 `COMP_SHAPE_RECT=0 / ELLIPSE=1 / LINE=2 / PATH=3` 与内核枚举同值。
+路径段用 `comp_shape_cubic`（float 的 `start/control1/control2/end` + `new_subpath`），
+ABI 层只做**结构性守卫**（指针与 1..65536 段数），坐标合法性交给域层参数闸。
+**不新增导出函数**，仍是 **112** 个：形状是既有 `comp_tool_apply` 的第 14 种算子，
+既有字段偏移全部不变。
+
+**3. 参数闸（全在 `txn_begin` 之前）。** kind 越界、填充与描边全关、可见色全透明、
+`opacity` 越界或 0、**描边开启时** `stroke_width` 非正、坐标为 NaN/Inf 或 `|v| > 1e6`、
+矩形/椭圆宽或高为 0、直线两端点重合、路径段数 0/超限/坐标非法——一律
+`COMP_ERR_INVALID_ARGUMENT`，撤销栈与像素都不动。上一轮踩到的一个坑写在这里：
+**纯填充形状不看 `stroke_width`**（0 合法）——外壳的矩形/椭圆只开填充，若把线宽
+无条件当必填，宿主就得为一个用不到的字段编数值，否则整条渲染通路白挂
+（自检里 13 项 FAIL 就是这条导致的，已修）。
+
+**4. 语义三处显式差异（不是遗漏）。** ① 上游画完**新建一个像素图层**，本仓工具算子统一
+「画进当前图层」——工具算子不该改图层树结构，否则 merge/flatten 的逐字节契约与撤销粒度
+都要跟着改；② 上游矩形/椭圆只填充、直线只描边，本仓把填充/描边做成两个独立开关
+（`fill`+`stroke` 同时开是超集，先填后描）；③ 贝塞尔路径本轮只有 ABI 通路，外壳的钢笔
+仍用于提交选区。另外**形状与图层完全不相交时成功、无像素改动、不产生撤销步**
+（note 如实说明），否则宿主会看到一步什么都没做的撤销。
+
+**5. 16 位 / HDR。** 整幅算子写 8 位工作副本，RGBA16 经 `merge_deep_paint` 合回
+（与 Dither / Lens / Gradient 同口径），RGBA16F 直接 `COMP_ERR_STATE`。
+
+**6. 外壳（`U`）。** `ui_core.h` 新增 `kShapeRect/kShapeEllipse/kShapeLine/kShapePath`
+（数值与 ABI 一致）、`shape_kind_name`（未知值返回 `?`，不猜）、
+`next_shell_shape_kind`（矩形 → 椭圆 → 直线 → 矩形，未知值收敛回矩形）、
+`shape_drag_box(start, current, square, from_center)`（`Shift` = 取较长边的正方/正圆、
+保留拖拽方向；`Alt` = 从中心向外；两者可叠加）、`kShapeMinExtent = 1.0` +
+`shape_drag_is_usable`（直线看端点距离，矩形/椭圆看宽高都 ≥ 1 px）、
+描边宽度 0.5..50（`×/÷1.2` 步进）与圆角半径 0..256（2 px 步进）的夹取/步进、
+`shape_effective_corner_radius`（先夹用户量程再夹短边一半，预览与落笔同一函数）。
+手势：`U` 选工具、已在该工具时再按 `U` 循环种类；拖对角点（直线拖两端点）松开提交；
+`Alt+[` / `Alt+]` 调线宽、`Shift+Alt+[` / `Shift+Alt+]` 调矩形圆角；`Esc` / 切工具 /
+失焦 / 捕获丢失只丢预览，不产生撤销步；短于 1 px 的拖拽外壳先放弃并提示。
+画布预览是白实线 + 黑虚线双描边（矩形/椭圆/直线，圆角用 `RoundRect` 且半径按缩放换算），
+只预演几何不预演像素。矩形/椭圆**只填充前景色**、直线**只用前景色描边**——外壳没有
+「描边颜色/线宽面板」，不编造宿主不存在的第二个颜色（引擎支持 fill+stroke 同时开）。
+
+**7. 测试与基线。** `test_tool_ops` 新增 5 例：矩形填充 + 一步撤销 + 未覆盖像素逐字节
+不变（并冻结 `COMP_TOOL_SHAPE == 14`）；椭圆中心填、四角不填、撤销逐字节回滚，再在左半
+矩形选区下重画且右半逐字节不动；直线是圆头描边（宽 4 → 轴心满、半宽仍实、超半宽为 0、
+端点外 1 px 仍有覆盖而 2 px 归零、起点侧同样圆头）；贝塞尔路径的非零缠绕成洞（外环填、
+内环是真空洞、框外不动）；参数闸 + 图层外 no-op（7 种非法参数都不留撤销步、合法参数
+照常成功、纯填充形状的 `stroke_width = 0` 合法、开描边时 0 线宽被拒）。
+`test_ui_core` 新增 1 例（种类镜像数值/命名/循环、`Shift`/`Alt`/叠加的拖拽换算、
+下限判定、线宽与圆角的夹取/步进、有效圆角半径）。基线 418 → **424 用例 0 失败**
+（`build.py` → **424 cases, 0 failed, 0 check failures**）。
+`--selftest` 新增 24 项：枚举冻结、矩形/椭圆/直线三次 `comp_tool_apply` + 像素断言 +
+单步撤销 + 逐字节回滚、填充直线拒绝且不留撤销步、图层外 no-op 不留空撤销步且渲染不变。
+113 → **137 项**，`compositor_shell_selftest.txt` 同步重新生成
+（SHA256 `bb416b59a614c690…`）；`scripts/run_regression.py --require-ohos` **6/6 PASS
+（0 skipped）**，含 OHOS aarch64 交叉编译 rc=0。
+
+**8. 事实边界。** 仍然**没有经过人手 Win32 实测**：无窗口环境下只验证到 ABI、
+`ui_core` 数学层与自检驱动序列，「画出来对不对」（尤其是圆角矩形的合成覆盖率与
+直线圆头的视觉宽度）仍需开窗目视。明确未做：形状**不进图层树**（不新建图层）、
+没有形状属性面板（线宽/圆角只能快捷键改）、路径只有 ABI、Type 与 `MERGED` 合成缓存
+不在本轮。口径 B 仍是 **28/48 ≈ 58%**——Type 未交付，整条不抬。
+
+报告：`../report/S10-shape-20261018-dsh.md`。
 
 ## 7. 许可
 
