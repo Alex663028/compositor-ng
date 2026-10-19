@@ -19,7 +19,10 @@ extern "C" {
 /*
  * 把整篇文档合成到给定目标。
  *   - COMP_SURFACE_CPU_BUFFER：直接写入 target->pixels（stride 为字节/行）
- *   - 其他 surface：由后端写入原生表面（M1 返回 COMP_ERR_UNSUPPORTED）
+ *   - COMP_SURFACE_HWND：由支持窗口直呈的后端（当前是 D3D12，S16）写入窗口的
+ *     DXGI 后备缓冲，需再调 comp_render_present 真正上屏；CPU 后端做不到，
+ *     会返回 COMP_ERR_UNSUPPORTED，而不是假装成功或只画一半
+ *   - 其他 surface：仍返回 COMP_ERR_UNSUPPORTED
  * 返回前不保证 GPU 工作已完成，需 comp_render_wait 同步。
  */
 COMP_API comp_result comp_render_document(comp_document document,

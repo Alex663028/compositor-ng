@@ -210,8 +210,10 @@ COMP_TEST(shell_contract_window_surfaces_report_unsupported) {
   }
 
   /*
-   * 两壳各自的窗口表面（Windows=HWND，OHOS=OHNativeWindow*）当前都无设备侧上屏实现，
-   * 必须如实返回 UNSUPPORTED，而不是伪造成功。native_handle 用占位值，不接触真实窗口。
+   * CPU 后端对两壳的窗口表面（Windows=HWND，OHOS=OHNativeWindow*）必须如实返回
+   * UNSUPPORTED，而不是伪造成功。native_handle 用占位值，不接触真实窗口。
+   * 注：D3D12 构建下的 HWND 直呈由 test_rhi.cpp 的窗口用例单独验证（S16）；
+   * 本用例锁的是「不支持时不许假装」这条契约，与后端能力无关。
    */
   const comp_surface_kind surfaces[2] = {COMP_SURFACE_HWND, COMP_SURFACE_HARMONY_WINDOW};
   for (comp_surface_kind kind : surfaces) {

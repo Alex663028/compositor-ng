@@ -126,6 +126,13 @@ target_include_directories(compositor_tests PRIVATE
 
 target_link_libraries(compositor_tests PRIVATE compositor_engine)
 
+# S16：test_rhi.cpp 的窗口直呈用例要真实 HWND（CreateWindowExW / DestroyWindow）。
+# 与 scripts/build.py 的 -luser32 同一口径，仅 Windows 目标链接；引擎库本身仍不依赖
+# user32（D3D12 交换链只和 DXGI 打交道，不等同于壳层）。
+if(WIN32)
+  target_link_libraries(compositor_tests PRIVATE user32)
+endif()
+
 # 工作目录必须是仓库根：test_camera_raw.cpp 以相对路径 resources/camera_raw_tables.bin
 # 读取随仓数据。scripts/build.py 的 run() 也以 ROOT 为 cwd 启动测试；若不指定，
 # ctest 默认在 build-cmake/ 下运行，12 个 camera_raw 用例会因找不到资源而失败。

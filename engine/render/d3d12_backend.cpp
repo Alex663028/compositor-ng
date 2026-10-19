@@ -14,6 +14,8 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
+#include <dxgi1_4.h> /* IDXGISwapChain3::GetCurrentBackBufferIndex（S16 窗口直呈必需） */
 
 #include <cstdio>
 #include <cstring>
@@ -72,6 +74,35 @@ const D3D12Api& d3d12_api() {
     if (a.compiler != nullptr) {
       a.compile = reinterpret_cast<PFN_D3DCompile>(
           reinterpret_cast<void*>(::GetProcAddress(a.compiler, "D3DCompile")));
+    }
+    return a;
+  }();
+  return api;
+}
+
+/* ------------------------------------------------------------------
+ * 动态入口：dxgi.dll 的 CreateDXGIFactory2。
+ *
+ * 与 d3d12 同一口径：不链接 dxgi.lib，工厂入口运行期解析；工厂/交换链对象都是
+ * COM，vtable 调用不需要导入库。
+ * ------------------------------------------------------------------ */
+
+typedef HRESULT(WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+
+struct DxgiApi {
+  HMODULE module = nullptr;
+  PFN_CreateDXGIFactory2 create_factory2 = nullptr;
+
+  bool ok() const { return create_factory2 != nullptr; }
+};
+
+const DxgiApi& dxgi_api() {
+  static DxgiApi api = [] {
+    DxgiApi a;
+    a.module = ::LoadLibraryA("dxgi.dll");
+    if (a.module != nullptr) {
+      a.create_factory2 = reinterpret_cast<PFN_CreateDXGIFactory2>(
+          reinterpret_cast<void*>(::GetProcAddress(a.module, "CreateDXGIFactory2")));
     }
     return a;
   }();
@@ -196,9 +227,27 @@ struct D3d12RenderBackend::GpuContext {
   D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_RESOURCE_STATES dst_state = D3D12_RESOURCE_STATE_COMMON;
 
+  /* S16：窗口直呈。交换链只在 HWND 目标出现时创建，并按窗口/画布尺寸重建。 */
+  IDXGIFactory2* factory = nullptr;
+  IDXGISwapChain1* swapchain = nullptr;
+  IDXGISwapChain3* swapchain3 = nullptr;
+  /* flip-model 的后备缓冲必须**创建时取一次并长期持有**：每帧 GetBuffer(0)
+     会拿到刚 Present 的那块缓冲，写它等于写正在扫描输出的表面（本机实测：
+     第二帧 ExecuteCommandLists 后设备被移除，原因 0x887A002B ACCESS_DENIED）。
+     正确做法是按 GetCurrentBackBufferIndex() 轮转使用固定持有的缓冲。 */
+  ID3D12Resource* window_buffers[2] = {nullptr, nullptr};
+  HWND swap_hwnd = nullptr;
+  UINT swap_width = 0;
+  UINT swap_height = 0;
+  bool window_frame_ready = false; /* render_document(HWND) 成功、尚未 Present */
+
   ~GpuContext() {
     if (upload != nullptr && upload_mapped != nullptr) upload->Unmap(0, nullptr);
     upload_mapped = nullptr;
+    for (ID3D12Resource*& buffer : window_buffers) release(buffer);
+    release(swapchain3);
+    release(swapchain);
+    release(factory);
     release(info_queue);
     release(readback);
     release(upload);
@@ -406,6 +455,103 @@ struct D3d12RenderBackend::GpuContext {
     dst_state = D3D12_RESOURCE_STATE_COMMON;
   }
 
+  void drop_swapchain() {
+    for (ID3D12Resource*& buffer : window_buffers) release(buffer);
+    release(swapchain3);
+    release(swapchain);
+    release(factory);
+    swap_hwnd = nullptr;
+    swap_width = 0;
+    swap_height = 0;
+    window_frame_ready = false;
+  }
+
+  /*
+   * 为 HWND 建 DXGI flip-model 交换链。
+   *
+   * 关键点（本机实测过，见 report/S16）：
+   *   - D3D12 的 CreateSwapChainForHwnd 第一个参数必须是 **direct 命令队列**，
+   *     不是 ID3D12Device；
+   *   - 后备缓冲格式必须与合成用的 dst_tex 一致（R8G8B8A8_UNORM），
+   *     CopyResource 不做格式转换；RGBA8 的 flip-discard 在 Win10+ 可用；
+   *   - 尺寸/窗口变化一律重建（本实现只在画布尺寸或目标窗口变化时重建，
+   *     交互式缩放会走这条，代价是重建设备侧交换链而不是 ResizeBuffers，
+   *     语义更简单且不会带进旧后备缓冲）。
+   */
+  bool ensure_swapchain(HWND hwnd, UINT w, UINT h, std::string* error) {
+    if (device == nullptr || queue == nullptr) {
+      if (error != nullptr) *error = "d3d12 backend: context is not initialized";
+      return false;
+    }
+    if (hwnd == nullptr) {
+      if (error != nullptr) *error = "d3d12 backend: window surface needs a non-null HWND";
+      return false;
+    }
+    if (swapchain != nullptr && swap_hwnd == hwnd && swap_width == w && swap_height == h) {
+      return true;
+    }
+    drop_swapchain();
+
+    const DxgiApi& dxgi = dxgi_api();
+    if (!dxgi.ok()) {
+      if (error != nullptr) *error = "d3d12 backend: dxgi.dll CreateDXGIFactory2 unavailable";
+      return false;
+    }
+    HRESULT hr = dxgi.create_factory2(0, __uuidof(IDXGIFactory2),
+                                      reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || factory == nullptr) {
+      if (error != nullptr) *error = hresult_text("create DXGI factory failed", hr);
+      release(factory);
+      return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = w;
+    desc.Height = h;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Stereo = FALSE;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc.Flags = 0;
+    hr = factory->CreateSwapChainForHwnd(queue, hwnd, &desc, nullptr, nullptr, &swapchain);
+    if (FAILED(hr) || swapchain == nullptr) {
+      if (error != nullptr) {
+        *error = hresult_text("create flip-model swap chain for hwnd failed (RGBA8)", hr);
+      }
+      release(swapchain);
+      release(factory);
+      return false;
+    }
+    /* 不让 DXGI 把 Alt+Enter 变成独占全屏（编辑器窗口不该被它接管）。 */
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    /* 需要 IDXGISwapChain3 拿「当前后备缓冲索引」：flip-model 下每帧必须轮转
+       缓冲，固定往 GetBuffer(0) 写会与正在显示的表面冲突（见上面 window_buffers 注释）。 */
+    HRESULT qi = swapchain->QueryInterface(__uuidof(IDXGISwapChain3),
+                                           reinterpret_cast<void**>(&swapchain3));
+    if (FAILED(qi) || swapchain3 == nullptr) {
+      if (error != nullptr) *error = hresult_text("swap chain3 interface missing", qi);
+      drop_swapchain();
+      return false;
+    }
+    for (UINT i = 0; i < 2u; ++i) {
+      hr = swapchain->GetBuffer(i, IID_PPV_ARGS(&window_buffers[i]));
+      if (FAILED(hr) || window_buffers[i] == nullptr) {
+        if (error != nullptr) *error = hresult_text("acquire swap chain back buffer failed", hr);
+        drop_swapchain();
+        return false;
+      }
+    }
+    swap_hwnd = hwnd;
+    swap_width = w;
+    swap_height = h;
+    return true;
+  }
+
   /*
    * 上传缓冲必须在提交前装下**所有**图层的像素：命令是录制后统一执行的，
    * 共用一块缓冲会让先录的 CopyTextureRegion 读到最后一层的数据（原实现的
@@ -609,11 +755,24 @@ BackendCaps D3d12RenderBackend::caps() const {
    * 这一条渲染路径，窗口上屏本来就没有）。
    */
   c.offscreen_compute = c.device_available;
-  c.window_present = false;
-  c.note = c.device_available
-               ? "D3D12 offscreen compute + readback (persistent device/PSO, HLSL compiled at "
-                 "runtime; falls back to CPU for documents outside the simple-stack subset)"
-               : "D3D12 device unavailable on this machine";
+  /*
+   * 窗口直呈（S16）：设备可用且 dxgi.dll 的 CreateDXGIFactory2 可解析。
+   * 交换链本身要等调用方给出 HWND 才建，成立性由 render_document 如实报错；
+   * 这里只回答「这条上屏路径在本机是否被支持」。
+   */
+  c.window_present = c.device_available && dxgi_api().ok();
+  if (c.device_available && c.window_present) {
+    c.note =
+        "D3D12 offscreen compute + readback, and HWND present via DXGI flip-model swap "
+        "chain (persistent device/PSO, HLSL compiled at runtime; falls back to CPU for "
+        "documents outside the simple-stack subset)";
+  } else if (c.device_available) {
+    c.note =
+        "D3D12 offscreen compute + readback (persistent device/PSO, HLSL compiled at "
+        "runtime; dxgi.dll unavailable, so window present is not offered)";
+  } else {
+    c.note = "D3D12 device unavailable on this machine";
+  }
   return c;
 }
 
@@ -628,13 +787,30 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
   if (!gpu_document_ready(doc, &paint, error)) return false;
 
   const DocumentState& state = doc.state();
-  if (target.kind != COMP_SURFACE_CPU_BUFFER) {
+  /*
+   * 两种目标：
+   *   - CPU_BUFFER：离屏合成 + 整幅回读（S13 起的既有路径，字节基准不变）；
+   *   - HWND：合成后直接拷进交换链后备缓冲，等 comp_render_present 上屏（S16）。
+   * 其他表面（Metal layer / Harmony window）仍明确拒绝，不做半张图。
+   */
+  const bool window_target = target.kind == COMP_SURFACE_HWND;
+  if (!window_target && target.kind != COMP_SURFACE_CPU_BUFFER) {
     if (error != nullptr) {
-      *error = "d3d12 backend currently renders offscreen only (COMP_SURFACE_CPU_BUFFER)";
+      *error =
+          "d3d12 backend supports COMP_SURFACE_CPU_BUFFER and COMP_SURFACE_HWND only";
     }
     return false;
   }
-  if (target.pixels == nullptr || target.format != COMP_PIXEL_RGBA8) {
+  if (window_target) {
+    if (target.native_handle == nullptr) {
+      if (error != nullptr) *error = "d3d12 backend: window surface needs native_handle = HWND";
+      return false;
+    }
+    if (target.format != COMP_PIXEL_RGBA8) {
+      if (error != nullptr) *error = "d3d12 backend: window surface only supports RGBA8";
+      return false;
+    }
+  } else if (target.pixels == nullptr || target.format != COMP_PIXEL_RGBA8) {
     if (error != nullptr) *error = "d3d12 backend needs a non-null RGBA8 target buffer";
     return false;
   }
@@ -645,6 +821,8 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
 
   std::lock_guard<std::mutex> lock(mutex_);
   offloaded_.store(false);
+  window_readback_ready_ = false;
+  const bool verify_window_readback = verify_window_readback_;
   if (gpu_ == nullptr) gpu_.reset(new GpuContext());
   if (!gpu_->ensure(error)) {
     gpu_.reset();
@@ -653,6 +831,12 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
   if (!gpu_->ensure_targets(static_cast<UINT>(state.width), static_cast<UINT>(state.height),
                             error)) {
     return false;
+  }
+  if (window_target) {
+    if (!gpu_->ensure_swapchain(static_cast<HWND>(target.native_handle), gpu_->width, gpu_->height,
+                                error)) {
+      return false;
+    }
   }
 
   const UINT width = gpu_->width;
@@ -788,12 +972,45 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
     gpu_->src_state = D3D12_RESOURCE_STATE_COPY_DEST;
   }
 
+  ID3D12Resource* window_buffer = nullptr; /* 借用 swapchain 持有的缓冲，不能 Release */
   if (built) {
-    barrier(gpu_->dst_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    barrier(gpu_->dst_tex, gpu_->dst_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     gpu_->dst_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    /* 目标纹理 -> 回读缓冲：方向是纹理为源、缓冲为目标。 */
-    copy_out(gpu_->dst_tex, gpu_->readback, 0);
+    if (window_target) {
+      /*
+       * 窗口路径：合成结果 -> 交换链后备缓冲，**不回读**。
+       *
+       * flip 模型下后备缓冲必须按 GetCurrentBackBufferIndex() 轮转，且缓冲引用在
+       * 交换链生命周期内常驻（见 window_buffers 上的注释）。每次 GetBuffer(0) 再
+       * Release 会让第二帧写入「正在显示的那块」，DXGI 直接把设备判为移除
+       * （0x887A0005 + 原因 0x887A002B）。缓冲状态由上一帧 Present 归一为 PRESENT，
+       * 这里显式 PRESENT -> COPY_DEST，拷完再转回 PRESENT 交给 Present。
+       */
+      const UINT window_index = gpu_->swapchain3->GetCurrentBackBufferIndex();
+      window_buffer = window_index < 2u ? gpu_->window_buffers[window_index] : nullptr;
+      if (window_buffer == nullptr) {
+        build_error = "d3d12 backend: swap chain back buffer index out of range";
+        built = false;
+      } else {
+        barrier(window_buffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyResource(window_buffer, gpu_->dst_tex);
+        if (verify_window_readback) {
+          /* 测试专用：把「即将 Present 的这一帧」再拷一份到回读缓冲对拍。
+             只在 set_window_readback_verification(true) 时录制，默认零开销。 */
+          barrier(window_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+          copy_out(window_buffer, gpu_->readback, 0);
+          barrier(window_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                  D3D12_RESOURCE_STATE_PRESENT);
+        } else {
+          barrier(window_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                  D3D12_RESOURCE_STATE_PRESENT);
+        }
+      }
+    } else {
+      /* 目标纹理 -> 回读缓冲：方向是纹理为源、缓冲为目标。 */
+      copy_out(gpu_->dst_tex, gpu_->readback, 0);
+    }
   }
 
   hr = list->Close();
@@ -814,6 +1031,14 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
     return false;
   }
 
+  if (window_target) {
+    /* 到这里「上传 → dispatch → 拷后备缓冲」整链都成功了：等 comp_render_present 上屏。 */
+    gpu_->window_frame_ready = true;
+    window_readback_ready_ = verify_window_readback;
+    offloaded_.store(true);
+    return true;
+  }
+
   void* mapped_read = nullptr;
   D3D12_RANGE read_range{0, static_cast<SIZE_T>(block_size)};
   hr = gpu_->readback->Map(0, &read_range, &mapped_read);
@@ -831,6 +1056,7 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
                 read + static_cast<size_t>(y) * aligned_row, out_row_bytes);
   }
   gpu_->readback->Unmap(0, nullptr);
+  readback_frames_.fetch_add(1);
   /* 到这里整条设备链路（上传 → dispatch → 回读）都成功了，才算真正用了 GPU。 */
   offloaded_.store(true);
   return true;
@@ -838,11 +1064,68 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
 
 bool D3d12RenderBackend::present(Document& doc, std::string* error) {
   (void)doc;
-  (void)error;
-  /*
-   * 本后端是离屏后端（RHI 契约：离屏后端 present 为无操作）。
-   * 窗口上屏走 COMP_SURFACE_HWND 是后续独立切片，caps().window_present 如实为 false。
-   */
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (gpu_ == nullptr || gpu_->swapchain == nullptr || !gpu_->window_frame_ready) {
+    /* 离屏路径没有可上屏的帧：保持 RHI 的「离屏后端 present 为无操作」语义。 */
+    return true;
+  }
+  const HRESULT hr = gpu_->swapchain->Present(0, 0);
+  gpu_->window_frame_ready = false;
+  if (FAILED(hr)) {
+    if (error != nullptr) {
+      std::string text = hresult_text("swap chain present failed", hr);
+      /* 设备丢失时把驱动的真实原因一并带出来：只报 0x887A0005 无法判断是
+         驱动 TDR、非法资源状态还是别的原因，读这一行的人会卡在这里。 */
+      if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) &&
+          gpu_->device != nullptr) {
+        char extra[80];
+        std::snprintf(extra, sizeof(extra), " (device removed reason 0x%08lx)",
+                      static_cast<unsigned long>(gpu_->device->GetDeviceRemovedReason()));
+        text += extra;
+      }
+      *error = text;
+    }
+    /* 设备没了：整块上下文丢弃，下一帧重新建（与渲染路径同一收口）。 */
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) gpu_.reset();
+    return false;
+  }
+  /* DXGI_STATUS_OCCLUDED 也是成功（窗口被遮挡时 Present 会返回它）。 */
+  presented_frames_.fetch_add(1);
+  return true;
+}
+
+void D3d12RenderBackend::set_window_readback_verification(bool enabled) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  verify_window_readback_ = enabled;
+}
+
+bool D3d12RenderBackend::take_window_readback(std::vector<std::uint8_t>* rgba, int* out_width,
+                                              int* out_height) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!window_readback_ready_ || gpu_ == nullptr || gpu_->readback == nullptr ||
+      gpu_->width == 0 || gpu_->height == 0) {
+    return false;
+  }
+  const UINT width = gpu_->width;
+  const UINT height = gpu_->height;
+  const size_t row_bytes = static_cast<size_t>(width) * 4;
+  const UINT64 block_size = static_cast<UINT64>(gpu_->aligned_row) * height;
+
+  void* mapped = nullptr;
+  D3D12_RANGE read_range{0, static_cast<SIZE_T>(block_size)};
+  if (FAILED(gpu_->readback->Map(0, &read_range, &mapped)) || mapped == nullptr) return false;
+  const uint8_t* read = static_cast<const uint8_t*>(mapped);
+  if (rgba != nullptr) {
+    rgba->resize(row_bytes * height);
+    for (UINT y = 0; y < height; ++y) {
+      std::memcpy(rgba->data() + static_cast<size_t>(y) * row_bytes,
+                  read + static_cast<size_t>(y) * gpu_->aligned_row, row_bytes);
+    }
+  }
+  gpu_->readback->Unmap(0, nullptr);
+  if (out_width != nullptr) *out_width = static_cast<int>(width);
+  if (out_height != nullptr) *out_height = static_cast<int>(height);
+  window_readback_ready_ = false;
   return true;
 }
 
@@ -905,6 +1188,14 @@ bool D3d12RenderBackend::present(Document&, std::string* error) {
 }
 
 bool D3d12RenderBackend::wait(Document&, std::string*) { return false; }
+
+void D3d12RenderBackend::set_window_readback_verification(bool enabled) {
+  verify_window_readback_ = enabled;
+}
+
+bool D3d12RenderBackend::take_window_readback(std::vector<std::uint8_t>*, int*, int*) {
+  return window_readback_ready_;
+}
 
 std::unique_ptr<RenderBackend> create_d3d12_backend(Engine*, std::string* error) {
   if (error != nullptr) *error = "d3d12 backend not compiled into this build";

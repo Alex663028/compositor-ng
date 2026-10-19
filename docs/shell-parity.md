@@ -33,12 +33,13 @@ compositor-ng 是「同引擎、两壳」结构：
 | PNG 导入/导出 | 可用 | 可用 | `comp_io_import` / `comp_io_export` | 已达成（libpng+zlib） |
 | JPEG 导入/导出 | 可用（有损） | 可用 | 同上 | 已达成（stb） |
 | PSD 只读导入 | 可用 | 可用 | `comp_io_import` | 已达成（stb） |
-| 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读，真实走设备；HWND 仍返回 `UNSUPPORTED` | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_flatten` | **有边界**：设备侧渲染已落地（S13），设备侧交换链未落地，窗口表面两壳均如实拒绝 |
+| 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读；**HWND 直呈已落地（S16，`caps().window_present`）** | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_present` / `comp_render_flatten` | **部分达成**：Windows 的设备侧离屏（S13）与交换链直呈（S16）都已落地；鸿蒙设备侧交换链未落地，窗口表面如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
 | 工具条 / 画布导航 | 17 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
-`COMP_ERR_UNSUPPORTED`**，不伪造成功。一旦窗口交换链落地，两壳无需改动调用点。
+`COMP_ERR_UNSUPPORTED`**，不伪造成功。Windows 侧已在 S16 补上 D3D12 交换链直呈
+（§5.10），鸿蒙侧仍需等设备侧交换链落地——调用点无需改动。
 
 ---
 
@@ -69,7 +70,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | `shell_contract_abi_constants_are_frozen` | 上表全部数值常量 |
 | `shell_contract_engine_lifecycle_is_shared` | `create(AUTO)`→`backend()` 返回合法枚举；`create(CPU)` 原样生效（两壳回退路径依赖） |
 | `shell_contract_flatten_semantics_is_shared` | 不透明源 + Normal 叠透明底，flatten 保源色（±1 LSB）、alpha=255 |
-| `shell_contract_window_surfaces_report_unsupported` | HWND / HARMONY_WINDOW 均返回 `UNSUPPORTED`；离屏 present/wait 无操作成功 |
+| `shell_contract_window_surfaces_report_unsupported` | **CPU 后端**对 HWND / HARMONY_WINDOW 均返回 `UNSUPPORTED`（不支持时不许假装）；离屏 present/wait 无操作成功。D3D12 的 HWND 直呈另见 §5.10 |
 | `shell_contract_codec_capability_query_is_shared` | PNG 可用、JPEG/PSD 为 VENDORED、TIFF 为 UNAVAILABLE，且 note 非空 |
 | `shell_contract_adjustment_control_metadata_is_shared` | kind=3=Exposure、3 个参数、首个路径 `exposureSettings.exposure`；越界显式失败 |
 
@@ -81,9 +82,10 @@ compositor-ng 是「同引擎、两壳」结构：
 ## 4. 边界与未达成项（如实记录）
 
 1. **设备侧上屏**：D3D12 **离屏渲染已真实走设备**（S13：上传 → 计算 → 回读；子集内
-   文档由 `last_render_offloaded()` 证明，见 `tests/test_rhi.cpp`），但**交换链仍未接**，
-   所以 `HWND` 表面照旧返回 `UNSUPPORTED`；鸿蒙无在线设备（`hdc list targets` 为空），
-   Vulkan 交换链未落地。故两壳窗口表面统一 `UNSUPPORTED`。
+   文档由 `last_render_offloaded()` 证明，见 `tests/test_rhi.cpp`），**窗口交换链直呈也已
+   落地**（S16：`caps().window_present`，`HWND` 表面写 DXGI flip-model 后备缓冲，见 §5.10）；
+   但交互壳主画布仍用 CPU 展平 + GDI（覆盖层冲突，§5.10 边界），鸿蒙无在线设备
+   （`hdc list targets` 为空）、Vulkan 交换链未落地，故**鸿蒙侧**窗口表面仍 `UNSUPPORTED`。
 2. **鸿蒙 UI 面板**：鸿蒙壳目前只有 `startup/shutdown/backendName/flatten/surfaceInfo/presentSurface`
    六个桥函数，尚未接图层/调整面板 UI；能力矩阵中标注为「未接 UI」，非能力缺失。
 3. **鸿蒙 HAP 真机验证**：交叉编译（aarch64 / x86_64）均可产出 `.so`，但无设备可上机。
@@ -326,9 +328,34 @@ S4–S14 的每一份报告都记着同一条边界：「未经人手 Win32 目�
 并给出「脚本场景 ↔ 清单章节」对照表。**它仍不替代 ALEX 的目视结论**。
 
 **事实边界。** 本轮证据是**机器抓的像素**，不是人眼；脚本抢前台、不模拟物理光标；
-`Z` 缩放工具按钮可选中但点击暂不改缩放；DXGI 交换链直呈仍未接。
+`Z` 缩放工具按钮可选中但点击暂不改缩放。（当时「DXGI 交换链直呈未接」，S16 已接，见 §5.10。）
 
-### 5.10 未达成的 UI 项
+### 5.10 S16 窗口 DXGI 交换链直呈（2026-10-19 追加）
+
+**1. 能力。** D3D12 构建下 `caps().window_present` 为 true，`comp_render_document` 收
+`COMP_SURFACE_HWND` 时：合成结果拷进 DXGI flip-model 后备缓冲，`comp_render_present`
+调 `Present` 上屏，**不回读**（`last_render_offloaded()` 仍为 true，`readback_frames()` 不增）。
+非 D3D12 构建或设备不可用 → 照旧 `COMP_ERR_UNSUPPORTED`，AUTO 回落 CPU 缓冲路径。
+
+**2. 关键实现约束（踩过的坑）。** 后备缓冲必须**创建时取一次并常驻持有**，每帧用
+`IDXGISwapChain3::GetCurrentBackBufferIndex()` 轮转。第一版每帧 `GetBuffer(0)` 再
+`Release`，第二帧 `ExecuteCommandLists` 后设备被移除（`0x887A0005`，原因
+`0x887A002B DXGI_ERROR_ACCESS_DENIED`）——因为写到了刚 Present 出去、正在扫描输出的表面。
+D3D11 上同样写法不炸（运行时内部代管轮转），所以这条坑只在 D3D12 直呈路径上暴露。
+代码里已用中文注释钉住，并有 `tests/test_rhi.cpp` 的**连续 4 帧**用例守门。
+
+**3. 基准（`--present-bench[=N]`）。** 交互壳主画布仍走 CPU 展平 + GDI（直呈窗口与 GDI
+覆盖层面板/蚂蚁线/笔迹预览不能安全混用），基准因此走独立窗口：1024²、底色 + 3 层整幅
+画布图层、预热 3 帧。AMD RX 6800 实测（30/60 帧各三次）：GPU 直呈平均
+**3.04–3.27 ms**，CPU `flatten + RGBA→BGRA + StretchDIBits` 平均 **3.85–3.91 ms**，
+约 **1.18–1.29×**。只快两成，瓶颈是逐层上传而非上屏；逐层 GPU 纹理缓存需要图层内容
+修订号（当前 `ImageBuffer::pixels` 是 shared_ptr + COW，无修订计数），列为后续工作。
+
+**4. 边界。** GPU 子集仍全有或全无（组/蒙版/调整/效果/旋转/裁剪/非 RGBA8 → 整次调用回落
+CPU，逐字节一致）；交换链只在尺寸变化时重建，跨 DPI/多显示器/窗口拖动后的行为**未经人手
+目视**（`docs/manual-test.md` M1–M16 仍未勾选）；鸿蒙壳窗口表面仍 `UNSUPPORTED`。
+
+### 5.11 未达成的 UI 项
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|

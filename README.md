@@ -9,11 +9,11 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   （FilterGraph）与图层组穿透/隔离语义、仿射变换与高质量重采样、`.comp` 像素改 PNG + UUID
   图层 id（打通上游互通）均已落地。**M3 进行中**——渲染后端接口切片（`rhi.h` + CPU/D3D12/Vulkan
   三后端）、SPIR-V 构建链路、Vulkan 计算管线设备侧实现（opt-in）、
-  **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成，交换链待接）**、
+  **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成；S16：DXGI 交换链直呈已接）**、
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **445 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
+  全量 **447 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -1378,7 +1378,7 @@ Windows 侧推荐编译器仍是 clang-cl。
   （`render_document` 仍返回 UNSUPPORTED、`caps().offscreen_compute` 仍为 false）——
   这是功能/性能项，默认构建继续关掉 `COMP_HAS_D3D12`，不把未验证的设备路径带进基线。
   → **2026-10-18 S13 已接入**：`offscreen_compute` 真实为 true，离屏渲染由设备执行
-  （`last_render_offloaded()` 证明），窗口交换链仍未接；见 §6.23。
+  （`last_render_offloaded()` 证明）；**2026-10-19 S16 已接窗口交换链直呈**（见 §6.26）。
 - **SPIR-V 仅静态校验**：真机 `vkCreateShaderModule` 已实际接受该 blob（不报错），但未接校验层
   做更严格的运行期校验；静态证据为 glslang 编译 + 真机管线创建成功。
 - **第三方编解码库：部分已接入，其余仍未链接**。PNG（libpng 1.6.44 + zlib 1.3.1）、
@@ -1478,16 +1478,16 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~91%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）；**2026-10-19 S16 补上 Windows 窗口 DXGI 交换链直呈 + 真机基准**（§6.26）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
-+ ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
++ ④ 15%×91% = 28.5 + 35.0 + 19.6 + 13.65 = **96.75% ≈ 97%**。
 
 **剩下的 3% 按层拆开，全部有明确归属**（不再是「被上游工具面阻塞」）：
 
 - ① 契约面 1.5 个点：`run_tool_op` 之外的少量诊断/边界口径；
-- ③ 合成与渲染 0.4 个点：**设备侧后端未接主渲染路径**（D3D12 代码已能在 SDK 下编译，
-  `render_document` 仍走 CPU，见 §6.2）；
+- ③ 合成与渲染 0.4 个点：GPU 子集仍是全有或全无（组/蒙版/调整/非全画布回落 CPU），
+  且直呈只比 CPU flatten+GDI 快 1.18–1.29×（瓶颈是逐层上传，§6.26）；
 - ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
 
 上一轮记的「`deep_take_painted` 被 S4 仿制笔刷阻塞」已证伪：上游 `BrushStroke.swift:1097`
@@ -2826,11 +2826,14 @@ D3D12 实例渲染 32×32 全画布文档，断言 `can_render_document` + `rend
 **如实结论：当前「离屏上传 + 整幅回读」的 GPU 路径比 CPU 慢**（每层上传 + PCIe 往返 +
 回读），本轮不宣称任何加速，只宣称「设备真的参与、结果正确、为交换链路径打好地基」。
 真正可能带来收益的是下一步的 **DXGI 交换链 `present`（不回读、直接上屏）**，
-在此之前没有性能结论。
+在此之前没有性能结论。→ **2026-10-19 S16 已接直呈并实测**：1024² 三层场景下
+GPU 直呈 3.04–3.27 ms vs CPU flatten+GDI 3.85–3.91 ms（约 1.18–1.29×），
+瓶颈在逐层上传而非上屏，见 §6.26。
 
 **5. 边界（未变）。** GPU 子集仍是**全有或全无**：组图层、`parent != 0`、剪贴源、蒙版、
 调整、效果、旋转/翻转、非全画布或非 RGBA8 图层 → 本次调用回落 CPU，像素与 CPU 基准
-**逐字节一致**；绝不渲染半个图层栈。窗口表面仍返回 `UNSUPPORTED`（交换链未落地）。
+**逐字节一致**；绝不渲染半个图层栈。窗口表面在 S13 仍返回 `UNSUPPORTED`（交换链未落地，
+**S16 已接直呈**，见 §6.26）。
 本机 D3D12 调试层未安装（`D3D12GetDebugInterface` → `0x887A002D`），故新增
 `COMP_D3D12_DEBUG` 环境变量开关（有 SDK 组件时启用 InfoQueue 并在 `Close()` 失败时打印
 最多 12 条消息），默认零开销。默认构建仍不编入 D3D12：`python scripts/build.py --gpu`
@@ -2951,11 +2954,99 @@ wand / gradient / shape / type / filter / adjustment / layers / view`。几个�
 **5. 边界（如实记录）。** 证据是**机器抓的像素**，不是人眼：手感、闪烁、光标形态、
 跨 DPI 仍需 ALEX 按清单走一遍（S4–S14 那条边界从「没人碰过」变成「脚本碰过且留了
 可复核截图」，不算消除）。脚本会抢前台窗口（`SetCapture` 需要），跑时别用键鼠。
-沿用 S13 边界：DXGI 交换链直呈未接、GPU 仅覆盖子集且**不比 CPU 快**；
+沿用 S13 边界：GPU 仅覆盖子集；「不比 CPU 快」这一条在 S16 直呈路径下已改成
+「只快 1.18–1.29×，瓶颈在逐层上传」（§6.26）；
 `Z` 缩放工具按钮可选中但点击暂不改缩放；文字仍 ASCII-only；
 ML / RAW / HEIC / WebP / SVG / PSB / TIFF 不在范围内。
 
 报告：`../report/S15-visual-drag-fix-20261019-dsh.md`。
+
+### 6.26 S16 DXGI 交换链直呈（2026-10-19，DSH）
+
+S13 把设备接进了离屏合成路径，但窗口表面仍返回 `UNSUPPORTED`：合成完要把整幅结果回读
+到 CPU 再交给 GDI。S16 补上这条缺口——**合成结果直接拷进 DXGI 后备缓冲，由
+`IDXGISwapChain1::Present` 上屏，全程不回读**。引擎核与 C ABI 零改动（导出仍 112 个）。
+
+**1. 实现（`engine/render/d3d12_backend.cpp` + `.h`）。** `GpuContext` 新增
+`IDXGIFactory2` / `IDXGISwapChain1` / `IDXGISwapChain3`，以及**创建时取一次、长期持有**的
+两块后备缓冲 `ID3D12Resource* window_buffers[2]`。`ensure_swapchain(HWND,W,H)` 建
+`DXGI_FORMAT_RGBA8_UNORM` / `BufferCount=2` / `DXGI_SWAP_EFFECT_FLIP_DISCARD` /
+`DXGI_SCALING_STRETCH` 的 flip-model 链（`CreateSwapChainForHwnd`，`MakeWindowAssociation(NO_ALT_ENTER)`），
+再 QI `IDXGISwapChain3`、`GetBuffer(0/1)` 常驻持有。`render_document(HWND)` 用
+`GetCurrentBackBufferIndex()` 轮转，`CopyResource` 进当前缓冲（`PRESENT→COPY_DEST→PRESENT`
+屏障），`present()` 调 `Present(0,0)`；尺寸/窗口变化或上屏失败时整块上下文丢弃重建。
+`caps().window_present` 为 true 时(`D3D12` 构建) `COMP_SURFACE_HWND` 才走该路径，否则照旧
+`COMP_ERR_UNSUPPORTED` 并由 AUTO 回落 CPU。
+
+**2. 真缺陷与根因（本节最值得记的部分）。** 第一版按「`GetBuffer(0)` → 用 → `Release()` →
+`Present()`」写，实测**只能上屏一帧**：第二帧 `ExecuteCommandLists` 之后设备直接被移除
+（`Present` 返回 `0x887A0005`，`GetDeviceRemovedReason()` = `0x887A002B`
+`DXGI_ERROR_ACCESS_DENIED`）。用 8 个一次性最小探针把变量拆到只剩「DXGI 与用法」：
+
+| 探针 | 做法 | 结果 |
+|------|------|------|
+| 纯 DXGI | `GetBuffer(0)`→`Release`→`Present`，无 GPU 工作 | 6/6 帧 `S_OK` |
+| 空命令表 | 每帧执行空命令表再 `Present` | 4/4 帧 `S_OK` |
+| 屏障 / Clear | 后备缓冲 `PRESENT→COPY_DEST→PRESENT`（±`ClearRenderTargetView`） | **第 1 帧 `S_OK`，第 2 帧必挂** |
+| 参数矩阵 | `FLIP_SEQUENTIAL` / `SCALING_NONE` / `BufferCount=3` / `BGRA8` | 四种组合全部第 2 帧挂 |
+| 显式适配器 | 设备+交换链都建在带输出的 adapter 0 | 同样挂（排除适配器错配） |
+| D3D11 对照 | 同窗口/同格式/同 flip 参数，D3D11 设备 | **5/5 帧 `S_OK`** |
+| WARP(D3D12) | 换微软软件适配器跑同一循环 | **同样第 2 帧挂**（排除 AMD 驱动） |
+| 标准写法 | `GetCurrentBackBufferIndex()` + 每缓冲常驻 RTV/引用 | **4/4 帧 `S_OK`** |
+
+结论：不是显卡、不是驱动、不是桌面/会话（`OpenInputDesktop` 成功、`GetSystemMetrics(SM_REMOTESESSION)=0`），
+而是**flip-model 下 D3D12 的后备缓冲必须按索引轮转并常驻持有**——每帧 `GetBuffer(0)`
+拿到的是刚 `Present` 出去的那块，再写它等于写正在扫描输出的表面，DXGI 直接把设备判为
+移除。D3D11 运行时内部代管缓冲轮转，所以同样写法在 D3D11 上不炸，这也是这个坑在
+「D3D11 经验」下极易踩中的原因。修法就是上表的「标准写法」，并在代码里用中文注释钉住
+「为什么不能每帧 `GetBuffer(0)` 再 `Release`」。
+
+**3. 护栏（`tests/test_rhi.cpp`）。** 既有的 `rhi_gpu_presents_eligible_document_to_hwnd_without_readback`
+从「渲染 1 帧 + Present 1 帧」扩成**连续 4 帧**：每帧都断言 `last_render_offloaded()`、
+后备缓冲回读与 CPU 基准 `max_diff <= 1`，最后断言 `presented_frames() == 4` 且
+`readback_frames() == 0`。单帧用例抓不到这个缺陷，4 帧循环把它变成回归项。
+
+**4. 真机基准（`compositor_shell.exe --present-bench[=N]`，新增）。** 交互壳不能直接用直呈：
+画布上还叠着 GDI 绘制的面板/选区蚂蚁线/缩放，混用会互相覆盖。所以基准走**独立窗口**：
+1024²、底色 + 3 层整幅画布图层（NORMAL/MULTIPLY/SCREEN，不透明度 1.0/0.75/0.5，全部是
+GPU 子集允许的形态）、预热 3 帧、默认 20 帧，结果写 `present_bench.txt` 并按需回显到
+父控制台。同一进程内对比两条上屏路径（AMD Radeon RX 6800，30/60 帧各跑三次）：
+
+| 指标 | GPU 直呈（render(HWND)+present） | CPU flatten + RGBA→BGRA + `StretchDIBits` |
+|------|-------------------------------|------------------------------------------|
+| 平均 | **3.04 – 3.27 ms** | **3.85 – 3.91 ms** |
+| 最好 / 最差 | 2.33 – 2.46 / 4.51 – 5.77 ms | — |
+| 只算 CPU 展平 | — | 2.94 – 3.02 ms |
+
+**如实结论**：直呈比「CPU 展平 + GDI 上屏」快 **1.18–1.29×**，只快两成，不是数量级。
+原因是瓶颈不在上屏而在**逐层上传**：每帧 4 块 1024² 纹理经 PCIe 上传 + 4 次 dispatch 已经
+吃掉约 3 ms（与 S13 记录的 3.01 ms 稳态一致），省掉的只是回读 + GDI blit 那一段。
+要真正拉开差距，下一步得做**逐层 GPU 纹理缓存**（避免每帧重传）；这需要给图层加内容
+版本号（`ImageBuffer::pixels` 是 `shared_ptr` + COW，当前没有修订计数，就地写入会让缓存
+静默过期），属于独立一轮工作，本轮不宣称。
+
+**5. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py --gpu` | **447 cases, 0 failed, 0 check failures**（+2，S16 两例） |
+| `python scripts/build.py`（默认） | **447 cases, 0 failed, 0 check failures** |
+| `python scripts/build_windows_shell.py --gpu` + `--present-bench=30` | `result=ok`，`hwnd_target=ok`，三次重复见上表 |
+| `compositor_shell.exe --selftest` | **164 项 0 失败**，`compositor_shell_selftest.txt` 逐字节未变（SHA256 `AA2E2754…`） |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 `compile ok=90 fail=0`） |
+| ABI 导出 | **112**（未新增；S16 只动内部 RHI 与 Shell 基准） |
+
+**6. 边界（如实记录）。**
+
+- 直呈只在 **D3D12 构建 + 合格文档**（整幅画布、RGBA8、无组/蒙版/调整/效果/旋转/裁剪）时启用；
+  其余文档仍逐字节回落 CPU，不渲染半个图层栈。
+- 交互外壳的**主画布仍走 CPU 展平 + GDI**：直呈窗口与 GDI 覆盖层（面板、蚂蚁线、笔迹预览）
+  不能安全混用，直呈目前是「能力已通 + 可复现基准」，没有替换交互路径。
+- 多显示器 / 跨 DPI / 窗口 resize 后的交换链重建只做了尺寸变化重建，**未经人手目视**
+  （`docs/manual-test.md` 里 M1–M16 仍未勾选）。
+- 鸿蒙壳的窗口表面仍如实返回 `UNSUPPORTED`；OHOS 真机 `hdc list targets` 仍为空。
+
+报告：`../report/S16-dxgi-present-20261019-dsh.md`。
 
 ## 7. 许可
 

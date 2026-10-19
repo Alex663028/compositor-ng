@@ -11,6 +11,7 @@
 #include "test_framework.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -28,12 +29,40 @@
 #include "domain/document.h"
 #include "domain/layer.h"
 #include "engine.h"
+#include "render/d3d12_backend.h"
 #include "render/gpu_kernel.h"
 #include "render/rhi.h"
+
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 using namespace compositor;
 
 namespace {
+
+#if defined(_WIN32)
+/* 窗口直呈用例需要真实 HWND：建一个不显示的普通窗口即可（swapchain 不要求可见）。 */
+HWND create_hidden_test_window(int width, int height) {
+  static const wchar_t kClass[] = L"CompositorRhiTestWindow";
+  static bool registered = false;
+  if (!registered) {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+    wc.lpszClassName = kClass;
+    if (RegisterClassExW(&wc) == 0) return nullptr;
+    registered = true;
+  }
+  return CreateWindowExW(0, kClass, L"compositor-rhi-test", WS_OVERLAPPEDWINDOW, 0, 0, width,
+                         height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+#endif
 
 bool valid_backend(comp_backend backend) {
   return backend == COMP_BACKEND_CPU || backend == COMP_BACKEND_D3D12 ||
@@ -648,4 +677,195 @@ COMP_TEST(rhi_gpu_falls_back_to_cpu_for_unsupported_documents) {
   comp_document_destroy(auto_doc);
   comp_engine_destroy(cpu_engine);
   comp_engine_destroy(auto_engine);
+}
+
+/*
+ * S16：DXGI 窗口直呈（COMP_SURFACE_HWND）。
+ *
+ * 单靠像素比对证明不了「没回读」——ABI 层随时可以静默回落到 CPU 回读路径而画面
+ * 依旧正确。所以这里直接持有 D3D12 后端实例，断言四件事：
+ *   1. 合法子集文档 + HWND 目标真的在设备上跑（last_render_offloaded）；
+ *   2. 窗口路径不产生整幅回读（readback_frames 不增长），且 present 之前没上屏；
+ *   3. 进 Present 之前那一帧后备缓冲像素与 CPU 基准一致（±1 LSB，预乘契约内）；
+ *   4. 离屏路径仍照旧回读——两条路径的差异是可观测的，不是自说自话。
+ * 未编入 D3D12 / 本机无设备 / 建窗失败 → 跳过（不算失败）。
+ */
+COMP_TEST(rhi_gpu_presents_eligible_document_to_hwnd_without_readback) {
+#if defined(_WIN32)
+  const int32_t size = 32;
+  HWND hwnd = create_hidden_test_window(320, 240);
+  COMP_CHECK_MSG(hwnd != nullptr, "create the hidden test window");
+  if (hwnd == nullptr) return;
+  struct WindowGuard {
+    HWND handle;
+    ~WindowGuard() {
+      if (handle != nullptr) DestroyWindow(handle);
+    }
+  } window_guard{hwnd};
+
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+
+  std::string why;
+  comp_backend actual = COMP_BACKEND_AUTO;
+  std::unique_ptr<RenderBackend> gpu = create_backend(&engine, COMP_BACKEND_D3D12, &why, &actual);
+  if (gpu == nullptr || gpu->kind() != COMP_BACKEND_D3D12) return; /* 本构建没有 D3D12 */
+  if (!gpu->caps().window_present) return; /* 本机没有可用的窗口上屏路径 */
+
+  /* 与既有 GPU 用例同一形态：整幅画布 RGBA8、预乘、无组/蒙版/调整。 */
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "canvas";
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  layer_desc.transform = comp_rect{0, 0, size, size};
+  comp_layer_id id = 0;
+  Layer* layer = document.create_layer(layer_desc, &id);
+  COMP_CHECK_MSG(layer != nullptr, "create a full-canvas layer");
+  if (layer == nullptr) return;
+  layer->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 40, 80, 120, 200);
+
+  /* CPU 基准：同一个 Document，交给 CPU 后端渲染到缓冲（逐字节可比）。 */
+  std::unique_ptr<RenderBackend> cpu = create_backend(&engine, COMP_BACKEND_CPU, &why, &actual);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels(static_cast<size_t>(size) * static_cast<size_t>(size) * 4, 0);
+  comp_render_target cpu_target{};
+  cpu_target.size = comp_size{size, size};
+  cpu_target.format = COMP_PIXEL_RGBA8;
+  cpu_target.kind = COMP_SURFACE_CPU_BUFFER;
+  cpu_target.stride = static_cast<size_t>(size) * 4;
+  cpu_target.pixels = cpu_pixels.data();
+  COMP_CHECK(cpu->render_document(document, cpu_target, &why));
+
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  d3d12->set_window_readback_verification(true);
+
+  comp_render_target window_target{};
+  window_target.size = comp_size{size, size};
+  window_target.format = COMP_PIXEL_RGBA8;
+  window_target.kind = COMP_SURFACE_HWND;
+  window_target.native_handle = hwnd;
+
+  why.clear();
+  COMP_CHECK_MSG(gpu->render_document(document, window_target, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                 "an eligible window target must run on the device");
+  COMP_CHECK_MSG(d3d12->readback_frames() == 0,
+                 "the window surface path must not read the frame back to the CPU");
+  COMP_CHECK(d3d12->presented_frames() == 0);
+
+  /* 测试专用回读：拿到的是「即将 Present」的那一帧后备缓冲内容。 */
+  std::vector<uint8_t> presented;
+  int presented_width = 0;
+  int presented_height = 0;
+  COMP_CHECK_MSG(d3d12->take_window_readback(&presented, &presented_width, &presented_height),
+                 "the verification readback of the presented frame must be available");
+  COMP_CHECK(presented_width == size && presented_height == size);
+
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, presented, &max_diff, &diff_count, &first_diff);
+  std::string message = "presented back buffer parity (max_diff=" + std::to_string(max_diff) +
+                        ", diffs=" + std::to_string(diff_count) +
+                        ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!presented.empty() && max_diff <= 1, message.c_str());
+
+  why.clear();
+  COMP_CHECK_MSG(gpu->present(document, &why), why.c_str());
+  COMP_CHECK_MSG(d3d12->presented_frames() == 1, "present must actually submit a frame");
+  COMP_CHECK_MSG(d3d12->readback_frames() == 0, "presenting must not introduce a readback");
+
+  /*
+   * 多帧轮转守卫：flip-model 下每帧必须换用另一块后备缓冲。早先的实现每帧
+   * GetBuffer(0) 再 Release，第二帧实际写进「正在扫描输出」的表面，第二帧
+   * ExecuteCommandLists 之后设备直接被移除（0x887A0005，原因 0x887A002B），
+   * 表现为「只能上屏一帧」。这里连续再上屏 3 帧，每帧都对拍内容。
+   */
+  for (int frame = 0; frame < 3; ++frame) {
+    why.clear();
+    COMP_CHECK_MSG(gpu->render_document(document, window_target, &why), why.c_str());
+    COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                   "every presented frame must still run on the device");
+    std::vector<uint8_t> frame_pixels;
+    int frame_width = 0;
+    int frame_height = 0;
+    COMP_CHECK_MSG(
+        d3d12->take_window_readback(&frame_pixels, &frame_width, &frame_height),
+        "the verification readback of every presented frame must be available");
+    COMP_CHECK(frame_width == size && frame_height == size);
+    int frame_max_diff = 255;
+    size_t frame_diffs = 0;
+    size_t frame_first_diff = 0;
+    compare_pixels(cpu_pixels, frame_pixels, &frame_max_diff, &frame_diffs, &frame_first_diff);
+    const std::string frame_message =
+        "presented frame " + std::to_string(frame + 2) + " parity (max_diff=" +
+        std::to_string(frame_max_diff) + ", diffs=" + std::to_string(frame_diffs) +
+        ", first_byte=" + std::to_string(frame_first_diff) + ")";
+    COMP_CHECK_MSG(!frame_pixels.empty() && frame_max_diff <= 1, frame_message.c_str());
+    why.clear();
+    COMP_CHECK_MSG(gpu->present(document, &why), why.c_str());
+  }
+  COMP_CHECK_MSG(d3d12->presented_frames() == 4,
+                 "four window frames must have been submitted without a device loss");
+  COMP_CHECK_MSG(d3d12->readback_frames() == 0,
+                 "presenting further frames must not introduce a readback");
+
+  /* 离屏路径仍走回读：两条路径的差异可观测，窗口直呈不是把回读改名了事。 */
+  std::vector<uint8_t> offscreen_pixels(static_cast<size_t>(size) * static_cast<size_t>(size) * 4,
+                                        0);
+  comp_render_target offscreen_target{};
+  offscreen_target.size = comp_size{size, size};
+  offscreen_target.format = COMP_PIXEL_RGBA8;
+  offscreen_target.kind = COMP_SURFACE_CPU_BUFFER;
+  offscreen_target.stride = static_cast<size_t>(size) * 4;
+  offscreen_target.pixels = offscreen_pixels.data();
+  why.clear();
+  COMP_CHECK_MSG(gpu->render_document(document, offscreen_target, &why), why.c_str());
+  COMP_CHECK_MSG(d3d12->readback_frames() == 1,
+                 "the offscreen path must still count exactly one readback");
+#endif /* _WIN32 */
+}
+
+/*
+ * 没有 GPU 时 HWND 表面必须被**明确拒绝**：CPU 后端不能假装上屏，也不能悄悄只画
+ * 一半。拒绝的是表面类型，不是文档——同一文档改走 CPU 缓冲照旧成功。
+ */
+COMP_TEST(rhi_hwnd_target_is_rejected_without_gpu_backend) {
+  const int32_t size = 16;
+  comp_engine cpu_engine = make_abi_engine(COMP_BACKEND_CPU);
+  COMP_CHECK(cpu_engine != nullptr);
+  if (cpu_engine == nullptr) return;
+  comp_document doc = build_scene(cpu_engine, size, false);
+  COMP_CHECK(doc != nullptr);
+  if (doc != nullptr) {
+    comp_render_target window_target{};
+    window_target.size = comp_size{size, size};
+    window_target.format = COMP_PIXEL_RGBA8;
+    window_target.kind = COMP_SURFACE_HWND;
+    /* 伪句柄：CPU 后端按表面类型就该拒绝，绝不该解引用它。 */
+    window_target.native_handle = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+    COMP_CHECK_MSG(comp_render_document(doc, &window_target) != COMP_OK,
+                   "the CPU backend must refuse a window surface");
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(size) * static_cast<size_t>(size) * 4, 0);
+    comp_render_target cpu_target{};
+    cpu_target.size = comp_size{size, size};
+    cpu_target.format = COMP_PIXEL_RGBA8;
+    cpu_target.kind = COMP_SURFACE_CPU_BUFFER;
+    cpu_target.stride = static_cast<size_t>(size) * 4;
+    cpu_target.pixels = pixels.data();
+    COMP_CHECK_MSG(comp_render_document(doc, &cpu_target) == COMP_OK,
+                   "the same document must still render to a CPU buffer");
+    /* 离屏后端 present 仍是合法无操作。 */
+    COMP_CHECK(comp_render_present(doc) == COMP_OK);
+    COMP_CHECK(comp_render_wait(doc) == COMP_OK);
+  }
+  comp_document_destroy(doc);
+  comp_engine_destroy(cpu_engine);
 }

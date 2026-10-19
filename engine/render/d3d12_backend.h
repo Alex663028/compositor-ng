@@ -3,9 +3,11 @@
 #define COMPOSITOR_RENDER_D3D12_BACKEND_H
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "render/rhi.h"
 
@@ -25,6 +27,10 @@ namespace compositor {
  *
  * 能力闸门：只接受 can_render_document 认可的简单文档（全画布 RGBA8、无组/
  * 蒙版/剪贴/调整/效果/变换）。ABI 层据此按文档回落 CPU，不会输出错误画面。
+ *
+ * S16 起支持窗口直呈：target.kind == COMP_SURFACE_HWND 时合成结果直接拷进
+ * DXGI flip-model 交换链后备缓冲，comp_render_present 才真正 Present——不再整幅
+ * 回读。离屏（CPU_BUFFER）路径保持原语义不变。
  */
 class D3d12RenderBackend final : public RenderBackend {
  public:
@@ -40,10 +46,25 @@ class D3d12RenderBackend final : public RenderBackend {
 
   bool render_document(Document& doc, const comp_render_target& target,
                        std::string* error) override;
-  /* 仅当「上传 → GPU dispatch → 回读」整链成功时为 true（CPU 回落不算）。 */
+  /* 仅当「上传 → GPU dispatch → （回读 | 拷进后备缓冲）」整链成功时为 true。 */
   bool last_render_offloaded() const override { return offloaded_.load(); }
   bool present(Document& doc, std::string* error) override;
   bool wait(Document& doc, std::string* error) override;
+
+  /* ---------------- 内部证据（不进 C ABI，仅供测试/外壳基准使用） ---------------- */
+
+  /* 成功提交到窗口表面的帧数（每次 comp_render_present 真正 Present 后 +1）。 */
+  unsigned long long presented_frames() const { return presented_frames_.load(); }
+  /* 走「纹理 -> 回读缓冲 -> CPU」离屏路径的帧数（窗口路径必须不增长）。 */
+  unsigned long long readback_frames() const { return readback_frames_.load(); }
+
+  /*
+   * 仅供测试：打开后，窗口渲染会在后备缓冲交给 Present **之前**多拷一份到回读
+   * 缓冲，可用 take_window_readback() 取回该帧像素与 CPU 基准对拍。
+   * 默认关闭——它不是渲染路径的一部分，也不改变上屏语义。
+   */
+  void set_window_readback_verification(bool enabled);
+  bool take_window_readback(std::vector<std::uint8_t>* rgba, int* out_width, int* out_height);
 
  private:
   struct GpuContext;
@@ -52,6 +73,10 @@ class D3d12RenderBackend final : public RenderBackend {
   std::unique_ptr<GpuContext> gpu_;
   mutable std::mutex mutex_;
   std::atomic<bool> offloaded_{false};
+  std::atomic<unsigned long long> presented_frames_{0};
+  std::atomic<unsigned long long> readback_frames_{0};
+  bool verify_window_readback_ = false; /* 仅 set_window_readback_verification 可改 */
+  bool window_readback_ready_ = false;  /* 上一次窗口渲染是否留下了可取的验证回读 */
 };
 
 /* 运行时探测：能否取得 D3D12 设备（含 WARP 软件适配器）。 */

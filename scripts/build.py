@@ -201,8 +201,14 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
 
     if msvc:
         link = linker + ["/nologo", "/Fe:" + binary] + objects
+        # 单测里 S16 的窗口直呈用例要真实 HWND（CreateWindowExW）；非 Windows 不链。
+        if os.name == "nt":
+            link.append("user32.lib")
     else:
         link = linker + objects + ["-o", binary, "-pthread"]
+        # 同上：Windows 上补 user32 供 CreateWindowExW/DestroyWindow。
+        if os.name == "nt":
+            link.append("-luser32")
     run(link)
 
     print(f"[build] OK -> {binary}")

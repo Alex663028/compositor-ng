@@ -6158,6 +6158,391 @@ int run_selftest(const wchar_t* out_path) {
   return failures == 0 ? 0 : 1;
 }
 
+/* ============================================================ 窗口直呈基准（S16） */
+
+/*
+ * --present-bench[=帧数]：DXGI 窗口直呈的端到端基准。
+ *
+ * 同一篇文档（1024²、背景 + 3 层，全部落在 GPU 子集内）、同一个窗口，比较两条
+ * **真实上屏**路径：
+ *   A. GPU：comp_render_document(COMP_SURFACE_HWND) -> comp_render_present
+ *            （合成在设备上，结果拷进交换链后备缓冲，整幅不回读）
+ *   B. CPU：comp_render_flatten -> 预乘 RGBA8 换 BGRA -> StretchDIBits
+ *            （外壳既有上屏路径，render_canvas + present 的等价计量）
+ * 另外单独计时 flatten，用来区分「合成」与「上屏」各占多少。
+ *
+ * -mwindows 没有控制台：结果写 present_bench.txt，同时在父进程是控制台时
+ * AttachConsole 直接回显（--selftest 的写文件口径保持一致）。
+ * 返回 0=成功；2=本构建/本机没有可用窗口直呈路径（如实跳过，不算失败）。
+ */
+constexpr int kBenchCanvas = 1024;
+
+LRESULT CALLBACK bench_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+  switch (message) {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      HDC dc = BeginPaint(window, &paint);
+      EndPaint(window, &paint);
+      (void)dc;
+      return 0;
+    }
+    case WM_CLOSE:
+      DestroyWindow(window);
+      return 0;
+    default:
+      return DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
+void pump_pending_messages() {
+  MSG message{};
+  while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) > 0) {
+    TranslateMessage(&message);
+    DispatchMessageW(&message);
+  }
+}
+
+double elapsed_ms(const LARGE_INTEGER& start, const LARGE_INTEGER& end, double frequency) {
+  return (static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0) / frequency;
+}
+
+/* 基准场景：不透明底 + 三层整幅画布图层，全部是 GPU 子集允许的形态。 */
+comp_document build_present_bench_document(comp_engine engine, int32_t size) {
+  comp_document document = nullptr;
+  comp_document_desc desc{};
+  desc.width = size;
+  desc.height = size;
+  if (comp_document_create(engine, &desc, &document) != COMP_OK) return nullptr;
+
+  size_t count = 0;
+  if (comp_layer_count(document, &count) != COMP_OK || count == 0) return document;
+  std::vector<comp_layer_id> ids(count);
+  if (comp_layer_list(document, ids.data(), ids.size(), &count) != COMP_OK) return document;
+
+  std::vector<uint8_t> pixels(static_cast<size_t>(size) * static_cast<size_t>(size) * 4);
+  comp_image image{};
+  image.width = size;
+  image.height = size;
+  image.format = COMP_PIXEL_RGBA8;
+  image.stride = static_cast<size_t>(size) * 4;
+  image.pixels = pixels.data();
+
+  /* 底层：不透明底色。 */
+  for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+    pixels[i + 0] = 24;
+    pixels[i + 1] = 96;
+    pixels[i + 2] = 168;
+    pixels[i + 3] = 255;
+  }
+  if (comp_layer_set_pixels(document, ids.front(), &image) != COMP_OK) return document;
+
+  const comp_blend_mode blends[3] = {COMP_BLEND_NORMAL, COMP_BLEND_MULTIPLY, COMP_BLEND_SCREEN};
+  const float opacities[3] = {1.0f, 0.75f, 0.5f};
+  for (int layer_index = 0; layer_index < 3; ++layer_index) {
+    comp_layer_desc layer_desc{};
+    layer_desc.name = "bench-layer";
+    layer_desc.blend = blends[layer_index];
+    layer_desc.opacity = opacities[layer_index];
+    layer_desc.transform = comp_rect{0, 0, size, size};
+    layer_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+    comp_layer_id id = 0;
+    if (comp_layer_add(document, &layer_desc, &id) != COMP_OK) return document;
+    /* 预乘合法：颜色分量都 <= alpha。 */
+    for (int32_t y = 0; y < size; ++y) {
+      for (int32_t x = 0; x < size; ++x) {
+        uint8_t* p = &pixels[(static_cast<size_t>(y) * static_cast<size_t>(size) +
+                              static_cast<size_t>(x)) * 4];
+        const uint32_t alpha =
+            (static_cast<uint32_t>(x * 11 + y * 7 + layer_index * 29) % 200u) + 40u;
+        p[0] = static_cast<uint8_t>(((x * 17 + layer_index * 31) % 255) * alpha / 255);
+        p[1] = static_cast<uint8_t>(((y * 13 + layer_index * 47) % 255) * alpha / 255);
+        p[2] = static_cast<uint8_t>((((x + y) * 7 + layer_index * 11) % 255) * alpha / 255);
+        p[3] = static_cast<uint8_t>(alpha);
+      }
+    }
+    if (comp_layer_set_pixels(document, id, &image) != COMP_OK) return document;
+  }
+  return document;
+}
+
+int run_present_bench(HINSTANCE instance, int frames) {
+  std::FILE* report = nullptr;
+  if (_wfopen_s(&report, L"present_bench.txt", L"wb") != 0 || report == nullptr) return 2;
+
+  /* 父进程是控制台时顺便回显；否则只写文件（--selftest 同口径）。 */
+  std::FILE* console = nullptr;
+  if (AttachConsole(ATTACH_PARENT_PROCESS) != 0) {
+    std::FILE* reopened = nullptr;
+    if (freopen_s(&reopened, "CONOUT$", "w", stdout) == 0) console = stdout;
+  }
+  auto emit = [&](const char* line) {
+    std::fprintf(report, "%s\n", line);
+    std::fflush(report); /* 崩溃也要留下最后到达的阶段，便于定位 */
+    if (console != nullptr) std::fprintf(console, "%s\n", line);
+  };
+  char line[512];
+
+  comp_engine engine = nullptr;
+  comp_engine_desc engine_desc{};
+  engine_desc.app_name = "compositor-shell-present-bench";
+  engine_desc.version = "0.1.0";
+  engine_desc.backend = COMP_BACKEND_AUTO;
+  if (comp_engine_create(&engine_desc, &engine) != COMP_OK || engine == nullptr) {
+    emit("result=engine_create_failed");
+    std::fclose(report);
+    return 1;
+  }
+  comp_backend actual = COMP_BACKEND_AUTO;
+  comp_engine_backend(engine, &actual);
+  /* 基准报告是纯文本（写文件/控制台），这里用窄名，不复用工具条的宽标签。 */
+  const char* backend_name = "AUTO";
+  if (actual == COMP_BACKEND_D3D12) {
+    backend_name = "D3D12";
+  } else if (actual == COMP_BACKEND_CPU) {
+    backend_name = "CPU";
+  } else if (actual == COMP_BACKEND_VULKAN) {
+    backend_name = "Vulkan";
+  } else if (actual == COMP_BACKEND_METAL) {
+    backend_name = "Metal";
+  }
+  std::snprintf(line, sizeof(line), "backend=%s", backend_name);
+  emit(line);
+
+  if (actual != COMP_BACKEND_D3D12) {
+    emit("result=skipped");
+    emit("reason=window present needs the D3D12 backend; build with --gpu and run on a machine "
+         "with a D3D12 device");
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 2;
+  }
+
+  static const wchar_t kBenchClass[] = L"CompositorPresentBenchWindow";
+  WNDCLASSEXW window_class{};
+  window_class.cbSize = sizeof(window_class);
+  window_class.style = CS_HREDRAW | CS_VREDRAW;
+  window_class.lpfnWndProc = bench_window_proc;
+  window_class.hInstance = instance;
+  window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  window_class.lpszClassName = kBenchClass;
+  if (RegisterClassExW(&window_class) == 0) {
+    emit("result=window_class_failed");
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+  RECT rect{0, 0, kBenchCanvas, kBenchCanvas};
+  AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+  HWND window = CreateWindowExW(0, kBenchClass, L"compositor present bench", WS_OVERLAPPEDWINDOW,
+                                CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left,
+                                rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+  if (window == nullptr) {
+    emit("result=window_create_failed");
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+  /* 不抢焦点但必须真的显示：隐藏窗口的 Present 会被系统当作遮挡，测不出真实上屏。 */
+  ShowWindow(window, SW_SHOWNOACTIVATE);
+  UpdateWindow(window);
+
+  comp_document document = build_present_bench_document(engine, kBenchCanvas);
+  if (document == nullptr) {
+    emit("result=document_create_failed");
+    DestroyWindow(window);
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+
+  comp_render_target target{};
+  target.size = comp_size{kBenchCanvas, kBenchCanvas};
+  target.format = COMP_PIXEL_RGBA8;
+  target.kind = COMP_SURFACE_HWND;
+  target.native_handle = window;
+
+  const size_t stride = static_cast<size_t>(kBenchCanvas) * 4;
+
+  std::snprintf(line, sizeof(line), "canvas=%dx%d", kBenchCanvas, kBenchCanvas);
+  emit(line);
+  std::snprintf(line, sizeof(line), "frames=%d", frames);
+  emit(line);
+
+  /* 预热 3 帧：把 PSO/交换链/首次上传这些一次性成本挪出测量窗口。 */
+  bool hwnd_path_ok = true;
+  comp_result render_result = COMP_OK;
+  comp_result present_result = COMP_OK;
+  for (int i = 0; i < 3; ++i) {
+    render_result = comp_render_document(document, &target);
+    if (render_result != COMP_OK) {
+      hwnd_path_ok = false;
+      break;
+    }
+    present_result = comp_render_present(document);
+    if (present_result != COMP_OK) {
+      hwnd_path_ok = false;
+      break;
+    }
+    pump_pending_messages();
+  }
+  if (!hwnd_path_ok) {
+    emit("result=hwnd_target_unsupported");
+    std::snprintf(line, sizeof(line), "render_result=%d", static_cast<int>(render_result));
+    emit(line);
+    std::snprintf(line, sizeof(line), "present_result=%d", static_cast<int>(present_result));
+    emit(line);
+    const char* last_error = comp_engine_last_error(engine);
+    std::snprintf(line, sizeof(line), "last_error=%s", last_error != nullptr ? last_error : "(none)");
+    emit(line);
+    /* 再用离屏目标试一次：区分「文档/窗口本身不行」与「整条渲染链路都不行」。 */
+    std::vector<uint8_t> probe(stride * kBenchCanvas, 0);
+    comp_render_target offscreen{};
+    offscreen.size = comp_size{kBenchCanvas, kBenchCanvas};
+    offscreen.format = COMP_PIXEL_RGBA8;
+    offscreen.kind = COMP_SURFACE_CPU_BUFFER;
+    offscreen.stride = stride;
+    offscreen.pixels = probe.data();
+    std::snprintf(line, sizeof(line), "offscreen_probe=%s",
+                  comp_render_document(document, &offscreen) == COMP_OK ? "ok" : "failed");
+    emit(line);
+    comp_document_destroy(document);
+    DestroyWindow(window);
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 2;
+  }
+  emit("hwnd_target=ok");
+
+  LARGE_INTEGER frequency{};
+  QueryPerformanceFrequency(&frequency);
+  const double freq = static_cast<double>(frequency.QuadPart);
+
+  /* ---- A. GPU 直呈：render(HWND) + present ---- */
+  double gpu_total = 0.0;
+  double gpu_best = 1.0e30;
+  double gpu_worst = 0.0;
+  bool gpu_ok = true;
+  for (int i = 0; i < frames; ++i) {
+    LARGE_INTEGER start{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&start);
+    const bool ok = comp_render_document(document, &target) == COMP_OK &&
+                    comp_render_present(document) == COMP_OK;
+    QueryPerformanceCounter(&end);
+    if (!ok) {
+      gpu_ok = false;
+      break;
+    }
+    const double elapsed = elapsed_ms(start, end, freq);
+    gpu_total += elapsed;
+    if (elapsed < gpu_best) gpu_best = elapsed;
+    if (elapsed > gpu_worst) gpu_worst = elapsed;
+    pump_pending_messages();
+  }
+  if (!gpu_ok) {
+    emit("result=gpu_present_failed");
+    comp_document_destroy(document);
+    DestroyWindow(window);
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+  const double gpu_avg = gpu_total / frames;
+
+  /* ---- B. CPU 上屏：flatten + RGBA->BGRA + StretchDIBits（外壳既有路径） ---- */
+  std::vector<uint8_t> rgba(stride * kBenchCanvas);
+  std::vector<uint8_t> bgra(stride * kBenchCanvas);
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = kBenchCanvas;
+  info.bmiHeader.biHeight = -kBenchCanvas; /* 负值 = 自顶向下 */
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  info.bmiHeader.biCompression = BI_RGB;
+
+  HDC window_dc = GetDC(window);
+  if (window_dc == nullptr) {
+    emit("result=getdc_failed");
+    comp_document_destroy(document);
+    DestroyWindow(window);
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+  double cpu_blit_total = 0.0;
+  bool cpu_ok = true;
+  for (int i = 0; i < frames; ++i) {
+    LARGE_INTEGER start{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&start);
+    if (comp_render_flatten(document, rgba.data(), COMP_PIXEL_RGBA8, stride) != COMP_OK) {
+      cpu_ok = false;
+      break;
+    }
+    /* 预乘 RGBA8 -> GDI 的 BGRA（与 render_canvas 的逐像素交换同口径）。 */
+    const size_t pixel_count = static_cast<size_t>(kBenchCanvas) * kBenchCanvas;
+    for (size_t p = 0; p < pixel_count; ++p) {
+      const uint8_t* src = rgba.data() + p * 4;
+      uint32_t packed = (static_cast<uint32_t>(src[3]) << 24) |
+                        (static_cast<uint32_t>(src[0]) << 16) |
+                        (static_cast<uint32_t>(src[1]) << 8) | static_cast<uint32_t>(src[2]);
+      std::memcpy(bgra.data() + p * 4, &packed, 4);
+    }
+    StretchDIBits(window_dc, 0, 0, kBenchCanvas, kBenchCanvas, 0, 0, kBenchCanvas, kBenchCanvas,
+                  bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+    GdiFlush();
+    QueryPerformanceCounter(&end);
+    cpu_blit_total += elapsed_ms(start, end, freq);
+    pump_pending_messages();
+  }
+  ReleaseDC(window, window_dc);
+  if (!cpu_ok) {
+    emit("result=cpu_present_failed");
+    comp_document_destroy(document);
+    DestroyWindow(window);
+    comp_engine_destroy(engine);
+    std::fclose(report);
+    return 1;
+  }
+  const double cpu_blit_avg = cpu_blit_total / frames;
+
+  /* ---- C. 只测 CPU 合成（不含上屏），把两条路径的差异拆开归因 ---- */
+  double cpu_flatten_total = 0.0;
+  for (int i = 0; i < frames; ++i) {
+    LARGE_INTEGER start{};
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&start);
+    comp_render_flatten(document, rgba.data(), COMP_PIXEL_RGBA8, stride);
+    QueryPerformanceCounter(&end);
+    cpu_flatten_total += elapsed_ms(start, end, freq);
+    pump_pending_messages();
+  }
+  const double cpu_flatten_avg = cpu_flatten_total / frames;
+
+  std::snprintf(line, sizeof(line), "gpu_present_avg_ms=%.3f", gpu_avg);
+  emit(line);
+  std::snprintf(line, sizeof(line), "gpu_present_best_ms=%.3f", gpu_best);
+  emit(line);
+  std::snprintf(line, sizeof(line), "gpu_present_worst_ms=%.3f", gpu_worst);
+  emit(line);
+  std::snprintf(line, sizeof(line), "cpu_flatten_blit_avg_ms=%.3f", cpu_blit_avg);
+  emit(line);
+  std::snprintf(line, sizeof(line), "cpu_flatten_avg_ms=%.3f", cpu_flatten_avg);
+  emit(line);
+  std::snprintf(line, sizeof(line), "cpu_present_over_gpu=%.2f", cpu_blit_avg / gpu_avg);
+  emit(line);
+  emit("result=ok");
+
+  comp_document_destroy(document);
+  DestroyWindow(window);
+  UnregisterClassW(kBenchClass, instance);
+  comp_engine_destroy(engine);
+  std::fclose(report);
+  return 0;
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
@@ -6165,6 +6550,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   if (command_line != nullptr && wcsstr(command_line, L"--selftest") != nullptr) {
     const wchar_t* equals = wcschr(command_line, L'=');
     return run_selftest(equals != nullptr ? equals + 1 : L"compositor_shell_selftest.txt");
+  }
+
+  /* --present-bench[=帧数]：S16 窗口直呈基准（GPU 直呈 vs CPU flatten+GDI 上屏）。 */
+  if (command_line != nullptr && wcsstr(command_line, L"--present-bench") != nullptr) {
+    int frames = 20;
+    const wchar_t* frame_flag = wcsstr(command_line, L"--present-bench=");
+    if (frame_flag != nullptr) {
+      const int parsed = _wtoi(frame_flag + wcslen(L"--present-bench="));
+      if (parsed > 0 && parsed <= 1000) frames = parsed;
+    }
+    return run_present_bench(instance, frames);
   }
 
   ShellState shell;

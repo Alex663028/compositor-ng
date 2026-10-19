@@ -70,3 +70,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---------------------------------------------- 外壳运行期输出（可重跑生成，不入库）
+# S16 `--present-bench` 的基准报告；`--selftest` 的 compositor_shell_selftest.txt 是基线，入库。
+present_bench.txt
