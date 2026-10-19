@@ -1,4 +1,4 @@
-# Windows 外壳人工目视测试（S4–S15）
+# Windows 外壳人工目视测试（S4–S20）
 
 本文是给人看的**手工**验收清单。它和 `scripts/visual_check.py` 是两条互补的证据链：
 
@@ -13,7 +13,7 @@
 前置：
 
 ```
-python scripts\build.py                # 引擎 + 445 用例 + 自检
+python scripts\build.py                # 引擎 + 470 用例 + 自检
 python scripts\build_windows_shell.py  # 外壳 -> build\compositor_shell.exe
 python scripts\visual_check.py         # 自动目视（可选，先跑它省手工）
 ```
@@ -176,17 +176,23 @@ CJK 目前**不支持**（只收 ASCII），这是已知边界。
 3. 菜单「编辑 → 枚举引擎命令」：状态栏报出可用命令数（命令层冒烟）。
 4. 退出时若有未保存修改：应有确认提示（**注意**：自动化脚本不要触发打开/保存这两个模态框）。
 
-## M14 GPU 渲染后端（S13）👁
+## M14 GPU 渲染后端（S13/S16/S19/S20）👁
+
+> **交互外壳的主画布始终是 CPU 展平 + GDI**（面板、蚂蚁线、笔迹预览都是 GDI 覆盖层，
+> 不能与直呈安全混用）。所以 M14 分两部分：能力/标题看外壳，真正的 GPU 上屏看
+> `--present-bench` 独立窗口。
 
 1. `python scripts\build.py --gpu` 后再 `python scripts\build_windows_shell.py --gpu`，
    启动外壳，标题后缀应为 `- D3D12`（驱动/调试层不可用时回落 `- CPU`），状态栏 `渲染 D3D12`。
-2. 在 GPU 子集内（整幅 RGBA8、普通/滤色混合、无组/无蒙版/无调整）画几笔：
-   画面应与 CPU 一致（S13 有 AUTO vs CPU 像素对拍自检）。
-3. 触发子集外特性（组图层 / 蒙版 / 调整层 / 裁剪 / 旋转）：应**静默回退 CPU**，
-   不得花屏或报错。
+2. 在主画布画几笔、加组/蒙版/调整层：**画面必须与 CPU 构建逐像素一致**，不花屏、不报错
+   （主画布本就是 CPU 路径；GPU 相关正确性由 `--gpu` 的 470 例用例与对拍守住）。
+3. 运行 `build\compositor_shell.exe --present-bench=60`：出现独立直呈窗口，
+   连续 60 帧后打印 `result=ok`、`hwnd_target=ok` 与耗时。窗口应稳定显示、不黑屏、不闪退。
+   重复跑 3 次，观察是否有偶发失败（S20 曾出现一次未复现的 0xC0000005，见 README §6.30）。
 
-👁 关注：GPU 路径**目前不比 CPU 快**（本机 RX 6800 1024²×3 层：3.01 ms vs 0.65 ms），
-不要用性能做验收标准；只需确认「显示正确、不崩」。
+👁 关注：直呈窗口有没有撕裂/闪烁；关闭窗口后进程是否干净退出。
+**性能只作参考**：本机 RX 6800、1024²、4 层，S19/S20 后直呈均值 1.365–1.421 ms，
+CPU 展平+BGRA+StretchDIBits 2.145–2.233 ms（约 1.56–1.61×）；无 GPU 的环境不要拿性能做验收。
 
 ## M15 跨 DPI / 多显示器（脚本盲区）👁
 
@@ -204,7 +210,8 @@ CJK 目前**不支持**（只收 ASCII），这是已知边界。
 
 ## 已知边界（不算失败）
 
-- 无 DXGI swapchain 直呈：走 `PrintWindow`/GDI 路径，`comp_render_document(kind=HWND)` 仍是 `UNSUPPORTED`。
+- 交互外壳主画布无直呈：走 `PrintWindow`/GDI 路径，`comp_render_document(kind=HWND)` 仍是 `UNSUPPORTED`；
+  直呈能力经 `--present-bench` 独立窗口验证（D3D12 构建 + 合格文档才启用）。
 - GPU 只覆盖子集，其余回退 CPU；GPU 慢于 CPU 属已知。
 - 调整层只作用于下方内容（上游语义），挂在像素层上看不到变化不是 bug。
 - 文字只支持 ASCII；CJK/富文本未接。
