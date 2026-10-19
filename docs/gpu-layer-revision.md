@@ -1,15 +1,17 @@
 # GPU 逐层纹理缓存的修订号设计（S17 设计稿）
 
-状态：**R1 已实施（S18），R2 待做**。本文确定数据结构、修订号分配点、缓存键与验收口径；
+状态：**R1 已实施（S18），R2 已实施（S19）**。本文确定数据结构、修订号分配点、缓存键与验收口径；
 不修改 C ABI（导出仍 112 个）、不改 `.comp` 格式、不动事务/历史语义。
 
 - **R1 已落地**：`Layer::content_revision`、`Document::allocate_revision()` /
   `touch_layer()` / `touch_all_layers()`、全部写入口换号（含 3 个领域自管事务入口）、
   §4.1 的 1–5 条验收测试（`tests/test_layer_revision.cpp` 6 例，默认构建 457 例全绿）。
-- **R2 未做**：D3D12 持久纹理缓存、`texture_uploads()` 计数、§4.2 的真机测试与基准复测。
+- **R2 已落地（S19）**：`d3d12_backend` 的持久逐层纹理（原生单元）+ `texture_uploads()`
+  计数，§4.2 的 4 条真机用例 + 跨文档隔离 1 例（`tests/test_rhi.cpp`），1024²/4 层真机基准复测见 §4.3。
+  默认构建 457 → 462 例、`--gpu` 462 例全绿；ABI 仍 112、`.comp` 不变。
 
 关联：§6.23（S13 GPU 设备侧接入）、§6.26（S16 DXGI 直呈）、§6.27（S17 按单元拆细）、
-§6.28（S18 R1 落地）。
+§6.28（S18 R1 落地）、§6.29（S19 R2 落地）。
 
 ---
 
@@ -136,8 +138,10 @@ struct CachedLayerTexture {
 std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 ```
 
-- 键 = `(layer.id, layer.content_revision, doc.state().width/height, surface format)`。
-  命中条件全等；否则重建纹理。
+- 键 = `(document.instance_serial(), layer.id, layer.content_revision, doc.state().width/height,
+  surface format)`。命中条件全等；否则重建纹理。
+  **文档实例号不可省**：`comp_layer_id` 与修订号都只是文档内唯一，同一后端先后服务两个
+  文档时 `(id, revision)` 会撞车；用实例号而不是对象地址（地址会被分配器复用）。
 - 纹理走**持久堆 + 按尺寸空闲链**复用，避免每次 `CreateCommittedResource` 抖动；
   上限按显存预算（例如 512 MB）LRU 淘汰，淘汰只影响性能。
 - **只缓存原生单元**（`GpuUnit::is_native()`）。烘焙单元先不做：它的键需要子树
@@ -145,6 +149,18 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 - 缓存是派生数据：不进事务快照/历史/`.comp`；文档销毁、设备丢失、尺寸变化即整体丢弃。
 - 诊断：加 `texture_uploads()` 计数（每创建/重传一张纹理 +1），**仅供测试**，
   不进 C ABI、不进 `BackendCaps`。
+
+**R2 实施事实（S19，与上面草案的差异）**：
+
+| 项 | 草案 | 实施 | 原因 |
+|----|------|------|------|
+| 纹理分配 | 持久堆 + 尺寸空闲链 | `CreateCommittedResource`（DEFAULT 堆）+ 512 MiB 预算 LRU 淘汰 | 逐层纹理数量小、尺寸固定为画布尺寸；空闲链只在「频繁换画布尺寸」时有意义，先按简单实现，避免自管堆的别名/状态坑 |
+| 描述符 | 一张 2 项表 | 堆按「单元对」扩容（`2 × max(16, 单元数)`），第 i 个单元写 `[dst UAV, src UAV]` | 命令是**录制后统一执行**的：所有单元共用一张表时，先录的 `Dispatch` 执行时读到的是最后一次写入的源纹理。每单元 2 次 `CreateUnorderedAccessView` 是微秒级，可接受 |
+| 键字段 | 含 format | 表里只记 `id` + `revision` + `w/h`；format 恒为 `R8G8B8A8_UNORM` 且尺寸变化会整体丢弃 | 一个后端只有一种目标格式；把恒定维度放进键只是噪声 |
+| 命中计数 | 创建/重传 +1 | 创建 +1、重传 +1、**走共享 `src_tex` 的逐帧上传也 +1** | 否则「烘焙单元/事务中途其实每帧都在传」会被误读成缓存命中；测试用这个口径断言「事务期间每帧 = 原生单元数」 |
+| 相邻 dispatch | （未提） | 每次 `Dispatch` 后对目标纹理发显式 **UAV 屏障** | S17 每个单元都会把 `src_tex` 转回 `COPY_DEST`，那次过渡屏障在本机驱动上顺带保证了顺序；缓存命中后源纹理不再逐帧过渡，读写顺序必须显式声明 |
+| 事务旁路 | 「不采信」 | **整段旁路**：既不读也不写缓存，走 S17 的共享 `src_tex` 逐帧上传 | 事务中间态没有任何修订号语义；读写任一方向都可能把中间态钉进缓存键 |
+| 换文档 | （未提） | 给 `Document` 加进程内唯一、不序列化的 `instance_serial()`；后端发现实例号变化即**整体丢弃**缓存 | `comp_layer_id` 与修订号都只是文档内唯一：同一个后端先后渲染两个文档时 `(id, revision)` 会撞车，缓存会跨文档串纹理（静默错图）。用实例号而非对象地址，因为地址会被分配器复用 |
 
 ### 3.4 为什么不直接用整篇序号做键
 
@@ -170,19 +186,42 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 5. **计划重算**：改 `transform`/`blend`/`visible`/`parent` 后 `build_gpu_plan`
    的单元序列随之变化（现有 S17 计划测试可扩展）。
 
-### 4.2 需要 GPU 的测试（`--gpu` + 真机）
+### 4.2 需要 GPU 的测试（`--gpu` + 真机）——**S19 已全部落地**
+
+落点：`tests/test_rhi.cpp` 的 5 个用例（`rhi_gpu_layer_textures_are_reused_across_identical_frames`、
+`rhi_gpu_layer_texture_cache_uploads_only_changed_layers`、
+`rhi_gpu_layer_texture_cache_rebuilds_after_canvas_resize`、
+`rhi_gpu_layer_texture_cache_is_bypassed_inside_a_transaction`、
+`rhi_gpu_layer_texture_cache_is_not_shared_between_documents`）；
+无 D3D12 / 无设备时整例跳过（与既有 GPU 用例同一口径）。场景统一是 32²、4 个整幅画布原生单元。
 
 1. 连续两次 `render_document`（不改文档）：第二次 `texture_uploads()` 不增，
-   像素与 CPU 基准仍 ≤1 LSB。
-2. 只改一层再渲染：`texture_uploads()` 恰好 +1，画面反映该层改动。
-3. 改画布尺寸：缓存整体重建（计数回到全量），画面正确。
-4. 事务中途渲染：不得命中事务前的缓存（活跃事务期间禁用缓存）。
+   像素与 CPU 基准仍 ≤1 LSB。→ 实测第二次增量 **0**，两帧逐字节相同。
+2. 只改一层再渲染：`texture_uploads()` 恰好 +1，画面反映该层改动。→ 实测 **+1**，
+   且与 CPU 基准 ≤1 LSB、与改动前画面不同。
+3. 改画布尺寸：缓存整体重建（计数回到全量），画面正确。→ 32²→64² 后增量
+   **= 当前原生单元数 4**，与 CPU 基准 ≤1 LSB。
+4. 事务中途渲染：不得命中事务前的缓存（活跃事务期间禁用缓存）。→ 事务内连渲两帧
+   每帧增量 **= 4**（全量重传），提交后只重传被改的那 **1** 层，画面与 CPU 一致。
 
-### 4.3 性能口径（只报实测）
+### 4.3 性能口径（只报实测）——**S19 复测结果**
 
 基线：S13 离屏 3.01 ms、S16 直呈 3.04–3.27 ms。实施后在同一机器、同一场景
 （1024²、4 层）复测并**如实写数字**；若没有明显下降（例如仍被 dispatch 或像素
 拷贝主导），就按实测记录，不宣称加速倍数。
+
+| 场景 | S16 基线 | S19（R2）实测 | 说明 |
+|------|----------|---------------|------|
+| 窗口直呈 `render_document(HWND)` + `present`，60 帧均值 | **3.04–3.27 ms** | **1.41 / 1.41 ms**（连跑两次：1.413、1.406） | 4 层纹理只上传一次，稳定帧只剩「清屏拷贝 + 4 次 dispatch + 拷后备缓冲 + Present」 |
+| 同帧最优 | — | **1.06–1.08 ms** | 无抖动帧 |
+| 同场景 CPU flatten + RGBA→BGRA + `StretchDIBits` | 3.85–3.91 ms | **2.22–2.27 ms** | 本轮未改 CPU 路径；差异属机器/负载波动 |
+| GPU / CPU 帧耗时比 | 1.18–1.29× | **1.58–1.60×** | 只按这两组同次测量的比值记录 |
+
+结论：**瓶颈确实是逐层上传**——去掉稳态帧的上传后窗口直呈从 ~3.1 ms 降到 ~1.41 ms
+（约 2.2×，同机同场景），相对 CPU 直绘的优势从 ~1.2× 扩大到 ~1.6×。剩余成本主要在
+「每帧 4 MB 全透明清屏拷贝 + 4 次 dispatch + 8 MB 后备缓冲拷贝 + Present」，不是缓存能
+解决的，所以没有把它吹成「数量级提升」。离屏（CPU_BUFFER）路径仍需整幅回读，本轮未改，
+其耗时不以本表推断。
 
 ## 5. 明确不做 / 后续项
 
@@ -197,4 +236,4 @@ std::unordered_map<comp_layer_id, CachedLayerTexture> layer_textures_;
 | 轮次 | 内容 | 验收 | 状态 |
 |------|------|------|------|
 | R1 | `Layer::content_revision` + `Document::allocate_revision()` + 全部写入口 bump + 4.1 的 1–5 | 默认构建全绿，用例数增加 | **已落地（S18）**：451 → 457 例，默认/`--gpu`/壳自检/OHOS 回归全绿 |
-| R2 | D3D12 持久纹理 + `texture_uploads()` + 4.2 + 真机基准复测 | `--gpu` 全绿，报告实测 | 待做 |
+| R2 | D3D12 持久纹理 + `texture_uploads()` + 4.2 + 真机基准复测 | `--gpu` 全绿，报告实测 | **已落地（S19）**：457 → 462 例，窗口直呈 3.04–3.27 → 1.39–1.41 ms（§4.3）；ABI 112、`.comp` 未变、壳自检 164 项逐字节不变 |

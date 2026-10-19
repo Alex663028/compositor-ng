@@ -34,6 +34,12 @@ namespace compositor {
  * S16 起支持窗口直呈：target.kind == COMP_SURFACE_HWND 时合成结果直接拷进
  * DXGI flip-model 交换链后备缓冲，comp_render_present 才真正 Present——不再整幅
  * 回读。离屏（CPU_BUFFER）路径保持原语义不变。
+ *
+ * S19 / R2 起原生单元走**持久逐层纹理**：缓存键 = (layer.id, layer.content_revision,
+ * 画布尺寸, 格式)，命中时整块 CPU→GPU 上传都省掉；烘焙单元仍逐帧上传（其内容键
+ * 需要子树修订集合 + 组结构签名，留给 v2）。活跃事务期间整段旁路缓存（事务是中间
+ * 态，不采信也不写入）；画布尺寸变化 / 设备上下文重建时整体丢弃。缓存是派生数据，
+ * 不进历史、事务快照或 .comp。
  */
 class D3d12RenderBackend final : public RenderBackend {
  public:
@@ -62,6 +68,13 @@ class D3d12RenderBackend final : public RenderBackend {
   unsigned long long readback_frames() const { return readback_frames_.load(); }
 
   /*
+   * 仅供测试/诊断（S19 / R2，设计稿 §3.3）：累计「源纹理上传」次数。
+   * 每创建一张逐层纹理或重传一次计 1（烘焙单元与事务期间的逐帧上传同样计数）。
+   * 不进 C ABI、不进 BackendCaps——它不是能力，只是逐层缓存是否真的生效的证据。
+   */
+  unsigned long long texture_uploads() const { return texture_uploads_.load(); }
+
+  /*
    * 仅供测试：打开后，窗口渲染会在后备缓冲交给 Present **之前**多拷一份到回读
    * 缓冲，可用 take_window_readback() 取回该帧像素与 CPU 基准对拍。
    * 默认关闭——它不是渲染路径的一部分，也不改变上屏语义。
@@ -78,6 +91,8 @@ class D3d12RenderBackend final : public RenderBackend {
   std::atomic<bool> offloaded_{false};
   std::atomic<unsigned long long> presented_frames_{0};
   std::atomic<unsigned long long> readback_frames_{0};
+  /* 逐层纹理上传计数（派生数据，见 texture_uploads 的说明）。 */
+  std::atomic<unsigned long long> texture_uploads_{0};
   bool verify_window_readback_ = false; /* 仅 set_window_readback_verification 可改 */
   bool window_readback_ready_ = false;  /* 上一次窗口渲染是否留下了可取的验证回读 */
 };

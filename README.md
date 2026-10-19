@@ -9,11 +9,12 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   （FilterGraph）与图层组穿透/隔离语义、仿射变换与高质量重采样、`.comp` 像素改 PNG + UUID
   图层 id（打通上游互通）均已落地。**M3 进行中**——渲染后端接口切片（`rhi.h` + CPU/D3D12/Vulkan
   三后端）、SPIR-V 构建链路、Vulkan 计算管线设备侧实现（opt-in）、
-  **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成；S16：DXGI 交换链直呈已接）**、
+  **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成；S16：DXGI 交换链直呈已接；
+  S19：逐层纹理跨帧常驻，1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms）**、
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **457 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
+  全量 **462 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -219,6 +220,20 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   用例直接钉住。纯结构变更（增删/排序/选中/剪贴源）与 undo/redo 刻意不换号。**不新增导出
   ABI**（仍 **112**），不动 `.comp`，不动 D3D12。基线 451 → **457 用例**（+6，新的
   `tests/test_layer_revision.cpp`）；**不宣称加速**（本轮还没有缓存）。详见 §6.28。
+
+  2026-10-19 第二十五轮（S19 D3D12 持久逐层纹理 R2 落地 + 真机基准复测）：把 S17 设计稿的
+  **R2** 做完。`d3d12_backend` 新增**持久逐层纹理缓存**：键 = `(文档实例号, 图层 id,
+  content_revision, 画布宽高)`，只缓存原生单元，512 MiB 预算 LRU 淘汰；活跃事务期间整段
+  旁路（不读不写）；换文档/换画布尺寸/设备丢失整体丢弃。为此给 `Document` 加了**进程内唯一、
+  不序列化**的 `instance_serial()`——`comp_layer_id` 与修订号都只是文档内唯一，同一后端先后
+  渲染两个文档时键会撞车（反向注入实验确认过：去掉这层判断会静默贴上一张文档的纹理，
+  画面 max_diff 222）。同时补两处 GPU 侧硬约束：**描述符按单元成对分配**（命令录制后统一
+  执行，共用一张表会让所有 dispatch 读到同一张源纹理）+ **相邻 dispatch 之间显式 UAV 屏障**
+  （缓存命中后源纹理不再逐帧过渡，写→读顺序必须声明）。新增 `texture_uploads()` 计数
+  （仅测试/诊断，不进 C ABI）。**真机基准**（1024²、4 层、`--present-bench=60`，连跑两次）：
+  窗口直呈 3.04–3.27 → **1.41 ms**，相对 CPU flatten+GDI 从 1.18–1.29× 扩到 **1.58–1.60×**。
+  **不新增导出 ABI**（仍 **112**）、`.comp` 未变、壳/鸿蒙代码零改动、壳自检 164 项逐字节不变。
+  基线 457 → **462 用例**（+5）。详见 §6.29。
 
 ## 1. M1 目标与范围
 
@@ -1504,7 +1519,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 |----|------|--------|--------|---------|
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
-| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20）；**S17：GPU 子集按合成单元拆细**（裁蒙/效果/变换/组/剪贴烘焙后上 GPU，调整层与 HDR 仍整篇回落，§6.27） |
+| ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20）；**S17：GPU 子集按合成单元拆细**（裁蒙/效果/变换/组/剪贴烘焙后上 GPU，调整层与 HDR 仍整篇回落，§6.27）；**S19：D3D12 逐层纹理跨帧常驻（原生单元），1024²/4 层窗口直呈 3.04–3.27 → 1.41 ms（§6.29）** |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~91%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）；**2026-10-19 S16 补上 Windows 窗口 DXGI 交换链直呈 + 真机基准**（§6.26）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
@@ -1514,10 +1529,11 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 - ① 契约面 1.5 个点：`run_tool_op` 之外的少量诊断/边界口径；
 - ③ 合成与渲染 0.4 个点：GPU 子集已从「整篇全有或全无」拆到**按合成单元**（裁剪/蒙版/
-  效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27），**S18 补上逐层纹理缓存的
-  前提**（每层 `content_revision` + 全部写入口换号 + 6 例不变量测试，§6.28），但仍有两条
-  整篇回落（调整层、HDR 表面），且纹理缓存本身（R2）还没做——逐层上传仍是瓶颈，
-  直呈只比 CPU flatten+GDI 快 1.18–1.29×（§6.26）；
+  效果/变换/隔离组/剪贴栈在 CPU 烘焙后照样上 GPU，§6.27）；**S18 补上逐层纹理缓存的前提**
+  （每层 `content_revision` + 全部写入口换号，§6.28），**S19 把纹理缓存本身（R2）做完**
+  （原生单元跨帧常驻，§6.29），窗口直呈 1024²/4 层从 3.04–3.27 ms 降到 **1.41 ms**、
+  比 CPU flatten+GDI 快 **1.58–1.60×**；仍剩两条整篇回落（调整层、HDR 表面）与烘焙单元
+  的逐帧上传，故仍扣分；
 - ④ 跨端 1.5 个点：无鸿蒙真机（`hdc list targets` 空）、无 macOS 端逐像素对比。
 
 上一轮记的「`deep_take_painted` 被 S4 仿制笔刷阻塞」已证伪：上游 `BrushStroke.swift:1097`
@@ -3271,6 +3287,102 @@ void     touch_all_layers() noexcept;                               // 换画布
   的 M1–M16 保持未勾选，ALEX 已推迟这项）。
 
 报告：`../report/S18-layer-revision-20261019-dsh.md`。
+
+### 6.29 S19 D3D12 持久逐层纹理（R2）落地（2026-10-19，DSH）
+
+S18 把「这层内容变没变」的问题解决了（逐层 `content_revision`），但一张纹理都没缓存。
+S19 把设计稿的 **R2** 做完：原生单元的纹理**跨帧常驻**，内容不变就不上传；同时给出
+`texture_uploads()` 计数、§4.2 的 4 条真机用例（外加跨文档隔离一例）。**本轮终于有实测加速，且只报实测。**
+
+**1. 缓存键与失效。**
+
+```cpp
+struct LayerTexture {           // D3d12RenderBackend::GpuContext 内部
+  ID3D12Resource* texture = nullptr;
+  uint64_t revision = 0;        // 0 = 尚无有效内容
+  UINT width = 0, height = 0;
+  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+  uint64_t last_used_frame = 0;
+};
+std::unordered_map<comp_layer_id, LayerTexture> layer_textures;
+// 键 = (document.instance_serial(), id, revision, w/h)
+```
+
+- **只缓存原生单元**（`GpuUnit::is_native()`）：烘焙单元的键要「子树修订号集合 + 组结构
+  签名」，是设计稿里的 v2，本轮仍逐帧上传。
+- 命中条件全等（`revision != 0 && revision == layer.content_revision && w/h 相等`）；
+  `revision == 0` 永远视为不命中——这是 R1 特意给「加载工程留 0」留的护栏。
+- **键里必须带文档实例号**：`comp_layer_id` 与修订号都只是文档内唯一，同一个后端先后
+  渲染两个文档时 `(id, revision)` 会撞车。为此给 `Document` 加了进程内原子递增、
+  永不序列化的 `instance_serial()`；后端发现实例号变了就整体丢弃缓存（只损失一次重传），
+  用实例号而不是对象地址是因为地址会被分配器复用。
+- 512 MiB 预算 + `last_used_frame` LRU 淘汰；本帧用过的条目不淘汰（避免同帧反复重建）。
+- 缓存是**派生数据**：不进事务快照/历史/`.comp`；`drop_targets()`（画布尺寸变化）与
+  上下文析构（设备丢失/关闭）整体丢弃。丢了只是多传一次纹理，不影响画面。
+
+**2. 活跃事务整段旁路。** `doc.txn_active()` 时既不读缓存也不写缓存，回到 S17 的共享
+`src_tex` 逐帧上传。事务是中间态，没有任何修订号语义；读会供应事务前内容，写会把中间态
+钉进缓存键。测试第 4 例钉住这条：事务内每帧重传全部原生单元，提交后只有被改的那层重传。
+
+**3. 描述符必须按单元分开（本轮最容易写错的一点）。** 原来是一张 2 项 UAV 表
+（u0=dst、u1=src），每单元只是换常量。缓存上线后源纹理因层而异，如果仍共用一张表，
+**命令是录制后统一执行**的 → 所有 `Dispatch` 执行时读到的都是最后一次写入的源纹理
+（与 S13「上传缓冲共用一块」同源的错误）。改成：描述符堆按「单元对」扩容到
+`2 × max(16, 单元数)`，第 i 个单元写 `[dst UAV, src UAV]` 并把表头偏移 `2*i` 传给
+`SetComputeRootDescriptorTable(1, ...)`。每单元 2 次 `CreateUnorderedAccessView` 是微秒级。
+
+**4. 相邻 dispatch 之间补 UAV 屏障。** S17 每个单元都会把 `src_tex` 转回 `COPY_DEST`，
+那次过渡屏障在本机驱动上顺带保证了「上一个 dispatch 的写 → 下一个 dispatch 的读」；
+缓存命中后源纹理不再逐帧过渡，顺序必须显式声明，否则混合结果可能是未定义顺序。
+目标纹理每次 `Dispatch` 后发 `D3D12_RESOURCE_BARRIER_TYPE_UAV`。
+
+**5. 计数口径（`texture_uploads()`，仅供测试/诊断）。** 创建 +1、重传 +1、走共享
+`src_tex` 的逐帧上传也 +1。不进 C ABI、不进 `BackendCaps`——它不是能力，是缓存是否
+真的生效的证据。
+
+**6. 护栏（`tests/test_rhi.cpp`，+4 例；无 D3D12/无设备时整例跳过）。**
+
+| 用例 | 钉住的行为 |
+|------|-----------|
+| `rhi_gpu_layer_textures_are_reused_across_identical_frames` | 4 原生单元首帧恰好 4 次上传；同文档第二帧 **+0**、两帧逐字节相同、与 CPU 基准 ≤1 LSB |
+| `rhi_gpu_layer_texture_cache_uploads_only_changed_layers` | 改一层 + `touch_layer` 后恰好 **+1**，画面确实变了，与 CPU 一致 |
+| `rhi_gpu_layer_texture_cache_rebuilds_after_canvas_resize` | 32²→64² 后缓存整体重建：增量 = 当前原生单元数 4，与 CPU 一致 |
+| `rhi_gpu_layer_texture_cache_is_bypassed_inside_a_transaction` | 事务内连渲两帧每帧 **= 4**（全量），提交后只重传被改的 **1** 层，画面与 CPU 一致 |
+
+**7. 真机基准复测（同机同场景：1024²、4 层；`--present-bench=60`，连跑三次）。**
+
+| 项 | S16 基线 | S19 实测 |
+|----|----------|----------|
+| GPU 窗口直呈（render+present）均值 | 3.04–3.27 ms | **1.389 / 1.406 / 1.413 ms** |
+| 同帧最优 | — | 1.040–1.081 ms |
+| CPU flatten+RGBA→BGRA+StretchDIBits 均值 | 3.85–3.91 ms | 2.205–2.266 ms |
+| GPU/CPU 帧耗时比 | 1.18–1.29× | **1.58–1.60×** |
+
+结论：瓶颈确实是逐层上传——稳态帧不再上传后，窗口直呈从 ~3.1 ms 降到 ~1.41 ms
+（同机同场景约 2.2×），相对 CPU 直绘的优势从 ~1.2× 扩到 ~1.6×。**剩余成本**是每帧
+「4 MB 全透明清屏拷贝 + 4 次 dispatch + 8 MB 后备缓冲拷贝 + Present」，不是缓存能消掉的，
+所以不宣称数量级提升；离屏（CPU_BUFFER）路径仍整幅回读，耗时不能由本表推断。
+
+**8. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py`（默认） | **462 cases, 0 failed, 0 check failures**（457 → 462，+5；GPU 用例跳过） |
+| `python scripts/build.py --gpu` | **462 cases, 0 failed, 0 check failures**（5 个 R2 用例在 RX 6800 上真跑） |
+| `compositor_shell.exe --selftest` | **164 项 0 失败**；SHA256 `AA2E2754…` 与仓内基线逐字节一致 |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 compile ok=91） |
+| ABI 导出 | **112**（未变）；`.comp` 格式未变 |
+
+**9. 边界（如实记录）。**
+
+- 烘焙单元仍逐帧上传（组/剪贴栈/蒙版/裁剪/效果/变换）；它们的缓存键是 v2。
+- 缓存不跨文档、不跨后端共享：换文档（`Document::instance_serial()` 变）即整体丢弃，
+  换画布尺寸（`drop_targets()`）同理。同尺寸下的**编辑**只重传被标脏的层。
+- 离屏路径仍是「GPU 合成 → 整幅回读」，没做零拷贝。
+- 交互壳主画布仍走 CPU 展平 + GDI；**Win32 人工目视仍未做**（`docs/manual-test.md`
+  的 M1–M16 保持未勾选，留给 ALEX 真机测试）。
+
+报告：`../report/S19-layer-texture-cache-20261019-dsh.md`。
 
 ## 7. 许可
 

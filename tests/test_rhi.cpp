@@ -1278,3 +1278,383 @@ COMP_TEST(rhi_gpu_renders_group_and_clipping_units_like_cpu) {
                               ", first_byte=" + std::to_string(first_diff) + ")";
   COMP_CHECK_MSG(!gpu_pixels.empty() && max_diff <= 1, message.c_str());
 }
+
+/* ==================================================================
+ * S19 / R2：D3D12 持久逐层纹理 + texture_uploads() 计数
+ * ================================================================== */
+
+namespace {
+
+/* 追加一个整幅画布 RGBA8 的「原生单元」图层（gpu_plan 的 native 分支）。 */
+comp_layer_id add_native_layer(Document& document, int32_t size, comp_blend_mode blend,
+                               float opacity, int32_t seed) {
+  Layer* layer =
+      add_test_layer(document, "native", blend, opacity, comp_rect{0, 0, size, size}, 0, false);
+  if (layer == nullptr) return 0;
+  layer->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  fill_test_pattern(&layer->pixels, seed);
+  return layer->id;
+}
+
+/*
+ * 4 个原生单元（1 个不透明底 + 3 个混合层），与 --present-bench 的 1024² 场景同形态。
+ * 全部是「整幅画布 + 无蒙版/效果/变换」→ 每个单元一张逐层纹理，预期一次渲染 4 次上传。
+ * seed_offset 用来让两个文档的像素内容不同（跨文档缓存隔离用例要它）。
+ */
+bool build_native_scene(Document& document, int32_t size, std::vector<comp_layer_id>* ids,
+                        int32_t seed_offset = 0) {
+  if (ids == nullptr) return false;
+  ids->clear();
+  Layer* background = add_test_layer(document, "bg", COMP_BLEND_NORMAL, 1.0f,
+                                     comp_rect{0, 0, size, size}, 0, false);
+  if (background == nullptr) return false;
+  background->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 24, 96, 168, 255);
+  ids->push_back(background->id);
+  const comp_blend_mode blends[3] = {COMP_BLEND_NORMAL, COMP_BLEND_MULTIPLY, COMP_BLEND_SCREEN};
+  const float opacities[3] = {1.0f, 0.75f, 0.5f};
+  for (int32_t i = 0; i < 3; ++i) {
+    const comp_layer_id id =
+        add_native_layer(document, size, blends[i], opacities[i], seed_offset + 1 + i);
+    if (id == 0) return false;
+    ids->push_back(id);
+  }
+  return true;
+}
+
+/* 当前文档里原生单元的数量 = 一次全量重传应有的上传次数。 */
+size_t native_unit_count(const Document& document) {
+  std::vector<GpuUnit> units;
+  if (!build_gpu_plan(document, &units, nullptr, nullptr)) return 0;
+  size_t natives = 0;
+  for (const GpuUnit& unit : units) {
+    if (unit.is_native()) ++natives;
+  }
+  return natives;
+}
+
+/* 打开 D3D12 后端；不可用（未编入 / 无设备）时返回 nullptr，用例据此跳过。 */
+std::unique_ptr<RenderBackend> open_gpu_backend(Engine* engine) {
+  std::string error;
+  std::unique_ptr<RenderBackend> gpu = make_backend(engine, COMP_BACKEND_D3D12, &error);
+  if (gpu == nullptr || gpu->kind() != COMP_BACKEND_D3D12 || !gpu->usable()) return nullptr;
+  return gpu;
+}
+
+}  // namespace
+
+/*
+ * R2 验收 1（设计稿 §4.2）：文档没变时连渲两帧，第二帧不得再上传任何逐层纹理，
+ * 且两帧逐字节一致、与 CPU 基准差 ≤1 LSB（缓存没有把内容改坏）。
+ */
+COMP_TEST(rhi_gpu_layer_textures_are_reused_across_identical_frames) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return; /* 本构建没有 D3D12 / 本机没有可用设备 */
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_native_scene(document, size, &ids), "build four native units");
+  COMP_CHECK(ids.size() == 4u);
+  COMP_CHECK_MSG(native_unit_count(document) == 4u,
+                 "the scene must consist of native units only (one texture each)");
+
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  std::string why;
+  std::vector<uint8_t> first;
+  std::vector<uint8_t> second;
+  const unsigned long long before = d3d12->texture_uploads();
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &first, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the first frame must reach the device");
+  const unsigned long long after_first = d3d12->texture_uploads();
+  COMP_CHECK_MSG(after_first - before == ids.size(),
+                 "the first frame must upload exactly one texture per native unit");
+
+  why.clear();
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &second, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the second frame must still reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() == after_first,
+                 "an unchanged document must not upload any layer texture again");
+  COMP_CHECK_MSG(first == second, "two identical frames must be byte-identical");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, second, &max_diff, &diff_count, &first_diff);
+  const std::string message = "cached-frame CPU parity (max_diff=" + std::to_string(max_diff) +
+                              ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!second.empty() && max_diff <= 1, message.c_str());
+}
+
+/*
+ * R2 验收 2（设计稿 §4.2）：只改一层并标脏，重渲时必须**恰好 +1** 次上传，
+ * 且画面反映改动（不是「省了上传但贴旧图」）。
+ */
+COMP_TEST(rhi_gpu_layer_texture_cache_uploads_only_changed_layers) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_native_scene(document, size, &ids), "build four native units");
+
+  std::string why;
+  std::vector<uint8_t> warm;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &warm, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the warm-up frame must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long after_warm = d3d12->texture_uploads();
+
+  Layer* changed = document.find(ids[2]);
+  COMP_CHECK_MSG(changed != nullptr, "the edited layer must exist");
+  if (changed == nullptr) return;
+  /* 直接改像素必须显式标脏（S18 的修订号才是缓存键）；颜色分量 ≤ alpha，保持预乘合法。 */
+  changed->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 100, 20, 60, 160);
+  COMP_CHECK_MSG(document.touch_layer(ids[2]) != 0, "touch_layer must allocate a new revision");
+
+  why.clear();
+  std::vector<uint8_t> edited;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &edited, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the frame after the edit must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - after_warm == 1u,
+                 "changing one layer must upload exactly that one layer texture");
+  COMP_CHECK_MSG(edited != warm, "the new frame must reflect the edited layer content");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, edited, &max_diff, &diff_count, &first_diff);
+  const std::string message = "edited-frame CPU parity (max_diff=" + std::to_string(max_diff) +
+                              ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!edited.empty() && max_diff <= 1, message.c_str());
+}
+
+/*
+ * R2 验收 3（设计稿 §4.2）：画布尺寸一变，逐层纹理的尺寸/内容键全部作废，
+ * 下一帧必须按当前原生单元数整份重传（而不是拿旧尺寸的纹理硬贴）。
+ */
+COMP_TEST(rhi_gpu_layer_texture_cache_rebuilds_after_canvas_resize) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  const int32_t resized = size * 2;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_native_scene(document, size, &ids), "build four native units");
+
+  std::string why;
+  std::vector<uint8_t> initial;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &initial, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the pre-resize frame must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long after_warm = d3d12->texture_uploads();
+
+  std::string resize_error;
+  COMP_CHECK_MSG(document.resize_image(comp_size{resized, resized}, &resize_error),
+                 resize_error.c_str());
+  const size_t natives = native_unit_count(document);
+  COMP_CHECK_MSG(natives == 4u, "full-canvas layers must stay native after the resize");
+
+  why.clear();
+  std::vector<uint8_t> rebuilt;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, resized, &rebuilt, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the post-resize frame must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - after_warm == natives,
+                 "a canvas size change must rebuild every layer texture");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, resized, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, rebuilt, &max_diff, &diff_count, &first_diff);
+  const std::string message = "post-resize CPU parity (max_diff=" + std::to_string(max_diff) +
+                              ", diffs=" + std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!rebuilt.empty() && max_diff <= 1, message.c_str());
+}
+
+/*
+ * R2 验收 4（设计稿 §4.2）：活跃事务期间整段旁路缓存——每帧都重传，绝不采信
+ * 事务前的缓存，也绝不把中间态写进缓存；提交后只有真正改过的层需要重传一次。
+ */
+COMP_TEST(rhi_gpu_layer_texture_cache_is_bypassed_inside_a_transaction) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> ids;
+  COMP_CHECK_MSG(build_native_scene(document, size, &ids), "build four native units");
+
+  std::string why;
+  std::vector<uint8_t> warm;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &warm, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the pre-transaction frame must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long after_warm = d3d12->texture_uploads();
+  const size_t natives = native_unit_count(document);
+  COMP_CHECK(natives == 4u);
+
+  std::string txn_error;
+  COMP_CHECK_MSG(document.txn_begin("R2 cache bypass", &txn_error) == COMP_OK, txn_error.c_str());
+  COMP_CHECK_MSG(document.txn_active(), "the transaction must be active");
+  Layer* edited = document.find(ids[1]);
+  COMP_CHECK_MSG(edited != nullptr, "the edited layer must exist");
+  if (edited == nullptr) return;
+  edited->pixels = ImageBuffer::solid(size, size, COMP_PIXEL_RGBA8, 40, 120, 200, 220);
+  document.touch_layer(ids[1]);
+
+  for (int round = 0; round < 2; ++round) {
+    const unsigned long long before_round = d3d12->texture_uploads();
+    why.clear();
+    std::vector<uint8_t> in_txn;
+    COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &in_txn, &why), why.c_str());
+    COMP_CHECK_MSG(gpu->last_render_offloaded(),
+                   "a frame inside a transaction must still reach the device");
+    COMP_CHECK_MSG(d3d12->texture_uploads() - before_round == natives,
+                   "transaction frames must bypass the layer texture cache entirely");
+  }
+  COMP_CHECK_MSG(d3d12->texture_uploads() - after_warm == natives * 2u,
+                 "two transaction frames must have uploaded every native unit twice");
+
+  COMP_CHECK_MSG(document.txn_commit(&txn_error) == COMP_OK, txn_error.c_str());
+  COMP_CHECK(!document.txn_active());
+
+  const unsigned long long after_commit = d3d12->texture_uploads();
+  why.clear();
+  std::vector<uint8_t> committed;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, document, size, &committed, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the post-commit frame must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - after_commit == 1u,
+                 "after the commit only the touched layer may be uploaded again");
+  COMP_CHECK_MSG(committed != warm, "the committed frame must reflect the edited layer");
+
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(warm, committed, &max_diff, &diff_count, &first_diff);
+  COMP_CHECK_MSG(max_diff > 0, "the committed frame must differ from the pre-transaction one");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, document, size, &cpu_pixels, &why), why.c_str());
+  int parity_max_diff = 255;
+  size_t parity_diffs = 0;
+  size_t parity_first_diff = 0;
+  compare_pixels(cpu_pixels, committed, &parity_max_diff, &parity_diffs, &parity_first_diff);
+  const std::string message = "post-commit CPU parity (max_diff=" +
+                              std::to_string(parity_max_diff) + ", diffs=" +
+                              std::to_string(parity_diffs) +
+                              ", first_byte=" + std::to_string(parity_first_diff) + ")";
+  COMP_CHECK_MSG(!committed.empty() && parity_max_diff <= 1, message.c_str());
+}
+
+/*
+ * R2 补充用例：逐层纹理缓存不得跨文档串用。
+ *
+ * 两个文档的图层 id 与内容修订号**完全相同**（都从新建状态开始发号），但像素不同。
+ * 缓存键若只有 (id, revision)，同一后端切文档就会把 A 的纹理贴到 B 上——静默错图。
+ * `Document::instance_serial()` 就是为此加的：实例号变 → 整体丢弃。
+ */
+COMP_TEST(rhi_gpu_layer_texture_cache_is_not_shared_between_documents) {
+  comp_engine_desc desc{};
+  desc.app_name = "compositor-tests";
+  desc.version = "1.0.0";
+  desc.backend = COMP_BACKEND_CPU;
+  desc.worker_threads = 1;
+  Engine engine(desc);
+  std::unique_ptr<RenderBackend> gpu = open_gpu_backend(&engine);
+  if (gpu == nullptr) return;
+
+  const int32_t size = 32;
+  Document first(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> first_ids;
+  COMP_CHECK_MSG(build_native_scene(first, size, &first_ids, 0), "build the first document");
+  std::string why;
+  std::vector<uint8_t> first_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, first, size, &first_pixels, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the first document must reach the device");
+  auto* d3d12 = static_cast<D3d12RenderBackend*>(gpu.get());
+  const unsigned long long after_first = d3d12->texture_uploads();
+
+  Document second(&engine, size, size, 72.0f, "sRGB");
+  std::vector<comp_layer_id> second_ids;
+  COMP_CHECK_MSG(build_native_scene(second, size, &second_ids, 10), "build the second document");
+  COMP_CHECK_MSG(first_ids == second_ids, "both documents must use the same layer ids");
+  /* 前提确认：两个文档的 (id, 修订号) 完全一致，不带文档号就必然撞键。 */
+  for (const comp_layer_id id : first_ids) {
+    const Layer* a = first.find(id);
+    const Layer* b = second.find(id);
+    COMP_CHECK_MSG(a != nullptr && b != nullptr, "both layers must exist");
+    if (a == nullptr || b == nullptr) return;
+    COMP_CHECK_MSG(a->content_revision == b->content_revision,
+                   "the two documents must have colliding revisions for this test to mean anything");
+  }
+
+  why.clear();
+  std::vector<uint8_t> second_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*gpu, second, size, &second_pixels, &why), why.c_str());
+  COMP_CHECK_MSG(gpu->last_render_offloaded(), "the second document must reach the device");
+  COMP_CHECK_MSG(d3d12->texture_uploads() - after_first == second_ids.size(),
+                 "switching documents must discard the cache and upload every layer again");
+  COMP_CHECK_MSG(second_pixels != first_pixels,
+                 "the second document must not show the first document's textures");
+
+  std::unique_ptr<RenderBackend> cpu = make_backend(&engine, COMP_BACKEND_CPU, &why);
+  COMP_CHECK(cpu != nullptr);
+  if (cpu == nullptr) return;
+  std::vector<uint8_t> cpu_pixels;
+  COMP_CHECK_MSG(render_to_buffer(*cpu, second, size, &cpu_pixels, &why), why.c_str());
+  int max_diff = 255;
+  size_t diff_count = 0;
+  size_t first_diff = 0;
+  compare_pixels(cpu_pixels, second_pixels, &max_diff, &diff_count, &first_diff);
+  const std::string message = "second-document CPU parity (max_diff=" +
+                              std::to_string(max_diff) + ", diffs=" +
+                              std::to_string(diff_count) +
+                              ", first_byte=" + std::to_string(first_diff) + ")";
+  COMP_CHECK_MSG(!second_pixels.empty() && max_diff <= 1, message.c_str());
+}

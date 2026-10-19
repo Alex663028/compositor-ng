@@ -179,6 +179,18 @@ class Document {
    */
   bool is_alive() const noexcept { return handle_magic_ == kDocumentMagic; }
 
+  /*
+   * 会话内唯一的文档实例号（S19 / R2 追加）。
+   *
+   * 用途只有一个：GPU 的逐层纹理缓存键是 (图层 id, content_revision)，而
+   * `comp_layer_id` 与修订号都只是**文档内**唯一——同一个 GPU 后端先后服务两个
+   * 文档时，两张表的 (id, revision) 可能撞在一起，缓存会跨文档串纹理。后端用
+   * 这个实例号判断「换文档了，整体丢弃」，比用对象地址安全（地址会被复用）。
+   *
+   * 进程内原子递增、永不复用；不序列化、不进 DocumentState / 历史 / 事务比较。
+   */
+  uint64_t instance_serial() const noexcept { return instance_serial_; }
+
   /* ------------------------------------------------------------- 事务 */
 
   bool txn_active() const noexcept { return txn_active_; }
@@ -224,6 +236,10 @@ class Document {
    * 不进 .comp、不进 DocumentState 的语义比较：它是会话内的派生数据。
    */
   uint64_t next_revision_ = 1;
+
+  /* 进程内唯一的文档实例号（见 public 区说明）。构造函数里分配，Document 不可复制。 */
+  static uint64_t allocate_instance_serial() noexcept;
+  uint64_t instance_serial_ = allocate_instance_serial();
 
   /* 合成缓存（派生数据，见 public 区的说明）。 */
   uint64_t content_serial_ = 0;

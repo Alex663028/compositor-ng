@@ -2,6 +2,7 @@
 #include "domain/document.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -15,6 +16,15 @@
 #include "engine.h"
 
 namespace compositor {
+
+/*
+ * 文档实例号发号器（S19 / R2）：进程内原子递增、永不复用。
+ * 只给 GPU 逐层纹理缓存做「换文档了要整体丢弃」的判据，不参与任何文档语义。
+ */
+uint64_t Document::allocate_instance_serial() noexcept {
+  static std::atomic<uint64_t> next_serial{1};
+  return next_serial.fetch_add(1, std::memory_order_relaxed);
+}
 
 Document::Document(Engine* engine, int32_t width, int32_t height, float dpi,
                    std::string color_space)

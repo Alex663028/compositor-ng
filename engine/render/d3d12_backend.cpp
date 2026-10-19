@@ -22,6 +22,10 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <algorithm>
+#include <unordered_map>
+#include <utility>
+
 namespace compositor {
 
 namespace {
@@ -153,6 +157,8 @@ struct D3d12RenderBackend::GpuContext {
   ID3D12PipelineState* pso = nullptr;
   ID3D12DescriptorHeap* uav_heap = nullptr;
   D3D12_GPU_DESCRIPTOR_HANDLE uav_table{};
+  /* 描述符堆按「单元对」容纳：一对 = [u0 目标纹理, u1 源纹理]。 */
+  UINT uav_pair_capacity = 0;
   ID3D12Fence* fence = nullptr;
   HANDLE fence_event = nullptr;
   UINT64 fence_value = 0;
@@ -185,7 +191,48 @@ struct D3d12RenderBackend::GpuContext {
   UINT swap_height = 0;
   bool window_frame_ready = false; /* render_document(HWND) 成功、尚未 Present */
 
+  /*
+   * 逐层纹理缓存（S19 / R2，设计稿 §3.3）。
+   *
+   * 键 = (图层 id, content_revision, 画布尺寸, 格式)；格式固定 R8G8B8A8_UNORM，
+   * 画布尺寸变化时 drop_targets() 整体丢弃，所以表里按 id 索引后只需再验 revision
+   * 与宽高。**只缓存原生单元**：烘焙单元的内容键是「子树修订号集合 + 组结构签名」，
+   * 属设计稿里的 v2，本轮逐帧上传。
+   *
+   * 缓存是派生数据：不进事务快照、不进历史、不进 .comp；丢了只会多传一次纹理。
+   * 活跃事务期间整段旁路（事务是中间态），画布尺寸/设备上下文变化时整体丢弃。
+   */
+  struct LayerTexture {
+    ID3D12Resource* texture = nullptr;
+    uint64_t revision = 0; /* 0 = 尚无有效内容（新纹理 / 尺寸变了） */
+    UINT width = 0;
+    UINT height = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    uint64_t last_used_frame = 0;
+  };
+  std::unordered_map<comp_layer_id, LayerTexture> layer_textures;
+  uint64_t layer_texture_bytes = 0;
+  uint64_t frame_counter = 0;
+  /*
+   * 当前缓存所属的文档实例号（S19 / R2）。
+   * `comp_layer_id` 与 `content_revision` 都只是**文档内**唯一，同一个后端先后服务
+   * 两个文档时键可能撞车 → 换文档必须整体丢弃缓存（只损失一次重传）。
+   */
+  uint64_t cached_document_serial = 0;
+  /* 上传计数由后端持有（上下文可能因设备丢失被整体重建，计数不应清零）。 */
+  std::atomic<unsigned long long>* upload_counter = nullptr;
+
+  /*
+   * 逐层纹理的显存预算：超过就按 LRU（last_used_frame 从小到大）淘汰。
+   * 1024² RGBA8 一层 4 MB，512 MiB ≈ 128 层；淘汰只影响下一次是否要重传，
+   * 不影响任何可观察结果。
+   */
+  static constexpr uint64_t kLayerTextureBudgetBytes = 512ull * 1024ull * 1024ull;
+
+  explicit GpuContext(std::atomic<unsigned long long>* counter) : upload_counter(counter) {}
+
   ~GpuContext() {
+    drop_layer_textures();
     if (upload != nullptr && upload_mapped != nullptr) upload->Unmap(0, nullptr);
     upload_mapped = nullptr;
     for (ID3D12Resource*& buffer : window_buffers) release(buffer);
@@ -207,6 +254,98 @@ struct D3d12RenderBackend::GpuContext {
     release(allocator);
     release(queue);
     release(device);
+  }
+
+  void drop_layer_textures() {
+    for (auto& item : layer_textures) release(item.second.texture);
+    layer_textures.clear();
+    layer_texture_bytes = 0;
+  }
+
+  /* 画布尺寸的原生单元纹理 / 目标纹理共用同一份描述。 */
+  HRESULT create_canvas_texture(UINT w, UINT h, ID3D12Resource** out) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = w;
+    desc.Height = h;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           IID_PPV_ARGS(out));
+  }
+
+  /*
+   * 取（必要时创建）某一层的持久纹理。
+   *
+   * 返回 nullptr 表示纹理创建失败；*needs_upload 说明调用方是否必须把像素再传一次
+   * （新建的纹理、修订号变了、尺寸变了都要传）。命中时只是把 last_used_frame 刷新。
+   *
+   * 注意：`layer_textures[id]` 会默认插入，所以创建失败的分支必须 erase 掉，
+   * 否则会留下一条 texture == nullptr 的「幽灵缓存项」。
+   */
+  LayerTexture* acquire_layer_texture(comp_layer_id id, uint64_t revision, UINT w, UINT h,
+                                      bool* needs_upload, std::string* error) {
+    LayerTexture& entry = layer_textures[id];
+    const bool created = entry.texture == nullptr || entry.width != w || entry.height != h;
+    if (created) {
+      if (entry.texture != nullptr) {
+        layer_texture_bytes -= static_cast<uint64_t>(entry.width) * entry.height * 4ull;
+        release(entry.texture);
+      }
+      const uint64_t bytes = static_cast<uint64_t>(w) * h * 4ull;
+      trim_layer_textures(bytes);
+      ID3D12Resource* fresh = nullptr;
+      HRESULT hr = create_canvas_texture(w, h, &fresh);
+      if (FAILED(hr) || fresh == nullptr) {
+        layer_textures.erase(id);
+        if (error != nullptr) *error = hresult_text("create layer texture failed", hr);
+        return nullptr;
+      }
+      entry = LayerTexture();
+      entry.texture = fresh;
+      entry.width = w;
+      entry.height = h;
+      layer_texture_bytes += bytes;
+      if (upload_counter != nullptr) upload_counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    entry.last_used_frame = frame_counter;
+    *needs_upload = created || entry.revision == 0 || entry.revision != revision;
+    if (!created && *needs_upload && upload_counter != nullptr) {
+      upload_counter->fetch_add(1, std::memory_order_relaxed); /* 重传 */
+    }
+    return &entry;
+  }
+
+  /* 按 LRU 淘汰到预算内；本帧刚用过的条目不动，避免同一帧里反复重建。 */
+  void trim_layer_textures(uint64_t incoming_bytes) {
+    if (layer_texture_bytes + incoming_bytes <= kLayerTextureBudgetBytes) return;
+    std::vector<std::pair<uint64_t, comp_layer_id>> order;
+    order.reserve(layer_textures.size());
+    for (const auto& item : layer_textures) {
+      order.emplace_back(item.second.last_used_frame, item.first);
+    }
+    std::sort(order.begin(), order.end());
+    for (const auto& item : order) {
+      if (layer_texture_bytes + incoming_bytes <= kLayerTextureBudgetBytes) break;
+      if (item.first == frame_counter && frame_counter != 0) continue; /* 本帧在用 */
+      auto it = layer_textures.find(item.second);
+      if (it == layer_textures.end()) continue;
+      if (it->second.texture != nullptr) {
+        layer_texture_bytes -=
+            static_cast<uint64_t>(it->second.width) * it->second.height * 4ull;
+        release(it->second.texture);
+      }
+      layer_textures.erase(it);
+    }
   }
 
   bool ensure(std::string* error) {
@@ -255,6 +394,8 @@ struct D3d12RenderBackend::GpuContext {
 
     /*
      * 根签名：b0 根常量（8 个 32 位）+ 一张 2 项 UAV 描述符表（u0=目标，u1=源）。
+     * 描述符堆按「单元对」容纳多份这样的表（见 ensure_descriptor_pairs）：命令
+     * 录制期不能改写同一个槽位，否则先录的 Dispatch 执行时读到的是最后一次写入。
      *
      * 这里**不能**用根 UAV 描述符：D3D12 的根 SRV/UAV 只能描述 buffer，纹理必须
      * 走描述符表。早期版本用根 UAV 绑 2D 纹理，AMD 驱动在 CreateComputePipelineState
@@ -309,18 +450,8 @@ struct D3d12RenderBackend::GpuContext {
       return false;
     }
 
-    /* 2 项 shader-visible UAV 描述符堆：u0 = 目标纹理，u1 = 源纹理。 */
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = 2;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    heap_desc.NodeMask = 0;
-    hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&uav_heap));
-    if (FAILED(hr)) {
-      if (error != nullptr) *error = hresult_text("create descriptor heap failed", hr);
-      return false;
-    }
-    uav_table = uav_heap->GetGPUDescriptorHandleForHeapStart();
+    /* shader-visible UAV 描述符堆：按「单元对」容纳（u0 = 目标纹理，u1 = 源纹理）。 */
+    if (!ensure_descriptor_pairs(16, error)) return false;
 
     const char* hlsl = gpu_kernel_hlsl();
     ID3DBlob* cs_blob = nullptr;
@@ -368,6 +499,35 @@ struct D3d12RenderBackend::GpuContext {
     return true;
   }
 
+  /*
+   * 描述符堆按「单元对」扩容：一对 = [u0 目标, u1 源]，第 i 个单元用第 i 对。
+   *
+   * 为什么不能只留一张 2 项表、每单元改写一次：命令是**录制后统一执行**的，
+   * 同一个描述符槽位被改写后，先录的 Dispatch 在执行时看到的是最后一次写入的
+   * 内容（S13 上传缓冲共用块的教训同源）。所以每个单元必须有自己的槽位。
+   */
+  bool ensure_descriptor_pairs(UINT pairs, std::string* error) {
+    if (pairs == 0) pairs = 1;
+    if (uav_heap != nullptr && uav_pair_capacity >= pairs) return true;
+    UINT capacity = uav_pair_capacity > pairs ? uav_pair_capacity : pairs;
+    if (capacity < 16) capacity = 16;
+    release(uav_heap);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = capacity * 2u;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap_desc.NodeMask = 0;
+    const HRESULT hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&uav_heap));
+    if (FAILED(hr)) {
+      uav_pair_capacity = 0;
+      if (error != nullptr) *error = hresult_text("create descriptor heap failed", hr);
+      return false;
+    }
+    uav_table = uav_heap->GetGPUDescriptorHandleForHeapStart();
+    uav_pair_capacity = capacity;
+    return true;
+  }
+
   void dump_debug_messages(const char* when) {
     if (info_queue == nullptr) return;
     const UINT64 count = info_queue->GetNumStoredMessages();
@@ -393,6 +553,11 @@ struct D3d12RenderBackend::GpuContext {
     release(upload);
     release(dst_tex);
     release(src_tex);
+    /*
+     * 画布尺寸变了：逐层纹理的尺寸/内容键一并作废，整体丢弃（设计稿 §4.2 第 3 条）。
+     * 只影响性能（下次全量重传），不影响画面。
+     */
+    drop_layer_textures();
     width = height = aligned_row = 0;
     upload_blocks = 0;
     src_state = D3D12_RESOURCE_STATE_COMMON;
@@ -553,54 +718,17 @@ struct D3d12RenderBackend::GpuContext {
     height = h;
     aligned_row = (w * 4u + 255u) & ~255u;
 
-    auto make_texture = [&](ID3D12Resource** out) -> HRESULT {
-      D3D12_HEAP_PROPERTIES heap{};
-      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-      heap.CreationNodeMask = 1;
-      heap.VisibleNodeMask = 1;
-      D3D12_RESOURCE_DESC desc{};
-      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-      desc.Width = w;
-      desc.Height = h;
-      desc.DepthOrArraySize = 1;
-      desc.MipLevels = 1;
-      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      desc.SampleDesc.Count = 1;
-      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-      return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                             IID_PPV_ARGS(out));
-    };
-    HRESULT hr = make_texture(&src_tex);
+    HRESULT hr = create_canvas_texture(w, h, &src_tex);
     if (FAILED(hr)) {
       if (error != nullptr) *error = hresult_text("create source texture failed", hr);
       drop_targets();
       return false;
     }
-    hr = make_texture(&dst_tex);
+    hr = create_canvas_texture(w, h, &dst_tex);
     if (FAILED(hr)) {
       if (error != nullptr) *error = hresult_text("create target texture failed", hr);
       drop_targets();
       return false;
-    }
-
-    /*
-     * 纹理建好就把 UAV 写进描述符堆：u0 = 目标、u1 = 源。
-     * 堆与表地址跨帧稳定；只有画布尺寸变化（纹理重建）时才需要重写。
-     */
-    {
-      D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
-      uav_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-      uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-      uav_desc.Texture2D.MipSlice = 0;
-      uav_desc.Texture2D.PlaneSlice = 0;
-      D3D12_CPU_DESCRIPTOR_HANDLE cpu = uav_heap->GetCPUDescriptorHandleForHeapStart();
-      const UINT increment =
-          device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-      device->CreateUnorderedAccessView(dst_tex, nullptr, &uav_desc, cpu);
-      cpu.ptr += increment;
-      device->CreateUnorderedAccessView(src_tex, nullptr, &uav_desc, cpu);
     }
 
     const UINT64 buffer_size = static_cast<UINT64>(aligned_row) * h;
@@ -774,7 +902,7 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
   offloaded_.store(false);
   window_readback_ready_ = false;
   const bool verify_window_readback = verify_window_readback_;
-  if (gpu_ == nullptr) gpu_.reset(new GpuContext());
+  if (gpu_ == nullptr) gpu_.reset(new GpuContext(&texture_uploads_));
   if (!gpu_->ensure(error)) {
     gpu_.reset();
     return false;
@@ -789,6 +917,50 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
       return false;
     }
   }
+
+  /*
+   * R2：每个单元一对描述符（u0 目标 / u1 源）。命令是录完才执行的，所有单元共用
+   * 一张表会让先录的 Dispatch 在执行时看到最后写入的源纹理。
+   */
+  if (!gpu_->ensure_descriptor_pairs(static_cast<UINT>(units.size()), error)) {
+    return false;
+  }
+  const UINT descriptor_increment =
+      gpu_->device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  const D3D12_CPU_DESCRIPTOR_HANDLE uav_cpu_base =
+      gpu_->uav_heap->GetCPUDescriptorHandleForHeapStart();
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+  uav_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  uav_desc.Texture2D.MipSlice = 0;
+  /* 为第 index 个单元写一对描述符并返回该对的 GPU 表头。 */
+  auto unit_descriptor_table = [&](size_t index, ID3D12Resource* source) {
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = uav_cpu_base;
+    cpu.ptr += static_cast<SIZE_T>(descriptor_increment) * (index * 2u);
+    gpu_->device->CreateUnorderedAccessView(gpu_->dst_tex, nullptr, &uav_desc, cpu);
+    cpu.ptr += descriptor_increment;
+    gpu_->device->CreateUnorderedAccessView(source, nullptr, &uav_desc, cpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE table = gpu_->uav_table;
+    table.ptr += static_cast<UINT64>(descriptor_increment) * (index * 2u);
+    return table;
+  };
+
+  /*
+   * 换文档：逐层纹理的键（图层 id / 修订号）只在文档内唯一，必须整体丢弃。
+   * 用文档实例号而不是对象地址——地址会被分配器复用。
+   */
+  const uint64_t document_serial = doc.instance_serial();
+  if (document_serial != gpu_->cached_document_serial) {
+    gpu_->drop_layer_textures();
+    gpu_->cached_document_serial = document_serial;
+  }
+
+  /*
+   * 逐层纹理缓存只在事务外采信：事务中途的状态是中间态（设计稿 §4.2 第 4 条），
+   * 这一段整段旁路，既不读也不写缓存，避免把中间态钉进缓存键。
+   */
+  const bool texture_cache_enabled = !doc.txn_active();
+  ++gpu_->frame_counter;
 
   const UINT width = gpu_->width;
   const UINT height = gpu_->height;
@@ -886,9 +1058,9 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
   /* 逐单元：上传源像素 -> UAV -> 计算混合 -> 回到可再次上传的状态。 */
   const UINT groups_x = (width + 7u) / 8u;
   const UINT groups_y = (height + 7u) / 8u;
-  for (size_t i = 0; i < units.size(); ++i) {
-    const GpuUnit& unit = units[i];
-    const UINT64 offset = block_size * static_cast<UINT64>(i + 1);
+  /* 把某个单元的画布尺寸源像素铺进第 index 块上传缓冲（1 块清屏 + 每单元 1 块）。 */
+  auto stage_unit_pixels = [&](size_t index, const GpuUnit& unit) -> bool {
+    const UINT64 offset = block_size * static_cast<UINT64>(index + 1);
     uint8_t* upload_target = gpu_->upload_mapped + static_cast<size_t>(offset);
     /*
      * 原生单元：图层像素就是整幅画布（gpu_plan 已保证 RGBA8 + 恒等几何）；
@@ -898,31 +1070,74 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
       const uint8_t* pixels = unit.native_layer->pixels.pixel_data().data();
       if (pixels == nullptr) {
         build_error = "d3d12 backend: layer pixel buffer inconsistent";
-        built = false;
-        break;
+        return false;
       }
       for (UINT y = 0; y < height; ++y) {
         std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
                     pixels + static_cast<size_t>(y) * row_bytes, row_bytes);
       }
+      return true;
+    }
+    if (unit.baked.empty() || unit.baked.width != static_cast<int32_t>(width) ||
+        unit.baked.height != static_cast<int32_t>(height) ||
+        unit.baked.format != COMP_PIXEL_RGBA8) {
+      build_error = "d3d12 backend: baked unit has an inconsistent surface";
+      return false;
+    }
+    for (UINT y = 0; y < height; ++y) {
+      std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
+                  unit.baked.row(static_cast<size_t>(y)), row_bytes);
+    }
+    return true;
+  };
+
+  for (size_t i = 0; i < units.size(); ++i) {
+    const GpuUnit& unit = units[i];
+    const UINT64 offset = block_size * static_cast<UINT64>(i + 1);
+
+    /*
+     * 源纹理选择（R2）：
+     *   - 原生单元 + 事务外：用持久逐层纹理；修订号没变就直接命中，一次上传都不做。
+     *   - 其余（烘焙单元、活跃事务期间）：共享 src_tex 逐帧上传，与 S17 行为一致。
+     */
+    ID3D12Resource* source_texture = gpu_->src_tex;
+    if (unit.is_native() && texture_cache_enabled) {
+      const Layer& layer = *unit.native_layer;
+      bool needs_upload = false;
+      GpuContext::LayerTexture* cached = gpu_->acquire_layer_texture(
+          layer.id, layer.content_revision, width, height, &needs_upload, error);
+      if (cached == nullptr) {
+        built = false;
+        build_error = (error != nullptr) ? *error : "d3d12 backend: layer texture unavailable";
+        break;
+      }
+      if (needs_upload) {
+        if (!stage_unit_pixels(i, unit)) {
+          built = false;
+          break;
+        }
+        barrier(cached->texture, cached->state, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_into(cached->texture, gpu_->upload, offset);
+        barrier(cached->texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cached->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        cached->revision = layer.content_revision;
+      }
+      source_texture = cached->texture;
     } else {
-      if (unit.baked.empty() || unit.baked.width != static_cast<int32_t>(width) ||
-          unit.baked.height != static_cast<int32_t>(height) ||
-          unit.baked.format != COMP_PIXEL_RGBA8) {
-        build_error = "d3d12 backend: baked unit has an inconsistent surface";
+      if (!stage_unit_pixels(i, unit)) {
         built = false;
         break;
       }
-      for (UINT y = 0; y < height; ++y) {
-        std::memcpy(upload_target + static_cast<size_t>(y) * aligned_row,
-                    unit.baked.row(static_cast<size_t>(y)), row_bytes);
-      }
+      barrier(gpu_->src_tex, gpu_->src_state, D3D12_RESOURCE_STATE_COPY_DEST);
+      copy_into(gpu_->src_tex, gpu_->upload, offset);
+      barrier(gpu_->src_tex, D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      gpu_->src_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      source_texture = gpu_->src_tex;
+      /* 共享 src_tex 的逐帧上传也要计数：这样「烘焙单元/事务中途」不被算成缓存命中。 */
+      texture_uploads_.fetch_add(1, std::memory_order_relaxed);
     }
-    barrier(gpu_->src_tex, gpu_->src_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    copy_into(gpu_->src_tex, gpu_->upload, offset);
-    barrier(gpu_->src_tex, D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    gpu_->src_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
     list->SetComputeRootSignature(gpu_->root);
     list->SetPipelineState(gpu_->pso);
@@ -932,13 +1147,26 @@ bool D3d12RenderBackend::render_document(Document& doc, const comp_render_target
     if (alpha > 1.0f) alpha = 1.0f;
     std::memcpy(&constants[4], &alpha, sizeof(float));
     list->SetComputeRoot32BitConstants(0, 8, constants, 0);
-    /* 一张表两项：u0 = 目标纹理，u1 = 源纹理（描述符在 ensure_targets 里写好）。 */
-    list->SetComputeRootDescriptorTable(1, gpu_->uav_table);
+    /* 一张表两项：u0 = 目标纹理，u1 = 源纹理（每个单元一对，避免录制期互相覆盖）。 */
+    list->SetComputeRootDescriptorTable(1, unit_descriptor_table(i, source_texture));
     list->Dispatch(groups_x, groups_y, 1);
 
-    barrier(gpu_->src_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-    gpu_->src_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    /*
+     * 相邻 dispatch 之间显式 UAV 屏障：下一个 dispatch 读的是上一个刚写进目标
+     * 纹理的混合结果。S17 时每个单元都会把 src_tex 转回 COPY_DEST，那次过渡屏障
+     * 在本机驱动上顺带保证了顺序；缓存命中后 src 不再逐帧过渡，必须写明。
+     */
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    uav_barrier.UAV.pResource = gpu_->dst_tex;
+    list->ResourceBarrier(1, &uav_barrier);
+
+    if (source_texture == gpu_->src_tex) {
+      barrier(gpu_->src_tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_COPY_DEST);
+      gpu_->src_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
   }
 
   ID3D12Resource* window_buffer = nullptr; /* 借用 swapchain 持有的缓冲，不能 Release */
