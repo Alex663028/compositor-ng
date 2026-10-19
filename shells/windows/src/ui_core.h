@@ -1003,6 +1003,75 @@ inline int dash_spans(double length, double dash, double gap, double phase,
   return count;
 }
 
+/* ------------------------------------------------------------ 选区工具（S7） */
+
+/*
+ * Marquee 的形状：M 键在矩形 / 椭圆之间循环。
+ *
+ * 上游 Marquee 有四角形与椭圆两种主形状（另有单行/单列），引擎的
+ * comp_selection_apply_shape 直接支持 COMP_SELECTION_RECT / COMP_SELECTION_ELLIPSE，
+ * 因此这里只暴露这两种——不做引擎不支持、只能「画个样子」的形状。
+ */
+enum MarqueeShape : int { kMarqueeRect = 0, kMarqueeEllipse = 1 };
+
+inline int marquee_shape_count() { return 2; }
+
+inline int marquee_shape_next(int shape) {
+  return shape == kMarqueeRect ? kMarqueeEllipse : kMarqueeRect;
+}
+
+inline const char* marquee_shape_name(int shape) {
+  return shape == kMarqueeEllipse ? "Ellipse" : "Rect";
+}
+
+/* 套索：自由手绘折线在松开时闭合成多边形，至少 3 点才有多边形语义。 */
+inline constexpr int kLassoMinPoints = 3;
+
+/*
+ * 壳侧折线缓冲上限：只防「一笔几万点」把状态撑爆；引擎侧多边形上限是
+ * kMaxSelectionPoints（262144），因此这个上限是壳的绘制/内存约束，不是语义约束。
+ */
+inline constexpr int kLassoMaxPoints = 8192;
+
+inline bool lasso_should_close(int point_count) { return point_count >= kLassoMinPoints; }
+
+inline bool lasso_can_append(int point_count) { return point_count < kLassoMaxPoints; }
+
+/* 魔棒容差（0..255，逐通道距离，alpha 参与）：[ / ] 调，默认 32。 */
+inline constexpr int kMinWandTolerance = 0;
+inline constexpr int kMaxWandTolerance = 255;
+inline constexpr int kDefaultWandTolerance = 32;
+
+inline int clamp_wand_tolerance(int value) {
+  if (value < kMinWandTolerance) return kMinWandTolerance;
+  if (value > kMaxWandTolerance) return kMaxWandTolerance;
+  return value;
+}
+
+/* 容差分档步进：小容差细调（1），中段 4，大容差 8——一档按一下手感够用。 */
+inline int step_wand_tolerance(int tolerance, int direction) {
+  const int current = clamp_wand_tolerance(tolerance);
+  const int step = current < 16 ? 1 : (current < 64 ? 4 : 8);
+  return clamp_wand_tolerance(current + (direction > 0 ? step : -step));
+}
+
+/* 新选区的羽化半径：0..250，与引擎 kMaxSelectionFeather 同口径。 */
+inline constexpr int kMinSelectionFeather = 0;
+inline constexpr int kMaxSelectionFeather = 250;
+
+inline int clamp_selection_feather(int value) {
+  if (value < kMinSelectionFeather) return kMinSelectionFeather;
+  if (value > kMaxSelectionFeather) return kMaxSelectionFeather;
+  return value;
+}
+
+/* 羽化步进：小半径 ±1、中段 ±5、大半径 ±10。 */
+inline int step_selection_feather(int feather, int direction) {
+  const int current = clamp_selection_feather(feather);
+  const int step = current < 10 ? 1 : (current < 50 ? 5 : 10);
+  return clamp_selection_feather(current + (direction > 0 ? step : -step));
+}
+
 }  // namespace comp_ui
 
 #endif /* COMPOSITOR_SHELL_UI_CORE_H */

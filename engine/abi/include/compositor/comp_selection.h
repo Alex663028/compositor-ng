@@ -191,6 +191,39 @@ COMP_API comp_result comp_selection_move_pixels(comp_document document, comp_lay
                                                 int32_t dx, int32_t dy, int32_t duplicate,
                                                 int32_t* out_changed);
 
+/* ------------------------------------------------------------ 魔棒（S7） */
+
+/* 魔棒取样来源：0 = 指定图层的像素，1 = 整篇合成（与吸管「合并」同源）。 */
+typedef enum comp_selection_wand_source {
+  COMP_SELECTION_WAND_LAYER  = 0,
+  COMP_SELECTION_WAND_MERGED = 1
+} comp_selection_wand_source;
+
+/*
+ * 魔棒选区：在文档像素 seed 处按逐通道容差匹配，把结果按 combine 并入选区
+ * （上游 MagicWand 的工具语义）：tolerance 0..255（alpha 参与比较）；
+ * contiguous != 0 时从种子做 4-连通泛洪，0 时选中全图所有匹配像素；
+ * radius 0..512 是参考色的 (2r+1)² 邻域半边长。
+ *
+ * 与 `comp_tool_apply(COMP_TOOL_SELECT)` 的区别：那次把结果**累积写进图层蒙版**
+ * （会覆写既有蒙版，宿主还要再 load 一次才得到选区），本入口直接产出文档选区、
+ * 不动图层蒙版，因此可以安全地反复点选。
+ *
+ * 语义与错误码：
+ *   - 0 个匹配像素时**不改选区**（out_changed = 0），不会静默清掉既有选区；
+ *   - 图层来源要求 1:1 变换（未缩放/旋转/翻转），否则 COMP_ERR_STATE；
+ *   - 图层不存在 -> COMP_ERR_NOT_FOUND；组图层/无像素 -> COMP_ERR_STATE；
+ *   - 枚举、容差、半径、contiguous 非法或 seed 落在画布/取样面之外 ->
+ *     COMP_ERR_INVALID_ARGUMENT；
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）。
+ */
+COMP_API comp_result comp_selection_apply_wand(comp_document document, comp_layer_id layer,
+                                               comp_selection_wand_source source,
+                                               double seed_x, double seed_y,
+                                               int32_t tolerance, int32_t contiguous,
+                                               int32_t radius, comp_selection_combine combine,
+                                               int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

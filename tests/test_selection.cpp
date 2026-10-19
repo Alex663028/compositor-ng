@@ -933,3 +933,255 @@ COMP_TEST(selection_move_pixels_rejects_unsupported_layers) {
   COMP_CHECK(comp_selection_move_pixels(fixture.document, deep, 2, 2, 0, &changed) ==
              COMP_ERR_STATE);
 }
+
+/* ============================================ S7: 魔棒选区 */
+
+namespace {
+
+/* 8 x 6：左半 (layer x<4) 不透明灰 200，右半不透明黑；alpha 全 255。 */
+std::vector<uint8_t> two_tone_pixels() {
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      const uint8_t value = x < 4 ? 200 : 0;
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/* 8 x 6：列 x 的灰度 = min(255, x * 32)，用来验证 tolerance 的匹配半径。 */
+std::vector<uint8_t> ramp_pixels() {
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      const uint8_t value = static_cast<uint8_t>(x * 32 > 255 ? 255 : x * 32);
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
+comp_result wand(comp_document document, comp_layer_id layer, comp_selection_wand_source source,
+                 double x, double y, int32_t tolerance, int32_t contiguous, int32_t radius,
+                 comp_selection_combine combine, int32_t* out_changed) {
+  return comp_selection_apply_wand(document, layer, source, x, y, tolerance, contiguous, radius,
+                                   combine, out_changed);
+}
+
+}  // namespace
+
+COMP_TEST(selection_wand_selects_a_contiguous_region) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = two_tone_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+  const size_t base_depth = undo_depth_of(fixture.document);
+
+  int32_t changed = -1;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == base_depth + 1);
+
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 10, 6) == 255, "the seed pixel is selected");
+  COMP_CHECK_MSG(at(mask, 13, 11) == 255, "the whole grey half is selected");
+  COMP_CHECK_MSG(at(mask, 14, 6) == 0, "the black half is a different colour");
+  COMP_CHECK_MSG(at(mask, 9, 6) == 0, "outside the layer stays unselected");
+
+  comp_rect bounds{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.x == 10 && bounds.y == 6 && bounds.w == 4 && bounds.h == 6);
+}
+
+COMP_TEST(selection_wand_global_mode_reaches_disjoint_pixels) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  /* 灰-黑-灰三带：左灰带与右灰带颜色相同但互不连通。 */
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      const uint8_t value = (x < 2 || x >= 6) ? 200 : 0;
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const std::vector<uint8_t> contiguous_mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(contiguous_mask, 10, 6) == 255, "contiguous keeps the seed run");
+  COMP_CHECK_MSG(at(contiguous_mask, 16, 6) == 0, "contiguous stops at the black band");
+
+  changed = 0;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 0, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const std::vector<uint8_t> global_mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(global_mask, 10, 6) == 255, "global keeps the left grey band");
+  COMP_CHECK_MSG(at(global_mask, 17, 6) == 255, "global reaches the disjoint right grey band");
+  COMP_CHECK_MSG(at(global_mask, 13, 6) == 0, "the black band still never matches");
+}
+
+COMP_TEST(selection_wand_tolerance_widens_the_match) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = ramp_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  /* 种子列灰 64：容差 0 只选自己；容差 32 还要吃 32 与 96。 */
+  int32_t changed = 0;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 12.0, 6.0, 0, 0, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK(at(mask, 12, 6) == 255);
+  COMP_CHECK(at(mask, 11, 6) == 0);
+  COMP_CHECK(at(mask, 13, 6) == 0);
+
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 12.0, 6.0, 32, 0, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 11, 6) == 255, "tolerance 32 reaches the 32 grey column");
+  COMP_CHECK_MSG(at(mask, 13, 6) == 255, "tolerance 32 reaches the 96 grey column");
+  COMP_CHECK_MSG(at(mask, 14, 6) == 0, "tolerance 32 stops before the 128 grey column");
+}
+
+COMP_TEST(selection_wand_merged_source_samples_the_composite) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  /* 全画布不透明白底 + 一块红补丁；合并取样应只看到「白底 + 红块」。 */
+  const comp_layer_id backdrop = add_source_layer(fixture.document, comp_rect{0, 0, kWidth, kHeight});
+  std::vector<uint8_t> white(static_cast<size_t>(kWidth) * kHeight * 4u);
+  for (size_t i = 0; i < white.size(); i += 4) {
+    white[i + 0] = 255;
+    white[i + 1] = 255;
+    white[i + 2] = 255;
+    white[i + 3] = 255;
+  }
+  set_layer_pixels(fixture.document, backdrop, kWidth, kHeight, white);
+
+  const comp_layer_id patch = add_source_layer(fixture.document, comp_rect{20, 20, 8, 8});
+  std::vector<uint8_t> red(8u * 8u * 4u);
+  for (size_t i = 0; i < red.size(); i += 4) {
+    red[i + 0] = 255;
+    red[i + 1] = 0;
+    red[i + 2] = 0;
+    red[i + 3] = 255;
+  }
+  set_layer_pixels(fixture.document, patch, 8, 8, red);
+
+  int32_t changed = 0;
+  COMP_CHECK(wand(fixture.document, patch, COMP_SELECTION_WAND_MERGED, 2.0, 2.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 2, 2) == 255, "the white backdrop is selected");
+  COMP_CHECK_MSG(at(mask, 24, 24) == 0, "the red patch on top is not white");
+}
+
+COMP_TEST(selection_wand_combines_with_the_existing_selection) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = two_tone_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 10.0f, 6.0f, 18.0f, 12.0f, COMP_SELECTION_REPLACE,
+                  &changed) == COMP_OK);
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_SUBTRACT, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 10, 6) == 0, "the wand subtracted the grey half");
+  COMP_CHECK_MSG(at(mask, 14, 6) == 255, "the black half of the rect survives");
+}
+
+COMP_TEST(selection_wand_zero_matches_keeps_the_previous_selection) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = two_tone_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 10.0f, 6.0f, 18.0f, 12.0f, COMP_SELECTION_REPLACE,
+                  &changed) == COMP_OK);
+  const size_t depth_before = undo_depth_of(fixture.document);
+
+  /*
+   * 种子取两色交界 (14,6)、radius 1：参考色是 (200+0+0)/3≈67，种子像素是 0，
+   * 容差 0 下窗口里没有像素命中参考色 -> 选中 0 个；此时既不能清空选区，
+   * 也不能留下撤销步（壳层靠 changed==0 回滚事务）。
+   */
+  int32_t no_match_changed = -1;
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 14.0, 6.0, 0, 1, 1,
+                  COMP_SELECTION_REPLACE, &no_match_changed) == COMP_OK);
+  COMP_CHECK(no_match_changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth_before);
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 10, 6) == 255, "the previous selection is untouched");
+}
+
+COMP_TEST(selection_wand_rejects_bad_arguments) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = two_tone_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+  int32_t changed = 0;
+
+  /* 种子落在画布外。 */
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, -1.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  /* 种子在画布内但落在图层外。 */
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 40.0, 30.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  /* NaN 种子。 */
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER,
+                  std::numeric_limits<double>::quiet_NaN(), 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  /* tolerance / contiguous / radius / combine / source 的量程。 */
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 256, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 2, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 513,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(wand(fixture.document, id, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  static_cast<comp_selection_combine>(9), &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(wand(fixture.document, id, static_cast<comp_selection_wand_source>(9), 10.0, 6.0, 0, 1,
+                  0, COMP_SELECTION_REPLACE, &changed) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* 源图层不存在 / 是分组 / 带缩放（非 1:1）。 */
+  int32_t* null_changed = nullptr;
+  COMP_CHECK(wand(fixture.document, 999999, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, null_changed) == COMP_ERR_NOT_FOUND);
+  const comp_layer_id group = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6}, 1);
+  COMP_CHECK(wand(fixture.document, group, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_STATE);
+  const comp_layer_id scaled = add_source_layer(fixture.document, comp_rect{10, 6, 4, 6});
+  std::vector<uint8_t> scaled_pixels = two_tone_pixels();
+  set_layer_pixels(fixture.document, scaled, 8, 6, scaled_pixels);
+  COMP_CHECK(wand(fixture.document, scaled, COMP_SELECTION_WAND_LAYER, 10.0, 6.0, 0, 1, 0,
+                  COMP_SELECTION_REPLACE, &changed) == COMP_ERR_STATE);
+  /* 所有失败都不得动选区。 */
+  COMP_CHECK(active_of(fixture.document) == 0);
+}

@@ -364,3 +364,59 @@ comp_result comp_selection_move_pixels(comp_document document, comp_layer_id lay
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)
 }
+
+/* --------------------------------------------------------------- 魔棒（S7） */
+
+comp_result comp_selection_apply_wand(comp_document document, comp_layer_id layer_id,
+                                      comp_selection_wand_source source, double seed_x,
+                                      double seed_y, int32_t tolerance, int32_t contiguous,
+                                      int32_t radius, comp_selection_combine combine,
+                                      int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 轻量参数闸在 ImplicitTxn 之前：非法参数不留半成品、不进撤销栈。 */
+  if (source != COMP_SELECTION_WAND_LAYER && source != COMP_SELECTION_WAND_MERGED) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown wand source");
+  }
+  if (combine < COMP_SELECTION_REPLACE || combine > COMP_SELECTION_SUBTRACT) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if (tolerance < 0 || tolerance > 255) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "wand tolerance out of 0..255");
+  }
+  if (contiguous != 0 && contiguous != 1) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "wand contiguous must be 0 or 1");
+  }
+  if (radius < 0 || radius > compositor::kMaxSelectionWandRadius) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "wand radius out of range");
+  }
+
+  const DocumentState& state = doc->state();
+  compositor::SelectionWandParams params;
+  params.source = source == COMP_SELECTION_WAND_MERGED ? compositor::kSelectionWandMerged
+                                                       : compositor::kSelectionWandLayer;
+  params.seed_x = seed_x;
+  params.seed_y = seed_y;
+  params.tolerance = tolerance;
+  params.contiguous = contiguous;
+  params.radius = radius;
+
+  compositor::abi::ImplicitTxn txn(doc, "Magic Wand Selection");
+  bool changed = false;
+  std::string error;
+  const comp_result code = compositor::selection_apply_wand(
+      &doc->selection(), state.width, state.height, *doc, layer_id, params, combine, &changed,
+      &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(
+        engine, code, error.empty() ? "magic wand selection failed" : error);
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}

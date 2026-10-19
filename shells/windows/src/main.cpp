@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -175,6 +176,18 @@ struct ShellState {
   bool marquee_active = false;
   comp_ui::Point marquee_start{};
   comp_ui::Point marquee_current{};
+  /* Marquee 形状（S7）：M 键在矩形 / 椭圆之间循环。 */
+  int marquee_shape = comp_ui::kMarqueeRect;
+  /* 套索（S7）：自由手绘折线（文档像素 x,y 交替），松开闭合成多边形。 */
+  bool lasso_active = false;
+  std::vector<float> lasso_points;
+  /* 魔棒（S7）：容差、取样来源与连通性；Shift+W 切「合并/当前图层」。 */
+  int wand_tolerance = comp_ui::kDefaultWandTolerance;
+  bool wand_contiguous = true;
+  bool wand_merged = false;
+  /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
+  int selection_feather = comp_ui::kMinSelectionFeather;
+  std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
   /* 鼠标是否停在画布上（决定画不画笔尖轮廓），客户区坐标。 */
   bool cursor_valid = false;
   bool tracking_leave = false;
@@ -1039,6 +1052,204 @@ void invert_selection(ShellState& shell) {
   finish_selection_command(shell, changed ? L"已反选" : L"反选：无选区，未变化");
 }
 
+/* ------------------------------------------------------- 选区工具共同尾部（S7） */
+
+/*
+ * 形状 / 套索 / 魔棒三个入口的共同尾部：一次选区操作只落**一个**撤销步。
+ *
+ * 引擎的 apply_shape / apply_wand 各自会自成一个隐式事务，而「新选区 + 羽化」是
+ * 两次 ABI 调用；因此这里开显式事务把它们并成一步（隐式事务会加入已开启的显式
+ * 事务，不会嵌套）。选区没有变化时回滚，避免空撤销步。
+ */
+void finish_new_selection(ShellState& shell, const char* label, const wchar_t* ok_text,
+                          const wchar_t* noop_text, const wchar_t* fail_text,
+                          const std::function<comp_result(int32_t*)>& apply) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, label, &txn) != COMP_OK) {
+    set_status(shell, L"选区：无法开始事务");
+    return;
+  }
+  int32_t changed = 0;
+  comp_result result = apply(&changed);
+  /* 新选区羽化只作用于本次新建的选区（形状先 reset feather，再叠加一次即精确 r）。 */
+  if (result == COMP_OK && shell.selection_feather > 0) {
+    int32_t feathered = 0;
+    result = comp_selection_modify(shell.document, COMP_SELECTION_FEATHER,
+                                   shell.selection_feather, &feathered);
+    if (result == COMP_OK && feathered != 0) changed = 1;
+  }
+  if (result != COMP_OK) {
+    /* 失败必须整体回滚：半成品选区比不动更坏。 */
+    comp_txn_abort(txn);
+    set_status(shell, fail_text);
+    return;
+  }
+  if (changed == 0) {
+    comp_txn_abort(txn);
+    set_status(shell, noop_text);
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"选区：提交失败");
+    return;
+  }
+  finish_selection_command(shell, ok_text);
+}
+
+/* --------------------------------------------------------------- 羽化（S7） */
+
+void refresh_feather_input_status(ShellState& shell) {
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"新选区羽化：%s px（回车应用 / Esc 取消，0..%d）",
+            shell.feather_input.c_str(), comp_ui::kMaxSelectionFeather);
+  set_status(shell, buffer);
+}
+
+void begin_feather_input(ShellState& shell) {
+  shell.feather_input.clear();
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"新选区羽化：键入 0..%d 后回车（当前 %d px）",
+            comp_ui::kMaxSelectionFeather, shell.selection_feather);
+  set_status(shell, buffer);
+}
+
+/*
+ * 回车：写进「新选区羽化」默认值。若已有选区，立即按引擎的 modify(FEATHER)
+ * 语义叠加一次（引擎的羽化是 sqrt(current² + requested²) 的**叠加**，不是绝对值
+ * 覆盖——ABI 没有「设置羽化」的入口，这里如实呈现，不假装是覆盖）。
+ */
+void commit_feather_input(ShellState& shell) {
+  const int value =
+      comp_ui::clamp_selection_feather(_wtoi(shell.feather_input.c_str()));
+  shell.feather_input.clear();
+  shell.selection_feather = value;
+
+  wchar_t buffer[224];
+  if (shell.document == nullptr || !shell.selection_active || value <= 0) {
+    wsprintfW(buffer, L"新选区羽化：%d px（对之后新建的选区生效）", value);
+    set_status(shell, buffer);
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_modify(shell.document, COMP_SELECTION_FEATHER, value, &changed) != COMP_OK) {
+    set_status(shell, L"羽化失败：当前选区不支持羽化");
+    return;
+  }
+  refresh_selection(shell);
+  wsprintfW(buffer, L"已对当前选区叠加羽化 %d px（引擎羽化为叠加语义）", value);
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------------------ 套索（S7） */
+
+bool lasso_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Lasso;
+}
+
+void lasso_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!lasso_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.lasso_active = true;
+  shell.lasso_points.clear();
+  shell.lasso_points.push_back(static_cast<float>(doc.x));
+  shell.lasso_points.push_back(static_cast<float>(doc.y));
+  SetCapture(window);
+  set_status(shell, L"套索：按住拖出自由选区，松开闭合成选区（Shift 加选 / Alt 减选）");
+}
+
+void lasso_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.lasso_active) return;
+  const int point_count = static_cast<int>(shell.lasso_points.size() / 2);
+  if (!comp_ui::lasso_can_append(point_count)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const size_t count = shell.lasso_points.size();
+  const double last_x = count >= 2 ? shell.lasso_points[count - 2] : doc.x;
+  const double last_y = count >= 2 ? shell.lasso_points[count - 1] : doc.y;
+  if (!comp_ui::stroke_point_should_append(last_x, last_y, doc.x, doc.y)) return;
+  shell.lasso_points.push_back(static_cast<float>(doc.x));
+  shell.lasso_points.push_back(static_cast<float>(doc.y));
+}
+
+void lasso_cancel(ShellState& shell) {
+  shell.lasso_active = false;
+  shell.lasso_points.clear();
+}
+
+void lasso_end(HWND window, ShellState& shell) {
+  if (!shell.lasso_active) return;
+  shell.lasso_active = false;
+  ReleaseCapture();
+  if (shell.document == nullptr) return;
+
+  std::vector<float> points;
+  points.swap(shell.lasso_points);
+  const int point_count = static_cast<int>(points.size() / 2);
+  if (!comp_ui::lasso_should_close(point_count)) {
+    set_status(shell, L"套索：至少需要拖出 3 个点才能闭合成选区");
+    return;
+  }
+
+  comp_selection_combine combine = COMP_SELECTION_REPLACE;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+    combine = COMP_SELECTION_ADD;
+  } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+    combine = COMP_SELECTION_SUBTRACT;
+  }
+
+  const wchar_t* ok_text = combine == COMP_SELECTION_ADD ? L"套索：已加选"
+                           : combine == COMP_SELECTION_SUBTRACT ? L"套索：已减选"
+                                                                : L"套索：已应用";
+  finish_new_selection(
+      shell, "Lasso Selection", ok_text, L"套索：选区未变化", L"套索失败：多边形无效",
+      [&](int32_t* changed) {
+        return comp_selection_apply_shape(shell.document, COMP_SELECTION_POLYGON, points.data(),
+                                          point_count, combine, /*antialias=*/1, changed);
+      });
+}
+
+/* ------------------------------------------------------------ 魔棒（S7） */
+
+bool wand_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Wand;
+}
+
+void wand_click(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!wand_available(shell)) return;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"魔棒：请先选择一个图层");
+    return;
+  }
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  comp_selection_combine combine = COMP_SELECTION_REPLACE;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+    combine = COMP_SELECTION_ADD;
+  } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+    combine = COMP_SELECTION_SUBTRACT;
+  }
+  const comp_selection_wand_source source =
+      shell.wand_merged ? COMP_SELECTION_WAND_MERGED : COMP_SELECTION_WAND_LAYER;
+
+  const wchar_t* ok_text = combine == COMP_SELECTION_ADD ? L"魔棒：已加选"
+                           : combine == COMP_SELECTION_SUBTRACT ? L"魔棒：已减选"
+                                                                : L"魔棒：已应用";
+  /* 图层带缩放/旋转/翻转时引擎拒绝 1:1 假设：提示切到合并取样，而不是静默失败。 */
+  const wchar_t* fail_text = L"魔棒失败：参数无效或该图层非 1:1 变换（Shift+W 切合并取样）";
+  finish_new_selection(shell, "Magic Wand Selection", ok_text, L"魔棒：没有匹配的像素，选区未变",
+                       fail_text, [&](int32_t* changed) {
+                         return comp_selection_apply_wand(
+                             shell.document, id, source, doc.x, doc.y, shell.wand_tolerance,
+                             shell.wand_contiguous ? 1 : 0, /*radius=*/0, combine, changed);
+                       });
+}
+
 /* ------------------------------------------------------------ 框选（Marquee） */
 
 bool marquee_available(const ShellState& shell) {
@@ -1070,7 +1281,7 @@ void marquee_end(HWND window, ShellState& shell) {
   ReleaseCapture();
   if (shell.document == nullptr) return;
 
-  /* 框选矩形的两个角点（顺序任意，引擎按包围盒解释）。 */
+  /* 框选的两个角点（顺序任意，引擎按包围盒解释）：矩形与椭圆都是 2 点语义。 */
   const float points[4] = {static_cast<float>(shell.marquee_start.x),
                            static_cast<float>(shell.marquee_start.y),
                            static_cast<float>(shell.marquee_current.x),
@@ -1081,20 +1292,19 @@ void marquee_end(HWND window, ShellState& shell) {
   } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
     combine = COMP_SELECTION_SUBTRACT;
   }
-
-  int32_t changed = 0;
-  const comp_result result = comp_selection_apply_shape(
-      shell.document, COMP_SELECTION_RECT, points, 2, combine, /*antialias=*/1, &changed);
-  if (result != COMP_OK) {
-    set_status(shell, L"框选失败");
-    return;
-  }
-  const wchar_t* prefix = changed ? L"框选：已应用" : L"框选：选区未变化";
-  if (combine == COMP_SELECTION_ADD) prefix = changed ? L"框选：已加选" : L"框选：加选未变化";
-  if (combine == COMP_SELECTION_SUBTRACT) {
-    prefix = changed ? L"框选：已减选" : L"框选：减选未变化";
-  }
-  finish_selection_command(shell, prefix);
+  const comp_selection_shape shape =
+      shell.marquee_shape == comp_ui::kMarqueeEllipse ? COMP_SELECTION_ELLIPSE
+                                                      : COMP_SELECTION_RECT;
+  const wchar_t* ok_text = combine == COMP_SELECTION_ADD ? L"框选：已加选"
+                           : combine == COMP_SELECTION_SUBTRACT ? L"框选：已减选"
+                                                                : L"框选：已应用";
+  finish_new_selection(
+      shell, shell.marquee_shape == comp_ui::kMarqueeEllipse ? "Ellipse Marquee Selection"
+                                                             : "Rect Marquee Selection",
+      ok_text, L"框选：选区未变化", L"框选失败", [&](int32_t* changed) {
+        return comp_selection_apply_shape(shell.document, shape, points, 2, combine,
+                                          /*antialias=*/1, changed);
+      });
 }
 
 /* ------------------------------------------------------------ 画布落笔（折线） */
@@ -2208,7 +2418,7 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dash_pen);
   }
 
-  /* 框选矩形：文档坐标两点 -> 屏幕矩形；白实线 + 黑虚线。 */
+  /* 框选预览：文档坐标两点 -> 屏幕矩形；白实线 + 黑虚线（M 键切椭圆）。 */
   if (shell.marquee_active) {
     const comp_ui::Point a = shell.view.doc_to_screen(shell.marquee_start.x,
                                                      shell.marquee_start.y, layout.canvas,
@@ -2224,13 +2434,41 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
     HGDIOBJ old_pen = SelectObject(dc, solid);
     HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Rectangle(dc, left, top, right, bottom);
-    SelectObject(dc, dotted);
-    Rectangle(dc, left, top, right, bottom);
+    if (shell.marquee_shape == comp_ui::kMarqueeEllipse) {
+      Ellipse(dc, left, top, right, bottom);
+      SelectObject(dc, dotted);
+      Ellipse(dc, left, top, right, bottom);
+    } else {
+      Rectangle(dc, left, top, right, bottom);
+      SelectObject(dc, dotted);
+      Rectangle(dc, left, top, right, bottom);
+    }
     SelectObject(dc, old_brush);
     SelectObject(dc, old_pen);
     DeleteObject(solid);
     DeleteObject(dotted);
+  }
+
+  /* 套索预览：沿已采样的折线画一条高对比度细线（闭合边在松开时由引擎生成）。 */
+  if (shell.lasso_active && shell.lasso_points.size() >= 4) {
+    HPEN trail = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HGDIOBJ old_pen = SelectObject(dc, trail);
+    bool started = false;
+    for (size_t i = 0; i + 1 < shell.lasso_points.size(); i += 2) {
+      const comp_ui::Point screen =
+          shell.view.doc_to_screen(shell.lasso_points[i], shell.lasso_points[i + 1],
+                                   layout.canvas, shell.width, shell.height);
+      const int px = static_cast<int>(std::lround(screen.x));
+      const int py = static_cast<int>(std::lround(screen.y));
+      if (!started) {
+        MoveToEx(dc, px, py, nullptr);
+        started = true;
+      } else {
+        LineTo(dc, px, py);
+      }
+    }
+    SelectObject(dc, old_pen);
+    DeleteObject(trail);
   }
 
   /* 进行中的笔迹折线（文档像素 -> 屏幕）：落色用前景色，重绘用高对比度青。 */
@@ -2391,10 +2629,21 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   shell.tool = id;
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
-  wchar_t buffer[128];
+  wchar_t buffer[192];
   if (id == comp_ui::ToolId::Retouch) {
     wsprintfW(buffer, L"工具：Retouch / %s（再按 R 循环）",
               widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  } else if (id == comp_ui::ToolId::Marquee) {
+    wsprintfW(buffer, L"工具：Marquee / %s（M 切矩形/椭圆，Shift 加选 / Alt 减选）",
+              widen_ascii(comp_ui::marquee_shape_name(shell.marquee_shape)).c_str());
+  } else if (id == comp_ui::ToolId::Lasso) {
+    wsprintfW(buffer, L"工具：Lasso（拖出自由选区；Shift 加选 / Alt 减选；羽化 %d px）",
+              shell.selection_feather);
+  } else if (id == comp_ui::ToolId::Wand) {
+    wsprintfW(buffer,
+              L"工具：Magic Wand（容差 %d，%s取样，%s；[ / ] 调容差，Shift+W 切来源）",
+              shell.wand_tolerance, shell.wand_merged ? L"合并" : L"当前图层",
+              shell.wand_contiguous ? L"连通" : L"全图");
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
               info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
@@ -2549,6 +2798,33 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     if (hex_digit && shell.color_input.size() < 7) {
       shell.color_input.push_back(static_cast<wchar_t>(key));
       refresh_color_input_status(shell);
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* 羽化半径键入态（Shift+F）：只吃数字/退格/回车/Esc，其余键一律屏蔽。 */
+  if (!shell.feather_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.feather_input.clear();
+      set_status(shell, L"已取消羽化输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      shell.feather_input.pop_back();
+      if (shell.feather_input.empty()) {
+        set_status(shell, L"已取消羽化输入");
+      } else {
+        refresh_feather_input_status(shell);
+      }
+      return;
+    }
+    if (key == VK_RETURN) {
+      commit_feather_input(shell);
+      return;
+    }
+    if (key >= '0' && key <= '9' && shell.feather_input.size() < 3) {
+      shell.feather_input.push_back(static_cast<wchar_t>(key));
+      refresh_feather_input_status(shell);
     }
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
@@ -2759,11 +3035,25 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_DOWN:
       run_shell_command(window, shell, kCmdLayerSelectDown);
       break;
-    case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低 */
-      brush_step(shell, -1, shift);
+    case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低；Wand = 容差 - */
+      if (shell.tool == comp_ui::ToolId::Wand) {
+        shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, -1);
+        wchar_t buffer[128];
+        wsprintfW(buffer, L"魔棒容差 %d（逐通道，alpha 参与）", shell.wand_tolerance);
+        set_status(shell, buffer);
+      } else {
+        brush_step(shell, -1, shift);
+      }
       break;
-    case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高 */
-      brush_step(shell, 1, shift);
+    case VK_OEM_6: /* ] = 笔刷变大；Shift+] = 硬度提高；Wand = 容差 + */
+      if (shell.tool == comp_ui::ToolId::Wand) {
+        shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, 1);
+        wchar_t buffer[128];
+        wsprintfW(buffer, L"魔棒容差 %d（逐通道，alpha 参与）", shell.wand_tolerance);
+        set_status(shell, buffer);
+      } else {
+        brush_step(shell, 1, shift);
+      }
       break;
     case VK_TAB:
       panel_move_param(shell, shift ? -1 : 1);
@@ -2804,6 +3094,34 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
                   widen_ascii(hex).c_str(), shell.palette_index + 1,
                   comp_ui::swatch_count());
         set_status(shell, buffer);
+        break;
+      }
+      /* Shift+F = 键入新选区羽化半径；M = 框选形状循环；Shift+W = 魔棒取样来源。 */
+      if (key == 'F' && shift) {
+        begin_feather_input(shell);
+        break;
+      }
+      if (key == 'M' && !ctrl) {
+        if (shell.tool == comp_ui::ToolId::Marquee) {
+          shell.marquee_shape = comp_ui::marquee_shape_next(shell.marquee_shape);
+          wchar_t buffer[160];
+          wsprintfW(buffer, L"框选形状：%s（再按 M 切换）",
+                    widen_ascii(comp_ui::marquee_shape_name(shell.marquee_shape)).c_str());
+          set_status(shell, buffer);
+        } else {
+          set_tool(shell, comp_ui::ToolId::Marquee);
+        }
+        break;
+      }
+      if (key == 'W' && shift && !ctrl) {
+        if (shell.tool == comp_ui::ToolId::Wand) {
+          shell.wand_merged = !shell.wand_merged;
+          set_status(shell, shell.wand_merged
+                                ? L"魔棒取样：合并图层（Shift+W 切回当前图层）"
+                                : L"魔棒取样：当前图层（Shift+W 切到合并）");
+        } else {
+          set_tool(shell, comp_ui::ToolId::Wand);
+        }
         break;
       }
       if (key < 128) {
@@ -2899,6 +3217,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               begin_pan(window, *shell, mouse_x, mouse_y);
             } else if (marquee_available(*shell)) {
               marquee_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (lasso_available(*shell)) {
+              lasso_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (wand_available(*shell)) {
+              wand_click(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
@@ -2928,6 +3250,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_LBUTTONUP:
       if (shell != nullptr && shell->marquee_active) {
         marquee_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->lasso_active) {
+        lasso_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -2966,6 +3293,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         move_cancel(*shell);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        lasso_cancel(*shell);
       }
       break;
     case WM_CAPTURECHANGED:
@@ -2975,6 +3303,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         move_cancel(*shell);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        lasso_cancel(*shell);
       }
       break;
     case WM_MOUSEMOVE:
@@ -2989,6 +3318,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             eyedropper_sample(*shell, mouse_x, mouse_y, layout);
           } else if (shell->marquee_active) {
             marquee_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->lasso_active) {
+            lasso_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (stroke_in_progress(*shell)) {
             stroke_extend(*shell, mouse_x, mouse_y, layout);
@@ -3689,10 +4021,169 @@ int run_selftest(const wchar_t* out_path) {
          "comp_selection_deselect() returns to the no-selection state");
 
   /*
+   * S7：椭圆框选 / 套索多边形 / 魔棒 / 新选区羽化。
+   * 按壳层 marquee_end / lasso_end / wand_click / finish_new_selection 的同一参数
+   * 序列调用 ABI——验证的是「接线后的真实调用」，不是另写一套理想路径。
+   */
+  const float ellipse_points[4] = {8.0f, 8.0f, 48.0f, 40.0f};
+  verify(comp_selection_apply_shape(document, COMP_SELECTION_ELLIPSE, ellipse_points, 2,
+                                    COMP_SELECTION_REPLACE, 1, &selection_changed) == COMP_OK &&
+             selection_changed == 1 &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(24) * stride + 28u] == 255 &&
+             coverage[static_cast<size_t>(8) * stride + 8u] == 0,
+         "comp_selection_apply_shape(ellipse) covers the centre and clips the corner");
+  verify(comp_document_undo(document) == COMP_OK, "comp_document_undo(ellipse selection step)");
+
+  const float lasso_polygon[6] = {8.0f, 8.0f, 40.0f, 8.0f, 8.0f, 40.0f};
+  verify(comp_selection_apply_shape(document, COMP_SELECTION_POLYGON, lasso_polygon, 3,
+                                    COMP_SELECTION_REPLACE, 1, &selection_changed) == COMP_OK &&
+             selection_changed == 1 &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(12) * stride + 12u] == 255 &&
+             coverage[static_cast<size_t>(36) * stride + 36u] == 0,
+         "comp_selection_apply_shape(polygon) is what the lasso commits");
+  verify(comp_document_undo(document) == COMP_OK, "comp_document_undo(lasso selection step)");
+
+  /* 魔棒测试图：左半 (x<32) 不透明灰 200，右半不透明黑；容差 0 = 只吃同色连通块。 */
+  std::vector<uint8_t> wand_pixels(stride * static_cast<size_t>(height), 0);
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* pixel =
+          wand_pixels.data() + static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4u;
+      const uint8_t value = x < 32 ? 200 : 0;
+      pixel[0] = value;
+      pixel[1] = value;
+      pixel[2] = value;
+      pixel[3] = 255;
+    }
+  }
+  comp_layer_desc wand_desc{};
+  wand_desc.name = "selftest-wand";
+  wand_desc.blend = COMP_BLEND_NORMAL;
+  wand_desc.opacity = 1.0f;
+  wand_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+  wand_desc.transform = comp_rect{0, 0, width, height}; /* 1:1，魔棒 LAYER 取样的前提 */
+  comp_image wand_image{};
+  wand_image.width = width;
+  wand_image.height = height;
+  wand_image.format = COMP_PIXEL_RGBA8;
+  wand_image.stride = stride;
+  wand_image.pixels = wand_pixels.data();
+  comp_layer_id wand_layer = 0;
+  const bool wand_fixture_ok =
+      comp_layer_add(document, &wand_desc, &wand_layer) == COMP_OK && wand_layer != 0 &&
+      comp_layer_set_pixels(document, wand_layer, &wand_image) == COMP_OK;
+  verify(wand_fixture_ok, "comp_layer_add(wand fixture) + comp_layer_set_pixels(1:1)");
+
+  int32_t wand_changed = 0;
+  const bool wand_ok =
+      wand_fixture_ok &&
+      comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, 10.0, 10.0, 0, 1,
+                                0, COMP_SELECTION_REPLACE, &wand_changed) == COMP_OK &&
+      wand_changed == 1 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(10) * stride + 10u] == 255 &&
+      coverage[static_cast<size_t>(10) * stride + 50u] == 0;
+  verify(wand_ok, "comp_selection_apply_wand(contiguous) selects one colour region");
+
+  comp_rect wand_bounds{};
+  verify(wand_ok && comp_selection_get_bounds(document, &wand_bounds) == COMP_OK &&
+             wand_bounds.w == 32 && wand_bounds.h == height,
+         "wand selection bounds cover the matched half only");
+  verify(wand_ok && comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(wand selection step)");
+
+  int32_t wand_merged_changed = 0;
+  verify(wand_fixture_ok &&
+             comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_MERGED, 2.0, 2.0,
+                                       0, 1, 0, COMP_SELECTION_REPLACE,
+                                       &wand_merged_changed) == COMP_OK &&
+             wand_merged_changed == 1,
+         "comp_selection_apply_wand(merged source) samples the composite");
+  verify(comp_document_undo(document) == COMP_OK, "comp_document_undo(merged wand step)");
+
+  int32_t wand_bad = -1;
+  verify(wand_fixture_ok &&
+             comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, -1.0, 4.0,
+                                       0, 1, 0, COMP_SELECTION_REPLACE,
+                                       &wand_bad) == COMP_ERR_INVALID_ARGUMENT &&
+             wand_bad == -1,
+         "comp_selection_apply_wand(seed outside canvas) rejected, out_changed untouched");
+  verify(wand_fixture_ok &&
+             comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, 4.0, 4.0,
+                                       256, 1, 0, COMP_SELECTION_REPLACE,
+                                       &wand_bad) == COMP_ERR_INVALID_ARGUMENT,
+         "comp_selection_apply_wand(tolerance=256) rejected");
+
+  /*
+   * 0 匹配必须是「无变化」而不是清空选区：壳层靠 changed==0 回滚事务，
+   * 所以引擎既不能改选区，也不能留下撤销步。
+   * 取两色交界 (32,10) 做种、radius 2：参考色是窗口均值 80，种子像素是 0，
+   * 容差 0 下同窗口内没有像素落在 80±0 内 -> 选中 0 个。
+   */
+  verify(comp_selection_apply_shape(document, COMP_SELECTION_RECT, rect_points, 2,
+                                    COMP_SELECTION_REPLACE, 1, &selection_changed) == COMP_OK,
+         "comp_selection_apply_shape(rect) before the no-match wand probe");
+  size_t depth_before_no_match = 0;
+  comp_document_history_stats(document, &depth_before_no_match, &redo_depth);
+  int32_t no_match_changed = 1;
+  const bool no_match_ok =
+      wand_fixture_ok &&
+      comp_selection_apply_wand(document, wand_layer, COMP_SELECTION_WAND_LAYER, 32.0, 10.0, 0, 1,
+                                2, COMP_SELECTION_REPLACE, &no_match_changed) == COMP_OK &&
+      no_match_changed == 0 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(20) * stride + 20u] == 255;
+  size_t depth_after_no_match = 0;
+  comp_document_history_stats(document, &depth_after_no_match, &redo_depth);
+  verify(no_match_ok && depth_after_no_match == depth_before_no_match,
+         "wand with no matching pixel keeps the old selection and adds no undo step");
+
+  /*
+   * 新选区羽化：finish_new_selection 把「形状 + comp_selection_modify(FEATHER)」
+   * 包进一个显式事务，因此两步只能算**一步**撤销，且羽化值是本次的绝对值
+   * （apply_shape 已把 feather 归零，modify 的 sqrt 叠加从 0 起算）。
+   */
+  comp_txn feather_txn = nullptr;
+  size_t depth_before_feather = 0;
+  comp_document_history_stats(document, &depth_before_feather, &redo_depth);
+  int32_t feather_changed = 0;
+  bool feather_ok = comp_txn_begin(document, "Feather Selection", &feather_txn) == COMP_OK;
+  feather_ok = feather_ok &&
+               comp_selection_apply_shape(document, COMP_SELECTION_RECT, rect_points, 2,
+                                          COMP_SELECTION_REPLACE, 1,
+                                          &selection_changed) == COMP_OK;
+  feather_ok = feather_ok && comp_selection_modify(document, COMP_SELECTION_FEATHER, 4,
+                                                   &feather_changed) == COMP_OK &&
+               feather_changed == 1;
+  feather_ok = feather_ok && comp_txn_commit(feather_txn) == COMP_OK;
+  float feather_value = -1.0f;
+  size_t depth_after_feather = 0;
+  comp_selection_get_feather(document, &feather_value);
+  comp_document_history_stats(document, &depth_after_feather, &redo_depth);
+  verify(feather_ok && std::fabs(feather_value - 4.0f) < 0.01f,
+         "shape + comp_selection_modify(FEATHER) yields feather 4 px");
+  verify(feather_ok && depth_after_feather == depth_before_feather + 1,
+         "shape + feather commit as ONE undo step (finish_new_selection contract)");
+  verify(comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 1 && comp_selection_get_feather(document, &feather_value) == COMP_OK &&
+             std::fabs(feather_value) < 0.01f,
+         "undoing the feathered selection restores the unfeathered previous selection");
+
+  /* 测试图用完即删：它是全画布不透明层，留着会盖住后面 S6 的 flatten 断言。 */
+  verify(comp_layer_remove(document, wand_layer) == COMP_OK,
+         "comp_layer_remove(wand fixture) keeps later flatten assertions honest");
+  verify(comp_selection_deselect(document, &deselect_changed) == COMP_OK &&
+             comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "deselect after the S7 probes restores the S6 precondition");
+
+  /*
    * S6：前景色 / 画笔 / 橡皮擦 / 吸管 / 选区搬移。
    * 壳层只做参数装配，因此这里按 paint_stroke_end / eyedropper_sample / move_end
    * 的同一顺序调用 ABI——验证的是「壳层接线后的真实序列」，不是另写一套。
    */
+
   verify(comp_ui::tool_shortcut_target(comp_ui::ToolId::Brush, 'e') ==
                  comp_ui::ToolId::Eraser &&
              comp_ui::tool_shortcut_target(comp_ui::ToolId::Eraser, 'E') ==

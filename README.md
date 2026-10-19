@@ -127,6 +127,15 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   一处内核缺陷：单点折线（点一下不移动）被参数闸接受却不落笔——已修为圆形 dab。
   基线 391 → **397 用例**，Windows 壳自检 59 → **71 项**，口径 B **27/48 ≈ 56%** →
   **28/48 ≈ 58%**。详见 §6.16。
+  2026-10-18 第十七轮（S7 选区工具补口：椭圆框选 / 套索 / 魔棒 / 新选区羽化）：新增
+  `comp_selection_apply_wand`（第 111 个导出 ABI；只写选区、不碰图层蒙版，与
+  `COMP_TOOL_SELECT` 的破坏性写入明确分工），`ui_core` 补框选形状循环、套索点数闸、
+  容差/羽化步进；Windows 壳接上 `M` 循环 矩形/椭圆、套索拖拽（≥3 点自动闭合，
+  Shift/Alt = 加/减选）、魔棒点选（`[`/`]` 调容差、`Shift+W` 切图层/合并取样）、
+  `Shift+F` 羽化键入，形状 + 羽化包在**一个显式事务**里（一步撤销、无变化不留空撤销步）。
+  基线 397 → **408 用例**，Windows 壳自检 71 → **90 项**；口径 B 保持 **28/48 ≈ 58%**
+  （S7 补的是已计数的「选区几何」条目内的 Marquee/Lasso/Magic Wand 子项，未凑整抬高条数）。
+  详见 §6.17。
 
 ## 1. M1 目标与范围
 
@@ -381,7 +390,7 @@ python scripts/build.py --clean
 |----|--------|
 | 编译单元 | 87（38 个 `.c` + 49 个 `.cpp`；其中 vendored 第三方 26 个 `.c`），按 `build/engine_*.o` 实测 |
 | 产物 | `build/compositor_tests.exe` |
-| 测试 | `summary: 397 cases, 0 failed, 0 check failures`（当前基线；§6.16 起） |
+| 测试 | `summary: 408 cases, 0 failed, 0 check failures`（当前基线；§6.17 起） |
 | 全量构建耗时 | ≈ 60–120 秒（含 `.c/.cpp` 编译、链接与测试运行） |
 | 源码规模 | engine：49 `.cpp` / 38 `.c`（含 vendored 26）/ 87 `.h`（含 vendored）；tests：34 `.cpp` |
 
@@ -1402,7 +1411,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 
 | 层 | 权重 | 覆盖率 | AUDIT8 | 变动依据 |
 |----|------|--------|--------|---------|
-| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | 110 个导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
+| ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **111 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
 | ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 27 项实机自检基线、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比 |
@@ -1429,7 +1438,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | Painting（笔刷 / Spot Heal / Content-Aware Fill / 吸管） | ✓（笔刷为解析式，噪声未采样；**S5 补上 Erase 模式**——同一支笔的 destination-out，§6.15；**S6 接上前景色模型、`E` 切换与吸管**，§6.16） |
 | Canvas（Canvas Size / Image Size / Trim / 旋转） | ✓ |
 | **Camera Raw**（6 文件 1,708 行） | ✓ 设置解析、曲线、763 张实测表与完整像素管线已交付（`comp_camera_raw_apply` 等 3 个 ABI，§6.10）；几何 / Upright 透视变换与 RAW 解码未做 |
-| **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee/Lasso/Pen 的形状、叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7）；Select Subject / 抠图仍为零（依赖 ML，不在本仓范围） |
+| **选区几何**（Marquee/Lasso/Pen/Select Subject/抠图，1,000+ 行） | ✓ **部分**：Marquee（矩形/椭圆）/Lasso（多边形）/魔棒、形状叠加、全选/取消/反选、羽化/扩缩已交付（`comp_selection_*`，§6.7 / §6.17）；Pen 工具手势与 Select Subject / 抠图仍缺（后两者依赖 ML，不在本仓范围） |
 | **选区运算**（加选/减选、移动轮廓、搬移与复制选区内的像素、把图层像素或蒙版载入为选区） | ✓ **S5 交付**：载入像素/蒙版（阈值 + 四则叠加）、平移轮廓、搬移/复制像素均已进 ABI（§6.15）；**S6 补上外壳的拖拽手势**（`V`，Alt = 复制，一步撤销，§6.16） |
 | **Type / Shape / Gradient**（TypeTool 472 行 + ShapeTool + Gradient） | **零** |
 | **Clone Stamp / Smudge / Liquify**（400+ 行） | ✓ 仿制图章（源快照 / aligned 偏移 / sampleAllLayers）、涂抹（carried 拖色）、液化 Push（前向位移重采样）已交付（`comp_tool_apply` kind 9/10/11，§6.9）；同一 `BlurToolMode` 里的 Blur 模式也已在 P1 补齐（`COMP_TOOL_BLUR = 12`，§6.12） |
@@ -1444,8 +1453,10 @@ Crop、Clone/Smudge/Liquify 与 Camera Raw 按已交付计入）。S5 抬高**�
 Selections 的「加选/减选 + 移动轮廓 + 搬移/复制像素」与「载入图层像素或蒙版」；
 S6 再抬高**一条**：**吸管（Painting #7）**——前景色模型与取色工具都已接进外壳，
 按「用户能做的事」口径从此命中（§6.16）。Painting 的 Erase 模式仍算进已计数的
-笔刷条目，不额外抬高条数。其余约 4,800 行 Swift **完全没有对应物**，
-且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
+笔刷条目，不额外抬高条数。**S7 也不抬高条数**：它补的是已计数的「选区几何」条目
+里的 Marquee(椭圆)/Lasso/Magic Wand 子项与外壳手势，该条目仍缺 Pen 工具、
+Select Subject 与抠图，不足以从「部分命中」升为整条命中（§6.17）。其余约 4,800 行 Swift
+**完全没有对应物**，且这些**不属于「接线」范畴，属新增功能**——不是把孤立内核接出去能解决的。
 
 #### 口径 A 与 B 不一致的原因与推进顺序
 
@@ -1498,7 +1509,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 
 | 内核 | 产品通路 | 已接线 | 仍未接线 |
 |------|---------|--------|----------|
-| Wand | `COMP_TOOL_SELECT` | `wand_mask`、`wand_trace`（只读闭合轮廓） | — |
+| Wand | `COMP_TOOL_SELECT`（破坏性写蒙版）；`comp_selection_apply_wand`（只读选区，S7） | `wand_mask`、`wand_trace`（只读闭合轮廓） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发） | `heal_coverage_bounds` |
 | Patch | `COMP_TOOL_HEAL` | `patch_fill` | — |
 | Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
@@ -2267,6 +2278,77 @@ hex 往返与垃圾拒绝、12 色板循环、0..1 换算夹取），`test_tool_
 明确失败提示而不是降级。
 
 报告：`../report/S6-shell-wiring-20261018-claude.md`。
+
+### 6.17 S7 选区工具补口：椭圆框选 / 套索 / 魔棒 / 新选区羽化（2026-10-18，DSH）
+
+S6 把 S5 的选区 ABI 接进了外壳，但外壳只能画矩形框选，魔棒、套索与新选区羽化在
+ABI 与 UI 两侧都没有通路（S6 报告 §9 的 follow-up）。S7 补这一组，并**只补缺口、
+不改 S6 已验证的接线**。
+
+**1. 新 ABI：`comp_selection_apply_wand`（第 111 个导出符号）。** 入参
+`(document, layer, source, seed_x, seed_y, tolerance, contiguous, radius, combine, out_changed)`；
+`source` 为 `COMP_SELECTION_WAND_LAYER`（当前图层像素）或 `COMP_SELECTION_WAND_MERGED`
+（整篇合成）。它**只写选区**，不动图层蒙版——这是与 `COMP_TOOL_SELECT` 的分工：
+后者是破坏性写入（魔棒直接改蒙版），前者是「先选再改」。关键口径：
+
+- 像素取样一律走 8 位预乘视图（16 位/HDR 图层先落到 8 位副本，探针读的就是画布上
+  看到的颜色）；`wand_rgba8_view` 是唯一取样口。
+- `LAYER` 源要求**整数平移的 1:1 变换**（`effective_bounds()` 的宽高 == 像素宽高）；
+  缩放/旋转/翻转的图层显式返回 `COMP_ERR_STATE`，需宿主先栅格化——不静默降级。
+- 种子在 ABI 闸里校验「在画布内」，域层再校验「在取样面内」（图层可能小于画布）；
+  分组图层 / 无像素图层 / 不存在的图层分别给 `COMP_ERR_STATE` / `COMP_ERR_STATE` /
+  `COMP_ERR_NOT_FOUND`。
+- **选中 0 个 = 无变化**：返回 `COMP_OK`、`out_changed = 0`，既有选区原样保留、
+  不产生撤销步（上游「无选中即不改变」）。这与 `COMP_TOOL_SELECT`「空选中不写蒙版」
+  是同一条原则的只读版。
+- 命中掩码经**画布尺寸的 coverage** 走既有的 `apply_coverage_mask`，因此
+  add/subtract/replace、羽化清零与「无变化短路」全部复用 S5 已冻结的语义。
+- 常量与量程：`tolerance` 0..255、`radius` 0..512、`contiguous` 0/1；参数闸在
+  事务之前，失败不留撤销步。
+
+**2. 外壳手势（`ui_core` 判据 + `main.cpp` 翻译）。**
+
+- `M` 循环 `Rect → Ellipse → Rect`（只循环引擎真支持的两种形状，不造「假形状」）；
+  `marquee_end` 按形状调 `COMP_SELECTION_RECT` / `COMP_SELECTION_ELLIPSE`，
+  预览也按同一形状画。
+- 套索：按下起笔、移动累积文档坐标点（复用 `stroke_point_should_append` 的 0.75 px
+  去抖，上限 8192 点），松开时 ≥3 点自动闭合提交为 `COMP_SELECTION_POLYGON`；
+  点数不足则不提交。Shift = 加选、Alt = 减选，与框选同一套修饰键。
+- 魔棒：点按取种子 `floor(doc)`，`LAYER` 源；`Shift+W` 切 `MERGED`（画布看到的颜色）；
+  `[` / `]` 在魔棒激活时调容差（0..255，步进 1/4/8），否则保持原笔刷直径行为；
+  状态栏如实显示「图层/合并」与当前容差。
+- 羽化：`Shift+F` 键入 0..250 px（模态输入，只吃数字、`Backspace`、回车确认、
+  `Esc` 取消）。默认对新选区生效；对**已有选区**再按 `Shift+F` 走
+  `comp_selection_modify(COMP_SELECTION_FEATHER, r)`，状态栏写明是**叠加**语义
+  （ABI 没有「绝对设置羽化」的入口，`modify` 按 `sqrt(cur² + r²)` 叠加），
+  不假装它是绝对值。
+- **一步撤销**：`finish_new_selection` 把「形状/魔棒 + 可选羽化」包进一个显式事务，
+  任一步失败 `comp_txn_abort`，`changed == 0` 也 abort（不产生空的撤销步）。
+  `apply_shape` 在 REPLACE 时会把 feather 归零，所以「形状 + 羽化」在同一事务里
+  得到的羽化值就是键入的 `r`，不会叠加到上一次的残留上。
+
+**3. 测试。** 新增 11 例：`test_selection` 7 例（连通魔棒、全局魔棒跨不连通色块、
+容差匹配半径、MERGED 取样、与既有选区做减选、0 匹配保留旧选区且不加撤销步、
+坏参数矩阵：种子越界/NaN/tolerance 256/contiguous 2/radius 513/非法 combine/
+非法 source/图层不存在/分组图层/非 1:1 图层）、`test_ui_core` 4 例（形状循环与命名、
+套索点数闸、魔棒容差夹取与步进、羽化夹取与步进）。基线 397 → **408 用例**。
+
+**4. 自检。** `--selftest` 新增 19 项：椭圆覆盖率/角落裁剪、多边形套索、魔棒 fixture
+（1:1 图层）、连通魔棒选区与边界、MERGED 取样、种子越界与 tolerance 越界的
+`out_changed` 不变性、0 匹配保留旧选区且不加深历史、形状 + 羽化同事务 = 一步撤销、
+撤销后回到未羽化的上一版选区。71 → **90 项**，`compositor_shell_selftest.txt` 同步
+重新生成（SHA256 `4cfd2789028cd6ec…`）。
+
+**5. 验证与边界。** `scripts/build.py` → **408 cases, 0 failed**；
+`scripts/run_regression.py --require-ohos` → **6/6 PASS / 0 skipped**（壳自检 90 项、
+`failures = 0`、SHA256 与仓内基线一致；OHOS aarch64 交叉编译 + NAPI rc=0）。
+仍然**没有经过人手实测**：无窗口环境下只验证到 ABI 与 `ui_core` 数学层。
+明确边界：套索只有多边形（Pen 贝塞尔手势未接，ABI 的 `COMP_SELECTION_PATH` 可用但
+没有外壳工具）；魔棒不做 N×N 平均窗口（`radius` 恒为 0，取样窗口 1）；
+`MERGED` 每次点击整篇合成一次（大文档下有成本，未做缓存）；羽化没有绝对设置入口；
+选区工具仍受引擎的 RGBA8 / 1:1 约束，其它图层给明确失败提示而非降级。
+
+报告：`../report/S7-selection-tools-20261018-dsh.md`。
 
 ## 7. 许可
 

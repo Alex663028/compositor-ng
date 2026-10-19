@@ -38,12 +38,15 @@
 #define COMPOSITOR_DOMAIN_SELECTION_H
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "compositor/comp_core.h"
 #include "domain/domain_state.h"
 
 namespace compositor {
+
+class Document;
 
 /* 与 ABI 的 comp_selection_shape / combine / modify 数值一一对应。 */
 enum SelectionShape {
@@ -143,6 +146,50 @@ bool selection_load_layer(SelectionState* selection, int32_t canvas_width, int32
  * 结果与旧蒙版逐字节一致时 changed = false（例如空选区或 dx = dy = 0）。
  */
 bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed);
+
+/* ------------------------------------------------------------ 魔棒（S7） */
+
+/* 参考色邻域半边长的上限（与 tool_ops 的 select.radius 同口径）。 */
+constexpr int32_t kMaxSelectionWandRadius = 512;
+
+/* 魔棒取样来源：0 = 指定图层的像素，1 = 整篇合成（与吸管「合并」同源）。 */
+enum SelectionWandSource {
+  kSelectionWandLayer = 0,
+  kSelectionWandMerged = 1
+};
+
+/* 魔棒参数。seed 是**文档像素**坐标（左上原点），tolerance 是逐通道距离阈值
+ * 0..255（alpha 参与比较），radius 是参考色 (2r+1)² 邻域的半边长，
+ * contiguous != 0 表示从种子做 4-连通泛洪、0 表示选中全图所有匹配像素。 */
+struct SelectionWandParams {
+  int32_t source = kSelectionWandLayer;
+  double seed_x = 0.0;
+  double seed_y = 0.0;
+  int32_t tolerance = 32;
+  int32_t contiguous = 1;
+  int32_t radius = 0;
+};
+
+/*
+ * 魔棒选区：用 wand_mask 内核在图层像素或整篇合成上匹配，再把结果按 combine
+ * 并回文档选区（上游 MagicWand 的工具语义）。
+ *
+ * 与 `COMP_TOOL_SELECT` 的区别：那次把结果**累积写进图层蒙版**（会覆写既有
+ * 蒙版，宿主还得再 load 一次才成选区），这里直接产出选区、不动图层蒙版。
+ *
+ * 返回 COMP_OK 时 changed 回报状态是否真的变了；0 个匹配像素时**不改选区**
+ * （changed = false），与「点了个空处不留下空蒙版」同口径。失败返回具体错误码：
+ *   - COMP_ERR_NOT_FOUND：图层来源的图层不存在；
+ *   - COMP_ERR_STATE：图层是组 / 无像素 / 不是 1:1 变换（泛洪网格与文档网格
+ *     之间必须是整数平移）；
+ *   - COMP_ERR_INVALID_ARGUMENT：画布非法、来源/叠加枚举未知、容差/半径越界、
+ *     contiguous 不是 0/1、seed 非有限或落在画布/取样面之外；
+ *   - COMP_ERR_OUT_OF_MEMORY：内核工作内存申请失败。
+ */
+comp_result selection_apply_wand(SelectionState* selection, int32_t canvas_width,
+                                 int32_t canvas_height, const Document& document,
+                                 comp_layer_id layer, const SelectionWandParams& params,
+                                 int32_t combine, bool* changed, std::string* error);
 
 /* 有效 coverage（画布分辨率，白 = 选中）：base 按 feather 高斯模糊。
  * selection 不活跃或基础蒙版为空时 out 清空（调用方必须先看 active）。 */

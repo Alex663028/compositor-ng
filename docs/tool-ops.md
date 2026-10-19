@@ -60,6 +60,13 @@
 - **选中数不为 0 时才写蒙版**——点了个空处不留下一张全 0 的空蒙版
   （否则整层被蒙成透明；上游是「无选中即不改变」）。
 - 写入是**加选**：与既有蒙版取逐像素最大值。
+- **与只读魔棒的分工（S7）**：`COMP_TOOL_SELECT` 是**破坏性**的——它直接改图层蒙版，
+  等于「选中即生效」。要「先选、再改」请用 `comp_selection_apply_wand`
+  （`engine/abi/include/compositor/comp_selection.h`）：同样吃 `layer/source/seed/
+  tolerance/contiguous/radius`，但只写选区 coverage，不改图层数据；
+  `COMP_SELECTION_WAND_MERGED` 取整篇合成、`LAYER` 要求图层是 1:1 整数平移。
+  选中 0 个时两条通路都遵守「无选中即不改变」（不写空蒙版、不清空既有选区）。
+  语义与外壳手势见 README §6.17。
 
 ### 4.2 Stroke（`COMP_TOOL_STROKE`）
 
@@ -258,3 +265,10 @@ coverage 把样本盖回当前像素。
   新增 2 例：擦除按 coverage 做减法而非覆盖、零压力 no-op。全量回归
   `build.py` → **391 cases, 0 failed**，`run_regression.py --require-ohos` 6/6 PASS。
   选区侧的载入/平移/像素搬移与吸管不走 `comp_tool_apply`，见 README §6.15。
+- S6 追加（2026-10-18）：外壳接线（前景色/吸管/`E` 橡皮擦/拖动选区），不新增 ABI；
+  基线 391 → **397 用例**，壳自检 59 → **71 项**，6/6 PASS。见 README §6.16。
+- S7 追加（2026-10-18）：新增 `comp_selection_apply_wand`（第 111 个导出 ABI，
+  §4.1 的只读魔棒）——它**不是** `comp_tool_apply` 的算子，而是 `comp_selection_*`
+  家族的选区构造入口；`COMP_TOOL_SELECT` 的破坏性合同不变。基线 397 → **408 用例**
+  （`test_selection` 7 + `test_ui_core` 4），壳自检 71 → **90 项**，6/6 PASS。
+  见 README §6.17。

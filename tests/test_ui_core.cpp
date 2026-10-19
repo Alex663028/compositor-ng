@@ -1,4 +1,4 @@
-﻿// AI生成
+// AI生成
 /*
  * test_ui_core.cpp — Windows 外壳 UI 核心的回归护栏。
  *
@@ -831,4 +831,49 @@ COMP_TEST(ui_core_color_unit_conversion_clamps) {
   const comp_ui::ColorRGB sampled = comp_ui::color_from_unit(200.0 / 255.0, 40.0 / 255.0,
                                                              20.0 / 255.0);
   COMP_CHECK(comp_ui::color_equal(sampled, comp_ui::ColorRGB{200, 40, 20}));
+}
+
+/* ============================================ S7: 选区工具（Marquee / Lasso / Wand） */
+
+COMP_TEST(ui_core_marquee_shape_cycles_between_two_engine_shapes) {
+  COMP_CHECK(comp_ui::marquee_shape_count() == 2);
+  COMP_CHECK(comp_ui::marquee_shape_next(comp_ui::kMarqueeRect) == comp_ui::kMarqueeEllipse);
+  COMP_CHECK(comp_ui::marquee_shape_next(comp_ui::kMarqueeEllipse) == comp_ui::kMarqueeRect);
+  /* 未知值必须落到矩形：状态被外部写坏时也不能停在未定义形状上。 */
+  COMP_CHECK(comp_ui::marquee_shape_next(99) == comp_ui::kMarqueeRect);
+  COMP_CHECK(std::string(comp_ui::marquee_shape_name(comp_ui::kMarqueeRect)) == "Rect");
+  COMP_CHECK(std::string(comp_ui::marquee_shape_name(comp_ui::kMarqueeEllipse)) == "Ellipse");
+}
+
+COMP_TEST(ui_core_lasso_needs_three_points_and_is_bounded) {
+  COMP_CHECK(!comp_ui::lasso_should_close(0));
+  COMP_CHECK(!comp_ui::lasso_should_close(2));
+  COMP_CHECK(comp_ui::lasso_should_close(3));
+  COMP_CHECK(comp_ui::lasso_can_append(comp_ui::kLassoMaxPoints - 1));
+  COMP_CHECK(!comp_ui::lasso_can_append(comp_ui::kLassoMaxPoints));
+  COMP_CHECK(comp_ui::kLassoMinPoints == 3);
+}
+
+COMP_TEST(ui_core_wand_tolerance_steps_are_clamped) {
+  COMP_CHECK(comp_ui::clamp_wand_tolerance(-5) == 0);
+  COMP_CHECK(comp_ui::clamp_wand_tolerance(999) == 255);
+  COMP_CHECK(comp_ui::step_wand_tolerance(0, -1) == 0);
+  COMP_CHECK(comp_ui::step_wand_tolerance(0, 1) == 1);
+  COMP_CHECK(comp_ui::step_wand_tolerance(15, 1) == 16);
+  COMP_CHECK(comp_ui::step_wand_tolerance(16, 1) == 20);
+  COMP_CHECK(comp_ui::step_wand_tolerance(64, 1) == 72);
+  COMP_CHECK(comp_ui::step_wand_tolerance(255, 1) == 255);
+  COMP_CHECK(comp_ui::step_wand_tolerance(255, -1) == 247);
+  COMP_CHECK(comp_ui::kDefaultWandTolerance == 32);
+}
+
+COMP_TEST(ui_core_selection_feather_steps_are_clamped) {
+  COMP_CHECK(comp_ui::clamp_selection_feather(-1) == 0);
+  COMP_CHECK(comp_ui::clamp_selection_feather(251) == 250);
+  COMP_CHECK(comp_ui::step_selection_feather(0, -1) == 0);
+  COMP_CHECK(comp_ui::step_selection_feather(0, 1) == 1);
+  COMP_CHECK(comp_ui::step_selection_feather(10, 1) == 15);
+  COMP_CHECK(comp_ui::step_selection_feather(50, 1) == 60);
+  COMP_CHECK(comp_ui::step_selection_feather(250, 1) == 250);
+  COMP_CHECK(comp_ui::step_selection_feather(250, -1) == 240);
 }

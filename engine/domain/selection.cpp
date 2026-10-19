@@ -9,8 +9,13 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include "compositing/compositor.h"
+#include "domain/document.h"
+#include "imaging/WandPixels.h"
 
 namespace compositor {
 
@@ -1074,6 +1079,150 @@ bool selection_load_layer(SelectionState* selection, int32_t canvas_width, int32
 
   return apply_coverage_mask(selection, canvas_width, canvas_height, std::move(coverage), combine,
                              changed);
+}
+
+/* --------------------------------------------------------------- 魔棒 */
+
+namespace {
+
+/* 取样面统一落到 RGBA8（预乘）：16 位/HDR 走既有的 8 位工作副本。
+ * 返回的像素指针可能指向 source 自身，也可能指向 scratch。 */
+bool wand_rgba8_view(const ImageBuffer& source, ImageBuffer* scratch,
+                     const std::vector<uint8_t>** out_pixels, size_t* out_stride) {
+  if (source.format == COMP_PIXEL_RGBA8) {
+    *out_pixels = &source.pixel_data();
+    *out_stride = source.stride();
+    return true;
+  }
+  const bool ok = source.format == COMP_PIXEL_RGBA16F ? hdr_to_rgba8(source, scratch)
+                                                      : deep_to_rgba8(source, scratch);
+  if (!ok) return false;
+  *out_pixels = &scratch->pixel_data();
+  *out_stride = scratch->stride();
+  return true;
+}
+
+}  // namespace
+
+comp_result selection_apply_wand(SelectionState* selection, int32_t canvas_width,
+                                 int32_t canvas_height, const Document& document,
+                                 comp_layer_id layer, const SelectionWandParams& params,
+                                 int32_t combine, bool* changed, std::string* error) {
+  if (changed != nullptr) *changed = false;
+  const auto fail = [error](comp_result code, const char* text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+
+  if (selection == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "selection is null");
+  if (canvas_width <= 0 || canvas_height <= 0) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand needs a non-empty canvas");
+  }
+  if (combine < kSelectionReplace || combine > kSelectionSubtract) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if (params.source != kSelectionWandLayer && params.source != kSelectionWandMerged) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown wand source");
+  }
+  if (params.tolerance < 0 || params.tolerance > 255) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand tolerance out of 0..255");
+  }
+  if (params.radius < 0 || params.radius > kMaxSelectionWandRadius) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand radius out of range");
+  }
+  if (params.contiguous != 0 && params.contiguous != 1) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand contiguous must be 0 or 1");
+  }
+  if (!std::isfinite(params.seed_x) || !std::isfinite(params.seed_y)) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand seed is not finite");
+  }
+
+  /* 指针在文档像素上取整：魔棒是逐像素操作，亚像素落点取所在像素。 */
+  const int64_t doc_x = static_cast<int64_t>(std::floor(params.seed_x));
+  const int64_t doc_y = static_cast<int64_t>(std::floor(params.seed_y));
+  if (doc_x < 0 || doc_y < 0 || doc_x >= canvas_width || doc_y >= canvas_height) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand seed lies outside the canvas");
+  }
+
+  ImageBuffer composite;
+  ImageBuffer scratch;
+  const std::vector<uint8_t>* pixels = nullptr;
+  size_t stride = 0;
+  int32_t grid_width = 0;
+  int32_t grid_height = 0;
+  int64_t origin_x = 0;
+  int64_t origin_y = 0;
+
+  if (params.source == kSelectionWandMerged) {
+    std::string compose_error;
+    if (!composite_document(document, &composite, &compose_error)) {
+      return fail(COMP_ERR_INTERNAL, "wand could not composite the document");
+    }
+    if (!wand_rgba8_view(composite, &scratch, &pixels, &stride)) {
+      return fail(COMP_ERR_INTERNAL, "wand could not build an 8-bit composite");
+    }
+    grid_width = canvas_width;
+    grid_height = canvas_height;
+  } else {
+    const Layer* target = document.find(layer);
+    if (target == nullptr) return fail(COMP_ERR_NOT_FOUND, "wand source layer was not found");
+    if (target->is_group) {
+      return fail(COMP_ERR_STATE, "group layers have no pixels to sample");
+    }
+    if (target->pixels.empty()) {
+      return fail(COMP_ERR_STATE, "wand source layer has no pixels");
+    }
+    if (!wand_rgba8_view(target->pixels, &scratch, &pixels, &stride)) {
+      return fail(COMP_ERR_STATE, "wand source layer could not be sampled as 8-bit RGBA");
+    }
+    /* 泛洪网格 = 图层像素网格，映射回文档必须是**整数平移**：缩放/旋转/翻转
+     * 图层先栅格化再选（宿主侧的光栅化是显式动作，不能在这里静默降级）。 */
+    const comp_rect bounds = target->effective_bounds();
+    if (bounds.w != target->pixels.width || bounds.h != target->pixels.height) {
+      return fail(COMP_ERR_STATE, "magic wand needs a layer with a 1:1 transform");
+    }
+    grid_width = target->pixels.width;
+    grid_height = target->pixels.height;
+    origin_x = bounds.x;
+    origin_y = bounds.y;
+  }
+
+  const int64_t grid_x = doc_x - origin_x;
+  const int64_t grid_y = doc_y - origin_y;
+  if (grid_x < 0 || grid_y < 0 || grid_x >= grid_width || grid_y >= grid_height) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand seed lies outside the sampled surface");
+  }
+
+  std::vector<uint8_t> mask(static_cast<size_t>(grid_width) * static_cast<size_t>(grid_height), 0);
+  const long selected =
+      wand_mask(pixels->data(), static_cast<size_t>(grid_width), static_cast<size_t>(grid_height),
+                stride, static_cast<size_t>(grid_x), static_cast<size_t>(grid_y),
+                static_cast<size_t>(params.radius), params.tolerance, params.contiguous,
+                mask.data());
+  if (selected < 0) return fail(COMP_ERR_OUT_OF_MEMORY, "wand ran out of memory");
+  /* 0 个匹配不改选区：与 COMP_TOOL_SELECT「没选中就不写蒙版」同口径，
+   * 否则在空处点一下会静默清掉用户已有的选区。 */
+  if (selected == 0) return COMP_OK;
+
+  std::vector<uint8_t> coverage(
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height), 0);
+  const int64_t left = std::max<int64_t>(0, origin_x);
+  const int64_t top = std::max<int64_t>(0, origin_y);
+  const int64_t right = std::min<int64_t>(canvas_width, origin_x + grid_width);
+  const int64_t bottom = std::min<int64_t>(canvas_height, origin_y + grid_height);
+  for (int64_t y = top; y < bottom; ++y) {
+    uint8_t* row = coverage.data() + static_cast<size_t>(y) * static_cast<size_t>(canvas_width);
+    const uint8_t* src = mask.data() +
+                         static_cast<size_t>(y - origin_y) * static_cast<size_t>(grid_width) +
+                         static_cast<size_t>(left - origin_x);
+    std::memcpy(row + left, src, static_cast<size_t>(right - left));
+  }
+
+  if (!apply_coverage_mask(selection, canvas_width, canvas_height, std::move(coverage), combine,
+                           changed)) {
+    return fail(COMP_ERR_INTERNAL, "selection coverage could not be updated");
+  }
+  return COMP_OK;
 }
 
 bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed) {

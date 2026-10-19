@@ -63,6 +63,25 @@
 [OK] comp_selection_select_all() covers the canvas
 [OK] comp_selection_invert() of a full selection means no selection
 [OK] comp_selection_deselect() returns to the no-selection state
+[OK] comp_selection_apply_shape(ellipse) covers the centre and clips the corner
+[OK] comp_document_undo(ellipse selection step)
+[OK] comp_selection_apply_shape(polygon) is what the lasso commits
+[OK] comp_document_undo(lasso selection step)
+[OK] comp_layer_add(wand fixture) + comp_layer_set_pixels(1:1)
+[OK] comp_selection_apply_wand(contiguous) selects one colour region
+[OK] wand selection bounds cover the matched half only
+[OK] comp_document_undo(wand selection step)
+[OK] comp_selection_apply_wand(merged source) samples the composite
+[OK] comp_document_undo(merged wand step)
+[OK] comp_selection_apply_wand(seed outside canvas) rejected, out_changed untouched
+[OK] comp_selection_apply_wand(tolerance=256) rejected
+[OK] comp_selection_apply_shape(rect) before the no-match wand probe
+[OK] wand with no matching pixel keeps the old selection and adds no undo step
+[OK] shape + comp_selection_modify(FEATHER) yields feather 4 px
+[OK] shape + feather commit as ONE undo step (finish_new_selection contract)
+[OK] undoing the feathered selection restores the unfeathered previous selection
+[OK] comp_layer_remove(wand fixture) keeps later flatten assertions honest
+[OK] deselect after the S7 probes restores the S6 precondition
 [OK] ui_core tool_shortcut_target(E) toggles brush/eraser
 [OK] ui_core swatch palette cycles (X)
 [OK] ui_core color_parse_hex / color_to_hex round trip (Shift+X)
