@@ -16,6 +16,13 @@ class CpuRenderBackend final : public RenderBackend {
   bool usable() const override { return true; }
   BackendCaps caps() const override;
 
+  /* CPU 是基准实现：任何文档都能渲染。 */
+  bool can_render_document(const Document& doc, std::string* error) const override {
+    (void)doc;
+    (void)error;
+    return true;
+  }
+
   bool render_document(Document& doc, const comp_render_target& target,
                        std::string* error) override;
   bool present(Document& doc, std::string* error) override;

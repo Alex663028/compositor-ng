@@ -29,6 +29,7 @@ namespace compositor {
 
 class CameraRawTableSet;
 class Document;
+class RenderBackend;
 
 class Engine {
  public:
@@ -50,7 +51,17 @@ class Engine {
   static void destroy(Engine* engine);
 
   const Allocator& allocator() const noexcept { return allocator_; }
+  /* 实际生效的后端（AUTO/不可用 GPU 已解析成真实值），ABI 报告的就是它。 */
   comp_backend backend() const noexcept { return backend_; }
+  /* 宿主原始请求（保留 AUTO 语义，供诊断与重新选择用）。 */
+  comp_backend requested_backend() const noexcept { return requested_backend_; }
+  /*
+   * 引擎持有的渲染后端实例：跨文档、跨帧复用（S13）。GPU 后端的设备与管线
+   * 常驻于此；ABI 渲染入口直接借用，不再每次调用重建。
+   */
+  RenderBackend* render_backend() const noexcept { return render_backend_.get(); }
+  /* 定义在 engine.cpp：unique_ptr 的析构/替换需要 RenderBackend 完整类型。 */
+  void adopt_render_backend(std::unique_ptr<RenderBackend> backend, comp_backend actual);
   uint32_t threads() const noexcept { return threads_; }
   const std::string& app_name() const noexcept { return app_name_; }
   const std::string& app_version() const noexcept { return app_version_; }
@@ -105,7 +116,9 @@ class Engine {
   }
 
   Allocator allocator_{};
+  comp_backend requested_backend_ = COMP_BACKEND_CPU;
   comp_backend backend_ = COMP_BACKEND_CPU;
+  std::unique_ptr<RenderBackend> render_backend_{};
   uint32_t threads_ = 1;
   std::string app_name_ = "compositor";
   std::string app_version_;

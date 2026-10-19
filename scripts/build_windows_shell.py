@@ -8,8 +8,13 @@ build_windows_shell.py — 构建 Windows 外壳层（M3）。
 
 用法：
     python scripts/build.py                # 先产出引擎对象文件与测试
+    python scripts/build.py --gpu          # 编入 D3D12 后端后再构建外壳
     python scripts/build_windows_shell.py  # 再产出 build/compositor_shell.exe
+
+`--gpu` 只用于让壳源码与引擎保持同一编译口径（壳本身只用 C ABI，不直接依赖
+D3D12 头）。引擎目标文件是否含 GPU 后端由先前那次 build.py 决定。
 """
+import argparse
 import glob
 import os
 import subprocess
@@ -61,6 +66,11 @@ def run(cmd):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Build the Windows shell executable")
+    parser.add_argument("--gpu", action="store_true",
+                        help="compile shell sources with -DCOMP_HAS_D3D12 (same variant as build.py --gpu)")
+    args = parser.parse_args()
+
     objects = sorted(glob.glob(os.path.join(BUILD, "engine_*.o")))
     if not objects:
         print("[shell] 未找到 build/engine_*.o，请先运行 python scripts/build.py")
@@ -74,6 +84,8 @@ def main():
         cmd = [PYTHON, "-m", "ziglang", "c++", "-c", source, "-o", obj]
         cmd += CXX_FLAGS
         cmd += ["-I" + path for path in INCLUDES]
+        if args.gpu:
+            cmd.append("-DCOMP_HAS_D3D12")
         run(cmd)
         shell_objects.append(obj)
 

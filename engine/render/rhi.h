@@ -43,9 +43,30 @@ class RenderBackend {
 
   virtual BackendCaps caps() const = 0;
 
+  /*
+   * 本后端能否按「当前文档内容」产出与 CPU 基准一致的像素。
+   *
+   * 这是 GPU 后端的能力闸门：CPU 后端恒为 true；D3D12 只接受「全画布 RGBA8、
+   * 无组/蒙版/剪贴/调整/效果/变换」的简单堆叠；Vulkan 的文档路径尚未接线，恒为
+   * false。返回 false 时 error 写明首个不满足的条件。
+   *
+   * ABI 层用它在每次渲染前判定「走 GPU 还是按文档回落 CPU」，因此 GPU 后端
+   * 不需要（也不允许）为了不支持的文档静默输出错误画面。
+   */
+  virtual bool can_render_document(const Document& doc, std::string* error) const = 0;
+
   /* 把文档合成到 target 指定的表面。 */
   virtual bool render_document(Document& doc, const comp_render_target& target,
                                std::string* error) = 0;
+
+  /*
+   * 上一次 render_document 是否真的在设备上执行（上传 → dispatch → 回读全链路）。
+   *
+   * 为什么需要这个标志：像素相等**不能**证明 GPU 参与——ABI 层在 GPU 渲染失败时
+   * 会回落 CPU 并照样输出正确像素。测试与诊断靠它区分「GPU 真的算了」与「悄悄
+   * 回落了 CPU」。CPU 后端恒为 false；GPU 后端只在整条设备链路成功后置 true。
+   */
+  virtual bool last_render_offloaded() const { return false; }
 
   /* 提交上屏（窗口后端使用；离屏后端为无操作）。 */
   virtual bool present(Document& doc, std::string* error) = 0;

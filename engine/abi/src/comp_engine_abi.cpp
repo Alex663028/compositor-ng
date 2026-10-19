@@ -88,10 +88,15 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
   /* 让 C 侧并行原语与引擎线程配置保持一致（M1 内核为顺序等价实现，此处为 M2 预置）。 */
   comp_parallel_set_threads(engine->threads());
 
-  /* 后端选择：M1 除 CPU 外均回落 CPU，回落事实通过 last_error 暴露。 */
+  /*
+   * 后端选择：按请求（AUTO 走平台偏好）创建**一个**实例并由引擎长期持有。
+   * 渲染入口此后借用这个实例（GPU 设备/管线常驻），不再每次渲染重建；
+   * 不可用时 create_backend 已回落 CPU，原因经 last_error 暴露。
+   */
   std::string backend_error;
+  comp_backend actual = engine->requested_backend();
   std::unique_ptr<compositor::RenderBackend> backend =
-      compositor::create_backend(engine, engine->backend(), &backend_error);
+      compositor::create_backend(engine, engine->requested_backend(), &backend_error, &actual);
   if (backend == nullptr) {
     /* Engine::create 是 placement new + 引擎分配器：释放必须走配对的
      * Engine::destroy。全局 delete 在定制分配器场景下跨堆释放（报告 6.2
@@ -99,6 +104,7 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
     Engine::destroy(engine);
     return COMP_ERR_BACKEND;
   }
+  engine->adopt_render_backend(std::move(backend), actual);
   if (!backend_error.empty()) engine->set_last_error(backend_error);
 
   *out_engine = reinterpret_cast<comp_engine>(engine);

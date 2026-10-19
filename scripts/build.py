@@ -15,10 +15,17 @@ clang 完成真实编译与测试运行；仅依赖 Python 3 与 pip。
     python scripts/build.py --driver clang  # 使用 PATH 中的 clang/clang++（需在 VS 开发者环境中运行）
     python scripts/build.py --driver msvc   # 显式使用 cl.exe（需已安装 VS 环境）
     python scripts/build.py --driver cc     # 使用 PATH 中的 cc/c++（gcc/clang）
+    python scripts/build.py --gpu           # 编入 D3D12 后端（-DCOMP_HAS_D3D12），AUTO 才可能走 GPU
 
 重要：`--driver msvc` 只对 C++ 源可用。engine/imaging/*.c 沿用原 macOS 工程的
 clang block 语法（^），cl.exe 没有 blocks 扩展，会直接以 C2059 报错；
 MSVC 环境请改用 `--driver clang`（VS 自带 LLVM 工具集，同为 MSVC ABI）。
+
+`--gpu` 只影响编译期是否编入 D3D12 后端，不做链接期依赖（D3D12/编译器入口
+全部运行期从 d3d12.dll / d3dcompiler_47.dll 解析）；未加该开关时后端如实报
+「not compiled into this build」，AUTO 回落 CPU。外壳层复用 build/ 下的目标文件，
+因此要用 GPU 路径时先跑 `--gpu` 再跑 build_windows_shell.py（外壳脚本同样接受
+--gpu，保持编译口径一致）。
 """
 
 from __future__ import annotations
@@ -126,7 +133,7 @@ def obj_path(source: str, driver: str, shared: bool = False) -> str:
     return os.path.join(BUILD, prefix + os.path.splitext(rel)[0] + ext)
 
 
-def compile_all(driver: str, shared: bool) -> list[str]:
+def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
     cc, cxx, linker = resolve_toolchain(driver)
     os.makedirs(BUILD, exist_ok=True)
 
@@ -146,6 +153,10 @@ def compile_all(driver: str, shared: bool) -> list[str]:
         if os.name != "nt":
             defines.append("-fPIC")
     msvc_defines = ["/DCOMP_SHARED", "/DCOMP_SHARED_BUILD"] if shared else []
+    # S13：D3D12 后端是 opt-in 构建；不定义 COMP_HAS_D3D12 时后端只有如实失败的桩。
+    if gpu:
+        defines.append("-DCOMP_HAS_D3D12")
+        msvc_defines.append("/DCOMP_HAS_D3D12")
 
     objects: list[str] = []
     msvc = driver == "msvc"
@@ -206,13 +217,16 @@ def main() -> int:
                              "(compositor_engine.dll / libcompositor_engine.so); "
                              "does not build or run the unit tests")
     parser.add_argument("--driver", default="zig", choices=["zig", "clang", "msvc", "cc"])
+    parser.add_argument("--gpu", action="store_true",
+                        help="compile the D3D12 backend (-DCOMP_HAS_D3D12); "
+                             "without it AUTO resolves to CPU")
     parser.add_argument("--clean", action="store_true", help="remove build/ before building")
     args = parser.parse_args()
 
     if args.clean and os.path.isdir(BUILD):
         shutil.rmtree(BUILD)
 
-    binaries = compile_all(args.driver, args.shared)
+    binaries = compile_all(args.driver, args.shared, args.gpu)
     if args.no_run:
         return 0
 

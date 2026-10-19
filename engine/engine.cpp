@@ -6,6 +6,7 @@
 #include "core/comp_parallel.h"
 #include "domain/camera_raw_tables.h"
 #include "domain/document.h"
+#include "render/rhi.h"
 
 namespace compositor {
 
@@ -15,12 +16,20 @@ bool Engine::camera_raw_tables_loaded() const noexcept {
 
 namespace {
 
-/* M1：AUTO 解析为 CPU 后端。
- * M2 起按平台择优：Apple -> METAL，Windows -> D3D12，HarmonyOS -> VULKAN，
- * 探测失败时一律回落 CPU，保证“始终可用”。 */
+/*
+ * AUTO 的后端偏好：Windows -> D3D12，Apple -> Metal，其余 -> Vulkan（OHOS/Linux）。
+ * 这里只表达「偏好」，真正能否创建由 create_backend 探测；不可用时它自己回落
+ * CPU 并把原因写进 last_error——所以 AUTO 永远能拿到一个能渲染的后端。
+ */
 comp_backend resolve_backend(comp_backend requested) {
-  if (requested == COMP_BACKEND_AUTO) return COMP_BACKEND_CPU;
-  return requested;
+  if (requested != COMP_BACKEND_AUTO) return requested;
+#if defined(_WIN32)
+  return COMP_BACKEND_D3D12;
+#elif defined(__APPLE__)
+  return COMP_BACKEND_METAL;
+#else
+  return COMP_BACKEND_VULKAN;
+#endif
 }
 
 }  // namespace
@@ -33,10 +42,16 @@ Engine::Engine(const comp_engine_desc& desc) {
   if (desc.version != nullptr) {
     app_version_ = desc.version;
   }
+  requested_backend_ = desc.backend;
   backend_ = resolve_backend(desc.backend);
 
   const size_t effective = comp_parallel_set_threads(desc.worker_threads);
   threads_ = static_cast<uint32_t>(effective);
+}
+
+void Engine::adopt_render_backend(std::unique_ptr<RenderBackend> backend, comp_backend actual) {
+  render_backend_ = std::move(backend);
+  backend_ = actual;
 }
 
 Engine::~Engine() {

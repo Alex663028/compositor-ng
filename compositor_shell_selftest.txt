@@ -1,5 +1,5 @@
 # compositor-shell selftest (Windows shell + engine C ABI)
-[OK] comp_engine_create(AUTO)
+[OK] comp_engine_create(CPU)
 [OK] comp_engine_backend()
 [info] backend = CPU
 [OK] comp_document_create(64x64)
@@ -159,6 +159,13 @@
 [OK] selection move pixels + translate commit in one explicit transaction
 [OK] comp_document_undo(move selection)
 [OK] one undo restores both the pixels and the selection outline
+[OK] comp_engine_create(AUTO) for gpu parity
+[OK] comp_engine_backend(AUTO engine)
+[info] auto backend = CPU
+[OK] parity scene builds on AUTO and CPU engines
+[OK] parity scene flattens on both backends
+[info] parity max_diff = 0 (diff bytes = 0, path = cpu)
+[OK] AUTO backend pixels match the CPU reference
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

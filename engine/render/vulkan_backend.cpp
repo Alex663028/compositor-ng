@@ -1426,10 +1426,8 @@ BackendCaps VulkanRenderBackend::caps() const {
   return c;
 }
 
-bool VulkanRenderBackend::render_document(Document& doc, const comp_render_target& target,
-                                          std::string* error) {
+bool VulkanRenderBackend::can_render_document(const Document& doc, std::string* error) const {
   (void)doc;
-  (void)target;
   if (error != nullptr) {
 #if COMPOSITOR_VULKAN_COMPUTE_READY
     *error =
@@ -1444,10 +1442,22 @@ bool VulkanRenderBackend::render_document(Document& doc, const comp_render_targe
   return false;
 }
 
+bool VulkanRenderBackend::render_document(Document& doc, const comp_render_target& target,
+                                          std::string* error) {
+  (void)doc;
+  (void)target;
+  return can_render_document(doc, error);
+}
+
 bool VulkanRenderBackend::present(Document& doc, std::string* error) {
   (void)doc;
-  if (error != nullptr) *error = "vulkan backend window presentation is not implemented yet";
-  return false;
+  (void)error;
+  /*
+   * 离屏后端无上屏动作（caps.window_present=false）：按 RHI 契约返回 true。
+   * 先前谎报失败，导致 AUTO 引擎的 present 在「Vulkan 实例建得出来、文档路径
+   * 尚未接线」的机器上失败——离屏后端不该因为「没有窗口表面」报错。
+   */
+  return true;
 }
 
 bool VulkanRenderBackend::wait(Document& doc, std::string* error) {

@@ -8,11 +8,12 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   当前进度：**M1（内核奠基）完成并验证通过**；**M2 完成**——像素内核区间并行调度、合成有向图
   （FilterGraph）与图层组穿透/隔离语义、仿射变换与高质量重采样、`.comp` 像素改 PNG + UUID
   图层 id（打通上游互通）均已落地。**M3 进行中**——渲染后端接口切片（`rhi.h` + CPU/D3D12/Vulkan
-  三后端）、SPIR-V 构建链路、Vulkan 计算管线设备侧实现（opt-in）、Windows 壳（Win32 + GDI 上屏、
-  菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳（NAPI + XComponent）均已有可编译产物；
-  另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、PSD 只读；第三方库以源码
-  vendoring 进 `engine/third_party/`）。
-  全量 **397 用例 0 失败**；Windows 外壳实机自检 **71 项全 OK**（与仓内基线逐字节一致）。
+  三后端）、SPIR-V 构建链路、Vulkan 计算管线设备侧实现（opt-in）、
+  **D3D12 离屏渲染真机接入主路径（S13：设备真的参与合成，交换链待接）**、
+  Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
+  （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
+  PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
+  全量 **444 用例 0 失败**；Windows 外壳实机自检 **160 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -228,6 +229,7 @@ compositor-ng/
 ├── docs/
 │   ├── adjustment-json-keys.md    # ★ 调整参数 JSON 键名表（对齐上游 $LayerAdjustment）
 │   ├── codec-migration.md         # ★ M5 编解码替换：探测证据、能力矩阵与接入步骤
+│   ├── format-import-matrix.md    # ★ 格式导入策略矩阵：HEIC/WebP/SVG/PSB 判定链与失败不变式
 │   └── shell-parity.md            # ★ 两壳一致性：能力矩阵、冻结常量与共享回归护栏（M5）
 ├── engine/
 │   ├── engine.h / engine.cpp      # 引擎实例：分配器、后端、线程池、错误状态
@@ -1373,6 +1375,8 @@ Windows 侧推荐编译器仍是 clang-cl。
   实测编译通过（53 KB 目标文件）。因此缺的不是 SDK，而是**把设备侧后端接到引擎主渲染路径**
   （`render_document` 仍返回 UNSUPPORTED、`caps().offscreen_compute` 仍为 false）——
   这是功能/性能项，默认构建继续关掉 `COMP_HAS_D3D12`，不把未验证的设备路径带进基线。
+  → **2026-10-18 S13 已接入**：`offscreen_compute` 真实为 true，离屏渲染由设备执行
+  （`last_render_offloaded()` 证明），窗口交换链仍未接；见 §6.23。
 - **SPIR-V 仅静态校验**：真机 `vkCreateShaderModule` 已实际接受该 blob（不报错），但未接校验层
   做更严格的运行期校验；静态证据为 glslang 编译 + 真机管线创建成功。
 - **第三方编解码库：部分已接入，其余仍未链接**。PNG（libpng 1.6.44 + zlib 1.3.1）、
@@ -2765,6 +2769,85 @@ D3D12 / Vulkan 的 GPU 路径不经过 `compositing/compositor`，本轮不接�
 第二次不再走 FilterGraph」的定性验证，没有做基准计时，不宣称倍数。
 
 报告：`../report/S12-merged-20261018-dsh.md`。
+
+### 6.23 S13 GPU 设备侧接入主渲染路径 + 格式导入矩阵（2026-10-18，DSH）
+
+S12 之后 M3 只剩最后一块硬骨头：**GPU 协同**。`rhi.h`、D3D12 后端、HLSL 内核、`--gpu`
+构建开关都在，外壳自检也一直打印 `backend = D3D12`——但**设备从未真正渲染过一帧**。
+本轮先证伪、再修复、再给可复验的证据，不拿「后端名是 D3D12」当结论。
+
+**1. 先证伪：GPU 为什么一直没跑。** 链路是：根签名把 `dst/src` 纹理直接当**根 UAV**
+描述符 → D3D12 规范只允许根 UAV 描述 buffer、不允许描述 texture →
+`CreateComputePipelineState` 返回 `E_INVALIDARG (0x80070057)` → `ensure()` 失败后
+`gpu_.reset()` → 下一帧重新建 D3D12 设备（冷启动 ~100 ms）→ 渲染失败 → ABI 按文档
+静默回落 CPU。像素测试全绿、`comp_render_backend` 报告 D3D12，于是「GPU 已接入」
+的假象维持了两轮（上一轮记录的性能数据也建立在「每帧重建设备」上，不可信）。
+**这类静默回落必须能被观测**，否则同样的事总会再发生一次。
+
+**2. 三处修复。**
+- **描述符表替代根 UAV**：根签名改成 2 个参数——`b0` 32 位常量 + 1 个
+  `D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE`（两个 UAV range：`u0 = dst`、`u1 = src`），
+  在 `ensure()` 里建 2 slot 的 shader-visible CBV_SRV_UAV 堆并写 UAV。根 UAV 描述 texture
+  是**规范限制**（不是驱动 bug），描述符表才是可移植路径。
+- **回读方向**：`COPY_DEST` 的回读缓冲必须当 copy 的**目的地**。此前复用了「上传」的
+  `copy_into`（buffer 当源）→ `Close()` 返回 `E_INVALIDARG`；新增 `copy_out`
+  （`PLACED_FOOTPRINT` 作为 destination placement，buffer→texture 的 `copy_into` 保持不变）。
+  这处用独立探针按「清屏 / +图层 / +barrier+dispatch / +回读」四变体二分定位，前三变体
+  `hr=0`、第四变体失败，才把范围收窄到回读拷贝。
+- **持久上下文 + 能力闸门**：`GpuContext`（device/queue/allocator/list/root/PSO/堆/fence/
+  textures/readback/upload blocks）随引擎常驻，一帧一次 `Reset`/`Close`/`Execute`；
+  `AUTO` 选择加 `caps().offscreen_compute` 闸门（否则本机可创建但不会渲染的 Vulkan
+  会被选中），`probe_backend` 结果按后端枚举进程内缓存，避免每次探测都建/毁设备。
+
+**3. 让「真上设备」可观测、可断言。** `RenderBackend` 新增内部虚函数
+`last_render_offloaded()`（纯 C++ RHI，**不进 C ABI**）：D3D12 只有在
+「上传 → dispatch → fence → 回读」整条链路成功后才置 true，CPU 后端恒为 false。
+新增 `tests/test_rhi.cpp::rhi_gpu_backend_really_offloads_an_eligible_document`：直接持有
+D3D12 实例渲染 32×32 全画布文档，断言 `can_render_document` + `render_document` +
+`last_render_offloaded() == true` + 回读像素确实被写；无设备/未编入 D3D12 时跳过而不是失败。
+像素对拍仍是 ±1 LSB（GPU 走 float、CPU 镜像走 double）：本机 RX 6800 上
+`max_diff = 1`、超差 0 字节。另补一例 `rhi_gpu_matches_cpu_for_translucent_screen_stack`
+锁住「半透明底 + 不透明度 + SCREEN」——外壳自检这个场景原先用了**非预乘**像素
+（`200,64,32,128`，颜色 > alpha），GPU 浮点与 CPU 整数在饱和钳制上差 **34 级**；
+那已超出 `comp_layer.h` 的预乘契约（非法输入，两后端不做一致性承诺），改成合法预乘值
+`100,32,16,128` 后对拍 `max_diff = 0`，这个坑现在由用例和注释一起钉住。
+
+**4. 实测数字（AMD Radeon RX 6800，1024²，3 层，同场景 AUTO vs 显式 CPU）。**
+
+| 指标 | AUTO(D3D12) | 显式 CPU |
+|------|------------|----------|
+| 冷启动（首帧，含建设备 + PSO） | 151.7 ms | 152.6 ms |
+| 稳态（5 次平均） | **3.01 ms** | **0.65 ms** |
+
+稳态拆解：录制含上传 0.06–0.9 ms、dispatch 0.03 ms、fence 等待 0.19–1.28 ms、
+回读拷贝 0.02–0.26 ms。尺寸扫描（AUTO 稳态）：256² 0.29 ms / 512² 0.80 ms / 1024² 2.91 ms。
+**如实结论：当前「离屏上传 + 整幅回读」的 GPU 路径比 CPU 慢**（每层上传 + PCIe 往返 +
+回读），本轮不宣称任何加速，只宣称「设备真的参与、结果正确、为交换链路径打好地基」。
+真正可能带来收益的是下一步的 **DXGI 交换链 `present`（不回读、直接上屏）**，
+在此之前没有性能结论。
+
+**5. 边界（未变）。** GPU 子集仍是**全有或全无**：组图层、`parent != 0`、剪贴源、蒙版、
+调整、效果、旋转/翻转、非全画布或非 RGBA8 图层 → 本次调用回落 CPU，像素与 CPU 基准
+**逐字节一致**；绝不渲染半个图层栈。窗口表面仍返回 `UNSUPPORTED`（交换链未落地）。
+本机 D3D12 调试层未安装（`D3D12GetDebugInterface` → `0x887A002D`），故新增
+`COMP_D3D12_DEBUG` 环境变量开关（有 SDK 组件时启用 InfoQueue 并在 `Close()` 失败时打印
+最多 12 条消息），默认零开销。默认构建仍不编入 D3D12：`python scripts/build.py --gpu`
+与 `python scripts/build_windows_shell.py --gpu` 才启用设备路径，基线可重复。
+
+**6. 同时交付：格式导入策略矩阵（s7）。** `docs/format-import-matrix.md` 写清
+HEIC/WebP/SVG/PSB 的判定链（magic → 注册表 → 扩展名 → 显式拒绝，绝不按扩展名猜）、
+四格式的能力矩阵与拒绝原因、失败不变式；`tests/test_import_matrix.cpp` 4 例锁死
+「扩展名映射显式」「不可用格式在触 IO 前拒绝」「未知格式不猜」「导入失败文档不被污染」。
+这是**文档 + 护栏**，不新增解码器，也不改变任何既有失败语义。
+
+**7. 基线。** 435 → **444 用例 0 失败**（+5 RHI GPU/回落/半透明对拍 + 4 格式导入矩阵），
+默认构建与 `--gpu` 构建**都是 444/0**；Windows 壳自检 155 → **160 项 0 失败**，
+基线 `compositor_shell_selftest.txt` 重新生成（SHA256 `772201aaad4f7263…`）；
+`run_regression.py --require-ohos` **6/6 PASS（0 skipped）**，含 OHOS aarch64
+`compile ok=90 fail=0` rc=0；口径 B 维持 **29/48 ≈ 60%**。ABI 导出仍 **112** 个，
+结构体布局/枚举值/工具算子零改动。
+
+报告：`../report/S13-gpu-device-backend-20261018-dsh.md`。
 
 ## 7. 许可
 

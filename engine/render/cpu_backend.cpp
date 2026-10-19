@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -165,8 +166,20 @@ std::unique_ptr<RenderBackend> create_backend(Engine* engine, comp_backend reque
       for (comp_backend candidate : order) {
         std::string local;
         std::unique_ptr<RenderBackend> backend = make_gpu(engine, candidate, &local);
-        if (backend != nullptr) return finish(std::move(backend));
-        if (!local.empty()) why = local;
+        /*
+         * 只有「真能把文档渲染出来」的后端才算 AUTO 的候选。有的设备端实例
+         * （例如本机存在 Vulkan 设备、但 RHI 文档路径尚未接线）建得出来却
+         * caps.offscreen_compute=false：选中它会让每次合成都要先判定再回落
+         * CPU，既没提速又让 present 等入口失败。宁可如实回落 CPU。
+         */
+        if (backend != nullptr && backend->caps().offscreen_compute) {
+          return finish(std::move(backend));
+        }
+        if (!local.empty()) {
+          why = local;
+        } else if (backend != nullptr) {
+          why = "gpu backend cannot render documents yet";
+        }
       }
       if (why.empty()) why = "auto: no gpu backend available on this platform";
       return fallback(why);
@@ -217,6 +230,20 @@ const char* intern_note(const std::string& text) {
  * note 指向进程级文本池，地址稳定且可跨线程持有（见 intern_note）。
  */
 BackendCaps probe_backend(comp_backend backend) {
+  /*
+   * 探测结果在进程内缓存：设备可用性不会在进程生命周期里改变，而 create_backend
+   * 会真的创建设备（Vulkan/D3D12 初始化是重活）。并发探测此前每轮都重新建一遍
+   * 设备，负载高时会拖住整个测试——缓存同时修掉这个稳定性问题。
+   * 缓存里的 note 一律来自地址稳定的文本池（intern_note / 各后端 static 文本）。
+   */
+  static std::mutex cache_mutex;
+  static std::map<int, BackendCaps> cache;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto cached = cache.find(static_cast<int>(backend));
+    if (cached != cache.end()) return cached->second;
+  }
+
   std::string error;
   comp_backend actual = backend;
   std::unique_ptr<RenderBackend> candidate = create_backend(nullptr, backend, &error, &actual);
@@ -231,15 +258,20 @@ BackendCaps probe_backend(comp_backend backend) {
    */
   const bool usable = backend == COMP_BACKEND_AUTO ? actual != COMP_BACKEND_CPU
                                                    : actual == backend;
-  if (candidate != nullptr && usable) {
-    return candidate->caps();
-  }
   BackendCaps caps;
-  caps.compiled = false;
-  caps.device_available = false;
-  caps.offscreen_compute = false;
-  caps.window_present = false;
-  caps.note = intern_note(error.empty() ? std::string("backend not available in this build") : error);
+  if (candidate != nullptr && usable) {
+    caps = candidate->caps();
+  } else {
+    caps.compiled = false;
+    caps.device_available = false;
+    caps.offscreen_compute = false;
+    caps.window_present = false;
+    caps.note =
+        intern_note(error.empty() ? std::string("backend not available in this build") : error);
+  }
+
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  cache.emplace(static_cast<int>(backend), caps);
   return caps;
 }
 

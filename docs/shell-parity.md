@@ -33,7 +33,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | PNG 导入/导出 | 可用 | 可用 | `comp_io_import` / `comp_io_export` | 已达成（libpng+zlib） |
 | JPEG 导入/导出 | 可用（有损） | 可用 | 同上 | 已达成（stb） |
 | PSD 只读导入 | 可用 | 可用 | `comp_io_import` | 已达成（stb） |
-| 窗口表面上屏 | AUTO 回落 CPU；HWND 返回 `UNSUPPORTED` | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) | **有边界**：设备侧交换链未落地，两壳均如实拒绝 |
+| 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读，真实走设备；HWND 仍返回 `UNSUPPORTED` | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_flatten` | **有边界**：设备侧渲染已落地（S13），设备侧交换链未落地，窗口表面两壳均如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
 | 工具条 / 画布导航 | 17 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 
@@ -80,9 +80,10 @@ compositor-ng 是「同引擎、两壳」结构：
 
 ## 4. 边界与未达成项（如实记录）
 
-1. **设备侧上屏**：D3D12 代码可在本机 SDK（VS 2022 / Windows SDK 10.0.26100）下编译，
-   但 `render_document` 仍走 CPU，交换链未接主渲染路径；鸿蒙无在线设备
-   （`hdc list targets` 为空），Vulkan 交换链未落地。故两壳窗口表面统一 `UNSUPPORTED`。
+1. **设备侧上屏**：D3D12 **离屏渲染已真实走设备**（S13：上传 → 计算 → 回读；子集内
+   文档由 `last_render_offloaded()` 证明，见 `tests/test_rhi.cpp`），但**交换链仍未接**，
+   所以 `HWND` 表面照旧返回 `UNSUPPORTED`；鸿蒙无在线设备（`hdc list targets` 为空），
+   Vulkan 交换链未落地。故两壳窗口表面统一 `UNSUPPORTED`。
 2. **鸿蒙 UI 面板**：鸿蒙壳目前只有 `startup/shutdown/backendName/flatten/surfaceInfo/presentSurface`
    六个桥函数，尚未接图层/调整面板 UI；能力矩阵中标注为「未接 UI」，非能力缺失。
 3. **鸿蒙 HAP 真机验证**：交叉编译（aarch64 / x86_64）均可产出 `.so`，但无设备可上机。

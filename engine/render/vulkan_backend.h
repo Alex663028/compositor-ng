@@ -29,6 +29,9 @@ class VulkanRenderBackend final : public RenderBackend {
   bool usable() const override;
   BackendCaps caps() const override;
 
+  /* 文档合成路径尚未接线到计算内核：如实返回 false，由 ABI 层回落 CPU。 */
+  bool can_render_document(const Document& doc, std::string* error) const override;
+
   bool render_document(Document& doc, const comp_render_target& target,
                        std::string* error) override;
   bool present(Document& doc, std::string* error) override;

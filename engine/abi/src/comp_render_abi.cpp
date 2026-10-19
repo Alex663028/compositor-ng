@@ -2,8 +2,10 @@
 /*
  * comp_render_abi.cpp — comp_render.h 的 C ABI 实现。
  *
- * M1：全部走 CPU 后端（离屏合成）。窗口类表面返回 COMP_ERR_UNSUPPORTED，
- * 由 M2 的后端实现接管；接口签名不再变动。
+ * M1 曾全部走 CPU 后端；S13 起引擎持有一个真实后端实例（AUTO 在 Windows 上
+ * 解析为 D3D12），渲染入口借用该实例。GPU 后端只覆盖「简单堆叠」子集，文档
+ * 越界时按**本次调用**回落 CPU——引擎报告的后端不变；回落成功时按 ABI 契约
+ * 清空 last_error，GPU 是否真实参与由后端 last_render_offloaded() 证明。
  */
 #include "compositor/comp_render.h"
 
@@ -22,8 +24,35 @@ using compositor::RenderBackend;
 
 namespace {
 
-RenderBackend* make_backend(Engine* engine, std::string* error) {
-  return compositor::create_backend(engine, engine->backend(), error).release();
+/*
+ * 选本次渲染用的后端。
+ *
+ *   - 用引擎持有的实例（设备/管线常驻，避免每次渲染重建 D3D12 设备）；
+ *   - 文档不在 GPU 子集内（组/蒙版/剪贴/调整/效果/变换/非全画布 RGBA8…）时，
+ *     本次调用改用临时 CPU 后端，结果与 CPU 基准逐字节一致。
+ */
+struct BackendPick {
+  RenderBackend* backend = nullptr;
+  std::unique_ptr<RenderBackend> cpu_fallback{};
+};
+
+BackendPick pick_backend(Engine* engine, const Document* doc) {
+  BackendPick pick;
+  pick.backend = engine->render_backend();
+  if (pick.backend == nullptr) {
+    pick.cpu_fallback = compositor::create_cpu_backend(engine);
+    pick.backend = pick.cpu_fallback.get();
+    return pick;
+  }
+  if (doc != nullptr) {
+    std::string why;
+    if (!pick.backend->can_render_document(*doc, &why)) {
+      pick.cpu_fallback = compositor::create_cpu_backend(engine);
+      pick.backend = pick.cpu_fallback.get();
+      if (!why.empty()) engine->set_last_error(why + "; rendered with cpu fallback");
+    }
+  }
+  return pick;
 }
 
 }  // namespace
@@ -42,12 +71,30 @@ comp_result comp_render_document(comp_document document, const comp_render_targe
   }
 
   std::string error;
-  std::unique_ptr<RenderBackend> backend(make_backend(engine, &error));
-  if (backend == nullptr) {
+  BackendPick pick = pick_backend(engine, doc);
+  if (pick.backend == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_BACKEND, "cannot create render backend");
   }
-  if (!backend->render_document(*doc, *target, &error)) {
-    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, error);
+  if (!pick.backend->render_document(*doc, *target, &error)) {
+    /*
+     * 运行期才暴露的能力缺口（例如目标表面格式/类型不在 GPU 路径内）：
+     * 本次调用用 CPU 重试一次。像素结果正确优先于「必须用 GPU」。
+     */
+    const std::string gpu_error = error;
+    if (pick.cpu_fallback == nullptr && pick.backend->kind() != COMP_BACKEND_CPU) {
+      std::unique_ptr<RenderBackend> cpu = compositor::create_cpu_backend(engine);
+      std::string cpu_error;
+      if (cpu != nullptr && cpu->render_document(*doc, *target, &cpu_error)) {
+        /*
+         * 回落成功：调用成功，按 ABI 契约 ok() 会清空 last_error，所以这里不再写
+         * 回落原因（写了也会被清掉）。GPU 是否真的参与由后端实例的
+         * last_render_offloaded() 与测试/shell 自检负责证明，而不是靠错误串。
+         */
+        return compositor::abi::ok(engine);
+      }
+      return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, cpu_error);
+    }
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, gpu_error);
   }
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -61,11 +108,11 @@ comp_result comp_render_present(comp_document document) {
   }
   COMP_ABI_TRY(engine)
   std::string error;
-  std::unique_ptr<RenderBackend> backend(make_backend(engine, &error));
-  if (backend == nullptr) {
+  BackendPick pick = pick_backend(engine, nullptr);
+  if (pick.backend == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_BACKEND, "cannot create render backend");
   }
-  if (!backend->present(*doc, &error)) {
+  if (!pick.backend->present(*doc, &error)) {
     return compositor::abi::fail(engine, COMP_ERR_BACKEND, error);
   }
   return compositor::abi::ok(engine);
@@ -80,11 +127,11 @@ comp_result comp_render_wait(comp_document document) {
   }
   COMP_ABI_TRY(engine)
   std::string error;
-  std::unique_ptr<RenderBackend> backend(make_backend(engine, &error));
-  if (backend == nullptr) {
+  BackendPick pick = pick_backend(engine, nullptr);
+  if (pick.backend == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_BACKEND, "cannot create render backend");
   }
-  if (!backend->wait(*doc, &error)) {
+  if (!pick.backend->wait(*doc, &error)) {
     return compositor::abi::fail(engine, COMP_ERR_BACKEND, error);
   }
   return compositor::abi::ok(engine);

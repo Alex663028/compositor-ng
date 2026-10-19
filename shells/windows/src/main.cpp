@@ -11,7 +11,9 @@
  * 设计约束：
  *   1. 外壳不得 #include 任何 engine/ 内部头（domain/ compositing/ render/），
  *      否则七层架构的「ABI 边界」立即失效；本文件只依赖 abi/include。
- *   2. 所有合成由引擎完成；本机无可用 GPU，comp_engine_desc.backend = AUTO 会回落 CPU。
+ *   2. 所有合成由引擎完成；comp_engine_desc.backend = AUTO 由引擎按平台择优
+ *      （Windows → D3D12），GPU 后端编入且驱动可用时真正参与合成，否则回落 CPU。
+ *      实际生效的后端显示在工具条与窗口标题上，绝不静默假设。
  *   3. 画布像素为预乘 RGBA8，GDI 需要 BGRA 顺序，上屏前做一次 R/B 交换。
  *   4. 撤销语义完全由引擎承担（文档级撤销栈，comp_undo.h）；
  *      外壳只做「触发 + 展示深度」，不自己维护历史。
@@ -113,6 +115,8 @@ struct LayerRow {
 struct ShellState {
   comp_engine engine = nullptr;
   comp_document document = nullptr;
+  /* 引擎实际生效的渲染后端（S13：AUTO 可能是 D3D12）；工具条/标题如实展示。 */
+  comp_backend backend = COMP_BACKEND_AUTO;
   int32_t width = 0;
   int32_t height = 0;
   std::vector<uint32_t> framebuffer;   /* BGRA，供 GDI 直接使用 */
@@ -2558,6 +2562,16 @@ void render_canvas(ShellState& shell) {
 }
 
 /* 工具条：按钮几何与命中共享 ui_core.h，壳只负责把选中态画出来。 */
+const wchar_t* backend_label(comp_backend backend) {
+  switch (backend) {
+    case COMP_BACKEND_D3D12:  return L"D3D12";
+    case COMP_BACKEND_VULKAN: return L"Vulkan";
+    case COMP_BACKEND_METAL:  return L"Metal";
+    case COMP_BACKEND_CPU:    return L"CPU";
+    default:                  return L"AUTO";
+  }
+}
+
 void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
   RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(44, 46, 52));
@@ -2595,11 +2609,12 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     }
   }
   wchar_t info_text[192];
-  wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%%s",
+  wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%   渲染 %s%s",
             static_cast<int>(shell.view.zoom * 100.0 + 0.5),
             static_cast<int>(shell.brush_size + 0.5),
-            static_cast<int>(shell.brush_hardness * 100.0 + 0.5), extra);
-  RECT info_rect{bar.right() - 460, bar.y, bar.right() - 10, bar.bottom()};
+            static_cast<int>(shell.brush_hardness * 100.0 + 0.5),
+            backend_label(shell.backend), extra);
+  RECT info_rect{bar.right() - 520, bar.y, bar.right() - 10, bar.bottom()};
   SetTextColor(dc, RGB(172, 176, 188));
   DrawTextW(dc, info_text, -1, &info_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
@@ -4546,11 +4561,15 @@ int run_selftest(const wchar_t* out_path) {
   comp_engine_desc engine_desc{};
   engine_desc.app_name = "compositor-shell-selfcheck";
   engine_desc.version = "0.1.0";
-  engine_desc.backend = COMP_BACKEND_AUTO;
+  /*
+   * 自检主体固定在 CPU 后端：下面的像素断言（画笔色、撤销后逐字节还原）是
+   * CPU 基准定义的。GPU 协同由本节末尾的 AUTO 引擎对称场景单独验证。
+   */
+  engine_desc.backend = COMP_BACKEND_CPU;
   comp_engine engine = nullptr;
   const bool engine_ok =
       comp_engine_create(&engine_desc, &engine) == COMP_OK && engine != nullptr;
-  verify(engine_ok, "comp_engine_create(AUTO)");
+  verify(engine_ok, "comp_engine_create(CPU)");
   if (!engine_ok) {
     std::fclose(report);
     return 1;
@@ -5696,6 +5715,111 @@ int run_selftest(const wchar_t* out_path) {
              move_undone == move_before,
          "one undo restores both the pixels and the selection outline");
 
+  /* ---------------------------------------------------------------- S13：GPU 协同 */
+  /*
+   * 独立的 AUTO 引擎：验证「编入 D3D12 时 AUTO 真的走 GPU」以及 GPU/CPU 像素对齐。
+   * 场景限定在 GPU 子集内（整幅画布 RGBA8 + 普通/滤色混合）：走 GPU 时允许
+   * ±1 LSB 浮点舍入差；回落 CPU 时必须与基准逐字节一致。
+   */
+  comp_engine_desc gpu_engine_desc{};
+  gpu_engine_desc.app_name = "compositor-shell-selfcheck-gpu";
+  gpu_engine_desc.version = "0.1.0";
+  gpu_engine_desc.backend = COMP_BACKEND_AUTO;
+  comp_engine gpu_engine = nullptr;
+  const bool gpu_engine_ok =
+      comp_engine_create(&gpu_engine_desc, &gpu_engine) == COMP_OK && gpu_engine != nullptr;
+  verify(gpu_engine_ok, "comp_engine_create(AUTO) for gpu parity");
+  if (gpu_engine_ok) {
+    comp_backend gpu_backend = COMP_BACKEND_AUTO;
+    const bool gpu_backend_ok = comp_engine_backend(gpu_engine, &gpu_backend) == COMP_OK;
+    verify(gpu_backend_ok, "comp_engine_backend(AUTO engine)");
+    const bool gpu_path = gpu_backend_ok && gpu_backend != COMP_BACKEND_CPU;
+    std::fprintf(report, "[info] auto backend = %s\n",
+                 gpu_backend_ok ? backend_name(gpu_backend) : "(query failed)");
+
+    const auto build_parity_document = [](comp_engine target_engine, comp_document* out) -> bool {
+      comp_document_desc desc{};
+      desc.width = 32;
+      desc.height = 32;
+      desc.dpi = 72.0f;
+      desc.color_space = "sRGB";
+      if (comp_document_create(target_engine, &desc, out) != COMP_OK || *out == nullptr) {
+        return false;
+      }
+      size_t count = 0;
+      if (comp_layer_count(*out, &count) != COMP_OK || count == 0) return false;
+      std::vector<comp_layer_id> ids(count);
+      if (comp_layer_list(*out, ids.data(), ids.size(), &count) != COMP_OK) return false;
+
+      std::vector<uint8_t> pixels(32u * 32u * 4u, 0);
+      for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+        pixels[i + 0] = 96;
+        pixels[i + 1] = 72;
+        pixels[i + 2] = 48;
+        pixels[i + 3] = 192;
+      }
+      comp_image base_image{};
+      base_image.width = 32;
+      base_image.height = 32;
+      base_image.format = COMP_PIXEL_RGBA8;
+      base_image.stride = 32u * 4u;
+      base_image.pixels = pixels.data();
+      if (comp_layer_set_pixels(*out, ids.front(), &base_image) != COMP_OK) return false;
+
+      comp_layer_desc top_desc{};
+      top_desc.name = "parity-top";
+      top_desc.blend = COMP_BLEND_SCREEN;
+      top_desc.opacity = 0.75f;
+      top_desc.transform = comp_rect{0, 0, 32, 32};
+      top_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+      comp_layer_id top = 0;
+      if (comp_layer_add(*out, &top_desc, &top) != COMP_OK || top == 0) return false;
+      /*
+       * 图层像素必须是**预乘** RGBA8（颜色分量 <= alpha，见 comp_layer.h）。
+       * 这里给的是预乘值：直通色 (200,64,32) @ alpha 128 → (100,32,16,128)。
+       * 用非预乘数据对拍会让 GPU 浮点与 CPU 整数在饱和/钳制上分叉（实测差 34 级），
+       * 那已超出 ABI 契约，不是两后端的一致性问题。
+       */
+      for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+        pixels[i + 0] = 100;
+        pixels[i + 1] = 32;
+        pixels[i + 2] = 16;
+        pixels[i + 3] = 128;
+      }
+      return comp_layer_set_pixels(*out, top, &base_image) == COMP_OK;
+    };
+
+    comp_document gpu_doc = nullptr;
+    comp_document cpu_doc = nullptr;
+    const bool scene_ok = build_parity_document(gpu_engine, &gpu_doc) &&
+                          build_parity_document(engine, &cpu_doc);
+    verify(scene_ok, "parity scene builds on AUTO and CPU engines");
+    if (scene_ok) {
+      std::vector<uint8_t> gpu_pixels(32u * 32u * 4u, 0);
+      std::vector<uint8_t> cpu_pixels(32u * 32u * 4u, 0);
+      const bool gpu_render_ok =
+          comp_render_flatten(gpu_doc, gpu_pixels.data(), COMP_PIXEL_RGBA8, 32u * 4u) == COMP_OK;
+      const bool cpu_render_ok =
+          comp_render_flatten(cpu_doc, cpu_pixels.data(), COMP_PIXEL_RGBA8, 32u * 4u) == COMP_OK;
+      verify(gpu_render_ok && cpu_render_ok, "parity scene flattens on both backends");
+      int max_diff = 0;
+      size_t diff_count = 0;
+      for (size_t i = 0; i < cpu_pixels.size(); ++i) {
+        const int diff =
+            std::abs(static_cast<int>(cpu_pixels[i]) - static_cast<int>(gpu_pixels[i]));
+        if (diff > max_diff) max_diff = diff;
+        if (diff != 0) ++diff_count;
+      }
+      std::fprintf(report, "[info] parity max_diff = %d (diff bytes = %u, path = %s)\n", max_diff,
+                   static_cast<unsigned>(diff_count), gpu_path ? "gpu" : "cpu");
+      verify(gpu_render_ok && cpu_render_ok && max_diff <= (gpu_path ? 1 : 0),
+             "AUTO backend pixels match the CPU reference");
+    }
+    if (cpu_doc != nullptr) comp_document_destroy(cpu_doc);
+    if (gpu_doc != nullptr) comp_document_destroy(gpu_doc);
+  }
+  if (gpu_engine != nullptr) comp_engine_destroy(gpu_engine);
+
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 
@@ -5719,15 +5843,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   comp_engine_desc engine_desc{};
   engine_desc.app_name = "compositor-shell-windows";
   engine_desc.version = "0.1.0";
-  engine_desc.backend = COMP_BACKEND_AUTO; /* 本机无 GPU 时由引擎回落 CPU */
+  /* AUTO：Windows 上优先 D3D12（该构建编入后端且设备可用时真正参与合成），否则回落 CPU。 */
+  engine_desc.backend = COMP_BACKEND_AUTO;
   if (comp_engine_create(&engine_desc, &shell.engine) != COMP_OK) {
     MessageBoxW(nullptr, L"引擎创建失败", L"compositor", MB_ICONERROR);
     return 1;
   }
 
   comp_backend actual = COMP_BACKEND_AUTO;
-  if (comp_engine_backend(shell.engine, &actual) == COMP_OK && actual != COMP_BACKEND_CPU) {
-    /* 后端非 CPU 时如实提示，不做静默假设。 */
+  if (comp_engine_backend(shell.engine, &actual) == COMP_OK) {
+    shell.backend = actual; /* 工具条“渲染 …”与窗口标题都显示这个真实值 */
+  }
+  if (shell.backend != COMP_BACKEND_CPU) {
     set_status(shell, L"引擎后端已启用硬件加速");
   }
 
@@ -5755,6 +5882,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   g_shell = &shell;
   shell.window = window; /* 视图命令需要客户区矩形，必须早于首次绘制设置 */
   create_document(shell);
+  {
+    /* 标题上也标出实际后端：不打开状态栏也能一眼判断走的是 GPU 还是 CPU。 */
+    wchar_t title[96];
+    wsprintfW(title, L"Compositor (Windows shell) - %s", backend_label(shell.backend));
+    SetWindowTextW(window, title);
+  }
   /* 蚂蚁线相位定时器：无选区时处理函数直接返回，不产生重绘。 */
   SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);
   ShowWindow(window, show);

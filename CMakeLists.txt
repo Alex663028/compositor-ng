@@ -92,6 +92,15 @@ if(COMP_SHARED)
     WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
+# 可选：编入 D3D12 后端（与 scripts/build.py --gpu 等价）。
+# D3D12/编译器入口全部运行期从 d3d12.dll / d3dcompiler_47.dll 解析，
+# 因此这里只加编译定义，不引入 d3d12.lib / dxgi.lib 链接依赖。
+option(COMP_ENABLE_D3D12 "Compile the D3D12 backend (Windows)" OFF)
+if(COMP_ENABLE_D3D12)
+  # PUBLIC：单测经 target_link_libraries 继承同一口径（它们要探测同一后端）。
+  target_compile_definitions(compositor_engine PUBLIC COMP_HAS_D3D12)
+endif()
+
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------
