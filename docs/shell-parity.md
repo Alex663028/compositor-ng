@@ -288,7 +288,47 @@ S11 的 `T` 工具只能用快捷键改字号/字距，行距没有按键。S14 
 - 边界：数字键入为非负值（空缓冲时 `-` 是步进键，负字距走 `Shift+[`，与滤镜/调整面板
   同规矩）；值随会话保留、不进 `.comp`；仍未经人手 Win32 目视。
 
-### 5.9 未达成的 UI 项
+### 5.9 拖动提交缺陷修复 + 自动化目视（2026-10-19 S15 追加）
+
+S4–S14 的每一份报告都记着同一条边界：「未经人手 Win32 目视实测」。S15 补了两件事：
+修掉一条只有真鼠标才能暴露的提交缺陷，并把「开窗点一遍」做成可重跑的命令。
+
+**1. 真缺陷：`ReleaseCapture()` 早于载荷搬出。** `paint_stroke_end`（画笔/橡皮擦）、
+`retouch_stroke_end`（模糊/涂抹/液化）、`lasso_end`（套索）三处旧顺序是
+「先 `ReleaseCapture()`，再把 `stroke_points` / `lasso_points` 搬出去提交」。
+`ReleaseCapture()` 会**同步**派发 `WM_CAPTURECHANGED`，而该处理器为「丢焦点/丢捕获即取消」
+会调 `stroke_cancel` / `lasso_cancel` 清空折点——于是真人拖完松手，画面上什么都没有；
+脚本用 `SendMessage` 模拟时因为在同一线程里不会触发这条重入路径，所以自检一直绿。
+修法：先把折点 `swap` 到局部变量、再 `ReleaseCapture()`、最后提交。三处同改，并加中文注释
+说明「为什么不能调换顺序」。`marquee_end` / `gradient_end` / `shape_end` / `move_end` /
+`pen_up` / `eyedropper` 的 `*_cancel` 只清 active 标志，不受影响（已逐一核对）。
+
+**2. 自动化目视（`scripts/visual_check.py`，新增）。** 11 个场景、45 项像素/几何断言、
+32 张 PNG（`../report/assets/s15/`），走真 `PostMessage` 键鼠 + `PrintWindow` 抓客户区像素：
+`start / brush / selection / wand / gradient / shape / type / filter / adjustment / layers / view`。
+几条值得记的口径：
+
+- 键：`AttachThreadInput` + `SetKeyboardState` 摆修饰键，再 `PostMessage(WM_KEYDOWN/UP)`；
+  Alt 组合走 `WM_SYSKEYDOWN`。焦点：`AttachThreadInput(fg, target)` + `SetForegroundWindow`
+  并校验 `GetForegroundWindow()`——否则 `SetCapture` 会丢，拖动类工具全部失真。
+- 鼠标：`PostMessage(WM_LBUTTONDOWN/MOUSEMOVE/LBUTTONUP)`，**不移动物理光标**；
+  但会抢前台窗口（`SetCapture` 需要），跑脚本时别同时用键鼠。
+- 断言不猜颜色常量：先由空文档的纯黑外接框测出文档屏幕矩形，再在矩形内取样；
+  文字场景用「字形像素外接框高度」比较 32 px 与 48 px 两段文字（实测 16 px vs 23 px）；
+  调整场景先铺底 `#336699`、新图层上挂 Exposure、抬值应用，断言像素
+  `(51,102,153) → (116,218,255)`，`Ctrl+Z` 后逐字节回到 `(51,102,153)`。
+- 已知坑：`Ctrl+=` 是 `VK_OEM_PLUS`（0xBB），不是字符 `'='`；文字键入态会吃掉数字键，
+  改字号必须先 `Enter` 提交文字再点面板行；调整是「调整图层、只作用于下方」，
+  挂在像素层上本来就看不到变化（见 §6.1 / `docs/manual-test.md` M10）。
+
+**3. 人工清单（`docs/manual-test.md`，新增）。** 把 M1–M16 的手工步骤、预期文案、
+脚本盲区（手感、蚂蚁线流动、跨 DPI、多显示器、模态对话框、退出清理）写成可勾选清单，
+并给出「脚本场景 ↔ 清单章节」对照表。**它仍不替代 ALEX 的目视结论**。
+
+**事实边界。** 本轮证据是**机器抓的像素**，不是人眼；脚本抢前台、不模拟物理光标；
+`Z` 缩放工具按钮可选中但点击暂不改缩放；DXGI 交换链直呈仍未接。
+
+### 5.10 未达成的 UI 项
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|

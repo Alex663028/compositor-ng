@@ -1239,11 +1239,13 @@ void lasso_cancel(ShellState& shell) {
 void lasso_end(HWND window, ShellState& shell) {
   if (!shell.lasso_active) return;
   shell.lasso_active = false;
+
+  /* 同画笔：ReleaseCapture 同步触发 WM_CAPTURECHANGED -> lasso_cancel 清点。 */
+  std::vector<float> points;
+  points.swap(shell.lasso_points);
   ReleaseCapture();
   if (shell.document == nullptr) return;
 
-  std::vector<float> points;
-  points.swap(shell.lasso_points);
   const int point_count = static_cast<int>(points.size() / 2);
   if (!comp_ui::lasso_should_close(point_count)) {
     set_status(shell, L"套索：至少需要拖出 3 个点才能闭合成选区");
@@ -2040,10 +2042,11 @@ void retouch_stroke_begin(HWND window, ShellState& shell, int x, int y,
 void retouch_stroke_end(HWND window, ShellState& shell) {
   if (shell.stroke_kind != comp_ui::StrokeKind::Retouch) return;
   shell.stroke_kind = comp_ui::StrokeKind::None;
-  ReleaseCapture();
 
+  /* 同 paint_stroke_end：折线必须先搬走，ReleaseCapture 会同步触发取消。 */
   std::vector<float> points;
   points.swap(shell.stroke_points);
+  ReleaseCapture();
   if (points.empty()) return;
 
   const comp_layer_id id = selected_layer_id(shell);
@@ -2137,10 +2140,15 @@ void paint_stroke_end(HWND window, ShellState& shell) {
   const bool erasing = shell.stroke_erase;
   shell.stroke_kind = comp_ui::StrokeKind::None;
   shell.stroke_erase = false;
-  ReleaseCapture();
 
+  /*
+   * 先把折线搬出来，再 ReleaseCapture：ReleaseCapture 会同步派发
+   * WM_CAPTURECHANGED，而该处理器调用 stroke_cancel 清空 stroke_points。
+   * 顺序反了就是「松开鼠标后一个点都不剩」，画笔/橡皮擦永远不落色。
+   */
   std::vector<float> points;
   points.swap(shell.stroke_points);
+  ReleaseCapture();
   if (points.empty()) return;
 
   const comp_layer_id id = selected_layer_id(shell);
@@ -2927,9 +2935,11 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
       L", / . 选择已有调整",
       L"Tab 切参数 · - / = 调值",
       L"数字键输入 · 回车提交",
-      L"Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除",
+      L"Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用",
+      L"Ctrl+Shift+D 删除选中调整",
+      L"调整只作用于下方 · 挂在新图层上",
   };
-  int hint_y = height - 92;
+  int hint_y = height - 128;
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;

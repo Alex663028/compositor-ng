@@ -13,7 +13,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **444 用例 0 失败**；Windows 外壳实机自检 **160 项全 OK**（与仓内基线逐字节一致）。
+  全量 **445 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -225,11 +225,13 @@ compositor-ng/
 │   ├── gen_vulkan_bindings.py     # ★ 从 GLSL 抽取 Vulkan 绑定/推送常量布局常量头
 │   ├── check_vulkan_slice.py      # ★ Vulkan 切片自检（双变体编译 + 回归 + 外壳链接）
 │   ├── run_regression.py          # ★ 一键回归（构建+单测+壳自检+两个 crosscheck+shared+鸿蒙交叉编译）
+│   ├── visual_check.py            # ★ Windows 壳自动化目视（真消息驱动 + PrintWindow 像素断言，S15）
 │   └── once/                      # 一次性补丁 / 诊断脚本（P2-7：已从 scripts/ 根移入，非构建入口）
 ├── docs/
 │   ├── adjustment-json-keys.md    # ★ 调整参数 JSON 键名表（对齐上游 $LayerAdjustment）
 │   ├── codec-migration.md         # ★ M5 编解码替换：探测证据、能力矩阵与接入步骤
 │   ├── format-import-matrix.md    # ★ 格式导入策略矩阵：HEIC/WebP/SVG/PSB 判定链与失败不变式
+│   ├── manual-test.md             # ★ Windows 壳人工目视清单（M1–M16，与 visual_check.py 互补，S15）
 │   └── shell-parity.md            # ★ 两壳一致性：能力矩阵、冻结常量与共享回归护栏（M5）
 ├── engine/
 │   ├── engine.h / engine.cpp      # 引擎实例：分配器、后端、线程池、错误状态
@@ -1476,7 +1478,7 @@ AUDIT8 记的 ≈90% 是**口径 A**，天然不含上游 macOS 应用层（`Com
 | ① 引擎核契约面（ABI / 领域模型 / 事务 / 历史 / 诊断 / 边界） | 30% | **~95%** | ~95% | **112 个**导出 ABI 全有异常护栏；句柄 magic、反序生命周期、线程局部错误槽、定制分配器、字节预算、transform 写入侧闸均已落地并有护栏；`run_tool_op` 的 `out_code` 契约已补；S8 补 `comp_selection_set_feather` 绝对羽化入口 |
 | ② 像素内核**有产品通路**的部分 | 35% | **~100%** | ~86% | AUDIT8 列的可达缺口清零：`wand_trace`、`scanlines`/`chunky`、deep round trip、`cube_apply`(16bit)、`extract/restore_alpha` 已接（见 §6.1.10）；**C5 又接上 `hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（half 表面，§6.1.19）；**最后一对 `deep_take_painted`/`deep_take_painted_hdr` 已接进落笔族**（Stroke/Clone/Smudge/Liquify 在 16 位与 HDR 图层上保留深度，§6.1.21）——上游语义本就是「整幅比较 painted/unpainted」，不需要 tile+coverage 记账。`dither_dots`/`dither_glow`/`deep_split`/`deep_merge` 经核实**已接线**，不再计入缺口；`brush_alpha_bounds` 一族由 `extract/restore_alpha` 取代，属**主动不接**而非缺口 |
 | ③ 合成与渲染正确性 | 20% | **~98%** | ~95% | **剪贴栈 alpha 语义对齐上游**（`a=0` → `a=128`）、`ImageBuffer::fill` 预乘修正、hidden 层优先级修正、剪贴栈成员 backdrop 补齐；**C5：合成表面按文档深度携带 half，8 位 24 种混合模式逐字节不变**（§6.1.19）；**C4：合成结果按全深度导出 EXR，8 位文档同路径**（§6.1.20） |
-| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **155 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互无人工目视 |
+| ④ 跨端与交付（两壳 / 编解码 / 互通 / 回归） | 15% | **~90%** | ~80% | Windows 壳 **164 项 `--selftest` 基线**（不是人工实测）、OHOS aarch64 交叉编译 + NAPI、PNG/JPEG/PSD 真实编解码、`.comp` 与 PIL 双向 0 LSB 交叉验证；**2026-10-18 补上 `cmake+ctest` 与 clang-cl（MSVC ABI）两条构建路径实测**（各 344/344，§6.1.21）；**2026-10-19 补上 `scripts/visual_check.py` 自动化目视**（11 场景 / 45 断言 / 32 张机器截图，§6.25）。扣分项：无 OHOS 真机、无 macOS 逐像素对比、Win32 交互仍无人工目视 |
 
 **加权完成度 ≈ 97%**（口径 A）。算术：① 30%×95% + ② 35%×100% + ③ 20%×98%
 + ④ 15%×90% = 28.5 + 35.0 + 19.6 + 13.5 = **96.6% ≈ 97%**。
@@ -2894,6 +2896,66 @@ S11 报告 §5 留了一条明确的缺口：「没有文字属性面板：字�
 （内部是 double，`Alt+[ / ]` 与数值键入都走同一夹取）。
 
 报告：`../report/S14-type-panel-20261019-claude.md`。
+
+### 6.25 S15 拖动提交缺陷修复 + 自动化目视（2026-10-19，DSH）
+
+S4–S14 的每一份报告都写着同一条边界：「未经人手 Win32 目视实测」。ALEX 把人工目视
+推迟了，于是本轮换个做法：**把「开窗点一遍」写成可重跑的命令**，再用它去找真 bug。
+结论是找到了一个从 S4 潜伏至今的提交缺陷。**引擎核与 C ABI 零改动**（导出仍 112 个）。
+
+**1. 真缺陷：`ReleaseCapture()` 早于载荷搬出。** `paint_stroke_end`（画笔/橡皮擦）、
+`retouch_stroke_end`（模糊/涂抹/液化）、`lasso_end`（套索）三处旧顺序是「先
+`ReleaseCapture()`，再把 `stroke_points` / `lasso_points` 搬出去提交」。
+`ReleaseCapture()` 会**同步**派发 `WM_CAPTURECHANGED`，而该处理器为「丢捕获 = 取消
+手势」调用 `stroke_cancel` / `lasso_cancel` 清空折点 —— 于是真人拖完松手，画面上什么
+都没有、撤销栈也不加步；而 `--selftest` 不建窗口、不走消息泵，永远测不到。
+修法：先 `swap` 出折点到局部变量、再 `ReleaseCapture()`、再提交，三处同改并加中文注释
+说明为什么不能调换。其余 `*_end`（`marquee` / `gradient` / `shape` / `move` / `pen_up` /
+`eyedropper`）的 `*_cancel` 只清 active 标志，逐一核对**不受影响**。
+
+**2. `scripts/visual_check.py`（新增）：自动化目视。** 启动真实外壳，`AttachThreadInput`
++ `SetKeyboardState` + `PostMessage(WM_KEYDOWN/WM_SYSKEYDOWN)` 发真键、`PostMessage`
+发真鼠标消息（不动物理光标）、`PrintWindow(PW_RENDERFULLCONTENT)` 抓客户区像素。
+关键约束：拖动类工具依赖 `SetCapture`，窗口必须**真前台**（`GetForegroundWindow` 校验，
+失败即抛错）；空文档的纯黑外接框用来定位文档矩形，坐标不写死。
+11 场景 45 项断言 32 张 PNG（`../report/assets/s15/`）：`start / brush / selection /
+wand / gradient / shape / type / filter / adjustment / layers / view`。几个实测证据：
+
+- 画笔松手后提交 17 个折点、画布出现橙色笔迹（修复前像素差 0）；
+- 文字：32 px 字形外接框高 16 px，改成 48 px 后 23 px；`Alt+]` 行距 125% → 135%；
+- 调整：铺底 `#336699` → 新图层挂 Exposure 抬值应用 → `(51,102,153)` 变 `(116,218,255)`，
+  `Ctrl+Z` 逐字节回到 `(51,102,153)`；
+- 视图：适合窗口 49% → 放大后应用底色像素 175457 → 50395。
+
+写脚本时确认了两条**语义**（不是 bug）：调整是「调整图层、只作用于下方内容」
+（上游 `EditorCanvas.swift:3092`、引擎 `compositing/filter_graph.cpp:503`），挂在唯一
+像素层上本来就看不到变化——脚本改成先建新层再挂调整；`Ctrl+=` 是 `VK_OEM_PLUS`（0xBB）
+而不是字符 `'='`，早先用 `ord("=")` 发键会让缩放静默失效。同时把调整面板底部提示补到
+7 行（含「调整只作用于下方 · 挂在新图层上」），避免长提示被面板右边界/底边裁掉。
+
+**3. `docs/manual-test.md`（新增）：人工清单。** M1–M16 手把手步骤 + 预期文案 +
+脚本盲区（手感、蚂蚁线流动、跨 DPI、多显示器、模态对话框、退出清理、GPU 回退观感）+
+「脚本场景 ↔ 清单章节」对照表 + 结论模板。**它不替代 ALEX 的目视结论。**
+
+**4. 测试与基线。**
+
+| 项 | 结果 |
+|----|------|
+| `python scripts/build.py` | **445 cases, 0 failed, 0 check failures**（引擎零改动） |
+| `python scripts/build_windows_shell.py` | 通过，无 error |
+| `compositor_shell.exe --selftest` | **164 项 0 失败**，`compositor_shell_selftest.txt` 逐字节未变 |
+| `python scripts/run_regression.py --require-ohos` | **6 passed, 0 skipped, 0 failed**（OHOS aarch64 `compile ok=90 fail=0`） |
+| `python scripts/visual_check.py` | **45 项检查，0 失败**（11 场景 / 32 截图） |
+| ABI 导出 | **112**（未新增） |
+
+**5. 边界（如实记录）。** 证据是**机器抓的像素**，不是人眼：手感、闪烁、光标形态、
+跨 DPI 仍需 ALEX 按清单走一遍（S4–S14 那条边界从「没人碰过」变成「脚本碰过且留了
+可复核截图」，不算消除）。脚本会抢前台窗口（`SetCapture` 需要），跑时别用键鼠。
+沿用 S13 边界：DXGI 交换链直呈未接、GPU 仅覆盖子集且**不比 CPU 快**；
+`Z` 缩放工具按钮可选中但点击暂不改缩放；文字仍 ASCII-only；
+ML / RAW / HEIC / WebP / SVG / PSB / TIFF 不在范围内。
+
+报告：`../report/S15-visual-drag-fix-20261019-dsh.md`。
 
 ## 7. 许可
 
