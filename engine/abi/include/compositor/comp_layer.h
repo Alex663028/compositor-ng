@@ -153,8 +153,9 @@ COMP_API comp_result comp_layer_get_visible(comp_document document,
  * （缩放须以当前中心为锚、旋转须在既有角度上累加，两端都必须知道现值）。
  *
  * 契约：回读值可直接再次传入 comp_layer_set_transform（往返保真，见
- * docs/tool-ops.md 的往返口径）；filp_x / flip_y 不属于本入口——它们只在
- * comp_layer_desc 里给出，且 set_transform 不会覆盖（写入变换不改变既有翻转）。
+ * docs/tool-ops.md 的往返口径）；flip_x / flip_y 不属于本入口——S24 起由
+ * comp_layer_get_flip / set_flip 单独读写，set_transform 依旧不会覆盖既有翻转
+ * （写入变换不改变翻转态，两者正交）。
  * 图层不存在 -> COMP_ERR_NOT_FOUND；出参为 NULL -> COMP_ERR_INVALID_ARGUMENT。
  * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
  */
@@ -171,6 +172,35 @@ COMP_API comp_result comp_layer_set_sampling(comp_document document,
 COMP_API comp_result comp_layer_get_sampling(comp_document document,
                                              comp_layer_id id,
                                              comp_sampling* out_sampling);
+
+/*
+ * 设置/读取图层镜像（S24）：flip_x / flip_y 是对图层局部像素的显示态翻转，
+ * 与 transform / rotation 正交（set_transform 不覆盖它们，翻转也不改 origin/size）。
+ *
+ * 为什么必须补这两个口：引擎的 resample 与图层求值一直在按 Layer::flip_x /
+ * flip_y 翻转像素，`.comp` 的 transform.flipX / flipY 也一直往返，但 ABI 里只有
+ * comp_layer_desc 能在**创建时**给出它们——外部既改不了也读不到，镜像成了「格式
+ * 里有、界面没有」的半截能力；S21 的 get_transform 又刻意把翻转排除在外，于是
+ * 外壳连「这一层现在是翻转态」都无从知道（面板画不出、菜单标不出）。
+ *
+ * 契约：
+ *   - flip_x / flip_y 非 0 即翻转；写入时规范化为 0/1，回读只会是 0 或 1；
+ *   - 两者同时为 1 = 水平 + 垂直（画面等价 180°，但 rotation 语义保持独立）；
+ *   - 写入进撤销栈（与 set_visible / set_sampling 同一套隐式事务）；
+ *   - 回读纯只读：不开事务、不进撤销栈、不改动任何状态；
+ *   - 图层不存在 -> COMP_ERR_NOT_FOUND；出参为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ *
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+COMP_API comp_result comp_layer_set_flip(comp_document document,
+                                         comp_layer_id id,
+                                         int32_t flip_x,
+                                         int32_t flip_y);
+
+COMP_API comp_result comp_layer_get_flip(comp_document document,
+                                         comp_layer_id id,
+                                         int32_t* out_flip_x,
+                                         int32_t* out_flip_y);
 
 /* ------------------------------------------------------ 调整图层与效果 */
 
@@ -194,12 +224,15 @@ COMP_API comp_result comp_layer_update_adjustment(comp_document document,
  * settings 为 UTF-8 JSON 串。
  *
  * 契约说明（与 comp_layer_add_adjustment 的差别，勿混用）：
- *   - effect 是 .comp 格式的引擎扩展键（engineEffects[].effect），内核目前
- *     不参与效果像素求值，因此**刻意不做枚举白名单校验**，以免与 .comp 互通
- *     冲突——上游新增效果类型时旧内核仍应能原样保存与回传。
+ *   - effect 是 .comp 格式的引擎扩展键（engineEffects[].effect），取值见
+ *     compositing/effect_eval.h 的 kEffectStroke..kEffectInnerGlow（0..5，与格式
+ *     规范一一对应）。内核**不做枚举白名单校验**，以免与 .comp 互通冲突——上游
+ *     新增效果类型时旧内核仍应能原样保存与回传；未知 kind 不参与像素求值。
  *   - settings_json_utf8 同理不校验结构，按不透明字符串原样落盘。
- *   调用方应自行保证 effect 取值来自当前格式规范；非法值不会被拒绝，
- *   但也不会参与渲染。
+ *   - **效果参与像素求值**（S22 记录的「纯元数据」结论已在 S24 复核时推翻）：
+ *     6 个 kind 由 compositing/effect_eval.cpp 的 apply_effects 就地求值（单趟），
+ *     composite_ops.cpp 先用 effects_margin() 外扩包围盒再调用。回读见下方的
+ *     comp_layer_effect_count / comp_layer_effect_at。
  */
 COMP_API comp_result comp_layer_set_effect(comp_document document,
                                            comp_layer_id id,
@@ -210,6 +243,37 @@ COMP_API comp_result comp_layer_set_effect(comp_document document,
 COMP_API comp_result comp_layer_remove_effect(comp_document document,
                                               comp_layer_id id,
                                               uint32_t effect);
+
+/*
+ * 效果回读（S24）：与 set_effect / remove_effect 成对。
+ *
+ * count + at 两段式，与 comp_layer_adjustment_count / comp_layer_adjustment_at
+ * 同构：at 的 settings_json_utf8 为 nullptr 或 capacity 为 0 时只回报长度
+ * （out_size），便于调用方先量后取；三个出参均可为 nullptr（全空 = 只探测该下标存在）。
+ *
+ * 为什么必须补：效果已经参与像素求值，但外壳只能写不能读——画不出「这层有几个
+ * 效果」，菜单也无法标出已启用的项。set_effect 写入的设置串若没有回读口，外部
+ * 只能自己记账，`.comp` 读回后记账即失真。
+ *
+ * 契约：
+ *   - 顺序即 layer->effects 的写入序（与 .comp 的 engineEffects 数组同序）；
+ *   - index 越界 -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 回读纯只读：不开事务、不进撤销栈；
+ *   - 图层不存在 -> COMP_ERR_NOT_FOUND；out_count 为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ *
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+COMP_API comp_result comp_layer_effect_count(comp_document document,
+                                             comp_layer_id id,
+                                             size_t* out_count);
+
+COMP_API comp_result comp_layer_effect_at(comp_document document,
+                                          comp_layer_id id,
+                                          size_t index,
+                                          uint32_t* out_effect,
+                                          char* settings_json_utf8,
+                                          size_t capacity,
+                                          size_t* out_size);
 
 /* ------------------------------------------------------------ 只读查询 */
 

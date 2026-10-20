@@ -58,6 +58,21 @@
 [OK] clipping source cleared
 [OK] S22 writes left undoable history and were rolled back
 [OK] S22 rollback reaches the pre-S22 depth
+[OK] get_flip reports no flip on a fresh layer
+[OK] flip round trip (set horizontal -> get)
+[OK] set_flip same value again
+[OK] same-value set_flip adds no undo step
+[OK] flip cleared back to 0/0
+[OK] effect_count is 0 before any effect is added
+[OK] comp_layer_set_effect(Color Overlay, blue)
+[OK] effect_count() == 1 after adding an effect
+[OK] effect_at() reports kind and settings length (two-pass probe)
+[OK] effect_at() round trips the settings JSON verbatim
+[OK] color overlay written through the ABI really changes the canvas
+[info] overlay pixel = (0,0,128,128)
+[OK] effect removal clears the list
+[OK] S24 writes were undoable and rolled back
+[OK] S24 rollback reaches the pre-S24 depth
 [OK] comp_layer_adjustment_kind_name(3) == Exposure
 [OK] comp_layer_adjustment_param_count(3) == 3
 [OK] comp_layer_adjustment_param_at(3,0) path

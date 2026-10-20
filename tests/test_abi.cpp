@@ -1492,3 +1492,275 @@ COMP_TEST(abi_layer_get_group_info_reports_tree_shape) {
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 }
+
+/*
+ * comp_layer_get_flip（S24，ABI 尾部追加 115 -> 116）+ set_flip 的镜像契约。
+ *
+ * 为什么必须补读口：引擎的 Layer::flip_x / flip_y 一直参与像素求值
+ * （resample.cpp:328 把符号折进采样坐标），但 ABI 只有 setter。壳读不到现值就只能
+ * 「盲目取反」——撤销、合并、.comp 读回之后本地记账即失真，取反会翻错方向。
+ *
+ * 本用例钉四件事，缺一条这个读口就等于没接：
+ *   1. 默认不翻转（0/0），且翻转真的改变合成像素（不是只改标志位）；
+ *   2. 写入规范化：-1 / 2 一律归 1，回读只会是 0 或 1；
+ *   3. 同值写入不产生撤销步，真切换恰好一步且可撤销回原态；
+ *   4. 出参必填、未知 id 被拒、纯查询不置脏（面板会反复轮询）。
+ */
+COMP_TEST(abi_layer_flip_round_trip_and_undo) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc document_desc{};
+  document_desc.width = 8;
+  document_desc.height = 8;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  comp_layer_id background = 0;
+  size_t layer_count = 0;
+  COMP_CHECK(comp_layer_list(document, &background, 1u, &layer_count) == COMP_OK);
+  COMP_CHECK(layer_count == 1u && background != 0);
+
+  /* 左半红、右半透明：水平镜像后红块必须换到右半，像素断言才有意义。 */
+  std::vector<uint8_t> half_pixels(8u * 8u * 4u, 0u);
+  for (int32_t y = 0; y < 8; ++y) {
+    for (int32_t x = 0; x < 4; ++x) {
+      const size_t index = (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      half_pixels[index + 0] = 255;
+      half_pixels[index + 3] = 255;
+    }
+  }
+  comp_image half_image{};
+  half_image.width = 8;
+  half_image.height = 8;
+  half_image.format = COMP_PIXEL_RGBA8;
+  half_image.stride = 8u * 4u;
+  half_image.pixels = half_pixels.data();
+  COMP_CHECK(comp_layer_set_pixels(document, background, &half_image) == COMP_OK);
+
+  /* 1. 默认不翻转。 */
+  int32_t flip_x = -1;
+  int32_t flip_y = -1;
+  COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, &flip_y) == COMP_OK);
+  COMP_CHECK(flip_x == 0 && flip_y == 0);
+
+  std::vector<uint8_t> canvas = flatten(document, 8, 8);
+  COMP_CHECK_MSG(matches(canvas, 8, 1, 1, 255, 0, 0, 255, 3), "untouched: red on the left");
+  COMP_CHECK_MSG(matches(canvas, 8, 6, 1, 0, 0, 0, 0, 3), "untouched: transparent on the right");
+
+  /* 2. flip_x 必须真的改像素（以下断言在 set_flip 变成纯元数据时会失败）。 */
+  COMP_CHECK(comp_layer_set_flip(document, background, 1, 0) == COMP_OK);
+  COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, &flip_y) == COMP_OK);
+  COMP_CHECK(flip_x == 1 && flip_y == 0);
+  canvas = flatten(document, 8, 8);
+  COMP_CHECK_MSG(matches(canvas, 8, 6, 1, 255, 0, 0, 255, 3), "flip_x: red moved to the right");
+  COMP_CHECK_MSG(matches(canvas, 8, 1, 1, 0, 0, 0, 0, 3), "flip_x: left is now transparent");
+
+  /* 3. 规范化：非 0 即翻转，回读只会是 0/1。 */
+  COMP_CHECK(comp_layer_set_flip(document, background, -1, 2) == COMP_OK);
+  COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, &flip_y) == COMP_OK);
+  COMP_CHECK(flip_x == 1 && flip_y == 1);
+  /* 垂直翻转对「左右分块」的图没有可见影响，只钉标志位即可（上面已证 flip_x 落像素）。 */
+  canvas = flatten(document, 8, 8);
+  COMP_CHECK(matches(canvas, 8, 6, 1, 255, 0, 0, 255, 3));
+
+  /* 4. 撤销语义：同值不产生步；真切换恰好一步，且能撤销回原态。 */
+  COMP_CHECK(comp_layer_set_flip(document, background, 1, 1) == COMP_OK); /* 已是 1/1 */
+  size_t undo_depth = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  const size_t baseline_depth = undo_depth;
+  COMP_CHECK_MSG(undo_depth > 0u, "前序 set_pixels / set_flip 已留下撤销步");
+
+  COMP_CHECK(comp_layer_set_flip(document, background, 1, 1) == COMP_OK);
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_depth == baseline_depth, "同值 set_flip 不得压入撤销步（否则撤销栈被空步塞满）");
+
+  COMP_CHECK(comp_layer_set_flip(document, background, 0, 1) == COMP_OK);
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_depth == baseline_depth + 1u, "一次切换恰好一步撤销");
+
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, &flip_y) == COMP_OK);
+  COMP_CHECK(flip_x == 1 && flip_y == 1);
+
+  /* 5. 出参必填 + 未知 id 必须被拒，不能写坏调用方栈。 */
+  COMP_CHECK(comp_layer_get_flip(document, background, nullptr, &flip_y) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_flip(document, 0xdeadbeef, &flip_x, &flip_y) == COMP_ERR_NOT_FOUND);
+
+  /* 6. 纯只读：查询不得把干净文档改脏（面板每帧都在轮询这一对）。 */
+  {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "compositor_flip_query_clean.comp").string();
+    COMP_CHECK(comp_document_save(document, path.c_str()) == COMP_OK);
+    int32_t dirty = 0;
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "保存后必须是干净状态");
+    for (int32_t i = 0; i < 4; ++i) {
+      COMP_CHECK(comp_layer_get_flip(document, background, &flip_x, &flip_y) == COMP_OK);
+    }
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "只读查询不得置脏");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/*
+ * comp_layer_effect_count / comp_layer_effect_at（S24，ABI 尾部追加 117 -> 119）。
+ *
+ * 这一对是「写得出、读不回」的最后一块：comp_layer_set_effect 早在 ABI 里，效果
+ * 也早已参与像素求值（effect_eval.cpp 的 6 个 kind），但壳无法枚举——画不出
+ * 「这层有几个效果」，菜单也无法标出已启用项；.comp 读回后本地记账即失真。
+ *
+ * 钉五件事：空层 count=0 且 at(0) 越界拒绝；写入顺序即回读顺序；settings 串
+ * **原样**回传（内核不解析不改写，含未知键）；两段式长度契约（capacity-1 + NUL、
+ * out_size 报全长的字节数）；通过 ABI 写的效果真的进入合成像素 + 纯查询不置脏。
+ */
+COMP_TEST(abi_layer_effect_enumeration_round_trip) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  comp_layer_id background = 0;
+  size_t layer_count = 0;
+  COMP_CHECK(comp_layer_list(document, &background, 1u, &layer_count) == COMP_OK);
+  COMP_CHECK(layer_count == 1u && background != 0);
+
+  const SolidImage green(4, 4, 0, 255, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &green.image) == COMP_OK);
+
+  /* 1. 空层：count=0，at(0) 必须按越界拒绝（不能读到上一层/越界的残留）。 */
+  size_t effect_count = 123u;
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  COMP_CHECK(effect_count == 0u);
+
+  uint32_t kind = 4242u;
+  size_t needed = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, nullptr, 0, &needed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  /*
+   * 2. 通过 ABI 挂一个颜色叠加并把绿色整层染红：这是「效果真的参与像素求值」的
+   *    端到端证据，也顺带钉住 settings 的键名（red/green/blue，0..1）。
+   *    同时验证 count/at 立刻能枚举出它。
+   */
+  COMP_CHECK(comp_layer_set_effect(document, background, 2u,
+                                   "{\"red\":1,\"green\":0,\"blue\":0}") == COMP_OK);
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  COMP_CHECK(effect_count == 1u);
+
+  const char kOverlaySettings[] = "{\"red\":1,\"green\":0,\"blue\":0}";
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  kind = 4242u;
+  needed = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, nullptr, 0, &needed) == COMP_OK);
+  COMP_CHECK(kind == 2u);
+  COMP_CHECK_MSG(needed == sizeof(kOverlaySettings) - 1u, "out_size 报字节长度（不含 NUL）");
+
+  std::vector<char> text(needed + 1u, '\0');
+  size_t written = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, text.data(), text.size(),
+                                  &written) == COMP_OK);
+  COMP_CHECK(written == needed);
+  COMP_CHECK_MSG(std::strcmp(text.data(), kOverlaySettings) == 0,
+                 "settings 必须原样回传（内核不解析、不重排键序）");
+
+  std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 255, 0, 0, 255, 3), "颜色叠加经 ABI 写入后真的改像素");
+
+  /* 3. 第二个效果 + 两段式容量契约（capacity=8 写 7 字节 + NUL）。 */
+  const char kStrokeSettings[] = "{\"size\":9,\"inside\":true,\"unknown\":[1,2]}";
+  COMP_CHECK(comp_layer_set_effect(document, background, 0u, kStrokeSettings) == COMP_OK);
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  COMP_CHECK(effect_count == 2u);
+
+  kind = 4242u;
+  needed = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 1, &kind, nullptr, 0, &needed) == COMP_OK);
+  COMP_CHECK(kind == 0u);
+  COMP_CHECK(needed == sizeof(kStrokeSettings) - 1u);
+
+  char truncated[8];
+  std::memset(truncated, 0x7f, sizeof(truncated));
+  size_t truncated_size = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 1, &kind, truncated, sizeof(truncated),
+                                  &truncated_size) == COMP_OK);
+  COMP_CHECK_MSG(truncated_size == needed, "容量不足时 out_size 仍报完整长度（先量后取）");
+  COMP_CHECK(truncated[sizeof(truncated) - 1] == '\0');
+  COMP_CHECK(std::strncmp(truncated, kStrokeSettings, sizeof(truncated) - 1) == 0);
+
+  /* 顺序 = 写入序，不是按 kind 排序。 */
+  kind = 4242u;
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, nullptr, 0, &needed) == COMP_OK);
+  COMP_CHECK(kind == 2u);
+
+  /* 4. 同 kind 再写 = 改设置而不是追加；移除只删该 kind，其余顺序不变。 */
+  COMP_CHECK(comp_layer_set_effect(document, background, 2u, "{\"red\":0,\"green\":0,\"blue\":1}") ==
+             COMP_OK);
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  COMP_CHECK(effect_count == 2u);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 0, 255, 255, 3), "改设置后像素跟着变（蓝）");
+
+  COMP_CHECK(comp_layer_remove_effect(document, background, 2u) == COMP_OK);
+  COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+  COMP_CHECK(effect_count == 1u);
+  kind = 4242u;
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, nullptr, 0, &needed) == COMP_OK);
+  COMP_CHECK(kind == 0u);
+
+  /* 5. 越界 / 空出参 / 未知图层：一律先拒，且不写坏调用方内存。 */
+  kind = 4242u;
+  needed = 0;
+  COMP_CHECK(comp_layer_effect_at(document, background, 1, &kind, nullptr, 0, &needed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_effect_count(document, background, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  /*
+   * 三个出参都是可选的（与 comp_layer_adjustment_at 同口径）：全给 nullptr 等于
+   * 「只想知道这一项存在」，必须 OK 而不是拒绝；拒绝会让两段式查询的探针写法失效。
+   */
+  COMP_CHECK(comp_layer_effect_at(document, background, 0, nullptr, nullptr, 0, nullptr) ==
+             COMP_OK);
+  COMP_CHECK(comp_layer_effect_count(document, 0xdeadbeef, &effect_count) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_effect_at(document, 0xdeadbeef, 0, &kind, nullptr, 0, &needed) ==
+             COMP_ERR_NOT_FOUND);
+
+  /* 6. 纯只读：枚举不得把干净文档改脏。 */
+  {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "compositor_effect_query_clean.comp").string();
+    COMP_CHECK(comp_document_save(document, path.c_str()) == COMP_OK);
+    int32_t dirty = 0;
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "保存后必须是干净状态");
+    for (int32_t i = 0; i < 4; ++i) {
+      COMP_CHECK(comp_layer_effect_count(document, background, &effect_count) == COMP_OK);
+      COMP_CHECK(comp_layer_effect_at(document, background, 0, &kind, nullptr, 0, &needed) ==
+                 COMP_OK);
+    }
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "只读枚举不得置脏");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}

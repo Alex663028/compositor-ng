@@ -100,6 +100,15 @@ constexpr UINT kCmdLayerBringToFront = 1407;       /* S22：置顶 */
 constexpr UINT kCmdLayerSendToBack = 1408;         /* S22：置底 */
 constexpr UINT kCmdHistogramToggle = 1409;         /* S22：直方图面板显隐 */
 constexpr UINT kCmdSamplingBase = 1410;             /* S22：+ 采样档位 0..2，菜单直达 */
+/*
+ * S24 命令号：接着 S22 的 1400 段排到 1500 段，避免与工具(1100)/滤镜(1200)/
+ * 混合(1300)/S22(1400) 的档位区间交错——两段共用基址时，加一档就会覆盖相邻命令。
+ */
+constexpr UINT kCmdLayerFlipHorizontal = 1500; /* S24：水平镜像（ABI 尾部追加） */
+constexpr UINT kCmdLayerFlipVertical = 1501;   /* S24：垂直镜像 */
+constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..5，菜单勾选 = 已启用 */
+constexpr UINT kCmdEffectClear = 1520;         /* S24：清除选中图层的全部效果 */
+constexpr UINT kCmdHistogramReset = 1521;      /* S24：直方图区间复位（双击同效） */
 constexpr UINT kCmdLayerMoveLeft = 1036;  /* S21：图层平移（Shift=微调、Ctrl=粗调） */
 constexpr UINT kCmdLayerMoveRight = 1037;
 constexpr UINT kCmdLayerMoveUp = 1038;
@@ -159,6 +168,14 @@ struct LayerRow {
    * 一条永远不成栈的 clipping_source：画面不变，但单层视图又按它求值。
    */
   comp_layer_id parent = 0;
+  /*
+   * S24：镜像与效果的只读快照。两者都是「引擎已参与像素求值、AIB 此前没有回读口
+   * 或只在创建时可给」的属性，补齐后与蒙版/组信息同一口径：只用于绘制与菜单勾选，
+   * 写路径一律回到引擎（comp_layer_set_flip / set_effect / remove_effect）。
+   */
+  uint8_t flip_x = 0;
+  uint8_t flip_y = 0;
+  int32_t effect_count = 0; /* 本层已有效果的个数（菜单标勾、面板标 fxN） */
 };
 
 struct ShellState {
@@ -208,6 +225,27 @@ struct ShellState {
   bool histogram_open = false;
   std::vector<double> histogram_bins;
   int32_t histogram_layer = 0; /* 取数时对应的图层 id；换层即重取 */
+  /*
+   * S24 直方图区间缩放：view 是可视亮度窗口（默认全幅 0…255），拖拽框选 / 滚轮
+   * 缩放 / 双击复位都只改它，几何与夹取规则全在 ui_core（clamp/zoom/映射）。
+   * 拖着的时候图不重取（bins 不动），只改窗口——重取要扫一遍全图，每帧都做会卡。
+   */
+  comp_ui::HistogramView histogram_view;
+  bool histogram_drag = false;
+  int32_t histogram_drag_from_x = 0;
+  int32_t histogram_drag_to_x = 0;
+  /*
+   * S24 图层拖行重排：pending = 已按下（还没超过阈值），active = 已构成拖拽。
+   * 用「按下再移动超阈值」而不是「一按下就算拖」，是为了不和「点一行选中」抢
+   * 语义：单击必须还是选中，手抖 1px 不该把层挪走。
+   */
+  int32_t layer_drag_row = -1;
+  int32_t layer_drag_target = -1;
+  int32_t layer_drag_press_y = 0;
+  bool layer_drag_pending = false;
+  bool layer_drag_active = false;
+  /* S24：选中图层已启用的效果 kind（数组序，与引擎 effects 同序）。 */
+  std::vector<uint32_t> effect_kinds;
   /* 前景色（S6）：画笔的笔画色；吸管与色板都写这里。 */
   comp_ui::ColorRGB foreground{};
   int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
@@ -384,6 +422,12 @@ void refresh_adjustments(ShellState& shell);
 /* S22：直方图数据同源于下方定义；refresh_layers 在换层/变更后统一刷新它。 */
 void refresh_histogram(ShellState& shell);
 
+/* S24：效果回读同源于下方定义；与 refresh_adjustments 一样跟随选中图层。 */
+void refresh_effects(ShellState& shell);
+
+/* S24：效果回读需要选中图层的 id；该 helper 定义在调整面板段之后。 */
+comp_layer_id selected_layer_id(const ShellState& shell);
+
 /* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
 std::wstring widen_ascii(const char* text);
 
@@ -455,6 +499,22 @@ void refresh_layers(ShellState& shell) {
     if (comp_layer_get_sampling(shell.document, id, &sampling) == COMP_OK) {
       row.sampling = static_cast<int32_t>(sampling);
     }
+    /*
+     * S24：镜像与效果。镜像走本层新增的 getter（set_flip 早已存在但壳调不到，
+     * 于是「翻转」这个 PS 基础操作在本壳里不存在）；效果数走 effect_count，
+     * 用于菜单勾选与行内 fx 标记。两者都只读、都只用于展示。
+     */
+    int32_t flip_x = 0;
+    int32_t flip_y = 0;
+    if (comp_layer_get_flip(shell.document, id, &flip_x, &flip_y) == COMP_OK) {
+      row.flip_x = flip_x != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+      row.flip_y = flip_y != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
+    size_t effect_count = 0;
+    if (comp_layer_effect_count(shell.document, id, &effect_count) == COMP_OK) {
+      /* 单层效果数量极少（<256），int32_t 足够；超限按 255 封顶只影响标记显示。 */
+      row.effect_count = effect_count > 255u ? 255 : static_cast<int32_t>(effect_count);
+    }
     shell.layers.push_back(row);
   }
 
@@ -464,6 +524,8 @@ void refresh_layers(ShellState& shell) {
   }
   /* 选中图层变化后，调整面板必须跟着换数据源。 */
   refresh_adjustments(shell);
+  /* S24：效果列表与调整列表同一数据源（选中图层），同一刷新汇合点。 */
+  refresh_effects(shell);
   /*
    * S22：直方图随后同步。挂在这里而不是每个写入口各调一次，是因为
    * refresh_layers 已经是全部变更路径（滤镜 / 工具 / 撤销 / 合并 / 打开文档）
@@ -943,6 +1005,378 @@ void panel_toggle_histogram(ShellState& shell) {
     refresh_history_status(shell, L"直方图：已显示");
   } else if (!shell.histogram_open) {
     set_status(shell, L"直方图：已隐藏");
+  }
+}
+
+/* ==================================================== S24：镜像 / 效果 / 区间 */
+
+/*
+ * 效果档位的中文名与「默认参数摘要」（S24）。
+ *
+ * 为什么摘要必须写在这里：set_effect(id, kind, "{}") 是让引擎用**键缺失即默认**的
+ * 规则填参数（engine/compositing/effect_eval.cpp 的 read_* 系列），壳里没有一份
+ * 默认值副本。用户在菜单里点了「投影」却看不到任何变化时，唯一能自诊断的信息
+ * 就是「投影默认距离 20px、黑色、50% 不透明度」——不然会以为功能没实现。
+ * 摘要与 effect_eval.cpp 的默认值逐项对应，改引擎默认值时这里必须同步（报告已记）。
+ */
+const wchar_t* effect_kind_label(int kind) {
+  switch (comp_ui::clamp_effect_kind(kind)) {
+    case 0: return L"描边";
+    case 1: return L"投影";
+    case 2: return L"颜色叠加";
+    case 3: return L"内阴影";
+    case 4: return L"外发光";
+    case 5: return L"内发光";
+    default: return L"描边";
+  }
+}
+
+const wchar_t* effect_kind_defaults(int kind) {
+  switch (comp_ui::clamp_effect_kind(kind)) {
+    case 0: return L"外描边 size 4px、黑色、不透明度 100%";
+    case 1: return L"角度 90°、距离 20px、模糊 20px、黑色、不透明度 50%";
+    case 2: return L"黑色、不透明度 100%";
+    case 3: return L"角度 90°、距离 10px、模糊 10px、黑色、不透明度 50%";
+    case 4: return L"size 20px、黑色、不透明度 75%";
+    case 5: return L"size 10px、黑色、不透明度 75%";
+    default: return L"";
+  }
+}
+
+/*
+ * 效果回读（S24）：与 refresh_adjustments 同构，走 count + at 两段式。
+ *
+ * 只回读 kind、不回读 settings：壳目前没有效果参数编辑面板（6 个 kind 全用引擎
+ * 默认参数），把设置串搬进壳只会多一份会漂移的副本。等真做参数面板时再按需取，
+ * 那时参数编辑也要像调整面板一样由 ABI 元数据驱动，不能在壳里写死键名。
+ */
+void refresh_effects(ShellState& shell) {
+  shell.effect_kinds.clear();
+  const comp_layer_id id = shell.document != nullptr ? selected_layer_id(shell) : 0;
+  if (id == 0) return;
+  size_t count = 0;
+  if (comp_layer_effect_count(shell.document, id, &count) != COMP_OK) return;
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t kind = 0;
+    size_t need = 0;
+    if (comp_layer_effect_at(shell.document, id, i, &kind, nullptr, 0, &need) != COMP_OK) break;
+    /* 第二趟只为校验（列表只需要 kind）；settings 长度留给将来的参数面板。 */
+    shell.effect_kinds.push_back(kind);
+  }
+}
+
+/*
+ * 图层镜像（S24）。
+ *
+ * 引擎的 Layer::flip_x / flip_y 一直在合成里生效（layer_transform 把符号折进
+ * 变换矩阵），但 ABI 只有 set 没有 get——壳读不到现值就只能「盲目取反」，而撤销、
+ * 合并、.comp 读回都会改变文档状态，盲目取反会把「已翻转」翻回「未翻转」。
+ * 因此 S24 先补 getter（comp_layer_get_flip），这里每次先读再写。
+ *
+ * 水平 / 垂直是**两个独立位**（PS 的「水平翻转」「垂直翻转」同款），不是三态循环：
+ * 两次水平翻转必须回到原样，而不是变成垂直。
+ */
+void panel_toggle_flip(ShellState& shell, bool horizontal) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const comp_layer_id id = row->id;
+  int32_t flip_x = 0;
+  int32_t flip_y = 0;
+  if (comp_layer_get_flip(shell.document, id, &flip_x, &flip_y) != COMP_OK) {
+    set_status(shell, L"读取镜像状态失败");
+    return;
+  }
+  const int32_t next_x = horizontal ? (flip_x != 0 ? 0 : 1) : flip_x;
+  const int32_t next_y = horizontal ? flip_y : (flip_y != 0 ? 0 : 1);
+  if (comp_layer_set_flip(shell.document, id, next_x, next_y) != COMP_OK) {
+    set_status(shell, L"镜像失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  if (horizontal) {
+    refresh_history_status(shell, next_x != 0 ? L"已水平翻转图层" : L"已取消水平翻转");
+  } else {
+    refresh_history_status(shell, next_y != 0 ? L"已垂直翻转图层" : L"已取消垂直翻转");
+  }
+}
+
+/*
+ * 效果开关（S24）。
+ *
+ * 引擎侧 6 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光）早已参与像素求值，
+ * 但 ABI 只有 set_effect / remove_effect，壳无法知道「这一层现在有哪些效果」。
+ * 加了 effect_count / effect_at 之后，这里可以做**幂等切换**：勾选 = 已启用。
+ *
+ * 已有同 kind 的效果时**不覆盖**：用户可能是 .comp 读回来的、带自定义参数的效果，
+ * 盖上 "{}" 会把他的参数静默抹掉（这是最典型的数据丢失）。要去掉就用「移除」。
+ */
+void panel_toggle_effect(ShellState& shell, int kind) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int clamped = comp_ui::clamp_effect_kind(kind);
+  const comp_layer_id id = row->id;
+  const bool present =
+      comp_ui::effect_list_contains(shell.effect_kinds.empty() ? nullptr : shell.effect_kinds.data(),
+                                    static_cast<int32_t>(shell.effect_kinds.size()), clamped);
+  wchar_t buffer[256];
+  if (present) {
+    if (comp_layer_remove_effect(shell.document, id, static_cast<uint32_t>(clamped)) != COMP_OK) {
+      set_status(shell, L"移除效果失败");
+      return;
+    }
+    wsprintfW(buffer, L"已移除效果：%s", effect_kind_label(clamped));
+  } else {
+    /*
+     * "{}" = 全部走引擎默认参数（键缺失即默认，见 effect_eval.cpp 的 read_*）。
+     * 壳内不拼一份默认 JSON：两份默认值必然有一天不一致，且引擎改默认值时壳不会跟着改。
+     */
+    if (comp_layer_set_effect(shell.document, id, static_cast<uint32_t>(clamped), "{}") != COMP_OK) {
+      set_status(shell, L"添加效果失败");
+      return;
+    }
+    wsprintfW(buffer, L"已添加效果：%s（默认参数：%s）", effect_kind_label(clamped),
+              effect_kind_defaults(clamped));
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 清除选中图层的全部效果（S24）。ABI 没有批量清除，只能逐个 remove_effect，
+ * 因此会产生 N 条撤销记录——如实说明，不假装是一步（引擎侧要一步得加新 ABI，
+ * 那是 S25 的事，不能在壳里绕）。
+ */
+void panel_clear_effects(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (shell.effect_kinds.empty()) {
+    set_status(shell, L"该图层没有效果");
+    return;
+  }
+  const comp_layer_id id = row->id;
+  const std::vector<uint32_t> kinds = shell.effect_kinds;
+  int removed = 0;
+  for (uint32_t kind : kinds) {
+    if (comp_layer_remove_effect(shell.document, id, kind) == COMP_OK) ++removed;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"已清除 %d 个效果（每个效果一步撤销）", removed);
+  refresh_history_status(shell, buffer);
+}
+
+/* 直方图当前区间 → 状态栏文案（夹取后的实际值，不写「理想值」）。 */
+void histogram_view_status(ShellState& shell) {
+  if (comp_ui::histogram_view_is_full(shell.histogram_view)) {
+    set_status(shell, L"直方图区间：全幅 0–255（双击复位）");
+    return;
+  }
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"直方图区间：亮度 %d–%d（双击复位）",
+            static_cast<int>(shell.histogram_view.lo + 0.5),
+            static_cast<int>(shell.histogram_view.hi + 0.5));
+  set_status(shell, buffer);
+}
+
+void panel_histogram_reset(ShellState& shell) {
+  if (!shell.histogram_open) {
+    set_status(shell, L"直方图未打开（F6 打开）");
+    return;
+  }
+  shell.histogram_view = comp_ui::HistogramView{};
+  shell.needs_render = true;
+  histogram_view_status(shell);
+}
+
+void panel_histogram_zoom(ShellState& shell, double factor, double focus_bin) {
+  if (!shell.histogram_open) return;
+  shell.histogram_view = comp_ui::zoom_histogram_view(shell.histogram_view, focus_bin, factor);
+  shell.needs_render = true;
+  histogram_view_status(shell);
+}
+
+/*
+ * 框选松手：把拖出的横向区间变成新的可视窗口。
+ * 位移小于 4px 视为单击（不放大）——否则「点一下图」会突然缩放到 8 个 bin 的
+ * 极限，看起来像图坏了。夹取由 ui_core 统一做，这里不重算。
+ */
+void panel_histogram_commit_drag(ShellState& shell, const comp_ui::Rect& plot) {
+  const int32_t delta = shell.histogram_drag_to_x - shell.histogram_drag_from_x;
+  if (delta >= -3 && delta <= 3) return;
+  shell.histogram_view = comp_ui::histogram_window_from_drag(
+      plot, shell.histogram_view, static_cast<double>(shell.histogram_drag_from_x),
+      static_cast<double>(shell.histogram_drag_to_x));
+  shell.needs_render = true;
+  histogram_view_status(shell);
+}
+
+/*
+ * 拖行重排落点（S24）：从面板行 from_shown 拖到 to_shown。
+ *
+ * 规划（行→数组下标换算、同父校验、锚点选择）全在 comp_ui::plan_layer_drag；
+ * 这里只做「把纯函数的结果翻译成一次 comp_layer_reorder」。跨组如实拒绝：
+ * 面板是扁平列表、不画缩进，静默改父级会让图层「消失」在别的组里。
+ */
+void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown) {
+  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  if (count <= 0) return;
+  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
+  for (int32_t i = 0; i < count; ++i) {
+    const LayerRow& row = shell.layers[static_cast<size_t>(i)];
+    entries[static_cast<size_t>(i)].id = static_cast<int64_t>(row.id);
+    entries[static_cast<size_t>(i)].parent = static_cast<int64_t>(row.parent);
+    entries[static_cast<size_t>(i)].clipping = static_cast<int64_t>(row.clipping);
+  }
+  const comp_ui::DragPlan plan =
+      comp_ui::plan_layer_drag(entries.data(), count, from_shown, to_shown);
+  switch (plan.target) {
+    case comp_ui::DragTarget::kSameRow:
+      set_status(shell, L"拖回原位，图层顺序未变");
+      return;
+    case comp_ui::DragTarget::kCrossParent:
+      set_status(shell, L"跨图层组拖拽暂不支持（两侧父级不同，未修改任何数据）");
+      return;
+    case comp_ui::DragTarget::kInvalid:
+      return;
+    case comp_ui::DragTarget::kOk:
+      break;
+  }
+  comp_layer_id before = 0;
+  if (plan.before_index >= 0) {
+    before = shell.layers[static_cast<size_t>(plan.before_index)].id;
+  }
+  const comp_layer_id self = shell.layers[static_cast<size_t>(
+      comp_ui::layer_array_index(count, from_shown))].id;
+  if (comp_layer_reorder(shell.document, self, before) != COMP_OK) {
+    set_status(shell, L"拖行重排失败（跨组需与目标同组）");
+    return;
+  }
+  refresh_layers(shell);
+  /* 选中态跟着被拖动的那一层走（selected_layer 是面板行索引，必须重算）。 */
+  shell.selected_layer = comp_ui::clamp_selected_row(plan.next_row, count);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"拖行重排：第 %d 行 → 第 %d 行", from_shown + 1, plan.next_row + 1);
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------ 菜单勾选态（S24） */
+
+/*
+ * 递归设置勾选。为什么必须递归：图层菜单里的「可见性/剪贴/隔离/直方图」在
+ * 顶层子菜单，「混合模式/采样模式」的档位在二级子菜单——CheckMenuItem 只能对
+ * 单个 HMENU 按命令 id 生效，不递归就会出现「顶层勾了、子菜单没勾」。
+ *
+ * 为什么不重建菜单：重建（DestroyMenu + build_menu + SetMenu）会让已打开的菜单
+ * 句柄悬空，并让每次 INITMENU 都闪一下；勾选态是纯显示状态，WM_INITMENU 里刷
+ * 一遍即可（GetMenu(window) 拿到的就是同一份 HMENU）。
+ */
+void menu_set_checked_recursive(HMENU menu, UINT id, bool checked) {
+  if (menu == nullptr) return;
+  const int count = GetMenuItemCount(menu);
+  for (int i = 0; i < count; ++i) {
+    const UINT state = GetMenuState(menu, static_cast<UINT>(i), MF_BYPOSITION);
+    if (state == static_cast<UINT>(-1)) continue;
+    if ((state & MF_POPUP) != 0) {
+      menu_set_checked_recursive(GetSubMenu(menu, i), id, checked);
+    } else if (GetMenuItemID(menu, i) == id) {
+      CheckMenuItem(menu, id, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
+    }
+  }
+}
+
+/*
+ * 单选设置（混合模式 / 采样模式 / 当前工具）：命令 id 落在 [first, last] 区间里
+ * 的整段做互斥勾选。只对**包含区间成员的同一个子菜单**调用 CheckMenuRadioItem，
+ * 否则 Win32 会把不相邻的项也当成一组。
+ */
+void menu_radio_check_recursive(HMENU menu, UINT first, UINT last, UINT selected) {
+  if (menu == nullptr) return;
+  const int count = GetMenuItemCount(menu);
+  for (int i = 0; i < count; ++i) {
+    const UINT state = GetMenuState(menu, static_cast<UINT>(i), MF_BYPOSITION);
+    if (state == static_cast<UINT>(-1)) continue;
+    if ((state & MF_POPUP) != 0) {
+      menu_radio_check_recursive(GetSubMenu(menu, i), first, last, selected);
+      continue;
+    }
+    const UINT command = GetMenuItemID(menu, i);
+    if (command >= first && command <= last) {
+      CheckMenuRadioItem(menu, first, last, selected, MF_BYCOMMAND);
+      return; /* 同一子菜单只做一次；继续递归会重复调用 */
+    }
+  }
+}
+
+/*
+ * WM_INITMENU 的唯一入口：把当前状态映射成勾选态。
+ *
+ * 判定规则在纯函数 comp_ui::layer_menu_checks 里（无选中层不勾、非组的 isolated
+ * 不算、采样/混合夹到合法档位），这里只做「状态 → 菜单」的搬运，所以规则部分
+ * 可以表驱动单测，不需要起窗口。
+ */
+void sync_menu_state(HWND window, ShellState& shell) {
+  HMENU menu = GetMenu(window);
+  if (menu == nullptr) return;
+
+  comp_ui::LayerMenuState state{};
+  const LayerRow* row = selected_row(shell);
+  if (row != nullptr) {
+    state.has_layer = true;
+    state.visible = row->visible != 0;
+    state.clipping = row->clipping != 0;
+    state.is_group = row->is_group != 0;
+    state.isolated = row->isolated != 0;
+    state.sampling = row->sampling;
+    state.blend = row->blend;
+  }
+  state.histogram_open = shell.histogram_open;
+  const comp_ui::LayerMenuChecks checks = comp_ui::layer_menu_checks(state);
+
+  menu_set_checked_recursive(menu, kCmdLayerToggleVisible, checks.visible);
+  menu_set_checked_recursive(menu, kCmdLayerToggleClipping, checks.clipping);
+  menu_set_checked_recursive(menu, kCmdLayerToggleIsolated, checks.isolated);
+  menu_set_checked_recursive(menu, kCmdHistogramToggle, checks.histogram);
+  if (checks.sampling >= 0) {
+    menu_radio_check_recursive(menu, kCmdSamplingBase,
+                               kCmdSamplingBase + static_cast<UINT>(comp_ui::kSamplingCount) - 1,
+                               kCmdSamplingBase + static_cast<UINT>(checks.sampling));
+  }
+  if (checks.blend >= 0) {
+    menu_radio_check_recursive(menu, kCmdBlendBase,
+                               kCmdBlendBase + static_cast<UINT>(comp_ui::kBlendCount) - 1,
+                               kCmdBlendBase + static_cast<UINT>(checks.blend));
+  }
+  /* 效果项：6 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
+  for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
+    const bool present =
+        comp_ui::effect_list_contains(shell.effect_kinds.empty() ? nullptr : shell.effect_kinds.data(),
+                                      static_cast<int32_t>(shell.effect_kinds.size()), kind);
+    menu_set_checked_recursive(menu, kCmdEffectBase + static_cast<UINT>(kind), present);
+  }
+  /* 工具菜单单选：当前工具（tool_index 是 ui_core 的单一真相，不在这里另算）。 */
+  const int tool = comp_ui::tool_index(shell.tool);
+  if (tool >= 0) {
+    menu_radio_check_recursive(menu, kCmdToolBase,
+                               kCmdToolBase + static_cast<UINT>(comp_ui::tool_count()) - 1,
+                               kCmdToolBase + static_cast<UINT>(tool));
+  }
+  /* 镜像两项目前是「动作」而非开关：勾选态展示该方向是否已翻转，便于自诊断。 */
+  if (row != nullptr) {
+    menu_set_checked_recursive(menu, kCmdLayerFlipHorizontal, row->flip_x != 0);
+    menu_set_checked_recursive(menu, kCmdLayerFlipVertical, row->flip_y != 0);
   }
 }
 
@@ -3553,6 +3987,19 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdHistogramToggle:
       panel_toggle_histogram(shell);
       break;
+    /* ---- S24：镜像、效果开关、直方图区间复位 ---- */
+    case kCmdLayerFlipHorizontal:
+      panel_toggle_flip(shell, true);
+      break;
+    case kCmdLayerFlipVertical:
+      panel_toggle_flip(shell, false);
+      break;
+    case kCmdEffectClear:
+      panel_clear_effects(shell);
+      break;
+    case kCmdHistogramReset:
+      panel_histogram_reset(shell);
+      break;
     case kCmdAdjKindPrev:
       panel_cycle_kind(shell, -1);
       break;
@@ -3612,6 +4059,11 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       /* 采样模式菜单项（S22）：kCmdSamplingBase + 档位 0..2。 */
       if (id >= kCmdSamplingBase && id < kCmdSamplingBase + comp_ui::kSamplingCount) {
         panel_set_sampling(shell, static_cast<int>(id - kCmdSamplingBase));
+        break;
+      }
+      /* 效果菜单项（S24）：kCmdEffectBase + kind 0..5，勾选 = 已启用。 */
+      if (id >= kCmdEffectBase && id < kCmdEffectBase + comp_ui::kEffectKindCount) {
+        panel_toggle_effect(shell, static_cast<int>(id - kCmdEffectBase));
         break;
       }
       return;
@@ -3798,12 +4250,18 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
      *   M  = 带蒙版     （filter_graph 的 coverage.add(&layer->mask)）
      *   >| = 已剪贴     （composite_ops 的 clipping_factor）
      *   [] = 组且隔离   （filter_graph 按 node.isolated 定 child_backdrop）
+     * S24 追加：
+     *   H / V = 已水平 / 垂直翻转（flip_x / flip_y，合成时折进变换矩阵）
+     *   fx    = 带效果        （effect_eval 的 6 种效果参与像素求值）
      * 不另开一列图标区：22px 行高 + 248px 栏宽已经排满，标号跟着层名走最省地方。
      */
     std::wstring marks;
     if (row.has_mask != 0) marks += L"M";
     if (row.clipping != 0) marks += L">|";
     if (row.is_group != 0) marks += row.isolated != 0 ? L"[]" : L"{}";
+    if (row.flip_x != 0) marks += L"H";
+    if (row.flip_y != 0) marks += L"V";
+    if (row.effect_count > 0) marks += L"fx";
     wchar_t line_text[224];
     if (!marks.empty()) {
       wsprintfW(line_text, L"%s #%I64u  %s %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
@@ -3815,6 +4273,23 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
                 static_cast<int>(row.opacity * 100.0f + 0.5f));
     }
     TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
+  }
+
+  /*
+   * S24 拖行落点指示线。位置由 ui_core::layer_insert_line_rect 从同一个 row_top
+   * 算（与行矩形共用偏移），指示线不会与行错位——错位会让人以为层会落到相邻行。
+   * 向上拖画目标行上边缘、向下拖画下边缘，见 layer_drag_insert_slot。
+   */
+  if (shell.layer_drag_active && shell.layer_drag_target >= 0 && count > 0 &&
+      shell.layer_drag_row >= 0) {
+    const int32_t slot =
+        comp_ui::layer_drag_insert_slot(shell.layer_drag_row, shell.layer_drag_target);
+    const comp_ui::Rect line_rect =
+        comp_ui::layer_insert_line_rect(panel_rect, row_top, slot, count);
+    RECT line{line_rect.x, line_rect.y, line_rect.right(), line_rect.bottom()};
+    HBRUSH line_brush = CreateSolidBrush(RGB(120, 200, 255));
+    FillRect(dc, &line, line_brush);
+    DeleteObject(line_brush);
   }
 
   /*
@@ -3831,42 +4306,90 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     DeleteObject(plot);
     FrameRect(dc, &frame, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
 
+    /*
+     * 可视区间由 shell.histogram_view 决定（S24：拖拽框选 / 滚轮缩放 / 双击复位）。
+     * 峰值只看可视区间：全幅峰值在放大后会把细节压成一条平线，正是缩放要看的
+     * 那部分反而看不见了。
+     */
+    const comp_ui::HistogramView& view = shell.histogram_view;
     double peak = 0.0;
-    for (double value : shell.histogram_bins) {
+    int32_t first_bin = static_cast<int32_t>(view.lo);
+    int32_t last_bin = static_cast<int32_t>(view.hi + 0.999);
+    if (first_bin < 0) first_bin = 0;
+    if (last_bin > 255) last_bin = 255;
+    for (int32_t i = first_bin; i <= last_bin; ++i) {
+      const double value = shell.histogram_bins[static_cast<size_t>(i)];
       if (value > peak) peak = value;
     }
-    if (peak > 0.0) {
+
+    /* 框选预览先铺底，再画曲线，否则曲线会被色块盖掉。 */
+    if (shell.histogram_drag) {
+      int32_t band_left = shell.histogram_drag_from_x;
+      int32_t band_right = shell.histogram_drag_to_x;
+      if (band_left > band_right) {
+        const int32_t swap = band_left;
+        band_left = band_right;
+        band_right = swap;
+      }
+      if (band_left < area.x) band_left = area.x;
+      if (band_right > area.right()) band_right = area.right();
+      if (band_right > band_left) {
+        RECT band{band_left, area.y + 1, band_right, area.bottom() - 1};
+        HBRUSH band_brush = CreateSolidBrush(RGB(36, 64, 104));
+        FillRect(dc, &band, band_brush);
+        DeleteObject(band_brush);
+        FrameRect(dc, &band, reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+      }
+    }
+
+    if (peak > 0.0 && area.w > 1 && area.h > 1) {
       /*
        * 对数刻度：真实照片的直方图是「暗部一座山 + 高光一线天」，线性刻度下那条
        * 高光线永远只有 1px 高，用户看不见高光滚降——那是直方图最该看的东西。
        * 用 log1p 归一化后形状可读，且空图（全 0）不会除零。
+       *
+       * 每列一个采样点，x → bin 的映射与命中测试共用 histogram_x_to_bin：缩放后
+       * 曲线与鼠标位置永远对得上（S22 用 i*width/255 的固定映射，一缩放就错位）。
        */
       HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 200, 255));
       HPEN old = static_cast<HPEN>(SelectObject(dc, pen));
-      const int steps = 256;
-      MoveToEx(dc, area.x, area.bottom(), nullptr);
-      for (int i = 0; i < steps; ++i) {
-        const double norm = std::log1p(shell.histogram_bins[static_cast<size_t>(i)]) /
+      bool started = false;
+      for (int column = 0; column < area.w; ++column) {
+        const double bin =
+            comp_ui::histogram_x_to_bin(area, view, static_cast<double>(area.x + column));
+        int32_t index = static_cast<int32_t>(bin + 0.5);
+        if (index < 0) index = 0;
+        if (index > 255) index = 255;
+        const double norm = std::log1p(shell.histogram_bins[static_cast<size_t>(index)]) /
                             std::log1p(peak);
-        const int px = area.x + static_cast<int>((static_cast<double>(i) * (area.w - 1)) /
-                                                 static_cast<double>(steps - 1));
         const int py =
             area.bottom() - static_cast<int>(norm * static_cast<double>(area.h - 1) + 0.5);
-        LineTo(dc, px, py);
+        if (!started) {
+          MoveToEx(dc, area.x + column, py, nullptr);
+          started = true;
+        } else {
+          LineTo(dc, area.x + column, py);
+        }
       }
       SelectObject(dc, old);
       DeleteObject(pen);
     }
     SetTextColor(dc, RGB(150, 154, 166));
-    const wchar_t* label = L"亮度直方图（对数刻度）";
+    wchar_t histogram_label[96];
+    if (comp_ui::histogram_view_is_full(view)) {
+      wsprintfW(histogram_label, L"亮度直方图（对数刻度，双击复位）");
+    } else {
+      wsprintfW(histogram_label, L"直方图 %d–%d（双击复位）",
+                static_cast<int>(view.lo + 0.5), static_cast<int>(view.hi + 0.5));
+    }
     const comp_ui::Rect label_rect = comp_ui::histogram_label_rect(panel_rect);
-    TextOutW(dc, label_rect.x, label_rect.y, label, lstrlenW(label));
+    TextOutW(dc, label_rect.x, label_rect.y, histogram_label, lstrlenW(histogram_label));
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
-  const wchar_t* hint = L"Ctrl+[ ] 不透明度 · Ctrl+Shift+↑↓ 排序";
+  const wchar_t* hint = L"Ctrl+[ ] 不透明度 · 拖行图层可重排";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 46, hint, lstrlenW(hint));
-  const wchar_t* hint2 = L"Shift+B / N 混合模式 · Ctrl+Shift+M 蒙版";
+  const wchar_t* hint2 = L"Shift+B/N 混合 · Ctrl+Shift+H/F 镜像 · 效果菜单";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
@@ -5270,6 +5793,22 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           return;
         }
         break;
+      /*
+       * S24 镜像：Ctrl+Shift+H 水平、Ctrl+Shift+F 垂直（避开已占用的 Ctrl+Shift+V；
+       * H/F 取 Flip Horizontal / Flip Vertical 首字母，与上游 ⌘T 系变换分开记）。
+       */
+      case 'H':
+        if (shift) {
+          run_shell_command(window, shell, kCmdLayerFlipHorizontal);
+          return;
+        }
+        break;
+      case 'F':
+        if (shift) {
+          run_shell_command(window, shell, kCmdLayerFlipVertical);
+          return;
+        }
+        break;
       case '0':
         run_shell_command(window, shell, kCmdViewFit);
         return;
@@ -5520,6 +6059,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_PAINT:
       if (shell != nullptr) present(window, *shell);
       break;
+    case WM_INITMENU:
+      /*
+       * S24：菜单勾选态在这里刷新。**不重建菜单**——重建会让已打开的 HMENU 悬空，
+       * 且每次弹菜单都闪一下；勾选是纯显示状态，按命令 id 递归改标记即可。
+       */
+      if (shell != nullptr) sync_menu_state(window, *shell);
+      return 0;
     case WM_KEYDOWN:
       if (shell != nullptr) {
         /*
@@ -5570,13 +6116,49 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
            * 两处各写一个常量迟早不一致，而症状是「点不中要的那层」——不报错、
            * 只在面板开着直方图时偶现，极难复现。
            */
+          /*
+           * S24 直方图交互：绘图区按下 = 开始框选（松开超过 4px 才真的缩放）；
+           * 标签行按下 = 复位全幅。放在图层行命中之前，两块几何互不重叠，但顺序
+           * 固定后「图里拖」与「点图层行」不会互相吃掉点击。
+           */
+          if (shell->histogram_open && !shell->histogram_bins.empty()) {
+            const comp_ui::Rect plot = comp_ui::histogram_plot_rect(layout.layer_panel);
+            if (plot.contains(mouse_x, mouse_y)) {
+              shell->histogram_drag = true;
+              shell->histogram_drag_from_x = mouse_x;
+              shell->histogram_drag_to_x = mouse_x;
+              SetCapture(window);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+            const comp_ui::Rect histogram_label =
+                comp_ui::histogram_label_rect(layout.layer_panel);
+            if (histogram_label.contains(mouse_x, mouse_y)) {
+              panel_histogram_reset(*shell);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           const int row_top = comp_ui::layer_rows_top(shell->histogram_open);
           const int row = comp_ui::layer_row_at(
               layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
               row_top);
           if (row >= 0) {
             shell->selected_layer = row;
+            /*
+             * S24 拖行重排：按下即 pending（记录起点行与 y），移动超过阈值才进入
+             * active。单击必须还是「选中」，手抖 1px 不该把层挪走；捕获在
+             * WM_LBUTTONUP / WM_CAPTURECHANGED 里释放。
+             */
+            shell->layer_drag_row = row;
+            shell->layer_drag_target = row;
+            shell->layer_drag_press_y = mouse_y;
+            shell->layer_drag_pending = true;
+            shell->layer_drag_active = false;
+            SetCapture(window);
             refresh_adjustments(*shell);
+            /* S24：效果列表同样跟随选中图层，否则菜单勾选与 fx 标记会停在上一层。 */
+            refresh_effects(*shell);
             const LayerRow* selected = selected_row(*shell);
             if (selected != nullptr) {
               wchar_t buffer[128];
@@ -5646,6 +6228,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       break;
+    case WM_LBUTTONDBLCLK:
+      /*
+       * S24：双击直方图绘图区 = 区间复位（与 PS 直方图一致）。
+       * 其它位置把双击还原成一次普通按下，画笔/选框的连点行为不受 CS_DBLCLKS 影响
+       * ——否则第二次点击会被 DBLCLK 吃掉，画笔连点就少一笔。
+       */
+      if (shell != nullptr) {
+        Layout layout{};
+        if (client_layout(*shell, &layout) && shell->histogram_open &&
+            !shell->histogram_bins.empty() &&
+            comp_ui::histogram_plot_rect(layout.layer_panel).contains(mouse_x, mouse_y)) {
+          panel_histogram_reset(*shell);
+          InvalidateRect(window, nullptr, FALSE);
+          return 0;
+        }
+      }
+      return SendMessageW(window, WM_LBUTTONDOWN, wparam, lparam);
     case WM_MBUTTONDOWN:
       if (shell != nullptr) {
         Layout layout{};
@@ -5656,6 +6255,40 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      /*
+       * S24 直方图框选收尾：位移 < 4px 视为单击（不缩放）；否则把拖出的亮度区间
+       * 设为新的可视窗口。夹取/排序全在 ui_core，这里只递交两个屏幕 x。
+       */
+      if (shell != nullptr && shell->histogram_drag) {
+        shell->histogram_drag = false;
+        shell->histogram_drag_to_x = mouse_x;
+        ReleaseCapture();
+        Layout layout{};
+        if (client_layout(*shell, &layout)) {
+          panel_histogram_commit_drag(*shell, comp_ui::histogram_plot_rect(layout.layer_panel));
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
+       * S24 拖行重排收尾。pending 但未 active = 单纯点选，什么都不做（不能把
+       * 「点一下图层」变成一次撤销步）；active 才提交，跨组由纯函数拒绝。
+       */
+      if (shell != nullptr && shell->layer_drag_pending) {
+        const bool dragged = shell->layer_drag_active;
+        const int32_t from_row = shell->layer_drag_row;
+        const int32_t to_row = shell->layer_drag_target;
+        shell->layer_drag_pending = false;
+        shell->layer_drag_active = false;
+        shell->layer_drag_row = -1;
+        shell->layer_drag_target = -1;
+        ReleaseCapture();
+        if (dragged && shell->document != nullptr) {
+          panel_drop_layer(*shell, from_row, to_row);
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->crop_active) {
         /* 框在拖拽中已实时成型（不像画笔要松手才提交），这里只收尾捕获与重绘。 */
         ReleaseCapture();
@@ -5717,6 +6350,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       /* 失焦后收不到 KEYUP / MOUSEUP：必须主动清状态，否则会「粘住」。 */
       if (shell != nullptr) {
         shell->space_down = false;
+        /* S24：拖行/框选是「按住鼠标」的临时态，失焦必须取消，否则指示线一直挂着。 */
+        shell->layer_drag_pending = false;
+        shell->layer_drag_active = false;
+        shell->histogram_drag = false;
         end_pan(window, *shell);
         stroke_cancel(*shell);
         move_cancel(*shell);
@@ -5731,6 +6368,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_CAPTURECHANGED:
       if (shell != nullptr) {
+        /* 捕获被别处抢走（菜单弹出/切窗口）时，拖行与框选一并取消，不留悬挂状态。 */
+        shell->layer_drag_pending = false;
+        shell->layer_drag_active = false;
+        shell->histogram_drag = false;
         end_pan(window, *shell);
         stroke_cancel(*shell);
         move_cancel(*shell);
@@ -5746,6 +6387,29 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
+          /*
+           * S24：图层拖行（超过 4px 阈值才进入 active）与直方图框选优先于工具状态机。
+           * 两者都持有鼠标捕获，必须在这里更新，否则松手时目标行停在按下那一行。
+           */
+          if (shell->layer_drag_pending) {
+            const int dy = mouse_y - shell->layer_drag_press_y;
+            if (!shell->layer_drag_active && (dy >= 4 || dy <= -4)) {
+              shell->layer_drag_active = true;
+            }
+            if (shell->layer_drag_active) {
+              const int32_t count = static_cast<int32_t>(shell->layers.size());
+              shell->layer_drag_target = comp_ui::layer_drag_target_row(
+                  layout.layer_panel, count, static_cast<double>(mouse_y),
+                  comp_ui::layer_rows_top(shell->histogram_open));
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
+          if (shell->histogram_drag) {
+            shell->histogram_drag_to_x = mouse_x;
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           if (shell->move_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
@@ -5913,6 +6577,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             set_status(*shell, buffer);
             InvalidateRect(window, nullptr, FALSE);
           }
+        } else if (client_layout(*shell, &layout) && layout.layer_panel.w > 0 &&
+                   shell->histogram_open &&
+                   comp_ui::histogram_plot_rect(layout.layer_panel)
+                       .contains(cursor.x, cursor.y)) {
+          /*
+           * 直方图滚轮缩放（S24，PS 同款）：以光标下的亮度为中心，一格 25%。
+           * 必须先于画布缩放判断——直方图绘图区与画布不重叠，但顺序写反会让
+           * 「光标在图内却缩放画布」成为可能；这里显式 return，语义单一。
+           */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const comp_ui::Rect plot = comp_ui::histogram_plot_rect(layout.layer_panel);
+            double focus = comp_ui::histogram_x_to_bin(plot, shell->histogram_view,
+                                                       static_cast<double>(cursor.x));
+            if (focus < 0.0) focus = 0.0;
+            if (focus > comp_ui::kHistogramMaxBin) focus = comp_ui::kHistogramMaxBin;
+            panel_histogram_zoom(*shell, delta > 0 ? 1.0 / 1.25 : 1.25, focus);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
         }
         return 0;
       }
@@ -6008,6 +6692,28 @@ HMENU build_menu() {
   /* S22 组隔离：只对图层组有意义。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleIsolated, L"切换穿透/隔离(&I)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  /*
+   * S24 镜像：水平 / 垂直两个独立位。引擎一直在合成里用 flip_x/flip_y，但 ABI
+   * 只有 setter，壳读不到现值就无法「切换」——所以 S24 补齐 getter 后接这里。
+   * 快捷键避开已被占用的 Ctrl+Shift+V（图层显隐），改用 H / F（Flip Horizontal / Flip Vertical）。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlipHorizontal, L"水平翻转(&H)\tCtrl+Shift+H");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlipVertical, L"垂直翻转(&V)\tCtrl+Shift+F");
+  /*
+   * S24 效果子菜单：6 种效果的开关（勾选 = 该层已启用），id = kCmdEffectBase + kind。
+   * 引擎侧效果早已参与像素求值（compositing/effect_eval.cpp），此前壳没有入口也没有
+   * 回读口，用户只能手改 .comp 里的 engineEffects 才能加投影/描边。
+   */
+  HMENU effect_menu = CreatePopupMenu();
+  for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
+    wchar_t effect_label[96];
+    wsprintfW(effect_label, L"%s", effect_kind_label(kind));
+    AppendMenuW(effect_menu, MF_STRING, kCmdEffectBase + static_cast<UINT>(kind), effect_label);
+  }
+  AppendMenuW(effect_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(effect_menu, MF_STRING, kCmdEffectClear, L"清除全部效果(&C)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(effect_menu), L"效果(&E)");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\tCtrl+]");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveLeft, L"平移左(&L)	Shift+←");
@@ -6064,6 +6770,7 @@ HMENU build_menu() {
    * 用户看不到图现在偏暗还是偏亮，只能凭感觉拖参数。
    */
   AppendMenuW(view_menu, MF_STRING, kCmdHistogramToggle, L"亮度直方图(&H)\tF6");
+  AppendMenuW(view_menu, MF_STRING, kCmdHistogramReset, L"直方图区间复位(&R)\t双击图内");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view_menu), L"视图(&V)");
 
   /* 工具菜单与工具条、快捷键共用同一张表（tool_table），不另抄一份键位。 */
@@ -6708,6 +7415,103 @@ int run_selftest(const wchar_t* out_path) {
   }
   verify(s22_undone > 0, "S22 writes left undoable history and were rolled back");
   verify(s22_depth_end == s22_depth_baseline, "S22 rollback reaches the pre-S22 depth");
+
+  /*
+   * S24 段：镜像读回（comp_layer_get_flip）+ 效果枚举（comp_layer_effect_count/at）。
+   *
+   * 这两对是「引擎早就算、壳却读不回」的最后一组：flip 早已折进采样坐标
+   * （resample.cpp），6 个 effect kind 早已参与像素求值（effect_eval.cpp），
+   * 但 ABI 只有写口——壳读不到现值就只能盲目取反，也画不出「这层带了什么效果」、
+   * 菜单更无法标出已启用项。
+   *
+   * 判据不采「调用返回 OK」：效果那段必须证明像素真的变了（纯元数据实现也能让
+   * count == 1 通过），翻转那段必须证明同值写入不产生撤销步（否则撤销栈被空步塞满）。
+   */
+  size_t s24_depth_baseline = 0;
+  comp_document_history_stats(document, &s24_depth_baseline, &redo_depth);
+
+  int32_t flip_now_x = -1;
+  int32_t flip_now_y = -1;
+  verify(comp_layer_get_flip(document, layer, &flip_now_x, &flip_now_y) == COMP_OK &&
+             flip_now_x == 0 && flip_now_y == 0,
+         "get_flip reports no flip on a fresh layer");
+  verify(comp_layer_set_flip(document, layer, 1, 0) == COMP_OK &&
+             comp_layer_get_flip(document, layer, &flip_now_x, &flip_now_y) == COMP_OK &&
+             flip_now_x == 1 && flip_now_y == 0,
+         "flip round trip (set horizontal -> get)");
+
+  size_t flip_depth_after_set = 0;
+  comp_document_history_stats(document, &flip_depth_after_set, &redo_depth);
+  verify(comp_layer_set_flip(document, layer, 1, 0) == COMP_OK, "set_flip same value again");
+  size_t flip_depth_after_noop = 0;
+  comp_document_history_stats(document, &flip_depth_after_noop, &redo_depth);
+  verify(flip_depth_after_noop == flip_depth_after_set,
+         "same-value set_flip adds no undo step");
+
+  verify(comp_layer_set_flip(document, layer, 0, 0) == COMP_OK &&
+             comp_layer_get_flip(document, layer, &flip_now_x, &flip_now_y) == COMP_OK &&
+             flip_now_x == 0 && flip_now_y == 0,
+         "flip cleared back to 0/0");
+
+  size_t effect_count_now = 123u;
+  verify(comp_layer_effect_count(document, layer, &effect_count_now) == COMP_OK &&
+             effect_count_now == 0,
+         "effect_count is 0 before any effect is added");
+
+  const char* overlay_settings = "{\"red\":0,\"green\":0,\"blue\":1}";
+  verify(comp_layer_set_effect(document, layer, 2u, overlay_settings) == COMP_OK,
+         "comp_layer_set_effect(Color Overlay, blue)");
+  verify(comp_layer_effect_count(document, layer, &effect_count_now) == COMP_OK &&
+             effect_count_now == 1,
+         "effect_count() == 1 after adding an effect");
+
+  uint32_t effect_kind_now = 999u;
+  size_t effect_settings_size = 0;
+  verify(comp_layer_effect_at(document, layer, 0u, &effect_kind_now, nullptr, 0,
+                              &effect_settings_size) == COMP_OK &&
+             effect_kind_now == 2u && effect_settings_size == std::strlen(overlay_settings),
+         "effect_at() reports kind and settings length (two-pass probe)");
+  std::vector<char> effect_settings(effect_settings_size + 1u, '\0');
+  verify(comp_layer_effect_at(document, layer, 0u, &effect_kind_now, effect_settings.data(),
+                              effect_settings.size(), &effect_settings_size) == COMP_OK &&
+             std::strcmp(effect_settings.data(), overlay_settings) == 0,
+         "effect_at() round trips the settings JSON verbatim");
+
+  std::vector<uint8_t> effect_after(flattened.size(), 0);
+  const bool effect_flatten_after =
+      comp_render_flatten(document, effect_after.data(), COMP_PIXEL_RGBA8, stride) == COMP_OK;
+  /*
+   * 判据取「蓝上来了、红下去了」，不写死 255：图层像素是 50% 预乘红
+   * (128,0,0,128)，颜色叠加按覆盖率求值，落盘仍是预乘值 —— 蓝色通道是
+   * 0..255 的 50% (=128)，写死 b > 200 会把自己的判据判错，而不是产品错了。
+   */
+  const bool effect_pixels_ok = effect_flatten_after && effect_after.size() >= 4u &&
+                                effect_after[2] >= 100u && effect_after[0] < 60u &&
+                                effect_after[2] > effect_after[0];
+  verify(effect_pixels_ok, "color overlay written through the ABI really changes the canvas");
+  if (effect_after.size() >= 4u) {
+    std::fprintf(report, "[info] overlay pixel = (%u,%u,%u,%u)\n", effect_after[0],
+                 effect_after[1], effect_after[2], effect_after[3]);
+  }
+
+  verify(comp_layer_remove_effect(document, layer, 2u) == COMP_OK &&
+             comp_layer_effect_count(document, layer, &effect_count_now) == COMP_OK &&
+             effect_count_now == 0,
+         "effect removal clears the list");
+
+  /* 撤销回 S24 基线（同 S22 的口径：既撤又要断言真的撤过，避免假护栏）。 */
+  size_t s24_undone = 0;
+  for (;;) {
+    size_t current = 0;
+    comp_document_history_stats(document, &current, &redo_depth);
+    if (current <= s24_depth_baseline) break;
+    if (comp_document_undo(document) != COMP_OK) break;
+    ++s24_undone;
+  }
+  verify(s24_undone > 0, "S24 writes were undoable and rolled back");
+  size_t s24_depth_end = 0;
+  comp_document_history_stats(document, &s24_depth_end, &redo_depth);
+  verify(s24_depth_end == s24_depth_baseline, "S24 rollback reaches the pre-S24 depth");
 
   /*
    * 调整面板链路（面板真正走的接口序列）：
@@ -8322,7 +9126,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   const wchar_t* class_name = L"CompositorShellWindow";
   WNDCLASSEXW window_class{};
   window_class.cbSize = sizeof(window_class);
-  window_class.style = CS_HREDRAW | CS_VREDRAW;
+  /* S24：CS_DBLCLKS —— 直方图双击复位需要 WM_LBUTTONDBLCLK（其它位置已还原成普通按下）。 */
+  window_class.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
   window_class.lpfnWndProc = window_proc;
   window_class.hInstance = instance;
   window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);

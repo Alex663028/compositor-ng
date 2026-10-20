@@ -466,3 +466,27 @@ coverage 把样本盖回当前像素。
   基线 478 → **485 用例**（`test_ui_core` 41 → **45**），壳自检 203 → **205 项**（diff 仅新增
   两行），`--gpu` 变体 485/0 且自检 205/0，`run_regression.py --require-ohos` 6/6 PASS。
   见 README §6.33。**S22 的非目标全部维持**（效果层、拖行重排、直方图交互、菜单勾选态、镜像）。
+
+- S24 追加（2026-10-20）：新增 4 个导出 ABI，**导出数 115 → 119**，像素公式与既有导出签名不变：
+  - `comp_layer_set_flip` / `comp_layer_get_flip`（第 116 / 117 个导出）：镜像回读口。引擎早已把
+    `layer.flip_x/flip_y` 折进采样坐标（`resample.cpp` 的 `us = -us`，按局部中心镜像、`x → w-1-x`，
+    `gpu_plan.cpp` 因此禁用 GPU 快路径），但 ABI 只有写口——壳读不到现值只能盲目取反，菜单也无法
+    显示当前方向。写入归一化为布尔，同值写入不产生撤销步。
+  - `comp_layer_effect_count` / `comp_layer_effect_at`（第 118 / 119 个导出）：效果枚举。`effect_at`
+    走两段式（`settings_json` 为 `nullptr` 或 `capacity` 为 0 时只回报长度；三个出参均可选，全空 =
+    只探测该下标存在），JSON 逐字回读、未知键保留；索引越界 `COMP_ERR_INVALID_ARGUMENT`，
+    未知图层 `COMP_ERR_NOT_FOUND`，只读不脏。
+  - **纠正 S22 的旧结论**：`set_effect` 不是「纯元数据」。`effect_eval.cpp` 对 6 种
+    `kEffectStroke(0)..kEffectInnerGlow(5)` 全部按颜色/不透明度/尺寸/角度/距离/模糊参与像素求值，
+    `composite_ops.cpp` 用 `effects_margin()` 扩边后 `apply_effects`，`test_layer_merge` 已证明合并
+    会烘焙效果。缺的只是枚举回读，不是求值能力。
+  - 壳侧同期落地：效果子菜单（6 档勾选 + 清除全部）、面板行 `fx` 标记、拖行重排（`plan_layer_drag`，
+    仅同父，落点指示线与行矩形同源）、直方图区间缩放（拖拽框选 / 滚轮 / 双击复位，`HistogramView`
+    + `kHistogramMinSpan=8`）、`WM_INITMENU` 勾选态（`layer_menu_checks`，不重建菜单）。修掉一个
+    浮点边界：缩到全幅后继续缩会得到 `lo=1.8e-15 / hi=255`，`histogram_view_is_full` 判假而标签
+    显示「直方图 0–255」，已收口为「跨度顶满即归位 0..255」。
+  基线 485 → **492 用例**（`test_ui_core` 45 → **50**、`test_abi` 27 → **29**），壳自检 205 →
+  **219 项**（diff 仅新增 15 行），`--gpu` 变体 `--present-bench` 报 `backend=D3D12`，
+  `run_regression.py --require-ohos` 6/6 PASS。见 README §6.34。
+  **边界**：效果无参数编辑 UI、无效果重排、清理 N 个效果 = N 步撤销；拖行仅同父（跨组明确拒绝）；
+  镜像仅菜单/快捷键；变换拖拽控制框与非均匀缩放仍未做。

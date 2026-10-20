@@ -1812,3 +1812,327 @@ COMP_TEST(ui_core_histogram_geometry_clears_title_and_rows) {
   COMP_CHECK(comp_ui::layer_row_at(panel, 3, row0.x + row0.w / 2.0, mid0, rows_top) == 0);
   COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, block.y + 1, rows_top) == -1);
 }
+
+/* ============================================================ S24 用例 */
+
+namespace {
+
+/* 按引擎「先 erase 后插到锚点之前」语义复算一次拖拽，返回落定后的数组（自下而上）。 */
+std::vector<int64_t> simulate_layer_drag(const std::vector<int64_t>& array,
+                                         const comp_ui::DragPlan& plan, int32_t from_shown) {
+  if (!plan.ok()) return array;
+  const int32_t from_index = static_cast<int32_t>(array.size()) - 1 - from_shown;
+  if (from_index < 0 || from_index >= static_cast<int32_t>(array.size())) return array;
+  const int64_t dragged = array[static_cast<size_t>(from_index)];
+  const int64_t anchor =
+      plan.before_index < 0 ? 0 : array[static_cast<size_t>(plan.before_index)];
+  std::vector<int64_t> result = array;
+  result.erase(result.begin() + from_index);
+  if (anchor == 0) {
+    /* comp_layer_reorder 的 before == 0 = 同级末尾（栈顶）。 */
+    result.push_back(dragged);
+  } else {
+    const auto it = std::find(result.begin(), result.end(), anchor);
+    result.insert(it == result.end() ? result.end() : it, dragged);
+  }
+  return result;
+}
+
+int32_t shown_row_of(const std::vector<int64_t>& array, int64_t id) {
+  for (size_t i = 0; i < array.size(); ++i) {
+    if (array[i] == id) return static_cast<int32_t>(array.size() - 1 - i);
+  }
+  return -1;
+}
+
+}  // namespace
+
+/*
+ * 菜单勾选态（S24）。
+ *
+ * Win32 的 CheckMenuItem 本身不可测，可测的是「该勾哪几项」的判定规则：
+ * 无选中层不能勾、非组的 isolated 置 1 也不算、越界档位必须先夹。规则搬进
+ * ui_core 就是为了能在这里表驱动穷举——否则「勾错了」只能靠肉眼开菜单看。
+ */
+COMP_TEST(ui_core_layer_menu_checks_follow_state_rules) {
+  /* 1. 无选中层：除直方图（文档级视图态）外一律不勾，采样/混合显式 -1。 */
+  comp_ui::LayerMenuState state;
+  comp_ui::LayerMenuChecks checks = comp_ui::layer_menu_checks(state);
+  COMP_CHECK(!checks.visible && !checks.clipping && !checks.isolated && !checks.histogram);
+  COMP_CHECK_MSG(checks.sampling == -1, "无选中层时采样不得勾任何一项");
+  COMP_CHECK_MSG(checks.blend == -1, "无选中层时混合不得勾任何一项");
+
+  state.histogram_open = true;
+  checks = comp_ui::layer_menu_checks(state);
+  COMP_CHECK(checks.histogram);
+  COMP_CHECK(!checks.visible);
+
+  /* 2. 有选中层：可见/剪贴如实透传；isolated 只在「是组」时才有意义。 */
+  state.has_layer = true;
+  state.visible = true;
+  state.clipping = true;
+  state.isolated = true; /* 非组层置 1：引擎不参与合成，勾上即误导 */
+  state.sampling = 2;
+  state.blend = 7;
+  checks = comp_ui::layer_menu_checks(state);
+  COMP_CHECK(checks.visible && checks.clipping);
+  COMP_CHECK_MSG(!checks.isolated, "非组层的 isolated 不得勾");
+  COMP_CHECK(checks.sampling == 2 && checks.blend == 7);
+
+  state.is_group = true;
+  checks = comp_ui::layer_menu_checks(state);
+  COMP_CHECK(checks.isolated);
+
+  /* 3. 越界档位先夹再勾：绝不能把不存在的档位勾上（勾错档 = 用户以为模式变了）。 */
+  state.sampling = -5;
+  state.blend = 999;
+  checks = comp_ui::layer_menu_checks(state);
+  COMP_CHECK(checks.sampling == comp_ui::clamp_sampling_mode(-5));
+  COMP_CHECK(checks.blend == comp_ui::clamp_blend_mode(999));
+  COMP_CHECK(checks.sampling >= 0 && checks.sampling < comp_ui::kSamplingCount);
+  COMP_CHECK(checks.blend >= 0 && checks.blend < comp_ui::kBlendCount);
+  COMP_CHECK(checks.sampling == 0);
+  COMP_CHECK(checks.blend == comp_ui::kBlendCount - 1);
+}
+
+/*
+ * 效果档位表（S24）。
+ *
+ * 数值 0..5 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序
+ * （effect_eval.cpp 的 kEffectStroke..kEffectInnerGlow）逐字一致：菜单 id 用
+ * kCmdEffectBase + kind 拼出来，表错一位就是「点描边结果加了投影」。
+ */
+COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
+  const char* expected[] = {"Stroke",  "Drop Shadow", "Color Overlay",
+                            "Inner Shadow", "Outer Glow", "Inner Glow"};
+  COMP_CHECK(comp_ui::kEffectKindCount == 6);
+  for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
+    COMP_CHECK_MSG(std::string(comp_ui::effect_kind_name(kind)) == expected[kind],
+                   "效果档位顺序必须与引擎一致");
+  }
+
+  /* 越界夹取：负 -> 首项，超界 -> 末项（菜单 id 永不指向不存在的档位）。 */
+  COMP_CHECK(comp_ui::clamp_effect_kind(-3) == 0);
+  COMP_CHECK(comp_ui::clamp_effect_kind(comp_ui::kEffectKindCount) ==
+             comp_ui::kEffectKindCount - 1);
+  COMP_CHECK(std::string(comp_ui::effect_kind_name(-1)) == "Stroke");
+  COMP_CHECK(std::string(comp_ui::effect_kind_name(99)) == "Inner Glow");
+
+  /* 勾选判定：null / 空表必须 false，命中与未命中都要对。 */
+  const uint32_t kinds[] = {2u, 5u};
+  COMP_CHECK(!comp_ui::effect_list_contains(nullptr, 3, 0));
+  COMP_CHECK(!comp_ui::effect_list_contains(kinds, 0, 2));
+  COMP_CHECK(comp_ui::effect_list_contains(kinds, 2, 2));
+  COMP_CHECK(comp_ui::effect_list_contains(kinds, 2, 5));
+  COMP_CHECK(!comp_ui::effect_list_contains(kinds, 2, 1));
+  /* 负 kind 被夹到 0，但 0 不在表里 —— 夹取不得变成「误命中」。 */
+  COMP_CHECK(!comp_ui::effect_list_contains(kinds, 2, -1));
+}
+
+/*
+ * 拖行重排（S24）：plan_layer_drag 必须与引擎 comp_layer_reorder 的语义逐位对齐。
+ *
+ * 这里不「相信」实现里的注释，而是用 erase+insert 独立复算一遍落点，再和
+ * plan.next_row 对账——注释写错、下标差一、拖到顶时 anchor=-1 的口径弄反，
+ * 都会在这里露出来。跨父级必须如实拒绝（面板不画缩进，静默改父子关系等于「层没了」）。
+ */
+COMP_TEST(ui_core_plan_layer_drag_keeps_engine_semantics) {
+  /* 5 个同父图层，数组自下而上；面板行 0 = 105（栈顶）。 */
+  const comp_ui::LayerStackEntry same_parent[5] = {
+      {101, 0, 0}, {102, 0, 0}, {103, 0, 0}, {104, 0, 0}, {105, 0, 0}};
+  const std::vector<int64_t> array = {101, 102, 103, 104, 105};
+  const int32_t count = 5;
+
+  for (int32_t from = 0; from < count; ++from) {
+    for (int32_t to = 0; to < count; ++to) {
+      const comp_ui::DragPlan plan = comp_ui::plan_layer_drag(same_parent, count, from, to);
+      if (from == to) {
+        COMP_CHECK_MSG(!plan.ok(), "落点即原行：不得产生写入");
+        COMP_CHECK(plan.target == comp_ui::DragTarget::kSameRow);
+        COMP_CHECK(plan.before_index == -1);
+        COMP_CHECK(plan.next_row == from);
+        continue;
+      }
+      COMP_CHECK(plan.ok());
+      const int64_t dragged = array[static_cast<size_t>(count - 1 - from)];
+      const std::vector<int64_t> after = simulate_layer_drag(array, plan, from);
+      COMP_CHECK_MSG(shown_row_of(after, dragged) == to, "落点行必须是 to_shown");
+      COMP_CHECK_MSG(shown_row_of(after, dragged) == plan.next_row,
+                     "选中态必须跟到 next_row（否则拖完选错层）");
+      /* 未参与拖拽的元素相对顺序不得变化（拖一层不能顺手重排别层）。 */
+      std::vector<int64_t> others_before;
+      for (int64_t id : array) {
+        if (id != dragged) others_before.push_back(id);
+      }
+      std::vector<int64_t> others_after;
+      for (int64_t id : after) {
+        if (id != dragged) others_after.push_back(id);
+      }
+      COMP_CHECK(others_before == others_after);
+    }
+  }
+
+  /* 拖到最顶 = 锚点取「同级末尾」(-1)；其余方向锚点是当前数组里的真实下标。 */
+  comp_ui::DragPlan plan = comp_ui::plan_layer_drag(same_parent, count, 4, 0);
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.before_index == -1);
+  COMP_CHECK(plan.next_row == 0);
+
+  /* 跨父级：如实拒绝，next_row 停原位（不回 0、不乱跳）。 */
+  const comp_ui::LayerStackEntry mixed[4] = {
+      {201, 0, 0}, {202, 0, 0}, {203, 77, 0}, {204, 77, 0}};
+  /* 面板行 0 = 204(77)、1 = 203(77)、2 = 202(根)、3 = 201(根)。 */
+  plan = comp_ui::plan_layer_drag(mixed, 4, 0, 2);
+  COMP_CHECK(!plan.ok());
+  COMP_CHECK(plan.target == comp_ui::DragTarget::kCrossParent);
+  COMP_CHECK(plan.next_row == 0);
+  plan = comp_ui::plan_layer_drag(mixed, 4, 0, 1); /* 同组内 204 -> 203 上面 */
+  COMP_CHECK(plan.ok());
+  plan = comp_ui::plan_layer_drag(mixed, 4, 2, 3); /* 根级相邻 */
+  COMP_CHECK(plan.ok());
+
+  /* 非法输入：空指针 / 空表 / 越界下标一律 kInvalid，不得越界读。 */
+  COMP_CHECK(!comp_ui::plan_layer_drag(nullptr, 4, 0, 1).ok());
+  COMP_CHECK(comp_ui::plan_layer_drag(nullptr, 4, 0, 1).target == comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, 0, 0, 0).target ==
+             comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, -1, 0).target ==
+             comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, 0, -1).target ==
+             comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, 0, count).target ==
+             comp_ui::DragTarget::kInvalid);
+}
+
+/*
+ * 拖行几何（S24）：指示线 / 落点行必须与行矩形同源。
+ *
+ * 历史上这类「两处各算一套坐标」的 bug 已经出现过（S23 直方图块与行起点错位 30px），
+ * 症状都不报错、只在特定面板状态下偏移。这里把三条不变式钉死：
+ *   1. slot 行指示线 = 该行上边缘 - 1px；slot == count 时 = 末行下边缘；
+ *   2. 直方图开关只整体平移同样的 rows_top；
+ *   3. 鼠标 y 落在行中心必判回本行，越界夹到首末行。
+ */
+COMP_TEST(ui_core_layer_drag_geometry_tracks_row_top) {
+  const Rect panel{0, 46, 248, 600};
+  const int32_t count = 4;
+  const int rows_top = comp_ui::layer_rows_top(true);
+
+  for (int32_t slot = 0; slot <= count; ++slot) {
+    const Rect line = comp_ui::layer_insert_line_rect(panel, rows_top, slot, count);
+    const int expected_y =
+        panel.y + comp_ui::kLayerHeaderHeight + rows_top + slot * comp_ui::kLayerRowHeight - 1;
+    COMP_CHECK(line.y == expected_y);
+    COMP_CHECK(line.h == 2);
+    COMP_CHECK(line.x >= panel.x && line.right() <= panel.right());
+    if (slot < count) {
+      const Rect row = comp_ui::layer_row_rect(panel, slot, rows_top);
+      COMP_CHECK_MSG(line.y + 1 == row.y, "指示线必须贴目标行上边缘");
+    }
+  }
+  const Rect last_row = comp_ui::layer_row_rect(panel, count - 1, rows_top);
+  const Rect bottom_line = comp_ui::layer_insert_line_rect(panel, rows_top, count, count);
+  COMP_CHECK(bottom_line.y + 1 == last_row.bottom());
+
+  /* 直方图开关只平移同一偏移量（不是各算一套）。 */
+  const int rows_top_off = comp_ui::layer_rows_top(false);
+  const Rect no_hist = comp_ui::layer_insert_line_rect(panel, rows_top_off, 2, count);
+  const Rect with_hist = comp_ui::layer_insert_line_rect(panel, rows_top, 2, count);
+  COMP_CHECK(with_hist.y - no_hist.y == rows_top - rows_top_off);
+  COMP_CHECK(rows_top_off == 0);
+
+  /* 插槽换算：向上拖画上边缘、向下拖画下边缘。 */
+  COMP_CHECK(comp_ui::layer_drag_insert_slot(3, 1) == 1);
+  COMP_CHECK(comp_ui::layer_drag_insert_slot(1, 3) == 4);
+
+  /* 鼠标 y -> 行：行中心必判回本行；上下越界夹到首末行；无层 -> -1。 */
+  for (int32_t row = 0; row < count; ++row) {
+    const Rect rect = comp_ui::layer_row_rect(panel, row, rows_top);
+    const double mid = rect.y + comp_ui::kLayerRowHeight * 0.5;
+    COMP_CHECK(comp_ui::layer_drag_target_row(panel, count, mid, rows_top) == row);
+  }
+  COMP_CHECK(comp_ui::layer_drag_target_row(panel, count, panel.y - 500.0, rows_top) == 0);
+  COMP_CHECK(comp_ui::layer_drag_target_row(panel, count, panel.bottom() + 500.0, rows_top) ==
+             count - 1);
+  COMP_CHECK(comp_ui::layer_drag_target_row(panel, 0, 100.0, rows_top) == -1);
+}
+
+/*
+ * 直方图可视窗口（S24）：夹取 / 缩放 / 映射三件套。
+ *
+ * 夹取是防崩的那一层：跨度 0 会让 histogram_bin_x 除以 0，NaN 坐标交给 GDI 的结果
+ * 是一整块空白且不报错。缩放要保证「光标下的那根柱不跑」，映射要与命中测试共用，
+ * 否则放大后曲线和鼠标位置对不上。框选还要容忍反向拖与单点框。
+ */
+COMP_TEST(ui_core_histogram_view_clamp_zoom_and_mapping) {
+  /* 1. 夹取：默认全幅、反向先排序、跨度不足补中心、越界整体平移。 */
+  const comp_ui::HistogramView full = comp_ui::clamp_histogram_view(0.0, 255.0);
+  COMP_CHECK(comp_ui::histogram_view_is_full(full));
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(full), 255.0));
+
+  const comp_ui::HistogramView swapped = comp_ui::clamp_histogram_view(200.0, 50.0);
+  COMP_CHECK(near_value(swapped.lo, 50.0) && near_value(swapped.hi, 200.0));
+
+  const comp_ui::HistogramView tiny = comp_ui::clamp_histogram_view(100.0, 102.0);
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(tiny), comp_ui::kHistogramMinSpan));
+  COMP_CHECK(near_value((tiny.lo + tiny.hi) * 0.5, 101.0)); /* 补跨度时中心不动 */
+
+  const comp_ui::HistogramView low = comp_ui::clamp_histogram_view(-40.0, 40.0);
+  COMP_CHECK(near_value(low.lo, 0.0));
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(low), 80.0)); /* 平移不缩跨度 */
+
+  const comp_ui::HistogramView high = comp_ui::clamp_histogram_view(230.0, 300.0);
+  COMP_CHECK(near_value(high.hi, comp_ui::kHistogramMaxBin));
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(high), 70.0));
+
+  /* NaN 一律回落全幅（否则 NaN 会一路传到 GDI）。 */
+  COMP_CHECK(comp_ui::histogram_view_is_full(comp_ui::clamp_histogram_view(std::nan(""), 100.0)));
+  COMP_CHECK(comp_ui::histogram_view_is_full(comp_ui::clamp_histogram_view(100.0, std::nan(""))));
+
+  /* 2. 缩放：focus 在窗口里的相对位置不变；极限处跨度锁死在最小跨度。 */
+  const comp_ui::HistogramView zoomed = comp_ui::zoom_histogram_view(full, 128.0, 0.5);
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(zoomed), 127.5));
+  COMP_CHECK(near_value(zoomed.lo, 64.0));
+  COMP_CHECK(near_value(zoomed.hi, 191.5));
+  const double t_before = (128.0 - full.lo) / comp_ui::histogram_view_span(full);
+  const double t_after = (128.0 - zoomed.lo) / comp_ui::histogram_view_span(zoomed);
+  COMP_CHECK_MSG(near_value(t_before, t_after), "缩放必须锚定 focus，光标下的柱不能跑");
+  COMP_CHECK(!comp_ui::histogram_view_is_full(zoomed));
+
+  comp_ui::HistogramView deepest = full;
+  for (int i = 0; i < 64; ++i) {
+    deepest = comp_ui::zoom_histogram_view(deepest, 128.0, 0.5);
+  }
+  COMP_CHECK(near_value(comp_ui::histogram_view_span(deepest), comp_ui::kHistogramMinSpan));
+
+  comp_ui::HistogramView reset = deepest;
+  for (int i = 0; i < 64; ++i) {
+    reset = comp_ui::zoom_histogram_view(reset, 128.0, 2.0);
+  }
+  COMP_CHECK_MSG(comp_ui::histogram_view_is_full(reset), "连续缩小必须回到全幅且不越界");
+
+  /* 3. 映射：两端严格对齐绘图区左右边，中间线性，bin->x->bin 往返稳定。 */
+  const Rect plot{0, 100, 200, 64};
+  const comp_ui::HistogramView view{64.0, 192.0};
+  COMP_CHECK(near_value(comp_ui::histogram_bin_x(plot, view, view.lo), plot.x));
+  COMP_CHECK(near_value(comp_ui::histogram_bin_x(plot, view, view.hi), plot.x + plot.w));
+  const double xs[] = {0.0, 1.0, 37.5, 100.0, 199.0, 200.0};
+  for (double x : xs) {
+    const double bin = comp_ui::histogram_x_to_bin(plot, view, x);
+    COMP_CHECK(near_value(comp_ui::histogram_bin_x(plot, view, bin), x));
+  }
+  COMP_CHECK(near_value(comp_ui::histogram_x_to_bin(plot, view, plot.x + plot.w * 0.5), 128.0));
+
+  /* 4. 框选：反向拖取排序后两端；单点框不得产生 0 跨度；全幅拖出即全幅。 */
+  const comp_ui::HistogramView selected =
+      comp_ui::histogram_window_from_drag(plot, full, 150.0, 50.0);
+  COMP_CHECK(near_value(selected.lo, 50.0 / 200.0 * 255.0));
+  COMP_CHECK(near_value(selected.hi, 150.0 / 200.0 * 255.0));
+
+  const comp_ui::HistogramView one_pixel =
+      comp_ui::histogram_window_from_drag(plot, full, 90.0, 90.0);
+  COMP_CHECK(comp_ui::histogram_view_span(one_pixel) >= comp_ui::kHistogramMinSpan);
+
+  COMP_CHECK(comp_ui::histogram_view_is_full(
+      comp_ui::histogram_window_from_drag(plot, full, -1000.0, 1000.0)));
+}

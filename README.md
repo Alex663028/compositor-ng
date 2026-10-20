@@ -3632,3 +3632,34 @@ S22 交付后 Claude 复审 `07397ad`，判出四项：**P1-a / P1-b 必修**、
 **8. 边界（如实记录）。** 直方图仍无缩放/平移交互；图层面板仍不支持拖行重排（只有菜单/快捷键）；延续 S22 的非目标：效果层、蒙版即滤镜图里程碑、变换拖拽控制框、菜单勾选态、镜像（需新 ABI）。
 
 报告：`../report/S23-review-fixes-20261020-dsh.md`。
+
+### 6.34 S24 S23 剩余五项非目标收口：效果层 / 拖行重排 / 直方图交互 / 菜单勾选态 / 镜像（2026-10-20，DSH）
+
+S23 报告 §9 列了五项非目标，ALEX 要求「一并做完再交测」。五项全部落地，新增 4 个导出 ABI（115 → **119**）。
+
+**1. 镜像（需新 ABI）——引擎早就在算，只是读不回。** `resample.cpp` 的 `if (layer.flip_x) us = -us;` 一直按局部中心镜像（`x → w-1-x`），`gpu_plan.cpp` 也因翻转禁用 GPU 快路径；但 ABI 只有写口没有回读，壳只能「盲取反」、菜单也显示不了当前方向。新增 `comp_layer_set_flip` / `comp_layer_get_flip`：写入归一化为布尔（`-1/2 → 1/1`），**同值写入不产生撤销步**（否则空步塞满撤销栈，用户按一次撤销画面不动）。用例用 8×8 左半红图：翻转后像素跑到右半，撤销后逐字节回到左侧。
+
+**2. 效果层——顺带纠正 S22 报告的一处旧结论。** S22 写「效果纯元数据、内核不参与像素求值，属滤镜图里程碑」。实测不成立：`effect_eval.cpp` 对 6 种 kind（Stroke / Drop Shadow / Color Overlay / Inner Shadow / Outer Glow / Inner Glow）都按颜色 + 不透明度 + 尺寸/角度/距离/模糊求值，`composite_ops.cpp` 用 `effects_margin()` 扩边后 `apply_effects`，`test_layer_merge` 已证明合并会把效果烘焙进像素。真正缺的是**枚举回读**，不是求值能力：新增 `comp_layer_effect_count` / `comp_layer_effect_at`（两段式，JSON 逐字回读、未知键保留、越界 `INVALID_ARGUMENT`、只读不脏）。壳侧 Layer 菜单新增「效果」子菜单（6 档开关 + 清除全部），勾选态显示该层已启用档位，图层行尾标记 `fx`。
+
+| 档位（即 `.comp` 的 `engineEffects[].effect`） | 默认参数 |
+|---|---|
+| 0 Stroke 描边 | size 4, opacity 1, inside=false |
+| 1 Drop Shadow 投影 | angle 90, distance 20, blur 20, opacity .5 |
+| 2 Color Overlay 颜色叠加 | 黑, opacity 1 |
+| 3 Inner Shadow 内阴影 | angle 90, distance 10, blur 10, opacity .5 |
+| 4 Outer Glow 外发光 | size 20, opacity .75 |
+| 5 Inner Glow 内发光 | size 10, opacity .75 |
+
+**3. 拖行重排。** 面板行拖到另一行即重排，规则抽成 `comp_ui::plan_layer_drag`：只允许**同父**拖拽（面板是扁平列表、不画缩进，跨组拖会改 parent 而用户看不出层去了哪个组——「层没了」比「明确拒绝」糟得多）；落点即原行返回 `kSameRow` 不产生写入；跨父返回 `kCrossParent` 并停原位。落点指示线 `layer_insert_line_rect` 与行矩形同源（同一个 `rows_top`），移动超过 4px 才进入拖拽态。用例用 erase+insert 独立复算 5×5 全部方向，比对「落点行 == 用户看到的那一行」与「选中态跟随」。
+
+**4. 直方图交互。** `HistogramView{lo,hi}` + 一组纯函数：绘图区横向拖拽 = 放大到框选区间，滚轮 = 以光标亮度为中心 25% 缩放，双击 = 复位全幅；最小跨度 8 个 bin（0 跨度会让映射除以 0，NaN 坐标交给 GDI 是一整块空白且不报错）。调试中发现一个真 bug：缩到全幅后继续「缩小一档」会得到 `lo = 1.8e-15 / hi = 255`——画面与全幅一样，但 `histogram_view_is_full` 判假，标签会一直显示「直方图 0–255」这种自相矛盾的放大态；已在 `clamp_histogram_view` 收口为「跨度顶满即归位 0..255」。
+
+**5. 菜单勾选态。** 菜单只在启动时建一次（`build_menu` 交给 `CreateWindowW`），勾选态只能在 `WM_INITMENU` 刷。判定规则抽成 `comp_ui::layer_menu_checks`：无选中层不勾任何项（采样/混合显式 `-1`）、非组图层的 `isolated` 置 1 也不算、越界档位先夹再勾、直方图开关是文档级状态与选中层无关。`menu_set_checked_recursive` / `menu_radio_check_recursive` 在子菜单树里按命令 id 定位，**不重建菜单**（重建会丢用户态并让快捷键表失效）。
+
+**6. 验证。** 单测 485 → **492 例 / 0 失败**（`test_ui_core` 45 → 50、`test_abi` 27 → 29）；壳自检 205 → **219 项 / 0 失败**（`Compare-Object` 逐行确认 diff 仅新增 15 行：14 条 OK + 1 条 info；基线 SHA256 `E277A4C4…`）；`run_regression.py --require-ohos` **6/6 PASS**（OHOS `ok=91 fail=0`）；`--gpu` 变体 `--present-bench` 报 `backend=D3D12`（GPU 直呈 avg 1.55ms/帧 vs CPU flatten+blit 2.18ms/帧，20 帧）。ABI 导出 115 → **119**。
+
+**7. 又一次「判据比产品更可疑」。** 自检里我断言颜色叠加后蓝通道 `> 200`，实测 `(0,0,128,128)`——图层像素是 50% 预乘红，叠加按覆盖率求值、落盘仍是预乘值，蓝色就是 128。产品对、断言错：改成「蓝上来、红下去」并把原因写进注释。另一处：`effect_at` 我最初断言「三个出参全给 nullptr 应返回 `INVALID_ARGUMENT`」，而既有 `comp_layer_adjustment_at` 的口径是三个出参都可选（全空 = 只探测该下标是否存在）——以既有口径为准，改断言并在头文件写清。
+
+**8. 边界（如实记录）。** 效果无参数编辑 UI（只有 6 档开关 + 默认参数）、无效果重排；清除 N 个效果 = N 步撤销，不是一步；拖行仅同父（跨组明确拒绝，不支持拖进/拖出组）；镜像只有菜单 + `Ctrl+Shift+H/F`，无可视控制柄；变换仍无拖拽控制框、非均匀缩放仍缺（S21 遗留）。沿用既有口径：M1–M16 人工目视由 ALEX 本人执行，本轮不代为声称。
+
+报告：`../report/S24-nongoals-20261020-dsh.md`。

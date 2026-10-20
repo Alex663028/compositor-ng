@@ -2080,6 +2080,287 @@ inline int layer_rows_top(bool histogram_open) {
   return histogram_open ? Layout::kHistogramHeight : 0;
 }
 
+/* ============================================ S24：菜单态 / 拖行 / 直方图区间 */
+
+/* -------------------------------------------------------- 菜单勾选态（S24） */
+
+/*
+ * 为什么把「该勾哪几项」做成纯函数：菜单只在启动时建一次（build_menu 交给
+ * CreateWindowW），勾选态只能在 WM_INITMENU 里刷。Win32 的 CheckMenuItem 本身
+ * 没有可测的地方，可测的是**判定规则**——无选中层时不能勾、非组的 isolated 置 1
+ * 也不算、采样/混合必须落在合法档位。规则搬到这里就能表驱动穷举，否则「勾错了」
+ * 只能靠肉眼开菜单看（自检与单元测试都覆盖不到）。
+ */
+struct LayerMenuState {
+  bool has_layer = false; /* 有选中图层 */
+  bool visible = false;
+  bool clipping = false;
+  bool is_group = false;
+  bool isolated = false;
+  int32_t sampling = 0;
+  int32_t blend = 0;
+  bool histogram_open = false;
+};
+
+struct LayerMenuChecks {
+  bool visible = false;
+  bool clipping = false;
+  bool isolated = false;
+  bool histogram = false;
+  int32_t sampling = -1; /* -1 = 不勾任何一项（无选中层时的显式「无」） */
+  int32_t blend = -1;
+};
+
+inline LayerMenuChecks layer_menu_checks(const LayerMenuState& state) {
+  LayerMenuChecks checks{};
+  /* 直方图开关是文档级视图状态，与有没有选中层无关。 */
+  checks.histogram = state.histogram_open;
+  if (!state.has_layer) return checks;
+  checks.visible = state.visible;
+  checks.clipping = state.clipping;
+  /* isolated 只对图层组有意义：非组层置 1 也不参与合成，勾上即误导。 */
+  checks.isolated = state.is_group && state.isolated;
+  checks.sampling = clamp_sampling_mode(state.sampling);
+  checks.blend = clamp_blend_mode(state.blend);
+  return checks;
+}
+
+/* ------------------------------------------------------------ 效果档位（S24） */
+
+/*
+ * 数值即 .comp 的 engineEffects[].effect，与 compositing/effect_eval.h 的
+ * kEffectStroke..kEffectInnerGlow（0..5）逐字对应；顺序也是引擎的落笔判定顺序。
+ * ui_core 不包含引擎头（纯几何/规则库，可脱壳编译），所以这里只镜像数值与名称。
+ */
+inline constexpr int kEffectKindCount = 6;
+
+inline int clamp_effect_kind(int kind) {
+  if (kind < 0) return 0;
+  if (kind >= kEffectKindCount) return kEffectKindCount - 1;
+  return kind;
+}
+
+inline const char* effect_kind_name(int kind) {
+  switch (clamp_effect_kind(kind)) {
+    case 0: return "Stroke";
+    case 1: return "Drop Shadow";
+    case 2: return "Color Overlay";
+    case 3: return "Inner Shadow";
+    case 4: return "Outer Glow";
+    case 5: return "Inner Glow";
+    default: return "Stroke";
+  }
+}
+
+/* 该层是否已经带了某个效果（菜单勾选态 / 面板标记共用同一个判定）。 */
+inline bool effect_list_contains(const uint32_t* kinds, int32_t count, int kind) {
+  if (kinds == nullptr || count <= 0) return false;
+  const uint32_t target = static_cast<uint32_t>(clamp_effect_kind(kind));
+  for (int32_t i = 0; i < count; ++i) {
+    if (kinds[i] == target) return true;
+  }
+  return false;
+}
+
+/* ------------------------------------------------------- 拖行重排（S24） */
+
+enum class DragTarget {
+  kOk = 0,
+  kSameRow,     /* 落点就是原行：不产生写入（否则撤销栈里多一条空记录） */
+  kCrossParent, /* 落点父级不同：如实拒绝，不静默改父子关系 */
+  kInvalid,
+};
+
+struct DragPlan {
+  DragTarget target = DragTarget::kInvalid;
+  int32_t before_index = -1; /* 锚点在**当前数组**里的下标；-1 = 同级末尾（before = 0） */
+  int32_t next_row = 0;      /* 放下后该图层应占的面板行（选中态跟随） */
+  bool ok() const { return target == DragTarget::kOk; }
+};
+
+/*
+ * 把面板第 from_shown 行拖到第 to_shown 行（0 = 最上层）。
+ *
+ * 只允许同父拖拽：跨组会改 parent，而面板是扁平列表（不画缩进），用户看不出自己
+ * 把层拖进了哪个组——「拖完层没了」比「明确拒绝」糟得多。
+ *
+ * 换算（数组序自下而上，shown = count-1-array）：
+ *   i0 = count-1-from，it = count-1-to，引擎语义是「erase 后插到锚点之前」：
+ *     it == count-1（拖到最顶） -> 锚点 = 同级末尾（before = 0，before_index = -1）；
+ *     it <  i0（往上拖）        -> 锚点 = 当前数组 it 那一层（删掉下方元素后它上位）；
+ *     it >  i0（往下拖）        -> 锚点 = 当前数组 it+1 那一层（erase 后原 it+1 顶到 it，
+ *                                  插到它之前才落在 it）。
+ * 三种情形都能用「先删后插」的模型复算，见 tests/test_ui_core.cpp 的表驱动用例。
+ */
+inline DragPlan plan_layer_drag(const LayerStackEntry* layers, int32_t count, int32_t from_shown,
+                                int32_t to_shown) {
+  DragPlan plan{};
+  if (layers == nullptr || count <= 0) return plan;
+  if (from_shown < 0 || from_shown >= count || to_shown < 0 || to_shown >= count) return plan;
+  if (from_shown == to_shown) {
+    plan.target = DragTarget::kSameRow;
+    plan.next_row = from_shown;
+    return plan;
+  }
+  const int32_t from_index = layer_array_index(count, from_shown);
+  const int32_t to_index = layer_array_index(count, to_shown);
+  if (layers[from_index].parent != layers[to_index].parent) {
+    plan.target = DragTarget::kCrossParent;
+    plan.next_row = from_shown;
+    return plan;
+  }
+  plan.target = DragTarget::kOk;
+  plan.next_row = to_shown;
+  if (to_index == count - 1) {
+    plan.before_index = -1;
+  } else if (to_index < from_index) {
+    plan.before_index = to_index;
+  } else {
+    plan.before_index = to_index + 1;
+  }
+  return plan;
+}
+
+/* 拖拽指示线的插槽：向上拖画在目标行上边缘，向下拖画在下边缘（都表示「落在这里」）。 */
+inline int32_t layer_drag_insert_slot(int32_t from_shown, int32_t to_shown) {
+  return to_shown >= from_shown ? to_shown + 1 : to_shown;
+}
+
+/*
+ * 拖行落点指示线：画在 to_shown 行的**上边缘**；to_shown == count 表示最后一行
+ * 之后（底部）。row_top 必须与 layer_row_rect / draw_layer_panel 用同一个偏移，
+ * 否则直方图一开指示线就整体上移 64px——「线在上一行、贴纸落到这一行」。
+ */
+inline Rect layer_insert_line_rect(const Rect& panel, int row_top, int32_t to_shown,
+                                   int32_t count) {
+  int32_t slot = to_shown;
+  if (slot < 0) slot = 0;
+  if (slot > count) slot = count;
+  const int y = panel.y + kLayerHeaderHeight + row_top + slot * kLayerRowHeight;
+  return Rect{panel.x + 4, y - 1, panel.w - 8, 2};
+}
+
+/* 落点行：把鼠标 y 换算成 0..count-1 的面板行（上/下越界夹到首/末行）。 */
+inline int32_t layer_drag_target_row(const Rect& panel, int32_t count, double y, int row_top) {
+  if (count <= 0) return -1;
+  const double top = static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
+  const double row = std::floor((y - top) / static_cast<double>(kLayerRowHeight));
+  if (row < 0.0) return 0;
+  if (row >= static_cast<double>(count)) return count - 1;
+  return static_cast<int32_t>(row);
+}
+
+/* -------------------------------------------------- 直方图区间缩放（S24） */
+
+/*
+ * 直方图可视窗口：亮度 [lo, hi] 铺满整条绘图区宽度，默认全幅 0…255。
+ * 交互：绘图区横向拖拽 = 放大到拖出的区间（PS 直方图同款：框一段亮度看细节）；
+ * 滚轮 = 以光标亮度为中心缩放；双击 = 复位全幅。
+ *
+ * 夹取规则也放在这里：最小跨度 kHistogramMinSpan 个 bin。允许 0 宽会让映射除以 0，
+ * NaN 坐标传给 GDI 的结果是一整块空白——不报错、只在缩放到极限时偶现。
+ */
+struct HistogramView {
+  double lo = 0.0;
+  double hi = 255.0;
+};
+
+inline constexpr double kHistogramMinSpan = 8.0;
+inline constexpr double kHistogramMaxBin = 255.0;
+
+inline HistogramView clamp_histogram_view(double lo, double hi) {
+  HistogramView view{};
+  /* NaN 比较全 false，先挡掉再谈大小关系。 */
+  if (!(lo == lo) || !(hi == hi)) return view;
+  if (hi < lo) {
+    const double swap = lo;
+    lo = hi;
+    hi = swap;
+  }
+  if (hi - lo < kHistogramMinSpan) {
+    const double center = (lo + hi) * 0.5;
+    lo = center - kHistogramMinSpan * 0.5;
+    hi = center + kHistogramMinSpan * 0.5;
+  }
+  if (lo < 0.0) {
+    hi -= lo;
+    lo = 0.0;
+  }
+  if (hi > kHistogramMaxBin) {
+    lo -= hi - kHistogramMaxBin;
+    hi = kHistogramMaxBin;
+  }
+  if (lo < 0.0) lo = 0.0;
+  if (hi > kHistogramMaxBin) hi = kHistogramMaxBin;
+  /*
+   * 跨度顶满全幅时只能落在 0..255，顺势归位。
+   *
+   * 不归位的话，先缩到全幅、再继续「缩小一档」会得到 lo = 1.8e-15、hi = 255：
+   * 画面与全幅完全一样，但 histogram_view_is_full 判假，标签就会一直显示
+   * 「直方图 0–255」这种自相矛盾的放大态。差一个浮点 ulp 的判定不该由 UI 承担。
+   */
+  if (hi - lo >= kHistogramMaxBin) {
+    lo = 0.0;
+    hi = kHistogramMaxBin;
+  }
+  view.lo = lo;
+  view.hi = hi;
+  return view;
+}
+
+inline double histogram_view_span(const HistogramView& view) { return view.hi - view.lo; }
+
+inline bool histogram_view_is_full(const HistogramView& view) {
+  return view.lo <= 0.0 && view.hi >= kHistogramMaxBin;
+}
+
+/* 以 focus（亮度）为中心按 factor 缩放：factor < 1 放大，factor > 1 缩小。 */
+inline HistogramView zoom_histogram_view(const HistogramView& view, double focus,
+                                         double factor) {
+  if (!(factor > 0.0) || factor == 1.0) return clamp_histogram_view(view.lo, view.hi);
+  const double current_lo = view.lo;
+  const double current_hi = view.hi;
+  const double span = current_hi - current_lo;
+  if (!(span > 0.0)) return clamp_histogram_view(focus - kHistogramMinSpan * 0.5,
+                                                 focus + kHistogramMinSpan * 0.5);
+  double focus_bin = focus;
+  if (focus_bin < current_lo) focus_bin = current_lo;
+  if (focus_bin > current_hi) focus_bin = current_hi;
+  double new_span = span * factor;
+  if (new_span > kHistogramMaxBin) new_span = kHistogramMaxBin;
+  /* 保持 focus 在窗口里的相对位置不变：光标下的那根柱不跑。 */
+  const double t = (focus_bin - current_lo) / span;
+  const double new_lo = focus_bin - t * new_span;
+  return clamp_histogram_view(new_lo, new_lo + new_span);
+}
+
+/* bin（0…255，可带小数）-> 绘图区 x。 */
+inline double histogram_bin_x(const Rect& plot, const HistogramView& view, double bin) {
+  const double span = histogram_view_span(view);
+  if (!(span > 0.0) || !(plot.w > 0.0)) return plot.x;
+  return plot.x + ((bin - view.lo) / span) * plot.w;
+}
+
+/* 绘图区 x -> bin（未夹取，调用方按需夹到 0…255）。 */
+inline double histogram_x_to_bin(const Rect& plot, const HistogramView& view, double x) {
+  if (!(plot.w > 0.0)) return view.lo;
+  const double span = histogram_view_span(view);
+  const double t = (x - plot.x) / plot.w;
+  return view.lo + t * span;
+}
+
+/* 拖拽区间 -> 新窗口：两端按 x 排序（允许反向拖），单端超界先夹再交给 clamp。 */
+inline HistogramView histogram_window_from_drag(const Rect& plot, const HistogramView& view,
+                                                double x0, double x1) {
+  const double left = x0 < x1 ? x0 : x1;
+  const double right = x0 < x1 ? x1 : x0;
+  double a = histogram_x_to_bin(plot, view, left);
+  double b = histogram_x_to_bin(plot, view, right);
+  if (a < 0.0) a = 0.0;
+  if (b > kHistogramMaxBin) b = kHistogramMaxBin;
+  return clamp_histogram_view(a, b);
+}
+
 }  // namespace comp_ui
 
 #endif /* COMPOSITOR_SHELL_UI_CORE_H */

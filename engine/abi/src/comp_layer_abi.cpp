@@ -500,6 +500,63 @@ comp_result comp_layer_get_sampling(comp_document document, comp_layer_id id,
   return compositor::abi::ok(engine);
 }
 
+comp_result comp_layer_set_flip(comp_document document, comp_layer_id id, int32_t flip_x,
+                                int32_t flip_y) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+
+  /*
+   * 规范化为 0/1：`Layer::flip_x` 是 bool，调用方传 -1 / 2 时若直接隐式转换，
+   * 回读得到 1 而它自己记的是 2，往返就不保真了。这里一次夹死。
+   */
+  const bool new_flip_x = flip_x != 0;
+  const bool new_flip_y = flip_y != 0;
+  if (layer->flip_x == new_flip_x && layer->flip_y == new_flip_y) {
+    /*
+     * 无变化不 commit：空事务会在撤销栈里留下一条「点了没反应」的记录，
+     * S23 修的就是这类空条目（撤销一次画面不动，用户以为撤销失效）。
+     */
+    return compositor::abi::ok(engine);
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Flip Layer");
+  layer->flip_x = new_flip_x;
+  layer->flip_y = new_flip_y;
+  doc->touch_layer(id);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_flip(comp_document document, comp_layer_id id, int32_t* out_flip_x,
+                                int32_t* out_flip_y) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  /* 两个出参都必填：只回一半会让调用方拿旧值补另一半，翻转态直接错。 */
+  if (out_flip_x == nullptr || out_flip_y == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "out_flip_x / out_flip_y is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_flip_x = layer->flip_x ? 1 : 0;
+  *out_flip_y = layer->flip_y ? 1 : 0;
+  return compositor::abi::ok(engine);
+}
+
 comp_result comp_layer_add_adjustment(comp_document document, comp_layer_id target, uint32_t kind,
                                      const char* settings_json_utf8) {
   Document* doc = nullptr;
@@ -830,6 +887,58 @@ comp_result comp_layer_remove_effect(comp_document document, comp_layer_id id, u
       layer->effects.end());
   doc->touch_layer(id);
   txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_effect_count(comp_document document, comp_layer_id id,
+                                    size_t* out_count) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_count == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_count is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_count = layer->effects.size();
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_layer_effect_at(comp_document document, comp_layer_id id, size_t index,
+                                 uint32_t* out_effect, char* settings_json_utf8,
+                                 size_t capacity, size_t* out_size) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (index >= layer->effects.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "effect index out of range");
+  }
+  const compositor::Effect& effect = layer->effects[index];
+  if (out_effect != nullptr) {
+    *out_effect = effect.effect;
+  }
+  const std::string& settings = effect.settings_json;
+  if (out_size != nullptr) {
+    *out_size = settings.size();
+  }
+  /* 两段式：settings_json_utf8 为 nullptr / capacity 为 0 时只回报长度。 */
+  if (settings_json_utf8 != nullptr && capacity > 0) {
+    const size_t copy = settings.size() < capacity - 1 ? settings.size() : capacity - 1;
+    std::memcpy(settings_json_utf8, settings.data(), copy);
+    settings_json_utf8[copy] = '\0';
+  }
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }
