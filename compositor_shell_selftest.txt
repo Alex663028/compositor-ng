@@ -56,6 +56,8 @@
 [OK] self-clipping is rejected
 [OK] clipping to a missing layer is NOT_FOUND
 [OK] clipping source cleared
+[OK] S22 writes left undoable history and were rolled back
+[OK] S22 rollback reaches the pre-S22 depth
 [OK] comp_layer_adjustment_kind_name(3) == Exposure
 [OK] comp_layer_adjustment_param_count(3) == 3
 [OK] comp_layer_adjustment_param_at(3,0) path

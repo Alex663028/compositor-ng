@@ -10,6 +10,7 @@
  *
  * 这些用例随 `python scripts/build.py` 与全量回归一起跑，不依赖窗口环境。
  */
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -1574,4 +1575,240 @@ COMP_TEST(ui_core_layer_rows_hit_test_respects_histogram_offset) {
     COMP_CHECK(comp_ui::layer_row_at(panel, 3, rect.x + rect.w / 2, mid, row_top) ==
                row_index);
   }
+}
+
+/* ---------------------------------------------------------------- S23 */
+
+/*
+ * 按引擎语义重演一次重排：engine/domain/document.cpp 的 reorder_layer 是
+ * 「先在 state_.layers 里 erase 自己，再把 id 插到锚点 **之前**」，数组序自下而上、
+ * 尾 = 顶层，before == 0 表示同级末尾。
+ *
+ * 测试里必须**独立重演**这一步，而不是复述 plan 的输出：只断言 plan 自己算出来的
+ * 数字，等于用被测对象证明被测对象。这里按文档化语义另写一份最小实现，再拿
+ * 「用户在面板上看到什么」去比。
+ */
+std::vector<int64_t> simulate_engine_reorder(const std::vector<int64_t>& bottom_to_top,
+                                             int32_t shown, int32_t direction) {
+  std::vector<int64_t> layers = bottom_to_top;
+  const int32_t count = static_cast<int32_t>(layers.size());
+  const comp_ui::ReorderPlan plan = comp_ui::plan_layer_reorder(count, shown, direction);
+  if (!plan.ok) return layers; /* 已在端头：不产生任何变更 */
+
+  const int32_t index = comp_ui::layer_array_index(count, shown);
+  const int64_t self = layers[static_cast<size_t>(index)];
+  int64_t before = 0;
+  if (plan.before_row >= 0) {
+    before = layers[static_cast<size_t>(comp_ui::layer_array_index(count, plan.before_row))];
+  }
+  layers.erase(layers.begin() + index);
+  if (before == 0) {
+    layers.push_back(self);
+  } else {
+    auto pos = std::find(layers.begin(), layers.end(), before);
+    layers.insert(pos, self);
+  }
+  return layers;
+}
+
+std::vector<int64_t> panel_order_of(const std::vector<int64_t>& bottom_to_top) {
+  return std::vector<int64_t>(bottom_to_top.rbegin(), bottom_to_top.rend());
+}
+
+/*
+ * 重排计划 = 用户可见的「上移 / 下移一行」，表驱动穷举 2~3 层 × 4 个方向。
+ *
+ * 这一条正是 S22 漏掉的那层：panel_* 里没有任何测试，于是「上移 / 下移整对写反」
+ * 加「选中态按相反假设跟随」两个错误互相抵消着进了主干——不报错、自检也过，只有
+ * 真去排序的人才发现层往反方向跑。现在两个方向都必须与「面板上挪一行 / 下挪一行」
+ * 一致，且 next_row 必须指向被移动的那一层。
+ */
+COMP_TEST(ui_core_layer_reorder_matches_engine_semantics) {
+  const int32_t directions[4] = {-2, -1, 1, 0}; /* 置顶 / 上移 / 下移 / 置底 */
+  for (int32_t count = 2; count <= 3; ++count) {
+    for (int32_t shown = 0; shown < count; ++shown) {
+      for (int32_t direction : directions) {
+        /* 数组序自下而上：10 是底层；面板行序相反（行 0 是顶层）。 */
+        std::vector<int64_t> bottom = {10, 11, 12};
+        bottom.resize(static_cast<size_t>(count));
+        const std::vector<int64_t> panel = panel_order_of(bottom);
+        const int64_t self = panel[static_cast<size_t>(shown)];
+
+        /* 期望直接按「这一层在面板上应该落到第几行」写，不经过数组下标换算。 */
+        int32_t target = shown;
+        if (direction == -2) {
+          target = 0;
+        } else if (direction == 0) {
+          target = count - 1;
+        } else if (direction < 0) {
+          target = shown - 1;
+        } else {
+          target = shown + 1;
+        }
+        if (target < 0 || target >= count) target = shown; /* 端头不动 */
+
+        std::vector<int64_t> expected = panel;
+        expected.erase(expected.begin() + shown);
+        expected.insert(expected.begin() + target, self);
+
+        const std::vector<int64_t> actual =
+            panel_order_of(simulate_engine_reorder(bottom, shown, direction));
+        COMP_CHECK(actual == expected);
+
+        const comp_ui::ReorderPlan plan =
+            comp_ui::plan_layer_reorder(count, shown, direction);
+        if (target == shown) {
+          COMP_CHECK(!plan.ok); /* 端头必须如实拒绝，不静默无操作 */
+        } else {
+          COMP_CHECK(plan.ok);
+          COMP_CHECK(plan.next_row == target); /* 选中态跟着这一层走 */
+        }
+      }
+    }
+  }
+
+  /* 空文档不产生计划。 */
+  COMP_CHECK(!comp_ui::plan_layer_reorder(0, 0, -1).ok);
+  COMP_CHECK(!comp_ui::plan_layer_reorder(0, 0, 0).ok);
+
+  /* 选中行越界时按夹取后的行算（99 → 最后一行 2，即数组最底层），上移落在行 1。 */
+  const comp_ui::ReorderPlan clamped = comp_ui::plan_layer_reorder(3, 99, -1);
+  COMP_CHECK(clamped.ok);
+  COMP_CHECK(clamped.next_row == 1);
+}
+
+/*
+ * 剪贴基底必须是「下方紧邻的同父图层」——引擎成栈的唯一条件
+ * （filter_graph.cpp: siblings[i+1+clip_run]->clipping_source == layer->id）。
+ *
+ * S22 取成了数组上方一层（self_index + 1），守卫却拒绝顶层、提示却写「最底层无法
+ * 剪贴」。取反之后剪贴栈永远不成形：FilterGraph 画面不变，而 compositor.cpp 的单层
+ * 视图只看 clipping_source != 0 就按基底求值——同一份文档在不同视图下画得不一样。
+ */
+COMP_TEST(ui_core_clipping_base_is_the_sibling_below) {
+  /* 数组序自下而上：100(底) / 101 / 102(顶)；面板行 0 = 102。 */
+  const comp_ui::LayerStackEntry flat[3] = {{100, 0, 0}, {101, 0, 0}, {102, 0, 0}};
+
+  /* 选中顶层（行 0）→ 基底是下方那层 101（数组下标 1），绝不是它上方或它自己。 */
+  comp_ui::ClippingPlan plan = comp_ui::plan_clipping_base(flat, 3, 0);
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.base_index == 1);
+  COMP_CHECK(!plan.joins_existing_stack);
+
+  /* 中间层（行 1）→ 基底是下方那层 100。 */
+  plan = comp_ui::plan_clipping_base(flat, 3, 1);
+  COMP_CHECK(plan.ok() && plan.base_index == 0);
+
+  /* 最底层（行 count-1）下方没有图层：如实拒绝，原因必须是「下方没有」而非顶层。 */
+  plan = comp_ui::plan_clipping_base(flat, 3, 2);
+  COMP_CHECK(!plan.ok());
+  COMP_CHECK(plan.target == comp_ui::ClippingTarget::kNoSiblingBelow);
+
+  /* 退化输入。 */
+  COMP_CHECK(!comp_ui::plan_clipping_base(nullptr, 3, 0).ok());
+  COMP_CHECK(!comp_ui::plan_clipping_base(flat, 0, 0).ok());
+}
+
+/*
+ * 有图层组时，「下方一层」必须是**同父**的下方一层：filter_graph 的 siblings 只含
+ * 同父层，全数组相邻不等于同父相邻。这里同时覆盖「并入已有剪贴栈」与「异常链」。
+ */
+COMP_TEST(ui_core_clipping_base_respects_groups_and_stack) {
+  /*
+   * 全数组序（自下而上）：
+   *   下标 0: 100 根级
+   *   下标 1: 200 根级（组）
+   *   下标 2: 201 parent=200
+   *   下标 3: 202 parent=200
+   *   下标 4: 103 根级
+   * 面板行：行 0 = 103，行 1 = 202，行 2 = 201，行 3 = 200，行 4 = 100。
+   */
+  const comp_ui::LayerStackEntry mixed[5] = {
+      {100, 0, 0}, {200, 0, 0}, {201, 200, 0}, {202, 200, 0}, {103, 0, 0}};
+
+  /*
+   * 选中 103（行 0）：同父下方最近的是**组图层 200**（下标 1，parent=0），必须跳过
+   * 夹在中间的组内层 201 / 202（下标 2、3）。200 本身是根级层，剪到它是合法的，
+   * 所以正确基底是 1 而不是 0——这一条同时钉住「跳过别组层」与「组本身可作为基底」。
+   */
+  comp_ui::ClippingPlan plan = comp_ui::plan_clipping_base(mixed, 5, 0);
+  COMP_CHECK(plan.ok() && plan.base_index == 1);
+  /* 反证：全局数组里紧邻 103 下方的是组内层 202（下标 3），取它就会跨父成栈失败。 */
+  COMP_CHECK(plan.base_index != 3);
+
+  /* 选中组内 202（行 1）：同父下方是 201（下标 2），不是全局相邻的 200（下标 1）。 */
+  plan = comp_ui::plan_clipping_base(mixed, 5, 1);
+  COMP_CHECK(plan.ok() && plan.base_index == 2);
+
+  /* 选中组内 201（行 2）：它的同父下方没有别的组内层 → 拒。 */
+  plan = comp_ui::plan_clipping_base(mixed, 5, 2);
+  COMP_CHECK(!plan.ok() && plan.target == comp_ui::ClippingTarget::kNoSiblingBelow);
+
+  /*
+   * 并入已有剪贴栈：C 已剪到 A（数组 A,B,C,D），此时选 D 应把基底解析成 A，
+   * 而不是链式地剪到 C——链式会让 D 落在 FilterGraph 的栈外，而单层视图仍按它求值。
+   */
+  const comp_ui::LayerStackEntry chained[4] = {{10, 0, 0}, {11, 0, 0}, {12, 0, 10}, {13, 0, 0}};
+  plan = comp_ui::plan_clipping_base(chained, 4, 0); /* 行 0 = 13（下标 3） */
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.base_index == 0);
+  COMP_CHECK(plan.joins_existing_stack);
+
+  /* 异常：B 的剪贴基底指向它上方的 C（越级 / 反向引用）→ 拒绝，不退化成链。 */
+  const comp_ui::LayerStackEntry backward[3] = {{20, 0, 0}, {21, 0, 22}, {22, 0, 0}};
+  plan = comp_ui::plan_clipping_base(backward, 3, 0); /* 行 0 = 22（下标 2） */
+  COMP_CHECK(!plan.ok());
+  COMP_CHECK(plan.target == comp_ui::ClippingTarget::kBrokenStack);
+
+  /* 基底 id 根本不存在同样算异常。 */
+  const comp_ui::LayerStackEntry missing[3] = {{30, 0, 0}, {31, 0, 999}, {32, 0, 0}};
+  plan = comp_ui::plan_clipping_base(missing, 3, 0);
+  COMP_CHECK(!plan.ok() && plan.target == comp_ui::ClippingTarget::kBrokenStack);
+
+  /*
+   * id 必须按 64 位处理（comp_layer_id 是 uint64_t）：若在接口上窄化成 int32_t，
+   * 高位 id 会被截断，两个不同图层可能撞成同一个值，'基底是哪一层'就会答错。
+   * 这里用 2^40 量级的 id 走一遍「并入已有栈」的路径，把位宽钉死。
+   */
+  const int64_t wide = static_cast<int64_t>(1) << 40;
+  const comp_ui::LayerStackEntry wide_ids[3] = {
+      {wide, 0, 0}, {wide + 1, 0, wide}, {wide + 2, 0, 0}};
+  plan = comp_ui::plan_clipping_base(wide_ids, 3, 0); /* 行 0 = wide+2（下标 2） */
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.base_index == 0);
+  COMP_CHECK(plan.joins_existing_stack);
+}
+
+/*
+ * 直方图几何：块贴标题行下方，块底与第一行图层严丝合缝。
+ *
+ * S22 的块顶取 panel.y，块内标签落在 panel.y+10，和标题的 panel.y+8 叠字；行起点
+ * 却在 +94，中间空出 30px。根因是三处各算一套坐标，这里钉死唯一来源。
+ */
+COMP_TEST(ui_core_histogram_geometry_clears_title_and_rows) {
+  const Rect panel{0, 46, 248, 600};
+  const Rect block = comp_ui::histogram_rect(panel);
+  const Rect label = comp_ui::histogram_label_rect(panel);
+  const Rect plot = comp_ui::histogram_plot_rect(panel);
+  const int rows_top = comp_ui::layer_rows_top(true);
+
+  /* 不压标题：标题行占 panel.y .. panel.y + kLayerHeaderHeight。 */
+  COMP_CHECK(block.y >= panel.y + comp_ui::kLayerHeaderHeight);
+  COMP_CHECK(label.y >= panel.y + 24); /* 标题文字在 +8，高约一行 */
+
+  /* 块内不叠：标签与绘图区互不重叠，且都落在块内。 */
+  COMP_CHECK(!rects_overlap(label, plot));
+  COMP_CHECK(label.bottom() <= plot.y);
+  COMP_CHECK(label.y >= block.y && label.bottom() <= block.bottom());
+  COMP_CHECK(plot.bottom() == block.bottom());
+
+  /* 不留空档：块底 == 图层行起点；关掉直方图时行偏移归零。 */
+  COMP_CHECK(block.bottom() == panel.y + comp_ui::kLayerHeaderHeight + rows_top);
+  COMP_CHECK(comp_ui::layer_rows_top(false) == 0);
+
+  /* 绘制与命中同一几何：第一行中心点判回第 0 行，块内任意点不落到任何行。 */
+  const Rect row0 = comp_ui::layer_row_rect(panel, 0, rows_top);
+  const double mid0 = row0.y + comp_ui::kLayerRowHeight / 2.0;
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, row0.x + row0.w / 2.0, mid0, rows_top) == 0);
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, block.y + 1, rows_top) == -1);
 }

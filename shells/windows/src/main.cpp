@@ -152,6 +152,13 @@ struct LayerRow {
   uint8_t is_group = 0;        /* 图层组 */
   uint8_t isolated = 0;        /* 组隔离开关；非组恒 0 */
   int32_t sampling = 0;        /* comp_sampling，0..2 */
+  /*
+   * S23：父级 id（0 = 根级）。剪贴基底必须与自身**同父**才算合法——引擎
+   * filter_graph 只把同一 siblings 序列里紧跟基底的那串成员收进剪贴栈。S22 只按
+   * 数组下标取「下方一层」，有图层组时取到的可能是别的组里的层，于是写了
+   * 一条永远不成栈的 clipping_source：画面不变，但单层视图又按它求值。
+   */
+  comp_layer_id parent = 0;
 };
 
 struct ShellState {
@@ -432,6 +439,7 @@ void refresh_layers(ShellState& shell) {
                                   &info_clipping) == COMP_OK) {
       row.is_group = info_is_group != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
       row.clipping = info_clipping;
+      row.parent = info_parent;
       /*
        * 组隔离开关只对组有意义（ABI 注释：写入非组图层不报错但属性不参与合成）。
        * 面板据此置灰：非组行不显示、也不允许切换隔离——否则用户对一个普通图层
@@ -711,17 +719,41 @@ void panel_toggle_clipping(ShellState& shell) {
     return;
   }
   /*
-   * 挂靠：面板行索引自上而下，数组序自下而上，故「下面一层」是数组里
-   * index + 1（跳过自己）。越界（已经是栈底一层）如实拒绝——栈底图层没有
-   * 可剪贴的来源，静默不做事会让用户以为菜单项坏了。
+   * 挂靠：基底取「下方紧邻的同父图层」——这正是引擎成栈的条件
+   * （filter_graph.cpp： siblings[i+1+clip_run]->clipping_source == layer->id，
+   * 即基底在前、成员紧跟其后；数组序自下而上，所以下方 = 下标更小）。
+   *
+   * S22 这里取的是 self_index + 1（**上方**一层），并且守卫拒绝的是顶层、提示却
+   * 写「最底层无法剪贴」。取反之后剪贴栈永远不成形：FilterGraph 路径画面不变，
+   * 而 compositor.cpp 的单层视图只看 clipping_source != 0 就按基底求值，于是同一
+   * 份文档在不同视图下画得不一样。换算现在全部交给 comp_ui::plan_clipping_base，
+   * 由 test_ui_core.cpp 表驱动穷举（同父相邻、跨组、已有剪贴栈、边界）。
    */
-  const size_t self_index = static_cast<size_t>(shell.layers.size()) - 1u -
-                            static_cast<size_t>(shell.selected_layer);
-  if (self_index + 1u >= shell.layers.size()) {
-    set_status(shell, L"最底层图层无法剪贴");
+  std::vector<comp_ui::LayerStackEntry> stack;
+  stack.reserve(shell.layers.size());
+  for (const LayerRow& item : shell.layers) {
+    stack.push_back(comp_ui::LayerStackEntry{static_cast<int64_t>(item.id),
+                                             static_cast<int64_t>(item.parent),
+                                             static_cast<int64_t>(item.clipping)});
+  }
+  const comp_ui::ClippingPlan plan = comp_ui::plan_clipping_base(
+      stack.data(), static_cast<int32_t>(stack.size()), shell.selected_layer);
+  if (!plan.ok()) {
+    switch (plan.target) {
+      case comp_ui::ClippingTarget::kNoSiblingBelow:
+        set_status(shell, L"下方没有同组图层可剪贴");
+        break;
+      case comp_ui::ClippingTarget::kBrokenStack:
+        set_status(shell, L"下方图层的剪贴关系异常，无法并入");
+        break;
+      default:
+        set_status(shell, L"无图层");
+        break;
+    }
     return;
   }
-  const comp_layer_id base = shell.layers[self_index + 1u].id;
+  const comp_layer_id base =
+      shell.layers[static_cast<size_t>(plan.base_index)].id;
   if (comp_layer_set_clipping_source(shell.document, self, base) != COMP_OK) {
     set_status(shell, L"建立剪贴蒙版失败");
     return;
@@ -729,8 +761,13 @@ void panel_toggle_clipping(ShellState& shell) {
   refresh_layers(shell);
   shell.needs_render = true;
   wchar_t buffer[128];
-  wsprintfW(buffer, L"已剪贴到下方图层 #%I64u",
-            static_cast<unsigned long long>(base));
+  if (plan.joins_existing_stack) {
+    wsprintfW(buffer, L"已并入剪贴栈，基底 #%I64u",
+              static_cast<unsigned long long>(base));
+  } else {
+    wsprintfW(buffer, L"已剪贴到下方图层 #%I64u",
+              static_cast<unsigned long long>(base));
+  }
   refresh_history_status(shell, buffer);
 }
 
@@ -765,9 +802,14 @@ void panel_toggle_isolated(ShellState& shell) {
 /*
  * 图层重排（S22）：按面板显示方向把选中图层上移 / 下移一层（或置顶 / 置底）。
  *
- * comp_layer_reorder(document, id, before) 的 before 是「移动到哪一层之前」
- * （0 = 同级末尾），且图层数组是**自下而上**的堆叠序。面板显示自上而下
- * * （顶层在第一行），所以「面板上移一行」= 数组里 index-1，before = 新的下一层。
+ * 换算全部交给 comp_ui::plan_layer_reorder 纯函数——S22 首版把这段逻辑内联在这里，
+ * 而本层没有任何测试，于是「上移 / 下移两个分支整对写反」+「选中态按相反的假设
+ * 跟随」两个错误互相抵消着进了主干：不报错、自检也过，只有真去排序的人才发现
+ * 层往反方向跑。抽成纯函数后可以表驱动穷举（见 test_ui_core.cpp 的 S23 段）。
+ *
+ * 引擎语义（engine/domain/document.cpp `reorder_layer`）：before 是「插到哪一层
+ * **之前**」，数组序即堆叠序、**尾 = 顶层**，before=0 = 同级末尾（顶层）。
+ * 面板行序相反（行 0 = 顶层），纯函数负责这个翻转。
  *
  * 这是 T2 点名的缺口之一：comp_layer_reorder 在壳侧调用数为 0，用户只能
  * 进菜单一条一条读说明，完全没有拖不动、也按不动的排序入口。
@@ -778,59 +820,43 @@ void panel_reorder_layer(ShellState& shell, int direction) {
     return;
   }
   const int32_t count = static_cast<int32_t>(shell.layers.size());
-  const int32_t shown = shell.selected_layer; /* 0 = 最上层显示行 */
-  const int32_t array_index = count - 1 - shown;
-  const comp_layer_id self = shell.layers[static_cast<size_t>(array_index)].id;
+  const comp_ui::ReorderPlan plan =
+      comp_ui::plan_layer_reorder(count, shell.selected_layer, direction);
 
-  comp_layer_id before = 0;
-  int32_t next_show = shown;
-  if (direction == -2) {
-    /* 置顶：移到数组末尾之前（数组末尾 = 面板第一行 = 顶层）。 */
-    if (array_index + 1 >= count) {
-      set_status(shell, L"已经是顶层");
-      return;
-    }
-    before = 0; /* 0 = 同级末尾，即自下而上序的顶层 */
-    next_show = 0;
-  } else if (direction < 0) {
-    /* 上移一层：数组 index-1；已在顶（数组 0）则无事可做。 */
-    if (array_index <= 0) {
-      set_status(shell, L"已经是顶层");
-      return;
-    }
-    before = shell.layers[static_cast<size_t>(array_index - 1)].id;
-    next_show = shown - 1;
-  } else if (direction > 0) {
-    /* 下移一层：数组 index+1；已在底则无事可做。 */
-    if (array_index + 1 >= count) {
-      set_status(shell, L"已经是底层");
-      return;
-    }
-    /* 越过自己后，新的下一层就是原来的下两层；没有（自己是倒数第二）时 before=0 = 置底。 */
-    before = (array_index + 2 < count)
-                 ? shell.layers[static_cast<size_t>(array_index + 2)].id
-                 : 0;
-    next_show = shown + 1;
-  } else {
-    /* direction == 0：置底（数组 0 之前）。 */
-    if (array_index == 0) {
-      set_status(shell, L"已经是底层");
-      return;
-    }
-    before = shell.layers[0].id;
-    next_show = count - 1;
+  if (!plan.ok) {
+    /* 已在端头：如实提示，不静默无操作（否则用户以为菜单坏了）。 */
+    set_status(shell, plan.at_top ? L"已经是顶层" : L"已经是底层");
+    return;
   }
+
+  const comp_layer_id self =
+      shell.layers[static_cast<size_t>(
+          comp_ui::layer_array_index(count, shell.selected_layer))].id;
+
+  /*
+   * before_row < 0 表示引擎约定的 before = 0（同级末尾 = 顶层）；
+   * 否则锚点是那一行对应的图层 id。锚点必须与被移动层同级——跨父锚点会被
+   * Document::reorder_layer 拒绝（返回 false）而不是静默错位，这里是壳侧
+   * 唯一可能越级的地方（面板是扁平列表，组内层也在其中）。
+   */
+  comp_layer_id before = 0;
+  if (plan.before_row >= 0) {
+    const int32_t anchor_index = comp_ui::layer_array_index(count, plan.before_row);
+    before = shell.layers[static_cast<size_t>(anchor_index)].id;
+  }
+
   if (comp_layer_reorder(shell.document, self, before) != COMP_OK) {
-    set_status(shell, L"调整图层顺序失败");
+    set_status(shell, L"调整图层顺序失败（跨组重排需与目标同组）");
     return;
   }
   refresh_layers(shell);
   /*
    * 选中态跟着该图层走：重排后数组换了位置，selected_layer 是**面板行索引**，
-   * 必须重算，否则「刚移动的那一层」在面板上换了行，后续快捷键会作用到别层——
-   * 这一类错误不报任何异常，只会让用户觉得软件选不中自己要的那层。
+   * 必须用纯函数给出的 next_row 重算，否则「刚移动的那一层」在面板上换了行，
+   * 后续快捷键会作用到别层——这一类错误不报任何异常，只会让用户觉得软件
+   * 选不中自己要的那层。
    */
-  shell.selected_layer = comp_ui::clamp_selected_row(next_show, count);
+  shell.selected_layer = comp_ui::clamp_selected_row(plan.next_row, count);
   shell.needs_render = true;
   if (direction == -2) {
     refresh_history_status(shell, L"图层置顶");
@@ -3749,7 +3775,7 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    * （ui_core::layer_row_rect / layer_row_at 的 row_top 参数）。这里从布局算，
    * 不在壳里另写一个数字——两处各写一次必然有一天不一致。
    */
-  const int row_top = shell.histogram_open ? comp_ui::Layout::kHistogramHeight : 0;
+  const int row_top = comp_ui::layer_rows_top(shell.histogram_open);
 
   const int32_t count = static_cast<int32_t>(shell.layers.size());
   for (int32_t line = 0; line < count; ++line) {
@@ -3797,9 +3823,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    * 折线在任何宽度下都能看出形状（偏暗/偏亮/断层）。
    */
   if (shell.histogram_open && !shell.histogram_bins.empty()) {
-    const comp_ui::Rect area{panel_rect.x + 6, panel_rect.y + comp_ui::Layout::kHistogramHeight -
-                                 comp_ui::Layout::kHistogramPlotHeight,
-                             panel_rect.w - 12, comp_ui::Layout::kHistogramPlotHeight};
+    /* 几何来自 comp_ui：块贴在标题行下方，块底与第一行图层严丝合缝（见 S23 P2）。 */
+    const comp_ui::Rect area = comp_ui::histogram_plot_rect(panel_rect);
     RECT frame{area.x, area.y, area.right(), area.bottom()};
     HBRUSH plot = CreateSolidBrush(RGB(14, 16, 20));
     FillRect(dc, &frame, plot);
@@ -3834,9 +3859,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     }
     SetTextColor(dc, RGB(150, 154, 166));
     const wchar_t* label = L"亮度直方图（对数刻度）";
-    TextOutW(dc, panel_rect.x + 8, panel_rect.y + comp_ui::Layout::kHistogramHeight -
-                                      comp_ui::Layout::kHistogramPlotHeight - 14,
-            label, lstrlenW(label));
+    const comp_ui::Rect label_rect = comp_ui::histogram_label_rect(panel_rect);
+    TextOutW(dc, label_rect.x, label_rect.y, label, lstrlenW(label));
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
@@ -5546,7 +5570,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
            * 两处各写一个常量迟早不一致，而症状是「点不中要的那层」——不报错、
            * 只在面板开着直方图时偶现，极难复现。
            */
-          const int row_top = shell->histogram_open ? comp_ui::Layout::kHistogramHeight : 0;
+          const int row_top = comp_ui::layer_rows_top(shell->histogram_open);
           const int row = comp_ui::layer_row_at(
               layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
               row_top);
@@ -6478,6 +6502,15 @@ int run_selftest(const wchar_t* out_path) {
   }
 
   /*
+   * S22 段的历史基线（S23 修正）：必须在**写入之前**取。
+   *
+   * 不引用后面滤镜段才声明的 depth_after_identity：selftest 是单函数长流程，
+   * 变量必须在自己第一次使用之前声明——这不是风格问题，是 C++ 的作用域规则。
+   */
+  size_t s22_depth_baseline = 0;
+  comp_document_history_stats(document, &s22_depth_baseline, &redo_depth);
+
+  /*
    * S22 蒙版回读（comp_layer_get_mask）：
    *
    * 这条锁死的是“面板能否知道这一层带不带蒙版”。蒙版是引擎早已参与合成的真能力
@@ -6652,20 +6685,29 @@ int run_selftest(const wchar_t* out_path) {
          "clipping source cleared");
 
   /*
-   * 上面的写入全部走隐式事务（一步一撤），上下文本来就锁定历史深度；把它们全部撤销回去，
-   * 不影响后续无关段的判据（要索在每步一撤，不在于尚未做完的事）。
+   * 把上面 S22 段的写入全部撤销回去，避免遗留历史深度影响后续无关段的判据。
    *
-   * 基线在这里现取，不引用后面滤镜段才声明的 depth_after_identity：selftest 是单函数
-   * 长流程，变量必须在自己第一次使用之前声明——这不是风格问题，是 C++ 的作用域规则。
+   * 基线必须在**写入之前**取（见本段开头的 s22_depth_baseline）。S22 首版把基线取在
+   * 这里，即全部写入之后，于是 current <= baseline 第一次判断就成立、一条都没撤——
+   * 注释说「全部撤销回去」，实际是空循环。它当时不影响通过，但那正是假护栏：
+   * 以后在它之后追加断言，就会莫名受上一段遗留深度影响。
+   *
+   * 因此这里不只做撤销，还**断言撤销确实发生过**（s22_undone > 0）并且深度回到基线。
+   * 若有人把基线取回调到写入之后，第一条立刻红——它把「护栏是不是真的在护」变成
+   * 可判定的，而不是靠注释自称。
    */
-  size_t s22_depth_baseline = 0;
-  comp_document_history_stats(document, &s22_depth_baseline, &redo_depth);
+  size_t s22_undone = 0;
+  size_t s22_depth_end = 0;
   for (;;) {
     size_t current = 0;
     comp_document_history_stats(document, &current, &redo_depth);
+    s22_depth_end = current;
     if (current <= s22_depth_baseline) break;
     if (comp_document_undo(document) != COMP_OK) break;
+    ++s22_undone;
   }
+  verify(s22_undone > 0, "S22 writes left undoable history and were rolled back");
+  verify(s22_depth_end == s22_depth_baseline, "S22 rollback reaches the pre-S22 depth");
 
   /*
    * 调整面板链路（面板真正走的接口序列）：

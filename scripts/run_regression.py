@@ -133,6 +133,23 @@ def step_windows_shell(reg: Regression) -> bool:
         if not os.path.isfile(SHELL_EXE):
             return "FAIL", f"missing {SHELL_EXE}"
 
+        # S23：引擎对象的变体记账必须与磁盘一致（T2 的 `--gpu --shared` 曾静默降级：
+        # 壳以为在跑 D3D12，链的却是上一次非 GPU 构建留下的 engine_*.o，AUTO 落到 CPU
+        # 且无任何提示）。壳构建现在按变体算确定路径、缺一个就失败，这里再加一条烟测，
+        # 盯住 --check 的结论确实反映磁盘，而不是恒真/恒假。
+        cpu_check = reg.run_cmd(
+            [sys.executable, os.path.join("scripts", "build_windows_shell.py"), "--check"],
+            capture=True)
+        if cpu_check.returncode != 0:
+            return "FAIL", "shell --check 报告 CPU 引擎对象缺失（第 1 步应已产出）"
+        gpu_on_disk = os.path.isfile(os.path.join("build", "gpu_engine_domain_document.o"))
+        gpu_check = reg.run_cmd(
+            [sys.executable, os.path.join("scripts", "build_windows_shell.py"),
+             "--gpu", "--check"], capture=True)
+        if (gpu_check.returncode == 0) != gpu_on_disk:
+            return ("FAIL",
+                    "shell --check --gpu 的结论与磁盘上的 GPU 对象不一致（变体记账不可信）")
+
         #
         # 壳自检自己会写 build/import_probe.png 夹具（缺了就现写，见 main.cpp 的
         # probe_png_exists / write_probe_png），所以这一步**不**再替它补。

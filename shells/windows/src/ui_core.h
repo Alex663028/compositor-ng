@@ -1866,6 +1866,220 @@ inline int32_t clamp_selected_row(int32_t row, int32_t count) {
   return row;
 }
 
+/*
+ * 面板行 <-> 数组下标（S23）：两个方向的翻转只允许写在这一处。
+ *
+ * 理由不是抽象洁癖：S22 把 `count - 1 - row` 手写了四遍（重排锚点、选中态跟随、
+ * 剪贴基底、直方图取层），只要有两处按相反方向理解，就会得到「层动了但选中态
+ * 跳到邻居」这种自洽却不报错的缺陷——它不抛异常、自检也过。抽成纯函数后可以
+ * 表驱动穷举，让方向错误在提交前就暴露。
+ */
+inline int32_t layer_array_index(int32_t count, int32_t row) {
+  if (count <= 0) return -1;
+  return count - 1 - clamp_selected_row(row, count);
+}
+
+inline int32_t layer_row_of_array_index(int32_t count, int32_t array_index) {
+  if (count <= 0 || array_index < 0 || array_index >= count) return -1;
+  return count - 1 - array_index;
+}
+
+/*
+ * 图层重排计划（S23）：把「面板行 + 方向」翻译成 comp_layer_reorder 的锚点。
+ *
+ * 抽成纯函数的理由不是洁癖：S22 的这段换算写在 panel_reorder_layer 里，而
+ * 那层没有任何测试，于是「上移 / 下移整对方向写反、且选中态按相反的假设跟随」
+ * 这种自洽的错误一路进了主干——两个错误互相抵消，肉眼看菜单也不报错，只有
+ * 真去拖图层的人才发现层跑反了。把换算搬到纯函数后可以表驱动穷举。
+ *
+ * 语义（engine/domain/document.cpp: `reorder_layer`）：先 erase 再把 id 插到
+ * `before` **之前**；数组序即堆叠序，**尾 = 顶层**；`before == 0` = 挪到同级末尾
+ * （顶层）。面板行序与之相反：行 0 = 顶层。
+ *
+ * 于是 row -> array_index = count-1-row，而「面板上移一行」= 堆叠序里往上 = 数组
+ * 下标 **+1**，锚点必须是**新位置之上那一层**（插到它前面才落在下面一档）……
+ * 注意插入是在锚点之前，所以要让 id 停在数组下标 k，锚点就必须是**现在**下标 k+1
+ * 的那层（依次递推，见下）。
+ */
+struct ReorderPlan {
+  bool ok;           /* false = 已经到头，界面上应如实提示而不是静默无操作。 */
+  bool at_top;       /* ok=false 时的原因是「已是顶层」还是「已是底层」。 */
+  int32_t before_row; /* 锚点所在的面板行；-1 表示 before = 0（同级末尾）。 */
+  int32_t next_row;   /* 重排后该图层应占的面板行，用于跟随选中态。 */
+};
+
+/*
+ * direction: -2 置顶, -1 上移一层, +1 下移一层, 0 置底。
+ *
+ * 设 idx = count-1-shown。
+ *   上移（-1）：idx+1 <= count-1 才可行；移完后它占 idx+1，锚点 = idx+2 那层，
+ *               若 idx+1 已经是尾（顶层）则 before=0。next_row = shown-1。
+ *   下移（+1）：idx-1 >= 0 才可行；移完后占 idx-1，锚点 = idx 现在的前一位
+ *               = 原 idx-1 那层（erase 之后它就是 idx 位置，仍是「插到它前面」）。
+ *               next_row = shown+1。
+ *   置顶（-2）：before=0，next_row=0。
+ *   置底（0）  ：锚点 = 数组 0（原栈底），next_row=count-1。
+ */
+inline ReorderPlan plan_layer_reorder(int32_t count, int32_t shown, int32_t direction) {
+  ReorderPlan plan{};
+  plan.ok = false;
+  plan.at_top = true;
+  plan.before_row = -1;
+  plan.next_row = 0;
+  if (count <= 0) return plan;
+  const int32_t row = clamp_selected_row(shown, count);
+  const int32_t idx = count - 1 - row;
+  plan.next_row = row;
+
+  if (direction == -2) { /* 置顶 */
+    if (idx == count - 1) { plan.at_top = true; plan.next_row = row; return plan; }
+    plan.ok = true;
+    plan.before_row = -1; /* before = 0 */
+    plan.next_row = 0;
+    return plan;
+  }
+  if (direction == 0) { /* 置底 */
+    if (idx == 0) { plan.at_top = false; plan.next_row = row; return plan; }
+    plan.ok = true;
+    plan.before_row = count - 1; /* 数组 0 = 面板最后一行 */
+    plan.next_row = count - 1;
+    return plan;
+  }
+  if (direction < 0) { /* 上移一层 */
+    if (idx + 1 >= count) { plan.at_top = true; plan.next_row = row; return plan; }
+    plan.ok = true;
+    /* 目标数组下标 = idx+1；锚点 = 目前 idx+2 那层，越界则同级末尾。 */
+    plan.before_row = (idx + 2 < count) ? (count - 1 - (idx + 2)) : -1;
+    plan.next_row = row - 1;
+    return plan;
+  }
+  if (direction > 0) { /* 下移一层 */
+    if (idx == 0) { plan.at_top = false; plan.next_row = row; return plan; }
+    plan.ok = true;
+    /* 目标数组下标 = idx-1；锚点 = 目前 idx-1 那层（面板行 count-1-(idx-1)）。 */
+    plan.before_row = count - 1 - (idx - 1);
+    plan.next_row = row + 1;
+    return plan;
+  }
+  return plan;
+}
+
+/*
+ * 剪贴基底规划（S23）：输入是「面板所见的一层」（数组序、自下而上）。
+ *
+ * 为什么必须做成纯函数：S22 的 panel_toggle_clipping 把「下方一层」取成了
+ * `self_index + 1`（数组上方那一层），守卫却拒绝的是顶层、提示还写「最底层无法
+ * 剪贴」。后果不是「没效果」而是**两条渲染路径给出不同画面**：
+ *   - FilterGraph 要求成员紧跟在基底之后（siblings[i+1+run]->clipping_source ==
+ *     base），取反后剪贴栈根本不成立，画面完全不变；
+ *   - compositor.cpp 的单层视图只要 clipping_source != 0 就按基底求值，画面变了。
+ * 这种「某些视图下看起来是对的」最难查，所以把选择规则搬到这里穷举。
+ */
+struct LayerStackEntry {
+  /*
+   * id / parent / clipping 都是 comp_layer_id（ABI 里是 uint64_t）的数值形式。
+   * 这里刻意用 int64_t 而不是 int32_t：窄化之后两个不同的 id 可能撞成同一个值，
+   * 于是「基底是不是这一层」的判断会在极端情况下给出错误答案，而那种错误只在
+   * 图层数很多时偶发——正是最难查的一类。ui_core 不包含引擎头，故不用精确类型。
+   */
+  int64_t id;       /* 图层 id */
+  int64_t parent;   /* 父级 id；0 = 根级 */
+  int64_t clipping; /* 该层当前剪贴到的基底 id；0 = 不是剪贴成员 */
+};
+
+enum class ClippingTarget {
+  kBase,           /* 成功，base_index 可用 */
+  kNoSiblingBelow, /* 下方没有同父图层：如实拒绝，不静默无操作 */
+  kBrokenStack,    /* 下方邻居是剪贴成员，但它的基底解析不出（越级 / 反向引用） */
+  kInvalid,        /* count / index 不合法 */
+};
+
+struct ClippingPlan {
+  ClippingTarget target = ClippingTarget::kInvalid;
+  int32_t base_index = -1;           /* 数组下标，调用方按 count-1-base_row 换算 */
+  bool joins_existing_stack = false; /* true = 并入下方邻居已有的剪贴栈 */
+  bool ok() const { return target == ClippingTarget::kBase; }
+};
+
+inline ClippingPlan plan_clipping_base(const LayerStackEntry* layers, int32_t count,
+                                       int32_t shown) {
+  ClippingPlan plan{};
+  if (layers == nullptr || count <= 0) return plan;
+  const int32_t index = layer_array_index(count, shown);
+  if (index < 0) return plan;
+  plan.target = ClippingTarget::kInvalid;
+
+  const int64_t parent = layers[index].parent;
+  /*
+   * 「下方一层」= 同父的紧邻前一个（数组序自下而上）。必须跳过夹在中间的别组层：
+   * filter_graph 的 siblings 只含同父层，「全局数组相邻」不等于「同父相邻」——
+   * S22 直接取 self_index-1，只要有图层组就会取到别的组里那一层。
+   */
+  int32_t below = index - 1;
+  while (below >= 0 && layers[below].parent != parent) --below;
+  if (below < 0) {
+    plan.target = ClippingTarget::kNoSiblingBelow;
+    return plan;
+  }
+
+  int32_t base = below;
+  if (layers[below].clipping != 0) {
+    /*
+     * 下方邻居本身已是剪贴成员：基底必须是**它所在栈的基底**，不能是它本人。
+     * 写成链式（C 剪到 B、B 又剪到 A）会让 C 落在栈外——FilterGraph 完全忽略
+     * C 的 clipping_source，而单层视图仍然按它求值，两条路径画面不一致。
+     */
+    int32_t existing = -1;
+    for (int32_t scan = below - 1; scan >= 0; --scan) {
+      if (layers[scan].id == layers[below].clipping) {
+        existing = scan;
+        break;
+      }
+    }
+    /* 只认「在下方且同父」的基底；越级 / 反向引用一律拒绝而不是退化成链。 */
+    if (existing < 0 || existing >= index || layers[existing].parent != parent) {
+      plan.target = ClippingTarget::kBrokenStack;
+      return plan;
+    }
+    base = existing;
+    plan.joins_existing_stack = true;
+  }
+  plan.target = ClippingTarget::kBase;
+  plan.base_index = base;
+  return plan;
+}
+
+/* ------------------------------------------------- 直方图几何（S23） */
+
+/*
+ * 直方图块紧贴图层标题行**下方**：块顶 = panel.y + kLayerHeaderHeight，块高
+ * kHistogramHeight，于是块底与图层行起点（panel.y + kLayerHeaderHeight +
+ * rows_top）严格相接——既不压标题、也不留空档。
+ *
+ * S22 的块顶直接取 panel.y（块内标签落在 panel.y+10），和标题的 panel.y+8 叠字；
+ * 行起点却在 +94，中间空出 30px。根因是「块的坐标」「标签的坐标」「行的偏移」
+ * 三处各算一套。这里统一成唯一来源，绘制与命中测试都从这里取。
+ */
+inline Rect histogram_rect(const Rect& panel) {
+  return Rect{panel.x, panel.y + kLayerHeaderHeight, panel.w, Layout::kHistogramHeight};
+}
+
+inline Rect histogram_label_rect(const Rect& panel) {
+  const Rect block = histogram_rect(panel);
+  return Rect{block.x + 8, block.y + 2, block.w - 16, 14};
+}
+
+inline Rect histogram_plot_rect(const Rect& panel) {
+  const Rect block = histogram_rect(panel);
+  return Rect{block.x + 6, block.y + Layout::kHistogramHeight - Layout::kHistogramPlotHeight,
+              block.w - 12, Layout::kHistogramPlotHeight};
+}
+
+/* 图层行相对标题行的额外下移量：直方图打开时整体让出块高。 */
+inline int layer_rows_top(bool histogram_open) {
+  return histogram_open ? Layout::kHistogramHeight : 0;
+}
+
 }  // namespace comp_ui
 
 #endif /* COMPOSITOR_SHELL_UI_CORE_H */

@@ -42,6 +42,10 @@ ENGINE = os.path.join(ROOT, "engine")
 TESTS = os.path.join(ROOT, "tests")
 BUILD = os.path.join(ROOT, "build")
 
+# 默认工具链。build_windows_shell.py 复用本模块的 engine_object_paths() 计算
+# 「同变体引擎对象在哪」，必须查到同一个 driver，因此把默认值提成常量而不是字面量。
+DEFAULT_DRIVER = "zig"
+
 INCLUDE_DIRS = [
     ENGINE,
     os.path.join(ENGINE, "abi", "include"),
@@ -125,12 +129,37 @@ def run(cmd: list[str], env: dict | None = None) -> None:
     subprocess.run(cmd, check=True, cwd=ROOT, env=env or child_env())
 
 
-def obj_path(source: str, driver: str, shared: bool = False) -> str:
+def obj_variant_prefix(shared: bool, gpu: bool) -> str:
+    """目标文件的变体前缀（S23）：把「是否共享」「是否编入 D3D12」都编进文件名。
+
+    之前只用 `shared_` 区分，GPU 与非 GPU 变体共用同一个 .o 路径，于是「先构建
+    --gpu、再构建默认」会**复用上一次的 GPU 对象**，反之则静默降级到 CPU 桩
+    （T2 在 `--gpu --shared` 上实测到的就是这个：壳链到了非 GPU 对象，AUTO 落到
+    CPU 而没有任何报错）。让变体在路径上就分开，混用不再可能发生。
+    """
+    parts: list[str] = []
+    if gpu:
+        parts.append("gpu")
+    if shared:
+        parts.append("shared")
+    return "_".join(parts) + "_" if parts else ""
+
+
+def obj_path(source: str, driver: str, shared: bool = False, gpu: bool = False) -> str:
     rel = os.path.relpath(source, ROOT).replace("..", "_").replace("/", "_").replace("\\", "_")
     ext = ".obj" if driver == "msvc" else ".o"
-    # 共享构建用独立前缀，避免把 -DCOMP_SHARED 编译出来的 .o 混进静态链接/单测复链里。
-    prefix = "shared_" if shared else ""
-    return os.path.join(BUILD, prefix + os.path.splitext(rel)[0] + ext)
+    return os.path.join(BUILD, obj_variant_prefix(shared, gpu) + os.path.splitext(rel)[0] + ext)
+
+
+def engine_object_paths(driver: str, shared: bool = False, gpu: bool = False) -> list[str]:
+    """本变体下引擎全部目标文件的**预期**路径（壳构建脚本用它，而不是 glob）。
+
+    glob `build/engine_*.o` 会把任意一次历史构建剩下的对象都当成本次输入——这正是
+    静默降级的另一半原因。按变体算出确定路径，缺一个就报错，不给「凑巧能链上」的
+    机会。
+    """
+    c_sources, cxx_sources, _ = collect_sources()
+    return [obj_path(source, driver, shared, gpu) for source in c_sources + cxx_sources]
 
 
 def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
@@ -162,7 +191,7 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
     msvc = driver == "msvc"
 
     for source in c_sources:
-        obj = obj_path(source, driver, shared)
+        obj = obj_path(source, driver, shared, gpu)
         if msvc:
             cmd = cc + ["/nologo", "/c", "/O2", "/utf-8", "/TC", source, f"/Fo{obj}"] + \
                   [f"/I{path}" for path in INCLUDE_DIRS] + msvc_defines
@@ -174,7 +203,7 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
     # 共享构建不编译单测：单测必须静态链进引擎，与「导出符号的库」是两种产物。
     translation_units = list(cxx_sources) + ([] if shared else list(test_sources))
     for source in translation_units:
-        obj = obj_path(source, driver, shared)
+        obj = obj_path(source, driver, shared, gpu)
         if msvc:
             cmd = cxx + ["/nologo", "/c", "/O2", "/utf-8", "/EHsc", "/TP", source, f"/Fo{obj}"] + \
                   [f"/I{path}" for path in INCLUDE_DIRS] + msvc_defines
@@ -222,7 +251,7 @@ def main() -> int:
                         help="build the C ABI as a shared library "
                              "(compositor_engine.dll / libcompositor_engine.so); "
                              "does not build or run the unit tests")
-    parser.add_argument("--driver", default="zig", choices=["zig", "clang", "msvc", "cc"])
+    parser.add_argument("--driver", default=DEFAULT_DRIVER, choices=["zig", "clang", "msvc", "cc"])
     parser.add_argument("--gpu", action="store_true",
                         help="compile the D3D12 backend (-DCOMP_HAS_D3D12); "
                              "without it AUTO resolves to CPU")

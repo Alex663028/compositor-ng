@@ -442,3 +442,27 @@ coverage 把样本盖回当前像素。
   壳自检 182 → **203 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.32。
   **效果（`set_effect`）仍不接**：纯元数据，内核不参与像素求值（`merge_down` 遇效果层直接
   `COMP_ERR_UNSUPPORTED`），属滤镜图里程碑，单独决策。
+- S23 追加（2026-10-20）：**无新增 ABI、不改像素公式**（导出数仍 **115**）。本轮是把 S22
+  复审的四项缺陷修掉，并把「面板换算层」搬进可穷举的纯函数：
+  - `comp_ui::plan_layer_reorder`：面板行 + 方向 → `comp_layer_reorder` 的锚点（`before_row
+    = -1` 表示引擎的 `before = 0`，即同级末尾/顶层）。S22 原实现把上移/下移整对写反且选中态
+    按相反假设跟随，两个错误互相抵消着进了主干；测试按引擎语义**独立重演** erase+insert
+    后比对面板可见顺序。
+  - `comp_ui::plan_clipping_base`：基底必须是**下方紧邻的同父层**。S22 取的是上方一层，
+    守卫却拒绝顶层、提示写「最底层」——取反后 `filter_graph` 的剪贴栈永远不成形（画面不变），
+    而 `compositor.cpp` 单层视图仍按 `clipping_source` 求值（画面变了），两条渲染路径分叉。
+    规则：下方邻居已是成员时并入**它所在栈的基底**（不做链式，链式成员落在栈外）；基底
+    越级/反向/不存在时如实拒绝。`LayerRow` 因此新增 `parent`（由 `get_group_info` 填充）。
+    纯函数接口的 id 一律 64 位（`comp_layer_id` 是 `uint64_t`，窄化会撞值）。
+  - 直方图几何收口到 `histogram_rect` / `histogram_label_rect` / `histogram_plot_rect` /
+    `layer_rows_top`：块贴标题行下方、块底与首行相接，绘制与命中同源（S22 三处各算一套，
+    标签压标题且中间空 30px）。
+  - 自检的历史基线改到写入**之前**取，并断言「确实撤销过」（此前基线取在写入之后，
+    撤销循环第一次判断即跳出，是空循环）。
+  - 构建侧堵掉 T2 的静默降级：`build.py` 的对象路径加**变体前缀**（`gpu_`/`shared_`/
+    `gpu_shared_`）并导出 `engine_object_paths()`；`build_windows_shell.py --gpu` 只链同变体
+    对象，缺一个即失败并提示该跑的命令（新增 `--check` 供回归烟测），不再 glob 历史残留。
+    本变体下 `--present-bench` 报 `backend=D3D12`。
+  基线 478 → **485 用例**（`test_ui_core` 41 → **45**），壳自检 203 → **205 项**（diff 仅新增
+  两行），`--gpu` 变体 485/0 且自检 205/0，`run_regression.py --require-ohos` 6/6 PASS。
+  见 README §6.33。**S22 的非目标全部维持**（效果层、拖行重排、直方图交互、菜单勾选态、镜像）。
