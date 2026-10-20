@@ -12,6 +12,7 @@
  */
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1295,4 +1296,181 @@ COMP_TEST(ui_core_type_panel_rows_steps_and_hit_testing) {
   const comp_ui::Rect row_rect = comp_ui::type_param_row_rect(panel, 2);
   COMP_CHECK(row_rect.x == 1000 && row_rect.y == 46 + 54 + 2 * 20 && row_rect.w == 330 &&
              row_rect.h == 20);
+}
+
+/* ---------------------------------------------------------- 混合模式（S21） */
+
+/*
+ * 表逐字对齐上游 LayerAppearance.swift：LayerBlendMode.allCases 的声明序
+ * （Shift++ / Shift+− 就按这个序循环）与 LayerBlendMode.groups 的分组。
+ * 数值同时是 comp_blend_mode 枚举，ABI 冻结，不能重排。
+ */
+COMP_TEST(ui_core_blend_table_matches_upstream_all_cases) {
+  /* 24 档：0 = Normal .. 23 = Luminosity（ABI comp_blend_mode 冻结表）。 */
+  COMP_CHECK(comp_ui::kBlendCount == 24);
+  COMP_CHECK(comp_ui::kBlendNormal == 0);
+
+  const struct {
+    int mode;
+    const char* name; /* 上游 rawValue 的规范拼写 */
+    int group;        /* 上游 groups[] 的组号：见 kBlendGroupName */
+  } expected[] = {
+      {0, "Normal", 0},
+      {1, "Darken", 1},
+      {2, "Multiply", 1},
+      {3, "Color Burn", 1},
+      {4, "Linear Burn", 1},
+      {5, "Lighten", 2},
+      {6, "Screen", 2},
+      {7, "Color Dodge", 2},
+      {8, "Linear Dodge (Add)", 2},
+      {9, "Overlay", 3},
+      {10, "Soft Light", 3},
+      {11, "Hard Light", 3},
+      {12, "Vivid Light", 3},
+      {13, "Linear Light", 3},
+      {14, "Pin Light", 3},
+      {15, "Hard Mix", 3},
+      {16, "Difference", 4},
+      {17, "Exclusion", 4},
+      {18, "Subtract", 4},
+      {19, "Divide", 4},
+      {20, "Hue", 5},
+      {21, "Saturation", 5},
+      {22, "Color", 5},
+      {23, "Luminosity", 5},
+  };
+  COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == comp_ui::kBlendCount);
+
+  for (const auto& entry : expected) {
+    COMP_CHECK_MSG(std::string(comp_ui::blend_mode_name(entry.mode)) == entry.name,
+                   comp_ui::blend_mode_name(entry.mode));
+    COMP_CHECK_MSG(comp_ui::blend_group_of(entry.mode) == entry.group,
+                   "blend group assignment");
+  }
+
+  /* 分组表本身必须自洽：组号连续、组内档位严格递增、全体恰好覆盖 0..23 一次。 */
+  bool seen[comp_ui::kBlendCount] = {};
+  for (int group = 0; group < comp_ui::kBlendGroupCount; ++group) {
+    int previous = -1;
+    for (int slot = 0; slot < 8; ++slot) {
+      const int mode = comp_ui::kBlendGroups[group][slot];
+      if (mode < 0) break;
+      COMP_CHECK(mode > previous); /* 组内按 allCases 顺序排列 */
+      COMP_CHECK(!seen[mode]);     /* 不得重复覆盖 */
+      seen[mode] = true;
+      previous = mode;
+    }
+  }
+  for (int mode = 0; mode < comp_ui::kBlendCount; ++mode) {
+    COMP_CHECK(seen[mode]);
+  }
+  /* 分组名非空，供状态栏显示。 */
+  for (int group = 0; group < comp_ui::kBlendGroupCount; ++group) {
+    COMP_CHECK(std::string(comp_ui::blend_group_name(group)).empty() == false);
+  }
+}
+
+COMP_TEST(ui_core_blend_mode_steps_and_wraps_like_upstream) {
+  /* clamp：负值与越界一律折回合法区间，不得把 999 这类脏值传给 ABI。 */
+  COMP_CHECK(comp_ui::clamp_blend_mode(-5) == 0);
+  COMP_CHECK(comp_ui::clamp_blend_mode(0) == 0);
+  COMP_CHECK(comp_ui::clamp_blend_mode(23) == 23);
+  COMP_CHECK(comp_ui::clamp_blend_mode(24) == 23);
+  COMP_CHECK(comp_ui::clamp_blend_mode(999) == 23);
+  COMP_CHECK(comp_ui::clamp_blend_mode(comp_ui::kBlendNormal) == comp_ui::kBlendNormal);
+
+  /* 步进回绕（对齐上游 cycleBlendMode 的取模）：Normal 后退到 Luminosity。 */
+  COMP_CHECK(comp_ui::step_blend_mode(0, -1) == 23);
+  COMP_CHECK(comp_ui::step_blend_mode(0, 1) == 1);
+  COMP_CHECK(comp_ui::step_blend_mode(23, 1) == 0);
+  COMP_CHECK(comp_ui::step_blend_mode(23, -1) == 22);
+
+  /* direction = 0 是幂等查询，不应改动档位。 */
+  COMP_CHECK(comp_ui::step_blend_mode(7, 0) == 7);
+  COMP_CHECK(comp_ui::step_blend_mode(0, 0) == 0);
+
+  /* 连续多步必须与单步逐次等价（回绕不能有偏差）。 */
+  int stepped = comp_ui::kBlendNormal;
+  for (int i = 0; i < comp_ui::kBlendCount; ++i) {
+    stepped = comp_ui::step_blend_mode(stepped, 1);
+  }
+  COMP_CHECK(stepped == comp_ui::kBlendNormal); /* 走完一轮回到起点 */
+  for (int i = 0; i < comp_ui::kBlendCount + 3; ++i) {
+    stepped = comp_ui::step_blend_mode(stepped, 1);
+  }
+  COMP_CHECK(stepped == 3); /* 再过三轮 + 3 */
+}
+
+/* ---------------------------------------------------------- 图层变换（S21） */
+
+/*
+ * 步进量与夹取的纯函数层：壳侧据此写入 comp_layer_set_transform，非法值由引擎拒。
+ * 这里只保证「壳算出来的值一定是引擎肯收的合法值」与「中心锚定」两条口径。
+ */
+COMP_TEST(ui_core_layer_transform_move_steps) {
+  COMP_CHECK(comp_ui::layer_transform_move_step(false) == 1);
+  COMP_CHECK(comp_ui::layer_transform_move_step(true) == 10);
+  /* 步进量必须是常量，不随任何状态变化。 */
+  COMP_CHECK(comp_ui::kLayerTransformMoveStep == 1);
+  COMP_CHECK(comp_ui::kLayerTransformMoveCoarse == 10);
+}
+
+COMP_TEST(ui_core_layer_transform_rotate_steps_and_stays_finite) {
+  /* 15 度一档（对齐上游方向/修饰键的旋转微调粒度）。 */
+  COMP_CHECK(comp_ui::layer_transform_rotate_step(0.0, false) == 15.0);
+  COMP_CHECK(comp_ui::layer_transform_rotate_step(15.0, false) == 30.0);
+  /* 精调档 1 度。 */
+  COMP_CHECK(near_value(comp_ui::layer_transform_rotate_step(0.0, true), 1.0));
+  /* 连续性：可以超过一圈，上游 isValid 只要求 finite。 */
+  double rotated = 0.0;
+  for (int i = 0; i < 24; ++i) rotated = comp_ui::layer_transform_rotate_step(rotated, false);
+  COMP_CHECK(near_value(rotated, 360.0));
+  COMP_CHECK(rotated > -1e18 && rotated < 1e18); /* 保持有限，引擎才肯收 */
+
+  /* NaN / inf 一律归一化到 0：脏值不进 ABI（否则 is_valid_transform 拒，面板分叉）。 */
+  COMP_CHECK(comp_ui::layer_transform_rotate_step(std::numeric_limits<double>::quiet_NaN(),
+                                                  false) == 0.0);
+  COMP_CHECK(comp_ui::layer_transform_rotate_step(
+                 std::numeric_limits<double>::infinity(), false) == 0.0);
+  COMP_CHECK(comp_ui::layer_transform_rotate_step(
+                 -std::numeric_limits<double>::infinity(), false) == 0.0);
+}
+
+COMP_TEST(ui_core_layer_transform_scale_clamps_and_holds_center) {
+  /* 夹取：NaN 与负值落到下限，超上限落到上限（对齐 is_valid_transform 的 size 1..300000）。 */
+  COMP_CHECK(comp_ui::clamp_layer_scale(-5.0) == comp_ui::kLayerTransformScaleMin);
+  COMP_CHECK(comp_ui::clamp_layer_scale(std::numeric_limits<double>::quiet_NaN()) ==
+             comp_ui::kLayerTransformScaleMin);
+  COMP_CHECK(comp_ui::clamp_layer_scale(1.0) == 1.0);
+  COMP_CHECK(comp_ui::clamp_layer_scale(99.0) == comp_ui::kLayerTransformScaleMax);
+
+  /* 中心锚定：缩放前后中心不变——这是拖动角缩放的行为，不是左上角固定。 */
+  int32_t x = 100, y = 50, w = 200, h = 100;
+  const double cx = 200.0, cy = 100.0;
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, 1.5);
+  COMP_CHECK(w == 300 && h == 150);
+  COMP_CHECK(near_value(static_cast<double>(x) + w / 2.0, cx));
+  COMP_CHECK(near_value(static_cast<double>(y) + h / 2.0, cy));
+  COMP_CHECK(x == 50 && y == 25);
+
+  /* 缩到下限附近：尺寸不得跌破 1 像素（引擎下限）。 */
+  x = 100; y = 50; w = 10; h = 10;
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, 0.001);
+  COMP_CHECK(w >= 1 && h >= 1);
+  COMP_CHECK(comp_ui::clamp_layer_scale(0.001) == comp_ui::kLayerTransformScaleMin);
+
+  /* 非法尺寸本身就是空操作，不得写出退化矩形。 */
+  x = 0; y = 0; w = 0; h = 0;
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, 2.0);
+  COMP_CHECK(w == 0 && h == 0); /* 非正尺寸原样返回，交给调用方拒绝 */
+
+  /* 缩放档位与双向对称：+1% 再 -1% 回到原尺寸（取整造成的 1 px 误差可接受）。 */
+  x = 100; y = 50; w = 200, h = 100;
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, 1.0 + comp_ui::kLayerTransformScaleStep);
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, 1.0 / (1.0 + comp_ui::kLayerTransformScaleStep));
+  COMP_CHECK(std::abs(w - 200) <= 1 && std::abs(h - 100) <= 1);
+
+  /* 空指针不得崩。 */
+  comp_ui::layer_transform_scale_rect(nullptr, nullptr, nullptr, nullptr, 1.0);
 }

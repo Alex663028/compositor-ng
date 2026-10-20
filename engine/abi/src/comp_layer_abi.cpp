@@ -369,6 +369,27 @@ comp_result comp_layer_get_visible(comp_document document, comp_layer_id id,
   return compositor::abi::ok(engine);
 }
 
+comp_result comp_layer_get_transform(comp_document document, comp_layer_id id,
+                                    comp_rect* out_transform, float* out_rotation) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  /* 两个出参都必填：只回一半会让调用方拿着半份变换去做相对步进，必然漂移。 */
+  if (out_transform == nullptr || out_rotation == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "out_transform / out_rotation is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_transform = layer->transform;
+  *out_rotation = layer->rotation;
+  return compositor::abi::ok(engine);
+}
+
 comp_result comp_layer_set_sampling(comp_document document, comp_layer_id id,
                                     comp_sampling sampling) {
   Document* doc = nullptr;

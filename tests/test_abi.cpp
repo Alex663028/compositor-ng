@@ -1256,3 +1256,64 @@ COMP_TEST(last_error_slot_is_thread_local) {
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 }
+
+/*
+ * 图层变换 round-trip（comp_layer_get_transform）。
+ *
+ * 入口的意义是「壳能做相对步进」：缩放要以当前中心为锚、旋转要在既有角度上累加，
+ * 两端都必须先读到现值。此前 ABI 只有 set_transform 没有对应 getter，壳侧只能
+ * 凭记忆维护一份 transform——那必然与文档漂移（撤销、合并、.comp 读回都会改它）。
+ *
+ * 断言三件事：回读等于写入值；回读值可直接再写入（往返保真）；非法 id 与空出参
+ * 被拒，而不是写坏调用方内存。
+ */
+COMP_TEST(abi_layer_transform_get_is_the_write_mirror) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc doc_desc{};
+  doc_desc.width = 16;
+  doc_desc.height = 16;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &document) == COMP_OK);
+
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "transform-probe";
+  const comp_rect placed{3, 5, 8, 6};
+  layer_desc.transform = placed;
+  layer_desc.rotation = 12.0f;
+  comp_layer_id layer = 0;
+  COMP_CHECK(comp_layer_add(document, &layer_desc, &layer) == COMP_OK);
+  COMP_CHECK(layer != 0);
+
+  /* 1. 写入的值必须原样读回（add 时给的 transform / rotation）。 */
+  comp_rect read_rect{0, 0, 0, 0};
+  float read_rotation = 0.0f;
+  COMP_CHECK(comp_layer_get_transform(document, layer, &read_rect, &read_rotation) == COMP_OK);
+  COMP_CHECK(read_rect.x == placed.x && read_rect.y == placed.y && read_rect.w == placed.w &&
+             read_rect.h == placed.h);
+  COMP_CHECK(read_rotation > 11.9f && read_rotation < 12.1f);
+
+  /* 2. 回读值可直接再写回（不发一次 ABI 也能证明结构无损）。 */
+  const comp_rect moved{40, 12, 20, 10};
+  const float turned = 200.0f;
+  COMP_CHECK(comp_layer_set_transform(document, layer, moved, turned) == COMP_OK);
+  COMP_CHECK(comp_layer_get_transform(document, layer, &read_rect, &read_rotation) == COMP_OK);
+  COMP_CHECK(read_rect.x == moved.x && read_rect.y == moved.y && read_rect.w == moved.w &&
+             read_rect.h == moved.h);
+  COMP_CHECK(read_rotation > 199.9f && read_rotation < 200.1f);
+
+  /* 3. 空出参必须先拒，不能写坏调用方内存。 */
+  COMP_CHECK(comp_layer_get_transform(document, layer, nullptr, &read_rotation) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_transform(document, layer, &read_rect, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_transform(document, 0xdeadbeef, &read_rect, &read_rotation) ==
+             COMP_ERR_NOT_FOUND);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}

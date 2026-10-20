@@ -26,7 +26,13 @@
 # sysroot 实测同时具备 aarch64 / arm / x86_64 三套 usr/lib 目录。
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# ROOT 必须是「原生路径」形式：DevEco 的 clang(.exe) 是 Windows 原生程序，
+# MSYS/MinGW 下 $(pwd) 给出的是 /e/... 形式；当 MSYS_NO_PATHCONV=1（或
+# MSYS2_ARG_CONV_EXCL=*）时 MSYS 不会把该参数翻译成 E:/...，原生 clang 会
+# 直接报 `no such file or directory`（实测 ok=0 fail=91，且 5 秒内全灭）。
+# 故优先用 pwd -W（MSYS 专有，输出 E:/… 正斜杠形式）；Linux/macOS 没有 -W，
+# 回落到 pwd，那里本来就是原生路径，无需翻译。
+ROOT="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 NDK="${OHOS_NDK:-G:/DevEco Studio/sdk/default/openharmony/native}"
 SYSROOT="$NDK/sysroot"
 BIN="$NDK/llvm/bin"

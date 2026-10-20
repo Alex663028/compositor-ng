@@ -11,11 +11,29 @@
 [OK] comp_render_flatten()
 [OK] flatten output has non-transparent pixels
 [info] non-transparent pixels = 4096 / 4096
-[info] history: can_undo=1 depth=2 redo=0
+[OK] blend mode round trip (set MULTIPLY -> get)
+[OK] invalid blend mode rejected without clobbering the stored value
+[OK] blend mode restored to NORMAL
+[OK] comp_io_export(png)
+[OK] comp_io_import(png round trip)
+[OK] image round trip keeps canvas size
+[OK] probe image imports at 240x160
+[OK] probe image content matches the known pattern
+[info] history: can_undo=1 depth=4 redo=0
 [OK] comp_document_undo()
 [OK] comp_document_save(.comp)
 [OK] comp_document_load(.comp round trip)
 [OK] round trip keeps canvas size
+[OK] comp_txn_begin() for layer transform
+[OK] comp_layer_get_transform()
+[OK] comp_layer_set_transform(move 1px)
+[OK] transform round trip keeps the stepped value
+[OK] comp_layer_set_transform(rotate +15)
+[OK] rotation accumulates on the current value
+[OK] selftest layer carries an explicit transform box
+[OK] comp_layer_set_transform(scale +1%)
+[OK] scale round trip keeps the new box
+[OK] comp_txn_abort() rolls the transform back
 [OK] comp_layer_adjustment_kind_name(3) == Exposure
 [OK] comp_layer_adjustment_param_count(3) == 3
 [OK] comp_layer_adjustment_param_at(3,0) path

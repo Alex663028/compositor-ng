@@ -34,6 +34,7 @@
 
 #include <compositor/comp_command.h>
 #include <compositor/comp_core.h>
+#include <compositor/comp_crop.h>
 #include <compositor/comp_engine.h>
 #include <compositor/comp_eyedropper.h>
 #include <compositor/comp_filter.h>
@@ -79,6 +80,20 @@ constexpr UINT kCmdLayerSelectDown = 1010;
 constexpr UINT kCmdLayerToggleVisible = 1011;
 constexpr UINT kCmdLayerOpacityDown = 1012;
 constexpr UINT kCmdLayerOpacityUp = 1013;
+constexpr UINT kCmdLayerBlendPrev = 1034; /* S21：混合模式按菜单序后退一步 */
+constexpr UINT kCmdLayerBlendNext = 1035; /* S21：混合模式按菜单序前进一步 */
+constexpr UINT kCmdBlendBase = 1300;      /* S21：+ 混合模式档位 0..23，菜单直达 */
+constexpr UINT kCmdLayerMoveLeft = 1036;  /* S21：图层平移（Shift=微调、Ctrl=粗调） */
+constexpr UINT kCmdLayerMoveRight = 1037;
+constexpr UINT kCmdLayerMoveUp = 1038;
+constexpr UINT kCmdLayerMoveDown = 1039;
+constexpr UINT kCmdLayerRotateLeft = 1040;  /* S21：图层旋转，见 layer_rotate_step */
+constexpr UINT kCmdLayerRotateRight = 1041;
+constexpr UINT kCmdLayerScaleDown = 1042;   /* S21：图层等比例缩放，中心锚定 */
+constexpr UINT kCmdLayerScaleUp = 1043;
+constexpr UINT kCmdOpenImage = 1044;   /* S22: open bitmap as new document */
+constexpr UINT kCmdImportImage = 1045; /* S22: bitmap as new layer */
+constexpr UINT kCmdExportImage = 1046; /* S22: export bitmap */
 constexpr UINT kCmdAdjKindPrev = 1014;
 constexpr UINT kCmdAdjKindNext = 1015;
 constexpr UINT kCmdAdjRowPrev = 1016;
@@ -182,6 +197,14 @@ struct ShellState {
   comp_ui::Point marquee_current{};
   /* Marquee 形状（S7）：M 键在矩形 / 椭圆之间循环。 */
   int marquee_shape = comp_ui::kMarqueeRect;
+  /*
+   * 裁剪（S22）：C 切工具，拖出框后 Enter 提交 / Esc 取消。
+   * 与 Marquee 不同的关键点：框本身是**文档坐标**的裁剪区，提交会改画布尺寸
+   * （引擎侧 comp_crop_apply 负责，且自带「取整 → 校验 → 一步撤销」的契约）。
+   * active 表示「框已定、等待提交」，拖拽中同样为 true（预览就是最终值）。
+   */
+  bool crop_active = false;
+  comp_crop_rect crop_rect{};
   /* 套索（S7）：自由手绘折线（文档像素 x,y 交替），松开闭合成多边形。 */
   bool lasso_active = false;
   std::vector<float> lasso_points;
@@ -313,6 +336,9 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 /* 调整面板在下方定义；refresh_layers 需要它同步选中图层的调整列表。 */
 void refresh_adjustments(ShellState& shell);
 
+/* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
+std::wstring widen_ascii(const char* text);
+
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
 void refresh_layers(ShellState& shell) {
   shell.layers.clear();
@@ -422,6 +448,166 @@ void panel_adjust_opacity(ShellState& shell, float delta) {
   shell.needs_render = true;
   wchar_t buffer[96];
   wsprintfW(buffer, L"不透明度 %d%%", static_cast<int>(next * 100.0f + 0.5f));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 混合模式步进（S21）：按上游 LayerBlendMode.allCases 的声明序循环并回绕，
+ * 一步一次撤销（对齐上游 cycleBlendMode / setLayerBlendMode）。
+ * 走 menu order 的档位由 ui_core 提供，壳内不复制枚举表。
+ */
+void panel_cycle_blend(ShellState& shell, int direction) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int next = comp_ui::step_blend_mode(row->blend, direction);
+  if (next == row->blend) return; /* 单一档位（不应发生）*/
+  if (comp_layer_set_blend(shell.document, row->id, static_cast<comp_blend_mode>(next)) != COMP_OK) {
+    set_status(shell, L"设置混合模式失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  const std::wstring name = widen_ascii(comp_ui::blend_mode_name(next));
+  const std::wstring group = widen_ascii(comp_ui::blend_group_name(comp_ui::blend_group_of(next)));
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"混合模式：%s（%s 组，%d/%d）", name.c_str(), group.c_str(), next + 1,
+            comp_ui::kBlendCount);
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 混合模式直达（S21）：菜单选哪一项就落到那一档，与步进走同一条 ABI 路径。
+ * 幂等：已是该档位时仍走一次写入（与上游 setLayerBlendMode 同语义，历史记一步）。
+ */
+void panel_set_blend(ShellState& shell, int mode) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int next = comp_ui::clamp_blend_mode(mode);
+  if (comp_layer_set_blend(shell.document, row->id, static_cast<comp_blend_mode>(next)) != COMP_OK) {
+    set_status(shell, L"设置混合模式失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  const std::wstring name = widen_ascii(comp_ui::blend_mode_name(next));
+  const std::wstring group = widen_ascii(comp_ui::blend_group_name(comp_ui::blend_group_of(next)));
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"混合模式：%s（%s 组，%d/%d）", name.c_str(), group.c_str(), next + 1,
+            comp_ui::kBlendCount);
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 图层平移（S21）：对选中图层做整层几何位移——与 Move 工具的选区搬移
+ * （comp_selection_move_pixels，只动当前图层的选区像素）是两件事，勿混。
+ *
+ * 前置：必须先 comp_layer_get_transform 读到现值再步进，不能凭壳内缓存——
+ * 撤销、合并、.comp 读回都会改变文档里的 transform，缓存必然漂移（这正是
+ * 补 comp_layer_get_transform 的原因）。
+ */
+void panel_move_layer(ShellState& shell, int dx, int dy) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
+    set_status(shell, L"读取图层变换失败");
+    return;
+  }
+  transform.x += dx;
+  transform.y += dy;
+  if (comp_layer_set_transform(shell.document, row->id, transform, rotation) != COMP_OK) {
+    set_status(shell, L"平移图层失败");
+    return;
+  }
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"图层位置：(%d, %d) 方向键", transform.x, transform.y);
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 图层旋转（S21）：在既有角度上累加——必须先读现值，理由同 panel_move_layer。
+ * 步进量与夹取口径全在 ui_core（layer_transform_rotate_step），壳不重算。
+ */
+void panel_rotate_layer(ShellState& shell, bool forward) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
+    set_status(shell, L"读取图层变换失败");
+    return;
+  }
+  /*
+   * ui_core 的步进函数只做「+step」；反向是取负方向（上游 Ctrl+左右是加减同一
+   * 档位，旋转不因方向不同而换粒度）。
+   */
+  double next = comp_ui::layer_transform_rotate_step(static_cast<double>(rotation), false);
+  if (!forward) next = static_cast<double>(rotation) - comp_ui::kLayerTransformRotateStep;
+  /* 多圈累加后归一化到 (-360, 360]，保持与上游 radians 的 truncatingRemainder 一致。 */
+  while (next > 360.0) next -= 360.0;
+  while (next <= -360.0) next += 360.0;
+  if (comp_layer_set_transform(shell.document, row->id, transform,
+                               static_cast<float>(next)) != COMP_OK) {
+    set_status(shell, L"旋转图层失败");
+    return;
+  }
+  shell.needs_render = true;
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"图层旋转：%d°（Ctrl+左右）",
+            static_cast<int>(next + 0.5));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 图层缩放（S21）：等比例、中心锚定，增量与夹取在 ui_core（scale_rect）。
+ * 同样必须先读现值——缩放算的是「新尺寸 = 旧尺寸 × 系数」。
+ */
+void panel_scale_layer(ShellState& shell, int direction) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
+    set_status(shell, L"读取图层变换失败");
+    return;
+  }
+  if (transform.w <= 0 || transform.h <= 0) {
+    /* w/h<=0 = 按像素尺寸（未显式给过变换）：此时没有可缩放的基准，如实拒绝。 */
+    set_status(shell, L"该图层还没有显式变换（按尺寸缩放需先给定变换）");
+    return;
+  }
+  int32_t x = transform.x, y = transform.y, w = transform.w, h = transform.h;
+  comp_ui::layer_transform_scale_rect(&x, &y, &w, &h, direction >= 0 ? 1.0 + comp_ui::kLayerTransformScaleStep
+                                                                    : 1.0 - comp_ui::kLayerTransformScaleStep);
+  if (w == transform.w && h == transform.h) {
+    set_status(shell, L"缩放已到上下限");
+    return;
+  }
+  const comp_rect scaled{x, y, w, h};
+  if (comp_layer_set_transform(shell.document, row->id, scaled, rotation) != COMP_OK) {
+    set_status(shell, L"缩放图层失败");
+    return;
+  }
+  shell.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"图层尺寸：%d×%d（Alt+[ ]，中心锚定）", w, h);
   refresh_history_status(shell, buffer);
 }
 
@@ -1979,6 +2165,82 @@ void marquee_end(HWND window, ShellState& shell) {
       });
 }
 
+/* ------------------------------------------------------------ 裁剪（Crop） */
+
+/*
+ * 与 Marquee 的区别：Marquee 产出的是**选区**（不动画布），Crop 产出的是**新画布**
+ * （动文档尺寸）。两者都拖框，但提交后果完全不同，所以不复用同一套状态。
+ *
+ * 交互对齐 PS：拖出框 → 框外变暗（三分段遮罩）→ Enter 提交 / Esc 取消。
+ * 提交走 comp_crop_apply：它自己负责取整、校验、一步撤销，壳不重复实现这些规则。
+ */
+bool crop_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Crop;
+}
+
+void crop_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!crop_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.crop_active = true;
+  shell.crop_rect.x = doc.x;
+  shell.crop_rect.y = doc.y;
+  shell.crop_rect.width = 1.0;
+  shell.crop_rect.height = 1.0;
+  SetCapture(window);
+  set_status(shell, L"裁剪：拖出框后 Enter 提交，Esc 取消");
+}
+
+void crop_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.crop_active) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  /* 允许任意方向拖拽：负宽高先标准化成正矩形，与引擎的 snap 口径一致。 */
+  shell.crop_rect.x = static_cast<double>(doc.x < shell.crop_rect.x ? doc.x : shell.crop_rect.x);
+  shell.crop_rect.y = static_cast<double>(doc.y < shell.crop_rect.y ? doc.y : shell.crop_rect.y);
+  const double right = static_cast<double>(doc.x > shell.crop_rect.x ? doc.x : shell.crop_rect.x);
+  const double bottom = static_cast<double>(doc.y > shell.crop_rect.y ? doc.y : shell.crop_rect.y);
+  shell.crop_rect.width = right - shell.crop_rect.x;
+  shell.crop_rect.height = bottom - shell.crop_rect.y;
+}
+
+void crop_cancel(ShellState& shell) { shell.crop_active = false; }
+
+/*
+ * 提交裁剪。读取引擎给出的 out_changed：为 0 表示框恰好等于当前画布，
+ * 这时引擎不产生撤销步，壳也不该把状态栏说成「已裁剪」。
+ */
+bool crop_commit(ShellState& shell) {
+  if (!shell.crop_active || shell.document == nullptr) return false;
+  fprintf(stderr, "[crop] commit rect=%f,%f,%f,%f\n", shell.crop_rect.x,
+          shell.crop_rect.y, shell.crop_rect.width, shell.crop_rect.height);
+  int32_t changed = 0;
+  const comp_result result = comp_crop_apply(shell.document, shell.crop_rect, &changed);
+  shell.crop_active = false;
+  fprintf(stderr, "[crop] apply result=%d changed=%d\n", (int)result,
+          (int)changed);
+  if (result != COMP_OK) {
+    set_status(shell, L"裁剪失败：框不合法");
+    return false;
+  }
+  if (changed == 0) {
+    set_status(shell, L"裁剪未改变画布尺寸");
+    return true;
+  }
+  /* 画布换了坐标系：view 的偏移按新尺寸重算，否则残留的平移会把画布推出可视区。 */
+  comp_size size{};
+  if (comp_document_size(shell.document, &size) == COMP_OK) {
+    shell.width = size.width;
+    shell.height = size.height;
+  }
+  shell.needs_fit = true;
+  shell.needs_render = true;
+  refresh_layers(shell);
+  refresh_selection(shell);
+  refresh_history_status(shell, L"已裁剪");
+  return true;
+}
+
 /* ------------------------------------------------------------ 画布落笔（折线） */
 
 /*
@@ -2539,6 +2801,170 @@ void save_document_dialog(HWND window, ShellState& shell) {
   save_document(shell, utf8);
 }
 
+/* 定义在下方（要用到 load_document / refresh_* 族），这里先声明：对话框入口需要它。 */
+void open_path_as_document(ShellState& shell, const char* path_utf8);
+
+/*
+ * 一个打开入口，两条去向。用户拖进来的东西可能是一张图，也可能是一个 .comp，
+ * 按扩展名分派比让用户先想「该点哪个菜单」更接近 PS 的行为（PS 也是看文件类型）。
+ */
+void open_path_as_document(ShellState& shell, const char* path_utf8) {
+  const comp_image_format format = comp_io_format_from_path(path_utf8);
+  if (format != COMP_FORMAT_UNKNOWN) {
+    comp_document document = nullptr;
+    if (comp_io_import(shell.engine, path_utf8, &document) != COMP_OK || document == nullptr) {
+      set_status(shell, L"打开位图失败：格式不支持或文件损坏");
+      return;
+    }
+    if (shell.document != nullptr) comp_document_destroy(shell.document);
+    shell.document = document;
+    comp_size size{};
+    if (comp_document_size(shell.document, &size) == COMP_OK) {
+      shell.width = size.width;
+      shell.height = size.height;
+    }
+    const size_t pixel_count =
+        static_cast<size_t>(shell.width) * static_cast<size_t>(shell.height);
+    shell.rgba.assign(pixel_count * 4, 0);
+    shell.framebuffer.assign(pixel_count, 0);
+    shell.needs_render = true;
+    shell.needs_fit = true;
+    shell.visibility.clear();
+    shell.filter_open = false;
+    shell.filter_input.clear();
+    stroke_cancel(shell);
+    move_cancel(shell);
+    eyedropper_cancel(shell);
+    marquee_cancel(shell);
+    lasso_cancel(shell);
+    pen_cancel(shell);
+    refresh_layers(shell);
+    refresh_selection(shell);
+    refresh_history_status(shell, L"已打开位图");
+    return;
+  }
+  load_document(shell, path_utf8);
+}
+
+/*
+ * 拖放导入。Windows 的 WM_DROPFILES 用 GMEM 句柄把路径交给窗口，必须
+ * DragQueryFileW + DragFinish 成对，否则句柄泄漏。
+ *
+ * 语义对齐 PS：**空文档**时拖入 = 打开该文件；**已有内容**时拖入 = 置为新图层。
+ * 这条分派比「永远新建文档」更符合工作流（在已有画布上叠一张素材是最常见操作）。
+ */
+void handle_drop_files(HWND window, ShellState& shell, HDROP drop) {
+  const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+  for (UINT index = 0; index < count; ++index) {
+    wchar_t path[MAX_PATH] = L"";
+    if (DragQueryFileW(drop, index, path, MAX_PATH) == 0) continue;
+    char utf8[MAX_PATH * 3] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr);
+    if (utf8[0] == '\0') continue;
+
+    if (shell.document == nullptr) {
+      open_path_as_document(shell, utf8);
+    } else if (comp_io_format_from_path(utf8) != COMP_FORMAT_UNKNOWN) {
+      comp_layer_id id = 0;
+      if (comp_io_import_layer(shell.document, utf8, &id) == COMP_OK && id != 0) {
+        shell.needs_render = true;
+        refresh_layers(shell);
+        refresh_selection(shell);
+        refresh_history_status(shell, L"已置入位图图层");
+      } else {
+        set_status(shell, L"置入位图失败");
+      }
+    } else {
+      open_path_as_document(shell, utf8);
+    }
+  }
+  DragFinish(drop);
+  (void)window;
+}
+
+/* ------------------------------------------------------- 位图导入 / 导出 */
+
+/*
+ * 位图对话框与 .comp 对话框分开：用户心智里「打开图片」和「打开工程」不是一件事，
+ * 混在一个过滤器里会让人以为 .comp 和 png 同级。格式由 comp_io_format_from_path
+ * 从扩展名推断，本构建不支持的（HEIF/WebP/TIFF/PSB/SVG）在引擎侧以具名原因拒绝，
+ * 这里不重复判断、不猜格式。
+ */
+void open_image_dialog(HWND window, ShellState& shell) {
+  wchar_t buffer[MAX_PATH] = L"";
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = window;
+  dialog.lpstrFilter =
+      L"位图 (*.png;*.jpg;*.jpeg;*.exr;*.psd;*.hdr)\0*.png;*.jpg;*.jpeg;*.exr;*.psd;*.hdr\0"
+      L"PNG (*.png)\0*.png\0JPEG (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0"
+      L"EXR (*.exr)\0*.exr\0PSD (*.psd)\0*.psd\0Radiance HDR (*.hdr)\0*.hdr\0"
+      L"所有文件\0*.*\0";
+  dialog.lpstrFile = buffer;
+  dialog.nMaxFile = MAX_PATH;
+  dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+  if (!GetOpenFileNameW(&dialog)) return;
+  char utf8[MAX_PATH * 3] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, sizeof(utf8), nullptr, nullptr);
+  open_path_as_document(shell, utf8);
+}
+
+/* 把图片作为新图层放进当前文档；失败时文档保持原样（引擎侧契约）。 */
+void import_image_dialog(HWND window, ShellState& shell) {
+  if (shell.document == nullptr) return;
+  wchar_t buffer[MAX_PATH] = L"";
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = window;
+  dialog.lpstrFilter =
+      L"位图 (*.png;*.jpg;*.jpeg;*.exr;*.psd;*.hdr)\0*.png;*.jpg;*.jpeg;*.exr;*.psd;*.hdr\0"
+      L"所有文件\0*.*\0";
+  dialog.lpstrFile = buffer;
+  dialog.nMaxFile = MAX_PATH;
+  dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+  if (!GetOpenFileNameW(&dialog)) return;
+  char utf8[MAX_PATH * 3] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, sizeof(utf8), nullptr, nullptr);
+  comp_layer_id id = 0;
+  if (comp_io_import_layer(shell.document, utf8, &id) != COMP_OK || id == 0) {
+    set_status(shell, L"置入图片失败");
+    return;
+  }
+  shell.needs_render = true;
+  refresh_layers(shell);
+  refresh_selection(shell);
+  refresh_history_status(shell, L"已置入图片图层");
+}
+
+/* 另存为位图。flatten 只对 PSD 有意义，其余格式引擎侧已按合成表面导出。 */
+void export_image_dialog(HWND window, ShellState& shell) {
+  if (shell.document == nullptr) return;
+  wchar_t buffer[MAX_PATH] = L"";
+  OPENFILENAMEW dialog{};
+  dialog.lStructSize = sizeof(dialog);
+  dialog.hwndOwner = window;
+  dialog.lpstrFilter =
+      L"PNG (*.png)\0*.png\0JPEG (*.jpg)\0*.jpg\0EXR (*.exr)\0*.exr\0"
+      L"所有文件\0*.*\0";
+  dialog.lpstrFile = buffer;
+  dialog.nMaxFile = MAX_PATH;
+  dialog.lpstrDefExt = L"png";
+  dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (!GetSaveFileNameW(&dialog)) return;
+  char utf8[MAX_PATH * 3] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, sizeof(utf8), nullptr, nullptr);
+  const comp_image_format format = comp_io_format_from_path(utf8);
+  if (format == COMP_FORMAT_UNKNOWN) {
+    set_status(shell, L"无法识别的导出格式");
+    return;
+  }
+  if (comp_io_export(shell.document, utf8, format, nullptr) != COMP_OK) {
+    set_status(shell, L"导出失败：该格式不可用");
+    return;
+  }
+  set_status(shell, L"已导出图片");
+}
+
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：
  * run_shell_command 是菜单与快捷键的唯一入口，不能被定义顺序卡住。 */
 void set_tool(ShellState& shell, comp_ui::ToolId id);
@@ -2559,6 +2985,15 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdSave:
       save_document_dialog(window, shell);
+      break;
+    case kCmdOpenImage:
+      open_image_dialog(window, shell);
+      break;
+    case kCmdImportImage:
+      import_image_dialog(window, shell);
+      break;
+    case kCmdExportImage:
+      export_image_dialog(window, shell);
       break;
     case kCmdUndo:
       undo_document(shell);
@@ -2614,6 +3049,36 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerOpacityUp:
       panel_adjust_opacity(shell, 0.1f);
       break;
+    case kCmdLayerBlendPrev:
+      panel_cycle_blend(shell, -1);
+      break;
+    case kCmdLayerBlendNext:
+      panel_cycle_blend(shell, 1);
+      break;
+    case kCmdLayerMoveLeft:
+      panel_move_layer(shell, -comp_ui::layer_transform_move_step(false), 0);
+      break;
+    case kCmdLayerMoveRight:
+      panel_move_layer(shell, comp_ui::layer_transform_move_step(false), 0);
+      break;
+    case kCmdLayerMoveUp:
+      panel_move_layer(shell, 0, -comp_ui::layer_transform_move_step(false));
+      break;
+    case kCmdLayerMoveDown:
+      panel_move_layer(shell, 0, comp_ui::layer_transform_move_step(false));
+      break;
+    case kCmdLayerRotateLeft:
+      panel_rotate_layer(shell, false);
+      break;
+    case kCmdLayerRotateRight:
+      panel_rotate_layer(shell, true);
+      break;
+    case kCmdLayerScaleDown:
+      panel_scale_layer(shell, -1);
+      break;
+    case kCmdLayerScaleUp:
+      panel_scale_layer(shell, 1);
+      break;
     case kCmdAdjKindPrev:
       panel_cycle_kind(shell, -1);
       break;
@@ -2663,6 +3128,11 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       /* 滤镜菜单项：kCmdFilterBase + 滤镜序号。 */
       if (id >= kCmdFilterBase && id < kCmdFilterBase + comp_ui::filter_count()) {
         open_filter_panel(shell, static_cast<comp_ui::FilterId>(id - kCmdFilterBase));
+        break;
+      }
+      /* 混合模式菜单项（S21）：kCmdBlendBase + 档位。 */
+      if (id >= kCmdBlendBase && id < kCmdBlendBase + comp_ui::kBlendCount) {
+        panel_set_blend(shell, static_cast<int>(id - kCmdBlendBase));
         break;
       }
       return;
@@ -2835,9 +3305,11 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     } else {
       SetTextColor(dc, RGB(206, 208, 216));
     }
-    wchar_t line_text[128];
-    wsprintfW(line_text, L"%s #%I64u  混合#%d  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
-              static_cast<unsigned long long>(row.id), row.blend,
+    /* 混合模式名先转宽字符再拼：wsprintfW 的 %hs 行为不可靠（与既有 widen_ascii 用法一致）。 */
+    const std::wstring blend_name = widen_ascii(comp_ui::blend_mode_name(row.blend));
+    wchar_t line_text[192];
+    wsprintfW(line_text, L"%s #%I64u  %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
+              static_cast<unsigned long long>(row.id), blend_name.c_str(),
               static_cast<int>(row.opacity * 100.0f + 0.5f));
     TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
   }
@@ -2845,7 +3317,7 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   SetTextColor(dc, RGB(140, 144, 156));
   const wchar_t* hint = L"点击选中 · Ctrl+Shift+V 显隐 · Ctrl+[ ] 不透明度";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 46, hint, lstrlenW(hint));
-  const wchar_t* hint2 = L"Ctrl+Shift+N 新建图层";
+  const wchar_t* hint2 = L"Shift+B / Shift+N 混合模式 · Ctrl+Shift+N 新建";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
@@ -3215,6 +3687,60 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     SelectObject(dc, old_pen);
     DeleteObject(solid);
     DeleteObject(dotted);
+  }
+
+  /*
+   * 裁剪预览（S22）：框外三段遮罩 + 白实线框。
+   * 遮罩分上/下/左/右四条带而不是「框外全糊」——中间保留一块完整可见区域，
+   * 用户才能看清自己框住了什么（PS 的同款做法，全屏暗反而看不出边界）。
+   */
+  if (shell.crop_active && shell.crop_rect.width > 0 && shell.crop_rect.height > 0) {
+    const comp_ui::Point a = shell.view.doc_to_screen(shell.crop_rect.x, shell.crop_rect.y,
+                                                     layout.canvas, shell.width, shell.height);
+    const comp_ui::Point b =
+        shell.view.doc_to_screen(shell.crop_rect.x + shell.crop_rect.width,
+                                 shell.crop_rect.y + shell.crop_rect.height, layout.canvas,
+                                 shell.width, shell.height);
+    const int left = static_cast<int>(std::lround(std::min(a.x, b.x)));
+    const int top = static_cast<int>(std::lround(std::min(a.y, b.y)));
+    const int right = static_cast<int>(std::lround(std::max(a.x, b.x)));
+    const int bottom = static_cast<int>(std::lround(std::max(a.y, b.y)));
+    const int canvas_left = layout.canvas.x;
+    const int canvas_top = layout.canvas.y;
+    const int canvas_right = layout.canvas.right();
+    const int canvas_bottom = layout.canvas.bottom();
+    const bool visible = right >= canvas_left && bottom >= canvas_top &&
+                         left <= canvas_right && top <= canvas_bottom;
+    if (visible) {
+      /* 裁剪框允许超出画布（Crop 支持向负方向扩），遮罩夹到画布矩形内。 */
+      const int over_left = std::max(left, canvas_left);
+      const int over_top = std::max(top, canvas_top);
+      const int over_right = std::min(right, canvas_right);
+      const int over_bottom = std::min(bottom, canvas_bottom);
+      HBRUSH shade = CreateSolidBrush(RGB(96, 96, 96));
+      HGDIOBJ old_brush = SelectObject(dc, shade);
+      if (over_top > canvas_top) {
+        Rectangle(dc, canvas_left, canvas_top, canvas_right, over_top);
+      }
+      if (over_bottom < canvas_bottom) {
+        Rectangle(dc, canvas_left, over_bottom, canvas_right, canvas_bottom);
+      }
+      if (over_left > canvas_left) {
+        Rectangle(dc, canvas_left, over_top, over_left, over_bottom);
+      }
+      if (over_right < canvas_right) {
+        Rectangle(dc, over_right, over_top, canvas_right, over_bottom);
+      }
+      SelectObject(dc, old_brush);
+      DeleteObject(shade);
+    }
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ frame_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, frame_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
   }
 
   /*
@@ -3645,6 +4171,14 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (shell.tool == comp_ui::ToolId::Shape && id != comp_ui::ToolId::Shape) {
     shape_cancel(shell);
   }
+  /*
+   * 离开裁剪工具 = 丢掉待提交的框。必须丢：框是文档坐标系里的绝对矩形，
+   * 切走工具后它还在屏幕上会让人以为按 Enter 还能提交，但那时 Enter 已经
+   * 路由到别的逻辑去了——留着一个不能用的模态比没有模态更难理解。
+   */
+  if (shell.tool == comp_ui::ToolId::Crop && id != comp_ui::ToolId::Crop) {
+    crop_cancel(shell);
+  }
   /* 离开文字工具 = 放弃未提交的键入与属性键入（面板本身不是模态，不产生撤销步）。 */
   if (shell.tool == comp_ui::ToolId::Type && id != comp_ui::ToolId::Type) {
     type_cancel(shell);
@@ -3679,6 +4213,9 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               L"Alt+[ / ] 调线宽，Shift+Alt+[ / ] 调圆角）",
               widen_ascii(comp_ui::shape_kind_name(shell.shape_kind)).c_str(),
               shell.shape_kind == comp_ui::kShapeLine ? L"两端点" : L"对角点");
+  } else if (id == comp_ui::ToolId::Crop) {
+    wsprintfW(buffer,
+              L"工具：Crop（拖出裁剪框，框外变暗；Enter 提交，Esc 取消；再点画布重新起框）");
   } else if (id == comp_ui::ToolId::Type) {
     wsprintfW(buffer,
               L"工具：Type（画布点击落插入点，键入 ASCII；Shift+Enter 换行，回车提交，Esc 取消；"
@@ -3849,6 +4386,23 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       refresh_color_input_status(shell);
     }
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /*
+   * 裁剪框待提交态（S22）：Enter 提交 / Esc 取消。
+   * 与颜色/羽化输入态同级——都是模态，任何其中一个激活时其余快捷键一律让路，
+   * 否则「框已拖好、手滑按到 B」会把混合模式改掉而裁剪框还在，状态不可解释。
+   */
+  if (shell.crop_active) {
+    if (key == VK_RETURN) {
+      crop_commit(shell);
+      return;
+    }
+    if (key == VK_ESCAPE) {
+      crop_cancel(shell);
+      set_status(shell, L"已取消裁剪");
+      return;
+    }
   }
 
   /* 羽化半径键入态（Shift+F）：只吃数字/退格/回车/Esc，其余键一律屏蔽。 */
@@ -4153,10 +4707,12 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         run_shell_command(window, shell, kCmdLayerMergeDown);
         return;
       case 'O':
-        run_shell_command(window, shell, kCmdOpen);
+        /* Ctrl+Shift+O 打开位图，Ctrl+O 打开 .comp——两条路径语义不同，不能合并。 */
+        run_shell_command(window, shell, shift ? kCmdOpenImage : kCmdOpen);
         return;
       case 'S':
-        run_shell_command(window, shell, kCmdSave);
+        /* Ctrl+Shift+S 另存为位图，Ctrl+S 保存 .comp。 */
+        run_shell_command(window, shell, shift ? kCmdExportImage : kCmdSave);
         return;
       case 'V':
         /* V 已是 Move 工具的键位，图层显隐改走 Ctrl+Shift+V。 */
@@ -4188,12 +4744,40 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     }
   }
   switch (key) {
+    /*
+     * 图层变换（S21）：方向键与 Alt+[ ] 在带修饰时归图层几何，不带修饰仍是既有
+     * 行为（VK_UP/DOWN 选图层、[ ] 调笔刷/容差/字号）。
+     *   方向键             = 选图层（不变）
+     *   Shift+方向         = 平移 1 px 微调
+     *   Ctrl+方向          = 平移 10 px
+     *   Ctrl+Shift+左/右  = 旋转 ∓15°（Alt 被 Move 的「复制」占用，不取）
+     *   Alt+[ / ]         = 等比例缩放 ±1%，中心锚定
+     * 步长全部由修饰现场决定，直接调用 panel_* 函数并传 dx/dy：命令常量只表达
+     * 「动作」，把粗细留给按键，壳侧就不存在第二套步长口径。
+     */
+    case VK_LEFT:
+    case VK_RIGHT: {
+      if (ctrl && shift) {
+        panel_rotate_layer(shell, key == VK_RIGHT);
+        break;
+      }
+      if (!ctrl && !shift) break; /* 无修饰：保持既有行为，交给下面的 OEM 分支之外无动作 */
+      const int step = comp_ui::layer_transform_move_step(ctrl);
+      panel_move_layer(shell, key == VK_LEFT ? -step : step, 0);
+      break;
+    }
     case VK_UP:
-      run_shell_command(window, shell, kCmdLayerSelectUp);
+    case VK_DOWN: {
+      /* 无修饰仍是选图层；Shift/Ctrl 才平移（避免与既有 ↑↓ 选图层抢键）。 */
+      if (shift || ctrl) {
+        const int step = comp_ui::layer_transform_move_step(ctrl);
+        panel_move_layer(shell, 0, key == VK_UP ? -step : step);
+        break;
+      }
+      run_shell_command(window, shell,
+                        key == VK_UP ? kCmdLayerSelectUp : kCmdLayerSelectDown);
       break;
-    case VK_DOWN:
-      run_shell_command(window, shell, kCmdLayerSelectDown);
-      break;
+    }
     case VK_OEM_4: /* [ = 笔刷变小；Shift+[ = 硬度降低；Wand = 容差 -；Type = 字号/字距 - */
       if (shell.tool == comp_ui::ToolId::Type) {
         type_step_param(shell, -1, shift);
@@ -4294,6 +4878,19 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         }
         break;
       }
+      /*
+       * Shift+B = 混合模式后退一步、Shift+N 同键位前进一步（对齐上游 Shift++ / Shift+−
+       * 的菜单序循环；本壳 OEM_PLUS/MINUS 已被调整面板与缩放占用，改取语义键）。
+       * 大写 B 不与 Brush 的小写 'b' 键位冲突（工具快捷键只匹配小写）。
+       */
+      if (key == 'B' && shift && !ctrl) {
+        run_shell_command(window, shell, kCmdLayerBlendPrev);
+        break;
+      }
+      if (key == 'N' && shift && !ctrl) {
+        run_shell_command(window, shell, kCmdLayerBlendNext);
+        break;
+      }
       if (key == 'G' && !ctrl) {
         /* 重复按 G 在同一工具内循环 Linear -> Radial（对齐上游的同类工具习惯）。 */
         if (shell.tool == comp_ui::ToolId::Gradient) {
@@ -4345,6 +4942,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
   const int mouse_y = static_cast<int>(static_cast<short>(HIWORD(lparam)));
   switch (message) {
     case WM_CREATE:
+      /* 拖放导入：注册后 Windows 才会把 OLE 拖放转成 WM_DROPFILES。 */
+      DragAcceptFiles(window, TRUE);
+      return 0;
+    case WM_DROPFILES:
+      if (shell != nullptr) handle_drop_files(window, *shell, reinterpret_cast<HDROP>(wparam));
       return 0;
     case WM_PAINT:
       if (shell != nullptr) present(window, *shell);
@@ -4426,6 +5028,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
+            } else if (crop_available(*shell)) {
+              /* 已有框时，再按一次画布 = 重新起框（对齐 PS 的「点框外取消、框内重来」语义） */
+              crop_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (pen_available(*shell)) {
               pen_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (marquee_available(*shell)) {
@@ -4467,6 +5072,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      if (shell != nullptr && shell->crop_active) {
+        /* 框在拖拽中已实时成型（不像画笔要松手才提交），这里只收尾捕获与重绘。 */
+        ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->pen_dragging) {
         pen_up(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
@@ -4553,6 +5164,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (client_layout(*shell, &layout)) {
           if (shell->move_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->crop_active) {
+            crop_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->pen_dragging) {
             pen_drag(*shell, mouse_x, mouse_y, layout);
@@ -4675,6 +5289,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
+      /*
+       * Alt+, / Alt+.：选中图层等比例缩放（中心锚定）。
+       * Alt+[ ] 已被模糊半径 / 涂抹强度 / 文字行距占用，Ctrl+[ ] 是不透明度，
+       * 普通 [ ] 是笔刷，因此缩放取逗号/句点这一对空闲键。
+       */
+      if (shell != nullptr && (wparam == VK_OEM_COMMA || wparam == VK_OEM_PERIOD)) {
+        panel_scale_layer(*shell, wparam == VK_OEM_PERIOD ? 1 : -1);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       break;
     case WM_MOUSEWHEEL:
       if (shell != nullptr) {
@@ -4736,6 +5360,10 @@ HMENU build_menu() {
   AppendMenuW(file_menu, MF_STRING, kCmdNew, L"新建(&N)\tCtrl+N");
   AppendMenuW(file_menu, MF_STRING, kCmdOpen, L"打开(&O)...\tCtrl+O");
   AppendMenuW(file_menu, MF_STRING, kCmdSave, L"保存(&S)...\tCtrl+S");
+  AppendMenuW(file_menu, MF_STRING, kCmdOpenImage, L"打开位图(&I)...\tCtrl+Shift+O");
+  AppendMenuW(file_menu, MF_STRING, kCmdImportImage, L"置入(&P)...");
+  AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(file_menu, MF_STRING, kCmdExportImage, L"导出为(&E)...\tCtrl+Shift+S");
   AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(file_menu, MF_STRING, kCmdExit, L"退出(&X)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file_menu), L"文件(&F)");
@@ -4762,6 +5390,34 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityDown, L"降低不透明度(&-)\tCtrl+[");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\tCtrl+]");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveLeft, L"平移左(&L)	Shift+←");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveRight, L"平移右(&R)	Shift+→");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveUp, L"平移上(&U)	Shift+↑");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveDown, L"平移下(&D)	Shift+↓");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerRotateLeft, L"逆旋转 15°(&[)	Ctrl+Shift+←");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerRotateRight, L"顺旋转 15°(&])	Ctrl+Shift+→");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerScaleDown, L"缩小(&-)	Alt+,");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerScaleUp, L"放大(&+)	Alt+.");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerBlendPrev, L"上一个混合模式(&P)\tShift+B");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerBlendNext, L"下一个混合模式(&X)\tShift+N");
+  /*
+   * 混合模式子菜单（S21）：档位与分组逐字取自上游 LayerBlendMode.groups（同一组内不画
+   * 分隔线），命令 id = kCmdBlendBase + 档位，即 comp_blend_mode 数值，菜单直达。
+   */
+  HMENU blend_menu = CreatePopupMenu();
+  for (int group = 0; group < comp_ui::kBlendGroupCount; ++group) {
+    if (group > 0) AppendMenuW(blend_menu, MF_SEPARATOR, 0, nullptr);
+    for (int slot = 0; slot < 8; ++slot) {
+      const int mode = comp_ui::kBlendGroups[group][slot];
+      if (mode < 0) break;
+      wchar_t label[64];
+      wsprintfW(label, L"%s", widen_ascii(comp_ui::blend_mode_name(mode)).c_str());
+      AppendMenuW(blend_menu, MF_STRING, kCmdBlendBase + static_cast<UINT>(mode), label);
+    }
+  }
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blend_menu), L"混合模式(&B)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
 
   HMENU view_menu = CreatePopupMenu();
@@ -4912,6 +5568,7 @@ int run_selftest(const wchar_t* out_path) {
   layer_desc.name = "selftest-layer";
   layer_desc.blend = COMP_BLEND_NORMAL;
   layer_desc.opacity = 1.0f;
+  layer_desc.transform = comp_rect{0, 0, width, height}; /* 显式基准：变换自检要收放 */
   layer_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
   comp_layer_id layer = 0;
   const bool add_ok = comp_layer_add(document, &layer_desc, &layer) == COMP_OK && layer != 0;
@@ -4935,6 +5592,97 @@ int run_selftest(const wchar_t* out_path) {
   verify(flatten_ok && non_transparent > 0, "flatten output has non-transparent pixels");
   std::fprintf(report, "[info] non-transparent pixels = %u / %u\n",
                static_cast<unsigned>(non_transparent), static_cast<unsigned>(width * height));
+
+  /*
+   * 混合模式接线（S21）：写一个非默认档位，读回必须等于写入值；再非法值必须被
+   * 引擎拒绝且不改变既有档位。这锁死的是壳与 ABI 之间「档位即 comp_blend_mode
+   * 数值」这条口径——面板行、菜单与状态栏全都从这同一个数值取名。
+   */
+  comp_blend_mode blend_read = COMP_BLEND_NORMAL;
+  const bool blend_set_ok =
+      comp_layer_set_blend(document, layer, COMP_BLEND_MULTIPLY) == COMP_OK &&
+      comp_layer_get_blend(document, layer, &blend_read) == COMP_OK &&
+      blend_read == COMP_BLEND_MULTIPLY;
+  verify(blend_set_ok, "blend mode round trip (set MULTIPLY -> get)");
+  comp_result bad_blend =
+      comp_layer_set_blend(document, layer, static_cast<comp_blend_mode>(999));
+  verify(bad_blend != COMP_OK && comp_layer_get_blend(document, layer, &blend_read) == COMP_OK &&
+             blend_read == COMP_BLEND_MULTIPLY,
+         "invalid blend mode rejected without clobbering the stored value");
+  verify(comp_layer_set_blend(document, layer, COMP_BLEND_NORMAL) == COMP_OK,
+         "blend mode restored to NORMAL");
+
+  /*
+   * 位图导入 / 导出闭环（S22）。
+   *
+   * 壳的「打开位图」「导出为」菜单走的正是这里验证的 comp_io_import /
+   * comp_io_export 这一对。之所以必须自检而不是只靠人工：GUI 那两个入口都有模态
+   * 对话框挡着，自动化点不过去；而对话框最终提交的仍是同一个 ABI 调用与同一个
+   * 路径字符串。所以这条断言退化时，人工目视之前壳就已经坏了。
+   *
+   * 判据是「导出 → 读回 → 尺寸与图层数一致」，再加一张内容已知的探针图往返。
+   */
+  wchar_t io_temp_dir[MAX_PATH] = L"";
+  if (GetTempPathW(MAX_PATH, io_temp_dir) == 0) wcscpy_s(io_temp_dir, L".\\");
+  wchar_t image_file[MAX_PATH] = L"";
+  wsprintfW(image_file, L"%sselftest_image_roundtrip.png", io_temp_dir);
+  char image_path_utf8[MAX_PATH * 2] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, image_file, -1, image_path_utf8,
+                      static_cast<int>(sizeof(image_path_utf8)), nullptr, nullptr);
+  const bool export_ok =
+      comp_io_export(document, image_path_utf8, COMP_FORMAT_PNG, nullptr) == COMP_OK;
+  verify(export_ok, "comp_io_export(png)");
+  if (export_ok) {
+    comp_document reimported = nullptr;
+    const bool reimport_ok =
+        comp_io_import(engine, image_path_utf8, &reimported) == COMP_OK &&
+        reimported != nullptr;
+    verify(reimport_ok, "comp_io_import(png round trip)");
+    if (reimport_ok) {
+      comp_size reimported_size{};
+      verify(comp_document_size(reimported, &reimported_size) == COMP_OK &&
+                 reimported_size.width == size.width &&
+                 reimported_size.height == size.height,
+             "image round trip keeps canvas size");
+      comp_document_destroy(reimported);
+    }
+  }
+
+  /*
+   * 探针图往返：build/import_probe.png 是像素值精确已知的 240x160 图
+   * （左红、中绿竖条、右蓝）。导入后核对画布尺寸，并核对左上角第一个像素
+   * 仍是纯红——证明「打开一张外部图片」真把内容搬进了文档，不是建了个空壳。
+   * 找不到探针图时跳过像素断言（不同工作副本可能没生成该文件），但尺寸断言仍在。
+   */
+  comp_document probe_document = nullptr;
+  const bool probe_ok =
+      comp_io_import(engine, "build/import_probe.png", &probe_document) == COMP_OK &&
+      probe_document != nullptr;
+  if (probe_ok) {
+    comp_size probe_size{};
+    const bool probe_size_ok =
+        comp_document_size(probe_document, &probe_size) == COMP_OK &&
+        probe_size.width == 240 && probe_size.height == 160;
+    verify(probe_size_ok, "probe image imports at 240x160");
+    if (probe_size_ok) {
+      const size_t probe_stride = static_cast<size_t>(probe_size.width) * 4u;
+      std::vector<uint8_t> probe_pixels(probe_stride * static_cast<size_t>(probe_size.height), 0);
+      const bool probe_flatten = comp_render_flatten(probe_document, probe_pixels.data(),
+                                                     COMP_PIXEL_RGBA8, probe_stride) == COMP_OK;
+      /* 左上角 = 红区，右下角 = 蓝区，中线 = 绿条。逐点对拍，不是统计近似。 */
+      const bool probe_pixels_ok = probe_flatten &&
+          probe_pixels[0] == 255 && probe_pixels[1] == 0 && probe_pixels[2] == 0 &&
+          probe_pixels.size() >= 4 &&
+          probe_pixels[probe_pixels.size() - 4] == 0 &&
+          probe_pixels[probe_pixels.size() - 3] == 0 &&
+          probe_pixels[probe_pixels.size() - 2] == 255;
+      verify(probe_pixels_ok, "probe image content matches the known pattern");
+    }
+    comp_document_destroy(probe_document);
+  } else {
+    std::fprintf(report,
+                 "[skip] build/import_probe.png 不存在，跳过内容对拍（尺寸断言已覆盖导入通路）\n");
+  }
 
   /* 撤销/重做由引擎维护，外壳只触发与展示。 */
   int32_t can_undo = 0;
@@ -4971,6 +5719,58 @@ int run_selftest(const wchar_t* out_path) {
              "round trip keeps canvas size");
       comp_document_destroy(reloaded);
     }
+  }
+
+  /*
+   * 图层变换链路（S21，面板平移/旋转/缩放真正走的接口序列）：
+   * 一次显式事务内 get -> 步进 -> set -> 再 get 回读，核对现值与步进量一致，
+   * 然后 abort 回滚——不往撤销栈里留一步（自检前面各段的隐式事务已经够了）。
+   */
+  comp_txn xform_txn = nullptr;
+  const bool xform_begin = comp_txn_begin(document, "Selftest Layer Transform", &xform_txn) == COMP_OK;
+  verify(xform_begin, "comp_txn_begin() for layer transform");
+  if (xform_begin) {
+    comp_rect before{};
+    float angle = 0.0f;
+    const bool read_ok = comp_layer_get_transform(document, layer, &before, &angle) == COMP_OK;
+    verify(read_ok, "comp_layer_get_transform()");
+    if (read_ok) {
+      /* 平移 1 px（Shift+方向的微调量）：壳侧算位移，引擎只管收。 */
+      const comp_rect moved{before.x + 1, before.y - 1, before.w, before.h};
+      verify(comp_layer_set_transform(document, layer, moved, angle) == COMP_OK,
+             "comp_layer_set_transform(move 1px)");
+      comp_rect after{};
+      float angle2 = 0.0f;
+      verify(comp_layer_get_transform(document, layer, &after, &angle2) == COMP_OK &&
+                 after.x == before.x + 1 && after.y == before.y - 1 && after.w == before.w &&
+                 after.h == before.h && angle2 == angle,
+             "transform round trip keeps the stepped value");
+      /* 旋转 +15°（Ctrl+左右的一档）：在现值上累加，回读必须是累加结果。 */
+      const float turned = angle + 15.0f;
+      verify(comp_layer_set_transform(document, layer, after, turned) == COMP_OK,
+             "comp_layer_set_transform(rotate +15)");
+      comp_rect after2{};
+      float angle3 = 0.0f;
+      verify(comp_layer_get_transform(document, layer, &after2, &angle3) == COMP_OK &&
+                 angle3 > turned - 0.01f && angle3 < turned + 0.01f,
+             "rotation accumulates on the current value");
+      /* 缩放 +1%（Alt+. 的一档，中心锚定）：壳侧算新矩形，回读核对中心不变。 */
+      int32_t sx = after2.x, sy = after2.y, sw = after2.w, sh = after2.h;
+      const bool has_box = sw > 0 && sh > 0;
+      verify(has_box, "selftest layer carries an explicit transform box");
+      if (has_box) {
+        comp_ui::layer_transform_scale_rect(&sx, &sy, &sw, &sh,
+                                            1.0 + comp_ui::kLayerTransformScaleStep);
+        verify(comp_layer_set_transform(document, layer, comp_rect{sx, sy, sw, sh}, angle3) == COMP_OK,
+               "comp_layer_set_transform(scale +1%)");
+        comp_rect scaled{};
+        float angle4 = 0.0f;
+        verify(comp_layer_get_transform(document, layer, &scaled, &angle4) == COMP_OK &&
+                   scaled.w == sw && scaled.h == sh,
+               "scale round trip keeps the new box");
+      }
+    }
+    verify(comp_txn_abort(xform_txn) == COMP_OK, "comp_txn_abort() rolls the transform back");
   }
 
   /*
@@ -6617,6 +7417,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);
   ShowWindow(window, show);
   UpdateWindow(window);
+
+  /*
+   * 命令行打开文件（compositor_shell.exe photo.png ／ *.comp）。
+   * 与拖放共用 open_path_as_document，两条入口不分叉。
+   * 只认第一个非开关参数，且必须是已存在的文件——沉默吞掉拼错的名字比报错更糟。
+   */
+  if (command_line != nullptr && command_line[0] != L'\0') {
+    for (const wchar_t* cursor = command_line; *cursor != L'\0';) {
+      while (*cursor == L' ' || *cursor == L'\t') ++cursor;
+      if (*cursor == L'\0') break;
+      const wchar_t* begin = cursor;
+      while (*cursor != L'\0' && *cursor != L' ' && *cursor != L'\t') ++cursor;
+      if (begin[0] == L'-') continue; /* 跳过开关参数 */
+      wchar_t path[MAX_PATH] = L"";
+      const size_t length = static_cast<size_t>(cursor - begin);
+      if (length > 0 && length < MAX_PATH) {
+        wcsncpy_s(path, MAX_PATH, begin, length);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+          char utf8[MAX_PATH * 3] = {0};
+          WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr);
+          open_path_as_document(shell, utf8);
+        }
+      }
+      break;
+    }
+  }
 
   MSG message{};
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {

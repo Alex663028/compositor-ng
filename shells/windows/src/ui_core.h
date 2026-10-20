@@ -1642,6 +1642,166 @@ inline int step_wand_radius(int radius, int direction) {
   return clamp_wand_radius(next);
 }
 
+/* ------------------------------------------------------------ 混合模式（S21） */
+
+/*
+ * 混合模式档位与名称：数值即 comp_blend_mode 枚举（0..23，ABI 冻结表），
+ * 顺序逐字对齐上游 LayerAppearance.swift 的 `LayerBlendMode.allCases` 声明序——
+ * 上游 Shift++ / Shift+− 就是按这个序循环、一步一撤销，可直接移植。
+ *
+ * 名称取上游 rawValue 的规范拼写（含 "Linear Dodge (Add)" 的全称）；分组沿用
+ * 上游 `LayerBlendMode.groups`（Normal / 加深 / 减淡 / 对比 / 比较 / 分量），
+ * 状态栏与菜单据此显示分组归属。
+ */
+inline constexpr int kBlendNormal = 0;
+inline constexpr int kBlendCount = 24;
+
+inline int clamp_blend_mode(int mode) {
+  if (mode < 0) return 0;
+  if (mode >= kBlendCount) return kBlendCount - 1;
+  return mode;
+}
+
+/* 菜单序步进并回绕（对齐上游 cycleBlendMode 的取模）。 */
+inline int step_blend_mode(int mode, int direction) {
+  if (direction == 0) return clamp_blend_mode(mode);
+  const int count = kBlendCount;
+  /* 先归一再取模，避免负数与来回多步时的回绕偏差。 */
+  int next = clamp_blend_mode(mode) + (direction > 0 ? 1 : -1);
+  next %= count;
+  if (next < 0) next += count;
+  return next;
+}
+
+inline const char* blend_mode_name(int mode) {
+  switch (clamp_blend_mode(mode)) {
+    case 0: return "Normal";
+    case 1: return "Darken";
+    case 2: return "Multiply";
+    case 3: return "Color Burn";
+    case 4: return "Linear Burn";
+    case 5: return "Lighten";
+    case 6: return "Screen";
+    case 7: return "Color Dodge";
+    case 8: return "Linear Dodge (Add)";
+    case 9: return "Overlay";
+    case 10: return "Soft Light";
+    case 11: return "Hard Light";
+    case 12: return "Vivid Light";
+    case 13: return "Linear Light";
+    case 14: return "Pin Light";
+    case 15: return "Hard Mix";
+    case 16: return "Difference";
+    case 17: return "Exclusion";
+    case 18: return "Subtract";
+    case 19: return "Divide";
+    case 20: return "Hue";
+    case 21: return "Saturation";
+    case 22: return "Color";
+    case 23: return "Luminosity";
+    default: return "Normal";
+  }
+}
+
+/*
+ * 上游分组编号（同 LayerBlendMode.groups）：0 Normal / 1 加深 / 2 减淡 /
+ * 3 对比 / 4 比较 / 5 分量。菜单在同一组内不画分隔线。
+ */
+inline constexpr int kBlendGroups[7][8] = {
+    {0, -1, -1, -1, -1, -1, -1, -1},
+    {1, 2, 3, 4, -1, -1, -1, -1},
+    {5, 6, 7, 8, -1, -1, -1, -1},
+    {9, 10, 11, 12, 13, 14, 15, -1},
+    {16, 17, 18, 19, -1, -1, -1, -1},
+    {20, 21, 22, 23, -1, -1, -1, -1},
+};
+inline constexpr int kBlendGroupCount = 6;
+
+inline int blend_group_of(int mode) {
+  const int value = clamp_blend_mode(mode);
+  for (int group = 0; group < kBlendGroupCount; ++group) {
+    for (int slot = 0; slot < 8; ++slot) {
+      if (kBlendGroups[group][slot] == value) return group;
+      if (kBlendGroups[group][slot] < 0) break;
+    }
+  }
+  return 0;
+}
+
+inline const char* blend_group_name(int group) {
+  switch (group) {
+    case 0: return "Normal";
+    case 1: return "加深";
+    case 2: return "减淡";
+    case 3: return "对比";
+    case 4: return "比较";
+    case 5: return "分量";
+    default: return "";
+  }
+}
+
+/* ------------------------------------------------------------ 图层变换（S21） */
+
+/*
+ * 图层变换的按键步进量（对齐上游 Free Transform 的微调粒度，均为文档像素/度）：
+ *   Shift+方向  = 平移 1 px（微调），方向键单独 = 平移 10 px（对齐上游方向键步长）
+ *   Ctrl+左右   = 旋转 15 度（Shift 再加速为 1 度精调）
+ *   Alt+[ / ]   = 缩放 ±1 档（保持宽高比，锚点为图层中心）
+ *
+ * 只做「步进量」的纯函数，真正的 ABI 写入在壳侧：变换受 is_valid_transform 约束
+ * （size 1..300000、|origin| <= 1000000、rotation 有限），壳必须夹取后再写入，
+ * 否则脏值会被引擎拒绝，面板与文档状态就会分叉。
+ */
+inline constexpr int kLayerTransformMoveStep = 1;   /* Shift+方向：1 px 微调 */
+inline constexpr int kLayerTransformMoveCoarse = 10; /* 方向键：10 px */
+inline constexpr int kLayerTransformRotateStep = 15; /* Ctrl+左右：15 度 */
+inline constexpr double kLayerTransformScaleStep = 0.01; /* Alt+[ ]：每档 1% */
+inline constexpr double kLayerTransformScaleMin = 0.01;  /* 1% */
+inline constexpr double kLayerTransformScaleMax = 32.0;  /* 3200% */
+
+inline int layer_transform_move_step(bool coarse) {
+  return coarse ? kLayerTransformMoveCoarse : kLayerTransformMoveStep;
+}
+
+/*
+ * 旋转步进并夹取到 (-360, 360) 之外不收窄：超过 360 维持单调，读取时再归一化。
+ * 上游 LayerTransform.isValid 只要求 finite，不限制圈数，这里不收口以保持连续性。
+ */
+inline double layer_transform_rotate_step(double rotation, bool fine) {
+  if (!(rotation > -1e18 && rotation < 1e18)) return 0.0; /* NaN / inf 归一化 */
+  const double step = fine ? 1.0 : static_cast<double>(kLayerTransformRotateStep);
+  return rotation + step;
+}
+
+inline double clamp_layer_scale(double scale) {
+  if (!(scale == scale) || scale < kLayerTransformScaleMin) {
+    return kLayerTransformScaleMin;
+  }
+  if (scale > kLayerTransformScaleMax) return kLayerTransformScaleMax;
+  return scale;
+}
+
+/*
+ * 缩放步进：按当前宽高的等比例增量，锚点为图层中心（origin 随之收缩/展开，
+ * 保持中心不动——上游拖角缩放的行为，比左上角固定更符合直觉）。
+ */
+inline void layer_transform_scale_rect(int32_t* x, int32_t* y, int32_t* w, int32_t* h,
+                                       double factor) {
+  if (x == nullptr || y == nullptr || w == nullptr || h == nullptr) return;
+  if (*w <= 0 || *h <= 0) return;
+  const double scale = clamp_layer_scale(factor);
+  const int32_t new_w = static_cast<int32_t>(std::lround(static_cast<double>(*w) * scale));
+  const int32_t new_h = static_cast<int32_t>(std::lround(static_cast<double>(*h) * scale));
+  if (new_w < 1 || new_h < 1) return; /* 尺寸下限由引擎校验，壳不越界 */
+  /* 中心保持：新原点 = 旧中心 - 新尺寸/2。 */
+  const double cx = static_cast<double>(*x) + static_cast<double>(*w) / 2.0;
+  const double cy = static_cast<double>(*y) + static_cast<double>(*h) / 2.0;
+  *x = static_cast<int32_t>(std::lround(cx - static_cast<double>(new_w) / 2.0));
+  *y = static_cast<int32_t>(std::lround(cy - static_cast<double>(new_h) / 2.0));
+  *w = new_w;
+  *h = new_h;
+}
+
 }  // namespace comp_ui
 
 #endif /* COMPOSITOR_SHELL_UI_CORE_H */

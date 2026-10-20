@@ -105,6 +105,21 @@ COMP_API comp_result comp_layer_get_visible(comp_document document,
                                             comp_layer_id id,
                                             int32_t* out_visible);
 
+/*
+ * 读取图层变换（原点 + 尺寸 + 旋转角）；与 set_transform 成对，供外壳做相对步进
+ * （缩放须以当前中心为锚、旋转须在既有角度上累加，两端都必须知道现值）。
+ *
+ * 契约：回读值可直接再次传入 comp_layer_set_transform（往返保真，见
+ * docs/tool-ops.md 的往返口径）；filp_x / flip_y 不属于本入口——它们只在
+ * comp_layer_desc 里给出，且 set_transform 不会覆盖（写入变换不改变既有翻转）。
+ * 图层不存在 -> COMP_ERR_NOT_FOUND；出参为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+COMP_API comp_result comp_layer_get_transform(comp_document document,
+                                              comp_layer_id id,
+                                              comp_rect* out_transform,
+                                              float* out_rotation);
+
 /* 设置/读取采样模式（对齐上游 LayerTransform.sampling）。 */
 COMP_API comp_result comp_layer_set_sampling(comp_document document,
                                              comp_layer_id id,

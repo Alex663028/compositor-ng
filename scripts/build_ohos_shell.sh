@@ -19,7 +19,9 @@
 #     SDK 路径含空格时必然失败；这里直接调用 llvm/bin/clang++ 并显式传 --target / --sysroot。
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 同 build_ohos.sh：ROOT 用原生路径（pwd -W），否则 MSYS_NO_PATHCONV=1 时
+# 传给原生 clang++ 的 /e/... 不会被翻译，链接必失败。
+ROOT="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 SDK="${OHOS_SDK:-G:/DevEco Studio/sdk/default/openharmony}"
 NATIVE="$SDK/native"
 SYSROOT="$NATIVE/sysroot"

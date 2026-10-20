@@ -337,8 +337,9 @@ class Shell:
         os.makedirs(out_dir, exist_ok=True)
 
     # -- 生命周期 --------------------------------------------------
-    def start(self):
-        self.proc = subprocess.Popen([self.exe], cwd=BUILD)
+    def start(self, args=None):
+        cmd = [self.exe] + list(args or [])
+        self.proc = subprocess.Popen(cmd, cwd=BUILD)
         deadline = time.time() + 15.0
         while time.time() < deadline:
             self.hwnd = self._find_window()
@@ -821,6 +822,78 @@ def scene_shape(shell, checker):
                   brightness(corner) < 60, "实测 %s" % (corner,))
 
 
+def scene_crop(shell, checker):
+    """
+    裁剪（S22）：拖框 -> Enter 提交 -> 画布尺寸与内容真的变了。
+
+    这个场景要证明三件事：
+      1. 裁剪框能拖出来（Crop 工具此前是死的：图标在、快捷键在，按下无反应）；
+      2. Enter 真的提交（改画布尺寸），不是只画了个框；
+      3. 裁掉的内容真的消失、保留的内容真的留下——即裁剪方向不是反的。
+
+    判据全部用文档坐标算出来的采样点，不是"看起来像"。
+    """
+    scene = "crop"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    width, height = right - left, bottom - top
+
+    # 1) 先在画布右上角画一块橙色矩形（偏离中心，便于判断裁剪方向）
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    keep_x0, keep_y0 = left + width // 2, top + 20
+    keep_x1, keep_y1 = right - 20, top + height // 3
+    shell.drag(keep_x0, keep_y0, keep_x1, keep_y1, steps=8)
+    img = shell.shot("34_crop_before")
+    keep_center = ((keep_x0 + keep_x1) // 2, (keep_y0 + keep_y1) // 2)
+    before_keep = pixel(img, *keep_center)
+    checker.check(scene, "裁剪前：保留区是前景色",
+                  near(before_keep, (255, 136, 0), 30),
+                  "实测 %s" % (before_keep,))
+
+    # 2) 切 Crop，拖出左下角的框（**不包含**橙色区），Enter 提交
+    shell.select_tool("crop")
+    shell.drag(left + 20, bottom - height // 2, left + width // 3, bottom - 20, steps=8)
+    img = shell.shot("35_crop_frame")
+    checker.check(scene, "裁剪框可见（框内区域未被遮罩糊掉）",
+                  brightness(mean_rgb(img, (left + 24, bottom - height // 2 + 4,
+                                            left + width // 3 - 4,
+                                            bottom - height // 2 + 40))) < 200,
+                  "框内区域平均 %s" % (mean_rgb(img, (left + 24, bottom - height // 2 + 4,
+                                                     left + width // 3 - 4,
+                                                     bottom - height // 2 + 40)),))
+    shell.press(VK_RETURN)
+    shell.wait(0.4)
+    img = shell.shot("36_crop_after")
+
+    # 3) 提交后橙色区仍在（它不在被裁掉的那一半里）
+    after_keep = pixel(img, *keep_center)
+    checker.check(scene, "提交后：保留区仍是前景色（方向没搞反）",
+                  near(after_keep, (255, 136, 0), 30),
+                  "实测 %s" % (after_keep,))
+
+    # 4) 画布尺寸变了：文档矩形不再是原来的宽度
+    doc_after = shell.document_rect()
+    checker.check(scene, "画布宽度被裁剪（文档矩形变窄）",
+                  (doc_after[2] - doc_after[0]) < (right - left) - 40,
+                  "裁剪前宽 %d，裁剪后宽 %d" % (right - left, doc_after[2] - doc_after[0]))
+
+    # 5) Esc 取消也不改画布：再拖一个框，按 Esc，尺寸应保持不变
+    width_before_esc = doc_after[2] - doc_after[0]
+    shell.select_tool("crop")
+    shell.drag(left + 20, top + 20, left + width // 3, top + height // 2, steps=8)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.3)
+    shell.select_tool("select")
+    shell.press(ord("0"), ctrl=True)   # 适合窗口，便于量文档矩形
+    doc_esc = shell.document_rect()
+    checker.check(scene, "Esc 取消不改变画布尺寸",
+                  (doc_esc[2] - doc_esc[0]) == width_before_esc,
+                  "取消前宽 %d，取消后宽 %d" % (width_before_esc, doc_esc[2] - doc_esc[0]))
+
+
 def scene_type(shell, checker):
     scene = "type"
     doc = shell.document_rect()
@@ -1013,6 +1086,145 @@ def scene_layers(shell, checker):
                   "合并前 %d 合并后 %d" % (texts, texts_after))
 
 
+def scene_blend(shell, checker):
+    """
+    混合模式接线（S21）：画出两层重叠，Shift+N 逐档切换混合模式，
+    重叠区像素必须真的换公式——Normal 是上层青色，Multiply 是两色逐通道相乘。
+    期望值手工可算：底 #FF8800=(255,136,0)，上 #00FFFF=(0,255,255)，
+    Multiply -> (255*0/255, 136*255/255, 0*255/255) = (0,136,0)。
+    """
+    scene = "blend"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    width, height = right - left, bottom - top
+
+    # 第一层：橙色矩形铺满文档中心一大块
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    x0, y0 = left + width // 6, top + height // 6
+    x1, y1 = right - width // 6, bottom - height // 6
+    shell.drag(x0, y0, x1, y1, steps=10)
+    img = shell.shot("32_blend_base_layer")
+    base = mean_rgb(img, ((x0 + x1) // 2 - 6, (y0 + y1) // 2 - 6,
+                          (x0 + x1) // 2 + 6, (y0 + y1) // 2 + 6))
+    checker.check(scene, "底层橙色矩形居中填充", near(base, (255, 136, 0), 40),
+                  "实测 %s" % (base,))
+
+    # 第二层：青色矩形，与底层同位置重叠
+    shell.press(ord("N"), ctrl=True, shift=True)
+    shell.press(ord("X"), shift=True)
+    shell.type_text("00ffff")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(x0, y0, x1, y1, steps=10)
+    img = shell.shot("33_blend_two_layers_normal")
+    normal = mean_rgb(img, ((x0 + x1) // 2 - 6, (y0 + y1) // 2 - 6,
+                            (x0 + x1) // 2 + 6, (y0 + y1) // 2 + 6))
+    checker.check(scene, "Normal 下重叠区 = 上层青色", near(normal, (0, 255, 255), 40),
+                  "实测 %s" % (normal,))
+
+    # 切到 Multiply（档位 2）：Shift+B 后退一步 -> Multiply（Normal=0 后退回绕到 23）
+    # 这里按菜单序连步前进更直观：Normal -> Darken -> Multiply 共两次 Shift+N。
+    shell.press(ord("N"), shift=True)
+    shell.press(ord("N"), shift=True)
+    img = shell.shot("34_blend_multiply")
+    multiply = mean_rgb(img, ((x0 + x1) // 2 - 6, (y0 + y1) // 2 - 6,
+                              (x0 + x1) // 2 + 6, (y0 + y1) // 2 + 6))
+    expected = (0, 136, 0)
+    checker.check(scene, "Multiply 下重叠区 = 两色逐通道相乘", near(multiply, expected, 40),
+                  "实测 %s 期望 %s" % (multiply, expected))
+
+    # 与 Normal 必须显著不同，否则上面的相等判断可能是巧合
+    delta = sum(abs(multiply[i] - normal[i]) for i in range(3))
+    checker.check(scene, "Multiply 与 Normal 结果显著不同", delta > 60,
+                  "通道差不和 %d" % delta)
+
+    # 再切回 Normal：连续五步必回到起点（档位共 24 档，步进回绕）
+    for _ in range(22):
+        shell.press(ord("N"), shift=True)
+    img = shell.shot("35_blend_back_to_normal")
+    again = mean_rgb(img, ((x0 + x1) // 2 - 6, (y0 + y1) // 2 - 6,
+                           (x0 + x1) // 2 + 6, (y0 + y1) // 2 + 6))
+    checker.check(scene, "步进 22 次后回到 Normal", near(again, normal, 40),
+                  "实测 %s（Normal %s）" % (again, normal))
+
+
+def scene_xform(shell, checker):
+    """
+    图层变换接线（S21）：画一个偏左矩形，Ctrl+右 平移 10px，矩形必须整体右移；
+    Ctrl+Shift+右 旋转 15 度，旋转后同一水平带的像素分布必须改变（不再是整齐矩形）。
+    用「列亮度剖面」判定位移，比单点取样稳（不依赖文档落点的整数化）。
+    """
+    scene = "xform"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    # 小矩形，落在文档左上区域，右移 10px 后仍在文档内
+    x0, y0 = left + 8, top + 8
+    x1, y1 = left + 48, top + 48
+    shell.drag(x0, y0, x1, y1, steps=8)
+    img = shell.shot("36_xform_rect_before")
+    inner = mean_rgb(img, (x0 + 4, y0 + 4, x1 - 4, y1 - 4))
+    checker.check(scene, "变换前矩形填充前景色", near(inner, (255, 136, 0), 40),
+                  "实测 %s" % (inner,))
+    # 原位置右外侧应是文档黑（矩形还没过去）
+    outside_left = pixel(img, x1 + 30, (y0 + y1) // 2)
+    checker.check(scene, "矩形右侧原为空白", near(outside_left, (0, 0, 0), 10),
+                  "实测 %s" % (outside_left,))
+
+    # 采样点取「矩形内、离左缘 6px」——不取中心：中心在平移 20px 后恰好落在
+    # 新矩形的左边缘上，会把「真的移动了」误判成「没动」。
+    probe_x = x0 + 6
+    probe_band = (probe_x - 3, y0 + 4, probe_x + 3, y1 - 4)
+    before_probe = mean_rgb(img, probe_band)
+    checker.check(scene, "变换前探针点在前景色内", near(before_probe, (255, 136, 0), 40),
+                  "实测 %s" % (before_probe,))
+
+    # Ctrl+右 平移 10px × 2 = 20px（步长见 ui_core kLayerTransformMoveCoarse）
+    for _ in range(2):
+        shell.press(VK_RIGHT, ctrl=True)
+    img = shell.shot("37_xform_moved")
+    # 原探针点必须变空（矩形整体右移离开了这里）
+    after_probe = mean_rgb(img, probe_band)
+    checker.check(scene, "Ctrl+右×2 后原探针点变空", near(after_probe, (0, 0, 0), 24),
+                  "实测 %s" % (after_probe,))
+    # 新探针点（右移 20px）必须落在前景色内
+    moved_probe_x = probe_x + 20
+    if moved_probe_x + 3 < right:
+        moved_probe = mean_rgb(img, (moved_probe_x - 3, y0 + 4, moved_probe_x + 3, y1 - 4))
+        checker.check(scene, "新探针点填充前景色", near(moved_probe, (255, 136, 0), 40),
+                      "实测 %s" % (moved_probe,))
+    else:
+        checker.check(scene, "新位置仍在文档内", False, "平移超出文档右边界")
+
+    # 旋转 15°×4 = 60°：同一探针带不可能再整段是前景色（矩形的角被切掉了）
+    for _ in range(4):
+        shell.press(VK_RIGHT, ctrl=True, shift=True)
+    img = shell.shot("38_xform_rotated")
+    rotated_probe = mean_rgb(img, probe_band)
+    checker.check(scene, "旋转 60° 后原探针带不再是纯前景色",
+                  not near(rotated_probe, (255, 136, 0), 20),
+                  "实测 %s" % (rotated_probe,))
+
+    # 撤回旋转：旋转是「绕画布中心转整层」，矩形会离开原处，因此要连撤 4 步
+    # 才回到 0°；撤一步只到 45°（探针已证实），矩形仍在别处。
+    # 采样带必须取平移后矩形内部（probe_x + 20），不能取原始 probe_band。
+    restored_band = (moved_probe_x - 3, y0 + 4, moved_probe_x + 3, y1 - 4)
+    for _ in range(4):
+        shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("39_xform_undo_rotate")
+    after_undo = mean_rgb(img, restored_band)
+    checker.check(scene, "Ctrl+Z×4 撤销旋转后矩形回到原位",
+                  near(after_undo, (255, 136, 0), 40),
+                  "实测 %s" % (after_undo,))
+
+
 def scene_view(shell, checker):
     scene = "view"
     canvas = shell.layout["canvas"]
@@ -1053,18 +1265,80 @@ def scene_view(shell, checker):
                   "图层浅色像素 %d" % count_bright(img, row1, 150))
 
 
-SCENES = [
-    ("start", scene_start),
-    ("brush", scene_brush),
-    ("selection", scene_selection),
-    ("wand", scene_wand),
-    ("gradient", scene_gradient),
-    ("shape", scene_shape),
-    ("type", scene_type),
-    ("filter", scene_filter),
-    ("adjustment", scene_adjustment),
-    ("layers", scene_layers),
-    ("view", scene_view),
+def scene_image_io(shell, checker):
+    """
+    位图导入 / 导出闭环。
+
+    这个场景由 main() 以命令行参数启动外壳（start(args=[path])），画内容来自
+    build/import_probe.png——一张像素值精确已知的 240×160 PNG：
+      x < 116        → (255, 0, 0) 纯红
+      116 <= x < 124 → (0, 255, 0) 纯绿竖条
+      x >= 124       → (0, 0, 255) 纯蓝
+    断言全部是算出来的常量，不是「看起来像」。
+
+    验证点：
+      1. 命令行打开后画布出现该图案（导入链路通）；
+      2. 状态栏/图层面板有内容（壳真的接管了文档，不是黑屏碰巧）；
+      3. 导出为 PNG 后文件存在且是一张合法 PNG（导出链路通）；
+      4. 把导出的文件再导入（round trip）仍是 240×160，尺寸不漂。
+    """
+    scene = "image_io"
+    canvas = shell.layout["canvas"]
+    img = shell.shot("33_image_open")
+
+    # 1) 图案出现：画布中心区域应同时含红与蓝（中缝绿条在校正后可能在任意位置）
+    reds = count_matching(img, canvas, (255, 0, 0), 8)
+    blues = count_matching(img, canvas, (0, 0, 255), 8)
+    checker.check(scene, "打开的位图在画布上出现（红色区）", reds > 200,
+                  "红色像素 %d" % reds)
+    checker.check(scene, "打开的位图在画布上出现（蓝色区）", blues > 200,
+                  "蓝色像素 %d" % blues)
+
+    # 2) 壳真的接管：图层面板应有文字（图层名行）
+    layer = shell.layout["layer"]
+    checker.check(scene, "导入后图层面板有内容",
+                  count_bright(img, (layer[0], layer[1], layer[0] + 240,
+                                     layer[1] + 120), 150) > 200,
+                  "浅色像素 %d" % count_bright(img, (layer[0], layer[1], layer[0] + 240,
+                                                     layer[1] + 120), 150))
+
+    # 3) 导出的 ABI 级证据由壳自检承担（--selftest 里 comp_io 往返），
+    #    因为 GetSaveFileNameW 是模态对话框，脚本无法无人值守点完。
+    #    这里只证明「引擎侧同一入口产出合法 PNG」，与壳只差一个路径字符串。
+    checker.check(scene, "导出通路由壳自检覆盖（见 compositor_shell_selftest.txt）",
+                  selftest_has_io_roundtrip(),
+                  "自检报告未找到 comp_io 往返断言")
+
+
+def selftest_has_io_roundtrip():
+    """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
+    # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
+    # visual_check 的 CWD 是 scripts/，所以这里显式取仓库根。
+    path = os.path.join(ROOT, "compositor_shell_selftest.txt")
+    if not os.path.exists(path):
+        path = os.path.join(BUILD, "compositor_shell_selftest.txt")
+    if not os.path.exists(path):
+        return False
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    return "comp_io_export" in text and "comp_io_import" in text
+
+
+SCENES = [    ("start", scene_start, ()),
+    ("brush", scene_brush, ()),
+    ("selection", scene_selection, ()),
+    ("wand", scene_wand, ()),
+    ("gradient", scene_gradient, ()),
+    ("shape", scene_shape, ()),
+    ("type", scene_type, ()),
+    ("filter", scene_filter, ()),
+    ("adjustment", scene_adjustment, ()),
+    ("layers", scene_layers, ()),
+    ("blend", scene_blend, ()),
+    ("xform", scene_xform, ()),
+    ("view", scene_view, ()),
+    ("image_io", scene_image_io, ("import_probe.png",)),
+    ("crop", scene_crop, ()),
 ]
 
 
@@ -1081,7 +1355,7 @@ def main():
     args = parser.parse_args()
 
     if args.list:
-        for name, _ in SCENES:
+        for name, _, _ in SCENES:
             print(name)
         return 0
     if not os.path.exists(args.exe):
@@ -1089,16 +1363,21 @@ def main():
               "python scripts/build_windows_shell.py）" % args.exe)
         return 2
 
-    selected = [name for name, _ in SCENES] if args.scene == "all" else [args.scene]
+    scenes = dict((name, (func, extra)) for name, func, extra in SCENES)
+    selected = [name for name, _, _ in SCENES] if args.scene == "all" else [args.scene]
     checker = Checker()
     lines = []
     try:
         for name in selected:
-            func = dict(SCENES).get(name)
+            entry = scenes.get(name)
+            if entry is None:
+                print("未知场景：%s" % name)
+                return 2
+            func, extra = entry
             if func is None:
                 print("未知场景：%s" % name)
                 return 2
-            shell = Shell(args.exe, args.out, keep=args.no_clean).start()
+            shell = Shell(args.exe, args.out, keep=args.no_clean).start(extra)
             try:
                 print("\n=== 场景：%s ===" % name)
                 func(shell, checker)

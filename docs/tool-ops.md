@@ -413,3 +413,14 @@ coverage 把样本盖回当前像素。
   行距快捷键。**引擎与 ABI 零改动**（仍 112 个导出、`COMP_TOOL_TYPE = 15` 不变）；
   基线 444 → **445 用例**（`test_ui_core` 1），壳自检 160 → **164 项**，
   `run_regression.py --require-ohos` 6/6 PASS。见 README §6.24。
+- S21 追加（2026-10-20）：新增 `comp_layer_get_transform`（第 **113** 个导出 ABI，
+  纯尾部追加，冻结面不变）——`set_transform` 的回读口，供外壳做相对步进（缩放以当前中心
+  为锚、旋转在既有角度上累加，两端都必须先读到现值；否则撤销/合并/`.comp` 读回会让壳侧
+  缓存与文档静默分叉）。契约：回读值可直接再写入；两个出参都必填；`flip_x`/`flip_y` 不在
+  本入口且 `set_transform` 不覆盖既有翻转。
+  同时外壳接上 24 档混合模式（表逐字对齐上游 `LayerBlendMode.allCases` / `.groups`：
+  Shift+B / Shift+N 步进 + 图层菜单子菜单直达 + 面板行显示模式名）与图层变换
+  （Shift+方向 1 px / Ctrl+方向 10 px / Ctrl+Shift+左右 ±15° / Alt+,. 等比例缩放）。
+  **不新增算子**，混合模式与变换走既有 `comp_layer_set_blend` / `set_transform`。
+  基线 470 → **476 用例**（`test_ui_core` 3 + `test_abi` 1），壳自检 164 → **177 项**，
+  自动化目视 45 → **57 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.31。
