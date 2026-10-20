@@ -83,6 +83,23 @@ constexpr UINT kCmdLayerOpacityUp = 1013;
 constexpr UINT kCmdLayerBlendPrev = 1034; /* S21：混合模式按菜单序后退一步 */
 constexpr UINT kCmdLayerBlendNext = 1035; /* S21：混合模式按菜单序前进一步 */
 constexpr UINT kCmdBlendBase = 1300;      /* S21：+ 混合模式档位 0..23，菜单直达 */
+/*
+ * S22 命令 id 段（1400 起，避开 1001..1046 单体、1100..1116 工具、1200..1212 滤镜、
+ * 1300..1323 混合模式四段已占用区间）。
+ * 这一组接的是「引擎早已实现、壳一直没调」的像素级图层能力：蒙版 / 剪贴蒙版 /
+ * 组隔离 / 采样 / 重排 / 直方图。它们与混合模式的差别只在于壳没开口子。
+ */
+constexpr UINT kCmdLayerMaskFromSelection = 1400; /* S22：选区 -> 图层蒙版 */
+constexpr UINT kCmdLayerMaskRemove = 1401;         /* S22：清除图层蒙版 */
+constexpr UINT kCmdLayerMaskToSelection = 1402;    /* S22：图层蒙版 -> 选区（回读） */
+constexpr UINT kCmdLayerToggleClipping = 1403;     /* S22：与下方图层互相剪贴 */
+constexpr UINT kCmdLayerToggleIsolated = 1404;     /* S22：组穿透 / 隔离开关 */
+constexpr UINT kCmdLayerBringForward = 1405;       /* S22：上移一层 */
+constexpr UINT kCmdLayerSendBackward = 1406;       /* S22：下移一层 */
+constexpr UINT kCmdLayerBringToFront = 1407;       /* S22：置顶 */
+constexpr UINT kCmdLayerSendToBack = 1408;         /* S22：置底 */
+constexpr UINT kCmdHistogramToggle = 1409;         /* S22：直方图面板显隐 */
+constexpr UINT kCmdSamplingBase = 1410;             /* S22：+ 采样档位 0..2，菜单直达 */
 constexpr UINT kCmdLayerMoveLeft = 1036;  /* S21：图层平移（Shift=微调、Ctrl=粗调） */
 constexpr UINT kCmdLayerMoveRight = 1037;
 constexpr UINT kCmdLayerMoveUp = 1038;
@@ -125,6 +142,16 @@ struct LayerRow {
   float opacity = 1.0f;
   int32_t blend = 0;   /* comp_blend_mode 数值，0..23（ABI 冻结表） */
   uint8_t visible = 1; /* 壳侧自持：ABI 无可见性 getter */
+  /*
+   * S22 新增的三个面板可见状态。三者都不是「壳的第二种真相」——全部由 ABI 回读，
+   * 只用于绘制与置灰，写路径一律回到引擎，所以撤销/合并/.comp 读回都不会让面板
+   * 与文档漂移（S21 的 transform 回读口就是同一个理由）。
+   */
+  uint8_t has_mask = 0;        /* 本层带蒙版（引擎已参与合成） */
+  comp_layer_id clipping = 0; /* 剪贴蒙版来源；0 = 不剪贴 */
+  uint8_t is_group = 0;        /* 图层组 */
+  uint8_t isolated = 0;        /* 组隔离开关；非组恒 0 */
+  int32_t sampling = 0;        /* comp_sampling，0..2 */
 };
 
 struct ShellState {
@@ -163,6 +190,17 @@ struct ShellState {
   comp_ui::FilterPanel filter;
   bool filter_open = false;
   std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
+  /*
+   * S22 直方图（comp_layer_histogram 的壳侧唯一调用点）。
+   *
+   * 256 桶亮度分布来自引擎的只读入口：预乘像素先反预乘再取亮度、按 alpha 加权。
+   * 壳**不自己扫像素**——自己算一遍就会与内核的 levels 调整口径漂移，那是
+   * 「面板曲线与实际调整对不上」的经典成因。
+   * bins 为 nullptr = 面板关闭或当前图层取不到（组图层 / 16 位图层）。
+   */
+  bool histogram_open = false;
+  std::vector<double> histogram_bins;
+  int32_t histogram_layer = 0; /* 取数时对应的图层 id；换层即重取 */
   /* 前景色（S6）：画笔的笔画色；吸管与色板都写这里。 */
   comp_ui::ColorRGB foreground{};
   int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
@@ -336,6 +374,9 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 /* 调整面板在下方定义；refresh_layers 需要它同步选中图层的调整列表。 */
 void refresh_adjustments(ShellState& shell);
 
+/* S22：直方图数据同源于下方定义；refresh_layers 在换层/变更后统一刷新它。 */
+void refresh_histogram(ShellState& shell);
+
 /* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
 std::wstring widen_ascii(const char* text);
 
@@ -373,6 +414,39 @@ void refresh_layers(ShellState& shell) {
       /* 兜底：仅在 ABI 查询失败时沿用壳侧缓存。 */
       row.visible = visible_of(shell, id);
     }
+    /*
+     * S22：把「引擎已参与像素求值、壳却看不到」的三个结构属性接进面板。全部走
+     * ABI 回读、只用于绘制与置灰——写路径一律回到引擎，所以撤销 / 合并 /
+     * `.comp` 读回都不会让面板与文档漂移（与 S21 的 transform 回读口同一理由）。
+     */
+    int32_t has_mask = 0;
+    int32_t mask_w = 0;
+    int32_t mask_h = 0;
+    if (comp_layer_get_mask(shell.document, id, &has_mask, &mask_w, &mask_h) == COMP_OK) {
+      row.has_mask = has_mask != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
+    int32_t info_is_group = 0;
+    comp_layer_id info_parent = 0;
+    comp_layer_id info_clipping = 0;
+    if (comp_layer_get_group_info(shell.document, id, &info_is_group, &info_parent,
+                                  &info_clipping) == COMP_OK) {
+      row.is_group = info_is_group != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+      row.clipping = info_clipping;
+      /*
+       * 组隔离开关只对组有意义（ABI 注释：写入非组图层不报错但属性不参与合成）。
+       * 面板据此置灰：非组行不显示、也不允许切换隔离——否则用户对一个普通图层
+       * 反复按快捷键只看到状态栏说「已忽略」，那是把引擎语义泄漏成 UI 异常。
+       */
+      int32_t isolated = 0;
+      if (row.is_group != 0 &&
+          comp_layer_get_isolated(shell.document, id, &isolated) == COMP_OK) {
+        row.isolated = isolated != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+      }
+    }
+    comp_sampling sampling = COMP_SAMPLING_HIGH_QUALITY;
+    if (comp_layer_get_sampling(shell.document, id, &sampling) == COMP_OK) {
+      row.sampling = static_cast<int32_t>(sampling);
+    }
     shell.layers.push_back(row);
   }
 
@@ -382,6 +456,13 @@ void refresh_layers(ShellState& shell) {
   }
   /* 选中图层变化后，调整面板必须跟着换数据源。 */
   refresh_adjustments(shell);
+  /*
+   * S22：直方图随后同步。挂在这里而不是每个写入口各调一次，是因为
+   * refresh_layers 已经是全部变更路径（滤镜 / 工具 / 撤销 / 合并 / 打开文档）
+   * 的共同汇合点；漏挂一条路径的症状是「面板上的图不动了」，而那种滞后很难
+   * 追。取不到的图层（组 / 16 位）由 refresh_histogram 自己关面板并说明原因。
+   */
+  refresh_histogram(shell);
 }
 
 /* 面板显示序：数组序是自下而上，UI 需要自上而下（顶层在第一行）。 */
@@ -501,6 +582,342 @@ void panel_set_blend(ShellState& shell, int mode) {
   wsprintfW(buffer, L"混合模式：%s（%s 组，%d/%d）", name.c_str(), group.c_str(), next + 1,
             comp_ui::kBlendCount);
   refresh_history_status(shell, buffer);
+}
+
+/* 取完蒙版信息后刷新选区缓存与状态栏的共同尾部（定义在选区小节之后）。 */
+void finish_selection_command(ShellState& shell, const wchar_t* prefix);
+
+/*
+ * 选区 -> 图层蒙版（S22，Ctrl+Shift+M / 菜单「从选区建立蒙版」）。
+ *
+ * 接的是引擎**早已实现且已参与合成**的能力：filter_graph.cpp 的
+ * coverage.add(&layer->mask) 真的把蒙版合成进画面，`.comp` 侧 maskFile /
+ * maskEnabled 也早已落盘。缺的从来只是壳没开口子。
+ *
+ * 两处刻意的口径：
+ *  1. 无选区时如实拒绝（COMP_ERR_STATE 由引擎给），不静默画一张全 255 的空操作
+ *     蒙版——那会让用户以为「取消了选区限制」而实际上层已被完全遮住；
+ *  2. 蒙版取的是**当前有效选区 coverage**（含羽化），因此「羽化 8px 后建蒙版」
+ *     得到的正是边缘渐变的蒙版，与蚂蚁线看见的一致，不必再走一层近似。
+ */
+void panel_mask_from_selection(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (!shell.selection_active || shell.selection_mask.empty()) {
+    set_status(shell, L"没有活动选区：先用框选/套索/魔棒划定范围");
+    return;
+  }
+  /*
+   * 选区 coverage 是文档分辨率、行距 = 文档宽；这就是 comp_mask 的原样形态
+   * （refresh_selection 正是用同一组字段从引擎取回来的），直接转手即可，
+   * 不在壳内重排或复制一份。
+   */
+  comp_mask mask{};
+  mask.width = shell.width;
+  mask.height = shell.height;
+  mask.stride = static_cast<size_t>(shell.width);
+  mask.pixels = shell.selection_mask.data();
+  if (comp_layer_set_mask(shell.document, row->id, &mask) != COMP_OK) {
+    set_status(shell, L"建立图层蒙版失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  refresh_history_status(shell, L"已从选区建立图层蒙版");
+}
+
+/*
+ * 清除图层蒙版（S22）。无蒙版时如实说明而不是假成功——面板上一排图标里
+ * 「有没有蒙版」必须是可核对的，假成功会让用户以为操作生效过。
+ */
+void panel_mask_remove(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (row->has_mask == 0) {
+    set_status(shell, L"该图层没有蒙版");
+    return;
+  }
+  if (comp_layer_set_mask(shell.document, row->id, nullptr) != COMP_OK) {
+    set_status(shell, L"清除蒙版失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  refresh_history_status(shell, L"已清除图层蒙版");
+}
+
+/*
+ * 图层蒙版 -> 选区（S22，上游 Load Mask as Selection 的 read 侧）。
+ * 走 comp_selection_load_layer(COMP_SELECTION_LOAD_MASK)：内核按图层 transform
+ * 把蒙版映射回文档坐标，壳不自己重采样——否则缩放/旋转过的图层会得到错位选区。
+ */
+void panel_mask_to_selection(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (row->has_mask == 0) {
+    set_status(shell, L"该图层没有蒙版");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_load_layer(shell.document, row->id, COMP_SELECTION_LOAD_MASK,
+                               COMP_SELECTION_REPLACE, 0, &changed) != COMP_OK) {
+    set_status(shell, L"载入蒙版为选区失败");
+    return;
+  }
+  finish_selection_command(shell, L"已把图层蒙版载入为选区");
+  shell.needs_render = true;
+}
+
+/*
+ * 剪贴蒙版开关（S22，Ctrl+Alt+G，上游 Create Clipping Mask 的对应键位）。
+ *
+ * 语义取上游默认档：**剪贴到下方紧邻的那一层**（base = 栈中下一层），因为上游
+ * 的 ⌘G 就是「与下面一个图层互相剪贴」，不是让用户从一堆 id 里挑。再次按下取消。
+ * 已处于剪贴态时先取消再决定是否重新挂——否则连按两次会在「取消/改挂」之间
+ * 跳变，用户无法预测。
+ *
+ * 引擎已参与像素求值（composite_ops.cpp 的 clipping_factor 真的按来源图层算
+ * 覆盖率），壳此前只是没调 setter。
+ */
+void panel_toggle_clipping(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (shell.layers.size() < 2) {
+    set_status(shell, L"至少需要两个图层才能剪贴");
+    return;
+  }
+  const comp_layer_id self = row->id;
+  /* 取消：已在剪贴态就解绑，一步撤销。 */
+  if (row->clipping != 0) {
+    if (comp_layer_set_clipping_source(shell.document, self, 0) != COMP_OK) {
+      set_status(shell, L"取消剪贴蒙版失败");
+      return;
+    }
+    refresh_layers(shell);
+    shell.needs_render = true;
+    refresh_history_status(shell, L"已取消剪贴蒙版");
+    return;
+  }
+  /*
+   * 挂靠：面板行索引自上而下，数组序自下而上，故「下面一层」是数组里
+   * index + 1（跳过自己）。越界（已经是栈底一层）如实拒绝——栈底图层没有
+   * 可剪贴的来源，静默不做事会让用户以为菜单项坏了。
+   */
+  const size_t self_index = static_cast<size_t>(shell.layers.size()) - 1u -
+                            static_cast<size_t>(shell.selected_layer);
+  if (self_index + 1u >= shell.layers.size()) {
+    set_status(shell, L"最底层图层无法剪贴");
+    return;
+  }
+  const comp_layer_id base = shell.layers[self_index + 1u].id;
+  if (comp_layer_set_clipping_source(shell.document, self, base) != COMP_OK) {
+    set_status(shell, L"建立剪贴蒙版失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"已剪贴到下方图层 #%I64u",
+            static_cast<unsigned long long>(base));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 组隔离开关（S22）。引擎侧语义见 ABI：隔离 = 子树先自合成一张透明缓冲再作为
+ * 整体参与混合；穿透（默认）= 子层直接叠加到组外背景。两者都是**已参与像素
+ * 求值**的真实差异（filter_graph.cpp 按 node.isolated 决定 child_backdrop）。
+ *
+ * 只对组图层有意义：非组行不显示也不响应——把引擎的「忽略」语义暴露成 UI
+ * 异常（按了没反应）比置灰更糟。
+ */
+void panel_toggle_isolated(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (row->is_group == 0) {
+    set_status(shell, L"只有图层组才能切换穿透/隔离");
+    return;
+  }
+  const int32_t next = row->isolated != 0 ? 0 : 1;
+  if (comp_layer_set_isolated(shell.document, row->id, next) != COMP_OK) {
+    set_status(shell, L"切换组隔离失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  refresh_history_status(shell, next != 0 ? L"图层组：已隔离" : L"图层组：已穿透");
+}
+
+/*
+ * 图层重排（S22）：按面板显示方向把选中图层上移 / 下移一层（或置顶 / 置底）。
+ *
+ * comp_layer_reorder(document, id, before) 的 before 是「移动到哪一层之前」
+ * （0 = 同级末尾），且图层数组是**自下而上**的堆叠序。面板显示自上而下
+ * * （顶层在第一行），所以「面板上移一行」= 数组里 index-1，before = 新的下一层。
+ *
+ * 这是 T2 点名的缺口之一：comp_layer_reorder 在壳侧调用数为 0，用户只能
+ * 进菜单一条一条读说明，完全没有拖不动、也按不动的排序入口。
+ */
+void panel_reorder_layer(ShellState& shell, int direction) {
+  if (shell.layers.empty()) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  const int32_t shown = shell.selected_layer; /* 0 = 最上层显示行 */
+  const int32_t array_index = count - 1 - shown;
+  const comp_layer_id self = shell.layers[static_cast<size_t>(array_index)].id;
+
+  comp_layer_id before = 0;
+  int32_t next_show = shown;
+  if (direction == -2) {
+    /* 置顶：移到数组末尾之前（数组末尾 = 面板第一行 = 顶层）。 */
+    if (array_index + 1 >= count) {
+      set_status(shell, L"已经是顶层");
+      return;
+    }
+    before = 0; /* 0 = 同级末尾，即自下而上序的顶层 */
+    next_show = 0;
+  } else if (direction < 0) {
+    /* 上移一层：数组 index-1；已在顶（数组 0）则无事可做。 */
+    if (array_index <= 0) {
+      set_status(shell, L"已经是顶层");
+      return;
+    }
+    before = shell.layers[static_cast<size_t>(array_index - 1)].id;
+    next_show = shown - 1;
+  } else if (direction > 0) {
+    /* 下移一层：数组 index+1；已在底则无事可做。 */
+    if (array_index + 1 >= count) {
+      set_status(shell, L"已经是底层");
+      return;
+    }
+    /* 越过自己后，新的下一层就是原来的下两层；没有（自己是倒数第二）时 before=0 = 置底。 */
+    before = (array_index + 2 < count)
+                 ? shell.layers[static_cast<size_t>(array_index + 2)].id
+                 : 0;
+    next_show = shown + 1;
+  } else {
+    /* direction == 0：置底（数组 0 之前）。 */
+    if (array_index == 0) {
+      set_status(shell, L"已经是底层");
+      return;
+    }
+    before = shell.layers[0].id;
+    next_show = count - 1;
+  }
+  if (comp_layer_reorder(shell.document, self, before) != COMP_OK) {
+    set_status(shell, L"调整图层顺序失败");
+    return;
+  }
+  refresh_layers(shell);
+  /*
+   * 选中态跟着该图层走：重排后数组换了位置，selected_layer 是**面板行索引**，
+   * 必须重算，否则「刚移动的那一层」在面板上换了行，后续快捷键会作用到别层——
+   * 这一类错误不报任何异常，只会让用户觉得软件选不中自己要的那层。
+   */
+  shell.selected_layer = comp_ui::clamp_selected_row(next_show, count);
+  shell.needs_render = true;
+  if (direction == -2) {
+    refresh_history_status(shell, L"图层置顶");
+  } else if (direction < 0) {
+    refresh_history_status(shell, L"图层上移一层");
+  } else if (direction > 0) {
+    refresh_history_status(shell, L"图层下移一层");
+  } else {
+    refresh_history_status(shell, L"图层置底");
+  }
+}
+
+/*
+ * 采样模式（S22）：comp_layer_set_sampling / get_sampling 是对上已有的 ABI
+ * （0 High quality / 1 Nearest / 2 Smooth），且引擎真的按它决定缩放手感
+ * （resample.cpp 的 sampling_from_abi）。壳此前一次都没调过。
+ *
+ * 与混合模式同样按「菜单直达 + 档位表」接：档位表在 ui_core，壳不复制命名。
+ */
+void panel_set_sampling(ShellState& shell, int mode) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int next = comp_ui::clamp_sampling_mode(mode);
+  if (comp_layer_set_sampling(shell.document, row->id, static_cast<comp_sampling>(next)) !=
+      COMP_OK) {
+    set_status(shell, L"设置采样模式失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.needs_render = true;
+  const std::wstring name = widen_ascii(comp_ui::sampling_mode_name(next));
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"采样模式：%s", name.c_str());
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 直方图面板开关（S22）。
+ *
+ * 接通 comp_layer_histogram——上游 Levels 面板左半边就是这张图，而本壳的调整面板
+ * 只有一排数字控件，用户看不到「这张图现在偏暗还是偏亮」，只能凭感觉拖参数。
+ *
+ * 三条刻意的口径：
+ *  1. **像素不自己扫**：全部由引擎的只读入口给（预乘先反预乘再取亮度、按 alpha
+ *     加权）。自己扫一遍必然与内核的 levels 口径漂移，面板曲线会系统性偏向暗部。
+ *  2. 取不到就如实说原因，不画一张空图糊弄：组图层、空像素图层、16 位图层
+ *     由引擎分别给 COMP_ERR_STATE / COMP_ERR_UNSUPPORTED。
+ *  3. 面板开着时，任何改动图层 / 撤销 / 合并 / 打开文档的路径都会刷新它——
+ *     见 refresh_histogram()，在各写入口后统一调用。
+ */
+void refresh_histogram(ShellState& shell) {
+  shell.histogram_bins.clear();
+  shell.histogram_layer = 0;
+  if (!shell.histogram_open) return;
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    shell.histogram_open = false;
+    return;
+  }
+  std::vector<double> bins(256, 0.0);
+  const comp_result result =
+      comp_layer_histogram(shell.document, row->id, nullptr, 0, bins.data());
+  if (result != COMP_OK) {
+    /*
+     * 取不到就关掉面板并说明原因：留着空面板比关掉更糟——用户会以为「这张图
+     * 没有直方图」，而真实原因是这一层取不到（组/16 位/无像素）。
+     */
+    shell.histogram_open = false;
+    set_status(shell, L"直方图不可用：组图层、空图层或 16 位图层");
+    return;
+  }
+  shell.histogram_bins = std::move(bins);
+  shell.histogram_layer = row->id;
+}
+
+void panel_toggle_histogram(ShellState& shell) {
+  shell.histogram_open = !shell.histogram_open;
+  refresh_histogram(shell);
+  shell.needs_render = true;
+  if (shell.histogram_open && !shell.histogram_bins.empty()) {
+    refresh_history_status(shell, L"直方图：已显示");
+  } else if (!shell.histogram_open) {
+    set_status(shell, L"直方图：已隐藏");
+  }
 }
 
 /*
@@ -3079,6 +3496,37 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerScaleUp:
       panel_scale_layer(shell, 1);
       break;
+    /* ---- S22：引擎早已实现、壳此前未接线的像素级图层能力 ---- */
+    case kCmdLayerMaskFromSelection:
+      panel_mask_from_selection(shell);
+      break;
+    case kCmdLayerMaskRemove:
+      panel_mask_remove(shell);
+      break;
+    case kCmdLayerMaskToSelection:
+      panel_mask_to_selection(shell);
+      break;
+    case kCmdLayerToggleClipping:
+      panel_toggle_clipping(shell);
+      break;
+    case kCmdLayerToggleIsolated:
+      panel_toggle_isolated(shell);
+      break;
+    case kCmdLayerBringForward:
+      panel_reorder_layer(shell, -1);
+      break;
+    case kCmdLayerSendBackward:
+      panel_reorder_layer(shell, 1);
+      break;
+    case kCmdLayerBringToFront:
+      panel_reorder_layer(shell, -2);
+      break;
+    case kCmdLayerSendToBack:
+      panel_reorder_layer(shell, 0);
+      break;
+    case kCmdHistogramToggle:
+      panel_toggle_histogram(shell);
+      break;
     case kCmdAdjKindPrev:
       panel_cycle_kind(shell, -1);
       break;
@@ -3133,6 +3581,11 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       /* 混合模式菜单项（S21）：kCmdBlendBase + 档位。 */
       if (id >= kCmdBlendBase && id < kCmdBlendBase + comp_ui::kBlendCount) {
         panel_set_blend(shell, static_cast<int>(id - kCmdBlendBase));
+        break;
+      }
+      /* 采样模式菜单项（S22）：kCmdSamplingBase + 档位 0..2。 */
+      if (id >= kCmdSamplingBase && id < kCmdSamplingBase + comp_ui::kSamplingCount) {
+        panel_set_sampling(shell, static_cast<int>(id - kCmdSamplingBase));
         break;
       }
       return;
@@ -3291,9 +3744,16 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   wsprintfW(title, L"图层（%u）", static_cast<unsigned>(shell.layers.size()));
   TextOutW(dc, panel_rect.x + 10, panel_rect.y + 8, title, lstrlenW(title));
 
+  /*
+   * S22：直方图打开时图层行整体下移，偏移与命中测试共用同一常量
+   * （ui_core::layer_row_rect / layer_row_at 的 row_top 参数）。这里从布局算，
+   * 不在壳里另写一个数字——两处各写一次必然有一天不一致。
+   */
+  const int row_top = shell.histogram_open ? comp_ui::Layout::kHistogramHeight : 0;
+
   const int32_t count = static_cast<int32_t>(shell.layers.size());
   for (int32_t line = 0; line < count; ++line) {
-    const comp_ui::Rect row_rect = comp_ui::layer_row_rect(panel_rect, line);
+    const comp_ui::Rect row_rect = comp_ui::layer_row_rect(panel_rect, line, row_top);
     const LayerRow& row = shell.layers[static_cast<size_t>(count - 1 - line)];
     if (line == shell.selected_layer) {
       RECT highlight{row_rect.x + 2, row_rect.y + 1, row_rect.right() - 2,
@@ -3307,17 +3767,82 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     }
     /* 混合模式名先转宽字符再拼：wsprintfW 的 %hs 行为不可靠（与既有 widen_ascii 用法一致）。 */
     const std::wstring blend_name = widen_ascii(comp_ui::blend_mode_name(row.blend));
-    wchar_t line_text[192];
-    wsprintfW(line_text, L"%s #%I64u  %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
-              static_cast<unsigned long long>(row.id), blend_name.c_str(),
-              static_cast<int>(row.opacity * 100.0f + 0.5f));
+    /*
+     * S22 行内状态标记。三个都是「引擎已参与像素求值、面板此前看不见」的属性：
+     *   M  = 带蒙版     （filter_graph 的 coverage.add(&layer->mask)）
+     *   >| = 已剪贴     （composite_ops 的 clipping_factor）
+     *   [] = 组且隔离   （filter_graph 按 node.isolated 定 child_backdrop）
+     * 不另开一列图标区：22px 行高 + 248px 栏宽已经排满，标号跟着层名走最省地方。
+     */
+    std::wstring marks;
+    if (row.has_mask != 0) marks += L"M";
+    if (row.clipping != 0) marks += L">|";
+    if (row.is_group != 0) marks += row.isolated != 0 ? L"[]" : L"{}";
+    wchar_t line_text[224];
+    if (!marks.empty()) {
+      wsprintfW(line_text, L"%s #%I64u  %s %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
+                static_cast<unsigned long long>(row.id), blend_name.c_str(), marks.c_str(),
+                static_cast<int>(row.opacity * 100.0f + 0.5f));
+    } else {
+      wsprintfW(line_text, L"%s #%I64u  %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
+                static_cast<unsigned long long>(row.id), blend_name.c_str(),
+                static_cast<int>(row.opacity * 100.0f + 0.5f));
+    }
     TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
   }
 
+  /*
+   * S22 直方图：256 桶亮度分布，像素由引擎只读入口给（预乘先反预乘再取亮度）。
+   * 画成折线而不是 256 根柱子：栏宽只有 248px，每桶不到 1px，柱子会糊成一片；
+   * 折线在任何宽度下都能看出形状（偏暗/偏亮/断层）。
+   */
+  if (shell.histogram_open && !shell.histogram_bins.empty()) {
+    const comp_ui::Rect area{panel_rect.x + 6, panel_rect.y + comp_ui::Layout::kHistogramHeight -
+                                 comp_ui::Layout::kHistogramPlotHeight,
+                             panel_rect.w - 12, comp_ui::Layout::kHistogramPlotHeight};
+    RECT frame{area.x, area.y, area.right(), area.bottom()};
+    HBRUSH plot = CreateSolidBrush(RGB(14, 16, 20));
+    FillRect(dc, &frame, plot);
+    DeleteObject(plot);
+    FrameRect(dc, &frame, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+
+    double peak = 0.0;
+    for (double value : shell.histogram_bins) {
+      if (value > peak) peak = value;
+    }
+    if (peak > 0.0) {
+      /*
+       * 对数刻度：真实照片的直方图是「暗部一座山 + 高光一线天」，线性刻度下那条
+       * 高光线永远只有 1px 高，用户看不见高光滚降——那是直方图最该看的东西。
+       * 用 log1p 归一化后形状可读，且空图（全 0）不会除零。
+       */
+      HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 200, 255));
+      HPEN old = static_cast<HPEN>(SelectObject(dc, pen));
+      const int steps = 256;
+      MoveToEx(dc, area.x, area.bottom(), nullptr);
+      for (int i = 0; i < steps; ++i) {
+        const double norm = std::log1p(shell.histogram_bins[static_cast<size_t>(i)]) /
+                            std::log1p(peak);
+        const int px = area.x + static_cast<int>((static_cast<double>(i) * (area.w - 1)) /
+                                                 static_cast<double>(steps - 1));
+        const int py =
+            area.bottom() - static_cast<int>(norm * static_cast<double>(area.h - 1) + 0.5);
+        LineTo(dc, px, py);
+      }
+      SelectObject(dc, old);
+      DeleteObject(pen);
+    }
+    SetTextColor(dc, RGB(150, 154, 166));
+    const wchar_t* label = L"亮度直方图（对数刻度）";
+    TextOutW(dc, panel_rect.x + 8, panel_rect.y + comp_ui::Layout::kHistogramHeight -
+                                      comp_ui::Layout::kHistogramPlotHeight - 14,
+            label, lstrlenW(label));
+  }
+
   SetTextColor(dc, RGB(140, 144, 156));
-  const wchar_t* hint = L"点击选中 · Ctrl+Shift+V 显隐 · Ctrl+[ ] 不透明度";
+  const wchar_t* hint = L"Ctrl+[ ] 不透明度 · Ctrl+Shift+↑↓ 排序";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 46, hint, lstrlenW(hint));
-  const wchar_t* hint2 = L"Shift+B / Shift+N 混合模式 · Ctrl+Shift+N 新建";
+  const wchar_t* hint2 = L"Shift+B / N 混合模式 · Ctrl+Shift+M 蒙版";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
@@ -4768,6 +5293,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     }
     case VK_UP:
     case VK_DOWN: {
+      /*
+       * S22：Ctrl+Shift+↑/↓ = 上移/下移一层（面板序）。
+       * 该组合此前未被占用（左右方向的 Ctrl+Shift 是 S21 的旋转），因此不与
+       * 任何既有键位冲突。
+       */
+      if (ctrl && shift) {
+        run_shell_command(window, shell,
+                          key == VK_UP ? kCmdLayerBringForward : kCmdLayerSendBackward);
+        break;
+      }
       /* 无修饰仍是选图层；Shift/Ctrl 才平移（避免与既有 ↑↓ 选图层抢键）。 */
       if (shift || ctrl) {
         const int step = comp_ui::layer_transform_move_step(ctrl);
@@ -4891,6 +5426,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         run_shell_command(window, shell, kCmdLayerBlendNext);
         break;
       }
+      /*
+       * S22：Ctrl+Shift+M = 从选区建立图层蒙版；Ctrl+Alt+G = 剪贴蒙版开关。
+       * M 在 Ctrl+Shift 下未被占用（单独 M 是 Marquee，Ctrl+M 无定义）；
+       * G 单独是渐变工具，故剪贴必须带 Alt 才能与它分开。
+       * Alt 由 WM_SYSKEYDOWN 上报，这里用 alt 标志区分（见本函数开头的取键）。
+       */
+      if (key == 'M' && ctrl && shift) {
+        run_shell_command(window, shell, kCmdLayerMaskFromSelection);
+        break;
+      }
       if (key == 'G' && !ctrl) {
         /* 重复按 G 在同一工具内循环 Linear -> Radial（对齐上游的同类工具习惯）。 */
         if (shell.tool == comp_ui::ToolId::Gradient) {
@@ -4953,6 +5498,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_KEYDOWN:
       if (shell != nullptr) {
+        /*
+         * S22 F6：亮度直方图开关。放在字母键处理之前——它与任何工具快捷键都
+         * 不冲突，且面板类快捷键统一走 run_shell_command 分发，菜单与键不分叉。
+         */
+        if (wparam == VK_F6) {
+          run_shell_command(window, *shell, kCmdHistogramToggle);
+          return 0;
+        }
         /* 文字键入态下空格是字符，不是临时抓手。 */
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         if (wparam == VK_SPACE && !(shell->type_active && !ctrl)) {
@@ -4988,8 +5541,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
+          /*
+           * 命中图层行：row_top 与 draw_layer_panel 共用同一个直方图偏移量。
+           * 两处各写一个常量迟早不一致，而症状是「点不中要的那层」——不报错、
+           * 只在面板开着直方图时偶现，极难复现。
+           */
+          const int row_top = shell->histogram_open ? comp_ui::Layout::kHistogramHeight : 0;
           const int row = comp_ui::layer_row_at(
-              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y);
+              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
+              row_top);
           if (row >= 0) {
             shell->selected_layer = row;
             refresh_adjustments(*shell);
@@ -5236,6 +5796,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_SYSKEYDOWN:
       /*
+       * S22：Ctrl+Alt+G = 剪贴蒙版开关（对齐上游 Create Clipping Mask）。
+       * Alt 组合只能在这里收到（WM_SYSKEYDOWN），G 单独按是渐变工具，因此必须
+       * 带 Alt+Ctrl 才不抢键；放最前面先判，省得走到 OEM_4/OEM_6 分支。
+       */
+      if (shell != nullptr && wparam == 'G') {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl) {
+          run_shell_command(window, *shell, kCmdLayerToggleClipping);
+          return 0;
+        }
+      }
+      /*
        * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化模式调强度。
        * 普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，因此放到 Alt 组合，
        * 且必须在这里吞掉，否则 DefWindowProc 会响铃。
@@ -5388,7 +5960,30 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectDown, L"选择下一图层(&D)\t↓");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleVisible, L"切换可见性(&V)\tCtrl+Shift+V");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityDown, L"降低不透明度(&-)\tCtrl+[");
+  /*
+   * S22 排列顺序：这四条接的是 comp_layer_reorder——T2 全量测试点名的
+   * 「壳侧调用数为 0」缺口之一，用户此前完全无法调整图层堆叠次序。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerBringForward, L"上移一层(&W)\tCtrl+Shift+↑");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerSendBackward, L"下移一层(&S)\tCtrl+Shift+↓");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerBringToFront, L"置于顶层(&T)\tCtrl+Shift+Home");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerSendToBack, L"置于底层(&B)\tCtrl+Shift+End");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  /*
+   * S22 蒙版三连：建（选区->蒙版）/读（蒙版->选区）/清。引擎侧蒙版早已参与
+   * 合成与 .comp 落盘，缺的只是壳没调 setter；补 comp_layer_get_mask 后面板
+   * 也能回读「这一层有没有蒙版」，不会出现建了却看不出来的情况。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMaskFromSelection,
+              L"从选区建立蒙版(&K)\tCtrl+Shift+M");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMaskToSelection, L"载入蒙版为选区(&Y)");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMaskRemove, L"清除蒙版(&R)");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  /* S22 剪贴蒙版：挂到下方紧邻图层。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleClipping, L"剪贴蒙版(&C)\tCtrl+Alt+G");
+  /* S22 组隔离：只对图层组有意义。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerToggleIsolated, L"切换穿透/隔离(&I)");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\tCtrl+]");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveLeft, L"平移左(&L)	Shift+←");
@@ -5418,6 +6013,18 @@ HMENU build_menu() {
     }
   }
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(blend_menu), L"混合模式(&B)");
+  /*
+   * S22 采样模式子菜单：kCmdSamplingBase + 档位（0 High quality / 1 Nearest /
+   * 2 Smooth）。引擎真的按它改变缩放手感（resample.cpp 的 sampling_from_abi），
+   * 不是展示开关；setter / getter 早就存在，壳此前一次都没调过。
+   */
+  HMENU sampling_menu = CreatePopupMenu();
+  for (int mode = 0; mode < comp_ui::kSamplingCount; ++mode) {
+    wchar_t label[64];
+    wsprintfW(label, L"%s", widen_ascii(comp_ui::sampling_mode_name(mode)).c_str());
+    AppendMenuW(sampling_menu, MF_STRING, kCmdSamplingBase + static_cast<UINT>(mode), label);
+  }
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sampling_menu), L"采样模式(&Q)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
 
   HMENU view_menu = CreatePopupMenu();
@@ -5426,6 +6033,13 @@ HMENU build_menu() {
   AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(view_menu, MF_STRING, kCmdViewZoomIn, L"放大(&I)\tCtrl+=");
   AppendMenuW(view_menu, MF_STRING, kCmdViewZoomOut, L"缩小(&O)\tCtrl+-");
+  AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
+  /*
+   * S22 直盘开关（F6）：数据来自 comp_layer_histogram 的只读入口。
+   * 上游 Levels 面板左半边就是这张图，而本壳此前只有一排数字控件——
+   * 用户看不到图现在偏暗还是偏亮，只能凭感觉拖参数。
+   */
+  AppendMenuW(view_menu, MF_STRING, kCmdHistogramToggle, L"亮度直方图(&H)\tF6");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view_menu), L"视图(&V)");
 
   /* 工具菜单与工具条、快捷键共用同一张表（tool_table），不另抄一份键位。 */
@@ -5486,6 +6100,84 @@ const char* backend_name(comp_backend backend) {
     case COMP_BACKEND_CPU:    return "CPU";
     default:                  return "AUTO";
   }
+}
+
+/*
+ * 探针夹具（240x160：左红 / 中绿竖条 / 右蓝）的存在性检测与自备写入。
+ *
+ * 为什么放在壳里而不是仓里：run_regression.py 的 --clean 会连 build/ 一起删掉，
+ * 而这份夹具本来就住在 build/ 里，于是全量回归后它必然不在。旧版自检此时把
+ * 「内容对拍」降级为 [skip]，SHA256 与基线不一致——那看起来像产品回归，实际只是
+ * 夹具不见了。改成自检自己写：这里链着引擎，写 PNG 与读 PNG 是同一条 comp_io_*
+ * 路径，不引入任何外部依赖，也不需要把二进制夹具提交进版本库。
+ *
+ * 返回值语义：probe_png_exists 只回答「在不在」；write_probe_png 回答「写没写成」
+ * （写成后一定在）。写入失败（磁盘满/只读）由调用方走 [skip] 出口，不假 PASS。
+ */
+bool probe_png_exists(const char* path) {
+  if (path == nullptr) return false;
+  FILE* probe = nullptr;
+  if (fopen_s(&probe, path, "rb") != 0 || probe == nullptr) return false;
+  std::fclose(probe);
+  return true;
+}
+
+bool write_probe_png(comp_engine engine, const char* path) {
+  if (engine == nullptr || path == nullptr) return false;
+  const int32_t probe_width = 240;
+  const int32_t probe_height = 160;
+  const int32_t stripe = (probe_width * 15) / 40; /* 中段绿条宽约 7.5% 画布 */
+
+  comp_document_desc desc{};
+  desc.width = probe_width;
+  desc.height = probe_height;
+  desc.dpi = 72.0f;
+  desc.color_space = "sRGB";
+  comp_document probe = nullptr;
+  if (comp_document_create(engine, &desc, &probe) != COMP_OK || probe == nullptr) return false;
+
+  const size_t probe_stride = static_cast<size_t>(probe_width) * 4u;
+  std::vector<uint8_t> probe_pixels(probe_stride * static_cast<size_t>(probe_height), 0);
+  for (int32_t y = 0; y < probe_height; ++y) {
+    uint8_t* row = probe_pixels.data() + static_cast<size_t>(y) * probe_stride;
+    for (int32_t x = 0; x < probe_width; ++x) {
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      if (x < stripe) {
+        pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255; /* 左：红 */
+      } else if (x < stripe * 2) {
+        pixel[0] = 0; pixel[1] = 255; pixel[2] = 0; pixel[3] = 255; /* 中：绿 */
+      } else {
+        pixel[0] = 0; pixel[1] = 0; pixel[2] = 255; pixel[3] = 255; /* 右：蓝 */
+      }
+    }
+  }
+
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "probe";
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  layer_desc.transform = comp_rect{0, 0, probe_width, probe_height};
+  layer_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+  comp_layer_id probe_layer = 0;
+  bool added = comp_layer_add(probe, &layer_desc, &probe_layer) == COMP_OK &&
+                probe_layer != 0;
+  if (added) {
+    comp_image image{};
+    image.width = probe_width;
+    image.height = probe_height;
+    image.format = COMP_PIXEL_RGBA8;
+    image.stride = probe_stride;
+    image.pixels = probe_pixels.data();
+    added = comp_layer_set_pixels(probe, probe_layer, &image) == COMP_OK;
+  }
+  bool exported = false;
+  if (added) {
+    const comp_image_format format = comp_io_format_from_path(path);
+    exported = format != COMP_FORMAT_UNKNOWN &&
+               comp_io_export(probe, path, format, nullptr) == COMP_OK;
+  }
+  comp_document_destroy(probe);
+  return exported;
 }
 
 /*
@@ -5649,14 +6341,25 @@ int run_selftest(const wchar_t* out_path) {
   }
 
   /*
-   * 探针图往返：build/import_probe.png 是像素值精确已知的 240x160 图
-   * （左红、中绿竖条、右蓝）。导入后核对画布尺寸，并核对左上角第一个像素
-   * 仍是纯红——证明「打开一张外部图片」真把内容搬进了文档，不是建了个空壳。
-   * 找不到探针图时跳过像素断言（不同工作副本可能没生成该文件），但尺寸断言仍在。
+   * 探针图往返：240x160、左红 / 中绿竖条 / 右蓝，像素值精确已知。
+   * 导入后核对画布尺寸与三个角落的像素——证明「打开一张外部图片」真把内容搬进了
+   * 文档，不是建了个空壳。
+   *
+   * 夹具缺失时**先用引擎写出它**再导入（而不是降级成 [skip]）：
+   *   - run_regression.py 的 --clean 会连 build/ 一起删掉，这份夹具本来就住在
+   *     build/ 里，于是每次全量回归后它必然不在——旧版自检此时会把两项内容对拍
+   *     降级为 [skip]，SHA256 与基线不一致，看起来像产品回归；
+   *   - 自检自己链着引擎（静态），写 PNG 与读 PNG 走的是同一条 comp_io_* 路径，
+   *     由它自备夹具不引入任何外部依赖；
+   *   - 降级出口仍然保留：万一写入失败（磁盘满/只读），如实报 [skip] 而不是假 PASS。
    */
+  const char* probe_path = "build/import_probe.png";
+  if (!probe_png_exists(probe_path)) {
+    (void)write_probe_png(engine, probe_path);
+  }
   comp_document probe_document = nullptr;
   const bool probe_ok =
-      comp_io_import(engine, "build/import_probe.png", &probe_document) == COMP_OK &&
+      comp_io_import(engine, probe_path, &probe_document) == COMP_OK &&
       probe_document != nullptr;
   if (probe_ok) {
     comp_size probe_size{};
@@ -5668,7 +6371,7 @@ int run_selftest(const wchar_t* out_path) {
       const size_t probe_stride = static_cast<size_t>(probe_size.width) * 4u;
       std::vector<uint8_t> probe_pixels(probe_stride * static_cast<size_t>(probe_size.height), 0);
       const bool probe_flatten = comp_render_flatten(probe_document, probe_pixels.data(),
-                                                     COMP_PIXEL_RGBA8, probe_stride) == COMP_OK;
+                                                    COMP_PIXEL_RGBA8, probe_stride) == COMP_OK;
       /* 左上角 = 红区，右下角 = 蓝区，中线 = 绿条。逐点对拍，不是统计近似。 */
       const bool probe_pixels_ok = probe_flatten &&
           probe_pixels[0] == 255 && probe_pixels[1] == 0 && probe_pixels[2] == 0 &&
@@ -5681,7 +6384,8 @@ int run_selftest(const wchar_t* out_path) {
     comp_document_destroy(probe_document);
   } else {
     std::fprintf(report,
-                 "[skip] build/import_probe.png 不存在，跳过内容对拍（尺寸断言已覆盖导入通路）\n");
+                 "[skip] %s 不存在且无法写出，跳过内容对拍（尺寸断言已覆盖导入通路）\n",
+                 probe_path);
   }
 
   /* 撤销/重做由引擎维护，外壳只触发与展示。 */
@@ -5771,6 +6475,196 @@ int run_selftest(const wchar_t* out_path) {
       }
     }
     verify(comp_txn_abort(xform_txn) == COMP_OK, "comp_txn_abort() rolls the transform back");
+  }
+
+  /*
+   * S22 蒙版回读（comp_layer_get_mask）：
+   *
+   * 这条锁死的是“面板能否知道这一层带不带蒙版”。蒙版是引擎早已参与合成的真能力
+   * （filter_graph.cpp 的 coverage.add(&layer->mask)），但 ABI 只有写入口、没有回读口，
+   * 因此壳侧之前完全看不见“已经建过蒙版”这件事。
+   *
+   * 断言里必须包含“清除后回到无蒙版”：只验证“能读到蒙版”的话，一个
+   * 写死的 has_mask也能通过（如果实现把数组当成写入口）。
+   */
+  int32_t has_mask = -1;
+  int32_t mask_w = -1;
+  int32_t mask_h = -1;
+  verify(comp_layer_get_mask(document, layer, &has_mask, &mask_w, &mask_h) == COMP_OK &&
+             has_mask == 0 && mask_w == 0 && mask_h == 0,
+         "get_mask reports no mask on a fresh layer");
+
+  std::vector<uint8_t> mask_pixels(static_cast<size_t>(width) *
+                                  static_cast<size_t>(height), 255u);
+  comp_mask full_mask{};
+  full_mask.width = width;
+  full_mask.height = height;
+  full_mask.stride = static_cast<size_t>(width);
+  full_mask.pixels = mask_pixels.data();
+  verify(comp_layer_set_mask(document, layer, &full_mask) == COMP_OK,
+         "comp_layer_set_mask(full cover)");
+  verify(comp_layer_get_mask(document, layer, &has_mask, &mask_w, &mask_h) == COMP_OK &&
+             has_mask == 1 && mask_w == width && mask_h == height,
+         "get_mask round trips presence and size");
+
+  verify(comp_layer_set_mask(document, layer, nullptr) == COMP_OK &&
+             comp_layer_get_mask(document, layer, &has_mask, &mask_w, &mask_h) == COMP_OK &&
+             has_mask == 0 && mask_w == 0 && mask_h == 0,
+         "clearing the mask returns to no-mask");
+
+  /*
+   * S22 结构关系回读（comp_layer_get_group_info）。
+   *
+   * “是不是组 / 挂在哪 / 剪贴谁”三件事目前只能在创建时给（comp_layer_desc），
+   * 此后没有 setter 之外的路。.comp 读回带组、带剪贴的文档时，面板就会静默失真。
+   */
+  comp_layer_id clipping_read = 0xdeadbeef;
+  int32_t is_group_read = -1;
+  comp_layer_id parent_read = 0xdeadbeef;
+  verify(comp_layer_get_group_info(document, layer, &is_group_read, &parent_read,
+                                  &clipping_read) == COMP_OK &&
+             is_group_read == 0 && parent_read == 0 && clipping_read == 0,
+         "get_group_info reports a root-level plain layer");
+
+  /*
+   * S22 重排链路（面板“上移/下移一层”真正走的接口）。
+   *
+   * T2 全量测试抄到的 43 项零调用里，comp_layer_reorder 就在其中：引擎早已实现，
+   * 而壳一次都没调过——用户完全无法调整图层堆叠次序。
+   *
+   * 判据采“堆叠序真的换了”而不是“调用返回了 OK”：把 layer 移到 background 之前，
+   * 然后用 comp_layer_list 重新读一次 id 序列（自下而上）。
+   *
+   * background 用两段式查询取，不靠字面量：id 是运行期分配的，写死会让这段断言
+   * 在另一台机器上静默失效（而 selftest 是唯一能在 CI 里拦住它的地方）。
+   */
+  comp_layer_id background = 0;
+  {
+    size_t background_index = 0;
+    comp_layer_id first = 0;
+    if (comp_layer_list(document, &first, 1u, &background_index) == COMP_OK &&
+        background_index >= 1u) {
+      background = first;
+    }
+  }
+  verify(background != 0 && background != layer, "background layer is resolvable");
+  comp_layer_id stack_before[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  size_t stack_count = 0;
+  verify(comp_layer_list(document, stack_before, 8u, &stack_count) == COMP_OK &&
+             stack_count == 2u && stack_before[0] == background && stack_before[1] == layer,
+         "reorder precondition: [background, layer]");
+  verify(comp_layer_reorder(document, layer, background) == COMP_OK,
+         "comp_layer_reorder(layer -> before background)");
+  comp_layer_id stack_after[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  stack_count = 0;
+  verify(comp_layer_list(document, stack_after, 8u, &stack_count) == COMP_OK &&
+             stack_count == 2u && stack_after[0] == layer && stack_after[1] == background,
+         "reorder really changed the stacking order");
+  verify(comp_layer_reorder(document, layer, 0) == COMP_OK &&
+             comp_layer_list(document, stack_after, 8u, &stack_count) == COMP_OK &&
+             stack_after[1] == layer,
+         "reorder back to the top restores the original order");
+
+  /*
+   * S22 直方图（comp_layer_histogram）。
+   *
+   * 这是上游 Levels 面板左半边的那张图，也是本壳唯一的 histogram 调用点。
+   *
+   * 判据采“峰值桶等于手算的亮度桶”，而不是“调用成功”或者“非零桶大于 0”。
+   * 原因是本段的图层像素固定：预乘红 (128,0,0,128)。内核先反预乘得到
+   * (255,0,0)，再按 0.299R+0.587G+0.114B 取亮度 = 76.245，落桶 76。
+   *
+   * 这个数字必须在每次改动图层像素时重算：上一轮我写死 200（想当然认为“均匀灰色”），
+   * 结果被真值 76 打脸——那一刷只能说明判据写错了，而不能说引擎算错了。
+   */
+  double histogram_bins[256] = {0.0};
+  verify(comp_layer_histogram(document, layer, nullptr, 0, histogram_bins) == COMP_OK,
+         "comp_layer_histogram() on the selftest layer");
+  double hist_peak = 0.0;
+  int hist_nonzero = 0;
+  int hist_peak_bin = -1;
+  for (int i = 0; i < 256; ++i) {
+    if (histogram_bins[i] > 0.0) ++hist_nonzero;
+    if (histogram_bins[i] > hist_peak) {
+      hist_peak = histogram_bins[i];
+      hist_peak_bin = i;
+    }
+  }
+  std::fprintf(report, "[info] histogram nonzero bins = %d, peak bin = %d\n",
+               hist_nonzero, hist_peak_bin);
+  /* 四舍五入：int(76.245) = 76，与上面手算一致。 */
+  verify(hist_peak_bin == 76,
+         "premultiplied red(128,0,0,128) un-premultiplies to (255,0,0) and luma 76");
+
+  /*
+   * S22 采样模式往返（comp_layer_get_sampling）。
+   *
+   * setter 早已存在且引擎真的按它改缩放手感（resample.cpp 的 sampling_from_abi），
+   * 但壳一次都没调过———用户看不见也改不了。
+   */
+  comp_sampling sampling_read = COMP_SAMPLING_NEAREST;
+  verify(comp_layer_set_sampling(document, layer, COMP_SAMPLING_NEAREST) == COMP_OK &&
+             comp_layer_get_sampling(document, layer, &sampling_read) == COMP_OK &&
+             sampling_read == COMP_SAMPLING_NEAREST,
+         "sampling mode round trip (set NEAREST -> get)");
+  verify(comp_layer_set_sampling(document, layer, COMP_SAMPLING_HIGH_QUALITY) == COMP_OK &&
+             comp_layer_get_sampling(document, layer, &sampling_read) == COMP_OK &&
+             sampling_read == COMP_SAMPLING_HIGH_QUALITY,
+         "sampling mode restored to HIGH_QUALITY");
+
+  /*
+   * S22 组隔离开关（comp_layer_set_isolated / get_isolated）。
+   *
+   * 两种值都是已参与像素求值的真差异（filter_graph.cpp 按 node.isolated 决定
+   * child_backdrop），不是展示开关。写非组图层时引擎不报错但属性不参与合成，
+   * 因此这里只验证读写往返，不验证它改变画面。
+   */
+  int32_t isolated_read = -1;
+  verify(comp_layer_set_isolated(document, layer, 1) == COMP_OK &&
+             comp_layer_get_isolated(document, layer, &isolated_read) == COMP_OK &&
+             isolated_read == 1,
+         "isolated round trip (set 1 -> get)");
+  verify(comp_layer_set_isolated(document, layer, 0) == COMP_OK &&
+             comp_layer_get_isolated(document, layer, &isolated_read) == COMP_OK &&
+             isolated_read == 0,
+         "isolated restored to 0");
+
+  /*
+   * S22 剪贴蒙版开关（comp_layer_set_clipping_source）。
+   *
+   * 引擎已参与像素求值（composite_ops.cpp 的 clipping_factor 真的按来源图层算覆盖率），
+   * 而壳之前没有任何入口能开关它。自标志与不存在的来源必须被拒。
+   */
+  verify(comp_layer_set_clipping_source(document, layer, background) == COMP_OK,
+         "comp_layer_set_clipping_source(baseline)");
+  comp_layer_id clip_check = 0;
+  verify(comp_layer_get_group_info(document, layer, &is_group_read, &parent_read,
+                                  &clip_check) == COMP_OK && clip_check == background,
+         "clipping source round trips through get_group_info");
+  verify(comp_layer_set_clipping_source(document, layer, layer) != COMP_OK,
+         "self-clipping is rejected");
+  verify(comp_layer_set_clipping_source(document, layer, 0xdeadbeef) == COMP_ERR_NOT_FOUND,
+         "clipping to a missing layer is NOT_FOUND");
+  verify(comp_layer_set_clipping_source(document, layer, 0) == COMP_OK &&
+             comp_layer_get_group_info(document, layer, &is_group_read, &parent_read,
+                                      &clip_check) == COMP_OK &&
+             clip_check == 0,
+         "clipping source cleared");
+
+  /*
+   * 上面的写入全部走隐式事务（一步一撤），上下文本来就锁定历史深度；把它们全部撤销回去，
+   * 不影响后续无关段的判据（要索在每步一撤，不在于尚未做完的事）。
+   *
+   * 基线在这里现取，不引用后面滤镜段才声明的 depth_after_identity：selftest 是单函数
+   * 长流程，变量必须在自己第一次使用之前声明——这不是风格问题，是 C++ 的作用域规则。
+   */
+  size_t s22_depth_baseline = 0;
+  comp_document_history_stats(document, &s22_depth_baseline, &redo_depth);
+  for (;;) {
+    size_t current = 0;
+    comp_document_history_stats(document, &current, &redo_depth);
+    if (current <= s22_depth_baseline) break;
+    if (comp_document_undo(document) != COMP_OK) break;
   }
 
   /*

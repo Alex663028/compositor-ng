@@ -157,12 +157,20 @@ struct Layout {
   static constexpr int kLayerPanelWidth = 248;
   static constexpr int kAdjustPanelWidth = 330;
   static constexpr int kMinCanvasWidth = 180;
+  /*
+   * S22 直方图面板：叠在图层面板顶部（不新增一栏，否则 248px 的图层栏会被
+   * 压到无法读层名）。高度是排版密度，不参与命中测试——它纯展示、不可点。
+   */
+  static constexpr int kHistogramHeight = 64;
+  /* 绘图区比整块高度小一圈，留给标题行；折线本身画在这块里。 */
+  static constexpr int kHistogramPlotHeight = 40;
 
   Rect toolbar{};
   Rect layer_panel{};
   Rect adjust_panel{};
   Rect canvas{};
   Rect status{};
+  Rect histogram{}; /* S22：图层面板顶部的直方图区域；未启用时为空矩形 */
 };
 
 inline Layout compute_layout(int width, int height) {
@@ -219,18 +227,32 @@ inline int tool_button_at(const Rect& toolbar, int button_count, double x, doubl
 inline constexpr int kLayerHeaderHeight = 30;
 inline constexpr int kLayerRowHeight = 22;
 
-/* 面板显示序：第 0 行 = 最上层图层（与引擎数组序相反，由调用方换算）。 */
-inline int layer_row_at(const Rect& panel, int layer_count, double x, double y) {
+/*
+ * 顶部偏移版（S22）：直方图面板打开时，图层行整体下移 kHistogramHeight。
+ * 偏移必须与绘制共用（layer_row_rect 的 row_top 参数），否则「点中的行」与
+ * 「画出来的行」会错开 kHistogramHeight——这类偏移不一致是最典型的「点不准」缺陷。
+ */
+inline int layer_row_at(const Rect& panel, int layer_count, double x, double y, int row_top) {
   if (layer_count <= 0 || !panel.contains(x, y)) return -1;
-  const double local = y - static_cast<double>(panel.y + kLayerHeaderHeight);
+  const double local = y - static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
   if (local < 0.0) return -1;
   const int row = static_cast<int>(std::floor(local / static_cast<double>(kLayerRowHeight)));
   if (row < 0 || row >= layer_count) return -1;
   return row;
 }
 
+/* 面板显示序：第 0 行 = 最上层图层（与引擎数组序相反，由调用方换算）。 */
+inline int layer_row_at(const Rect& panel, int layer_count, double x, double y) {
+  return layer_row_at(panel, layer_count, x, y, 0);
+}
+
 inline Rect layer_row_rect(const Rect& panel, int row) {
   return Rect{panel.x, panel.y + kLayerHeaderHeight + row * kLayerRowHeight, panel.w,
+              kLayerRowHeight};
+}
+
+inline Rect layer_row_rect(const Rect& panel, int row, int row_top) {
+  return Rect{panel.x, panel.y + kLayerHeaderHeight + row_top + row * kLayerRowHeight, panel.w,
               kLayerRowHeight};
 }
 
@@ -1800,6 +1822,48 @@ inline void layer_transform_scale_rect(int32_t* x, int32_t* y, int32_t* w, int32
   *y = static_cast<int32_t>(std::lround(cy - static_cast<double>(new_h) / 2.0));
   *w = new_w;
   *h = new_h;
+}
+
+/* ------------------------------------------------------- 采样模式（S22） */
+
+/*
+ * 采样模式档位表：数值即 comp_sampling 枚举（0 High quality / 1 Nearest /
+ * 2 Smooth，ABI 冻结表），名称逐字取 ABI 注释里的上游拼写。
+ *
+ * 为什么值得在平台无关层钉一张表：引擎真的按它改变缩放手感
+ * （resample.cpp 的 sampling_from_abi 把它译成内核的 SamplingMode），不是
+ * 纯展示开关；而壳此前一次都没调过 setter / getter，用户看不到也改不了。
+ */
+inline constexpr int kSamplingHighQuality = 0;
+inline constexpr int kSamplingNearest = 1;
+inline constexpr int kSamplingSmooth = 2;
+inline constexpr int kSamplingCount = 3;
+
+inline int clamp_sampling_mode(int mode) {
+  if (mode < 0) return kSamplingHighQuality;
+  if (mode >= kSamplingCount) return kSamplingCount - 1;
+  return mode;
+}
+
+inline const char* sampling_mode_name(int mode) {
+  switch (clamp_sampling_mode(mode)) {
+    case 0: return "High quality";
+    case 1: return "Nearest";
+    case 2: return "Smooth";
+    default: return "High quality";
+  }
+}
+
+/*
+ * 图层面板行索引夹取（S22）：selected_layer 是**面板显示序**索引（0 = 最上层
+ * 那一行），不是文档数组下标。重排、增删图层后都必须重新夹取，否则越界索引会让
+ * selected_row 返回空指针，后续快捷键静默失效——「选了但按了没反应」最难排查。
+ */
+inline int32_t clamp_selected_row(int32_t row, int32_t count) {
+  if (count <= 0) return 0;
+  if (row < 0) return 0;
+  if (row >= count) return count - 1;
+  return row;
 }
 
 }  // namespace comp_ui

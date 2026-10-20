@@ -1474,3 +1474,104 @@ COMP_TEST(ui_core_layer_transform_scale_clamps_and_holds_center) {
   /* 空指针不得崩。 */
   comp_ui::layer_transform_scale_rect(nullptr, nullptr, nullptr, nullptr, 1.0);
 }
+
+/* ------------------------------------------------------- 采样模式（S22） */
+
+/*
+ * 采样档位表：名称与数量必须和 ABI 的 comp_sampling 冻结表一致。不一致的后果
+ * 不是这里 FAIL，而是菜单写出一个引擎不认识的档位、被参数闸拒绝——而用户只在
+ * 点下去之后才看到失败。
+ */
+COMP_TEST(ui_core_sampling_table_matches_abi_enum) {
+  COMP_CHECK(comp_ui::kSamplingCount == 3);
+  COMP_CHECK(comp_ui::kSamplingHighQuality == 0);
+  COMP_CHECK(comp_ui::kSamplingNearest == 1);
+  COMP_CHECK(comp_ui::kSamplingSmooth == 2);
+
+  COMP_CHECK(std::string(comp_ui::sampling_mode_name(0)) == "High quality");
+  COMP_CHECK(std::string(comp_ui::sampling_mode_name(1)) == "Nearest");
+  COMP_CHECK(std::string(comp_ui::sampling_mode_name(2)) == "Smooth");
+
+  /* 夹取：负值回落 High quality、越界回落最后一档。 */
+  COMP_CHECK(comp_ui::clamp_sampling_mode(-7) == 0);
+  COMP_CHECK(comp_ui::clamp_sampling_mode(99) == comp_ui::kSamplingCount - 1);
+  COMP_CHECK(comp_ui::sampling_mode_name(-7) == std::string("High quality"));
+  COMP_CHECK(comp_ui::sampling_mode_name(99) == std::string("Smooth"));
+}
+
+/* ---------------------------------------------------- 面板行索引与偏移（S22） */
+
+/*
+ * clamp_selected_row：重排 / 删层后 selected_layer 是面板序索引，越界会让
+ * selected_row 返回空指针，后续快捷键静默失效——「选了但按了没反应」最难排查。
+ */
+COMP_TEST(ui_core_clamp_selected_row_never_leaves_the_panel) {
+  COMP_CHECK(comp_ui::clamp_selected_row(5, 0) == 0); /* 空面板不崩、不给负数 */
+  COMP_CHECK(comp_ui::clamp_selected_row(-1, 0) == 0);
+
+  const int32_t count = 4;
+  COMP_CHECK(comp_ui::clamp_selected_row(-3, count) == 0);
+  COMP_CHECK(comp_ui::clamp_selected_row(100, count) == count - 1);
+  COMP_CHECK(comp_ui::clamp_selected_row(0, count) == 0);
+  COMP_CHECK(comp_ui::clamp_selected_row(2, count) == 2);
+  COMP_CHECK(comp_ui::clamp_selected_row(count - 1, count) == count - 1);
+
+  /* 单层面板：0 是唯一合法值。盯「删到只剩一层后索引没收口」。 */
+  COMP_CHECK(comp_ui::clamp_selected_row(3, 1) == 0);
+}
+
+/*
+ * 直方图打开时图层行整体下移：绘制与命中共用同一偏移量。两处不一致的症状是
+ * 「点不中要的那一层」，且只在面板开着直方图时出现，极难复现——所以这里同时
+ * 正向断言（同一屏幕点命中下一行）与反面断言（面板外/表头区不命中）。
+ */
+COMP_TEST(ui_core_layer_rows_hit_test_respects_histogram_offset) {
+  const Rect panel{0, 46, 248, 400};
+  const int header = comp_ui::kLayerHeaderHeight;
+  const int row = comp_ui::kLayerRowHeight;
+  const int row_top = comp_ui::Layout::kHistogramHeight;
+
+  const double y_row0 = panel.y + header + row / 2;
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row0, 0) == 0);
+  /*
+   * 同一屏幕点在直方图打开时落到表头区里（y_row0 距顶只有 header + row/2，
+   * 而 row_top 把第一个可命中位置压到 header + kHistogramHeight 处）——
+   * 于是它不再是任何一行。这正是偏移真的生效的证据：不是「照样命中第 0 行」。
+   */
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row0, row_top) == -1);
+
+  /*
+   * 有偏移时，第 0 行的中心点下移了整整一个直方图高度，仍然命中第 0 行。
+   * 这条与上面那条合起来才构成「偏移生效且只影响起点」的完整判据。
+   */
+  const double y_row0_shifted = panel.y + header + row_top + row / 2;
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row0_shifted, row_top) == 0);
+  /*
+   * 无偏移时同一个点落在第 4 行位置——面板只有 3 层，所以不在任何行内（-1）。
+   * 这一条同时盯住「偏移让起点后移」与「界外不得回绕到第 0 行」两件事。
+   */
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row0_shifted, 0) == -1);
+
+  /* 偏移下第 1 行的中心点，仍然命中第 1 行（不是整体平移后串行）。 */
+  const double y_row1_shifted = panel.y + header + row_top + row + row / 2;
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row1_shifted, row_top) == 1);
+
+  const double y_row1 = panel.y + header + row + row / 2;
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, y_row1, 0) == 1);
+
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x + 10, panel.y + 2, 0) == -1);
+  COMP_CHECK(comp_ui::layer_row_at(panel, 3, panel.x - 5, y_row0, 0) == -1);
+  COMP_CHECK(comp_ui::layer_row_at(panel, 0, panel.x + 10, y_row0, 0) == -1);
+
+  /*
+   * 正面钉「同一几何」：layer_row_rect(panel, row, row_top) 的中心点必须被
+   * layer_row_at(..., row_top) 判回同一个 row。上面的断言只证明偏移存在，
+   * 这一条证明绘制与命中用的是同一个偏移。
+   */
+  for (int row_index = 0; row_index < 3; ++row_index) {
+    const Rect rect = comp_ui::layer_row_rect(panel, row_index, row_top);
+    const double mid = rect.y + comp_ui::kLayerRowHeight / 2;
+    COMP_CHECK(comp_ui::layer_row_at(panel, 3, rect.x + rect.w / 2, mid, row_top) ==
+               row_index);
+  }
+}

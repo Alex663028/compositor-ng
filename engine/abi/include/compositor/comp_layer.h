@@ -76,6 +76,49 @@ COMP_API comp_result comp_layer_set_mask(comp_document document,
                                          comp_layer_id id,
                                          const comp_mask* mask);
 
+/*
+ * 读取图层蒙版的存在与尺寸（与 set_mask 成对，供外壳面板回读与 .comp 往返）。
+ *
+ * 契约：
+ *   - out_has_mask 非 0 = 该图层当前带蒙版；为 0 表示「没有蒙版」（此时
+ *     out_width / out_height 均为 0，与域层空 MaskBuffer 同口径）；
+ *   - 蒙版尺寸写 out_width / out_height（文档像素）。**像素不回传**——蒙版只是
+ *     一张 8 位灰度覆盖图，要让宿主把它变成可见选区应走
+ *     comp_selection_load_layer(COMP_SELECTION_LOAD_MASK)，那才是 source of truth
+ *     的读出口；本入口只回答「有没有、多大」，因为外壳要的只是面板状态。
+ *   - 只读：不开事务、不进撤销栈、不改动任何像素。
+ *
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+COMP_API comp_result comp_layer_get_mask(comp_document document,
+                                         comp_layer_id id,
+                                         int32_t* out_has_mask,
+                                         int32_t* out_width,
+                                         int32_t* out_height);
+
+/*
+ * 读取图层在树中的位置关系（is_group / parent / clipping_source）。
+ *
+ * 为什么必须补这个回读口：三者都是**已参与像素求值**的结构属性（组的隔离开关
+ * 决定子树怎么合成、剪贴来源决定 coverage 从哪来），`comp_layer_desc` 只在
+ * **创建时**给出它们，此后没有 setter 之外的回读路径。外壳要画「这一行是不是组」
+ * 「这一层是否附着在下一层上（剪贴）」就只能靠猜——`.comp` 读回带组/带剪贴的文档
+ * 后面板会静默失真。这与 S21 的 get_transform 是同一类缺口，一并补掉。
+ *
+ * 契约：
+ *   - out_is_group 非 0 = 图层组；out_parent = 0 表示根级；
+ *   - out_clipping_source = 0 表示不剪贴，否则是被附着的图层 id；
+ *   - 三个出参都必填（只回一部分等于让壳在信息不全时做决定）；
+ *   - **只读**：不开事务、不进撤销栈、不改动任何状态。
+ *
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+COMP_API comp_result comp_layer_get_group_info(comp_document document,
+                                               comp_layer_id id,
+                                               int32_t* out_is_group,
+                                               comp_layer_id* out_parent,
+                                               comp_layer_id* out_clipping_source);
+
 /* 设置剪贴蒙版来源；source 为 0 表示取消。 */
 COMP_API comp_result comp_layer_set_clipping_source(comp_document document,
                                                     comp_layer_id id,

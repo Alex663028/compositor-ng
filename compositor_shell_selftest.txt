@@ -34,6 +34,28 @@
 [OK] comp_layer_set_transform(scale +1%)
 [OK] scale round trip keeps the new box
 [OK] comp_txn_abort() rolls the transform back
+[OK] get_mask reports no mask on a fresh layer
+[OK] comp_layer_set_mask(full cover)
+[OK] get_mask round trips presence and size
+[OK] clearing the mask returns to no-mask
+[OK] get_group_info reports a root-level plain layer
+[OK] background layer is resolvable
+[OK] reorder precondition: [background, layer]
+[OK] comp_layer_reorder(layer -> before background)
+[OK] reorder really changed the stacking order
+[OK] reorder back to the top restores the original order
+[OK] comp_layer_histogram() on the selftest layer
+[info] histogram nonzero bins = 1, peak bin = 76
+[OK] premultiplied red(128,0,0,128) un-premultiplies to (255,0,0) and luma 76
+[OK] sampling mode round trip (set NEAREST -> get)
+[OK] sampling mode restored to HIGH_QUALITY
+[OK] isolated round trip (set 1 -> get)
+[OK] isolated restored to 0
+[OK] comp_layer_set_clipping_source(baseline)
+[OK] clipping source round trips through get_group_info
+[OK] self-clipping is rejected
+[OK] clipping to a missing layer is NOT_FOUND
+[OK] clipping source cleared
 [OK] comp_layer_adjustment_kind_name(3) == Exposure
 [OK] comp_layer_adjustment_param_count(3) == 3
 [OK] comp_layer_adjustment_param_at(3,0) path

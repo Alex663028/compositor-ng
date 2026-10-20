@@ -133,6 +133,12 @@ def step_windows_shell(reg: Regression) -> bool:
         if not os.path.isfile(SHELL_EXE):
             return "FAIL", f"missing {SHELL_EXE}"
 
+        #
+        # 壳自检自己会写 build/import_probe.png 夹具（缺了就现写，见 main.cpp 的
+        # probe_png_exists / write_probe_png），所以这一步**不**再替它补。
+        # 曾经在这里补过，但那依赖 build/compositor_engine.dll——而第 5 步才建它，
+        # 第 2 步必然取不到；把依赖放错了步骤，比不补更糟。
+
         fd, report_path = tempfile.mkstemp(prefix="compositor_selftest_", suffix=".txt")
         os.close(fd)
         try:

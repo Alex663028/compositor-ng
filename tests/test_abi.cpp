@@ -1317,3 +1317,178 @@ COMP_TEST(abi_layer_transform_get_is_the_write_mirror) {
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 }
+
+/*
+ * comp_layer_get_mask（S22，ABI 尾部追加 113 -> 114）的读侧契约。
+ *
+ * 为什么值得单独钉：蒙版是**已参与像素求值**的能力（filter_graph.cpp 的
+ * coverage.add(&layer->mask) 真的把蒙版合成进画面），壳却长期没有回读口，
+ * 于是图层面板既不知道这一层受不受蒙版约束、也无法把既有蒙版变成可见选区。
+ * 这里只钉「存在性 + 尺寸」两个问题，不钉像素——像素的读出口是
+ * comp_selection_load_layer(COMP_SELECTION_LOAD_MASK)，两处不得漂移。
+ */
+COMP_TEST(abi_layer_get_mask_reports_presence_and_size) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc doc_desc{};
+  doc_desc.width = 8;
+  doc_desc.height = 8;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &document) == COMP_OK);
+
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "mask-probe";
+  layer_desc.transform = comp_rect{0, 0, 8, 8};
+  comp_layer_id layer = 0;
+  COMP_CHECK(comp_layer_add(document, &layer_desc, &layer) == COMP_OK);
+  COMP_CHECK(layer != 0);
+
+  /* 1. 新建图层没有蒙版：has=0 且尺寸必须归零，不能让调用方看到上一层的残值。 */
+  int32_t has = -1;
+  int32_t width = -1;
+  int32_t height = -1;
+  COMP_CHECK(comp_layer_get_mask(document, layer, &has, &width, &height) == COMP_OK);
+  COMP_CHECK(has == 0);
+  COMP_CHECK(width == 0 && height == 0);
+
+  /* 2. 写入一张 5x3 的实心蒙版：has=1 且尺寸如实回读。 */
+  std::vector<uint8_t> mask_bytes(5 * 3, 128u);
+  comp_mask mask{};
+  mask.width = 5;
+  mask.height = 3;
+  mask.stride = 5;
+  mask.pixels = mask_bytes.data();
+  COMP_CHECK(comp_layer_set_mask(document, layer, &mask) == COMP_OK);
+  COMP_CHECK(comp_layer_get_mask(document, layer, &has, &width, &height) == COMP_OK);
+  COMP_CHECK(has == 1);
+  COMP_CHECK(width == 5 && height == 3);
+
+  /* 3. set_mask(nullptr) = 移除：回到 has=0 + 尺寸归零（与域层空 MaskBuffer 同口径）。 */
+  COMP_CHECK(comp_layer_set_mask(document, layer, nullptr) == COMP_OK);
+  COMP_CHECK(comp_layer_get_mask(document, layer, &has, &width, &height) == COMP_OK);
+  COMP_CHECK(has == 0);
+  COMP_CHECK(width == 0 && height == 0);
+
+  /* 4. 出参必填：缺一个就必须先拒，不能写坏调用方栈。 */
+  COMP_CHECK(comp_layer_get_mask(document, layer, nullptr, &width, &height) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_mask(document, layer, &has, nullptr, &height) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_mask(document, layer, &has, &width, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_mask(document, 0xdeadbeef, &has, &width, &height) ==
+             COMP_ERR_NOT_FOUND);
+
+  /*
+   * 5. 只读：查询蒙版信息不得把文档从干净改成脏（面板轮询会反复调它）。
+   *    做法是先 set_mask（如实置脏）→ 存盘（mark_dirty(false)）→ 反复查询 →
+   *    脏标记必须仍是干净的。只查「一直脏所以没变坏」是空断言，骗得过自己。
+   */
+  {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              "compositor_mask_query_clean.comp")
+                                 .string();
+    COMP_CHECK(comp_document_save(document, path.c_str()) == COMP_OK);
+    int32_t dirty = 0;
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "saving must clear the dirty flag");
+    for (int32_t i = 0; i < 4; ++i) {
+      COMP_CHECK(comp_layer_get_mask(document, layer, &has, &width, &height) == COMP_OK);
+    }
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "read-only mask query must not dirty the document");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/*
+ * comp_layer_get_group_info（S22，ABI 尾部追加 113 -> 114 -> 115）。
+ *
+ * 钉三件事：根级图层的树关系全零；显式建组后 is_group/parent 如实回读；
+ * 剪贴来源写什么回什么。缺任何一件，图层面板就只能靠猜画「是不是组」「是否剪贴」
+ * ——`.comp` 读回带组/带剪贴的文档时会静默失真，且没有任何测试能发现。
+ */
+COMP_TEST(abi_layer_get_group_info_reports_tree_shape) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc doc_desc{};
+  doc_desc.width = 8;
+  doc_desc.height = 8;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &document) == COMP_OK);
+
+  /* 1. 背景层是根级普通图层：三项必须全零。 */
+  comp_layer_id background = 0;
+  size_t count = 0;
+  COMP_CHECK(comp_layer_list(document, &background, 1u, &count) == COMP_OK);
+  COMP_CHECK(count == 1u && background != 0);
+
+  int32_t is_group = -1;
+  comp_layer_id parent = 0xdeadbeef;
+  comp_layer_id clipping = 0xdeadbeef;
+  COMP_CHECK(comp_layer_get_group_info(document, background, &is_group, &parent,
+                                       &clipping) == COMP_OK);
+  COMP_CHECK(is_group == 0 && parent == 0 && clipping == 0);
+
+  /* 2. 建一个组 + 组内一层：组的 is_group=1、子的 parent 指向组。 */
+  comp_layer_desc group_desc{};
+  group_desc.name = "group";
+  group_desc.is_group = 1;
+  group_desc.transform = comp_rect{0, 0, 8, 8};
+  comp_layer_id group = 0;
+  COMP_CHECK(comp_layer_add(document, &group_desc, &group) == COMP_OK);
+  COMP_CHECK(group != 0);
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "child";
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  child_desc.parent = group;
+  comp_layer_id child = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &child) == COMP_OK);
+  COMP_CHECK(child != 0);
+
+  COMP_CHECK(comp_layer_get_group_info(document, group, &is_group, &parent,
+                                       &clipping) == COMP_OK);
+  COMP_CHECK(is_group == 1);
+  COMP_CHECK(parent == 0); /* 组自身是根级 */
+
+  COMP_CHECK(comp_layer_get_group_info(document, child, &is_group, &parent,
+                                       &clipping) == COMP_OK);
+  COMP_CHECK(is_group == 0);
+  COMP_CHECK(parent == group);
+
+  /* 3. 剪贴来源：写什么回什么，取消后回 0。 */
+  COMP_CHECK(comp_layer_set_clipping_source(document, child, background) == COMP_OK);
+  COMP_CHECK(comp_layer_get_group_info(document, child, &is_group, &parent,
+                                       &clipping) == COMP_OK);
+  COMP_CHECK(clipping == background);
+  COMP_CHECK(comp_layer_set_clipping_source(document, child, 0) == COMP_OK);
+  COMP_CHECK(comp_layer_get_group_info(document, child, &is_group, &parent,
+                                       &clipping) == COMP_OK);
+  COMP_CHECK(clipping == 0);
+
+  /* 4. 出参必填 + 未知 id 必须被拒（不能写坏调用方栈）。 */
+  COMP_CHECK(comp_layer_get_group_info(document, child, nullptr, &parent, &clipping) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_group_info(document, child, &is_group, nullptr, &clipping) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_group_info(document, child, &is_group, &parent, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_group_info(document, 0xdeadbeef, &is_group, &parent,
+                                       &clipping) == COMP_ERR_NOT_FOUND);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}

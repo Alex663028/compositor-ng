@@ -424,3 +424,21 @@ coverage 把样本盖回当前像素。
   **不新增算子**，混合模式与变换走既有 `comp_layer_set_blend` / `set_transform`。
   基线 470 → **476 用例**（`test_ui_core` 3 + `test_abi` 1），壳自检 164 → **177 项**，
   自动化目视 45 → **57 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.31。
+- S22 追加（2026-10-20）：新增 `comp_layer_get_mask`（第 **114** 个导出 ABI）与
+  `comp_layer_get_group_info`（第 **115** 个，均纯尾部追加，冻结面不变）。两者都是
+  **回读口**，不是新能力——动机与 S21 的 `get_transform` 同源：壳侧没有回读就只能靠猜。
+  - `get_mask`：回「有没有蒙版 + 尺寸」，**不回传像素**（蒙版只是 8 位灰度覆盖图，
+    要变成可见选区应走 `comp_selection_load_layer(COMP_SELECTION_LOAD_MASK)`，
+    那才是 source of truth；两处不得漂移）。判据与域层空 `MaskBuffer` 同口径：
+    空蒙版 = 没有蒙版，不区分「从未设置」与「已移除」。
+  - `get_group_info`：回 `is_group` / `parent` / `clipping_source`。这三个值此前只在
+    `comp_layer_desc`（创建时）给出，没有 setter 之外的路；`.comp` 读回带组/带剪贴的
+    文档时面板必然静默失真。
+  外壳据此接上：选区↔蒙版（建/读/清）、剪贴蒙版（Ctrl+Alt+G，只做「挂到下方紧邻一层」，
+  对齐上游 ⌘G 默认档）、组穿透/隔离开关、图层重排（Ctrl+Shift+↑↓ 与置顶/置底）、
+  采样模式 3 档菜单、亮度直方图（F6，取 `comp_layer_histogram`，**不在壳侧扫像素**
+  ——自己扫必然与内核 levels 口径漂移）。**不新增算子、不改像素公式**，全部走既有 setter。
+  基线 476 → **478 用例**（`test_abi` 2）、`test_ui_core` 38 → **41 例**（3），
+  壳自检 182 → **203 项**，`run_regression.py --require-ohos` 6/6 PASS。见 README §6.32。
+  **效果（`set_effect`）仍不接**：纯元数据，内核不参与像素求值（`merge_down` 遇效果层直接
+  `COMP_ERR_UNSUPPORTED`），属滤镜图里程碑，单独决策。

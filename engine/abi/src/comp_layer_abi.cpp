@@ -222,6 +222,74 @@ comp_result comp_layer_set_mask(comp_document document, comp_layer_id id, const 
   COMP_ABI_CATCH(engine)
 }
 
+comp_result comp_layer_get_mask(comp_document document, comp_layer_id id,
+                                int32_t* out_has_mask, int32_t* out_width,
+                                int32_t* out_height) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  /* 三个出参都必填：只要一半会让调用方把「未知」当成「没有蒙版」。 */
+  if (out_has_mask == nullptr || out_width == nullptr || out_height == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "out_has_mask / out_width / out_height is null");
+  }
+  *out_has_mask = 0;
+  *out_width = 0;
+  *out_height = 0;
+  COMP_ABI_TRY(engine)
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /*
+   * 只读：不开事务、不进撤销栈。判据与域层空 MaskBuffer 同口径——空蒙版等于
+   * 没有蒙版（comp_layer_set_mask(nullptr) 正是把 mask 置空），因此不区分
+   * 「从未设置」与「已移除」，面板只关心「当前这一层受不受蒙版约束」。
+   */
+  if (layer->mask.empty()) {
+    return compositor::abi::ok(engine);
+  }
+  *out_has_mask = 1;
+  *out_width = layer->mask.width;
+  *out_height = layer->mask.height;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_group_info(comp_document document, comp_layer_id id,
+                                      int32_t* out_is_group, comp_layer_id* out_parent,
+                                      comp_layer_id* out_clipping_source) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  /* 三个出参都必填：图层面板要么拿全「是不是组 + 挂在哪 + 剪贴谁」，要么不画。 */
+  if (out_is_group == nullptr || out_parent == nullptr || out_clipping_source == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "out_is_group / out_parent / out_clipping_source is null");
+  }
+  *out_is_group = 0;
+  *out_parent = 0;
+  *out_clipping_source = 0;
+  COMP_ABI_TRY(engine)
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /*
+   * 只读：不开事务、不进撤销栈。这三个值都只可能是结构性的（.comp 读回或创建时
+   * 给定），没有任何「壳侧可写」的入口会读到一半状态；回读即当前真相。
+   */
+  *out_is_group = layer->is_group ? 1 : 0;
+  *out_parent = layer->parent;
+  *out_clipping_source = layer->clipping_source;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 comp_result comp_layer_set_clipping_source(comp_document document, comp_layer_id id,
                                           comp_layer_id source) {
   Document* doc = nullptr;
