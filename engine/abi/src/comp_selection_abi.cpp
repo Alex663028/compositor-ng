@@ -445,3 +445,42 @@ comp_result comp_selection_apply_wand(comp_document document, comp_layer_id laye
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)
 }
+
+comp_result comp_selection_apply_color_range(comp_document document, const uint8_t* include,
+                                             size_t include_count, const uint8_t* exclude,
+                                             size_t exclude_count, int32_t fuzziness,
+                                             int32_t invert, comp_selection_combine combine,
+                                             int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 轻量参数闸在 ImplicitTxn 之前：非法参数不留半成品、不进撤销栈。 */
+  if ((include == nullptr && include_count > 0) || (exclude == nullptr && exclude_count > 0)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "color array is null but count is nonzero");
+  }
+  if (fuzziness < 0 || fuzziness > compositor::kMaxColorRangeFuzziness) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "color range fuzziness out of 0..200");
+  }
+  if (combine < COMP_SELECTION_REPLACE || combine > COMP_SELECTION_SUBTRACT) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+
+  const compositor::DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, "Color Range Selection");
+  bool changed = false;
+  std::string error;
+  const comp_result code = compositor::selection_apply_color_range(
+      &doc->selection(), state.width, state.height, *doc, include, include_count, exclude,
+      exclude_count, fuzziness, invert, combine, &changed, &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(engine, code,
+                                 error.empty() ? "color range selection failed" : error);
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}

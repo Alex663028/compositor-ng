@@ -74,6 +74,8 @@ constexpr int32_t kMaxSelectionPoints = 1 << 18;
 constexpr int32_t kMaxSelectionSegments = 1 << 16;
 constexpr int32_t kMaxSelectionFeather = 250;
 constexpr int32_t kMaxSelectionGrow = 500;
+/* 色彩范围的 fuzziness 上限（上游 ColorRangeEdit.fuzzinessRange = 0...200）。 */
+constexpr int32_t kMaxColorRangeFuzziness = 200;
 
 /* 三次贝塞尔路径段。start 只在 new_subpath 为真（或这是第一段）时使用；
  * 否则曲线从上一段的终点继续（对齐 CGPath 的 current point 语义）。 */
@@ -201,9 +203,53 @@ comp_result selection_apply_wand(SelectionState* selection, int32_t canvas_width
                                  comp_layer_id layer, const SelectionWandParams& params,
                                  int32_t combine, bool* changed, std::string* error);
 
+/*
+ * 色彩范围选区（PS Select > Color Range；上游 ColorRangeSelection.swift）。
+ *
+ * 在**整篇合成**（sampleAllLayers）上按颜色匹配**全部**像素（不要求连续，
+ * 这是与魔棒 flood fill 的本质区别）：一个像素被选中 = 与某个 include
+ * 颜色的逐通道绝对差都 <= fuzziness，**且**与任何 exclude 颜色都不满足。
+ * invert != 0 时把匹配结果取反再写入选区。
+ *
+ * include / exclude 是扁平 RGB 三元组数组（count 为颜色数，不是字节数）。
+ * 可任一为空：include 为空按「无匹配」（invert 时全选）处理。
+ *
+ * 距离度量与魔棒 / trim 同一家族（RGB 三通道 Chebyshev），直接在合成图
+ * 的 RGBA8 字节上比较，不做反预乘——与 wand_mask 同口径。fuzziness
+ * 范围 0..200（上游 fuzzinessRange）；硬边选区（匹配 = 255，否则 0）。
+ *
+ * combine 语义与形状叠加一致（replace / add / subtract）。**0 个匹配像素
+ * 不改选区**（changed = false），与魔棒「点了个空处不留下空蒙版」同口径。
+ * 失败返回具体错误码（参数闸在一切写入之前）。
+ */
+comp_result selection_apply_color_range(SelectionState* selection, int32_t canvas_width,
+                                        int32_t canvas_height, const Document& document,
+                                        const uint8_t* include, size_t include_count,
+                                        const uint8_t* exclude, size_t exclude_count,
+                                        int32_t fuzziness, int32_t invert, int32_t combine,
+                                        bool* changed, std::string* error);
+
 /* 有效 coverage（画布分辨率，白 = 选中）：base 按 feather 高斯模糊。
  * selection 不活跃或基础蒙版为空时 out 清空（调用方必须先看 active）。 */
 void selection_effective_coverage(const SelectionState& selection, std::vector<uint8_t>* out);
+
+/*
+ * 把一次像素操作的结果按选区与原像素混合（上游 PixelAdjust.blend）。
+ *
+ * rgba 是**已经改好**的图层像素（整层视图，stride 由调用方给），original
+ * 是改之前的拷贝。coverage 是**文档分辨率**有效选区，图层像素按
+ * effective_bounds() 的原点平移到文档坐标（与合成/工具同款约定）；
+ * 图层落在画布外的部分 coverage 视为 0（选区之外），保持原像素。
+ * coverage 为空 / 画布非法时整层回滚成 original（显式空选区在上游就是
+ * 「什么都不改」）。
+ *
+ * S25 起从 filters.cpp 提取共享：filter_apply 与 invert_layer 共用同一条
+ * 选区混合口径，避免两处各写一套互相漂移。
+ */
+void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
+                             int32_t height, const std::vector<uint8_t>& coverage,
+                             const comp_rect& bounds, int32_t canvas_width,
+                             int32_t canvas_height);
 
 /* 基础蒙版里非零像素的包围盒，按 ceil(2 * feather) 外扩后裁到画布。
  * 没有选区或显式空选区返回 {0, 0, 0, 0}。 */

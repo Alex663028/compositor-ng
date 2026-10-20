@@ -1027,6 +1027,136 @@ bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool
   return true;
 }
 
+comp_result selection_apply_color_range(SelectionState* selection, int32_t canvas_width,
+                                        int32_t canvas_height, const Document& document,
+                                        const uint8_t* include, size_t include_count,
+                                        const uint8_t* exclude, size_t exclude_count,
+                                        int32_t fuzziness, int32_t invert, int32_t combine,
+                                        bool* changed, std::string* error) {
+  if (changed != nullptr) *changed = false;
+  const auto fail = [error](comp_result code, const char* text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+  if (selection == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "selection is null");
+  if (canvas_width <= 0 || canvas_height <= 0) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "color range needs a non-empty canvas");
+  }
+  if (combine < kSelectionReplace || combine > kSelectionSubtract) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if ((include == nullptr && include_count > 0) || (exclude == nullptr && exclude_count > 0)) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "color range color array is null but count is nonzero");
+  }
+  if (fuzziness < 0 || fuzziness > kMaxColorRangeFuzziness) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "color range fuzziness out of 0..200");
+  }
+
+  ImageBuffer composite;
+  std::string compose_error;
+  if (!composite_document(document, &composite, &compose_error)) {
+    return fail(COMP_ERR_INTERNAL, "color range could not composite the document");
+  }
+  if (composite.width != canvas_width || composite.height != canvas_height) {
+    return fail(COMP_ERR_INTERNAL, "color range composite size does not match the canvas");
+  }
+
+  /* 16 位 / HDR 合成转 8 位视图（与魔棒同一家族）。 */
+  const std::vector<uint8_t>* pixels = nullptr;
+  size_t stride = 0;
+  ImageBuffer scratch;
+  if (composite.format == COMP_PIXEL_RGBA8) {
+    pixels = &composite.pixel_data();
+    stride = composite.stride();
+  } else if (hdr_to_rgba8(composite, &scratch) || deep_to_rgba8(composite, &scratch)) {
+    pixels = &scratch.pixel_data();
+    stride = scratch.stride();
+  } else {
+    return fail(COMP_ERR_UNSUPPORTED, "color range could not build an 8-bit composite view");
+  }
+
+  const size_t pixel_count = static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  std::vector<uint8_t> coverage(pixel_count, 0);
+
+  /* 像素 p 匹配 ⇔ ∃ c ∈ include: 三通道差都 <= fuzziness，且 ∄ e ∈ exclude 满足。
+   * include 为空时无匹配（invert 则等效全选）。 */
+  const auto matches_any = [fuzziness](const uint8_t* p, const uint8_t* colors,
+                                      size_t count) -> bool {
+    for (size_t i = 0; i < count; ++i) {
+      const uint8_t* c = colors + i * 3;
+      if (std::abs(static_cast<int32_t>(p[0]) - static_cast<int32_t>(c[0])) <= fuzziness &&
+          std::abs(static_cast<int32_t>(p[1]) - static_cast<int32_t>(c[1])) <= fuzziness &&
+          std::abs(static_cast<int32_t>(p[2]) - static_cast<int32_t>(c[2])) <= fuzziness) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  size_t selected = 0;
+  for (int32_t y = 0; y < canvas_height; ++y) {
+    const uint8_t* row = pixels->data() + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < canvas_width; ++x) {
+      const uint8_t* p = row + static_cast<size_t>(x) * 4;
+      bool hit = matches_any(p, include, include_count);
+      if (hit && exclude != nullptr && exclude_count > 0 &&
+          matches_any(p, exclude, exclude_count)) {
+        hit = false; /* 被排除色覆盖（上游 include/exclude 双表语义） */
+      }
+      bool keep = invert != 0 ? !hit : hit;
+      if (keep) {
+        coverage[static_cast<size_t>(y) * static_cast<size_t>(canvas_width) + x] = 255;
+        ++selected;
+      }
+    }
+  }
+
+  /* 0 个匹配不改选区：与魔棒「点了个空处不留下空蒙版」同口径。 */
+  if (selected == 0) return COMP_OK;
+  if (changed != nullptr) *changed = true;
+  return apply_coverage_mask(selection, canvas_width, canvas_height, std::move(coverage), combine,
+                             changed)
+             ? COMP_OK
+             : fail(COMP_ERR_INTERNAL, "color range could not merge the coverage");
+}
+
+void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
+                             int32_t height, const std::vector<uint8_t>& coverage,
+                             const comp_rect& bounds, int32_t canvas_width,
+                             int32_t canvas_height) {
+  if (coverage.empty() || canvas_width <= 0 || canvas_height <= 0) {
+    /* 没有有效 coverage：整层保持原样（显式空选区在上游就是「什么都不改」）。 */
+    for (int32_t y = 0; y < height; ++y) {
+      std::memcpy(rgba + static_cast<size_t>(y) * stride,
+                  original + static_cast<size_t>(y) * stride, static_cast<size_t>(width) * 4u);
+    }
+    return;
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* before = original + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4;
+      const uint8_t* o = before + static_cast<size_t>(x) * 4;
+      const int32_t doc_x = bounds.x + x;
+      const int32_t doc_y = bounds.y + y;
+      int32_t cov = 0;
+      if (doc_x >= 0 && doc_y >= 0 && doc_x < canvas_width && doc_y < canvas_height) {
+        cov = coverage[static_cast<size_t>(doc_y) * static_cast<size_t>(canvas_width) +
+                       static_cast<size_t>(doc_x)];
+      }
+      if (cov == 0) {
+        for (int c = 0; c < 4; ++c) p[c] = o[c];
+      } else if (cov < 255) {
+        for (int c = 0; c < 4; ++c) {
+          const int blended = (p[c] * cov + o[c] * (255 - cov) + 127) / 255;
+          p[c] = static_cast<uint8_t>(std::min(255, blended));
+        }
+      }
+    }
+  }
+}
+
 void selection_effective_coverage(const SelectionState& selection, std::vector<uint8_t>* out) {
   if (out == nullptr) return;
   out->clear();

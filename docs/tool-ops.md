@@ -490,3 +490,31 @@ coverage 把样本盖回当前像素。
   `run_regression.py --require-ohos` 6/6 PASS。见 README §6.34。
   **边界**：效果无参数编辑 UI、无效果重排、清理 N 个效果 = N 步撤销；拖行仅同父（跨组明确拒绝）；
   镜像仅菜单/快捷键；变换拖拽控制框与非均匀缩放仍未做。
+
+- S25 追加（2026-10-20）：对标 PS「图像」菜单与上游 `CanvasRotation.swift` / `ImageTrim.swift` /
+  `PixelInvert.swift` / `ColorRangeSelection.swift`，补齐**引擎侧缺失的画布级操作通路**——
+  新增 4 个导出 ABI，**导出数 119 → 123**，既有 ABI 头与像素公式零改动：
+  - `comp_document_rotate_canvas`（第 120 个导出）：Image > Image Rotation。quarter_turns ∈ {1,-1,2,-2}，
+    画布尺寸 90° 互换 / 180° 不变，**不重采样**——图层像素逐字节不动，落位 transform 换成旋转后的
+    轴对齐包围盒 + rotation 累加；选区（文档分辨率蒙版）按 90°/180° 精确转置随动；两遍校验新 origin
+    越界（±1e6）即整体拒绝，空文档 + 尺寸不变时 changed = 0 不进历史。
+  - `comp_document_trim`（第 121 个导出）：Image > Trim。先 flatten 整篇可见合成算边框（不看选区），
+    再复用 `crop_apply` 的「平移图层 + 换画布」一步提交；透明 / 左上角色 / 右下角色三种基准，
+    逐通道容差（RGBA 四通道 abs 差 <= tol），逐行扫描算法与上游一致（行中间的不匹配像素不改变边界）；
+    整篇无可保留内容 / 四边全关 / 未知枚举 → STATE / INVALID_ARGUMENT，文档不变。
+  - `comp_layer_invert`（第 122 个导出）：Image > Adjustments > Invert（破坏性一次性，区别于
+    `COMP_ADJUSTMENT_INVERT` 调整层）。预乘语义 c' = alpha - c、alpha 不动（透明像素反相后仍透明）；
+    HDR（RGBA16F）拒绝 UNSUPPORTED、16 位图层落 8 位工作副本（撤销恢复 16 位），选区按文档坐标
+    裁剪（复用从 filters.cpp 提取的共享 `blend_through_selection`）。
+  - `comp_selection_apply_color_range`（第 123 个导出）：Select > Color Range。在整篇可见合成上
+    **全局**匹配（不要求连续，与魔棒 flood fill 的本质区别），include/exclude 双表 + fuzziness 0..200
+    + invert，RGB 三通道 Chebyshev 距离（与魔棒同家族）；0 匹配不改选区，combine 与形状叠加一致。
+  - **修掉两个写进 S25 代码自身的 bug**（由新单测当场抓到）：① 90° 蒙版转置把源行/列直接当目标
+    列/行用，非正方形选区转置结果全错；② 90° 旋转沿用原横矩形 transform，渲染器
+    `build_layer_unit` 的光栅窗口取轴对齐 bounds，旋转出去的一半内容被裁空——已改为旋转后包围盒落位。
+  基线 492 → **523 用例**（新增 `test_canvas_ops.cpp` 31 例）；壳自检 **219 项**零变化（SHA256
+  `e277a4c4…` 与 S24 基线逐字节一致，既有行为零漂移）；`--gpu` 变体 523/0、`--present-bench` 报
+  `backend=D3D12`；视觉探针 68/0；ctypes 探针实测四个新导出的错误码与 noop 契约；
+  `run_regression.py --require-ohos` 6/6 PASS（OHOS 91 → 93，新增两个 .cpp 参与交叉编译）。
+  **边界（待续）**：本轮只做引擎 + ABI 层。壳侧菜单 / 快捷键 / 面板接线（Image 菜单三条 + Select >
+  Color Range 面板）尚未做；Trim 的颜色基准预览与 Color Range 的吸管取样 UI 亦未做。

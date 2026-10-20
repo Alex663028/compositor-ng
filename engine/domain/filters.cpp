@@ -227,47 +227,12 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
 }
 
 /*
- * 把滤镜结果按选区与原像素混合（上游 PixelFilter.run 末尾的
- * PixelAdjust.blend）。coverage 是**文档分辨率**，图层像素按
- * effective_bounds() 的原点平移到文档坐标（与合成/工具同款约定）。
- * 图层落在画布外的部分 coverage 视为 0（选区之外），保持原像素。
+ * 把一次像素操作的结果按选区与原像素混合（上游 PixelFilter.run 末尾的
+ * PixelAdjust.blend；S25 起也服务 invert_layer，故从 filters.cpp 提取共享）。
+ * coverage 是**文档分辨率**，图层像素按 effective_bounds() 的原点平移到
+ * 文档坐标（与合成/工具同款约定）。图层落在画布外的部分 coverage 视为 0
+ * （选区之外），保持原像素。
  */
-void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
-                             int32_t height, const std::vector<uint8_t>& coverage,
-                             const comp_rect& bounds, int32_t canvas_width,
-                             int32_t canvas_height) {
-  if (coverage.empty() || canvas_width <= 0 || canvas_height <= 0) {
-    /* 没有有效 coverage：整层保持原样（显式空选区在上游就是「什么都不改」）。 */
-    for (int32_t y = 0; y < height; ++y) {
-      std::memcpy(rgba + static_cast<size_t>(y) * stride,
-                  original + static_cast<size_t>(y) * stride, static_cast<size_t>(width) * 4u);
-    }
-    return;
-  }
-  for (int32_t y = 0; y < height; ++y) {
-    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
-    const uint8_t* before = original + static_cast<size_t>(y) * stride;
-    for (int32_t x = 0; x < width; ++x) {
-      uint8_t* p = row + static_cast<size_t>(x) * 4;
-      const uint8_t* o = before + static_cast<size_t>(x) * 4;
-      const int32_t doc_x = bounds.x + x;
-      const int32_t doc_y = bounds.y + y;
-      int32_t cov = 0;
-      if (doc_x >= 0 && doc_y >= 0 && doc_x < canvas_width && doc_y < canvas_height) {
-        cov = coverage[static_cast<size_t>(doc_y) * static_cast<size_t>(canvas_width) +
-                       static_cast<size_t>(doc_x)];
-      }
-      if (cov == 0) {
-        for (int c = 0; c < 4; ++c) p[c] = o[c];
-      } else if (cov < 255) {
-        for (int c = 0; c < 4; ++c) {
-          const int blended = (p[c] * cov + o[c] * (255 - cov) + 127) / 255;
-          p[c] = static_cast<uint8_t>(std::min(255, blended));
-        }
-      }
-    }
-  }
-}
 
 }  // namespace
 

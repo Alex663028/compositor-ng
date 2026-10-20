@@ -3663,3 +3663,45 @@ S23 报告 §9 列了五项非目标，ALEX 要求「一并做完再交测」。
 **8. 边界（如实记录）。** 效果无参数编辑 UI（只有 6 档开关 + 默认参数）、无效果重排；清除 N 个效果 = N 步撤销，不是一步；拖行仅同父（跨组明确拒绝，不支持拖进/拖出组）；镜像只有菜单 + `Ctrl+Shift+H/F`，无可视控制柄；变换仍无拖拽控制框、非均匀缩放仍缺（S21 遗留）。沿用既有口径：M1–M16 人工目视由 ALEX 本人执行，本轮不代为声称。
 
 报告：`../report/S24-nongoals-20261020-dsh.md`。
+
+### 6.35 S25 对标 PS「图像」菜单：画布旋转 / 修边 / 反相 / 色彩范围（引擎 + ABI 层，2026-10-20，hermes）
+
+S24 交付后 ALEX 指令「对标 Photoshop 功能和 `compositor/` 上游，识别并补充缺失功能」。精读上游后定性：
+**12 种调整层已对齐，真正的缺口在产品通路**——上游 `Image` 菜单的四条画布级操作在本仓连引擎
+入口都没有（只有 crop）。本轮补齐**引擎 + ABI 层**，新增 4 个导出（119 → **123**），既有 ABI 头
+与像素公式零改动：
+
+| ABI（导出序号） | PS 对应 | 上游真源 | 关键口径 |
+|---|---|---|---|
+| `comp_document_rotate_canvas` (#120) | Image > Image Rotation | `CanvasRotation.swift`（quarterTurned） | 不重采样：像素逐字节不动，落位换成旋转后包围盒 + rotation 累加；选区蒙版精确转置 |
+| `comp_document_trim` (#121) | Image > Trim | `ImageTrim.swift` | flatten 整篇合成算框 → 复用 `crop_apply` 提交；三基准 × 逐通道容差 × 逐行扫描 |
+| `comp_layer_invert` (#122) | Image > Adjustments > Invert | `PixelInvert.swift` | 预乘 `c' = alpha - c`（透明仍是透明）；HDR 拒绝、16 位落工作副本、选区按文档坐标裁剪 |
+| `comp_selection_apply_color_range` (#123) | Select > Color Range | `ColorRangeSelection.swift` | 整篇合成上**全局**匹配（不连续也算）；include/exclude 双表 + fuzziness 0..200 + invert |
+
+**两个由新单测当场抓到的实现 bug（都在本轮新代码里）**：
+
+1. **90° 蒙版转置行列写反**。`rotate_mask_90` 把源行/列直接当目标列/行用（`d[(h-1-y)*stride + x]`），
+   目标窄于源时写进相邻行——非正方形选区（如 16×8 画布的 6×4 选区）旋转后蒙版全错。正解是
+   `d[x_s * stride + (h-1-y_s)]`（CW）/ `d[(w-1-x_s) * stride + y_s]`（CCW），行列必须同时换。
+2. **90° 旋转沿用原横矩形 transform → 渲染缺一半**。渲染器 `build_layer_unit` 的 rotation 是
+   「绕 bounds 中心转、光栅窗口 = 轴对齐 bounds」；16×8 图层转 90° 后实际占 8×16 竖矩形，window
+   还是 16×8 的话旋转出去的那一半落在窗口外被裁空（实测四角全黑）。正解：90° 时 transform
+   换成旋转后轴对齐包围盒（w/h 互换）——**像素依然不动**，不重采样原则保持。这条坑写进了头文件
+   注释与 `canvas_ops.cpp` 的落位口径说明，避免后人重蹈。
+
+另从 `filters.cpp` 提取共享的 `blend_through_selection` 到 `selection.h`（filter_apply 与 invert_layer
+共用同一条选区混合口径，防两处漂移）；`document_trim` 的 8 位视图统一走 `layer.h` 导出的
+`deep_to_rgba8` / `hdr_to_rgba8`，不碰私有/匿名命名空间。
+
+**验证。** 单测 492 → **523 例 / 0 失败**（新增 `test_canvas_ops.cpp` 31 例：旋转几何 / 奇数取整 /
+四圈闭合 / origin 越界、选区转置 / 空选区、trim 三基准 × 容差 × 逐边开关 × 事务、反相预乘语义 /
+16 位 / HDR / 选区裁剪 / 偏移图层、色彩范围全局匹配 / invert / exclude / fuzziness / combine /
+错误闸）；壳自检 **219 项零变化**（SHA256 `e277a4c4…` 与 S24 基线**逐字节一致**——既有行为零漂移）；
+`--gpu` 变体 523/0、`--present-bench` 报 `backend=D3D12`（avg 2.09 ms/帧）；视觉探针 68/0；
+ctypes 探针实测四个新导出的错误码与空文档 noop 契约；`run_regression.py --require-ohos`
+**6/6 PASS**（OHOS 91 → 93，新增两个 `.cpp` 参与鸿蒙交叉编译）。
+
+**边界（下一步的活，本轮没做）。** 本轮交付止于引擎 + ABI + 单测：壳的 Image 菜单三条命令、
+Select > Color Range 面板（吸管取样 / fuzziness 滑杆 / 反相勾选）、快捷键接线全部未做；
+Trim 的颜色基准预览与 Color Range 的取样 UI 亦未做。`scripts/visual_check.py` 的 +84/−46
+探针修复（S24 遗留）仍在工作区未提交，等 ALEX 定夺。

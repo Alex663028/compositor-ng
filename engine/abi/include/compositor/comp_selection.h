@@ -237,6 +237,43 @@ COMP_API comp_result comp_selection_apply_wand(comp_document document, comp_laye
                                                int32_t radius, comp_selection_combine combine,
                                                int32_t* out_changed);
 
+/* ------------------------------------------------------------ 色彩范围（S25） */
+
+/*
+ * 色彩范围选区（PS Select > Color Range；上游 ColorRangeSelection.swift）。
+ *
+ * 在**整篇可见合成**上按颜色匹配**全部**像素（不要求连续，这是与魔棒
+ * flood fill 的本质区别）。一个像素被选中 = 与某个 include 颜色的 RGB
+ * 三通道绝对差都 <= fuzziness，**且**与任何 exclude 颜色都不满足；
+ * invert != 0 时把匹配结果取反再写入选区。
+ *
+ * 参数：
+ *   - include / include_count：扁平 RGB 三元组数组（include_count 是
+ *     **颜色数**，不是字节数；include 为 NULL 时按无匹配处理）。可传
+ *     NULL + 0 表示不含任何取样色；
+ *   - exclude / exclude_count：同上，被排除色覆盖（上游面板里 Option
+ *     点选减去的颜色）；
+ *   - fuzziness 0..200（上游 fuzzinessRange）；
+ *   - invert：!= 0 时选「匹配之外」的像素。
+ *
+ * 语义与错误码：
+ *   - 距离度量与魔棒同家族（RGB 三通道 Chebyshev），直接在合成 RGBA8
+ *     字节上比较，不反预乘；
+ *   - 0 个匹配像素时**不改选区**（out_changed = 0，与魔棒同口径）；
+ *   - combine 语义与形状/魔棒叠加一致（replace / add / subtract）；
+ *   - 数组为 NULL 但 count > 0、fuzziness 越界、枚举非法 ->
+ *     COMP_ERR_INVALID_ARGUMENT；
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）。
+ *
+ * out_changed 可为 NULL。
+ */
+COMP_API comp_result comp_selection_apply_color_range(comp_document document,
+                                                      const uint8_t* include, size_t include_count,
+                                                      const uint8_t* exclude, size_t exclude_count,
+                                                      int32_t fuzziness, int32_t invert,
+                                                      comp_selection_combine combine,
+                                                      int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
