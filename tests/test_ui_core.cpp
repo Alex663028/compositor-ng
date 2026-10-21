@@ -367,6 +367,43 @@ COMP_TEST(ui_core_panel_splitter_hit_test) {
   COMP_CHECK(comp_ui::panel_splitter_at(narrow, narrow.canvas.x, mid_y) == 0);
 }
 
+COMP_TEST(ui_core_layer_in_subtree) {
+  /*
+   * 1 是根级，2 是 1 的子层，3 是 2 的子层，4 是另一个根级（1 的兄弟），
+   * 5 自引用，6/7 互指成环，8 也是 1 的子层。数组成员按面板顺序排列——数组相邻
+   * 与父子关系无关，正是不能靠下标判断、「必须沿 parent 链走」的原因。
+   */
+  const comp_ui::LayerStackEntry stack[] = {
+      {1, 0, 0}, {2, 1, 0}, {3, 2, 0}, {4, 0, 0},
+      {5, 5, 0}, {6, 7, 0}, {7, 6, 0}, {8, 1, 0},
+  };
+  const int32_t count = static_cast<int32_t>(sizeof(stack) / sizeof(stack[0]));
+
+  /* 直接子层与孙层都算成员；root 自己不算成员（它只是容器）。 */
+  COMP_CHECK(comp_ui::layer_in_subtree(stack, count, 2, 1));
+  COMP_CHECK(comp_ui::layer_in_subtree(stack, count, 3, 1));
+  COMP_CHECK(comp_ui::layer_in_subtree(stack, count, 8, 1));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 1, 1));
+
+  /* 兄弟层、以及「方向反了」的查询（组在子层下面时）都不算成员。 */
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 4, 1));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 2, 3));
+
+  /* 表里不存在的 id：宁可少移一层，也不能当成成员。 */
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 99, 1));
+
+  /* 环：自引用与互引用都返回 false 而不是死循环。 */
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 5, 4));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 6, 4));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 7, 4));
+
+  /* 非法入参：空表、非正 count、root 为 0（不是图层）。 */
+  COMP_CHECK(!comp_ui::layer_in_subtree(nullptr, count, 2, 1));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, 0, 2, 1));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, -3, 2, 1));
+  COMP_CHECK(!comp_ui::layer_in_subtree(stack, count, 2, 0));
+}
+
 COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
   const Rect panel{0, Layout::kToolbarHeight, Layout::kLayerPanelWidth, 600};
   const int count = 3;

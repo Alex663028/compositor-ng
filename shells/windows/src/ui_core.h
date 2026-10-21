@@ -2558,6 +2558,36 @@ struct ClippingPlan {
   bool ok() const { return target == ClippingTarget::kBase; }
 };
 
+/*
+ * 整组移动（§6.61）：node 是否落在 root 的子树里（root 自己不算成员）。
+ *
+ * 组的 transform 不参与合成（filter_graph 只烘焙成员），所以「移动组」= 把子树里
+ * 每个成员各自平移同样的量，而不是写组自己的 transform。成员关系必须沿 parent 链
+ * 走——面板是扁平列表，视觉上的相邻与树上的父子没有任何关系，按数组相邻来搬会动到
+ * 别的组里的层。
+ *
+ * 链最多走 count 步：数据有环时返回 false，宁可少移一层也不死循环。
+ */
+inline bool layer_in_subtree(const LayerStackEntry* layers, int32_t count, int64_t node,
+                             int64_t root) {
+  if (layers == nullptr || count <= 0 || root == 0 || node == root) return false;
+  int64_t current = node;
+  for (int32_t guard = 0; guard <= count; ++guard) {
+    int64_t parent = -1;
+    for (int32_t i = 0; i < count; ++i) {
+      if (layers[i].id == current) {
+        parent = layers[i].parent;
+        break;
+      }
+    }
+    if (parent < 0) return false; /* node 不在表里 */
+    if (parent == root) return true;
+    if (parent == 0) return false;
+    current = parent;
+  }
+  return false; /* 环：当作不属于，绝不死循环 */
+}
+
 inline ClippingPlan plan_clipping_base(const LayerStackEntry* layers, int32_t count,
                                        int32_t shown) {
   ClippingPlan plan{};
