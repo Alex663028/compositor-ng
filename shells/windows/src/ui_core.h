@@ -2162,6 +2162,56 @@ inline bool effect_list_contains(const uint32_t* kinds, int32_t count, int kind)
   return false;
 }
 
+/* ---------------------------------------------------- 效果参数面板（P0-2） */
+
+/*
+ * 行几何与滤镜面板同源：标题 + 效果名两行（54 px）之后是参数行，每行 20 px。
+ * 绘制与命中都用下面两个函数，避免「看得见点不中」。
+ */
+inline constexpr int kEffectRowHeight = 20;
+inline constexpr int kEffectRowsTop = 54;
+
+inline Rect effect_param_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kEffectRowsTop + row * kEffectRowHeight, panel.w,
+              kEffectRowHeight};
+}
+
+inline int effect_param_row_at(const Rect& panel, int param_count, double x, double y) {
+  if (param_count <= 0 || !panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kEffectRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kEffectRowHeight)));
+  if (row < 0 || row >= param_count) return -1;
+  return row;
+}
+
+/* 夹取口径与 clamp_filter_param 相同：NaN / 无穷夹到区间，绝不产生越界值。 */
+inline double clamp_effect_param(double value, double min_value, double max_value) {
+  if (!(value == value)) return min_value; /* NaN */
+  if (value < min_value) return min_value;
+  if (value > max_value) return max_value;
+  return value;
+}
+
+/*
+ * 步长按量程决定，而不是给每个参数再抄一份 `step` 字段：
+ * 0..1 的归一化量（不透明度、RGB）走 0.05，其余（平方像素、角度）走 1。
+ * 阈值取「跨度 <= 1」——当前表里没有跨度刚好为 1 的非归一量，若将来出现，
+ * 补 `step` 字段比在这里加特例更诚实。
+ */
+inline double effect_param_step(double min_value, double max_value) {
+  return (max_value - min_value) <= 1.0 ? 0.05 : 1.0;
+}
+
+inline double step_effect_param(double current, int direction, double min_value,
+                                double max_value) {
+  const double base = clamp_effect_param(current, min_value, max_value);
+  if (direction == 0) return base;
+  return clamp_effect_param(base + effect_param_step(min_value, max_value) *
+                                         static_cast<double>(direction),
+                            min_value, max_value);
+}
+
 /* ------------------------------------------------------- 拖行重排（S24） */
 
 enum class DragTarget {

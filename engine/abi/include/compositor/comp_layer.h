@@ -967,6 +967,83 @@ COMP_API comp_result comp_layer_duplicate(comp_document document,
                                           comp_layer_id id,
                                           comp_layer_id* out_id);
 
+/* ------------------------------------------- 效果参数元数据（P0-2 尾部追加） */
+
+/*
+ * 已知效果类型（与 compositing/effect_eval.h 的 kEffectStroke..kEffectInnerGlow
+ * 及 shell ui_core 的 kEffectKindCount 数值一致）。
+ *
+ * 注意：这组枚举只用于**参数面板**。`comp_layer_set_effect` 的 effect 参数仍然
+ * 不做白名单校验（未知 kind 原样落盘、不参与求值），本组接口对未知 kind 返回
+ * COMP_ERR_INVALID_ARGUMENT —— 面板只编辑内核认识的 6 种，其它效果如实不提供编辑。
+ */
+typedef enum comp_effect_kind {
+  COMP_EFFECT_STROKE = 0,
+  COMP_EFFECT_DROP_SHADOW = 1,
+  COMP_EFFECT_COLOR_OVERLAY = 2,
+  COMP_EFFECT_INNER_SHADOW = 3,
+  COMP_EFFECT_OUTER_GLOW = 4,
+  COMP_EFFECT_INNER_GLOW = 5,
+} comp_effect_kind;
+
+#define COMP_EFFECT_KIND_COUNT 6
+
+/*
+ * 单个可编辑效果参数的元数据。`json_path` 是 settings 对象的**顶层键**
+ * （效果 settings 是扁平对象，如 "size" / "opacity"）；`default_value` 与
+ * `effect_eval.cpp` 的 read_* 缺省值逐项一致，面板在键缺失时用它回填。
+ *
+ * settings 的写入侧仍是不透明字符串：本结构只描述「面板能编什么、量程多少」，
+ * 不改变 `comp_layer_set_effect` 的冻结契约。`flags` 保留，恒为 0。
+ */
+typedef struct comp_effect_param {
+  const char* json_path;
+  const char* label;
+  comp_param_type type;
+  double min_value;
+  double max_value;
+  double default_value;
+  uint32_t flags; /* 保留，恒为 0 */
+} comp_effect_param;
+
+/* 该 effect 的可编辑参数数量；effect 非法或 out_count 为 NULL -> INVALID_ARGUMENT。 */
+COMP_API comp_result comp_layer_effect_param_count(uint32_t effect, size_t* out_count);
+
+/* 取第 index 个参数元数据（index 越界 -> COMP_ERR_INVALID_ARGUMENT）。只读，不开事务。 */
+COMP_API comp_result comp_layer_effect_param_at(uint32_t effect,
+                                                size_t index,
+                                                comp_effect_param* out_param);
+
+/*
+ * 从效果 settings JSON 按 json_path 读标量叶子，供面板回填既有值：
+ * 命中数值写 out_number、命中布尔写 out_boolean（0/1），两个出参都可为 NULL。
+ * 路径缺失、中间段非对象或叶子不是标量 -> COMP_ERR_NOT_FOUND（调用方回落到
+ * param_at 的 default_value）。settings_json_utf8 为 NULL 按 "{}" 处理。
+ */
+COMP_API comp_result comp_layer_effect_read_value(const char* settings_json_utf8,
+                                                  const char* json_path,
+                                                  double* out_number,
+                                                  int32_t* out_boolean);
+
+/*
+ * 由面板扁平值在**既有 settings** 上合并出新 settings（引擎侧组装，外壳不写 JSON）：
+ *   - values[i] 对应 param_at(effect, i)，ASCII 文本（布尔 "0"/"1"），空串 = 该项不动；
+ *     values 可少于 param_count（缺的按空串处理），多出的被忽略（与
+ *     comp_layer_adjustment_build_settings 同口径）；
+ *   - `base_settings_json_utf8` 是当前 settings（通常来自 comp_layer_effect_at）；
+ *     未知键与未编辑的键**原样保留**——效果 settings 允许前向扩展，不能整棵重建；
+ *   - 数值越界 / 非有限 / 文本非法 -> COMP_ERR_INVALID_ARGUMENT（不写半成品）；
+ *   - 两段式：capacity 为 0 时只回报长度（含结尾 NUL 所需字节）；out_size 恒写
+ *     正文长度（不含 NUL）。
+ */
+COMP_API comp_result comp_layer_effect_build_settings(uint32_t effect,
+                                                      const char* const* values,
+                                                      size_t value_count,
+                                                      const char* base_settings_json_utf8,
+                                                      char* settings_json_utf8,
+                                                      size_t capacity,
+                                                      size_t* out_size);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -3799,3 +3799,61 @@ rotation/flip 直接把 invert 与全部滤镜打成不支持，功能退化且�
 不支持批量拖拽；③ 验收证据是机器抓的像素，手感/跨 DPI/多显示器仍待 ALEX 目视
 （`docs/manual-test.md`）；④ `scripts/visual_check.py` 的工作区改动按约定仍未提交。
 
+### 6.38 P0-2 效果参数面板：参数元数据收进 ABI（2026-10-21，Claude）
+
+**缺口。** 效果此前只能从菜单添加/清除，参数一个也改不了；更糟的是壳里抄了一份
+`effect_kind_defaults()`（每个 kind 的缺省值摘要），与 `effect_eval.cpp` 的 `read_*` 实参
+**两处各写一份数值**。这种重复不会编译报错，只会表现为「面板写着 90°，落笔按 0° 算」。
+验收标准：**六种效果都能在面板里逐个改参数，改完画面按引擎语义变化，且壳内不再有任何一份
+参数数值**。
+
+**ABI（纯尾部追加，127 → 131）。** `comp_layer_effect_param_count` /
+`comp_layer_effect_param_at` / `comp_layer_effect_read_value` /
+`comp_layer_effect_build_settings`；既有枚举、结构体与签名一个不动。参数元数据
+（`json_path` / `label` / `type` / `min` / `max` / `default`）现在只有一份实现：
+`engine/domain/effect_table.{h,cpp}`，由 ABI 原样导出。
+
+**引擎表。** 六种 kind 的参数个数 **6 / 7 / 4 / 7 / 5 / 5**（Stroke、DropShadow、
+ColorOverlay、InnerShadow、OuterGlow、InnerGlow），键名就是 `effect_eval.cpp` 里
+`read_*` 用的扁平 JSON 键。`effect_read_value` 直接复用 `adjustment_read_value`——
+两者要的语义完全相同（点分路径取标量，缺失/中间段非对象/叶子非标量一律 `NOT_FOUND`），
+共用一份实现避免「同一条路径规则写两遍」。`effect_build_settings` 只做**合并**：空串 = 该项
+不动，未知键原样保留（效果 settings 是前向兼容的不透明字符串，整棵重建会丢上游字段），
+越界/非数/坏布尔/坏 base 显式拒绝，多给的值按 adjustment 同口径忽略。
+
+**壳侧面板。** `Ctrl+Shift+E`（效果菜单里也有「编辑参数…」）打开右侧效果面板；右面板
+同一时刻只属于滤镜/效果/文字/调整之一，打开效果会先关掉滤镜面板。面板行几何与步进
+（`kEffectRowsTop = 54`、`kEffectRowHeight = 20`、跨度 ≤ 1 时步进 0.05，否则 1.0）落在
+`ui_core.h` 的纯函数里，可单测，不依赖窗口。键盘：`Tab` 选参数、`-`/`=` 调值、
+数字/`.`/`-` 进入键入态、`回车` 应用（未启用该效果时等同添加）、`,`/`.` 切换效果类型、
+`Backspace` 重置为本表缺省、`Esc` 关闭；点行即聚焦该参数。应用只调一次
+`comp_layer_set_effect`（同 kind 幂等替换），因此天然一步撤销；底串始终是本层当前 settings
+的回读，未知键跟着走。
+
+**漂移护栏（本轮的核心理由）。** `tests/test_effect_table.cpp` 对六种 kind 各做两次展平：
+`set_effect(kind, "{}")`（引擎内部缺省）与「把参数表缺省值全部显式写入」——两份像素必须
+**逐字节相同**。另有用例钉住参数个数、键名与缺省值抽样（`stroke.size = 4 [0,500]`、
+`drop_shadow.angle = 90`、`inner_glow.size = 10` 等）、未知键保留、越界拒绝、回读往返。
+壳侧几何/步进另加一例 `ui_core_effect_param_panel_geometry_and_steps`。
+
+**验证。** 全量 **535 例 / 0 失败**（P0-1 的 528 + 效果表 6 例 + 面板几何 1 例）；
+PE 导出 **131**；`run_regression.py --require-ohos` **6/6 PASS**；壳自检 **219 项 SHA256
+零变化**（`e277a4c4…`，未加自检项）；`visual_check.py` **68 项 / 0 失败**；**本批新增告警 0**。
+另跑了一次**真实 UI 路径对拍**（仓外一次性脚本，16 项 / 0 失败，截图 `report/assets/p0_2/`）：
+面板打开→改 `Red=1` 回车→画布出现描边→一次 `Ctrl+Z` 逐像素回到应用前→`Ctrl+Y` 逐像素回到
+应用后；`Size` 步进到 9 与键入 25 各自产生新的撤销步；以及「`Backspace` 回表缺省 + `red=1`」
+与「引擎 `{}` + `red=1`」两帧**文档矩形内逐像素相同**——`test_effect_table.cpp` 的漂移对拍
+在 UI 上复现了一遍。
+
+**审核补丁（壳侧三处）。** ① 从 `.comp` 回读的参数值按表量程夹取后再显示，否则旧文件里
+`size=1000` 会让面板显示 1000 而引擎按 500 求值；② `Backspace` 重置只把**参数值**还原，
+保留本层 settings 作为合并底串，避免随后回车时把未知键整串抹掉；③ `type_begin` 顺手关掉
+效果/滤镜面板，否则文字工具落插入点后数字键会被面板的键盘分支先吃掉（插入点在闪、打字没反应）。
+
+**边界。** ① 没有滑杆拖动与实时预览：改值靠键盘步进/键入，`回车` 才落笔一次（与滤镜面板
+同口径），拖动式预览要等滤镜图的增量缓存；② 颜色是 `red`/`green`/`blue` 三个 0..1 的数字，
+没有取色器/HSL；③ 面板只编辑「当前选中图层」，多选批量加效果未做；④ 参数表是手写常量，
+新增参数必须同时改 `effect_eval.cpp` 的 `read_*`——漂移由像素对拍用例守，不是编译期联动；
+⑤ 面板手感/跨 DPI 仍待 ALEX 目视（`docs/manual-test.md` M17）；⑥ `scripts/visual_check.py`
+的工作区改动按约定仍未提交。
+

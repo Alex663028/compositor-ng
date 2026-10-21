@@ -109,6 +109,7 @@ constexpr UINT kCmdLayerFlipVertical = 1501;   /* S24：垂直镜像 */
 constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..5，菜单勾选 = 已启用 */
 constexpr UINT kCmdEffectClear = 1520;         /* S24：清除选中图层的全部效果 */
 constexpr UINT kCmdHistogramReset = 1521;      /* S24：直方图区间复位（双击同效） */
+constexpr UINT kCmdEffectEdit = 1522;          /* P0-2：打开效果参数面板（Ctrl+Shift+E） */
 /*
  * P0-1 命令号（1530 段）：图层面板的四个「上游有、本壳没有」的动作。
  * 重命名与精确不透明度需要键入，沿用本壳既有的「状态栏输入态」而不是另开对话框
@@ -282,6 +283,25 @@ struct ShellState {
   bool layer_drag_active = false;
   /* S24：选中图层已启用的效果 kind（数组序，与引擎 effects 同序）。 */
   std::vector<uint32_t> effect_kinds;
+  /*
+   * P0-2 效果参数面板。
+   *
+   * effect_settings 与 effect_kinds 对齐，是本层效果的 settings 回读副本——面板只
+   * 从它取「底」，写回时由 ABI 在它上面合并（未知键保留）。effect_open 时面板占
+   * 右侧栏（与滤镜面板同一位置、同一模态规矩）；effect_kind 是正在编辑的 kind，
+   * 允许尚未启用（回车即添加）。
+   *
+   * effect_values 是本面板的**编辑缓冲**，长度与 ABI 参数表一致；空串 = 该项不动。
+   * 所有键名/量程/缺省值都来自 comp_layer_effect_param_*，壳里不再抄一份
+   * （旧 effect_kind_defaults() 已删除）。
+   */
+  bool effect_open = false;
+  std::vector<std::string> effect_settings;
+  int32_t effect_kind = 0;
+  int32_t effect_param = 0;
+  std::vector<std::string> effect_values;
+  std::wstring effect_input;
+  std::string effect_base_json;
   /* 前景色（S6）：画笔的笔画色；吸管与色板都写这里。 */
   comp_ui::ColorRGB foreground{};
   int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
@@ -466,6 +486,9 @@ comp_layer_id selected_layer_id(const ShellState& shell);
 
 /* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
 std::wstring widen_ascii(const char* text);
+
+/* 数值 -> 面板文本（定义在调整面板段；效果参数面板也要用）。 */
+std::string number_text(double value);
 
 /* UTF-8 <-> UTF-16。图层名是 UTF-8（comp_layer.h 契约），面板是 UTF-16。 */
 std::wstring widen_utf8(const std::string& text);
@@ -1087,13 +1110,11 @@ void panel_toggle_histogram(ShellState& shell) {
 /* ==================================================== S24：镜像 / 效果 / 区间 */
 
 /*
- * 效果档位的中文名与「默认参数摘要」（S24）。
+ * 效果档位的中文名（S24）。
  *
- * 为什么摘要必须写在这里：set_effect(id, kind, "{}") 是让引擎用**键缺失即默认**的
- * 规则填参数（engine/compositing/effect_eval.cpp 的 read_* 系列），壳里没有一份
- * 默认值副本。用户在菜单里点了「投影」却看不到任何变化时，唯一能自诊断的信息
- * 就是「投影默认距离 20px、黑色、50% 不透明度」——不然会以为功能没实现。
- * 摘要与 effect_eval.cpp 的默认值逐项对应，改引擎默认值时这里必须同步（报告已记）。
+ * 只保留**名称**：默认参数摘要原先也抄在这里，P0-2 起改由 ABI 参数表提供
+ * （comp_layer_effect_param_at 的 label/default_value），壳不再自持任何一份
+ * 数值——两份默认值迟早会漂移，而漂移的症状是「面板说 90°，落笔按 0° 算」。
  */
 const wchar_t* effect_kind_label(int kind) {
   switch (comp_ui::clamp_effect_kind(kind)) {
@@ -1107,38 +1128,101 @@ const wchar_t* effect_kind_label(int kind) {
   }
 }
 
-const wchar_t* effect_kind_defaults(int kind) {
-  switch (comp_ui::clamp_effect_kind(kind)) {
-    case 0: return L"外描边 size 4px、黑色、不透明度 100%";
-    case 1: return L"角度 90°、距离 20px、模糊 20px、黑色、不透明度 50%";
-    case 2: return L"黑色、不透明度 100%";
-    case 3: return L"角度 90°、距离 10px、模糊 10px、黑色、不透明度 50%";
-    case 4: return L"size 20px、黑色、不透明度 75%";
-    case 5: return L"size 10px、黑色、不透明度 75%";
-    default: return L"";
+/*
+ * 重建参数编辑缓冲（P0-2）。
+ *
+ * 与 reset_adjustment_values 同构：底色来自 ABI 参数表的 default_value；当该层
+ * 已经有这个 kind 时，再按 settings 逐项回填（解析由引擎完成，壳不解析 JSON）。
+ * use_existing = false 用于面板的「重置为默认」——只改缓冲，回车才落盘。
+ */
+void reset_effect_values(ShellState& shell, bool use_existing = true) {
+  shell.effect_values.clear();
+  shell.effect_param = 0;
+  shell.effect_input.clear();
+
+  const uint32_t kind = static_cast<uint32_t>(comp_ui::clamp_effect_kind(shell.effect_kind));
+  shell.effect_base_json = "{}";
+  if (use_existing) {
+    for (size_t i = 0; i < shell.effect_kinds.size(); ++i) {
+      if (shell.effect_kinds[i] != kind) continue;
+      if (i < shell.effect_settings.size()) shell.effect_base_json = shell.effect_settings[i];
+      break;
+    }
+  }
+
+  size_t param_count = 0;
+  if (comp_layer_effect_param_count(kind, &param_count) != COMP_OK) param_count = 0;
+  for (size_t i = 0; i < param_count; ++i) {
+    comp_effect_param param{};
+    if (comp_layer_effect_param_at(kind, i, &param) != COMP_OK) {
+      shell.effect_values.emplace_back();
+      continue;
+    }
+    bool filled = false;
+    std::string text;
+    if (use_existing) {
+      if (param.type == COMP_PARAM_BOOL) {
+        int32_t boolean = 0;
+        if (comp_layer_effect_read_value(shell.effect_base_json.c_str(), param.json_path, nullptr,
+                                         &boolean) == COMP_OK) {
+          text = boolean != 0 ? "1" : "0";
+          filled = true;
+        }
+      } else {
+        double number = 0.0;
+        if (comp_layer_effect_read_value(shell.effect_base_json.c_str(), param.json_path, &number,
+                                         nullptr) == COMP_OK) {
+          /*
+           * .comp 里可能带着超出当前量程的旧值（引擎求值时 `ranged` 会夹取）。面板也夹：
+           * 否则面板写 1000、引擎按 500 算，用户看到的「当前值」就是假的。
+           */
+          text = number_text(comp_ui::clamp_effect_param(number, param.min_value, param.max_value));
+          filled = true;
+        }
+      }
+    }
+    if (!filled) {
+      text = param.type == COMP_PARAM_BOOL ? (param.default_value != 0.0 ? "1" : "0")
+                                           : number_text(param.default_value);
+    }
+    shell.effect_values.push_back(text);
   }
 }
 
 /*
  * 效果回读（S24）：与 refresh_adjustments 同构，走 count + at 两段式。
  *
- * 只回读 kind、不回读 settings：壳目前没有效果参数编辑面板（6 个 kind 全用引擎
- * 默认参数），把设置串搬进壳只会多一份会漂移的副本。等真做参数面板时再按需取，
- * 那时参数编辑也要像调整面板一样由 ABI 元数据驱动，不能在壳里写死键名。
+ * P0-2：settings 也一并回读，作为参数面板的合并底——面板只覆盖用户改过的键，
+ * 上游 .comp 里新增的未知键必须原样带回去（effect_build_settings 的深合并契约）。
+ * 键名/量程/缺省值仍然一个都不在壳里：全部由 ABI 参数表转出。
  */
 void refresh_effects(ShellState& shell) {
   shell.effect_kinds.clear();
+  shell.effect_settings.clear();
   const comp_layer_id id = shell.document != nullptr ? selected_layer_id(shell) : 0;
-  if (id == 0) return;
+  if (id == 0) {
+    reset_effect_values(shell);
+    return;
+  }
   size_t count = 0;
-  if (comp_layer_effect_count(shell.document, id, &count) != COMP_OK) return;
+  if (comp_layer_effect_count(shell.document, id, &count) != COMP_OK) {
+    reset_effect_values(shell);
+    return;
+  }
   for (size_t i = 0; i < count; ++i) {
     uint32_t kind = 0;
     size_t need = 0;
     if (comp_layer_effect_at(shell.document, id, i, &kind, nullptr, 0, &need) != COMP_OK) break;
-    /* 第二趟只为校验（列表只需要 kind）；settings 长度留给将来的参数面板。 */
+    /* P0-2：settings 一并回读，作为参数面板「合并底」（未知键必须原样带回去）。 */
+    std::vector<char> text(need + 1, '\0');
+    if (comp_layer_effect_at(shell.document, id, i, &kind, text.data(), text.size(), &need) !=
+        COMP_OK) {
+      break;
+    }
     shell.effect_kinds.push_back(kind);
+    shell.effect_settings.emplace_back(text.data(), need);
   }
+  reset_effect_values(shell);
 }
 
 /*
@@ -1212,13 +1296,18 @@ void panel_toggle_effect(ShellState& shell, int kind) {
     /*
      * "{}" = 全部走引擎默认参数（键缺失即默认，见 effect_eval.cpp 的 read_*）。
      * 壳内不拼一份默认 JSON：两份默认值必然有一天不一致，且引擎改默认值时壳不会跟着改。
+     *
+     * P0-2：添加后直接打开参数面板——面板里的值就是 ABI 参数表的缺省值，用户
+     * 点完「投影」若看不出变化（黑底黑阴影），至少能立刻看到距离/角度在哪调。
      */
     if (comp_layer_set_effect(shell.document, id, static_cast<uint32_t>(clamped), "{}") != COMP_OK) {
       set_status(shell, L"添加效果失败");
       return;
     }
-    wsprintfW(buffer, L"已添加效果：%s（默认参数：%s）", effect_kind_label(clamped),
-              effect_kind_defaults(clamped));
+    shell.effect_open = true;
+    shell.effect_kind = clamped;
+    wsprintfW(buffer, L"已添加效果：%s（参数面板已打开：Tab 选参数 · -/= 调值 · 回车应用）",
+              effect_kind_label(clamped));
   }
   refresh_layers(shell);
   shell.needs_render = true;
@@ -1250,6 +1339,256 @@ void panel_clear_effects(ShellState& shell) {
   shell.needs_render = true;
   wchar_t buffer[128];
   wsprintfW(buffer, L"已清除 %d 个效果（每个效果一步撤销）", removed);
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------- 效果参数面板（P0-2） */
+
+/*
+ * 面板的全部「知识」只有：当前 kind、当前参数序号、参数表给的 label/量程/缺省值。
+ * 键名、量程、缺省值一个都不在壳里——这就是 P0-2 拆掉 effect_kind_defaults() 的
+ * 目的。写路径只有 comp_layer_set_effect 一条：它本来就按 kind 幂等替换，
+ * 「添加」和「修改参数」因此走同一个动作，不需要两套代码。
+ */
+
+bool effect_present(const ShellState& shell, int kind) {
+  return comp_ui::effect_list_contains(
+      shell.effect_kinds.empty() ? nullptr : shell.effect_kinds.data(),
+      static_cast<int32_t>(shell.effect_kinds.size()), kind);
+}
+
+void open_effect_panel(ShellState& shell, int kind) {
+  if (selected_row(shell) == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  /* 右栏一次只挂一个面板：滤镜与效果共用同一块矩形，同时打开会互相遮住。 */
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.effect_open = true;
+  shell.effect_kind = comp_ui::clamp_effect_kind(kind);
+  reset_effect_values(shell);
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"效果参数：%s（%s）Tab 选参数 · -/= 调值 · 回车应用 · Esc 关闭",
+            effect_kind_label(shell.effect_kind),
+            effect_present(shell, shell.effect_kind) ? L"本层已启用" : L"本层未启用，回车添加");
+  set_status(shell, buffer);
+}
+
+void close_effect_panel(ShellState& shell) {
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  set_status(shell, L"已关闭效果参数面板");
+}
+
+/* `,` / `.`：在 6 个 kind 之间循环（不必先启用就能预览参数表；回车即添加）。 */
+void panel_effect_cycle_kind(ShellState& shell, int32_t delta) {
+  if (selected_row(shell) == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const int32_t total = comp_ui::kEffectKindCount;
+  int32_t kind = shell.effect_kind + delta;
+  if (kind < 0) kind = total - 1;
+  if (kind >= total) kind = 0;
+  shell.effect_kind = kind;
+  shell.effect_open = true;
+  reset_effect_values(shell);
+  wchar_t buffer[200];
+  wsprintfW(buffer, L"效果 %d/%d：%s（%s）", kind + 1, total, effect_kind_label(kind),
+            effect_present(shell, kind) ? L"本层已启用" : L"本层未启用，回车添加");
+  set_status(shell, buffer);
+}
+
+/* 聚焦某一行参数；越界夹取（与面板行几何共用同一个序号空间）。 */
+void panel_effect_focus_row(ShellState& shell, int32_t row) {
+  const int32_t count = static_cast<int32_t>(shell.effect_values.size());
+  if (count == 0) {
+    set_status(shell, L"该效果没有可编辑参数");
+    return;
+  }
+  if (row < 0) row = 0;
+  if (row >= count) row = count - 1;
+  shell.effect_param = row;
+  shell.effect_input.clear();
+  comp_effect_param param{};
+  if (comp_layer_effect_param_at(static_cast<uint32_t>(shell.effect_kind),
+                                 static_cast<size_t>(row), &param) != COMP_OK) {
+    return;
+  }
+  wchar_t buffer[220];
+  wsprintfW(buffer, L"参数 %d/%d：%s = %s", row + 1, count,
+            widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+            widen_ascii(shell.effect_values[static_cast<size_t>(row)].c_str()).c_str());
+  set_status(shell, buffer);
+}
+
+void panel_effect_move_param(ShellState& shell, int32_t delta) {
+  panel_effect_focus_row(shell, shell.effect_param + delta);
+}
+
+/*
+ * 步长由量程决定（ui_core::step_effect_param）：0..1 的归一量走 0.05，
+ * 像素/角度走 1。夹取也在 ui_core，ABI 只做最后一道拒绝。
+ */
+void panel_effect_step_value(ShellState& shell, int32_t direction) {
+  const size_t index = static_cast<size_t>(shell.effect_param);
+  if (index >= shell.effect_values.size()) {
+    set_status(shell, L"该效果没有可编辑参数");
+    return;
+  }
+  comp_effect_param param{};
+  if (comp_layer_effect_param_at(static_cast<uint32_t>(shell.effect_kind), index, &param) !=
+      COMP_OK) {
+    return;
+  }
+  if (param.type == COMP_PARAM_BOOL) {
+    shell.effect_values[index] = shell.effect_values[index] == "1" ? "0" : "1";
+  } else {
+    const double current = std::atof(shell.effect_values[index].c_str());
+    shell.effect_values[index] = number_text(comp_ui::step_effect_param(
+        current, direction, param.min_value, param.max_value));
+  }
+  shell.effect_input.clear();
+  wchar_t buffer[240];
+  wsprintfW(buffer, L"%s = %s （范围 [%s, %s]）",
+            widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+            widen_ascii(shell.effect_values[index].c_str()).c_str(),
+            widen_ascii(number_text(param.min_value).c_str()).c_str(),
+            widen_ascii(number_text(param.max_value).c_str()).c_str());
+  set_status(shell, buffer);
+}
+
+/* 数字键开始输入：布尔参数不进入文本态，直接切换（与调整面板同规矩）。 */
+void panel_effect_begin_input(ShellState& shell, wchar_t character) {
+  const size_t index = static_cast<size_t>(shell.effect_param);
+  if (index >= shell.effect_values.size()) {
+    set_status(shell, L"该效果没有可编辑参数");
+    return;
+  }
+  comp_effect_param param{};
+  if (comp_layer_effect_param_at(static_cast<uint32_t>(shell.effect_kind), index, &param) !=
+      COMP_OK) {
+    return;
+  }
+  if (param.type == COMP_PARAM_BOOL) {
+    panel_effect_step_value(shell, 1);
+    return;
+  }
+  shell.effect_input.assign(1, character);
+  set_status(shell, L"输入中：回车提交并应用，Esc 取消");
+}
+
+void panel_effect_backspace(ShellState& shell) {
+  if (!shell.effect_input.empty()) shell.effect_input.pop_back();
+}
+
+void panel_effect_commit_input(ShellState& shell) {
+  if (shell.effect_input.empty()) {
+    set_status(shell, L"未在输入状态（数字键开始输入）");
+    return;
+  }
+  const size_t index = static_cast<size_t>(shell.effect_param);
+  if (index >= shell.effect_values.size()) {
+    shell.effect_input.clear();
+    return;
+  }
+  comp_effect_param param{};
+  if (comp_layer_effect_param_at(static_cast<uint32_t>(shell.effect_kind), index, &param) !=
+      COMP_OK) {
+    shell.effect_input.clear();
+    return;
+  }
+  const std::string text(shell.effect_input.begin(), shell.effect_input.end());
+  char* end = nullptr;
+  const double value = std::strtod(text.c_str(), &end);
+  if (end == text.c_str() || end == nullptr || *end != '\0' || !std::isfinite(value)) {
+    set_status(shell, L"输入不是合法数值，未提交");
+    return;
+  }
+  /* 面板夹取（与滤镜同口径）；不夹就等着 ABI 拒绝，状态栏只能报「参数不合法」。 */
+  shell.effect_values[index] =
+      number_text(comp_ui::clamp_effect_param(value, param.min_value, param.max_value));
+  shell.effect_input.clear();
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已设置 %s = %s", widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+            widen_ascii(shell.effect_values[index].c_str()).c_str());
+  set_status(shell, buffer);
+}
+
+/*
+ * Backspace（非输入态）= 缓冲回引擎缺省；仍然要回车才落盘。
+ *
+ * 注意保留 effect_base_json：`reset_effect_values(..., false)` 会把它清成 "{}"，
+ * 那样回车时就用「纯缺省」重建整串，把本层 settings 里的未知键（上游新增字段）
+ * 一起抹掉。重置的是**参数值**，不是这一层的 settings。
+ */
+void panel_effect_reset_values(ShellState& shell) {
+  const std::string base = shell.effect_base_json;
+  reset_effect_values(shell, false);
+  shell.effect_base_json = base;
+  set_status(shell, L"效果参数已重置为默认值（回车应用，Esc 关闭）");
+}
+
+/*
+ * settings JSON 由引擎组装并在既有 settings 上合并（壳内不拼 JSON、不解析 JSON）。
+ * 返回的字符串里未知键原样保留——这是 .comp 前向兼容的关键。
+ */
+bool build_effect_settings_json(const ShellState& shell, std::string* out_json) {
+  std::vector<const char*> values;
+  values.reserve(shell.effect_values.size());
+  for (const std::string& text : shell.effect_values) values.push_back(text.c_str());
+
+  const uint32_t kind = static_cast<uint32_t>(comp_ui::clamp_effect_kind(shell.effect_kind));
+  const char* const* data = values.empty() ? nullptr : values.data();
+  size_t need = 0;
+  if (comp_layer_effect_build_settings(kind, data, values.size(),
+                                       shell.effect_base_json.c_str(), nullptr, 0, &need) !=
+      COMP_OK) {
+    return false;
+  }
+  std::string json(need + 1, '\0');
+  if (comp_layer_effect_build_settings(kind, data, values.size(),
+                                       shell.effect_base_json.c_str(), &json[0], json.size(),
+                                       &need) != COMP_OK) {
+    return false;
+  }
+  json.resize(need);
+  if (out_json != nullptr) *out_json = json;
+  return true;
+}
+
+/*
+ * 回车 = 落盘。set_effect 按 kind 幂等替换，因此「添加」与「改参数」是同一个动作；
+ * 每次调用产生一步隐式撤销（与菜单里的效果开关同口径）。
+ */
+void panel_apply_effect(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"请先用 ↑↓ 选择一个图层");
+    return;
+  }
+  std::string json;
+  if (!build_effect_settings_json(shell, &json)) {
+    set_status(shell, L"应用被拒：参数不合法");
+    return;
+  }
+  const uint32_t kind = static_cast<uint32_t>(comp_ui::clamp_effect_kind(shell.effect_kind));
+  const comp_result result = comp_layer_set_effect(shell.document, id, kind, json.c_str());
+  shell.needs_render = true;
+
+  /* refresh_layers 会把编辑缓冲重建（并清焦点），这里把焦点恢复到同一行。 */
+  const int32_t focused = shell.effect_param;
+  refresh_layers(shell);
+  if (!shell.effect_values.empty()) {
+    if (focused >= 0 && focused < static_cast<int32_t>(shell.effect_values.size())) {
+      shell.effect_param = focused;
+    }
+  }
+
+  wchar_t buffer[200];
+  wsprintfW(buffer, L"%s：%s", result == COMP_OK ? L"已应用效果" : L"应用效果失败",
+            effect_kind_label(static_cast<int>(kind)));
   refresh_history_status(shell, buffer);
 }
 
@@ -2435,6 +2774,9 @@ std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
 }
 
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
+  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板。 */
+  shell.effect_open = false;
+  shell.effect_input.clear();
   shell.filter.select(id);
   shell.filter_open = true;
   shell.filter_input.clear();
@@ -3305,6 +3647,14 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
   shell.type_text.clear();
   /* 落插入点即离开属性面板的数值键入态，否则数字键会被面板缓冲吃掉。 */
   shell.type_input.clear();
+  /*
+   * 同理关掉效果/滤镜面板：这两块的键盘分支排在文字键入态之前，留着会把
+   * 刚点的这一笔字符全吞掉（用户看到插入点在闪、打字没反应）。
+   */
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.filter_open = false;
+  shell.filter_input.clear();
   type_refresh_status(shell);
 }
 
@@ -4536,6 +4886,12 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdEffectClear:
       panel_clear_effects(shell);
       break;
+    /* P0-2：编辑参数。没有效果时从第一档（描边）开始，回车即添加。 */
+    case kCmdEffectEdit:
+      open_effect_panel(shell, shell.effect_kinds.empty()
+                                   ? 0
+                                   : static_cast<int>(shell.effect_kinds.front()));
+      break;
     case kCmdHistogramReset:
       panel_histogram_reset(shell);
       break;
@@ -5113,6 +5469,98 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
       L"Amount = 0 时滤镜为恒等（不改像素）",
   };
   int hint_y = bottom - 104;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
+ * 效果参数面板（P0-2）。行几何来自 ui_core.h 的 effect_param_row_rect——绘制与
+ * 命中同源，避免「看得见点不中」。参数名/量程展示全部来自 ABI 参数表。
+ */
+void draw_effect_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"效果参数（Effect）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+  y += 22;
+
+  const int kind = comp_ui::clamp_effect_kind(shell.effect_kind);
+  SetTextColor(dc, RGB(150, 210, 255));
+  wsprintfW(line, L"%d/%d：%s · %s", kind + 1, comp_ui::kEffectKindCount,
+            effect_kind_label(kind),
+            effect_present(shell, kind) ? L"本层已启用" : L"本层未启用（回车添加）");
+  TextOutW(dc, left + 10, y, line, lstrlenW(line));
+
+  const uint32_t effect = static_cast<uint32_t>(kind);
+  const int param_count = static_cast<int>(shell.effect_values.size());
+  if (param_count == 0) {
+    SetTextColor(dc, RGB(200, 170, 120));
+    const wchar_t* note = L"（该效果没有可面板编辑的参数）";
+    TextOutW(dc, left + 10, panel_rect.y + comp_ui::kEffectRowsTop, note, lstrlenW(note));
+  }
+  int rows_bottom = panel_rect.y + comp_ui::kEffectRowsTop;
+  for (int row = 0; row < param_count; ++row) {
+    comp_effect_param param{};
+    if (comp_layer_effect_param_at(effect, static_cast<size_t>(row), &param) != COMP_OK) break;
+    const comp_ui::Rect row_rect = comp_ui::effect_param_row_rect(panel_rect, row);
+    const bool focused = row == shell.effect_param;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6, row_rect.bottom() + 2};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    const std::string value = shell.effect_values[static_cast<size_t>(row)];
+    if (param.type == COMP_PARAM_BOOL) {
+      wsprintfW(line, L"%s = %s", widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+                value == "1" ? L"true" : L"false");
+    } else {
+      wsprintfW(line, L"%s = %s", widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+                widen_ascii(value.c_str()).c_str());
+    }
+    TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
+    rows_bottom = row_rect.bottom();
+  }
+
+  /* 参数来源：新增 = 引擎缺省；已有 = 在该层既有 settings 上合并（未知键保留）。 */
+  int note_y = rows_bottom + 8;
+  SetTextColor(dc, RGB(180, 184, 196));
+  const wchar_t* source = effect_present(shell, kind)
+                              ? L"在既有 settings 上合并（未知键原样保留）"
+                              : L"新增效果（未给出的键走引擎缺省）";
+  TextOutW(dc, left + 10, note_y, source, lstrlenW(source));
+  note_y += 18;
+  wsprintfW(line, L"该图层已有有效果：%u", static_cast<unsigned>(shell.effect_kinds.size()));
+  TextOutW(dc, left + 10, note_y, line, lstrlenW(line));
+
+  if (!shell.effect_input.empty()) {
+    SetTextColor(dc, RGB(255, 240, 160));
+    wsprintfW(line, L"输入中：%s", shell.effect_input.c_str());
+    TextOutW(dc, left + 10, bottom - 136, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L", / . 切换效果类型",
+      L"Tab / Shift+Tab 切参数",
+      L"- / = 调值 · 数字键输入",
+      L"回车应用（按 kind 替换/新增）",
+      L"Backspace 重置为默认值",
+      L"Esc 关闭面板",
+  };
+  int hint_y = bottom - 120;
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;
@@ -5776,7 +6224,9 @@ void present(HWND window, ShellState& shell) {
   draw_toolbar(memory_dc, shell, layout.toolbar);
   if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
   if (layout.adjust_panel.w > 0) {
-    if (shell.filter_open) {
+    if (shell.effect_open) {
+      draw_effect_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.filter_open) {
       draw_filter_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.tool == comp_ui::ToolId::Type) {
       draw_type_panel(memory_dc, shell, layout.adjust_panel);
@@ -6160,6 +6610,81 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return;
   }
 
+  /* 效果参数面板输入态：与滤镜面板同一套输入规矩，目标值是效果参数。 */
+  if (!shell.effect_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.effect_input.clear();
+      set_status(shell, L"已取消输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      panel_effect_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      /* 键入 + 回车 = 落值并立刻应用，少一次按键（与滤镜面板同款）。 */
+      panel_effect_commit_input(shell);
+      panel_apply_effect(shell);
+      return;
+    }
+    if (key == VK_TAB) {
+      shell.effect_input.clear();
+      panel_effect_move_param(shell, shift ? -1 : 1);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      shell.effect_input.push_back(static_cast<wchar_t>(key));
+      return;
+    }
+    if (key == VK_OEM_PERIOD) {
+      shell.effect_input.push_back(L'.');
+      return;
+    }
+    if (key == VK_OEM_MINUS) {
+      shell.effect_input.push_back(L'-');
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* 效果参数面板打开时，键盘归面板：Esc 只关面板（不关窗），Ctrl 组合仍可穿透。 */
+  if (shell.effect_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        close_effect_panel(shell);
+        return;
+      case VK_TAB:
+        panel_effect_move_param(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        panel_apply_effect(shell);
+        return;
+      case VK_OEM_MINUS:
+        panel_effect_step_value(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        panel_effect_step_value(shell, 1);
+        return;
+      case VK_BACK:
+        panel_effect_reset_values(shell);
+        return;
+      case VK_OEM_COMMA:
+        panel_effect_cycle_kind(shell, -1);
+        return;
+      case VK_OEM_PERIOD:
+        panel_effect_cycle_kind(shell, 1);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      panel_effect_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键在面板打开时吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
   /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
   if (!shell.type_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -6371,7 +6896,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         run_shell_command(window, shell, shift ? kCmdLayerAdd : kCmdNew);
         return;
       case 'E':
-        /* Ctrl+E 向下合并（对齐上游 ⌘E）。 */
+        /* Ctrl+Shift+E = 效果参数面板；Ctrl+E 仍是向下合并（对齐上游 ⌘E）。 */
+        if (shift) {
+          run_shell_command(window, shell, kCmdEffectEdit);
+          return;
+        }
         run_shell_command(window, shell, kCmdLayerMergeDown);
         return;
       case 'O':
@@ -6847,6 +7376,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             }
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          if (shell->effect_open && layout.adjust_panel.w > 0) {
+            /* 点参数行 = 聚焦到该行；行几何与绘制共用 effect_param_row_rect。 */
+            const int row = comp_ui::effect_param_row_at(
+                layout.adjust_panel, static_cast<int>(shell->effect_values.size()), mouse_x,
+                mouse_y);
+            if (row >= 0) {
+              panel_effect_focus_row(*shell, row);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
           }
           if (shell->filter_open && layout.adjust_panel.w > 0) {
             /* 点参数行 = 聚焦到该行；行几何与绘制共用 filter_param_row_rect。 */
@@ -7433,6 +7973,7 @@ HMENU build_menu() {
     AppendMenuW(effect_menu, MF_STRING, kCmdEffectBase + static_cast<UINT>(kind), effect_label);
   }
   AppendMenuW(effect_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(effect_menu, MF_STRING, kCmdEffectEdit, L"编辑参数…(&P)\tCtrl+Shift+E");
   AppendMenuW(effect_menu, MF_STRING, kCmdEffectClear, L"清除全部效果(&C)");
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(effect_menu), L"效果(&E)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);

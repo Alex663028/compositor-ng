@@ -1930,6 +1930,61 @@ COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
 }
 
 /*
+ * 效果参数面板（P0-2）的行几何与步长。
+ *
+ * 绘制和命中都用 effect_param_row_rect：这里逐行对账，防「看得见点不中」；
+ * 步长按量程决定（归一量 0.05 / 像素与角度 1），夹取必须永不产生越界值——
+ * 面板夹取是 ABI 拒绝之前的最后一道，越界值会让状态栏只报一句「参数不合法」。
+ */
+COMP_TEST(ui_core_effect_param_panel_geometry_and_steps) {
+  const comp_ui::Rect panel{1000, 100, 220, 600};
+  COMP_CHECK(comp_ui::kEffectRowsTop == 54);
+  COMP_CHECK(comp_ui::kEffectRowHeight == 20);
+
+  const comp_ui::Rect first = comp_ui::effect_param_row_rect(panel, 0);
+  COMP_CHECK(first.x == panel.x && first.w == panel.w && first.h == comp_ui::kEffectRowHeight);
+  COMP_CHECK(first.y == panel.y + comp_ui::kEffectRowsTop);
+  const comp_ui::Rect third = comp_ui::effect_param_row_rect(panel, 2);
+  COMP_CHECK(third.y == first.y + 2 * comp_ui::kEffectRowHeight);
+
+  /* 行首 / 行中 / 行尾都必须命中同一行。 */
+  for (int row = 0; row < 4; ++row) {
+    const comp_ui::Rect rect = comp_ui::effect_param_row_rect(panel, row);
+    const double x = static_cast<double>(rect.x + 2);
+    COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, x, static_cast<double>(rect.y)) == row);
+    COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, x, static_cast<double>(rect.y) +
+                                                             rect.h / 2.0) == row);
+    COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, x,
+                                            static_cast<double>(rect.bottom()) - 1.0) == row);
+  }
+  /* 标题区 / 面板外 / 参数行数之外都不是参数行。 */
+  COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, static_cast<double>(first.x + 2),
+                                          static_cast<double>(panel.y + 10)) == -1);
+  COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, static_cast<double>(panel.right() + 4),
+                                          static_cast<double>(first.y)) == -1);
+  COMP_CHECK(comp_ui::effect_param_row_at(panel, 0, static_cast<double>(first.x + 2),
+                                          static_cast<double>(first.y)) == -1);
+  COMP_CHECK(comp_ui::effect_param_row_at(panel, 7, static_cast<double>(first.x + 2),
+                                          static_cast<double>(first.y) +
+                                              7 * comp_ui::kEffectRowHeight + 2.0) == -1);
+
+  /* 步长：归一量 0.05，像素/角度 1（不是给每个参数再抄一份 step 字段）。 */
+  COMP_CHECK(comp_ui::effect_param_step(0.0, 1.0) == 0.05);
+  COMP_CHECK(comp_ui::effect_param_step(0.0, 500.0) == 1.0);
+  COMP_CHECK(comp_ui::effect_param_step(-360.0, 360.0) == 1.0);
+  COMP_CHECK(comp_ui::step_effect_param(4.0, 1, 0.0, 500.0) == 5.0);
+  COMP_CHECK(comp_ui::step_effect_param(4.0, -1, 0.0, 500.0) == 3.0);
+  /* 两端夹取：0.98 + 0.05 不得变成 1.03，0.02 - 0.05 不得变成负数。 */
+  COMP_CHECK(comp_ui::step_effect_param(0.98, 1, 0.0, 1.0) == 1.0);
+  COMP_CHECK(comp_ui::step_effect_param(0.02, -1, 0.0, 1.0) == 0.0);
+  /* direction 0 = 只夹取（回显用），合法值必须原样返回。 */
+  COMP_CHECK(comp_ui::step_effect_param(0.37, 0, 0.0, 1.0) == 0.37);
+  COMP_CHECK(comp_ui::clamp_effect_param(1e9, 0.0, 1.0) == 1.0);
+  COMP_CHECK(comp_ui::clamp_effect_param(-1e9, 0.0, 500.0) == 0.0);
+  COMP_CHECK(comp_ui::clamp_effect_param(std::nan(""), 0.0, 500.0) == 0.0);
+}
+
+/*
  * 拖行重排（S24）：plan_layer_drag 必须与引擎 comp_layer_reorder 的语义逐位对齐。
  *
  * 这里不「相信」实现里的注释，而是用 erase+insert 独立复算一遍落点，再和

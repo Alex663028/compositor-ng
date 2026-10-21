@@ -16,6 +16,7 @@
 #include "compositing/blend.h"
 #include "core/comp_geometry.h"
 #include "domain/adjustment_table.h"
+#include "domain/effect_table.h"
 #include "domain/tool_ops.h"
 
 using compositor::Document;
@@ -1482,6 +1483,86 @@ comp_result comp_tool_coverage_bounds(const uint8_t* coverage, size_t coverage_s
   compositor::heal_coverage_bounds_of(coverage, coverage_stride, width, height, bounds,
                                        nullptr, nullptr);
   return COMP_OK;
+}
+
+/* ------------------------------------------- 效果参数元数据（P0-2） */
+
+/*
+ * 与调整面板的 param_count/param_at 同构：纯只读元数据，不开事务。
+ * 参数表在 domain/effect_table.cpp，本层只做边界检查与结构体搬运；
+ * 这样「面板有哪些行」不会在 ABI 与外壳里各写一份。
+ */
+comp_result comp_layer_effect_param_count(uint32_t effect, size_t* out_count) {
+  COMP_ABI_TRY(nullptr)
+  const compositor::EffectKindInfo* info = compositor::effect_kind_info(effect);
+  if (info == nullptr || out_count == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+  *out_count = info->param_count;
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_effect_param_at(uint32_t effect, size_t index,
+                                       comp_effect_param* out_param) {
+  COMP_ABI_TRY(nullptr)
+  const compositor::EffectKindInfo* info = compositor::effect_kind_info(effect);
+  if (info == nullptr || out_param == nullptr || index >= info->param_count) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  const compositor::EffectParam& param = info->params[index];
+  out_param->json_path = param.json_path;
+  out_param->label = param.label;
+  out_param->type = static_cast<comp_param_type>(param.type);
+  out_param->min_value = param.min_value;
+  out_param->max_value = param.max_value;
+  out_param->default_value = param.default_value;
+  out_param->flags = 0;
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_effect_read_value(const char* settings_json_utf8, const char* json_path,
+                                         double* out_number, int32_t* out_boolean) {
+  if (json_path == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+  /* 无引擎上下文的纯函数：std::string 构造 + JSON 解析会抛，护栏传 nullptr。 */
+  COMP_ABI_TRY(nullptr)
+  const std::string settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
+  if (!compositor::effect_read_value(settings, json_path, out_number, out_boolean)) {
+    return COMP_ERR_NOT_FOUND;
+  }
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_effect_build_settings(uint32_t effect, const char* const* values,
+                                              size_t value_count, const char* base_json_utf8,
+                                              char* settings_json_utf8, size_t capacity,
+                                              size_t* out_size) {
+  COMP_ABI_TRY(nullptr)
+  const compositor::EffectKindInfo* info = compositor::effect_kind_info(effect);
+  if (info == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+
+  std::vector<std::string> flat;
+  flat.reserve(info->param_count);
+  for (size_t i = 0; i < info->param_count; ++i) {
+    const char* text = (values != nullptr && i < value_count) ? values[i] : nullptr;
+    flat.emplace_back(text != nullptr ? text : "");
+  }
+
+  std::string json;
+  std::string error;
+  const std::string base = base_json_utf8 != nullptr ? base_json_utf8 : "";
+  if (!compositor::effect_build_settings(effect, flat, base, &json, &error)) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_size != nullptr) *out_size = json.size();
+  /* 与 adjustment_build_settings 同口径：容量按「含 NUL」计，不够则截断并补 NUL。 */
+  if (settings_json_utf8 != nullptr && capacity > 0) {
+    const size_t copy = json.size() < capacity - 1 ? json.size() : capacity - 1;
+    std::memcpy(settings_json_utf8, json.data(), copy);
+    settings_json_utf8[copy] = '\0';
+  }
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
 }
 
 } /* extern "C" */
