@@ -25,6 +25,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 调整图层参数编辑 | 调整面板 | （未接 UI） | 调整 ABI 全套 | 已达成（鸿蒙无面板） |
 | 调整控件元数据 | `refresh_adjustments` | 预留 | `comp_layer_adjustment_param_at` 等 | 已达成 |
 | 调整滑杆 + 曲线/色阶编辑器（P0-3） | 调整面板：拖动滑杆实时预览；曲线加点/拖点/删点；色阶 20 参数分页 | （未接 UI） | `comp_layer_update_adjustment_at` + `comp_layer_curves_*` | **已达成**（P0-3，见 §5.14）：一次拖动 = **一个**撤销步，空拖动不产生撤销步 |
+| 选区补齐第一批（P0-4） | 「选择(&S)」菜单：扩展…/收缩…/按图层像素载入选区 | （未接 UI） | `comp_selection_modify`(EXPAND/CONTRACT) / `comp_selection_load_layer`(LOAD_PIXELS) | **部分达成**（§5.15）：三条入口接线完成；色彩范围对话框留待第二批 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
@@ -550,4 +551,39 @@ x/y 取整后写回引擎；点列真相在引擎 settings 里，壳只缓存当
 `ranges[0]` 管合成、`ranges[1..3]` 各管一个色彩通道；③ 布尔参数没有滑道（点一下即切换）；
 ④ 滑杆值吸附到整数是「量程 ≥ 50」时的统一规则，没有按住 `Shift` 的精细模式；
 ⑤ 手感/跨 DPI/连续拖动是否跟手仍待 ALEX 目视（`docs/manual-test.md` M18）。
+
+### 5.15 选区补齐第一批：扩展 / 收缩 / 按图层像素载入（P0-4，2026-10-21）
+
+P0-4 的前提是「引擎与 ABI 全齐，只差 UI」。实测三个入口确实都是**壳侧零调用**：
+`comp_selection_modify(EXPAND | CONTRACT)` 与 `comp_selection_load_layer(LOAD_PIXELS)`
+在引擎里有实现、在 `tests/test_selection.cpp` / `test_canvas_ops.cpp` 里有断言，
+但 `shells/windows/src/main.cpp` 里搜不到调用点。本批先接这两条（ABI **零改动**）：
+
+**1. 菜单单列「选择(&S)」。** 此前全选/取消/反选夹在「编辑」里，扩展/收缩装不下。
+现在单列一个菜单，三条旧命令**只搬位置、ID 不变**（1031/1032/1033），
+`run_shell_command` 同时服务菜单与快捷键，两条入口不会分叉；新增
+`扩展…`（1047）/`收缩…`（1048）/`按图层像素载入选区`（1049）。
+
+**2. 扩展/收缩共用一个键入态。** 菜单只决定 `modify_op`，半径的键入/退格/回车/Esc
+与羽化完全同款（状态机只有一份：`begin_modify_input` → `commit_modify_input`）。
+量程 1..500 来自 `ui_core.h` 的 `kMinSelectionGrow`/`kMaxSelectionGrow`，与引擎
+`kMaxSelectionGrow` 同口径；**0 在壳侧就拦成提示**，不把必然被判 `INVALID_ARGUMENT`
+的调用打到引擎上（羽化的 0 有意义 = 清除羽化，扩展/收缩的 0 没有语义，这是两者唯一的
+量程差异，所以没有复用 `clamp_selection_feather`）。
+
+**3. 按图层像素载入**取当前选中图层、`threshold = 1`（任何有像素处都算选中）。
+取 0 会把全透明像素也算进去（等价全选），不是「按内容载入」的本意；将来给阈值面板时
+再放出来。蒙版载入那条入口早在 S22 就有（图层菜单「载入蒙版为选区」），这里补的是
+**像素**侧，二者共用同一个 `comp_selection_load_layer`。
+
+**4. 验证。** `--selftest` 追加 9 项（219 → **228**，`compositor_shell_selftest.txt`
+已显式重定基线）：20×20 矩形 → EXPAND 3 得 26×26、一次撤销回 20×20；CONTRACT 3 得
+14×14、一次撤销回 20×20；EXPAND 0 被判非法且不改选区；LOAD_PIXELS 选中全不透明层。
+`tests/test_ui_core.cpp` 加 `ui_core_selection_grow_clamps_to_engine_range`（钳位与步进，
+含「步进不得推到 1 以下」）。单测 **554 例 / 0 失败**。
+
+**5. 边界。** ① 色彩范围对话框**本批未做**（下一批）；② 扩展/收缩在引擎里是
+「按距离变换外扩/内缩」，拐角是圆角、超出画布的部分被裁掉，这是上游口径不是缺陷；
+③ 空选区调用扩展会被引擎当无操作（`changed = 0`），壳在入口就先拒绝并提示；
+④ 菜单项暂未做置灰（无选区时点了给状态栏提示，不给假成功）。
 

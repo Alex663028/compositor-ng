@@ -1478,6 +1478,29 @@ inline int step_selection_feather(int feather, int direction) {
   return clamp_selection_feather(current + (direction > 0 ? step : -step));
 }
 
+/*
+ * 选区扩展/收缩半径（P0-4）：1..500，与引擎 kMaxSelectionGrow 同口径。
+ * 下限是 **1** 不是 0——`comp_selection_modify` 把 0 当 INVALID_ARGUMENT 拒掉
+ * （羽化那边 0 有意义 = 清除羽化，扩展/收缩的 0 没有语义），所以面板要先把
+ * 0 拦成提示，而不是把盖然无效果的调用打到引擎上。
+ */
+inline constexpr int kMinSelectionGrow = 1;
+inline constexpr int kMaxSelectionGrow = 500;
+
+inline int clamp_selection_grow(int value) {
+  if (value < kMinSelectionGrow) return kMinSelectionGrow;
+  if (value > kMaxSelectionGrow) return kMaxSelectionGrow;
+  return value;
+}
+
+/* 扩展/收缩步进：小半径 ±1、中段 ±5、大半径 ±10（与羽化同一手感）。 */
+inline int step_selection_grow(int radius, int direction) {
+  const int current = clamp_selection_grow(radius);
+  const int step = current < 10 ? 1 : (current < 50 ? 5 : 10);
+  const int next = current + (direction > 0 ? step : -step);
+  return next < kMinSelectionGrow ? kMinSelectionGrow : (next > kMaxSelectionGrow ? kMaxSelectionGrow : next);
+}
+
 /* ------------------------------------------------------------ 钢笔路径（S8） */
 
 /*

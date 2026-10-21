@@ -206,6 +206,15 @@
 [OK] pen path selection is exactly one undo step
 [OK] pen preview polyline closes back onto the first anchor
 [OK] comp_document_undo(pen path selection step)
+[OK] comp_selection_apply_shape(rect 20x20) is the P0-4 fixture
+[OK] comp_selection_modify(EXPAND, 3) grows the selection 3 px per side
+[OK] one undo returns the expanded selection to 20x20
+[OK] comp_selection_modify(CONTRACT, 3) shrinks the selection 3 px per side
+[OK] one undo returns the contracted selection to 20x20
+[OK] comp_selection_modify(EXPAND, 0) is rejected before touching the selection
+[OK] comp_selection_load_layer(LOAD_PIXELS, threshold 1) selects every opaque pixel
+[OK] comp_document_undo(load layer pixels step)
+[OK] deselect after the P0-4 probes
 [OK] comp_layer_remove(wand fixture) keeps later flatten assertions honest
 [OK] deselect after the S7 probes restores the S6 precondition
 [OK] ui_core tool_shortcut_target(E) toggles brush/eraser

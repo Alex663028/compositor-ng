@@ -882,6 +882,28 @@ COMP_TEST(ui_core_selection_feather_steps_are_clamped) {
   COMP_CHECK(comp_ui::step_selection_feather(250, -1) == 240);
 }
 
+/* ------------------------------------------- P0-4: 扩展 / 收缩半径 */
+
+COMP_TEST(ui_core_selection_grow_clamps_to_engine_range) {
+  /* 下限是 1：引擎把 0 当 INVALID_ARGUMENT，面板不能把 0 递下去。 */
+  COMP_CHECK(comp_ui::clamp_selection_grow(0) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_grow(-7) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_grow(1) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_grow(500) == 500);
+  COMP_CHECK(comp_ui::clamp_selection_grow(501) == 500);
+
+  COMP_CHECK(comp_ui::step_selection_grow(1, -1) == 1);
+  COMP_CHECK(comp_ui::step_selection_grow(1, 1) == 2);
+  COMP_CHECK(comp_ui::step_selection_grow(9, 1) == 10);
+  COMP_CHECK(comp_ui::step_selection_grow(10, 1) == 15);
+  COMP_CHECK(comp_ui::step_selection_grow(50, 1) == 60);
+  COMP_CHECK(comp_ui::step_selection_grow(500, 1) == 500);
+  COMP_CHECK(comp_ui::step_selection_grow(500, -1) == 490);
+  /* 步进不能把值推到下限以下（与羽化的 0 语义不同）：方向只决定加减。 */
+  COMP_CHECK(comp_ui::step_selection_grow(3, -5) == 2);
+  COMP_CHECK(comp_ui::step_selection_grow(1, -5) == 1);
+}
+
 /* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
 
 COMP_TEST(ui_core_pen_anchors_build_symmetric_segments) {

@@ -153,6 +153,10 @@ constexpr UINT kCmdViewZoomOut = 1030;
 constexpr UINT kCmdSelectAll = 1031;
 constexpr UINT kCmdSelectNone = 1032;
 constexpr UINT kCmdSelectInvert = 1033;
+/* P0-4：扩展/收缩走同一个键入态（op 由菜单项决定），载入用当前图层像素。 */
+constexpr UINT kCmdSelectExpand = 1047;
+constexpr UINT kCmdSelectContract = 1048;
+constexpr UINT kCmdSelectLoadPixels = 1049;
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -417,6 +421,14 @@ struct ShellState {
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
+  /*
+   * 扩展/收缩（P0-4）：同一个键入态服务两个菜单项，op 记住这次是扩还是缩，
+   * 回车时才真正调 comp_selection_modify。0 被引擎拒（见 ui_core 的
+   * kMinSelectionGrow 注释），所以这里额外记一版「上次用的半径」给提示用。
+   */
+  comp_selection_modify_op modify_op = COMP_SELECTION_EXPAND;
+  std::wstring modify_input; /* 扩展/收缩半径键入缓冲；非空 = 输入态 */
+  int selection_grow = comp_ui::kMinSelectionGrow;
   /*
    * 钢笔路径（S8）：锚点与控制柄都在文档坐标；pen_dragging = 按下后正在拖
    * 最后一个锚点的控制柄。路径本身不产生撤销步，Enter/点首锚点才提交选区。
@@ -3225,6 +3237,112 @@ void commit_feather_input(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* --------------------------------------------------- 扩展 / 收缩（P0-4） */
+
+/*
+ * 扩展与收缩共用一套键入态：菜单点哪条只决定 modify_op，半径的键入/退格/
+ * 回车/Esc 语义完全一致（与羽化同款），所以不做两份状态机。
+ */
+const wchar_t* modify_op_name(comp_selection_modify_op op) {
+  return op == COMP_SELECTION_CONTRACT ? L"收缩" : L"扩展";
+}
+
+void refresh_modify_input_status(ShellState& shell) {
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"选区%s：%s px（回车应用 / Esc 取消，%d..%d）",
+            modify_op_name(shell.modify_op), shell.modify_input.c_str(),
+            comp_ui::kMinSelectionGrow, comp_ui::kMaxSelectionGrow);
+  set_status(shell, buffer);
+}
+
+void begin_modify_input(ShellState& shell, comp_selection_modify_op op) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"选区：还没有文档");
+    return;
+  }
+  /* 空选区扩展没有意义（引擎会如实返回无变化），先在入口拦下来。 */
+  if (!shell.selection_active) {
+    set_status(shell, L"选区：先建立一个选区，再扩展/收缩");
+    return;
+  }
+  shell.modify_op = op;
+  shell.modify_input.clear();
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"选区%s：键入 %d..%d px 后回车（上次 %d px）",
+            modify_op_name(op), comp_ui::kMinSelectionGrow, comp_ui::kMaxSelectionGrow,
+            shell.selection_grow);
+  set_status(shell, buffer);
+}
+
+void commit_modify_input(ShellState& shell) {
+  const int typed = _wtoi(shell.modify_input.c_str());
+  shell.modify_input.clear();
+  /* 0 是「用户还没键入」的常见残留，按下限 1 处理会有 1px 的意外扩展，
+   * 所以 0 先拦成提示，不写进画布也不占撤销步。 */
+  if (typed <= 0) {
+    set_status(shell, L"选区：半径必须 ≥ 1 px（未改动）");
+    return;
+  }
+  if (shell.document == nullptr) {
+    set_status(shell, L"选区：还没有文档");
+    return;
+  }
+  if (!shell.selection_active) {
+    set_status(shell, L"选区：当前没有选区可改");
+    return;
+  }
+  const int value = comp_ui::clamp_selection_grow(typed);
+  shell.selection_grow = value;
+
+  int32_t changed = 0;
+  if (comp_selection_modify(shell.document, shell.modify_op, value, &changed) != COMP_OK) {
+    set_status(shell, L"选区修改失败（半径超出引擎量程？）");
+    return;
+  }
+
+  wchar_t buffer[224];
+  if (changed == 0) {
+    /* changed = 0 只表示引擎没动蒙版（例如收缩把选区收空了不在此列——
+     * 空选区也算一次真实变化）。 */
+    wsprintfW(buffer, L"选区%s %d px：无变化", modify_op_name(shell.modify_op), value);
+  } else {
+    wsprintfW(buffer, L"已将选区%s %d px（撤销一步）", modify_op_name(shell.modify_op), value);
+  }
+  finish_selection_command(shell, buffer);
+}
+
+/*
+ * 按图层像素载入选区（P0-4）：threshold 是 alpha 下限，取 1 = 「任何有像素的
+ * 地方都算选中」。取 0 会把全透明像素也算进去（等于全选），不是「按内容载入」
+ * 的本意；面板将来给阈值时再放出来。
+ */
+void load_layer_pixels_selection(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"选区：还没有文档");
+    return;
+  }
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"选区：先选中一个图层");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_selection_load_layer(shell.document, row->id, COMP_SELECTION_LOAD_PIXELS,
+                                COMP_SELECTION_REPLACE, 1, &changed) != COMP_OK) {
+    set_status(shell, L"按图层像素载入选区失败");
+    return;
+  }
+  if (changed == 0) {
+    refresh_selection(shell);
+    refresh_history_status(shell, L"按图层像素载入选区：该层没有不透明像素");
+    return;
+  }
+  const std::wstring name = widen_utf8(row->name);
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"已按图层「%s」的像素载入选区", name.c_str());
+  finish_selection_command(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 套索（S7） */
 
 bool lasso_available(const ShellState& shell) {
@@ -4860,6 +4978,16 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdSelectInvert:
       invert_selection(shell);
+      break;
+    /* ---- P0-4：扩展 / 收缩 / 按图层像素载入选区 ---- */
+    case kCmdSelectExpand:
+      begin_modify_input(shell, COMP_SELECTION_EXPAND);
+      break;
+    case kCmdSelectContract:
+      begin_modify_input(shell, COMP_SELECTION_CONTRACT);
+      break;
+    case kCmdSelectLoadPixels:
+      load_layer_pixels_selection(shell);
       break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
@@ -7200,6 +7328,33 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
 
+  /* 扩展/收缩半径键入态（P0-4）：同款输入机，回车才落盘（一步撤销）。 */
+  if (!shell.modify_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.modify_input.clear();
+      set_status(shell, L"已取消选区修改");
+      return;
+    }
+    if (key == VK_BACK) {
+      shell.modify_input.pop_back();
+      if (shell.modify_input.empty()) {
+        set_status(shell, L"已取消选区修改");
+      } else {
+        refresh_modify_input_status(shell);
+      }
+      return;
+    }
+    if (key == VK_RETURN) {
+      commit_modify_input(shell);
+      return;
+    }
+    if (key >= '0' && key <= '9' && shell.modify_input.size() < 3) {
+      shell.modify_input.push_back(static_cast<wchar_t>(key));
+      refresh_modify_input_status(shell);
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
   /* 滤镜面板输入态：与调整面板同一套输入规矩，但目标值是滤镜参数。 */
   if (!shell.filter_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -8726,10 +8881,7 @@ HMENU build_menu() {
   AppendMenuW(edit_menu, MF_STRING, kCmdUndo, L"撤销(&U)\tCtrl+Z");
   AppendMenuW(edit_menu, MF_STRING, kCmdRedo, L"重做(&R)\tCtrl+Y");
   AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(edit_menu, MF_STRING, kCmdSelectAll, L"全选(&A)\tCtrl+A");
-  AppendMenuW(edit_menu, MF_STRING, kCmdSelectNone, L"取消选择(&D)\tCtrl+D");
-  AppendMenuW(edit_menu, MF_STRING, kCmdSelectInvert, L"反选(&I)\tCtrl+Shift+I");
-  AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
+  /* 选区三条（全选/取消/反选）已搬到单独的「选择」菜单，ID 不变。 */
   AppendMenuW(edit_menu, MF_STRING, kCmdListCommands, L"枚举引擎命令(&L)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit_menu), L"编辑(&E)");
 
@@ -8843,6 +8995,23 @@ HMENU build_menu() {
   }
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sampling_menu), L"采样模式(&Q)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
+
+  /*
+   * P0-4：把选区命令从「编辑」里拆出来，单列一个菜单。全选/取消/反选三条
+   * 只搬位置、ID 不变（handle_key 与菜单共用 run_shell_command，两条入口不会分叉）；
+   * 新增的三条此前壳里没有入口——引擎的 comp_selection_modify(EXPAND/CONTRACT)
+   * 与 comp_selection_load_layer(LOAD_PIXELS) 早已实现并有单测，缺的只是 UI。
+   */
+  HMENU select_menu = CreatePopupMenu();
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectAll, L"全选(&A)\tCtrl+A");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectNone, L"取消选择(&D)\tCtrl+D");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectInvert, L"反选(&I)\tCtrl+Shift+I");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectExpand, L"扩展(&E)...");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectContract, L"收缩(&O)...");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(select_menu), L"选择(&S)");
 
   HMENU view_menu = CreatePopupMenu();
   AppendMenuW(view_menu, MF_STRING, kCmdViewFit, L"适合窗口(&F)\tCtrl+0");
@@ -10542,6 +10711,66 @@ int run_selftest(const wchar_t* out_path) {
          "pen preview polyline closes back onto the first anchor");
   verify(comp_document_undo(document) == COMP_OK,
          "comp_document_undo(pen path selection step)");
+
+  /*
+   * P0-4：扩展 / 收缩 / 按图层像素载入选区。
+   * 壳里这三条命令分别接到 begin_modify_input + commit_modify_input 与
+   * load_layer_pixels_selection，参数与这里逐字一致（半径 0 在壳侧就被拦成
+   * 提示，不会打到引擎；这里只验证引擎的量程闸确实会拒 0）。
+   */
+  const float grow_rect[4] = {20.0f, 20.0f, 40.0f, 40.0f};
+  int32_t grow_changed = 0;
+  comp_rect grow_bounds{};
+  const bool grow_fixture_ok =
+      comp_selection_apply_shape(document, COMP_SELECTION_RECT, grow_rect, 2,
+                                 COMP_SELECTION_REPLACE, 1, &grow_changed) == COMP_OK &&
+      grow_changed == 1 && comp_selection_get_bounds(document, &grow_bounds) == COMP_OK &&
+      grow_bounds.w == 20 && grow_bounds.h == 20;
+  verify(grow_fixture_ok, "comp_selection_apply_shape(rect 20x20) is the P0-4 fixture");
+
+  grow_changed = 0;
+  verify(grow_fixture_ok &&
+             comp_selection_modify(document, COMP_SELECTION_EXPAND, 3, &grow_changed) == COMP_OK &&
+             grow_changed == 1 &&
+             comp_selection_get_bounds(document, &grow_bounds) == COMP_OK &&
+             grow_bounds.w == 26 && grow_bounds.h == 26,
+         "comp_selection_modify(EXPAND, 3) grows the selection 3 px per side");
+  verify(grow_fixture_ok && comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_bounds(document, &grow_bounds) == COMP_OK &&
+             grow_bounds.w == 20 && grow_bounds.h == 20,
+         "one undo returns the expanded selection to 20x20");
+
+  grow_changed = 0;
+  verify(grow_fixture_ok &&
+             comp_selection_modify(document, COMP_SELECTION_CONTRACT, 3, &grow_changed) == COMP_OK &&
+             grow_changed == 1 &&
+             comp_selection_get_bounds(document, &grow_bounds) == COMP_OK &&
+             grow_bounds.w == 14 && grow_bounds.h == 14,
+         "comp_selection_modify(CONTRACT, 3) shrinks the selection 3 px per side");
+  verify(grow_fixture_ok && comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_bounds(document, &grow_bounds) == COMP_OK &&
+             grow_bounds.w == 20 && grow_bounds.h == 20,
+         "one undo returns the contracted selection to 20x20");
+  grow_changed = 99;
+  verify(comp_selection_modify(document, COMP_SELECTION_EXPAND, 0, &grow_changed) ==
+                 COMP_ERR_INVALID_ARGUMENT &&
+             grow_changed == 99,
+         "comp_selection_modify(EXPAND, 0) is rejected before touching the selection");
+
+  /* 按图层像素载入：测试图两半都不透明，所以左右各取样点都应被选中。 */
+  grow_changed = 99;
+  verify(wand_fixture_ok &&
+             comp_selection_load_layer(document, wand_layer, COMP_SELECTION_LOAD_PIXELS,
+                                      COMP_SELECTION_REPLACE, 1, &grow_changed) == COMP_OK &&
+             grow_changed == 1 &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 255 &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 255,
+         "comp_selection_load_layer(LOAD_PIXELS, threshold 1) selects every opaque pixel");
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(load layer pixels step)");
+  verify(comp_selection_deselect(document, &deselect_changed) == COMP_OK,
+         "deselect after the P0-4 probes");
 
 
   /* 测试图用完即删：它是全画布不透明层，留着会盖住后面 S6 的 flatten 断言。 */
