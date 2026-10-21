@@ -409,6 +409,23 @@ struct ShellState {
   comp_ui::Point move_start{};
   comp_ui::Point move_current{};
   bool move_duplicate = false;
+  /*
+   * 整层拖动（Move 工具、无选区时，S21 补的鼠标入口）：与上面的选区搬移是两件事
+   * ——它只改图层的 transform（origin 平移），像素一个字节都不搬。
+   * 拖动期间在一个显式事务里实时写 transform（所见即所得），松手 commit = 一步撤销；
+   * 失焦 / 捕获丢失 / Esc 走 abort 回滚。txn 属于 layer_move_doc，换文档后旧句柄
+   * 随文档一起失效，**不能再 abort**（与 color_range 同一 UAF 规则）。
+   */
+  bool layer_move_active = false;
+  bool layer_move_dirty = false;
+  comp_document layer_move_doc = nullptr;
+  comp_txn layer_move_txn = nullptr;
+  comp_layer_id layer_move_id = 0;
+  comp_rect layer_move_base{};
+  float layer_move_rotation = 0.0f;
+  comp_ui::Point layer_move_start{};
+  int32_t layer_move_applied_dx = 0;
+  int32_t layer_move_applied_dy = 0;
   /* 吸管拖拽（S6）：按住拖动时连续取样；只读，不产生撤销步。 */
   bool eyedropper_drag = false;
   /*
@@ -5849,10 +5866,123 @@ bool move_available(const ShellState& shell) {
   return shell.document != nullptr && shell.tool == comp_ui::ToolId::Move;
 }
 
+/*
+ * 整层拖动（Move 工具、无选区）。与选区搬移分开实现：
+ *   - 选区搬移改的是**像素**（comp_selection_move_pixels），只动当前图层选区内的字节；
+ *   - 整层拖动改的是**transform 的 origin**（comp_layer_set_transform），像素不动。
+ * 上游 V 在没有选区时拖的是整层，这里对齐该语义。
+ *
+ * 拖动期间实时写 transform（所见即所得），与调整滑杆同一套事务写法：
+ * 按下开显式事务，途中每个整数像素变化写一次（ImplicitTxn 加入该事务），
+ * 松手 commit = 恰好一步撤销；失焦 / 捕获丢失 / Esc abort 回滚到按下前。
+ */
+void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"移动：请先选择一个图层");
+    return;
+  }
+  /* 组的 transform 不参与合成（filter_graph 只烘焙成员），写进去等于静默无操作。 */
+  if (row->is_group != 0) {
+    set_status(shell, L"移动：组图层不参与 transform 合成，暂不支持整组拖动");
+    return;
+  }
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
+    set_status(shell, L"移动：读取图层变换失败");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Move Layer", &txn) != COMP_OK) {
+    set_status(shell, L"移动：无法开始事务");
+    return;
+  }
+  shell.layer_move_active = true;
+  shell.layer_move_dirty = false;
+  shell.layer_move_doc = shell.document;
+  shell.layer_move_txn = txn;
+  shell.layer_move_id = row->id;
+  shell.layer_move_base = transform;
+  shell.layer_move_rotation = rotation;
+  shell.layer_move_start =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.layer_move_applied_dx = 0;
+  shell.layer_move_applied_dy = 0;
+  SetCapture(window);
+
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"移动图层：拖动改变位置（松开算一步撤销），当前 (%d, %d)", transform.x,
+            transform.y);
+  set_status(shell, buffer);
+}
+
+void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.layer_move_active) return;
+  /* 换文档后旧事务随旧文档失效：宁可不动，也不要写进新文档。 */
+  if (shell.document == nullptr || shell.document != shell.layer_move_doc) return;
+
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const int32_t dx = static_cast<int32_t>(std::lround(doc.x - shell.layer_move_start.x));
+  const int32_t dy = static_cast<int32_t>(std::lround(doc.y - shell.layer_move_start.y));
+  if (dx == shell.layer_move_applied_dx && dy == shell.layer_move_applied_dy) return;
+
+  comp_rect target = shell.layer_move_base;
+  target.x += dx;
+  target.y += dy;
+  if (comp_layer_set_transform(shell.document, shell.layer_move_id, target,
+                               shell.layer_move_rotation) != COMP_OK) {
+    return;
+  }
+  shell.layer_move_applied_dx = dx;
+  shell.layer_move_applied_dy = dy;
+  shell.layer_move_dirty = true;
+  shell.needs_render = true;
+
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x, target.y, dx,
+            dy);
+  set_status(shell, buffer);
+}
+
+void layer_move_end(HWND window, ShellState& shell) {
+  if (!shell.layer_move_active) return;
+
+  /* 与滑杆同一顺序：先清状态再 ReleaseCapture，捕获变更会重入 move_cancel。 */
+  const comp_txn txn = shell.layer_move_txn;
+  const bool dirty = shell.layer_move_dirty;
+  const int32_t dx = shell.layer_move_applied_dx;
+  const int32_t dy = shell.layer_move_applied_dy;
+  shell.layer_move_active = false;
+  shell.layer_move_dirty = false;
+  shell.layer_move_doc = nullptr;
+  shell.layer_move_txn = nullptr;
+  ReleaseCapture();
+
+  if (txn == nullptr) return;
+  if (!dirty) {
+    /* 只点不拖：空事务不该占一步撤销。 */
+    comp_txn_abort(txn);
+    set_status(shell, L"移动：位置未变化");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"移动图层：提交失败");
+    return;
+  }
+
+  shell.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+  refresh_history_status(shell, buffer);
+}
+
 void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
   if (!move_available(shell)) return;
   if (!shell.selection_active) {
-    set_status(shell, L"移动：当前没有选区（先用选框建立选区）");
+    /* 无选区 = 拖整层（上游 V 的默认行为），不再当成错误。 */
+    layer_move_begin(window, shell, x, y, layout);
     return;
   }
   const comp_ui::Point doc =
@@ -5868,14 +5998,36 @@ void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
 }
 
 void move_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (shell.layer_move_active) {
+    layer_move_extend(shell, x, y, layout);
+    return;
+  }
   if (!shell.move_active) return;
   shell.move_current =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
 }
 
-void move_cancel(ShellState& shell) { shell.move_active = false; }
+void move_cancel(ShellState& shell) {
+  /*
+   * 换文档路径也会走到这里，而那时旧文档已经 destroy：事务句柄随文档失效，
+   * abort 会打到已释放对象上（UAF）。与 color_range 同一规则——只有当事务
+   * 属于**当前**文档时才 abort。
+   */
+  if (shell.layer_move_txn != nullptr && shell.layer_move_doc == shell.document) {
+    comp_txn_abort(shell.layer_move_txn);
+  }
+  shell.layer_move_txn = nullptr;
+  shell.layer_move_doc = nullptr;
+  shell.layer_move_active = false;
+  shell.layer_move_dirty = false;
+  shell.move_active = false;
+}
 
 void move_end(HWND window, ShellState& shell) {
+  if (shell.layer_move_active) {
+    layer_move_end(window, shell);
+    return;
+  }
   if (!shell.move_active) return;
   shell.move_active = false;
   ReleaseCapture();
@@ -9668,6 +9820,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     InvalidateRect(window, nullptr, FALSE);
     return;
   }
+  /* Move 工具拖图层：Esc 放弃这次位移（abort 事务 = 位置回到按下时）。 */
+  if (shell.layer_move_active && key == VK_ESCAPE) {
+    move_cancel(shell);
+    set_status(shell, L"已取消移动，图层位置未改变");
+    InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
   /*
    * P0-3：曲线页按 Delete = 删除焦点控制点。必须在图层删除命令之前判——
    * 那边 Delete 是「删图层」，正在调曲线时按到会整层消失。
@@ -10788,7 +10947,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
-      if (shell != nullptr && shell->move_active) {
+      if (shell != nullptr && (shell->move_active || shell->layer_move_active)) {
         move_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -10842,7 +11001,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         adjust_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
+        /* 整层拖动被 abort 后画面必须重画，否则图层会「停在」被拖到的位置。 */
+        const bool layer_move_was_active = shell->layer_move_active;
         move_cancel(*shell);
+        if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         lasso_cancel(*shell);
@@ -10864,7 +11026,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         adjust_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
+        /* 同上：捕获被抢走时整层拖动也要回滚并重画。 */
+        const bool layer_move_was_active = shell->layer_move_active;
         move_cancel(*shell);
+        if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         lasso_cancel(*shell);
@@ -10914,7 +11079,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
-          if (shell->move_active) {
+          if (shell->move_active || shell->layer_move_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->crop_active) {

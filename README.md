@@ -4433,6 +4433,50 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 文档：`docs/shell-parity.md` §5.23，`docs/manual-test.md` M12 补步 6–8。
 遗留：拖出矩形缩放到该区域（marquee zoom）、双击 = 实际像素、缩放光标形态。
 
+### 6.51 Move 工具拖拽图层（2026-10-21，Claude）
+
+**同一把工具、两种对象。** Move（`V`）原来只认选区：有选区就搬像素，
+没有选区直接报错「移动：请先选择一个图层」——虽然那条文案本来就暗示了用户想要什么。
+图层 transform 的写入侧（`comp_layer_set_transform`）、读取侧（`comp_layer_get_transform`）
+和旋转字段都已在 ABI 里，缺的一直是壳侧的拖动循环，所以 §5.11 表里只能写「未做」。
+
+**分流规则。** `move_begin` 按下时看 `selection_active`：有选区 → 原路径不动
+（选区像素搬运、松开时一次性提交、预览靠蚂蚁线跟随）；无选区但有选中图层 →
+新路径 `layer_move_begin`。这条规则把 Photoshop 那个「选区内外行为不同」的坑
+缩到最小：本项只做「没有选区时拖图层」，有选区时仍然只动像素，
+不会出现「拖了一下，像素和图层一起动」。
+
+**一次拖动 = 一步撤销。** 按下时 `comp_txn_begin("Move Layer")`，
+`layer_move_extend` 每次鼠标移动用 `base + (doc - start)` 重算目标矩形并调
+`comp_layer_set_transform`——**目标始终由按下时的基准矩形推导**，不在上一帧结果上累加，
+所以来回拖动不会因取整而漂移。因为写的是真 transform，渲染管线直接就能画对，
+旋转过的图层也不需要额外几何预览代码。松开时 `comp_txn_commit`，
+没动过（`dx == dy == 0`）则 `comp_txn_abort` 并写「位置未变化」，不产生空撤销步。
+
+**两个容易踩的地方。** 一是顺序：`layer_move_end` 必须**先清状态再
+`ReleaseCapture()`**，因为捕获变更会同步重入 `WM_CAPTURECHANGED → move_cancel`，
+顺序反了就会把刚提交的事务 abort 掉。二是换文档：`move_cancel` 在三条
+打开/新建/关闭路径上都在旧文档 `destroy` 之后才被调用，此时
+`shell.document != shell.layer_move_doc`，所以 abort 前必须比对这个句柄
+——这是 `forget_color_range` 那条注释写的同一个坑，abort 一个已释放文档的事务就是 UAF。
+
+**取消。** `Esc` 走 `move_cancel`（abort 回滚到按下时的位置，写「已取消移动，
+图层位置未改变」）；失焦、捕获丢失同样走 `move_cancel`。选区路径与图层路径共用
+`move_cancel`，它内部对两条路都做清理，所以不存在「切了一半留下的 active 标志」。
+
+**组图层直接拒绝。** 组的 `transform` 不参与合成——`filter_graph` 只烘焙成员，
+组节点不读自己的 transform（`engine/compositing/composite_ops.cpp:472` 明确拒绝
+烘焙组）。所以拖组即便写成功也是**静默无操作**，不如按组时报
+「组图层不参与 transform 合成，暂不支持整组拖动」，让用户知道该拖组里的成员。
+
+**验证。** 纯外壳改动，无新增单测（`ui_core` 不参与）。单测 **589 例 / 0 失败**；
+PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.24（并回填 §5.11 表格），`docs/manual-test.md` M27。
+遗留：`Alt` 拖动 = 边移边复制图层、方向键微调、拖出画布时的位置提示、
+旋转/缩放手柄（transform 的尺寸与角度目前只能由引擎侧命令改）、
+组图层整体移动（要先让合成侧读组 transform）。
+
 
 
 

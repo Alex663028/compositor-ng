@@ -396,7 +396,7 @@ CPU 烘焙后照样上 GPU，§6.27），仍整篇回落的是调整层与 HDR/R
 
 | 缺口 | 状态 | 原因 |
 |------|------|------|
-| Move 工具拖拽平移图层 | 未做 | 需图层 transform 写入侧与像素回读配合；现有 `comp_layer_*` 不足以在不猜语义的前提下实现 |
+| Move 工具拖拽平移图层 | 已做（2026-10-21，§5.24） | 无选区 + 选中图层时拖动 = 改 transform；一次拖动一步撤销 |
 | 工具按钮图标 | 未做 | 当前为文字快捷键字母，避免引入图标资源/字体 |
 | 选区羽化 / 扩缩手柄 | 未做 | ABI `comp_selection_modify` 已有；壳层只接了矩形框选与全选/取消/反选 |
 | Brush/Eraser 逐笔撤销粒度 | 部分做 | 已有可视笔迹预览与笔尖轮廓；Brush/Eraser 的像素提交仍走既有 Stroke 通路 |
@@ -1025,6 +1025,44 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 
 **5. 仍未做。** ① 拖出矩形缩放（marquee zoom）到该区域；② 双击画布 = 实际像素；
 ③ 缩放光标（放大镜 +/- 形态，壳目前统用箭头）；④ 拖动时连续缩放（上游是点按式）。
+
+### 5.24 Move 工具拖拽图层（2026-10-21）
+
+**1. 分流规则。** `move_begin` 按下时看 `shell.selection_active`：有选区 → 走原路径
+（搬选区像素，松开时一次性提交，预览靠蚂蚁线跟随）；无选区且有选中图层 →
+走新路径 `layer_move_begin`。两者互斥，不会出现「像素和图层一起动」。
+组图层直接拒绝（「组图层不参与 transform 合成，暂不支持整组拖动」）：
+`filter_graph` 只烘焙成员、组节点不读自己的 transform，写进去是静默无操作。
+
+**2. 一次拖动 = 一步撤销。** 按下时 `comp_txn_begin(document, "Move Layer")`；
+每次移动用 `base + (doc - start)` **重新推导**目标矩形再调
+`comp_layer_set_transform(document, id, target, rotation)`——不在上一帧结果上累加，
+来回拖动不会因取整漂移；写的是真 transform，旋转过的图层由渲染管线直接画对，
+不需要额外的几何预览代码。松开 `comp_txn_commit`；`dx == dy == 0` 则
+`comp_txn_abort` 并写「位置未变化」，不留空撤销步。
+
+**3. 先清状态，再 `ReleaseCapture()`。** 捕获变更会同步重入
+`WM_CAPTURECHANGED → move_cancel`，顺序反了会把刚提交的事务 abort 掉——
+与调整滑杆的 `*_drag_finish` 是同一条规矩。
+
+**4. 换文档必须比对句柄。** `move_cancel` 在打开位图 / 新建 / 关闭三条路径上
+都在旧文档 `destroy` **之后**才被调用；此时 `shell.document != shell.layer_move_doc`，
+若照旧 `comp_txn_abort` 就是 UAF。守卫条件与 `forget_color_range` 的注释同源。
+
+**5. 取消与调用点。** `Esc` / 失焦 / 捕获丢失 → `move_cancel`（abort 回滚，
+「已取消移动，图层位置未改变」）；三个入口都做两条路径的清理，不会留下 active 残标。
+`WM_MOUSEMOVE` 与 `WM_LBUTTONUP` 的分发条件都已放宽为
+`move_active || layer_move_active`（否则图层拖动收不到移动与提交）。
+
+**6. 验证。** 纯外壳改动，无新增单测。单测 **589 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M27**。
+
+**7. 仍未做。** ① `Alt` 拖动 = 边移边复制图层；② 方向键微调；③ 拖出画布的位置提示；
+④ 旋转 / 缩放手柄（transform 的尺寸与角度目前只能由引擎侧命令改）；
+⑤ PS 那个「拖选区外 = 移图层」的细节本项不模拟（有选区就只搬像素）；
+⑥ 组图层整体移动——必须先让合成侧读组的 transform，壳侧才有意义。
 
 
 
