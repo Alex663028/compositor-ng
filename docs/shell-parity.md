@@ -966,8 +966,9 @@ Tab / Shift+Tab 切行（夹住不环绕）；`-` / `=` 对基准行循环三档
 一格」——归因成本极高，所以这条规则放进 `ui_core.h` 并有单测钉住。
 
 **2. 交互与状态机。** Alt+点击画布 = 落源点（吸附到整数像素，清零偏移），
-不进入笔迹、不落撤销步；Shift+Alt+点击 = `sample_all_layers`（整篇合成取样，
-否则只取目标图层）。普通按下 / 拖动 = `StrokeKind::Clone` 笔迹，单击也是一记 dab。
+不进入笔迹、不落撤销步；Shift+Alt+点击 = 把 `sample_all_layers` 置为整篇合成并保持
+（否则只取目标图层），随时切换走 `Shift+K`（§5.31）。普通按下 / 拖动 =
+`StrokeKind::Clone` 笔迹，单击也是一记 dab。
 未设源点时按下不捕获，状态栏直接写「先 Alt+点击画布设置源点」。
 源点在一个工具会话内保留（切走再切回仍有效，与上游一致）；**换文档必须复位**：
 新建 / `load_document` / 拖入位图三条路径都调 `clone_reset_source`——旧文档的源点
@@ -992,8 +993,8 @@ seed 0）与画笔、Retouch、历史记录画笔完全一致；`clone.opacity` 
 **6/6 通过**；`build_windows_shell.py` 零警告。目视项见 `docs/manual-test.md` **M26**。
 
 **6. 仍未做。** ① Spot Healing（`J`）已接线，见 §5.25；
-② 不透明度与「对齐」开关已在 §5.26 补齐；③ `sample_all_layers` 仍无菜单勾选态
-（只能 Shift+Alt+点击临时指定）。
+② 不透明度与「对齐」开关已在 §5.26 补齐；③ `sample_all_layers` 的持久勾选态已在
+§5.31 补齐（`Shift+K`）。
 
 ### 5.23 缩放工具（`Z`）接线（2026-10-21）
 
@@ -1144,8 +1145,8 @@ Shift 组合最省记忆；不带 Shift 的 `S` 仍是选工具。语义直接�
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M26** 补步 13–17。
 
-**7. 仍未做。** `sample_all_layers` 没有持久勾选态（只能 Shift+Alt+点击临时指定），
-与上游选项栏的差别只剩这一项。
+**7. 仍未做。** 无。`sample_all_layers` 的持久开关已在 §5.31 补齐（`Shift+K`），
+与上游选项栏的差别只剩「选项不落盘」。
 
 ### 5.27 缩放工具补齐：拖框 / 双击 100% / 放大镜光标（2026-10-21）
 
@@ -1279,6 +1280,32 @@ Move 工具下用户正在摆图层，与上游语义一致。`Shift` 维持 1 p
 
 **5. 仍未做。** 每按一次 = 一步撤销（上游把连续微调合成一步）；要合并得做按键节流，
 否则按住方向键会把历史面板刷满。
+
+### 5.31 仿制图章：取样范围做成持久开关（2026-10-21）
+
+**1. 缺口。** §5.22 遗留 ③ / §5.26 遗留 ⑦。`sample_all_layers` 只有
+`Shift+Alt+点击` 一条入口，且 `clone_pick_source` 无条件写 `= shift_held`——
+换一次源点就把口径清回「当前图层」。上游是选项栏里的持久勾选，壳没有选项栏。
+
+**2. 键位 `Shift+K`。** 复用 `Shift+S` 切对齐的记法：`Shift + 工具字母 = 工具选项`，
+只在仿制工具激活时拦截。不用 `Shift+A`（Sample All 首字母）因为 `a` 是 Select 工具的
+键位，拦截会把「按 A 回选择工具」抢走；`k` 不在 `tool_table` 里。`Alt+字母` 也走不通：
+它由 `WM_SYSKEYDOWN` 派发，`WM_KEYDOWN` 分支收不到（与 §6.56 的 Alt 拖动同一个坑）。
+
+**3. 两处语义修改，零新增状态。** ① `clone_toggle_sample_all(shell)` 翻转
+`clone_sample_all` 并回一条带去向的提示；② `clone_pick_source` 改为「按住 Shift 才
+置真」——`Shift+Alt+点击` 仍可直接置为整篇合成（并保持），不带 Shift 的换源点则保留选项。
+换文档仍由 `clone_reset_source` 连同源点一起复位（源点属旧文档的像素网格）。
+读取点不变：`clone_stroke_end` 的 `desc.clone.sample_all_layers`，所以切换对下一笔生效，
+已提交的笔画不受影响。工具栏「源 x,y 图层/合并」每帧现读，无需刷新。
+
+**4. 验证。** 纯外壳改动，无新增单测。单测 **591 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M26 步 18–21**。
+
+**5. 仍未做。** 选项不落盘：退出重开回到「当前图层」（上游写进偏好设置）。
+
 
 
 

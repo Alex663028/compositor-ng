@@ -317,6 +317,12 @@ struct ShellState {
   bool clone_has_offset = false;
   double clone_offset_x = 0.0;
   double clone_offset_y = 0.0;
+  /*
+   * 取样范围是**持久选项**（同上游选项栏的 Sample: Current Layer / All Layers）：
+   * Shift+K 切换，之后每一笔、以及换源点都沿用。Shift+Alt+点击是它的快捷键——
+   * 直接把选项置为「整篇合成」并保持，而不是只对本次点击生效。
+   * 换文档时随源点一起复位（见 clone_reset_source）。
+   */
   bool clone_sample_all = false;
   /*
    * 仿制选项：不透明度与「对齐」。对齐关 = 每一笔都以源点重新对位（offset 不携带），
@@ -5705,7 +5711,20 @@ void clone_reset_source(ShellState& shell) {
   shell.clone_sample_all = false;
 }
 
-/* Alt+点击：只落源点，不改像素（同时按住 Shift = 整篇合成取样）。 */
+/*
+ * 取样范围开关（Shift+K）。上游把它做成选项栏里的持久勾选；本壳没有选项栏，
+ * 沿用 Shift+S 切对齐的记法。这里只翻状态：真正读它的地方是 clone_stroke_end
+ * 的 desc.clone.sample_all_layers，所以切完立刻对下一笔生效。
+ */
+void clone_toggle_sample_all(ShellState& shell) {
+  shell.clone_sample_all = !shell.clone_sample_all;
+  set_status(shell,
+             shell.clone_sample_all
+                 ? L"仿制取样：整篇合成（Shift+K 切回当前图层）"
+                 : L"仿制取样：当前图层（Shift+K 切到整篇合成）");
+}
+
+/* Alt+点击：只落源点，不改像素（同时按住 Shift = 把取样范围置为整篇合成并保持）。 */
 void clone_pick_source(ShellState& shell, int x, int y, const Layout& layout) {
   if (!clone_stroke_available(shell)) return;
   const comp_ui::Point doc =
@@ -5721,7 +5740,11 @@ void clone_pick_source(ShellState& shell, int x, int y, const Layout& layout) {
   shell.clone_source_x = std::floor(doc.x); /* 吸附到像素：偏移也随之为整数 */
   shell.clone_source_y = std::floor(doc.y);
   shell.clone_has_offset = false; /* 换源点 = 重算首笔偏移 */
-  shell.clone_sample_all = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  /*
+   * 按住 Shift = 把选项置为「整篇合成」并保持（等价于按 Shift+K 切到合并）；
+   * 不带 Shift 时保留选项栏的持久态，不再把它写回「当前图层」。
+   */
+  if (GetKeyState(VK_SHIFT) & 0x8000) shell.clone_sample_all = true;
   wchar_t buffer[224];
   wsprintfW(buffer, L"仿制图章：源点 (%d, %d)｜%s取样｜拖动开始仿制",
             static_cast<int>(shell.clone_source_x), static_cast<int>(shell.clone_source_y),
@@ -5733,7 +5756,7 @@ void clone_stroke_begin(HWND window, ShellState& shell, int x, int y,
                         const Layout& layout) {
   if (!clone_stroke_available(shell)) return;
   if (!shell.clone_source_set) {
-    set_status(shell, L"仿制图章：先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
+    set_status(shell, L"仿制图章：先 Alt+点击画布设置源点（Shift+Alt = 整篇合成，Shift+K 切取样范围）");
     return;
   }
   if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Clone)) return;
@@ -9107,14 +9130,16 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
     if (shell.clone_source_set) {
       wsprintfW(buffer,
                 L"工具：Clone Stamp（S）· 源 (%d, %d) · %s取样｜Alt+点击换源点，"
-                L"Shift+Alt = 整篇合成",
+                L"Shift+Alt = 整篇合成（保持），Shift+K 切取样范围",
                 static_cast<int>(shell.clone_source_x),
                 static_cast<int>(shell.clone_source_y),
                 shell.clone_sample_all ? L"整篇合成" : L"当前图层");
     } else {
       wsprintfW(buffer,
-                L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）；"
-                L"Shift+S 切对齐（%s），Alt+[ / ] 调不透明度（%d%%）",
+                L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成）；"
+                L"Shift+K 切取样范围（%s），Shift+S 切对齐（%s），"
+                L"Alt+[ / ] 调不透明度（%d%%）",
+                shell.clone_sample_all ? L"整篇合成" : L"当前图层",
                 shell.clone_aligned ? L"开" : L"关",
                 static_cast<int>(comp_ui::clamp_clone_opacity(shell.clone_opacity) * 100.0 + 0.5));
     }
@@ -10851,6 +10876,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
                         ? L"仿制对齐：开（整段会话复用首笔偏移；Shift+S 切换）"
                         : L"仿制对齐：关（每一笔都以源点重新对位；Shift+S 切换）");
           set_status(shell, buffer);
+          break;
+        }
+        /*
+         * Shift+K = 仿制取样范围（当前图层 / 整篇合成）的持久开关。K 不在工具键位表里，
+         * 不会抢别的工具的字母；与 Shift+S 同一套「Shift+工具字母 = 工具选项」记法。
+         */
+        if (key == 'K' && shift && shell.tool == comp_ui::ToolId::Clone) {
+          clone_toggle_sample_all(shell);
           break;
         }
         const comp_ui::ToolId id =

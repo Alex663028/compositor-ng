@@ -4378,7 +4378,8 @@ Right / Tolerance，无堆分配；行几何 `trim_row_rect` 同时供绘制与�
 「第一笔对、之后每一笔整体偏一点」，极难归因。
 
 **交互。** Alt+点击画布 = 落源点（不落笔），源点吸附到像素（`floor`）并清零偏移；
-同时按住 Shift = `sample_all_layers`（整篇合成取样，否则只取目标图层）。
+同时按住 Shift = `sample_all_layers`（整篇合成取样，否则只取目标图层；这是选项的
+持久态，`Shift+K` 可随时切换，见 §6.58）。
 普通拖动才落笔；单击也是一记 dab（单点折线）。未设源点时按下不捕获、
 状态栏直接写「先 Alt+点击画布设置源点」。源点跟随会话保留（切走再切回仍有效），
 但**换文档必须复位**：源点是旧文档的像素坐标，新建 / 打开 .comp / 拖入位图三条
@@ -4548,7 +4549,7 @@ Proximity Match），从别的工具切进来一律回到 Content-Aware，避免
 壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.26（并回填 §5.22），`docs/manual-test.md` M26 补步 13–17。
-遗留：`sample_all_layers` 仍没有持久勾选态（只能 Shift+Alt+点击临时指定）。
+遗留：`sample_all_layers` 当时没有持久勾选态（只能 Shift+Alt+点击指定），已在 §6.58 补齐。
 
 ### 6.54 缩放工具补齐：拖框 / 双击 100% / 放大镜光标（2026-10-21，Claude）
 
@@ -4673,6 +4674,39 @@ transform 作为拖动基准（副本若被引擎偏移过，起点不会跳）�
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.30（并回填 §5.24），`docs/manual-test.md` M27 补步 16–17。
 遗留：连续按方向键每按一次 = 一步撤销（上游把连续微调合成一步），要合并得做按键节流。
+
+### 6.58 仿制图章：取样范围做成持久开关（2026-10-21，Claude）
+
+**补掉 §5.26 遗留 ⑦（与 README §6.53 的遗留同一项）。** `sample_all_layers` 此前只有
+一条入口：`Shift+Alt+点击` 设源点的**同时**把取样口径定成「整篇合成」，松手即忘；
+`clone_pick_source` 更是无条件 `= shift_held`，等于每换一次源点就把选项清回「当前图层」。
+上游把它做成选项栏里的持久勾选（Sample: Current Layer / All Layers），壳里没有选项栏，
+所以缺的是两个东西：**能随时切换的键位** + **换源点不会把它冲掉**。
+
+**1. 键位选 `Shift+K`。** 沿用 `Shift+S` 切对齐的「Shift + 工具字母 = 工具选项」记法。
+不选 `Shift+A`（Sample All 首字母）是因为 `a` 是 Select 工具的键位，在仿制工具下拦截
+`Shift+A` 会把「按 A 回选择工具」这条基本操作抢走；`k` 不在工具表里，任何工具下都不冲突。
+`Alt+字母` 另有问题：组合键以 `WM_SYSKEYDOWN` 到达，`WM_KEYDOWN` 分支收不到。
+
+**2. 持久化边界。** 状态本来就存在壳里（`ShellState::clone_sample_all`），所以这一项
+**不需要新字段、不需要新 ABI**，只改两处语义：① 新增 `clone_toggle_sample_all`，
+`Shift+K` 翻转并回一条带方向提示的状态栏；② `clone_pick_source` 从「赋值」改成
+「按住 Shift 才置真」——`Shift+Alt+点击` 仍可直接把选项切成整篇合成并保持，但不带
+Shift 的换源点从此保留选项，不再把用户的勾选清掉。换文档时 `clone_reset_source` 仍连同源点
+一起复位：源点属于旧文档的像素网格，取样口径跟着源点走最不容易让人误解。
+
+**3. 读取点不变。** 真正读它的是 `clone_stroke_end` 里的
+`desc.clone.sample_all_layers = shell.clone_sample_all ? 1 : 0`，因此切换对**下一笔**
+立刻生效；已落下的笔画不受影响（desc 在松手时一次性提交）。工具栏「源 x,y 图层/合并」
+与状态栏文案都是每帧现读，不用额外刷新。
+
+**验证。** 纯外壳改动，无新增单测。单测 **591 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.31（并回填 §5.22 的遗留 ③、§5.26 的遗留 ⑦），
+`docs/manual-test.md` M26 补步 18–21。
+遗留：选项只在本次运行内保留，退出重开回到「当前图层」（上游会把选项存进偏好设置）。
+
 
 
 
