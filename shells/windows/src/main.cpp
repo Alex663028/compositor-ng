@@ -438,6 +438,13 @@ struct ShellState {
   comp_ui::Point layer_move_start{};
   int32_t layer_move_applied_dx = 0;
   int32_t layer_move_applied_dy = 0;
+  /*
+   * Alt 拖动 = 边移边复制（§5.24 遗留 ①）。按下时只记标志，**真正复制推迟到
+   * 第一次产生位移的那一帧**：只点不拖不该在画布上凭空多出一层（PS 亦然）。
+   * 复制成功后 layer_move_id 换成副本的 id，后续 transform 全写在副本上。
+   */
+  bool layer_move_alt = false;
+  bool layer_move_duplicated = false;
   /* 吸管拖拽（S6）：按住拖动时连续取样；只读，不产生撤销步。 */
   bool eyedropper_drag = false;
   /*
@@ -6179,8 +6186,14 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
     set_status(shell, L"移动：读取图层变换失败");
     return;
   }
+  /*
+   * Alt 在按下时取样一次：途中松开 Alt 不该改变这一拖的语义（与画笔 Shift 同规矩）。
+   * 事务名也据此区分——历史面板里「复制并移动」与「移动」不该长得一样。
+   */
+  const bool alt_copy = (GetKeyState(VK_MENU) & 0x8000) != 0;
   comp_txn txn = nullptr;
-  if (comp_txn_begin(shell.document, "Move Layer", &txn) != COMP_OK) {
+  if (comp_txn_begin(shell.document, alt_copy ? "Duplicate & Move Layer" : "Move Layer", &txn) !=
+      COMP_OK) {
     set_status(shell, L"移动：无法开始事务");
     return;
   }
@@ -6195,11 +6208,19 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   shell.layer_move_applied_dx = 0;
   shell.layer_move_applied_dy = 0;
+  /* Alt 语义见上：只记标志，复制推迟到首次位移。 */
+  shell.layer_move_alt = alt_copy;
+  shell.layer_move_duplicated = false;
   SetCapture(window);
 
   wchar_t buffer[192];
-  wsprintfW(buffer, L"移动图层：拖动改变位置（松开算一步撤销），当前 (%d, %d)", transform.x,
-            transform.y);
+  if (shell.layer_move_alt) {
+    wsprintfW(buffer, L"复制并移动图层：拖动即复制一份再移动（松开算一步撤销），当前 (%d, %d)",
+              transform.x, transform.y);
+  } else {
+    wsprintfW(buffer, L"移动图层：拖动改变位置（松开算一步撤销），当前 (%d, %d)", transform.x,
+              transform.y);
+  }
   set_status(shell, buffer);
 }
 
@@ -6214,6 +6235,35 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
   const int32_t dy = static_cast<int32_t>(std::lround(doc.y - shell.layer_move_start.y));
   if (dx == shell.layer_move_applied_dx && dy == shell.layer_move_applied_dy) return;
 
+  /*
+   * Alt 拖动：第一次真正产生位移时才复制。副本落在同一个显式事务里，
+   * `comp_layer_duplicate` 内部的 ImplicitTxn 会加入该事务，所以松手 commit 后
+   * **一步撤销同时撤掉「多出来的图层」和「这一次位移」**（与 Ctrl+J 复制不同步）。
+   * 复制失败就退回移动原图层并在状态栏说明，而不是假装复制过。
+   */
+  if (shell.layer_move_alt && !shell.layer_move_duplicated) {
+    comp_layer_id copy_id = 0;
+    if (comp_layer_duplicate(shell.document, shell.layer_move_id, &copy_id) == COMP_OK &&
+        copy_id != 0) {
+      shell.layer_move_id = copy_id;
+      shell.layer_move_duplicated = true;
+      /* 以副本自己的 transform 作为基准：副本若被引擎偏移过，拖动起点不会跳。 */
+      comp_rect copy_transform{};
+      float copy_rotation = 0.0f;
+      if (comp_layer_get_transform(shell.document, copy_id, &copy_transform, &copy_rotation) ==
+          COMP_OK) {
+        shell.layer_move_base = copy_transform;
+        shell.layer_move_rotation = copy_rotation;
+      }
+      /* 面板跟到副本：接着拖、接着按方向键都是对副本生效，与原图层无关。 */
+      shell.extra_selection.clear();
+      refresh_layers(shell);
+      panel_select_layer_id(shell, copy_id);
+    } else {
+      shell.layer_move_alt = false;
+    }
+  }
+
   comp_rect target = shell.layer_move_base;
   target.x += dx;
   target.y += dy;
@@ -6227,8 +6277,13 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
   shell.needs_render = true;
 
   wchar_t buffer[192];
-  wsprintfW(buffer, L"移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x, target.y, dx,
-            dy);
+  if (shell.layer_move_duplicated) {
+    wsprintfW(buffer, L"复制并移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x,
+              target.y, dx, dy);
+  } else {
+    wsprintfW(buffer, L"移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x, target.y,
+              dx, dy);
+  }
   set_status(shell, buffer);
 }
 
@@ -6238,18 +6293,24 @@ void layer_move_end(HWND window, ShellState& shell) {
   /* 与滑杆同一顺序：先清状态再 ReleaseCapture，捕获变更会重入 move_cancel。 */
   const comp_txn txn = shell.layer_move_txn;
   const bool dirty = shell.layer_move_dirty;
+  const bool duplicated = shell.layer_move_duplicated;
   const int32_t dx = shell.layer_move_applied_dx;
   const int32_t dy = shell.layer_move_applied_dy;
   shell.layer_move_active = false;
   shell.layer_move_dirty = false;
   shell.layer_move_doc = nullptr;
   shell.layer_move_txn = nullptr;
+  shell.layer_move_alt = false;
+  shell.layer_move_duplicated = false;
   ReleaseCapture();
 
   if (txn == nullptr) return;
   if (!dirty) {
-    /* 只点不拖：空事务不该占一步撤销。 */
+    /* 只点不拖：空事务不该占一步撤销（Alt 时复制尚未发生，没有残留副本）。 */
     comp_txn_abort(txn);
+    /* 万一复制成功但紧接着写 transform 失败，abort 会把副本一起回滚，
+     * 面板里那个 id 已经不存在——重取一次，别留着悬空选中。 */
+    if (duplicated) refresh_layers(shell);
     set_status(shell, L"移动：位置未变化");
     return;
   }
@@ -6260,7 +6321,11 @@ void layer_move_end(HWND window, ShellState& shell) {
 
   shell.needs_render = true;
   wchar_t buffer[192];
-  wsprintfW(buffer, L"已移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+  if (duplicated) {
+    wsprintfW(buffer, L"已复制并移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+  } else {
+    wsprintfW(buffer, L"已移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+  }
   refresh_history_status(shell, buffer);
 }
 
@@ -6306,6 +6371,8 @@ void move_cancel(ShellState& shell) {
   shell.layer_move_doc = nullptr;
   shell.layer_move_active = false;
   shell.layer_move_dirty = false;
+  shell.layer_move_alt = false;
+  shell.layer_move_duplicated = false;
   shell.move_active = false;
 }
 
@@ -9049,6 +9116,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               L"再按 J 切算法，[ / ] 调直径、Shift+[ / ] 调硬度、Alt+[ / ] 调不透明度（%d%%）",
               widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
               static_cast<int>(comp_ui::clamp_heal_opacity(shell.heal_opacity) * 100.0 + 0.5));
+  } else if (id == comp_ui::ToolId::Move) {
+    wsprintfW(buffer,
+              L"工具：Move（V）· 无选区 = 拖整层、Alt+拖动 = 复制一份再移动；"
+              L"有选区 = 搬选区像素（Alt = 复制）");
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"

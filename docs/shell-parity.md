@@ -1060,7 +1060,8 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M27**。
 
-**7. 仍未做。** ① `Alt` 拖动 = 边移边复制图层；② 方向键微调；③ 拖出画布的位置提示；
+**7. 仍未做。** ~~① `Alt` 拖动 = 边移边复制图层~~ —— 已在 §5.29 补齐；
+② 方向键微调；③ 拖出画布的位置提示；
 ④ 旋转 / 缩放手柄（transform 的尺寸与角度目前只能由引擎侧命令改）；
 ⑤ PS 那个「拖选区外 = 移图层」的细节本项不模拟（有选区就只搬像素）；
 ⑥ 组图层整体移动——必须先让合成侧读组的 transform，壳侧才有意义。
@@ -1219,6 +1220,39 @@ margin = 0.98)` 与 `fit` 并列：区域按 margin 铺满画布、区域中心�
 **7. 仍未做。** 选区只限制**目标**，不限制**采样源**：`spot_heal` 内部按补丁重采样，
 选区外的像素仍可能被当作来源（PS 的选区同时限制取样）。要一致得把选区传进
 `spot_heal`，属于引擎接口变化，不在壳侧范围内。
+
+### 5.29 Move：Alt 拖动 = 复制图层再移动（2026-10-21）
+
+**1. 范围。** §5.24 遗留 ①。有选区时的**像素搬移**早有 `Alt = 复制`
+（`move_duplicate` → `comp_selection_move_pixels`）；缺的是无选区时**整层拖动**那条路。
+零新增 ABI 导出（`comp_layer_duplicate` 既有）。
+
+**2. 复制推迟到首次位移。** `layer_move_begin` 只把 `Alt` 取样成 `layer_move_alt`
+（途中松开不改变语义），真正的复制在 `layer_move_extend` 里第一次 `dx/dy` 非零时做。
+这样「Alt 点一下不拖」不会在画布上凭空多出一层，事务 abort 也能干净收场，
+不需要「先建再删」的补偿路径。
+
+**3. 一步撤销。** 复制发生在 `comp_txn_begin` **之后**：`comp_layer_duplicate` 内部的
+`ImplicitTxn` 只在没有活动事务时才 own（`owns_ = !document->txn_active()`），
+所以它加入已开启的显式事务，松手 `commit` 后 `Ctrl+Z` 一次同时撤掉新图层与位移。
+事务名按 Alt 分成 `Duplicate & Move Layer` / `Move Layer`。
+
+**4. 基准与选中项切到副本。** 复制后回读**副本自己的** transform 当拖动基准
+（引擎若挪过副本，起点不跳）；`refresh_layers` + `panel_select_layer_id(copy_id)`
+把面板选中项挪到副本，后续拖动与快捷键都作用在副本上。复制失败则
+`layer_move_alt = false`，本拖退回移动原图层，不假装复制过。
+
+**5. 清理。** `layer_move_end` / `move_cancel` 都清两个新标志；`!dirty` 分支若复制已发生
+（复制成功但 `comp_layer_set_transform` 失败），先 `refresh_layers` 再 abort，
+避免面板留着已被回滚的 id。工具选中文案补 Alt 语义。
+
+**6. 验证。** 纯外壳改动，无新增单测。单测 **591 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M27 步 12–15**。
+
+**7. 仍未做。** 仍在 §5.24 清单里：② 方向键微调；③ 拖出画布的位置提示；
+④ 旋转/缩放手柄；⑤「有选区时拖选区外移图层」；⑥ 组图层整体移动。
 
 
 

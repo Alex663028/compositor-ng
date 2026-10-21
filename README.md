@@ -4617,6 +4617,37 @@ AND/XOR 两个位平面（`AND=1,XOR=0` 透明、`AND=0,XOR=0` 黑、`AND=0,XOR=
 遗留：选区只在落笔结算时生效（`spot_heal` 内部按补丁扩散采样，选区外像素不参与
 作为**源**，只被排除在**目标**之外），与 PS「选区同时限制采样」仍有差别。
 
+### 6.56 Move：Alt 拖动 = 复制图层再移动（2026-10-21，Claude）
+
+**补掉 §5.24 遗留 ①：`Alt` 拖动应复制一份图层再移动。** 有选区时的像素搬移早就支持
+`Alt = 复制`（`move_duplicate` 走 `comp_selection_move_pixels`）；这次补的是**无选区**
+的整层拖动那条路。零新增 ABI 导出：`comp_layer_duplicate` 本来就在。
+
+**1. 复制推迟到首次位移。** 按下时只记 `layer_move_alt`，真正 `comp_layer_duplicate`
+放在 `layer_move_extend` 里第一次算出非零位移的那一帧。理由：只点不拖不该在画布上
+凭空多出一层（PS 亦然），而且此时 abort 事务就能干净收场，不需要「先建再删」。
+Alt 在按下时取样一次，拖动途中松开 `Alt` 不改变这一拖的语义——与画笔的 Shift 同规矩。
+
+**2. 一步撤销。** 复制发生在 `comp_txn_begin` 之后：`comp_layer_duplicate` 内部的
+`ImplicitTxn` 会**加入**已开启的显式事务（`owns_ = !document->txn_active()`），
+所以松手 `commit` 后 `Ctrl+Z` 一次同时撤掉「多出来的图层」和「这一次位移」。
+事务名按 Alt 分成 `Duplicate & Move Layer` / `Move Layer`，历史面板一眼能分。
+
+**3. 基准与选中项都切到副本。** 复制后用 `comp_layer_get_transform` **回读副本自己的**
+transform 作为拖动基准（副本若被引擎偏移过，起点不会跳）；`refresh_layers` 重建面板后
+`panel_select_layer_id` 把选中项挪到副本，接着拖、接着按键都作用在副本上。
+复制失败时 `layer_move_alt = false`，本拖退回「移动原图层」——不会假装复制过。
+
+**4. 清理。** `layer_move_end` / `move_cancel` 都清两个新标志；`!dirty` 分支若已复制过
+（复制成功但写 transform 失败），先 `refresh_layers` 再 abort，避免面板留着已回滚的 id。
+工具选中文案补「无选区 = 拖整层、Alt+拖动 = 复制一份再移动」。
+
+**验证。** 纯外壳改动，无新增单测。单测 **591 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.29（并回填 §5.24），`docs/manual-test.md` M27 补步 12–15。
+遗留：方向键微调、拖出画布的位置提示、旋转/缩放手柄仍按 §5.24 的清单排队。
+
 
 
 
