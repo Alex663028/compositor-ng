@@ -882,6 +882,124 @@ inline int filter_param_row_at(const Rect& panel, int param_count, double x, dou
   return row;
 }
 
+/* ------------------------------------------------------------ 修边面板（图像 > 修边） */
+
+/*
+ * 上游 TrimOptions 的壳侧编辑模型（PS Image > Trim 对话框的等价物）。
+ * 六行：基准 / 上 / 下 / 左 / 右 / 容差。值语义、无堆分配；提交时按固定行序
+ * 搬进 comp_trim_options（映射只在 main.cpp 写一处）。
+ *
+ * 与滤镜面板同一套键盘规矩：Tab / Shift+Tab 切行、- / = 改值、容差行可数字键入、
+ * 回车提交、Esc 取消。基准行循环三档；四条边是开关（- / = 都切换）。
+ */
+inline constexpr int kTrimRowCount = 6;
+inline constexpr int kTrimBasedOnCount = 3;
+
+inline const char* trim_based_on_name(int based_on) {
+  switch (based_on) {
+    case 0: return "Transparent Pixels";
+    case 1: return "Top Left Pixel Color";
+    case 2: return "Bottom Right Pixel Color";
+    default: return "?";
+  }
+}
+
+inline const char* trim_row_label(int row) {
+  switch (row) {
+    case 0: return "Based On";
+    case 1: return "Top";
+    case 2: return "Bottom";
+    case 3: return "Left";
+    case 4: return "Right";
+    case 5: return "Tolerance";
+    default: return "";
+  }
+}
+
+/* 边开关的显示文字（绘制与状态栏共用）。 */
+inline const char* trim_edge_text(int on) { return on ? "on" : "off"; }
+
+struct TrimPanel {
+  int focused = 0;
+  int based_on = 0;           /* comp_trim_based_on 数值 0..2 */
+  int edge[4] = {1, 1, 1, 1}; /* top / bottom / left / right；1 = 这一边参与裁切 */
+  int tolerance = 0;          /* 0..255（comp_trim_options.tolerance 是 uint8_t） */
+
+  void reset() {
+    focused = 0;
+    based_on = 0;
+    edge[0] = 1;
+    edge[1] = 1;
+    edge[2] = 1;
+    edge[3] = 1;
+    tolerance = 0;
+  }
+
+  int row_count() const { return kTrimRowCount; }
+
+  /* 焦点夹在 [0, kTrimRowCount-1]，不环绕（与滤镜 / 效果面板一致）。 */
+  void focus(int delta) {
+    focused += delta;
+    if (focused < 0) focused = 0;
+    if (focused >= kTrimRowCount) focused = kTrimRowCount - 1;
+  }
+
+  /* - / = 改当前行；返回是否真的变化。 */
+  bool step(int direction) {
+    if (direction == 0) return false;
+    switch (focused) {
+      case 0: {
+        int next = based_on + (direction > 0 ? 1 : -1);
+        if (next < 0) next = kTrimBasedOnCount - 1;
+        if (next >= kTrimBasedOnCount) next = 0;
+        if (next == based_on) return false;
+        based_on = next;
+        return true;
+      }
+      case 1:
+      case 2:
+      case 3:
+      case 4: {
+        int& value = edge[focused - 1];
+        const int next = value ? 0 : 1;
+        value = next;
+        return true;
+      }
+      case 5: {
+        int next = tolerance + (direction > 0 ? 1 : -1);
+        if (next < 0) next = 0;
+        if (next > 255) next = 255;
+        if (next == tolerance) return false;
+        tolerance = next;
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  void set_tolerance(int value) { tolerance = value < 0 ? 0 : (value > 255 ? 255 : value); }
+
+  bool any_edge() const { return (edge[0] | edge[1] | edge[2] | edge[3]) != 0; }
+};
+
+/* 行几何：与 draw_trim_panel 共用，绘制与命中同源。 */
+inline constexpr int kTrimRowHeight = 20;
+inline constexpr int kTrimRowsTop = 54;
+
+inline Rect trim_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kTrimRowsTop + row * kTrimRowHeight, panel.w, kTrimRowHeight};
+}
+
+inline int trim_row_at(const Rect& panel, int row_count, double x, double y) {
+  if (row_count <= 0 || !panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kTrimRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kTrimRowHeight)));
+  if (row < 0 || row >= row_count) return -1;
+  return row;
+}
+
 /* ------------------------------------------------------------ Retouch 工具模式 */
 
 /*

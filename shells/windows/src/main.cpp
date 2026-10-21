@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <compositor/comp_canvas.h>
 #include <compositor/comp_command.h>
 #include <compositor/comp_core.h>
 #include <compositor/comp_crop.h>
@@ -161,6 +162,16 @@ constexpr UINT kCmdSelectLoadPixels = 1049;
 constexpr UINT kCmdSelectColorRange = 1050;
 constexpr UINT kCmdSelectPaths = 1051; /* P0-4 可选：路径面板（Ctrl+Shift+P） */
 constexpr UINT kCmdHistoryPanel = 1052; /* P1：历史记录面板（Ctrl+Alt+H） */
+/*
+ * P1 图像菜单（1053 段）：转画布 / 修边 / 反相。三项的 ABI 自 §6.35 就在
+ * （comp_document_rotate_canvas / comp_document_trim / comp_layer_invert），
+ * 壳此前一条调用点都没有——这里只补入口，不动引擎口径。
+ */
+constexpr UINT kCmdImageRotateCW = 1053;  /* 画布顺时针 90° */
+constexpr UINT kCmdImageRotateCCW = 1054; /* 画布逆时针 90° */
+constexpr UINT kCmdImageRotate180 = 1055; /* 画布 180° */
+constexpr UINT kCmdImageTrim = 1056;      /* 修边（模态面板，回车应用） */
+constexpr UINT kCmdImageInvert = 1057;    /* 图层反相（Ctrl+I） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -307,6 +318,14 @@ struct ShellState {
   comp_ui::Point progressive_axis_start{};
   comp_ui::Point progressive_axis_final{};   /* 已提交的终点 */
   comp_ui::Point progressive_axis_current{}; /* 拖拽中的终点（预览用） */
+  /*
+   * 修边面板（图像 > 修边）。参数（基于哪条边 / 四条边开关 / 容差）全在
+   * ui_core::TrimPanel，壳只做绘制、键盘与 comp_trim_options 的搬运。
+   * 面板是模态的（与滤镜/效果同规矩），回车应用、Esc 关闭。
+   */
+  comp_ui::TrimPanel trim;
+  bool trim_open = false;
+  std::wstring trim_input; /* 容差键入缓冲；非空 = 输入态 */
   /*
    * S22 直方图（comp_layer_histogram 的壳侧唯一调用点）。
    *
@@ -588,6 +607,9 @@ void refresh_effects(ShellState& shell);
 
 /* S24：效果回读需要选中图层的 id；该 helper 定义在调整面板段之后。 */
 comp_layer_id selected_layer_id(const ShellState& shell);
+
+/* 画布级操作（转画布 / 修边）后要重取选区缓存；定义在选区段落。 */
+void refresh_selection(ShellState& shell);
 
 /* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
 std::wstring widen_ascii(const char* text);
@@ -3160,7 +3182,222 @@ void apply_filter(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
-/* ------------------------------------------------------------ 选区 */
+/* ------------------------------------------------------------ 图像菜单（转画布 / 修边 / 反相） */
+
+/*
+ * 画布级写操作（转画布 / 修边）的共同尾部：换尺寸后 view 的偏移与新坐标
+ * 系不再对应，必须重新适配；图层、选区与撤销深度都要重新从引擎回读
+ * （旋转会转置选区蒙版，修边会清掉选区——壳侧缓存一律作废，不自己推）。
+ */
+void finish_canvas_command(ShellState& shell) {
+  comp_size size{};
+  if (comp_document_size(shell.document, &size) == COMP_OK) {
+    shell.width = size.width;
+    shell.height = size.height;
+  }
+  shell.needs_fit = true;
+  shell.needs_render = true;
+  refresh_layers(shell);
+  refresh_selection(shell);
+}
+
+/*
+ * 图像 > 图像旋转。quarter_turns：1 = 顺时针 90°，-1 = 逆时针，2 = 180°。
+ * 引擎不重采样：只换画布尺寸与图层落位，像素字节不动（见 comp_canvas.h）。
+ */
+void image_rotate_canvas(ShellState& shell, int32_t quarter_turns, const wchar_t* label) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"图像：还没有文档");
+    return;
+  }
+  /* 修边预设按旧画布算出来的边，旋转后已无意义：先收掉面板，别让它留在那儿。 */
+  if (shell.trim_open) {
+    shell.trim_open = false;
+    shell.trim_input.clear();
+  }
+  int32_t changed = 0;
+  const comp_result result =
+      comp_document_rotate_canvas(shell.document, quarter_turns, &changed);
+  if (result != COMP_OK) {
+    set_status(shell, L"画布旋转失败：参数或图层位置不合法（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    /* 空文档 + 180°（或正方形画布的 90°）：状态逐字节相同，引擎不进历史。 */
+    set_status(shell, L"画布未变化（空文档且旋转后尺寸不变，未产生撤销步）");
+    return;
+  }
+  finish_canvas_command(shell);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已旋转画布：%s", label);
+  refresh_history_status(shell, buffer);
+}
+
+/* 图像 > 反相：破坏性一次性落墨，只碰目标图层（与调整层的 Invert 并存）。 */
+void image_invert_layer(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"图像：还没有文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"反相：请先选择一个图层");
+    return;
+  }
+  int32_t changed = 0;
+  const comp_result result = comp_layer_invert(shell.document, id, &changed);
+  if (result == COMP_ERR_UNSUPPORTED) {
+    set_status(shell, L"反相：HDR（RGBA16F）图层不受支持（未改动）");
+    return;
+  }
+  if (result == COMP_ERR_STATE) {
+    set_status(shell, L"反相：组图层或没有像素的图层（未改动）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"反相失败（未改动）");
+    return;
+  }
+  shell.needs_render = true;
+  if (changed == 0) {
+    /* 显式空选区：引擎什么都不改，不产生撤销步。 */
+    set_status(shell, L"反相：选区为空，未改动");
+    return;
+  }
+  refresh_history_status(shell, L"已反相图层");
+}
+
+/* ------------------------------------------------------------ 修边面板 */
+
+void trim_begin(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"修边：还没有文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史/色彩范围互斥）。 */
+  if (shell.color_range_open) color_range_cancel(shell);
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.path_open = false;
+  shell.history_open = false;
+  shell.trim_open = true;
+  shell.trim_input.clear();
+  /* 参数保留上次设置（上游 Trim 对话框同样记住上次），只把焦点放回第一行。 */
+  shell.trim.focused = 0;
+  set_status(shell, L"修边：Tab 选行 · -/= 调值 · 回车应用 · Esc 关闭（撤销一步）");
+}
+
+void trim_close(ShellState& shell) {
+  shell.trim_open = false;
+  shell.trim_input.clear();
+  set_status(shell, L"已关闭修边面板（未改动画布）");
+}
+
+/* 面板值 -> ABI 结构（唯一映射点，与 ui_core 的行序一一对应）。 */
+void build_trim_options(const ShellState& shell, comp_trim_options* out) {
+  comp_trim_options options{};
+  options.based_on = static_cast<comp_trim_based_on>(shell.trim.based_on);
+  options.top = shell.trim.edge[0];
+  options.bottom = shell.trim.edge[1];
+  options.left = shell.trim.edge[2];
+  options.right = shell.trim.edge[3];
+  options.tolerance = static_cast<uint8_t>(shell.trim.tolerance);
+  *out = options;
+}
+
+void trim_apply(ShellState& shell) {
+  if (!shell.trim_open || shell.document == nullptr) return;
+  if (!shell.trim.any_edge()) {
+    /* 引擎也会拒（trimsAny guard），但状态栏要说得比错误码具体。 */
+    set_status(shell, L"修边：至少勾选一条边（当前四条边都关）");
+    return;
+  }
+  comp_trim_options options{};
+  build_trim_options(shell, &options);
+  int32_t changed = 0;
+  const comp_result result = comp_document_trim(shell.document, options, &changed);
+  if (result == COMP_ERR_INVALID_ARGUMENT) {
+    set_status(shell, L"修边失败：选项不合法（未改动）");
+    return;
+  }
+  if (result == COMP_ERR_STATE) {
+    set_status(shell, L"修边失败：空文档、或整篇没有可保留的内容（未改动）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"修边失败（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    /* 算出来的边框与当前画布相同：引擎不裁、不进历史；面板留着让用户改参数。 */
+    set_status(shell, L"修边后画布尺寸未变（未产生撤销步）");
+    return;
+  }
+  shell.trim_open = false;
+  shell.trim_input.clear();
+  finish_canvas_command(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"已修边（基于 %s · 容差 %d）",
+            widen_ascii(comp_ui::trim_based_on_name(shell.trim.based_on)).c_str(),
+            shell.trim.tolerance);
+  refresh_history_status(shell, buffer);
+}
+
+void trim_focus_row(ShellState& shell, int delta) {
+  if (!shell.trim_open) return;
+  shell.trim_input.clear();
+  shell.trim.focus(delta);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"修边 %d/%d：%s", shell.trim.focused + 1, shell.trim.row_count(),
+            widen_ascii(comp_ui::trim_row_label(shell.trim.focused)).c_str());
+  set_status(shell, buffer);
+}
+
+/* - / = ：按当前焦点行步进（基于方式循环 / 四条边开关 / 容差 ±1）。 */
+void trim_step_value(ShellState& shell, int direction) {
+  if (!shell.trim_open) return;
+  if (!shell.trim.step(direction)) {
+    set_status(shell, L"该行没有可继续变化的值");
+    return;
+  }
+  wchar_t buffer[192];
+  const int row = shell.trim.focused;
+  if (row == 0) {
+    wsprintfW(buffer, L"Based On = %s",
+              widen_ascii(comp_ui::trim_based_on_name(shell.trim.based_on)).c_str());
+  } else if (row >= 1 && row <= 4) {
+    wsprintfW(buffer, L"%s = %s", widen_ascii(comp_ui::trim_row_label(row)).c_str(),
+              shell.trim.edge[row - 1] ? L"on" : L"off");
+  } else {
+    wsprintfW(buffer, L"Tolerance = %d（逐通道 0..255）", shell.trim.tolerance);
+  }
+  set_status(shell, buffer);
+}
+
+void trim_begin_input(ShellState& shell, wchar_t character) {
+  if (!shell.trim_open) return;
+  if (shell.trim_input.size() >= 3) return; /* 0..255，三位够了 */
+  shell.trim_input.push_back(character);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"输入中：%s", shell.trim_input.c_str());
+  set_status(shell, buffer);
+}
+
+void trim_commit_input(ShellState& shell) {
+  if (shell.trim_input.empty()) return;
+  int value = 0;
+  for (const wchar_t character : shell.trim_input) {
+    value = value * 10 + static_cast<int>(character - L'0');
+  }
+  shell.trim_input.clear();
+  shell.trim.set_tolerance(value);
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"Tolerance = %d（逐通道 0..255）", shell.trim.tolerance);
+  set_status(shell, buffer);
+}
+
 
 /*
  * 从引擎取完整选区状态：active、有效 coverage（含羽化）、边界线段。
@@ -5982,6 +6219,22 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdHistoryPanel:
       history_panel_toggle(shell);
       break;
+    /* ---- P1：图像菜单（转画布 / 修边 / 反相） ---- */
+    case kCmdImageRotateCW:
+      image_rotate_canvas(shell, 1, L"顺时针 90°");
+      break;
+    case kCmdImageRotateCCW:
+      image_rotate_canvas(shell, -1, L"逆时针 90°");
+      break;
+    case kCmdImageRotate180:
+      image_rotate_canvas(shell, 2, L"180°");
+      break;
+    case kCmdImageTrim:
+      trim_begin(shell);
+      break;
+    case kCmdImageInvert:
+      image_invert_layer(shell);
+      break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
       break;
@@ -6819,6 +7072,73 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   int hint_y = height - 96;
   for (int i = 0; i < 5; ++i) {
     TextOutW(dc, left + 10, hint_y, hints[i], lstrlenW(hints[i]));
+    hint_y += 18;
+  }
+}
+
+/*
+ * 修边面板（P1 图像菜单）。行几何来自 ui_core.h 的 trim_row_rect——绘制与
+ * 命中同源，避免「看得见点不中」。
+ */
+void draw_trim_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"修边（Trim）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+  y += 22;
+  SetTextColor(dc, RGB(150, 210, 255));
+  const wchar_t* subtitle = L"按透明像素 / 边缘色裁掉多余边框";
+  TextOutW(dc, left + 10, y, subtitle, lstrlenW(subtitle));
+
+  for (int row = 0; row < shell.trim.row_count(); ++row) {
+    const comp_ui::Rect row_rect = comp_ui::trim_row_rect(panel_rect, row);
+    const bool focused = row == shell.trim.focused;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6,
+                     row_rect.bottom() + 2};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    const std::wstring label = widen_ascii(comp_ui::trim_row_label(row));
+    if (row == 0) {
+      wsprintfW(line, L"%s = %s", label.c_str(),
+                widen_ascii(comp_ui::trim_based_on_name(shell.trim.based_on)).c_str());
+    } else if (row >= 1 && row <= 4) {
+      wsprintfW(line, L"%s = %s", label.c_str(),
+                comp_ui::trim_edge_text(shell.trim.edge[row - 1]));
+    } else {
+      wsprintfW(line, L"%s = %d", label.c_str(), shell.trim.tolerance);
+    }
+    TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
+  }
+
+  if (!shell.trim_input.empty()) {
+    SetTextColor(dc, RGB(255, 240, 160));
+    wsprintfW(line, L"输入中：%s", shell.trim_input.c_str());
+    TextOutW(dc, left + 10, bottom - 130, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"Tab / Shift+Tab 切行",
+      L"- / = 调值 · 数字键输入容差",
+      L"回车应用（一步撤销）· Esc 关闭",
+      L"基于颜色时容差是逐通道差（0..255）",
+  };
+  int hint_y = bottom - 104;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;
   }
 }
@@ -7930,6 +8250,8 @@ void present(HWND window, ShellState& shell) {
       draw_history_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.color_range_open) {
       draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.trim_open) {
+      draw_trim_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.effect_open) {
       draw_effect_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.filter_open) {
@@ -8686,6 +9008,72 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
 
+  /* 修边面板的容差键入态：只吃数字/退格/回车/Esc。 */
+  if (!shell.trim_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.trim_input.clear();
+      set_status(shell, L"已取消容差输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      shell.trim_input.pop_back();
+      if (shell.trim_input.empty()) {
+        set_status(shell, L"已取消容差输入");
+      } else {
+        wchar_t buffer[96];
+        wsprintfW(buffer, L"输入中：%s", shell.trim_input.c_str());
+        set_status(shell, buffer);
+      }
+      return;
+    }
+    if (key == VK_RETURN) {
+      trim_commit_input(shell);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      trim_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /*
+   * 修边面板打开时，键盘归面板：Esc 只关面板（不关窗），Ctrl 组合仍可穿透
+   * （与滤镜/效果面板同一条模态规矩）。数字键直接把焦点落到 Tolerance 再键入。
+   */
+  if (shell.trim_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        trim_close(shell);
+        return;
+      case VK_TAB:
+        trim_focus_row(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        trim_apply(shell);
+        return;
+      case VK_OEM_MINUS:
+        trim_step_value(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        trim_step_value(shell, 1);
+        return;
+      case VK_BACK:
+        shell.trim.reset();
+        set_status(shell, L"修边参数已重置为默认值");
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      shell.trim.focused = 5;
+      trim_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键在面板打开时吞掉：避免按工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
   /* 滤镜面板输入态：与调整面板同一套输入规矩，但目标值是滤镜参数。 */
   if (!shell.filter_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -9158,12 +9546,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         run_shell_command(window, shell, kCmdSelectAll);
         return;
       case 'I':
-        /* Ctrl+Shift+I 反选（与上游一致）；单独 Ctrl+I 不做绑定。 */
+        /* Ctrl+Shift+I 反选（与上游一致）；Ctrl+I = 图像 > 反相（破坏性落墨）。 */
         if (shift) {
           run_shell_command(window, shell, kCmdSelectInvert);
           return;
         }
-        break;
+        run_shell_command(window, shell, kCmdImageInvert);
+        return;
       case 'U':
         if (shift) {
           run_shell_command(window, shell, kCmdAdjApply);
@@ -9718,6 +10107,21 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (shell->trim_open && layout.adjust_panel.w > 0) {
+            /* 点行 = 聚焦到该行；行几何与绘制共用 trim_row_rect。 */
+            const int row = comp_ui::trim_row_at(layout.adjust_panel, shell->trim.row_count(),
+                                                 mouse_x, mouse_y);
+            if (row >= 0) {
+              shell->trim_input.clear();
+              shell->trim.focused = row;
+              wchar_t buffer[192];
+              wsprintfW(buffer, L"修边 %d/%d：%s", row + 1, shell->trim.row_count(),
+                        widen_ascii(comp_ui::trim_row_label(row)).c_str());
+              set_status(*shell, buffer);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           if (shell->filter_open && layout.adjust_panel.w > 0) {
             /* 点参数行 = 聚焦到该行；行几何与绘制共用 filter_param_row_rect。 */
             const int row = comp_ui::filter_param_row_at(
@@ -9740,7 +10144,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
-          if (!shell->effect_open && !shell->filter_open && !type_panel_visible(*shell) &&
+          if (!shell->effect_open && !shell->filter_open && !shell->trim_open &&
+              !type_panel_visible(*shell) &&
               !shell->color_range_open && !path_panel_visible(*shell) &&
               !history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
@@ -10651,6 +11056,24 @@ HMENU build_menu() {
   }
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sampling_menu), L"采样模式(&Q)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
+
+  /*
+   * P1：图像菜单。三件事的 ABI（comp_document_rotate_canvas / comp_document_trim /
+   * comp_layer_invert）自 §6.35 就在，壳此前一条调用点都没有——用户拿不到
+   * 「转画布 / 修边 / 反相」。命令 id 与菜单、快捷键共用 run_shell_command 一条通路。
+   */
+  HMENU image_rotate_menu = CreatePopupMenu();
+  AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotateCW, L"顺时针 90°(&C)");
+  AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotateCCW, L"逆时针 90°(&W)");
+  AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotate180, L"180°(&1)");
+  HMENU image_menu = CreatePopupMenu();
+  AppendMenuW(image_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image_rotate_menu),
+              L"图像旋转(&R)");
+  AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(image_menu, MF_STRING, kCmdImageTrim, L"修边…(&T)");
+  AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(image_menu, MF_STRING, kCmdImageInvert, L"反相(&I)\tCtrl+I");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image_menu), L"图像(&I)");
 
   /*
    * P0-4：把选区命令从「编辑」里拆出来，单列一个菜单。全选/取消/反选三条

@@ -4319,5 +4319,49 @@ ABI 字段搬运（含 `explicit_axis` 反相映射）与 note caveat。单测 5
 文档：`docs/filters.md` §1 / §3.9 / §5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，
 `docs/manual-test.md` M9 追加第 10 条。
 
+### 6.48 图像菜单接线：转画布 / 修边 / 反相（2026-10-21，Claude）
+
+**缺口在壳，不在引擎。** `comp_document_rotate_canvas` / `comp_document_trim` /
+`comp_layer_invert` 自 §6.35 起就有实现与用例（上游 `CanvasRotation.swift` /
+`ImageTrim.swift` / `PixelInvert.swift`），但 `shells/windows` 里**零调用**，
+顶层菜单也没有「图像」项——能力在，产品通路不在。本轮补菜单、命令 ID 与一个
+修边参数面板，让三条命令真的能用。
+
+**旋转不重采样。** 引擎按 `comp_canvas.h` 的口径只换画布尺寸与图层落位
+（90° 时 width/height 互换，180° 不变），像素字节一个不动；选区的蒙版随之转置。
+壳侧不复制像素，统一走 `finish_canvas_command`：重取文档尺寸、置
+`needs_fit`（旧视图偏移对应旧画布）与 `needs_render`，再从引擎回读图层与选区——
+**缓存一律作废而不自己推**。撤销计数同样回读，状态栏写「已旋转画布：顺时针 90°」
+这类具体文案；空文档旋转后尺寸不变时引擎 `out_changed = 0`，壳明确写
+「未产生撤销步」，不假装成功。旋转会先收掉修边面板：面板里的四条边是按旧画布算的。
+
+**修边面板（`ui_core.h` 的 `TrimPanel`）。** 六行 Based On / Top / Bottom / Left /
+Right / Tolerance，无堆分配；行几何 `trim_row_rect` 同时供绘制与命中（沿用
+「看得见就点得中」）。Tab / Shift+Tab 切行并夹在两端；`-` / `=` 对基准行循环三档、
+对四条边是开关、对容差 ±1 并夹 0..255；数字键跳到容差行进入键入态（最多 3 位，
+`Esc` 取消、`Backspace` 删字符）。面板值 → `comp_trim_options` 只在
+`build_trim_options` 一处映射。四边全关在本地拦下（「至少勾选一条边」），
+`STATE`（空文档 / 无内容）与 `changed == 0`（裁出来等于当前画布）都保持面板打开、
+不产生撤销步；成功才关面板、走共同尾部并报「已修边（基于 … · 容差 N）」。
+
+**反相是破坏性落墨，与调整层并存。** 目标为当前选中图层：组 / 无像素 →
+`STATE`，HDR（RGBA16F）→ `UNSUPPORTED`，两者都不改像素、不落步；预乘语义
+（`c → alpha - c`，透明仍透明）与选区混合由引擎负责，显式空选区 `changed == 0` →
+「选区为空，未改动」。16 位图层按引擎既有口径写回后永久变 RGBA8（撤销可恢复
+原 16 位快照），壳不另作提示。快捷键 `Ctrl+I` = 反相，`Ctrl+Shift+I` 仍是反选。
+
+**互斥与穿透。** `trim_open` 进入右栏单挂位：打开时取消色彩范围的预览事务并关掉
+滤镜 / 效果 / 路径 / 历史；反向打开那些面板也会关掉修边。面板拥有键盘时非 `Ctrl`
+按键一律吞掉，只有 `Ctrl+…` 快捷键穿透——与 §5.16/§5.17 同一套规矩。
+菜单为「图像(&I)」：图像旋转子菜单（CW / CCW / 180°）、修边…、反相（Ctrl+I）。
+
+**验证。** UI 层 2 例（`TrimPanel` 三档循环 / 边开关 / 容差钳位 / 重置 / 名称表；
+行几何命中首末行、行外与空行数）。单测 586 → **588 例 / 0 失败**；PE 导出
+**138 不变**（本项零新增导出）；壳自检 **245 项不变**（基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.21、
+`docs/manual-test.md` M25。
+
+
 
 

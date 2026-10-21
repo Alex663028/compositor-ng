@@ -532,6 +532,102 @@ COMP_TEST(ui_core_filter_rows_hit_test_matches_geometry) {
                                           panel.y + comp_ui::kFilterRowsTop + 1.0) == -1);
 }
 
+COMP_TEST(ui_core_trim_panel_cycles_and_clamps) {
+  comp_ui::TrimPanel panel;
+  COMP_CHECK(panel.row_count() == comp_ui::kTrimRowCount);
+  COMP_CHECK(comp_ui::kTrimRowCount == 6);
+  COMP_CHECK(panel.focused == 0);
+  COMP_CHECK(panel.based_on == 0);
+  COMP_CHECK(panel.edge[0] == 1 && panel.edge[1] == 1 && panel.edge[2] == 1 &&
+             panel.edge[3] == 1);
+  COMP_CHECK(panel.tolerance == 0);
+  COMP_CHECK(panel.any_edge());
+
+  /* Based On：三档循环，方向只决定前后（越界绕回另一头）。 */
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(panel.based_on == 1);
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(panel.based_on == 2);
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(panel.based_on == 0);
+  COMP_CHECK(panel.step(-1));
+  COMP_CHECK(panel.based_on == 2);
+  /* direction == 0 不是「切换」而是「无动作」。 */
+  COMP_CHECK(!panel.step(0));
+
+  /* 四条边：- / = 都是翻转（不是 ±1 数值），关掉一条后 any_edge 仍为真。 */
+  panel.focus(1);
+  COMP_CHECK(panel.focused == 1);
+  COMP_CHECK(panel.step(1));
+  COMP_CHECK(panel.edge[0] == 0);
+  COMP_CHECK(panel.step(-1));
+  COMP_CHECK(panel.edge[0] == 1);
+
+  /* 四边全关：引擎会拒（trimsAny guard），面板要能自己报告。 */
+  panel.edge[0] = panel.edge[1] = panel.edge[2] = panel.edge[3] = 0;
+  COMP_CHECK(!panel.any_edge());
+  panel.reset();
+  COMP_CHECK(panel.any_edge());
+
+  /* Tolerance：逐通道 0..255，夹取且到边界报「没变化」。 */
+  panel.focus(99);
+  COMP_CHECK(panel.focused == 5);
+  panel.set_tolerance(-7);
+  COMP_CHECK(panel.tolerance == 0);
+  COMP_CHECK(!panel.step(-1));
+  panel.set_tolerance(999);
+  COMP_CHECK(panel.tolerance == 255);
+  COMP_CHECK(!panel.step(1));
+  panel.set_tolerance(80);
+  COMP_CHECK(panel.step(1) && panel.tolerance == 81);
+  COMP_CHECK(panel.step(-1) && panel.tolerance == 80);
+
+  /* 焦点夹在 [0, row_count-1]，不环绕。 */
+  panel.focus(-99);
+  COMP_CHECK(panel.focused == 0);
+  panel.focus(99);
+  COMP_CHECK(panel.focused == 5);
+
+  /* 名表：三种基准与六个行名，越界给空串 / "?"（不越界读表）。 */
+  COMP_CHECK(std::string(comp_ui::trim_based_on_name(0)) == "Transparent Pixels");
+  COMP_CHECK(std::string(comp_ui::trim_based_on_name(1)) == "Top Left Pixel Color");
+  COMP_CHECK(std::string(comp_ui::trim_based_on_name(2)) == "Bottom Right Pixel Color");
+  COMP_CHECK(std::string(comp_ui::trim_based_on_name(3)) == "?");
+  COMP_CHECK(std::string(comp_ui::trim_based_on_name(-1)) == "?");
+  COMP_CHECK(std::string(comp_ui::trim_row_label(0)) == "Based On");
+  COMP_CHECK(std::string(comp_ui::trim_row_label(5)) == "Tolerance");
+  COMP_CHECK(std::string(comp_ui::trim_row_label(6)).empty());
+  COMP_CHECK(std::string(comp_ui::trim_row_label(-1)).empty());
+  COMP_CHECK(std::string(comp_ui::trim_edge_text(1)) == "on");
+  COMP_CHECK(std::string(comp_ui::trim_edge_text(0)) == "off");
+}
+
+COMP_TEST(ui_core_trim_rows_hit_test_matches_geometry) {
+  const Rect panel{248, Layout::kToolbarHeight, Layout::kAdjustPanelWidth, 600};
+  const int row_count = comp_ui::kTrimRowCount;
+
+  for (int row = 0; row < row_count; ++row) {
+    const Rect rect = comp_ui::trim_row_rect(panel, row);
+    COMP_CHECK(rect.x == panel.x && rect.w == panel.w);
+    COMP_CHECK(rect.y == panel.y + comp_ui::kTrimRowsTop + row * comp_ui::kTrimRowHeight);
+    COMP_CHECK(rect.h == comp_ui::kTrimRowHeight);
+    COMP_CHECK(comp_ui::trim_row_at(panel, row_count, rect.x + 4.0, rect.y) == row);
+    COMP_CHECK(comp_ui::trim_row_at(panel, row_count, rect.x + 4.0, rect.bottom() - 1.0) ==
+               row);
+  }
+
+  /* 行区上方（标题 / 副标题）不命中；行数外、面板外、row_count 0 都不命中。 */
+  COMP_CHECK(comp_ui::trim_row_at(panel, row_count, panel.x + 4.0,
+                                  panel.y + comp_ui::kTrimRowsTop - 1.0) == -1);
+  COMP_CHECK(comp_ui::trim_row_at(panel, row_count, panel.x + 4.0,
+                                  panel.y + comp_ui::kTrimRowsTop +
+                                      row_count * comp_ui::kTrimRowHeight) == -1);
+  COMP_CHECK(comp_ui::trim_row_at(panel, row_count, panel.x - 1.0,
+                                  panel.y + comp_ui::kTrimRowsTop + 1.0) == -1);
+  COMP_CHECK(comp_ui::trim_row_at(panel, 0, panel.x + 4.0,
+                                  panel.y + comp_ui::kTrimRowsTop + 1.0) == -1);
+}
+
 COMP_TEST(ui_core_retouch_modes_cycle_and_blur_radius_is_bounded) {
   /* R 键循环：Blur -> Smudge -> Liquify -> Blur（对齐上游 retouch 组）。 */
   COMP_CHECK(comp_ui::kRetouchModeCount == 3);
