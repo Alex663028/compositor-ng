@@ -157,14 +157,23 @@ compositor-ng 是「同引擎、两壳」结构：
   探长度会把滤镜应用两遍；壳用固定 512 字节缓冲一次调用。
 - **面板夹取，ABI 拒绝**：键入手输先用 `clamp_filter_param` 夹到量程内，
   ABI 侧仍是越界拒绝（不静默 clamp）。
-- **八个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
+- **九个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
   （Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
-  Add Noise / Grain / Motion Blur）。布尔项（`Preserve` / `Gaussian` / `Mono`）在面板上是
+  Add Noise / Grain / Motion Blur / Progressive Blur）。布尔项（`Preserve` /
+  `Gaussian` / `Mono` / `Radial` / `Inverted`）在面板上是
   0/1 行，`build_filter_desc` 用 `>= 0.5` 转成 ABI 的 int32；`Seed` 用
   `llround` 转 `uint32`（面板量程 0..4294967295，正好是 uint32 全域）。
 - **Gaussian Blur 的面板量程含 0**（恒等）；步进从 0 直达 1，键入手输
   `(0, 0.1)` 里的值会被 ABI 拒绝——这是有意的严格口径，不是壳的遗漏。
   Motion Blur 的 `Distance` 同理：0 = 恒等，步进从 0 到 1，`(0, 1)` 被拒。
+- **Progressive Blur 的轴在画布上拖**：面板只有 From / To / Radial / Inverted
+  四行；渐变轴端点来自画布拖拽（`progressive_axis_begin/extend/end`），
+  拖拽中画实线、已提交的轴画虚线，径向档另画半径圆。面板打开期间画布拖拽
+  优先给轴而不是笔迹，手型 / 空格平移仍优先；`WM_CAPTURECHANGED` / 失焦经
+  `progressive_axis_cancel` 只丢弃本次拖拽（不动已提交的轴）。
+  `progressive_axis_set` 才置 `explicit_axis = 1`，否则交给域层的缺省中线；
+  新建 / 打开文档会作废旧轴（端点是旧文档坐标）。轴拖拽**不进撤销栈**，
+  回车应用才是那一步 `Filter: Progressive Blur`。
 - **`Alt+[` / `Alt+]` 调模糊半径**：`[`/`]` 已属笔刷直径、`Ctrl+[`/`]` 已属
   不透明度；Blur 半径 0.5..50。
 - **笔迹去抖**：点间距小于 `kStrokeMinDistance`（0.75 文档像素）不追加，

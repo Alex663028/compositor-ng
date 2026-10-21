@@ -129,8 +129,8 @@ CJK 目前**不支持**（只收 ASCII），这是已知边界。
 2. 菜单「滤镜」→ 选 Vignette（或按面板顺序切）：右侧出现滤镜面板，第一参数高亮。
 3. 用 `=` / `-` 或数字键改 Amount：画布**实时**变暗四角、中心保持亮。
 4. `Enter` 应用：状态栏 `Vignette：已应用`；`Esc` 关闭面板回到调整面板。
-5. `,` / `.` 在 8 个滤镜间切换：依次经过 Vignette / Tonal Contrast / Bloom / Lens Correction /
-   Gaussian Blur / Add Noise / Grain / Motion Blur，面板行数与第一行高亮随之变化。
+5. `,` / `.` 在 9 个滤镜间切换：依次经过 Vignette / Tonal Contrast / Bloom / Lens Correction /
+   Gaussian Blur / Add Noise / Grain / Motion Blur / Progressive Blur，面板行数与第一行高亮随之变化。
 6. Gaussian Blur：`Radius` 调到 8 左右回车：图像变糊；`Preserve 0/1` 设为 1 再应用：
    轮廓（透明边界）不扩散；`Ctrl+Z` **一次**回到应用前。
 7. Add Noise：`Amount` 调到 40、`Seed` 改成 7 回车：画面加噪点；`Ctrl+Z` 撤销；
@@ -141,6 +141,12 @@ CJK 目前**不支持**（只收 ASCII），这是已知边界。
    `Angle` 0 回车：方块沿水平方向拉出条纹，上下远端不糊；`Angle` 90 再应用：
    条纹转成竖直。`Ctrl+Z` **一次**回到应用前；`Distance` 保持 0 时回车
    应报恒等、不产生撤销步。输入 `0.5` 回车会被拒绝（量程是 0 或 1..2000）。
+10. Progressive Blur：先铺一块**高频纹理**（Gaussian Blur 那段的小方块也可）。
+   `From` 0、`To` 40 回车：默认轴（图层中线、自顶向下）上端锐、下端糊。
+   再打开面板，在画布上**从左上向右下拖一条线**：拖拽中画实线、松手后画虚线，
+   状态栏显示两端坐标；`Radial 0/1` 设为 1 时轴变成以起点为心的径向渐变
+   （角上最糊、中心不糊）；`Inverted 0/1` 设为 1 交换两端。回车应用，
+   `Ctrl+Z` **一次**回到应用前。拖轴本身不产生撤销步；`Ctrl+N` 新建文档后旧轴作废。
 
 👁 关注：实时预览的帧率是否可接受（CPU 全幅重算，大图会慢）；面板参数多时是否滚动。
 

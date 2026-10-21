@@ -2,9 +2,9 @@
 /*
  * comp_filter.h — Filter 菜单的 C ABI（P1 滤镜批次）。
  *
- * 语义唯一真源见 `domain/filters.h` 的文件头：八个算子（Vignette / Tonal
+ * 语义唯一真源见 `domain/filters.h` 的文件头：九个算子（Vignette / Tonal
  * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain /
- * Motion Blur）的像素口径、选区混合与能力边界都写在那里。
+ * Motion Blur / Progressive Blur）的像素口径、选区混合与能力边界都写在那里。
  *
  * 本头文件只暴露一件事：一次「整层」滤镜调用。
  *
@@ -43,7 +43,8 @@ typedef enum comp_filter_kind {
   COMP_FILTER_GAUSSIAN_BLUR   = 4,
   COMP_FILTER_ADD_NOISE       = 5,
   COMP_FILTER_GRAIN           = 6,
-  COMP_FILTER_MOTION_BLUR     = 7
+  COMP_FILTER_MOTION_BLUR     = 7,
+  COMP_FILTER_PROGRESSIVE_BLUR = 8
 } comp_filter_kind;
 
 /*
@@ -138,6 +139,31 @@ typedef struct comp_filter_motion_blur {
 } comp_filter_motion_blur;
 
 /*
+ * Progressive Blur（上游 FilterSettings.progressive*，CIMaskedVariableBlur）。
+ *   from / to   0..250（渐变轴两端的模糊半径，图层像素；预览再乘 scale）
+ *   start_x/y   轴起点的文档坐标（连续；auto_axis = 1 时忽略）
+ *   end_x/y     轴终点的文档坐标（同上）
+ *   radial        1 = 以 start 为心、|end - start| 为半径的径向渐变
+ *   inverted      1 = 交换 from/to（等价于把轴掉头）
+ *   explicit_axis 0 = 用缺省轴（图层自身像素矩形中线、自顶向下）；
+ *                 1 = 用 start/end（文档坐标）
+ *
+ * 零初始化（from = to = 0，explicit_axis = 0）= 恒等 + 缺省轴：C 侧与域层
+ * （`auto_axis = true`）的零初始化口径一致，不把 (0,0)-(0,0) 误读成退化轴。
+ */
+typedef struct comp_filter_progressive_blur {
+  double from;
+  double to;
+  double start_x;
+  double start_y;
+  double end_x;
+  double end_y;
+  int32_t radial;
+  int32_t inverted;
+  int32_t explicit_axis;
+} comp_filter_progressive_blur;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
  */
@@ -151,13 +177,14 @@ typedef struct comp_filter_desc {
   comp_filter_add_noise        add_noise;
   comp_filter_grain            grain;
   comp_filter_motion_blur      motion_blur;
+  comp_filter_progressive_blur progressive_blur;
 } comp_filter_desc;
 
 /*
  * 对目标图层跑一次滤镜。成功返回 COMP_OK。
  *
- * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响高斯半径（Tonal
- * Contrast / Bloom / Gaussian Blur 的 radius、Motion Blur 的 distance），
+ * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响以像素为单位的半径
+ * （Tonal Contrast / Bloom / Gaussian Blur / Motion Blur / Progressive Blur），
  * 让降采样预览看起来与全尺寸一致。
  *
  * 错误码：
@@ -167,8 +194,9 @@ typedef struct comp_filter_desc {
  *   分配失败                         -> COMP_ERR_OUT_OF_MEMORY
  *
  * note 可为 NULL；非 NULL 时写入 UTF-8 非致命说明（16 位降位、选区裁切、
- * Bloom / Gaussian Blur / Motion Blur 的近似口径），两段式：note_capacity 为 0
- * 时只回报所需长度，out_note_size 写入含 '\0' 的长度。out_changed 可为 NULL。
+ * Bloom / Gaussian Blur / Motion Blur / Progressive Blur 的近似口径），两段式：
+ * note_capacity 为 0 时只回报所需长度，out_note_size 写入含 '\0' 的长度。
+ * out_changed 可为 NULL。
  */
 COMP_API comp_result comp_filter_apply(comp_document document, comp_layer_id target,
                                        const comp_filter_desc* desc, double scale,

@@ -278,6 +278,16 @@ struct Layer {
                          double doc_y, int32_t* out_x, int32_t* out_y) const;
 
   /*
+   * document_to_pixel 的**连续**版：同一套映射，但按图层自身像素尺寸求值、
+   * 保留小数、**不**判断是否落在缓冲内（点可以在缓冲外，坐标是仿射延拓）。
+   *
+   * 用途：需要亚像素几何的操作（Progressive Blur 的渐变轴端点）。取整版
+   * document_to_pixel 在缩放/旋转下会把同一对端点抖动 ±1 px，渐变方向随之跳变。
+   */
+  bool document_to_pixel_continuous(double doc_x, double doc_y, double* out_x,
+                                    double* out_y) const;
+
+  /*
    * 上面的逆映射：图层/蒙版像素 (px, py) 的**像素中心**落在文档坐标的哪一点。
    * 同样按 归一化 → 翻转 → 旋转 → 反归一化 的次序展开，与 document_to_pixel
    * 严格互逆（那是「文档→像素」的逆旋转 + 反归一化，这里是正变换）。

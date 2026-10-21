@@ -74,6 +74,17 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
 
   settings.motion_blur.angle = desc.motion_blur.angle;
   settings.motion_blur.distance = desc.motion_blur.distance;
+
+  settings.progressive_blur.from = desc.progressive_blur.from;
+  settings.progressive_blur.to = desc.progressive_blur.to;
+  settings.progressive_blur.start_x = desc.progressive_blur.start_x;
+  settings.progressive_blur.start_y = desc.progressive_blur.start_y;
+  settings.progressive_blur.end_x = desc.progressive_blur.end_x;
+  settings.progressive_blur.end_y = desc.progressive_blur.end_y;
+  settings.progressive_blur.radial = desc.progressive_blur.radial != 0;
+  settings.progressive_blur.inverted = desc.progressive_blur.inverted != 0;
+  /* explicit_axis = 0（零初始化）用缺省轴，与域层 auto_axis = true 对齐。 */
+  settings.progressive_blur.auto_axis = desc.progressive_blur.explicit_axis == 0;
   return settings;
 }
 

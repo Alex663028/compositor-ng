@@ -202,11 +202,18 @@ comp_rect Layer::effective_bounds() const {
   return comp_rect{transform.x, transform.y, pixels.width, pixels.height};
 }
 
-bool Layer::document_to_pixel(int32_t source_width, int32_t source_height, double doc_x,
-                              double doc_y, int32_t* out_x, int32_t* out_y) const {
-  if (out_x == nullptr || out_y == nullptr) return false;
+namespace {
+
+/* document_to_pixel 的连续版：同一套「归一化 -> 逆旋转 -> 翻转 -> 像素坐标」，
+ * 但保留小数、不做范围夹取。document_to_pixel 在它之上取整并夹到缓冲内；
+ * Progressive Blur 的渐变轴需要亚像素位置（一条跨画布的轴被取整会在缩放下抖动），
+ * 直接走这个。
+ *
+ * 返回 false 只表示「几何不可用」（bounds 为空 / 源尺寸为 0），不表示点落在图层外。 */
+bool map_document_to_pixel(const comp_rect& bounds, int32_t source_width, int32_t source_height,
+                           float rotation, bool flip_x, bool flip_y, double doc_x, double doc_y,
+                           double* out_x, double* out_y) {
   if (source_width <= 0 || source_height <= 0) return false;
-  const comp_rect bounds = effective_bounds();
   if (bounds.w <= 0 || bounds.h <= 0) return false;
 
   const double ud = (doc_x + 0.5 - static_cast<double>(bounds.x)) /
@@ -227,8 +234,29 @@ bool Layer::document_to_pixel(int32_t source_width, int32_t source_height, doubl
   if (flip_x) us = -us;
   if (flip_y) vs = -vs;
 
-  const double sx = (us + 1.0) * 0.5 * static_cast<double>(source_width) - 0.5;
-  const double sy = (vs + 1.0) * 0.5 * static_cast<double>(source_height) - 0.5;
+  *out_x = (us + 1.0) * 0.5 * static_cast<double>(source_width) - 0.5;
+  *out_y = (vs + 1.0) * 0.5 * static_cast<double>(source_height) - 0.5;
+  return true;
+}
+
+}  // namespace
+
+bool Layer::document_to_pixel_continuous(double doc_x, double doc_y, double* out_x,
+                                         double* out_y) const {
+  if (out_x == nullptr || out_y == nullptr) return false;
+  return map_document_to_pixel(effective_bounds(), pixels.width, pixels.height, rotation, flip_x,
+                               flip_y, doc_x, doc_y, out_x, out_y);
+}
+
+bool Layer::document_to_pixel(int32_t source_width, int32_t source_height, double doc_x,
+                              double doc_y, int32_t* out_x, int32_t* out_y) const {
+  if (out_x == nullptr || out_y == nullptr) return false;
+  double sx = 0.0;
+  double sy = 0.0;
+  if (!map_document_to_pixel(effective_bounds(), source_width, source_height, rotation, flip_x,
+                             flip_y, doc_x, doc_y, &sx, &sy)) {
+    return false;
+  }
   if (sx < -0.5 || sy < -0.5 || sx > static_cast<double>(source_width) - 0.5 ||
       sy > static_cast<double>(source_height) - 0.5) {
     return false;

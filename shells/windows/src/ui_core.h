@@ -623,7 +623,7 @@ inline int step_swatch(int index, int direction) {
 /* ------------------------------------------------------------ 滤镜面板 */
 
 /*
- * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..7，尾部追加）；
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..8，尾部追加）；
  * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
  */
 enum class FilterId : int {
@@ -635,6 +635,7 @@ enum class FilterId : int {
   AddNoise = 5,
   Grain = 6,
   MotionBlur = 7,
+  ProgressiveBlur = 8,
   Count
 };
 
@@ -734,6 +735,17 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"Distance", 0.0, 2000.0, 1.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      /* 渐变轴不走面板行：在画布上拖一条线来定（见 main.cpp 的
+       * progressive_begin/extend/end）。面板只承载两端半径与两个开关。 */
+      {FilterId::ProgressiveBlur,
+       "Progressive Blur",
+       4,
+       {{"From", 0.0, 250.0, 1.0, 0.0},
+        {"To", 0.0, 250.0, 1.0, 20.0},
+        {"Radial 0/1", 0.0, 1.0, 1.0, 0.0},
+        {"Inverted 0/1", 0.0, 1.0, 1.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0}}},
   };

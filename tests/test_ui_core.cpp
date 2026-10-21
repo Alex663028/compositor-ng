@@ -322,10 +322,10 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
 COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   size_t count = 0;
   const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
-  COMP_CHECK(count == 8);
+  COMP_CHECK(count == 9);
   COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
 
-  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..7 一一对齐（main.cpp 里也有 static_assert）。 */
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..8 一一对齐（main.cpp 里也有 static_assert）。 */
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
@@ -334,10 +334,11 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::AddNoise) == 5);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Grain) == 6);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::MotionBlur) == 7);
-  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 8);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == 8);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 9);
 
   /* 面板行数：docs/filters.md §3 各表的数据行数。 */
-  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2};
+  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4};
   for (size_t i = 0; i < count; ++i) {
     COMP_CHECK_MSG(table[i].param_count == row_counts[i], "panel row count");
     COMP_CHECK_MSG(table[i].param_count > 0 &&
@@ -413,6 +414,23 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(near_value(motion->params[1].min_value, 0.0)); /* Distance：0 = 恒等 */
   COMP_CHECK(near_value(motion->params[1].max_value, 2000.0));
   COMP_CHECK(near_value(motion->params[1].default_value, 0.0));
+
+  const comp_ui::FilterSpec* progressive = comp_ui::filter_spec(comp_ui::FilterId::ProgressiveBlur);
+  COMP_CHECK(progressive != nullptr && std::string(progressive->name) == "Progressive Blur");
+  COMP_CHECK(progressive->param_count == 4);
+  COMP_CHECK(near_value(progressive->params[0].min_value, 0.0)); /* From */
+  COMP_CHECK(near_value(progressive->params[0].max_value, 250.0));
+  COMP_CHECK(near_value(progressive->params[0].default_value, 0.0)); /* 恒等 */
+  COMP_CHECK(near_value(progressive->params[1].min_value, 0.0));      /* To */
+  COMP_CHECK(near_value(progressive->params[1].max_value, 250.0));
+  COMP_CHECK(near_value(progressive->params[1].default_value, 20.0));
+  /* 两个开关都是 0/1 的整数行，缺省关（同 Preserve / Gaussian 的口径）。 */
+  COMP_CHECK(near_value(progressive->params[2].min_value, 0.0)); /* Radial */
+  COMP_CHECK(near_value(progressive->params[2].max_value, 1.0));
+  COMP_CHECK(near_value(progressive->params[2].default_value, 0.0));
+  COMP_CHECK(near_value(progressive->params[3].min_value, 0.0)); /* Inverted */
+  COMP_CHECK(near_value(progressive->params[3].max_value, 1.0));
+  COMP_CHECK(near_value(progressive->params[3].default_value, 0.0));
 
   COMP_CHECK(comp_ui::filter_spec_at(-1) == nullptr);
   COMP_CHECK(comp_ui::filter_spec_at(static_cast<int>(count)) == nullptr);

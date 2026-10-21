@@ -11,6 +11,8 @@
  *   Add Noise       NoisePixels.h   noise_add_at
  *   Grain           AdjustPixels.h  adjust_grain（与 kind 5 调整层同一内核）
  *   Motion Blur     本文件（上游是 Core Image CIMotionBlur，见 motion_blur_pixels）
+ *   Progressive Blur 本文件（上游是 Core Image CIMaskedVariableBlur，见
+ *                   progressive_blur_pixels：分档三角混合逼近逐像素半径）
  *
  * 本文件只做「校验 -> 装配 -> 调用 -> 选区混合 -> 事务」，不重新定义内核语义。
  */
@@ -55,6 +57,15 @@ bool set_error(std::string* error, const char* text) {
   if (error != nullptr) *error = text;
   return false;
 }
+
+/* Progressive Blur 的渐变轴，已经投到图层像素坐标（连续、可越界）。 */
+struct ProgressiveLine {
+  bool valid = false;
+  double x0 = 0.0;
+  double y0 = 0.0;
+  double x1 = 0.0;
+  double y1 = 0.0;
+};
 
 /* ------------------------------------------------------------ 参数闸 */
 
@@ -140,6 +151,20 @@ bool motion_blur_valid(const MotionBlurSettings& s, std::string* error) {
   /* 0 = 恒等；>0 时按上游量程 1..2000。中间那段 (0, 1) 显式拒绝。 */
   if (s.distance != 0.0 && !in_range(s.distance, 1.0, 2000.0)) {
     return set_error(error, "motion blur distance must be 0 or in 1..2000");
+  }
+  return true;
+}
+
+bool progressive_blur_valid(const ProgressiveBlurSettings& s, std::string* error) {
+  if (!in_range(s.from, 0.0, 250.0)) {
+    return set_error(error, "progressive blur from radius out of 0..250");
+  }
+  if (!in_range(s.to, 0.0, 250.0)) {
+    return set_error(error, "progressive blur to radius out of 0..250");
+  }
+  /* 显式轴的端点必须有限；落在画布/图层外是合法的（渐变轴常常横跨整幅画布）。 */
+  if (!finite(s.start_x) || !finite(s.start_y) || !finite(s.end_x) || !finite(s.end_y)) {
+    return set_error(error, "progressive blur axis endpoint is not finite");
   }
   return true;
 }
@@ -394,9 +419,132 @@ comp_result motion_blur_pixels(uint8_t* rgba, int32_t width, int32_t height, siz
   return COMP_OK;
 }
 
+/*
+ * Progressive Blur：半径沿一条轴渐变的模糊（上游 `CIMaskedVariableBlur` +
+ * `CILinearGradient` / `CIRadialGradient` 遮罩）。
+ *
+ * 上游的遮罩按位置给出**半径比例**（mask = radius / strongest），
+ * `inputRadius = strongest * scale` 是上限，Core Image 再逐像素用较小的半径
+ * 模糊。本仓共享内核 `blur_rgba8_copy` 只接受单一 sigma，因此用**分档三角混合**
+ * 逼近：
+ *
+ *   1. 把半径区间等分成 kProgressiveLevels 档，逐档跑一次均匀模糊；
+ *   2. 每个像素按它在轴上的位置 t ∈ [0,1] 得到档位坐标 t * Levels，
+ *      在相邻两档之间取三角权重（权重和恒为 1）；
+ *   3. 把各档结果按权重累加进 float 缓冲，最后四舍五入回 8 位。
+ *
+ * 因此「轴向均匀」（from == to）时只有一档有权重，结果与单一 sigma 的
+ * `blur_rgba8_copy` **逐字节相同**（权重恰为 1.0f）；渐变轴上半径分段线性。
+ * 与上游的差异（note 如实写明）：CIMaskedVariableBlur 的半径逐像素连续变化，
+ * 本仓是 8 档混合，过渡带内不声称逐像素等同。
+ *
+ * 轴向：`line` 已由 filter_apply 投到图层像素坐标。线性档取「点在轴上的投影 /
+ * 轴长」，径向档取「点与 start 的距离 / 轴长」，都夹到 0..1。轴退化
+ * （距离 < 1 px）时终点取 start + (0, 1)：本仓像素 y 向下，与上游在 CI 里
+ * 取 start + (0, -1)（y 向上）是同一方向。
+ */
+constexpr int kProgressiveLevels = 8;
+
+comp_result progressive_blur_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                    const ProgressiveBlurSettings& s, double scale,
+                                    const ProgressiveLine& line) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  if (!line.valid) return COMP_OK;
+  double from = s.from;
+  double to = s.to;
+  if (s.inverted) std::swap(from, to);
+  const double strongest = std::max(from, to);
+  /* 上游 guard strongest > 0（Filters.swift:399）：两端都为 0 时原样返回。 */
+  if (!(strongest > 0.0)) return COMP_OK;
+
+  double sx = line.x0;
+  double sy = line.y0;
+  double ex = line.x1;
+  double ey = line.y1;
+  double dx = ex - sx;
+  double dy = ey - sy;
+  double length = std::hypot(dx, dy);
+  if (length < 1.0) {
+    ex = sx;
+    ey = sy + 1.0;
+    dx = 0.0;
+    dy = 1.0;
+    length = 1.0;
+  }
+  const double inv_length = 1.0 / length;
+  const double inv_length2 = inv_length * inv_length;
+
+  const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+
+  /* 每像素的档位坐标（0..kProgressiveLevels），只算一次。 */
+  std::vector<float> position(pixel_count);
+  for (int32_t y = 0; y < height; ++y) {
+    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int32_t x = 0; x < width; ++x) {
+      const double px = static_cast<double>(x) - sx;
+      const double py = static_cast<double>(y) - sy;
+      const double t = s.radial ? std::hypot(px, py) * inv_length
+                                : (px * dx + py * dy) * inv_length2;
+      position[row + static_cast<size_t>(x)] =
+          static_cast<float>(clamp01(t) * static_cast<double>(kProgressiveLevels));
+    }
+  }
+
+  std::vector<float> accumulated(pixel_count * 4u, 0.0f);
+  std::vector<uint8_t> blurred;
+  for (int level = 0; level <= kProgressiveLevels; ++level) {
+    const uint8_t* image = source.data();
+    const double t = static_cast<double>(level) / static_cast<double>(kProgressiveLevels);
+    const double radius = from + (to - from) * t;
+    /* level 0 是轴起点的半径，不是「原图」：from > 0 时它同样要模糊，
+     * 否则 from == to 的均匀档会在起点留一条不模糊的边，与「整层同一半径」
+     * 的上游口径不符。from == 0 才用原图（半径 0 = 不动是 0.1 px 做不到的）。 */
+    if (radius > 0.0) {
+      const double sigma = std::max(0.1, radius * scale);
+      if (!blur_rgba8_copy(source.data(), width, height, row_bytes, static_cast<float>(sigma),
+                           &blurred)) {
+        return COMP_ERR_OUT_OF_MEMORY;
+      }
+      image = blurred.data();
+    }
+    const float level_value = static_cast<float>(level);
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const float weight = 1.0f - std::fabs(position[i] - level_value);
+      if (weight <= 0.0f) continue;
+      const uint8_t* p = image + i * 4u;
+      float* a = accumulated.data() + i * 4u;
+      a[0] += weight * static_cast<float>(p[0]);
+      a[1] += weight * static_cast<float>(p[1]);
+      a[2] += weight * static_cast<float>(p[2]);
+      a[3] += weight * static_cast<float>(p[3]);
+    }
+  }
+
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const size_t base = static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int32_t x = 0; x < width; ++x) {
+      const float* a = accumulated.data() + (base + static_cast<size_t>(x)) * 4u;
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 4; ++c) {
+        const long value = std::lround(a[c]);
+        pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
-                         int64_t origin_y) {
+                         int64_t origin_y, const ProgressiveLine& line) {
   switch (settings.kind) {
     case kFilterVignette:
       vignette_pixels(rgba, width, height, stride, settings.vignette);
@@ -415,6 +563,9 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return grain_pixels(rgba, width, height, stride, settings.grain, scale);
     case kFilterMotionBlur:
       return motion_blur_pixels(rgba, width, height, stride, settings.motion_blur, scale);
+    case kFilterProgressiveBlur:
+      return progressive_blur_pixels(rgba, width, height, stride, settings.progressive_blur, scale,
+                                     line);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -441,6 +592,7 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterAddNoise: return add_noise_valid(settings.add_noise, error);
     case kFilterGrain: return grain_valid(settings.grain, error);
     case kFilterMotionBlur: return motion_blur_valid(settings.motion_blur, error);
+    case kFilterProgressiveBlur: return progressive_blur_valid(settings.progressive_blur, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -458,6 +610,9 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterAddNoise: return settings.add_noise.amount == 0.0;
     case kFilterGrain: return settings.grain.amount == 0.0;
     case kFilterMotionBlur: return settings.motion_blur.distance == 0.0;
+    case kFilterProgressiveBlur:
+      /* 上游 guard strongest > 0：两端半径都为 0 时原样返回。 */
+      return std::max(settings.progressive_blur.from, settings.progressive_blur.to) <= 0.0;
   }
   return true;
 }
@@ -472,6 +627,7 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterAddNoise: return "Add Noise";
     case kFilterGrain: return "Grain";
     case kFilterMotionBlur: return "Motion Blur";
+    case kFilterProgressiveBlur: return "Progressive Blur";
   }
   return "filter";
 }
@@ -557,9 +713,26 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
       /* Add Noise 的噪声场锚在文档坐标（同上游 noiseOrigin）：原点取图层
        * effective_bounds()——图层移动后图案不会在像素上「游动」。 */
       const comp_rect bounds = layer->effective_bounds();
+      /* Progressive Blur 的渐变轴：auto_axis 时取图层自身像素矩形中线、自顶向下
+       * （上游 progressiveStart/End 为 nil 时的画布中线口径，本层不替宿主猜画布）；
+       * 否则把文档坐标端点投到图层像素空间（连续、允许越界）。 */
+      ProgressiveLine line;
+      if (settings.kind == kFilterProgressiveBlur) {
+        const ProgressiveBlurSettings& p = settings.progressive_blur;
+        if (p.auto_axis) {
+          line.x0 = line.x1 = (static_cast<double>(layer->pixels.width) - 1.0) * 0.5;
+          line.y0 = 0.0;
+          line.y1 = static_cast<double>(layer->pixels.height) - 1.0;
+          line.valid = layer->pixels.width > 0 && layer->pixels.height > 0;
+        } else {
+          line.valid = layer->document_to_pixel_continuous(p.start_x, p.start_y, &line.x0,
+                                                           &line.y0) &&
+                       layer->document_to_pixel_continuous(p.end_x, p.end_y, &line.x1, &line.y1);
+        }
+      }
       status = apply_pixels(pixels, layer->pixels.width, layer->pixels.height,
                             layer->pixels.stride(), settings, effective_scale,
-                            static_cast<int64_t>(bounds.x), static_cast<int64_t>(bounds.y));
+                            static_cast<int64_t>(bounds.x), static_cast<int64_t>(bounds.y), line);
       if (status != COMP_OK) {
         failure = status == COMP_ERR_OUT_OF_MEMORY ? "filter ran out of memory"
                                                    : "filter could not apply the settings";
@@ -604,6 +777,13 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     if (settings.kind == kFilterMotionBlur) {
       *note += " as a box streak over distance * scale (CIMotionBlur's radius is the equivalent "
                "standard deviation, so the shape is not pixel-identical)";
+    }
+    if (settings.kind == kFilterProgressiveBlur) {
+      *note += " as an 8-level blend of uniform box blurs (CIMaskedVariableBlur varies the radius "
+               "per pixel, so the ramp is not pixel-identical)";
+      if (settings.progressive_blur.auto_axis) {
+        *note += ", axis defaulted to the layer's mid-line";
+      }
     }
     if (clip) *note += ", clipped to the document selection";
   }

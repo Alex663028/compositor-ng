@@ -9,8 +9,9 @@
 上游把 Filter 菜单收在 `FilterSettings` + `PixelFilter.run` 一条通路上
 （`Filters.swift:63`、`:312-356`）。本仓的七个像素内核早已就位，缺的是**产品入口**：
 参数契约、与图层几何的装配、一步撤销、与选区的混合。`comp_filter_apply` 就是那条入口。
-Motion Blur 在上游走 Core Image 的 `CIMotionBlur`，本仓没有对应内核，由本层按
-其可观察口径补一份盒式线积分（见 §3.8、§5）。
+Motion Blur 在上游走 Core Image 的 `CIMotionBlur`、Progressive Blur 走
+`CIMaskedVariableBlur`，本仓都没有对应内核，由本层按可观察口径各补一份
+（盒式线积分 / 分档三角混合，见 §3.8、§3.9、§5）。
 
 | 滤镜 | 内核 | 上游来源 |
 |------|------|---------|
@@ -22,6 +23,7 @@ Motion Blur 在上游走 Core Image 的 `CIMotionBlur`，本仓没有对应内�
 | Add Noise | `noise_add_at`（`imaging/NoisePixels.h`） | `amount` / `gaussian` / `monochromatic` / `seed` |
 | Grain | `adjust_grain`（与 Grain 调整层同一内核） | `grain` / `GrainSettings` |
 | Motion Blur | 本文件 `motion_blur_pixels`（盒式线积分，见 §5） | `angle` / `distance`（Core Image `CIMotionBlur`） |
+| Progressive Blur | 本文件 `progressive_blur_pixels`（8 档 `blur_rgba8_copy` 三角混合，见 §3.9） | `progressive*`（Core Image `CIMaskedVariableBlur`） |
 
 与工具层（[`docs/tool-ops.md`](tool-ops.md)）的分工：
 
@@ -169,6 +171,41 @@ alpha。因此 alpha 通道逐字节不变，轮廓不向外扩散，透明邻�
 - 每像素最多 257 个采样点；更长的条纹按步长重采样（仍覆盖整条长度）。
 - 角度只决定方向，条纹以像素为中心左右对称（上游 `CIMotionBlur` 亦无偏移参数）。
 
+### 3.9 Progressive Blur（`COMP_FILTER_PROGRESSIVE_BLUR`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `from` | 0..250 | 0 | 渐变轴起点的模糊半径（图层像素；预览再乘 `scale`） |
+| `to` | 0..250 | 20 | 渐变轴终点的模糊半径（同上） |
+| `radial` | 0 / 1 | 0 | 1 = 以 `start` 为心、`\|end - start\|` 为半径的径向渐变 |
+| `inverted` | 0 / 1 | 0 | 1 = 交换 `from` / `to`（等价于把轴掉头） |
+| `start_x` / `start_y` | 文档坐标（连续） | 0 | 轴起点；`explicit_axis = 0` 时忽略 |
+| `end_x` / `end_y` | 文档坐标（连续） | 0 | 轴终点；同上 |
+| `explicit_axis` | 0 / 1 | 0 | 0 = 用缺省轴（图层像素矩形中线、自顶向下）；1 = 用 `start` / `end` |
+
+- **恒等判据**：`max(from, to) <= 0`（上游 `guard strongest > 0`）。零初始化
+  （`from = to = 0`、`explicit_axis = 0`）= 恒等 + 缺省轴，不碰像素、不开事务。
+  文档层用反相的 `auto_axis`（缺省 `true`），两侧零初始化含义一致。
+- 实现：把 `[from, to]` 等分成 8 档，逐档跑共享内核 `blur_rgba8_copy`，
+  每个像素按它在轴上的位置 `t ∈ [0, 1]` 在相邻两档之间取三角权重（权重和为 1）。
+  `from == to` 时各档半径相同，结果与同 sigma 的 Gaussian Blur **逐字节相同**。
+  第 0 档是**起点的半径**而不是原图：`from > 0` 时它同样要模糊，否则均匀档
+  会在轴起点留一条不模糊的边；`from = 0` 才用原图（0 半径用 0.1 px 近似会
+  平白改掉一像素）。
+- 轴向：线性档 `t = dot(p - start, d) / |d|²`，径向档 `t = |p - start| / |d|`，
+  都夹到 `0..1`（径向超过轴长的部分按终点半径处理）。轴退化（`|d| < 1 px`）时
+  终点取 `start + (0, +1)`：本仓像素 y 向下，与上游在 CI 里取 `start + (0, -1)`
+  是同一方向。
+- 显式轴端点经 `Layer::document_to_pixel_continuous` 投到图层像素空间：
+  同一套仿射（归一化 → 逆旋转 → 翻转），**保留亚像素**、允许落在缓冲外。
+  取整版 `document_to_pixel` 在缩放 / 旋转下会让同一对端点抖动 ±1 px，
+  渐变方向随之跳变，所以这里不用它。
+- 缺省轴（`explicit_axis = 0`）取**图层自身像素矩形**的中线：
+  `x = (w - 1) / 2`，`y` 从 `0` 到 `h - 1`。上游 `progressiveStart/End` 为 nil
+  时取画布中线，但域层没有画布上下文，不替宿主猜；note 写明
+  `axis defaulted to the layer's mid-line`。
+- `scale` 只乘半径，不改正则方向：降采样预览看起来与全尺寸一致。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -206,8 +243,13 @@ note 写明 `document selection is empty`。
    `distance` 的均匀条纹同方差）；本仓直接对长度 `distance` 做盒式平均。
    方向与长度两条可观察口径一致，形状不声称逐像素等同，note 写明
    `CIMotionBlur's radius is the equivalent standard deviation`。
-7. **新四例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur
-   都跑在 8 位工作副本上（见 §6），HDR 拒绝。
+7. **后五例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur /
+   Progressive Blur 都跑在 8 位工作副本上（见 §6），HDR 拒绝。
+8. **Progressive Blur 是 8 档混合，不是逐像素半径**。上游 `CIMaskedVariableBlur`
+   逐像素连续变化半径；本仓把 `[from, to]` 切成 8 档、逐档均匀模糊后按三角权重
+   混合（见 §3.9）。可观察口径一致：两端半径、渐变方向、`radial` / `inverted`
+   语义；过渡带内不声称逐像素等同，note 写明
+   `8-level blend ... the ramp is not pixel-identical`。
 
 ## 6. 16 位与 HDR
 
@@ -221,11 +263,12 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（18 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（22 例，ABI + 域层混合视角）钉住：
 
-- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增四个 kind 的零初始化）；
-- 越界参数在事务之前拒绝（17 组，含 NaN scale；覆盖 blur radius、noise amount、
-  grain size / roughness、motion blur angle / distance 的边界内外）；
+- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增五个 kind 的零初始化）；
+- 越界参数在事务之前拒绝（20 组，含 NaN scale / 轴端点；覆盖 blur radius、
+  noise amount、grain size / roughness、motion blur angle / distance、
+  progressive blur from / to 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -242,7 +285,12 @@ note 写明 `document selection is empty`。
 - Grain 同 seed 复现、换 seed 不同、一步撤销；
 - Motion Blur 在 `angle = 0` 时只沿 x 拉出条纹（远端行逐字节不动、不沿 y 移动），
   `angle = 90` 时转为竖直；`scale = 0.5` 把条纹长度减半；一步撤销；
-- ABI 正确搬运四个新 kind 的字段（含布尔），越界值在 ABI 边界同样被拒。
+- Progressive Blur 的缺省轴自顶向下（顶部方差远大于底部、起点行逐字节不变）；
+  显式水平轴的锐端在 `start`、`inverted` 换到另一端；径向档中心锐、角上糊；
+  `scale = 0.25` 时远端比全尺寸更锐；`from == to` 与同 sigma 的 Gaussian Blur
+  **逐字节相同**；一步撤销；
+- ABI 正确搬运五个新 kind 的字段（含布尔与 `explicit_axis` 的反相映射），
+  越界值在 ABI 边界同样被拒。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -262,12 +310,20 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 | Add Noise 0..3 | `add_noise.amount/gaussian/monochromatic/seed` | 0 / 0 / 0 / 0 |
 | Grain 0..3 | `grain.amount/size/roughness/seed` | 0 / 1.5 / 50 / 0 |
 | Motion Blur 0..1 | `motion_blur.angle/distance` | 0 / 0 |
+| Progressive Blur 0..3 | `progressive_blur.from/to/radial/inverted` | 0 / 20 / 0 / 0 |
+| （渐变轴） | `progressive_blur.start_x/start_y/end_x/end_y` + `explicit_axis = 1` | 画布拖拽定轴；未拖拽时 `explicit_axis = 0` 用缺省中线 |
 
 - **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
   值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。
 - **一次调用**：壳用固定 512 字节 note 缓冲调用一次 `comp_filter_apply`，不做
   `note_capacity = 0` 的长度探测（该函数先执行后写 note，探测会应用两遍）。
 - **恒等如实回报**：`out_changed == 0` 时状态栏写「参数为恒等，未改动」。
+- **Progressive Blur 的轴**：面板只承载两端半径与两个开关；渐变轴在画布上
+  **拖一条线**来定（`main.cpp` 的 `progressive_axis_begin/extend/end`）。
+  面板打开期间画布拖拽优先给轴，不落笔迹；手型 / 空格平移仍然优先。
+  已提交的轴以虚线画在画布上（拖拽中为实线，径向档另画半径圆），
+  `Ctrl+N` / 打开新文档会作废旧轴（端点是旧文档坐标）。轴本身不进撤销栈，
+  只有回车应用才产生一步 `Filter: Progressive Blur`。
 - **边缘色**：`vignette.color[3]` 固定 0,0,0（面板行模型只承载标量，颜色选择器
   属后续 UI 轮次，见 §3.1）。
 

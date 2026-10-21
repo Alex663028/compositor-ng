@@ -3,14 +3,15 @@
  * filters.h — Filter 菜单的领域层（P1 滤镜批次）。
  *
  * 背景：Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
- * Add Noise / Grain / Motion Blur 在上游是 FilterSettings + PixelFilter.run 的
- * 一条通路（Filters.swift:63、:312-356）。这八个算子里，前七个的像素内核在本仓
- * 早已就位（AdjustPixels.h 的 adjust_colored_vignette / adjust_tonal_contrast /
- * adjust_grain、LensPixels.h 的 lens_distort、NoisePixels.h 的 noise_add_at、
- * adjustment_eval.h 的 blur_rgba8_copy），Motion Blur 没有对应内核，由本文件
- * 按上游 `CIMotionBlur` 的可观察口径补一份盒式线积分；缺的都是**产品入口**：
- * 参数契约、与图层几何的装配、一步撤销、与选区的混合。本文件把那条通路
- * 收口成一个领域入口。
+ * Add Noise / Grain / Motion Blur / Progressive Blur 在上游是 FilterSettings +
+ * PixelFilter.run 的一条通路（Filters.swift:63、:312-356）。这九个算子里，前七个
+ * 的像素内核在本仓早已就位（AdjustPixels.h 的 adjust_colored_vignette /
+ * adjust_tonal_contrast / adjust_grain、LensPixels.h 的 lens_distort、
+ * NoisePixels.h 的 noise_add_at、adjustment_eval.h 的 blur_rgba8_copy），
+ * Motion Blur 与 Progressive Blur 没有对应内核，由本文件按上游
+ * `CIMotionBlur` / `CIMaskedVariableBlur` 的可观察口径补一份（盒式线积分 /
+ * 分档三角混合）；缺的都是**产品入口**：参数契约、与图层几何的装配、
+ * 一步撤销、与选区的混合。本文件把那条通路收口成一个领域入口。
  *
  * 与工具层（tool_ops.h）的分工：
  *   - 工具层按「笔迹 / coverage」工作，一次调用通常落一笔；
@@ -178,6 +179,42 @@ struct MotionBlurSettings {
   double distance = 0.0;
 };
 
+/*
+ * Progressive Blur（上游 FilterSettings.progressive*，CIMaskedVariableBlur）。
+ *
+ * `from` / `to` 是渐变轴两端的模糊半径（图层像素，0..250，预览再乘 scale）：
+ * 起点按 `from`、终点按 `to`，中间按轴上的位置线性插值。`inverted` 交换 from/to
+ * （等价于把轴掉头）。**两端半径都为 0 = 恒等**（上游 `strongest > 0` 的 guard）。
+ *
+ * `start_*` / `end_*` 是**文档坐标**的轴端点（连续，不必落在图层内）。上游把两点
+ * 经 `job.mapping.inverted()` 投到像素空间；本层走
+ * `Layer::document_to_pixel_continuous`，同一套仿射（归一化 → 逆旋转 → 翻转），
+ * 保留亚像素位置，缩放/旋转下渐变方向不会 ±1 px 抖动。
+ *
+ * `radial` 为真时轴变成以 start 为心、|end − start| 为半径的径向渐变（上游
+ * `CIRadialGradient`，radius0 = 0、radius1 = 轴长），否则是沿轴的线性渐变。
+ *
+ * 退化轴（两点距离 < 1 px）：上游把终点改成 start + (0, -1)（CI 的 y 向上），
+ * 本层在像素空间取 start + (0, +1)（本仓像素 y 向下），对渐变方向等价。
+ *
+ * 缺省轴：上游 `progressiveStart/End` 为 nil 时取画布中线（x = 画布中线、
+ * y 从 minY 到 maxY）。`auto_axis = true`（零初始化口径）时本层不替宿主猜画布——
+ * 按「图层自身像素矩形中线、自顶向下」落轴；宿主给了 true 以外的显式轴时置
+ * `auto_axis = false` 并填 start/end。这样零初始化的 `(0,0)-(0,0)` 不会被误读成
+ * 「原点上的退化轴」（径向档下那是一个有意义的输入，不是缺省值）。
+ */
+struct ProgressiveBlurSettings {
+  double from = 0.0;
+  double to = 0.0;
+  double start_x = 0.0;
+  double start_y = 0.0;
+  double end_x = 0.0;
+  double end_y = 0.0;
+  bool radial = false;
+  bool inverted = false;
+  bool auto_axis = true;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -188,6 +225,7 @@ enum FilterKind {
   kFilterAddNoise = 5,
   kFilterGrain = 6,
   kFilterMotionBlur = 7,
+  kFilterProgressiveBlur = 8,
 };
 
 /*
@@ -204,6 +242,7 @@ struct FilterSettings {
   AddNoiseSettings add_noise;
   GrainSettings grain;
   MotionBlurSettings motion_blur;
+  ProgressiveBlurSettings progressive_blur;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */
@@ -220,9 +259,10 @@ const char* filter_kind_label(FilterKind kind);
 /*
  * 对目标图层跑一次滤镜。成功返回 true。
  *
- * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：只影响高斯半径（Tonal
- * Contrast / Bloom），让降采样预览看起来与全尺寸一致；几何类（Vignette /
- * Lens Correction）本身就相对图层尺寸，无需缩放。
+ * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：只影响以像素为单位的半径
+ * （Tonal Contrast / Bloom / Gaussian Blur / Motion Blur / Progressive Blur），
+ * 让降采样预览看起来与全尺寸一致；几何类（Vignette / Lens Correction）本身
+ * 相对图层尺寸，无需缩放。
  *
  * 错误码（本层直接回报，调用方不从文案反推）：
  *   设置越界 / 非有限 -> COMP_ERR_INVALID_ARGUMENT

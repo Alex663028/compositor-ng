@@ -1664,6 +1664,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段）/ `COMP_FILTER_ADD_NOISE` | `noise_add_at`（origin 锚定） | — |
 | Motion Blur（P1 新增，本仓内核） | `COMP_FILTER_MOTION_BLUR` | `engine/domain/filters.cpp` 的 `motion_blur_pixels`（盒式线积分：长度 = `distance * scale`，预乘双线性、边缘夹取、最多 257 采样） | 无独立内核函数（上游是 Core Image `CIMotionBlur`） |
+| Progressive Blur（P1 新增，本仓内核） | `COMP_FILTER_PROGRESSIVE_BLUR` | `engine/domain/filters.cpp` 的 `progressive_blur_pixels`（8 档 `blur_rgba8_copy` 三角混合；线性 / 径向轴，端点经 `document_to_pixel_continuous`） | 无独立内核函数（上游是 Core Image `CIMaskedVariableBlur`） |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19）、**`deep_take_painted`/`deep_take_painted_hdr`**（落笔族在 RGBA16 / RGBA16F 上保留深像素，§6.1.21） | — |
@@ -4261,6 +4262,62 @@ radius——即让 CI 的分布与长度为 `distance` 的均匀条纹同方差�
 **245 项不变**（SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
 **6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/filters.md` §1 / §3.8 /
 §5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，`docs/manual-test.md` M9 追加第 9 条。
+
+### 6.47 P1 滤镜库扩容（收尾）：Progressive Blur（2026-10-21，Claude）
+
+**立项口径。** 上游 Filter 菜单里最后一个还没有产品通路的算子（`Filters.swift:387-413`：
+`CIMaskedVariableBlur` + 线性 / 径向渐变遮罩，`strongest = max(from, to)`，
+`guard strongest > 0`）。本仓没有「逐像素半径」的模糊内核，按上游的可观察口径
+（两端半径、渐变方向、`radial` / `inverted` 语义）补一份 **8 档三角混合**，
+并接上与其余八个算子同一条 `comp_filter_apply` 入口。
+
+**零新增导出。** `comp_filter_kind` 尾部追加 `COMP_FILTER_PROGRESSIVE_BLUR = 8`；
+`comp_filter_desc` 尾部追加
+`progressive_blur { from, to, radial, inverted, start_x, start_y, end_x, end_y, explicit_axis }`。
+既有枚举值、字段偏移与导出一个不动，PE 导出仍 **138**。
+
+**口径。** `from` / `to` 各 0..250（图层像素，预览再乘 `scale`），恒等判据
+`max(from, to) <= 0`（对齐上游 `guard strongest > 0`）——零初始化不碰像素、不开事务、
+`out_changed = 0`。域层用反相的 `auto_axis`（缺省 `true`），ABI 用 `explicit_axis`
+（缺省 0），两侧零初始化都是「恒等 + 缺省轴」。`inverted` 交换两端半径。
+实现把 `[from, to]` 等分成 8 档、逐档跑共享内核 `blur_rgba8_copy`，每个像素按它在轴上
+的位置 `t ∈ [0,1]` 在相邻两档间取三角权重（权重和为 1）。**第 0 档是起点的半径而不是
+原图**：`from > 0` 时它同样要模糊，否则均匀档会在轴起点留一条不模糊的边；`from = 0`
+才用原图（0 半径用 0.1 px 近似会平白改掉一像素）。因此 `from == to` 与同 sigma 的
+Gaussian Blur **逐字节相同**，由用例钉住。
+
+**轴与亚像素。** 显式轴端点经新增的 `Layer::document_to_pixel_continuous`
+（归一化 → 逆旋转 → 翻转，同一套仿射）投到图层像素空间，**保留亚像素**、允许落在
+缓冲外；取整版会让同一对端点随缩放 / 旋转抖动 ±1 px，方向随之跳变。线性档
+`t = dot(p - start, d) / |d|²`，径向档 `t = |p - start| / |d|`，都夹到 0..1；
+轴退化（`|d| < 1 px`）时终点取 `start + (0, +1)`——本仓像素 y 向下，与上游在 CI 里
+取 `start + (0, -1)` 是同一方向。缺省轴（`explicit_axis = 0`）取**图层自身像素矩形**
+的中线（`x = (w-1)/2`，`y` 从 0 到 `h-1`）：域层没有画布上下文，不替宿主猜，
+note 写明 `axis defaulted to the layer's mid-line`。
+
+**为什么不声称与 CI 逐位一致。** 上游 `CIMaskedVariableBlur` 是逐像素连续变化半径；
+本仓切成 8 档均匀模糊再按三角权重混合。两端半径、渐变方向、`radial` / `inverted`
+语义一致，过渡带内不逐像素等同，note 写明
+`8-level blend ... the ramp is not pixel-identical`。
+
+**外壳。** `FilterId` 追加 8（`Count` 移到 9），`filter_table()` 追加一行
+（From / To / Radial / Inverted，4 个参数，仍在上限 6 之内），菜单与面板仍从同一张表
+生成；`build_filter_desc` 追加唯一映射分支。渐变的两个端点不在面板行里，而是在画布上
+**拖一条线**定轴（`progressive_axis_begin/extend/end`）：拖拽中画实线、松手画虚线，
+径向档另画半径圆；未拖拽时 `explicit_axis = 0` 用缺省中线。拖轴本身不进撤销栈，
+只有回车应用才产生一步 `Filter: Progressive Blur`。`Ctrl+N` / 打开 `.comp` 时作废旧轴
+（端点是旧文档坐标）——新建与打开两条路径各补一次 `progressive_axis_set = false`，
+与 `filter_open` / 笔迹清理放在同一处。
+
+**验证。** 领域 / ABI 层 22 例（新增 4 例）：缺省轴自顶向下（顶部方差远大于底部、
+起点行逐字节不变）；显式水平轴锐端在 `start`、`inverted` 换到另一端；径向档中心锐、
+角上糊；`scale = 0.25` 时远端比全尺寸更锐；`from == to` 与同 sigma 的 Gaussian Blur
+逐字节相同；一步撤销逐字节还原；越界闸（`from -0.5`、`to 250.5`、NaN 轴端点）；
+ABI 字段搬运（含 `explicit_axis` 反相映射）与 note caveat。单测 582 → **586 例 /
+0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**（SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/filters.md` §1 / §3.9 / §5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，
+`docs/manual-test.md` M9 追加第 10 条。
 
 
 

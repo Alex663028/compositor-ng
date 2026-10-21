@@ -1,14 +1,15 @@
 // AI生成
 /*
  * test_filters.cpp — P1 滤镜批次（Vignette / Tonal Contrast / Bloom /
- * Lens Correction / Gaussian Blur / Add Noise / Grain / Motion Blur）的回归护栏。
+ * Lens Correction / Gaussian Blur / Add Noise / Grain / Motion Blur /
+ * Progressive Blur）的回归护栏。
  *
- * 为什么需要这组用例：这八个算子在上游是 Filter 菜单的一条通路
+ * 为什么需要这组用例：这九个算子在上游是 Filter 菜单的一条通路
  * （Filters.swift + PixelFilter.run），本仓的像素内核早已就位，缺的是产品入口。
  * 本组用例冻结入口落地之后的契约：
  *   1. 恒等设置是**真 no-op**：不动像素、不开事务、out_changed = 0；
  *   2. 参数闸在开事务之前：越界参数 -> INVALID_ARGUMENT，不进撤销栈；
- *   3. 八个算子分别可观察地改变像素，且各恰好一步撤销；
+ *   3. 九个算子分别可观察地改变像素，且各恰好一步撤销；
  *   4. Bloom 只加光、不改 alpha（预乘不变式：颜色不超过 alpha）；
  *   5. 选区委剪按**文档坐标**混合；图层带偏移时用 effective_bounds() 的原点；
  *   6. 16 位图层落 8 位工作副本并在 note 里写明，撤销恢复 16 位；
@@ -236,7 +237,7 @@ COMP_TEST(filters_new_kinds_are_identity_at_zero_initialisation) {
   const size_t undo_before = undo_depth(document);
 
   const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain,
-                              kFilterMotionBlur};
+                              kFilterMotionBlur, kFilterProgressiveBlur};
   for (FilterKind kind : kinds) {
     FilterSettings settings;
     settings.kind = kind; /* 其余字段零初始化：radius / amount 为 0 = 恒等 */
@@ -367,6 +368,26 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
     s.kind = kFilterMotionBlur;
     s.motion_blur.distance = 2000.5;
     cases.push_back({"motion blur distance above 2000", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterProgressiveBlur;
+    s.progressive_blur.to = 20.0;
+    s.progressive_blur.from = -0.5;
+    cases.push_back({"progressive blur from below 0", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterProgressiveBlur;
+    s.progressive_blur.to = 250.5;
+    cases.push_back({"progressive blur to above 250", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterProgressiveBlur;
+    s.progressive_blur.to = 20.0;
+    s.progressive_blur.start_x = std::numeric_limits<double>::quiet_NaN();
+    cases.push_back({"progressive blur axis endpoint is not finite", s});
   }
 
   for (const Case& item : cases) {
@@ -861,6 +882,176 @@ COMP_TEST(filters_motion_blur_streaks_along_the_angle_and_is_one_step_undo) {
   COMP_CHECK_MSG(pixels_of(horizontal, horizontal_id) == dot, "one undo restores the source");
 }
 
+/* ================================================== 2d. Progressive Blur */
+
+namespace {
+
+/* 小窗口内的单通道方差：棋盘格被模糊后这个数会掉下来，
+ * 不用重算内核公式也能判断「哪一端更糊」。 */
+double window_variance(const std::vector<uint8_t>& rgba, int32_t width, int32_t x0, int32_t y0,
+                       int32_t size) {
+  double sum = 0.0;
+  double sum_sq = 0.0;
+  int32_t count = 0;
+  for (int32_t y = y0; y < y0 + size; ++y) {
+    for (int32_t x = x0; x < x0 + size; ++x) {
+      const double value = channel_at(rgba, width, x, y, 0);
+      sum += value;
+      sum_sq += value * value;
+      ++count;
+    }
+  }
+  const double mean = sum / static_cast<double>(count);
+  return sum_sq / static_cast<double>(count) - mean * mean;
+}
+
+}  // namespace
+
+COMP_TEST(filters_progressive_blur_ramps_along_the_default_axis_and_is_one_step_undo) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  const std::vector<uint8_t> chess = checkerboard(size, size);
+
+  FilterSettings settings;
+  settings.kind = kFilterProgressiveBlur;
+  settings.progressive_blur.from = 0.0;
+  settings.progressive_blur.to = 40.0; /* auto_axis 缺省：图层像素矩形中线、自顶向下 */
+
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, chess, comp_rect{0, 0, size, size});
+  const size_t undo_before = undo_depth(document);
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "progressive blur is a real product path");
+  COMP_CHECK_MSG(code == COMP_OK, "success writes COMP_OK to out_code");
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1,
+                 "one progressive blur is exactly one undo step");
+  COMP_CHECK_MSG(note.find("8-level blend") != std::string::npos,
+                 "the note records the 8-level approximation instead of claiming CI parity");
+  COMP_CHECK_MSG(note.find("mid-line") != std::string::npos,
+                 "the note records that the default axis is the layer's mid-line");
+
+  const std::vector<uint8_t> ramped = pixels_of(document, id);
+  COMP_CHECK_MSG(changed_pixels(ramped, chess) > 0, "the ramp actually moves pixels");
+  /* 缺省轴自顶向下：顶部（t ≈ 0）明显比底部（t ≈ 1）锐。 */
+  const double top = window_variance(ramped, size, size / 2 - 4, 0, 8);
+  const double bottom = window_variance(ramped, size, size / 2 - 4, size - 8, 8);
+  COMP_CHECK_MSG(top > bottom * 4.0 + 1.0,
+                 "the top of the default axis stays far sharper than the bottom");
+  COMP_CHECK_MSG(window_variance(chess, size, size / 2 - 4, 0, 8) > top,
+                 "even the sharp end is softened, so the scale is not silently 0");
+  /* 轴起点（y = 0）的权重重心恰在 0 档 = 原图：整行逐字节不变。 */
+  COMP_CHECK_MSG(row_identical(ramped, chess, size, 0),
+                 "the axis start row keeps the source bytes (level 0 is the source at radius 0)");
+
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == chess, "one undo restores the source");
+}
+
+COMP_TEST(filters_progressive_blur_honours_the_explicit_axis_radial_and_scale) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  const std::vector<uint8_t> chess = checkerboard(size, size);
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string error;
+
+  /* 显式水平轴：左端 from = 0 锐、右端 to = 40 糊。 */
+  FilterSettings horizontal;
+  horizontal.kind = kFilterProgressiveBlur;
+  horizontal.progressive_blur.from = 0.0;
+  horizontal.progressive_blur.to = 40.0;
+  horizontal.progressive_blur.auto_axis = false;
+  horizontal.progressive_blur.start_x = 0.0;
+  horizontal.progressive_blur.start_y = 32.0;
+  horizontal.progressive_blur.end_x = 63.0;
+  horizontal.progressive_blur.end_y = 32.0;
+
+  Document across(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id across_id = add_layer_with(&across, chess, comp_rect{0, 0, size, size});
+  COMP_CHECK(filter_apply(&across, across_id, horizontal, 1.0, &code, &changed, nullptr, &error));
+  const std::vector<uint8_t> sideways = pixels_of(across, across_id);
+  const double left = window_variance(sideways, size, 0, size / 2 - 4, 8);
+  const double right = window_variance(sideways, size, size - 8, size / 2 - 4, 8);
+  COMP_CHECK_MSG(left > right * 4.0 + 1.0,
+                 "an explicit start/end pair puts the sharp end at the start");
+
+  /* inverted 交换 from / to：同一根轴，锐端换到右边。 */
+  horizontal.progressive_blur.inverted = true;
+  Document flipped(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id flipped_id = add_layer_with(&flipped, chess, comp_rect{0, 0, size, size});
+  COMP_CHECK(filter_apply(&flipped, flipped_id, horizontal, 1.0, &code, &changed, nullptr, &error));
+  const std::vector<uint8_t> reversed = pixels_of(flipped, flipped_id);
+  COMP_CHECK_MSG(window_variance(reversed, size, size - 8, size / 2 - 4, 8) >
+                     window_variance(reversed, size, 0, size / 2 - 4, 8) * 4.0 + 1.0,
+                 "inverted swaps the two radii along the same axis");
+
+  /* 径向：中心 start 锐、角上（距离超过轴长，夹到 1）糊。 */
+  FilterSettings radial = horizontal;
+  radial.progressive_blur.inverted = false;
+  radial.progressive_blur.radial = true;
+  radial.progressive_blur.start_x = 32.0;
+  radial.progressive_blur.start_y = 32.0;
+  radial.progressive_blur.end_x = 32.0;
+  radial.progressive_blur.end_y = 63.0;
+  Document circle(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id circle_id = add_layer_with(&circle, chess, comp_rect{0, 0, size, size});
+  COMP_CHECK(filter_apply(&circle, circle_id, radial, 1.0, &code, &changed, nullptr, &error));
+  const std::vector<uint8_t> round = pixels_of(circle, circle_id);
+  const double centre = window_variance(round, size, size / 2 - 4, size / 2 - 4, 8);
+  const double corner = window_variance(round, size, 0, 0, 8);
+  COMP_CHECK_MSG(centre > corner * 4.0 + 1.0,
+                 "the radial mask starts at the centre and clamps past the radius");
+
+  /* scale 乘在半径上：0.25 预览的远端比全尺寸的远端锐。 */
+  horizontal.progressive_blur.inverted = false;
+  Document preview(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id preview_id = add_layer_with(&preview, chess, comp_rect{0, 0, size, size});
+  COMP_CHECK(filter_apply(&preview, preview_id, horizontal, 0.25, &code, &changed, nullptr,
+                          &error));
+  const std::vector<uint8_t> half = pixels_of(preview, preview_id);
+  COMP_CHECK_MSG(window_variance(half, size, size - 8, size / 2 - 4, 8) >
+                     right,
+                 "scale multiplies the radius, so a downscaled preview blurs less");
+}
+
+COMP_TEST(filters_progressive_blur_uniform_radius_matches_gaussian_blur) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 48;
+  const std::vector<uint8_t> chess = checkerboard(size, size);
+
+  FilterSettings gaussian;
+  gaussian.kind = kFilterGaussianBlur;
+  gaussian.gaussian_blur.radius = 8.0;
+
+  FilterSettings uniform;
+  uniform.kind = kFilterProgressiveBlur;
+  uniform.progressive_blur.from = 8.0;
+  uniform.progressive_blur.to = 8.0; /* 两端同半径 = 整层均匀 */
+
+  Document gaussian_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id gaussian_id =
+      add_layer_with(&gaussian_doc, chess, comp_rect{0, 0, size, size});
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string error;
+  COMP_CHECK(filter_apply(&gaussian_doc, gaussian_id, gaussian, 1.0, &code, &changed, nullptr,
+                          &error));
+  const std::vector<uint8_t> blurred = pixels_of(gaussian_doc, gaussian_id);
+
+  Document uniform_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id uniform_id =
+      add_layer_with(&uniform_doc, chess, comp_rect{0, 0, size, size});
+  COMP_CHECK(filter_apply(&uniform_doc, uniform_id, uniform, 1.0, &code, &changed, nullptr,
+                          &error));
+  COMP_CHECK_MSG(pixels_of(uniform_doc, uniform_id) == blurred,
+                 "from == to collapses to the same single box-blur result as Gaussian Blur");
+}
+
 /* ================================================== 3. 选区 / 深度 / 拒绝 */
 
 COMP_TEST(filters_clip_to_the_document_selection_in_document_coordinates) {
@@ -1192,4 +1383,99 @@ COMP_TEST(filters_abi_maps_the_motion_blur_fields) {
   motion.motion_blur.distance = 0.5;
   COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &motion, 1.0, &changed, nullptr,
                                0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+COMP_TEST(filters_abi_maps_the_progressive_blur_fields) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  const std::vector<uint8_t> chess = checkerboard(size, size);
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  int32_t changed = 0;
+
+  /* explicit_axis = 0（零初始化）走缺省轴：自顶向下。 */
+  Document auto_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id auto_id = add_layer_with(&auto_doc, chess, comp_rect{0, 0, size, size});
+  comp_filter_desc identity{};
+  identity.kind = COMP_FILTER_PROGRESSIVE_BLUR;
+  changed = -1;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&auto_doc), auto_id, &identity, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts a zero-initialized progressive blur desc");
+  COMP_CHECK_MSG(changed == 0, "from = to = 0 is the identity through the ABI too");
+
+  comp_filter_desc desc{};
+  desc.kind = COMP_FILTER_PROGRESSIVE_BLUR;
+  desc.progressive_blur.from = 0.0;
+  desc.progressive_blur.to = 40.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&auto_doc), auto_id, &desc, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the progressive blur desc");
+  COMP_CHECK_MSG(changed == 1, "the progressive blur reports out_changed = 1");
+  COMP_CHECK_MSG(std::string(note).find("Progressive Blur applied") != std::string::npos,
+                 "the note names the filter");
+  COMP_CHECK_MSG(std::string(note).find("8-level blend") != std::string::npos,
+                 "the note keeps the CIMaskedVariableBlur caveat");
+  COMP_CHECK_MSG(std::string(note).find("mid-line") != std::string::npos,
+                 "explicit_axis = 0 still means the default mid-line axis");
+  const std::vector<uint8_t> vertical = pixels_of(auto_doc, auto_id);
+  COMP_CHECK_MSG(window_variance(vertical, size, size / 2 - 4, 0, 8) >
+                     window_variance(vertical, size, size / 2 - 4, size - 8, 8) * 4.0 + 1.0,
+                 "explicit_axis = 0 runs the ramp top-down");
+
+  /* explicit_axis = 1 + start/end：水平轴，左端锐、右端糊。 */
+  Document horizontal_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id horizontal_id =
+      add_layer_with(&horizontal_doc, chess, comp_rect{0, 0, size, size});
+  comp_filter_desc horizontal = desc;
+  horizontal.progressive_blur.explicit_axis = 1;
+  horizontal.progressive_blur.start_x = 0.0;
+  horizontal.progressive_blur.start_y = 32.0;
+  horizontal.progressive_blur.end_x = 63.0;
+  horizontal.progressive_blur.end_y = 32.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&horizontal_doc), horizontal_id, &horizontal, 1.0,
+                               &changed, nullptr, 0, nullptr) == COMP_OK);
+  const std::vector<uint8_t> sideways = pixels_of(horizontal_doc, horizontal_id);
+  COMP_CHECK_MSG(window_variance(sideways, size, 0, size / 2 - 4, 8) >
+                     window_variance(sideways, size, size - 8, size / 2 - 4, 8) * 4.0 + 1.0,
+                 "explicit_axis = 1 uses the start/end pair");
+
+  /* inverted 过 ABI：同一根轴，锐端换到右边。 */
+  Document flipped_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id flipped_id =
+      add_layer_with(&flipped_doc, chess, comp_rect{0, 0, size, size});
+  comp_filter_desc flipped = horizontal;
+  flipped.progressive_blur.inverted = 1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&flipped_doc), flipped_id, &flipped, 1.0,
+                               &changed, nullptr, 0, nullptr) == COMP_OK);
+  const std::vector<uint8_t> reversed = pixels_of(flipped_doc, flipped_id);
+  COMP_CHECK_MSG(window_variance(reversed, size, size - 8, size / 2 - 4, 8) >
+                     window_variance(reversed, size, 0, size / 2 - 4, 8) * 4.0 + 1.0,
+                 "inverted = 1 crosses the ABI as a real boolean");
+
+  /* radial 过 ABI：中心 start 锐、角上（超过轴长）糊。 */
+  Document radial_doc(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id radial_id = add_layer_with(&radial_doc, chess, comp_rect{0, 0, size, size});
+  comp_filter_desc radial = horizontal;
+  radial.progressive_blur.radial = 1;
+  radial.progressive_blur.start_x = 32.0;
+  radial.progressive_blur.start_y = 32.0;
+  radial.progressive_blur.end_x = 32.0;
+  radial.progressive_blur.end_y = 63.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&radial_doc), radial_id, &radial, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_OK);
+  const std::vector<uint8_t> round = pixels_of(radial_doc, radial_id);
+  COMP_CHECK_MSG(window_variance(round, size, size / 2 - 4, size / 2 - 4, 8) >
+                     window_variance(round, size, 0, 0, 8) * 4.0 + 1.0,
+                 "radial = 1 crosses the ABI as a real boolean");
+
+  /* 越界量程在 ABI 边界被拒。 */
+  desc.progressive_blur.to = 250.5;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&auto_doc), auto_id, &desc, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  desc.progressive_blur.to = 20.0;
+  desc.progressive_blur.end_y = std::numeric_limits<double>::quiet_NaN();
+  COMP_CHECK(comp_filter_apply(as_document_handle(&auto_doc), auto_id, &desc, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }

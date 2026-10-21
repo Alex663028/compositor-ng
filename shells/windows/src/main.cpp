@@ -298,6 +298,16 @@ struct ShellState {
   bool filter_open = false;
   std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
   /*
+   * Progressive Blur 的渐变轴（P1 滤镜收官）：面板打开时在画布上拖一条线
+   * 即「从 start 到 end」，松手只记端点（不提交滤镜，回车才应用）。
+   * axis_set 为假 = 交给引擎的缺省轴（图层自身像素矩形中线）。
+   */
+  bool progressive_axis_set = false;
+  bool progressive_axis_dragging = false;
+  comp_ui::Point progressive_axis_start{};
+  comp_ui::Point progressive_axis_final{};   /* 已提交的终点 */
+  comp_ui::Point progressive_axis_current{}; /* 拖拽中的终点（预览用） */
+  /*
    * S22 直方图（comp_layer_histogram 的壳侧唯一调用点）。
    *
    * 256 桶亮度分布来自引擎的只读入口：预乘像素先反预乘再取亮度、按 alpha 加权。
@@ -2941,6 +2951,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::Grain) == COMP_FILTER_GRAIN,
               "FilterId::Grain must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::MotionBlur) == COMP_FILTER_MOTION_BLUR,
               "FilterId::MotionBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTER_PROGRESSIVE_BLUR,
+              "FilterId::ProgressiveBlur must match comp_filter_kind");
 
 std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
   const comp_ui::FilterParamSpec* spec = panel.param_at(panel.focused);
@@ -3031,8 +3043,10 @@ void filter_commit_input(ShellState& shell) {
   set_status(shell, buffer);
 }
 
-/* 面板值按固定行序搬进 ABI 结构（唯一映射点；顺序见 ui_core 的 filter_table）。 */
-void build_filter_desc(const comp_ui::FilterPanel& panel, comp_filter_desc* out) {
+/* 面板值按固定行序搬进 ABI 结构（唯一映射点；顺序见 ui_core 的 filter_table）。
+ * Progressive Blur 的渐变轴不在面板行里，从 ShellState 的画布拖拽状态取。 */
+void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
+  const comp_ui::FilterPanel& panel = shell.filter;
   comp_filter_desc desc{};
   desc.kind = static_cast<comp_filter_kind>(static_cast<int>(panel.id));
   switch (panel.id) {
@@ -3081,6 +3095,20 @@ void build_filter_desc(const comp_ui::FilterPanel& panel, comp_filter_desc* out)
       desc.motion_blur.angle = panel.value(0);
       desc.motion_blur.distance = panel.value(1);
       break;
+    case comp_ui::FilterId::ProgressiveBlur:
+      desc.progressive_blur.from = panel.value(0);
+      desc.progressive_blur.to = panel.value(1);
+      desc.progressive_blur.radial = panel.value(2) >= 0.5 ? 1 : 0;
+      desc.progressive_blur.inverted = panel.value(3) >= 0.5 ? 1 : 0;
+      /* 没拖过轴 = 交给引擎的缺省轴（图层像素矩形中线），不传伪端点。 */
+      if (shell.progressive_axis_set) {
+        desc.progressive_blur.explicit_axis = 1;
+        desc.progressive_blur.start_x = shell.progressive_axis_start.x;
+        desc.progressive_blur.start_y = shell.progressive_axis_start.y;
+        desc.progressive_blur.end_x = shell.progressive_axis_final.x;
+        desc.progressive_blur.end_y = shell.progressive_axis_final.y;
+      }
+      break;
     default:
       break;
   }
@@ -3101,7 +3129,7 @@ void apply_filter(ShellState& shell) {
   if (spec == nullptr) return;
 
   comp_filter_desc desc{};
-  build_filter_desc(shell.filter, &desc);
+  build_filter_desc(shell, &desc);
 
   int32_t changed = 0;
   char note[512] = {0};
@@ -4397,6 +4425,64 @@ void gradient_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ---------------------------------------------- Progressive Blur 渐变轴（P1） */
+
+/*
+ * Progressive Blur 的轴不走面板行：滤镜面板开着且选中该滤镜时，画布拖拽
+ * 只用来定一条「起点 -> 终点」的轴（与色彩范围面板「画布点击只取样」同优先级，
+ * 不交给当前绘图工具）。松手只记端点，回车才应用——面板仍然是
+ * 「回车应用、Esc 关闭」，这里不产生撤销步。
+ *
+ * 轴端点是**文档坐标**，可以落在图层外：引擎在图层像素空间里做投影，渐变
+ * 因此能横跨整幅画布（上游 `progressiveStart/End` 同为文档坐标）。
+ */
+bool progressive_axis_available(const ShellState& shell) {
+  return shell.filter_open && shell.filter.id == comp_ui::FilterId::ProgressiveBlur;
+}
+
+void progressive_axis_cancel(ShellState& shell) { shell.progressive_axis_dragging = false; }
+
+void progressive_axis_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!progressive_axis_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  shell.progressive_axis_start = doc;
+  shell.progressive_axis_current = doc;
+  shell.progressive_axis_dragging = true;
+  SetCapture(window);
+  set_status(shell,
+             L"Progressive Blur：拖出渐变轴（起点 = From 端、终点 = To 端；松手后回车应用）");
+}
+
+void progressive_axis_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.progressive_axis_dragging) return;
+  shell.progressive_axis_current =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+}
+
+void progressive_axis_end(HWND window, ShellState& shell) {
+  if (!shell.progressive_axis_dragging) return;
+  /* 先清状态再 ReleaseCapture：捕获丢失会同步派发 WM_CAPTURECHANGED（S15 的坑）。 */
+  shell.progressive_axis_dragging = false;
+  ReleaseCapture();
+
+  /* 拖拽途中 Esc / 别的面板把滤镜面板关掉了：只放掉捕获，不把轴偷偷提交。 */
+  if (!progressive_axis_available(shell)) return;
+
+  const comp_ui::Point start = shell.progressive_axis_start;
+  const comp_ui::Point end = shell.progressive_axis_current;
+  if (!comp_ui::gradient_drag_is_usable(start.x, start.y, end.x, end.y)) {
+    set_status(shell, L"Progressive Blur：轴太短，已放弃（需要一条可定义的方向）");
+    return;
+  }
+  shell.progressive_axis_final = end;
+  shell.progressive_axis_set = true;
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"Progressive Blur 渐变轴：(%.0f, %.0f) → (%.0f, %.0f)，回车应用",
+            start.x, start.y, end.x, end.y);
+  set_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 形状（S10） */
 
 /*
@@ -5510,6 +5596,9 @@ bool create_document(ShellState& shell) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
+  /* Progressive Blur 的渐变轴端点是旧文档坐标，换文档后一并作废。 */
+  shell.progressive_axis_set = false;
+  shell.progressive_axis_dragging = false;
   stroke_cancel(shell);
   move_cancel(shell);
   eyedropper_cancel(shell);
@@ -5546,6 +5635,8 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.filter.select(comp_ui::FilterId::Vignette);
+  shell.progressive_axis_set = false;
+  shell.progressive_axis_dragging = false;
   stroke_cancel(shell);
   move_cancel(shell);
   eyedropper_cancel(shell);
@@ -7427,6 +7518,54 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     SelectObject(dc, old_pen);
     DeleteObject(solid);
     DeleteObject(dashed);
+  }
+
+  /*
+   * Progressive Blur 的渐变轴（P1 滤镜收官）：拖拽中画实线，已提交的轴画虚线
+   * 常驻；起点（From 端）空心方框、终点（To 端）实心方块，径向档额外画半径圆。
+   * 只画几何——真正的模糊在回车时由引擎一次性写出（与渐变/形状预览同口径）。
+   */
+  if (progressive_axis_available(shell)) {
+    comp_ui::Point from{};
+    comp_ui::Point to{};
+    bool show = false;
+    if (shell.progressive_axis_dragging) {
+      from = shell.progressive_axis_start;
+      to = shell.progressive_axis_current;
+      show = true;
+    } else if (shell.progressive_axis_set) {
+      from = shell.progressive_axis_start;
+      to = shell.progressive_axis_final;
+      show = true;
+    }
+    if (show) {
+      const comp_ui::Point a = shell.view.doc_to_screen(from.x, from.y, layout.canvas, shell.width,
+                                                       shell.height);
+      const comp_ui::Point b = shell.view.doc_to_screen(to.x, to.y, layout.canvas, shell.width,
+                                                       shell.height);
+      const int ax = static_cast<int>(std::lround(a.x));
+      const int ay = static_cast<int>(std::lround(a.y));
+      const int bx = static_cast<int>(std::lround(b.x));
+      const int by = static_cast<int>(std::lround(b.y));
+      HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+      HPEN dashed = CreatePen(PS_DASH, 1, RGB(0, 0, 0));
+      HGDIOBJ old_pen = SelectObject(dc, shell.progressive_axis_dragging ? solid : dashed);
+      HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+      MoveToEx(dc, ax, ay, nullptr);
+      LineTo(dc, bx, by);
+      if (shell.filter.value(2) >= 0.5) { /* Radial 0/1 行 */
+        const int radius = static_cast<int>(std::lround(std::hypot(b.x - a.x, b.y - a.y)));
+        Ellipse(dc, ax - radius, ay - radius, ax + radius, ay + radius);
+      }
+      Rectangle(dc, ax - 3, ay - 3, ax + 4, ay + 4);
+      HGDIOBJ old_fill = SelectObject(dc, GetStockObject(BLACK_BRUSH));
+      Rectangle(dc, bx - 2, by - 2, bx + 3, by + 3);
+      SelectObject(dc, old_fill);
+      SelectObject(dc, old_brush);
+      SelectObject(dc, old_pen);
+      DeleteObject(solid);
+      DeleteObject(dashed);
+    }
   }
 
   /*
@@ -9778,6 +9917,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
+            } else if (progressive_axis_available(*shell)) {
+              /* 滤镜面板指着 Progressive Blur：画布拖拽只定渐变轴（不画图）。 */
+              progressive_axis_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (crop_available(*shell)) {
               /* 已有框时，再按一次画布 = 重新起框（对齐 PS 的「点框外取消、框内重来」语义） */
               crop_begin(window, *shell, mouse_x, mouse_y, layout);
@@ -9951,6 +10093,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
+      if (shell != nullptr && shell->progressive_axis_dragging) {
+        progressive_axis_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->gradient_active) {
         gradient_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
@@ -10026,6 +10173,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
+        progressive_axis_cancel(*shell);
         shape_cancel(*shell);
         type_cancel(*shell);
       }
@@ -10047,6 +10195,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
+        progressive_axis_cancel(*shell);
         shape_cancel(*shell);
       }
       break;
@@ -10098,6 +10247,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->pen_dragging) {
             pen_drag(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->progressive_axis_dragging) {
+            progressive_axis_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->gradient_active) {
             gradient_extend(*shell, mouse_x, mouse_y, layout);
