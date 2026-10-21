@@ -8580,6 +8580,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
       wsprintfW(buffer,
                 L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
     }
+  } else if (id == comp_ui::ToolId::Zoom) {
+    wsprintfW(buffer,
+              L"工具：Zoom（点击放大 1.2 倍，Alt+点击缩小；以点击点为锚；"
+              L"Ctrl+0 适合窗口 / Ctrl+1 实际像素）");
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
               info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
@@ -8657,6 +8661,40 @@ void view_zoom_step(ShellState& shell, double factor) {
   shell.view.zoom_by(factor, center.x, center.y, layout.canvas);
   wchar_t buffer[96];
   wsprintfW(buffer, L"缩放 %d%%", static_cast<int>(shell.view.zoom * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+/* ------------------------------------------------------------ 缩放工具（Z） */
+
+/*
+ * 缩放工具是纯视图操作：只改 view.zoom/pan，不碰文档、不进撤销栈。
+ *
+ * 锚点用**点击点**而不是画布中心（PS 语义）：连点时目标像素停在光标下，
+ * 不会越点越偏。尺度夹取仍在 ui_core（2%..3200%），到顶再点画面不动，
+ * 所以状态栏要明确写「已到上限/下限」，否则看起来像没响应。
+ */
+bool zoom_tool_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Zoom;
+}
+
+void zoom_tool_click(ShellState& shell, int screen_x, int screen_y, const Layout& layout) {
+  if (layout.canvas.empty()) return;
+  const bool zoom_out = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  const double before = shell.view.zoom;
+  shell.view.zoom_by(zoom_out ? 1.0 / 1.2 : 1.2, static_cast<double>(screen_x),
+                     static_cast<double>(screen_y), layout.canvas);
+  shell.needs_fit = false;
+
+  const int percent = static_cast<int>(shell.view.zoom * 100.0 + 0.5);
+  wchar_t buffer[160];
+  if (shell.view.zoom == before) {
+    const bool at_floor = shell.view.zoom <= comp_ui::CanvasView::kMinZoom;
+    wsprintfW(buffer, L"缩放 %d%%：已到%s，画面不再变化（Ctrl+0 适合窗口）", percent,
+              at_floor ? L"下限 2%" : L"上限 3200%");
+  } else {
+    wsprintfW(buffer, L"缩放 %d%%（%s·以点击点为锚）", percent,
+              zoom_out ? L"缩小" : L"放大");
+  }
   set_status(shell, buffer);
 }
 
@@ -10540,6 +10578,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
+            } else if (zoom_tool_available(*shell)) {
+              /* Z：点击放大、Alt+点击缩小，以点击点为锚（纯视图，不动文档）。 */
+              zoom_tool_click(*shell, mouse_x, mouse_y, layout);
             } else if (progressive_axis_available(*shell)) {
               /* 滤镜面板指着 Progressive Blur：画布拖拽只定渐变轴（不画图）。 */
               progressive_axis_begin(window, *shell, mouse_x, mouse_y, layout);
