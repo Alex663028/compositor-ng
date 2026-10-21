@@ -4430,7 +4430,8 @@ seed 0），`clone.opacity` 显式给 1——零初始化等于 0，引擎会当
 PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.23，`docs/manual-test.md` M12 补步 6–8。
-遗留：拖出矩形缩放到该区域（marquee zoom）、双击 = 实际像素、缩放光标形态。
+遗留：拖出矩形缩放到该区域（marquee zoom）、双击 = 实际像素、缩放光标形态
+（三项已在 §6.54 补齐）。
 
 ### 6.51 Move 工具拖拽图层（2026-10-21，Claude）
 
@@ -4547,6 +4548,48 @@ Proximity Match），从别的工具切进来一律回到 Content-Aware，避免
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.26（并回填 §5.22），`docs/manual-test.md` M26 补步 13–17。
 遗留：`sample_all_layers` 仍没有持久勾选态（只能 Shift+Alt+点击临时指定）。
+
+### 6.54 缩放工具补齐：拖框 / 双击 100% / 放大镜光标（2026-10-21，Claude）
+
+**把 §6.50 的三条遗留一次做完。** §6.50 接线时只做了「点击放大 / Alt+点击缩小」，
+其余三项记在遗留里：① 拖出矩形缩放到该区域、② 双击画布 = 实际像素、
+③ 放大镜 +/- 光标。三项都在壳侧，**零新增 ABI 导出**。
+
+**1. 拖框缩放（`zoom_to_doc_rect`）。** 新函数进 `ui_core::CanvasView`，与 `fit`
+并列：矩形按 `margin = 0.98` 铺满画布、矩形中心移到画布中心。`fit` 关心整幅文档，
+`zoom_to_doc_rect` 只关心这一块，所以直接用 `pan = -(rect_center - doc_center) * zoom`
+而不是复用 `zoom_at`（后者保证锚点不动，而这里要的恰恰是「把中心搬过来」）。
+两点先归一化，宽或高不为正返回 `false`；缩放仍走 `clamp_zoom`，夹取后照样居中矩形中心。
+
+**2. 按下只记起点，松手才判定。** `zoom_marquee_begin` 只存**屏幕坐标**并抓鼠标
+（拖框期间视图不变，屏幕矩形就是用户看到的矩形，预览不必每帧反算文档坐标）。
+松手时位移 `< 4 px` 视为单击，回落到原来的 `zoom_tool_click`；否则两角
+`screen_to_doc` 后交给 `zoom_to_doc_rect`。单击 / 拖框共用一个入口，
+`Alt+点击缩小` 的语义完全不受影响。预览是白实线 + 黑虚线双描边，与选区预览同一套；
+`WM_CAPTURECHANGED / WM_KILLFOCUS` 里清掉 `zoom_marquee_active`，不留悬挂矩形。
+
+**3. 双击 = 100%。** `WM_LBUTTONDBLCLK` 已存在（直方图复位、路径转选区、图层改名都挂在
+它上面）。缩放工具的分支放在最后「还原成普通按下」之前：只调 `actual_pixels()` 并写
+「缩放 100%（实际像素）」，否则双击会被拆成两次 1.2 倍放大。第一次点击仍会先放大
+1.2 倍再被双击复位，净结果是 100%；这是消息顺序决定的，不影响结果。
+
+**4. 放大镜光标。** 系统光标表里没有放大镜 +/-，用 32×32 **单色光标**自绘：
+AND/XOR 两个位平面（`AND=1,XOR=0` 透明、`AND=0,XOR=0` 黑、`AND=0,XOR=1` 反色白），
+按解析几何逐像素判定圆环（黑边 + 白环、玻璃透明）、手柄线段和玻璃内的横/竖线——
+缩小只有横线，放大是十字。32 px 宽正好 4 字节/行，不需要行尾补齐。
+`WM_SETCURSOR` 只在「缩放工具 + 光标在画布内 + 不在平移」时接管，
+`Alt` 按下换成缩小形态；平移中保持抓手，其它区域/工具继续交给 `DefWindowProc`。
+`CreateCursor` 失败时 `zoom_cursor_handle` 返回 `nullptr`，调用方回落到默认箭头，
+不会因为光标把工具弄坏。光标按「放大 / 缩小」各建一次并缓存到进程结束。
+
+**验证。** 新增 1 个单测（`ui_core_zoom_to_rect_fills_the_view_and_centers_the_rect`：
+铺满比例、居中、反序拖框等价、超大/超小框夹取、退化输入不改视图），单测
+**590 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**
+（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.27（并回填 §5.23），`docs/manual-test.md` M12 补步 9–13。
+遗留：④ 拖动过程中连续缩放（上游是点按式，本壳同为松手结算）；
+拖框不支持拖出画布边缘自动平移；放大镜是单色反色光标，不跟随系统深色主题。
 
 
 

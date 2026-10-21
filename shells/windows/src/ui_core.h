@@ -133,6 +133,31 @@ struct CanvasView {
     pan_y = 0.0;
   }
 
+  /*
+   * 缩放到文档矩形（Z 拖框）：矩形按 margin 边距铺满画布，矩形中心移到画布
+   * 中心（与 fit 的区别是只关心这一块，而不是整幅文档）。
+   * 传入的两点先按左上/右下归一化；宽或高不为正（单点点击、零宽拖动）返回
+   * false，调用方回落到「点一下放大 20%」。缩放会夹到 [kMinZoom, kMaxZoom]，
+   * 夹取后仍然居中矩形中心。
+   */
+  bool zoom_to_doc_rect(double x0, double y0, double x1, double y1, const Rect& canvas,
+                        int doc_w, int doc_h, double margin = 0.98) {
+    if (canvas.empty()) return false;
+    const double left = std::min(x0, x1);
+    const double top = std::min(y0, y1);
+    const double right = std::max(x0, x1);
+    const double bottom = std::max(y0, y1);
+    const double rect_w = right - left;
+    const double rect_h = bottom - top;
+    if (!(rect_w > 0.0) || !(rect_h > 0.0)) return false;
+    const double scale_x = static_cast<double>(canvas.w) * margin / rect_w;
+    const double scale_y = static_cast<double>(canvas.h) * margin / rect_h;
+    zoom = clamp_zoom(std::min(scale_x, scale_y));
+    pan_x = -((left + right) * 0.5 - static_cast<double>(doc_w) * 0.5) * zoom;
+    pan_y = -((top + bottom) * 0.5 - static_cast<double>(doc_h) * 0.5) * zoom;
+    return true;
+  }
+
   void actual_pixels() {
     zoom = 1.0;
     pan_x = 0.0;

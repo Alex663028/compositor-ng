@@ -153,6 +153,50 @@ COMP_TEST(ui_core_fit_and_actual_pixels_are_predictable) {
   COMP_CHECK(std::isfinite(view.pan_x) && std::isfinite(view.pan_y));
 }
 
+COMP_TEST(ui_core_zoom_to_rect_fills_the_view_and_centers_the_rect) {
+  const Rect canvas{0, 0, 800, 600};
+  const int doc_w = 1600;
+  const int doc_h = 1200;
+  CanvasView view;
+
+  /* 200x100 的框：min(800*0.98/200, 600*0.98/100) = 3.92。 */
+  COMP_CHECK(view.zoom_to_doc_rect(200.0, 300.0, 400.0, 400.0, canvas, doc_w, doc_h, 0.98));
+  COMP_CHECK(near_value(view.zoom, 3.92));
+  /* 框中心 (300, 350) -> 画布中心；pan = -(中心 - 文档中心) * zoom。 */
+  COMP_CHECK(near_value(view.pan_x, -(300.0 - 800.0) * 3.92));
+  COMP_CHECK(near_value(view.pan_y, -(350.0 - 600.0) * 3.92));
+  const Point center = view.doc_to_screen(300.0, 350.0, canvas, doc_w, doc_h);
+  COMP_CHECK_MSG(same_point(center, CanvasView::canvas_center(canvas), 1e-6),
+                 "rect center lands on canvas center");
+
+  /* 反序拖框（右下 -> 左上）结果一致。 */
+  CanvasView reversed;
+  COMP_CHECK(reversed.zoom_to_doc_rect(400.0, 400.0, 200.0, 300.0, canvas, doc_w, doc_h, 0.98));
+  COMP_CHECK(near_value(reversed.zoom, view.zoom));
+  COMP_CHECK(near_value(reversed.pan_x, view.pan_x));
+  COMP_CHECK(near_value(reversed.pan_y, view.pan_y));
+
+  /* 缩小框同样可用；超大框夹到 2% 下限，不会出现 0 / 负数。 */
+  CanvasView tiny;
+  COMP_CHECK(tiny.zoom_to_doc_rect(0.0, 0.0, 4.0, 4.0, canvas, doc_w, doc_h, 1.0));
+  COMP_CHECK(near_value(tiny.zoom, CanvasView::kMaxZoom));
+  CanvasView huge;
+  COMP_CHECK(huge.zoom_to_doc_rect(-1e6, -1e6, 1e6, 1e6, canvas, doc_w, doc_h, 1.0));
+  COMP_CHECK(near_value(huge.zoom, CanvasView::kMinZoom));
+
+  /* 退化输入：单点点击 / 零宽 / 空画布一律返回 false 且不改动视图。 */
+  CanvasView untouched;
+  untouched.zoom = 2.5;
+  untouched.pan_x = 11.0;
+  untouched.pan_y = -7.0;
+  COMP_CHECK(!untouched.zoom_to_doc_rect(300.0, 300.0, 300.0, 300.0, canvas, doc_w, doc_h));
+  COMP_CHECK(!untouched.zoom_to_doc_rect(100.0, 200.0, 300.0, 200.0, canvas, doc_w, doc_h));
+  COMP_CHECK(!untouched.zoom_to_doc_rect(0.0, 0.0, 10.0, 10.0, Rect{}, doc_w, doc_h));
+  COMP_CHECK(near_value(untouched.zoom, 2.5));
+  COMP_CHECK(near_value(untouched.pan_x, 11.0));
+  COMP_CHECK(near_value(untouched.pan_y, -7.0));
+}
+
 COMP_TEST(ui_core_layout_never_overlaps_at_any_size) {
   const int widths[] = {0, 1, 180, 427, 428, 429, 510, 800, 1280, 1920, 3840};
   const int heights[] = {0, 1, 40, 71, 72, 200, 720, 1080};

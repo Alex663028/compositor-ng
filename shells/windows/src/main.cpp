@@ -456,6 +456,14 @@ struct ShellState {
   /* Marquee 形状（S7）：M 键在矩形 / 椭圆之间循环。 */
   int marquee_shape = comp_ui::kMarqueeRect;
   /*
+   * 框选缩放（Z 拖框）：存**屏幕坐标**而不是文档坐标——拖框期间视图不变，
+   * 屏幕矩形就是用户看到的矩形，预览每帧直接画，不必反算文档坐标。
+   * 松手时再换算成文档矩形交给 CanvasView::zoom_to_doc_rect。
+   */
+  bool zoom_marquee_active = false;
+  POINT zoom_marquee_start{};
+  POINT zoom_marquee_current{};
+  /*
    * 裁剪（S22）：C 切工具，拖出框后 Enter 提交 / Esc 取消。
    * 与 Marquee 不同的关键点：框本身是**文档坐标**的裁剪区，提交会改画布尺寸
    * （引擎侧 comp_crop_apply 负责，且自带「取整 → 校验 → 一步撤销」的契约）。
@@ -8332,6 +8340,28 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
   }
 
   /*
+   * 缩放拖框预览：屏幕坐标矩形，白实线 + 黑虚线（松手后该区域铺满画布）。
+   * 与选区预览同一套双描边，区别只是不经过文档坐标——拖框期间视图不变。
+   */
+  if (shell.zoom_marquee_active) {
+    const int left = std::min(shell.zoom_marquee_start.x, shell.zoom_marquee_current.x);
+    const int top = std::min(shell.zoom_marquee_start.y, shell.zoom_marquee_current.y);
+    const int right = std::max(shell.zoom_marquee_start.x, shell.zoom_marquee_current.x);
+    const int bottom = std::max(shell.zoom_marquee_start.y, shell.zoom_marquee_current.y);
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, dotted);
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+
+  /*
    * 裁剪预览（S22）：框外三段遮罩 + 白实线框。
    * 遮罩分上/下/左/右四条带而不是「框外全糊」——中间保留一块完整可见区域，
    * 用户才能看清自己框住了什么（PS 的同款做法，全屏暗反而看不出边界）。
@@ -9002,8 +9032,8 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               static_cast<int>(comp_ui::clamp_heal_opacity(shell.heal_opacity) * 100.0 + 0.5));
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
-              L"工具：Zoom（点击放大 1.2 倍，Alt+点击缩小；以点击点为锚；"
-              L"Ctrl+0 适合窗口 / Ctrl+1 实际像素）");
+              L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"
+              L"双击画布 = 100%；Ctrl+0 适合窗口 / Ctrl+1 实际像素）");
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
               info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
@@ -9115,6 +9145,137 @@ void zoom_tool_click(ShellState& shell, int screen_x, int screen_y, const Layout
     wsprintfW(buffer, L"缩放 %d%%（%s·以点击点为锚）", percent,
               zoom_out ? L"缩小" : L"放大");
   }
+  set_status(shell, buffer);
+}
+
+/* ------------------------------------------------------- 缩放光标（自定义） */
+
+/*
+ * 系统光标表里没有「放大镜 +/-」，用 32x32 单色光标自绘一个：
+ *   - 圆环 [7.2, 8.0] 像素带 = 黑描边，[5.6, 7.2] = 白环，玻璃内透明；
+ *   - 手柄从 (18,18) 到 (27,27)，宽 2.2 px 白芯 + 黑边；
+ *   - 玻璃中心画横线（缩小）或横竖两线（放大）。
+ * 单色光标用 AND/XOR 两个位平面：AND=1,XOR=0 透明；AND=0,XOR=0 黑；
+ * AND=0,XOR=1 白（实际是反色，黑白背景都看得见）。32 px 宽正好 4 字节/行，
+ * 不需要行尾补齐。进程内各建一次并缓存；建失败时回落到箭头。
+ */
+HCURSOR make_zoom_cursor(bool zoom_out) {
+  constexpr int kSize = 32;
+  constexpr int kStride = kSize / 8; /* 32 位 -> 4 字节，天然 WORD 对齐 */
+  uint8_t and_bits[kStride * kSize];
+  uint8_t xor_bits[kStride * kSize];
+  std::memset(and_bits, 0xFF, sizeof(and_bits)); /* 默认全透明 */
+  std::memset(xor_bits, 0x00, sizeof(xor_bits));
+
+  const double cx = 12.5;
+  const double cy = 12.5;
+  for (int y = 0; y < kSize; ++y) {
+    for (int x = 0; x < kSize; ++x) {
+      const double px = static_cast<double>(x) + 0.5;
+      const double py = static_cast<double>(y) + 0.5;
+      const double dx = px - cx;
+      const double dy = py - cy;
+      const double dist = std::sqrt(dx * dx + dy * dy);
+
+      bool black = false;
+      bool white = false;
+      /* 圆环：外圈黑、内圈白，玻璃内部留空。 */
+      if (dist <= 8.0 && dist >= 5.6) {
+        if (dist >= 7.2) {
+          black = true;
+        } else {
+          white = true;
+        }
+      }
+      /* 手柄：线段 (18,18)->(27,27) 的垂直距离与端点圆头。 */
+      {
+        const double sx = px - 18.0;
+        const double sy = py - 18.0;
+        const double t = std::min(std::max((sx + sy) * 0.5, 0.0), 6.364);
+        const double hx = sx - t * 0.70710678;
+        const double hy = sy - t * 0.70710678;
+        const double hd = std::sqrt(hx * hx + hy * hy);
+        if (hd <= 2.0) {
+          if (hd <= 1.1) {
+            white = true;
+          } else {
+            black = true;
+          }
+        }
+      }
+      /* 玻璃内的 +/-：约 1.8 px 粗的白线（反色，压在任何内容上都可见）。 */
+      if (std::fabs(dy) <= 0.9 && std::fabs(dx) <= 4.0) white = true;
+      if (!zoom_out && std::fabs(dx) <= 0.9 && std::fabs(dy) <= 4.0) white = true;
+
+      if (!black && !white) continue; /* 透明 */
+      const int index = y * kStride + x / 8;
+      const uint8_t mask = static_cast<uint8_t>(0x80u >> (x % 8));
+      and_bits[index] = static_cast<uint8_t>(and_bits[index] & ~mask); /* AND=0 */
+      if (white) xor_bits[index] = static_cast<uint8_t>(xor_bits[index] | mask);
+    }
+  }
+  return CreateCursor(GetModuleHandleW(nullptr), 12, 12, kSize, kSize, and_bits, xor_bits);
+}
+
+HCURSOR zoom_cursor_handle(bool zoom_out) {
+  static HCURSOR cached[2] = {nullptr, nullptr};
+  HCURSOR& slot = cached[zoom_out ? 1 : 0];
+  if (slot == nullptr) slot = make_zoom_cursor(zoom_out);
+  return slot;
+}
+
+/* ------------------------------------------------------- 框选缩放（Z 拖框） */
+
+/*
+ * 按下先只记录起点并抓鼠标：真正的判断放在松手——位移小于 4 px 视为单击，
+ * 沿用原来的「点一下放大 1.2 倍」；大于阈值才换算成文档矩形缩放到该区域。
+ * 这样单击/拖框共用一个入口，Alt+单击缩小的语义也不受影响。
+ */
+void zoom_marquee_begin(HWND window, ShellState& shell, int x, int y) {
+  shell.zoom_marquee_active = true;
+  shell.zoom_marquee_start.x = x;
+  shell.zoom_marquee_start.y = y;
+  shell.zoom_marquee_current = shell.zoom_marquee_start;
+  SetCapture(window);
+}
+
+void zoom_marquee_extend(ShellState& shell, int x, int y) {
+  if (!shell.zoom_marquee_active) return;
+  shell.zoom_marquee_current.x = x;
+  shell.zoom_marquee_current.y = y;
+}
+
+void zoom_marquee_end(HWND window, ShellState& shell) {
+  if (!shell.zoom_marquee_active) return;
+  shell.zoom_marquee_active = false;
+  const POINT start = shell.zoom_marquee_start;
+  const POINT current = shell.zoom_marquee_current;
+  /* 先清状态再放捕获：ReleaseCapture 会同步重入 WM_CAPTURECHANGED。 */
+  ReleaseCapture();
+
+  Layout layout{};
+  if (shell.document == nullptr || !client_layout(shell, &layout) || layout.canvas.empty()) {
+    return;
+  }
+  const int dx = current.x - start.x;
+  const int dy = current.y - start.y;
+  if (abs(dx) < 4 && abs(dy) < 4) {
+    zoom_tool_click(shell, start.x, start.y, layout);
+    return;
+  }
+  const comp_ui::Point a =
+      shell.view.screen_to_doc(start.x, start.y, layout.canvas, shell.width, shell.height);
+  const comp_ui::Point b =
+      shell.view.screen_to_doc(current.x, current.y, layout.canvas, shell.width, shell.height);
+  if (!shell.view.zoom_to_doc_rect(a.x, a.y, b.x, b.y, layout.canvas, shell.width,
+                                   shell.height)) {
+    zoom_tool_click(shell, start.x, start.y, layout);
+    return;
+  }
+  shell.needs_fit = false;
+  const int percent = static_cast<int>(shell.view.zoom * 100.0 + 0.5);
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"缩放 %d%%（框选放大：拖出的区域铺满画布；Ctrl+0 适合窗口）", percent);
   set_status(shell, buffer);
 }
 
@@ -11039,8 +11200,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
             } else if (zoom_tool_available(*shell)) {
-              /* Z：点击放大、Alt+点击缩小，以点击点为锚（纯视图，不动文档）。 */
-              zoom_tool_click(*shell, mouse_x, mouse_y, layout);
+              /* Z：单击放大 / Alt+单击缩小；拖出矩形 = 缩放到该区域（松手判定）。 */
+              zoom_marquee_begin(window, *shell, mouse_x, mouse_y);
             } else if (progressive_axis_available(*shell)) {
               /* 滤镜面板指着 Progressive Blur：画布拖拽只定渐变轴（不画图）。 */
               progressive_axis_begin(window, *shell, mouse_x, mouse_y, layout);
@@ -11142,6 +11303,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
         }
+        /*
+         * 缩放工具双击画布 = 100%（实际像素），与 PS 一致。放在「还原成普通
+         * 按下」之前：双击不再额外放大 1.2 倍，只落到实际像素。
+         */
+        if (client_layout(*shell, &layout) && shell->document != nullptr &&
+            shell->tool == comp_ui::ToolId::Zoom && layout.canvas.contains(mouse_x, mouse_y)) {
+          shell->view.actual_pixels();
+          shell->needs_fit = false;
+          set_status(*shell, L"缩放 100%（实际像素）：双击画布；Ctrl+0 适合窗口");
+          InvalidateRect(window, nullptr, FALSE);
+          return 0;
+        }
       }
       return SendMessageW(window, WM_LBUTTONDOWN, wparam, lparam);
     case WM_MBUTTONDOWN:
@@ -11154,6 +11327,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      /* 缩放拖框：单击/拖框在松手时区分，必须最先结算（它持有鼠标捕获）。 */
+      if (shell != nullptr && shell->zoom_marquee_active) {
+        zoom_marquee_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       /* P0-3 曲线松手：提交事务 = 一次拖动只占一步撤销。 */
       if (shell != nullptr && shell->curve_drag_point >= 0) {
         curve_drag_finish(*shell, true);
@@ -11315,6 +11494,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
+        shell->zoom_marquee_active = false;
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
@@ -11340,11 +11521,33 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
+        shell->zoom_marquee_active = false;
         lasso_cancel(*shell);
         pen_cancel_drag(*shell);
         gradient_cancel(*shell);
         progressive_axis_cancel(*shell);
         shape_cancel(*shell);
+      }
+      break;
+    case WM_SETCURSOR:
+      /*
+       * 缩放工具在画布内显示自绘放大镜（Alt 按下 = 缩小形态）；平移中保持抓手，
+       * 其它区域/工具交给 DefWindowProc 维持默认光标。
+       */
+      if (shell != nullptr && LOWORD(lparam) == HTCLIENT && !shell->panning &&
+          shell->tool == comp_ui::ToolId::Zoom && shell->document != nullptr) {
+        POINT pt{};
+        if (GetCursorPos(&pt) != 0 && ScreenToClient(window, &pt) != 0) {
+          Layout layout{};
+          if (client_layout(*shell, &layout) && layout.canvas.contains(pt.x, pt.y)) {
+            HCURSOR cursor = zoom_cursor_handle((GetKeyState(VK_MENU) & 0x8000) != 0);
+            if (cursor != nullptr) {
+              SetCursor(cursor);
+              return TRUE;
+            }
+          }
+        }
       }
       break;
     case WM_MOUSEMOVE:
@@ -11387,7 +11590,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
-          if (shell->move_active || shell->layer_move_active) {
+          if (shell->zoom_marquee_active) {
+            /* 不 return：后面的笔尖/光标跟踪仍要走，否则拖框时光标状态会冻住。 */
+            zoom_marquee_extend(*shell, mouse_x, mouse_y);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->move_active || shell->layer_move_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->crop_active) {
