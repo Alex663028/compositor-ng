@@ -8109,6 +8109,246 @@ const wchar_t* backend_label(comp_backend backend) {
   }
 }
 
+/* ------- 6.67 工具图标：GDI 现画，零资源文件（S40） ------- */
+/*
+ * 工具栏以前画的是快捷键字母（V / B / M…），看不出工具是干什么的。但 .rc + .ico
+ * 要改构建脚本，字体符号又依赖机器上装了什么，都会破坏单文件 exe 的部署前提。
+ * 这里按 32×32 逻辑网格用 GDI 图元现画：坐标全是逻辑值，按按钮内框边长缩放，
+ * 窗口变大变小图标跟着缩放，构建产物里不新增任何资源文件。
+ * 笔宽 lround(2 * scale) 且下限 1，小缩放下线条也不会消失；虚线用 1 px PS_DOT。
+ */
+struct ToolIconMap {
+  HDC dc;
+  double ox;
+  double oy;
+  double scale;
+
+  POINT at(double x, double y) const {
+    return POINT{static_cast<LONG>(std::lround(ox + x * scale)),
+                 static_cast<LONG>(std::lround(oy + y * scale))};
+  }
+  void line(double x1, double y1, double x2, double y2) const {
+    const POINT a = at(x1, y1);
+    const POINT b = at(x2, y2);
+    MoveToEx(dc, a.x, a.y, nullptr);
+    LineTo(dc, b.x, b.y);
+  }
+  void poly(const double* xy, int count, bool closed) const {
+    POINT pts[12];
+    if (count < 2 || count > 12) return;
+    for (int i = 0; i < count; ++i) pts[i] = at(xy[i * 2], xy[i * 2 + 1]);
+    if (closed) {
+      Polygon(dc, pts, count);
+    } else {
+      Polyline(dc, pts, count);
+    }
+  }
+  void circle(double cx, double cy, double r) const {
+    const POINT a = at(cx - r, cy - r);
+    const POINT b = at(cx + r, cy + r);
+    Ellipse(dc, a.x, a.y, b.x, b.y);
+  }
+  void rect(double l, double t, double r, double b) const {
+    const POINT a = at(l, t);
+    const POINT c = at(r, b);
+    Rectangle(dc, a.x, a.y, c.x, c.y);
+  }
+  void round_rect(double l, double t, double r, double b, double radius) const {
+    const POINT a = at(l, t);
+    const POINT c = at(r, b);
+    const int rr = static_cast<int>(std::lround(radius * scale));
+    RoundRect(dc, a.x, a.y, c.x, c.y, rr, rr);
+  }
+};
+
+void draw_tool_icon(HDC dc, comp_ui::ToolId tool, const comp_ui::Rect& button, COLORREF color) {
+  const int side = (button.w < button.h ? button.w : button.h) - 8;
+  if (side < 8) return;
+  const double scale = side / 32.0;
+  const ToolIconMap map{dc, static_cast<double>(button.x) + (button.w - side) * 0.5,
+                        static_cast<double>(button.y) + (button.h - side) * 0.5, scale};
+  const int width = static_cast<int>(std::lround(2.0 * scale));
+  HPEN pen = CreatePen(PS_SOLID, width < 1 ? 1 : width, color);
+  HPEN dot = CreatePen(PS_DOT, 1, color);
+  HBRUSH brush = CreateSolidBrush(color);
+  HGDIOBJ old_pen = SelectObject(dc, pen);
+  HGDIOBJ old_brush = SelectObject(dc, brush);
+  /* 空心形状先换成 NULL_BRUSH，画完再换回来；fill 只是给后面实心图元复位。 */
+  const auto hollow = [&]() { SelectObject(dc, GetStockObject(NULL_BRUSH)); };
+  const auto fill = [&]() { SelectObject(dc, brush); };
+
+  switch (tool) {
+    case comp_ui::ToolId::Select: {
+      /* 光标箭头：外轮廓闭合，尾巴向右下，形状一眼能认。 */
+      static const double arrow[] = {11, 5,  11, 26, 16, 21, 19, 29,
+                                     23, 27, 20, 19, 26, 19};
+      map.poly(arrow, 7, true);
+      break;
+    }
+    case comp_ui::ToolId::Move: {
+      map.line(5, 16, 27, 16);
+      map.line(16, 5, 16, 27);
+      map.line(5, 16, 10, 12);
+      map.line(5, 16, 10, 20);
+      map.line(27, 16, 22, 12);
+      map.line(27, 16, 22, 20);
+      map.line(16, 5, 12, 10);
+      map.line(16, 5, 20, 10);
+      map.line(16, 27, 12, 22);
+      map.line(16, 27, 20, 22);
+      break;
+    }
+    case comp_ui::ToolId::Marquee: {
+      HGDIOBJ previous = SelectObject(dc, dot);
+      hollow();
+      map.rect(5, 8, 27, 24);
+      fill();
+      SelectObject(dc, previous);
+      break;
+    }
+    case comp_ui::ToolId::Lasso: {
+      static const double loop[] = {10, 9, 15, 5, 22, 6, 26, 11,
+                                    25, 18, 19, 22, 12, 21, 8, 16, 10, 9};
+      map.poly(loop, 9, false);
+      map.line(12, 21, 11, 28);
+      map.line(11, 28, 15, 27);
+      break;
+    }
+    case comp_ui::ToolId::Pen: {
+      /* 笔尖用空心轮廓：中间的笔缝要能透出来，实心画就成一团了。 */
+      hollow();
+      static const double nib[] = {21, 4, 28, 11, 14, 25, 6, 27, 7, 19};
+      map.poly(nib, 5, true);
+      fill();
+      map.line(10, 16, 16, 22);
+      break;
+    }
+    case comp_ui::ToolId::Wand: {
+      map.line(5, 27, 18, 14);
+      static const double star[] = {23, 4, 25, 8, 29, 10, 25, 12, 23, 16, 21, 12, 17, 10, 21, 8};
+      map.poly(star, 8, true);
+      break;
+    }
+    case comp_ui::ToolId::Crop: {
+      map.line(10, 5, 10, 22);
+      map.line(10, 22, 27, 22);
+      map.line(5, 10, 22, 10);
+      map.line(22, 10, 22, 27);
+      break;
+    }
+    case comp_ui::ToolId::Eyedropper: {
+      map.circle(22, 10, 4);
+      map.line(19, 13, 8, 24);
+      map.line(6, 22, 10, 26);
+      break;
+    }
+    case comp_ui::ToolId::Brush: {
+      map.line(23, 5, 14, 14);
+      static const double ferrule[] = {14, 14, 19, 19, 16, 22, 11, 17};
+      map.poly(ferrule, 4, true);
+      map.line(12, 18, 5, 27);
+      map.line(15, 21, 8, 29);
+      break;
+    }
+    case comp_ui::ToolId::Eraser: {
+      static const double body[] = {8, 22, 18, 7, 26, 13, 16, 28};
+      map.poly(body, 4, true);
+      map.line(12, 25, 22, 10);
+      break;
+    }
+    case comp_ui::ToolId::Heal: {
+      hollow();
+      static const double band[] = {7, 19, 19, 7, 25, 13, 13, 25};
+      map.poly(band, 4, true);
+      fill();
+      map.line(12, 16, 20, 16);
+      map.line(16, 12, 16, 20);
+      break;
+    }
+    case comp_ui::ToolId::Clone: {
+      map.rect(11, 5, 21, 12);
+      map.rect(13, 12, 19, 15);
+      map.rect(8, 15, 24, 21);
+      map.rect(6, 23, 26, 27);
+      break;
+    }
+    case comp_ui::ToolId::Retouch: {
+      static const double tear[] = {16, 4, 10, 20, 22, 20};
+      map.poly(tear, 3, true);
+      map.circle(16, 21, 6);
+      break;
+    }
+    case comp_ui::ToolId::Tone: {
+      map.circle(16, 16, 5);
+      for (int i = 0; i < 8; ++i) {
+        const double angle = i * 3.14159265358979323846 / 4.0;
+        map.line(16.0 + std::cos(angle) * 9.0, 16.0 + std::sin(angle) * 9.0,
+                 16.0 + std::cos(angle) * 13.0, 16.0 + std::sin(angle) * 13.0);
+      }
+      break;
+    }
+    case comp_ui::ToolId::Gradient: {
+      /* 方框 + 对角半实心：这是「渐变」的通用字形，堆条纹在小尺寸下会看成图片图标。 */
+      hollow();
+      map.rect(6, 8, 26, 24);
+      fill();
+      static const double ramp[] = {7, 23, 25, 23, 25, 9};
+      map.poly(ramp, 3, true);
+      break;
+    }
+    case comp_ui::ToolId::Shape: {
+      /* 实心方块 + 空心圆：两个都空心会看成「复制」图标。 */
+      map.rect(5, 8, 18, 22);
+      hollow();
+      map.circle(21, 17, 7);
+      fill();
+      break;
+    }
+    case comp_ui::ToolId::Type: {
+      map.line(8, 7, 24, 7);
+      map.line(16, 7, 16, 26);
+      map.line(12, 26, 20, 26);
+      break;
+    }
+    case comp_ui::ToolId::Hand: {
+      hollow();
+      map.round_rect(9, 15, 23, 28, 6);
+      map.line(12, 15, 12, 8);
+      map.line(15.5, 15, 15.5, 6);
+      map.line(19, 15, 19, 8);
+      map.line(9, 19, 5, 15);
+      fill();
+      break;
+    }
+    case comp_ui::ToolId::Zoom: {
+      hollow();
+      map.circle(14, 14, 8);
+      fill();
+      map.line(20, 20, 27, 27);
+      map.line(10, 14, 18, 14);
+      map.line(14, 10, 14, 18);
+      break;
+    }
+    case comp_ui::ToolId::HistoryBrush: {
+      hollow();
+      map.circle(16, 16, 10);
+      fill();
+      map.line(16, 16, 16, 9);
+      map.line(16, 16, 21, 19);
+      break;
+    }
+    case comp_ui::ToolId::Count:
+    default:
+      break;
+  }
+
+  SelectObject(dc, old_brush);
+  SelectObject(dc, old_pen);
+  DeleteObject(brush);
+  DeleteObject(dot);
+  DeleteObject(pen);
+}
+
 void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
   RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(44, 46, 52));
@@ -8126,10 +8366,8 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     HBRUSH fill = CreateSolidBrush(selected ? RGB(70, 104, 168) : RGB(58, 60, 68));
     FillRect(dc, &button, fill);
     DeleteObject(fill);
-    SetTextColor(dc, selected ? RGB(255, 255, 255) : RGB(198, 200, 208));
-    const wchar_t letter[2] = {
-        info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ', 0};
-    DrawTextW(dc, letter, 1, &button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    /* 图标跟按钮文字同色：选中纯白、未选中浅灰，短键看状态栏的「工具名（V）」。 */
+    draw_tool_icon(dc, info->id, rect, selected ? RGB(255, 255, 255) : RGB(198, 200, 208));
   }
 
   /* 右侧读数：缩放、笔刷，Retouch / Tone 工具再带上子模式与当前参数。 */
