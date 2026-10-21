@@ -1533,6 +1533,107 @@ void panel_toggle_flip(ShellState& shell, bool horizontal) {
  * 已有同 kind 的效果时**不覆盖**：用户可能是 .comp 读回来的、带自定义参数的效果，
  * 盖上 "{}" 会把他的参数静默抹掉（这是最典型的数据丢失）。要去掉就用「移除」。
  */
+
+/* 单层的效果清单查询（count + at 两段式，只问 kind）。批量切换时要逐层问自己，
+ * 不能用壳里缓存的 shell.effect_kinds——那是主选中层的副本。 */
+bool layer_has_effect(ShellState& shell, comp_layer_id id, uint32_t kind) {
+  size_t count = 0;
+  if (comp_layer_effect_count(shell.document, id, &count) != COMP_OK) return false;
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t at = 0;
+    size_t need = 0;
+    if (comp_layer_effect_at(shell.document, id, i, &at, nullptr, 0, &need) != COMP_OK) break;
+    if (at == kind) return true;
+  }
+  return false;
+}
+
+/* 面板选中集合（定义在下面；批量效果需要它，所以先声明）。 */
+std::vector<comp_layer_id> panel_selection_ids(const ShellState& shell, bool drop_covered);
+
+/*
+ * §6.65 多选批量切换效果：主选中层决定「加还是减」（菜单勾选就是看主选中层），
+ * 整个选中集合执行同一个动作，一个事务 = 一步撤销。
+ *
+ * 组图层必须跳过，不能「顺着搬」：`filter_graph` 的 kGroup 分支只合成子树，
+ * 从不读组自己的 effects，写进去是静默无操作（与组 transform 同一类假象）。
+ */
+void panel_toggle_effect_multi(ShellState& shell, int clamped, const wchar_t* label) {
+  const std::vector<comp_layer_id> batch = panel_selection_ids(shell, true);
+  const comp_layer_id primary = selected_layer_id(shell);
+  if (primary == 0 || batch.size() < 2) return;
+  const bool removing = layer_has_effect(shell, primary, static_cast<uint32_t>(clamped));
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, removing ? "Remove Effect From Layers" : "Add Effect To Layers",
+                     &txn) != COMP_OK) {
+    set_status(shell, L"切换效果：无法开始事务");
+    return;
+  }
+  size_t changed = 0;
+  size_t skipped = 0;
+  size_t groups = 0;
+  size_t failed = 0;
+  for (comp_layer_id id : batch) {
+    const LayerRow* row = nullptr;
+    for (const LayerRow& item : shell.layers) {
+      if (item.id == id) {
+        row = &item;
+        break;
+      }
+    }
+    if (row == nullptr) {
+      ++failed;
+      continue;
+    }
+    if (row->is_group != 0) {
+      ++groups;
+      continue;
+    }
+    const bool present = layer_has_effect(shell, id, static_cast<uint32_t>(clamped));
+    if (present == removing) {
+      const comp_result result =
+          removing ? comp_layer_remove_effect(shell.document, id, static_cast<uint32_t>(clamped))
+                   : comp_layer_set_effect(shell.document, id, static_cast<uint32_t>(clamped), "{}");
+      if (result == COMP_OK) {
+        ++changed;
+      } else {
+        ++failed;
+      }
+    } else {
+      ++skipped; /* 本来就在目标状态：不写、也不占撤销步。 */
+    }
+  }
+  if (changed == 0) {
+    comp_txn_abort(txn);
+    wchar_t empty_buffer[224];
+    wsprintfW(empty_buffer, L"切换效果：选中的图层没有改动%s", groups > 0 ? L"（组图层不参与效果）" : L"");
+    set_status(shell, empty_buffer);
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"切换效果：提交失败");
+    return;
+  }
+  refresh_effects(shell);
+  refresh_layers(shell);
+  shell.needs_render = true;
+  wchar_t buffer[320];
+  wsprintfW(buffer, removing ? L"已为 %u 个图层移除效果：%s" : L"已为 %u 个图层添加效果：%s",
+            static_cast<unsigned>(changed), label);
+  if (skipped > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L"（%u 个已在目标状态）", static_cast<unsigned>(skipped));
+  }
+  if (groups > 0) {
+    /* 说清楚为什么跳过：组的效果不会被求值，写进去只会让人以为生效了。 */
+    wsprintfW(buffer + lstrlenW(buffer), L" · 跳过 %u 个组图层（引擎不按组求值效果）",
+              static_cast<unsigned>(groups));
+  }
+  if (failed > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L" · %u 个失败", static_cast<unsigned>(failed));
+  }
+  refresh_history_status(shell, buffer);
+}
+
 void panel_toggle_effect(ShellState& shell, int kind) {
   const LayerRow* row = selected_row(shell);
   if (row == nullptr) {
@@ -1540,10 +1641,20 @@ void panel_toggle_effect(ShellState& shell, int kind) {
     return;
   }
   const int clamped = comp_ui::clamp_effect_kind(kind);
+  if (!shell.extra_selection.empty()) {
+    panel_toggle_effect_multi(shell, clamped, effect_kind_label(clamped));
+    return;
+  }
+  if (row->is_group != 0) {
+    /*
+     * §6.65 组图层不能加效果：`filter_graph` 的 kGroup 分支只合成子树，从不读组
+     * 自己的 effects——写进去画面一个像素都不会变。如实拒绝，不制造「已添加」的假象。
+     */
+    set_status(shell, L"效果：组图层不参与效果求值（请选中组内成员）");
+    return;
+  }
   const comp_layer_id id = row->id;
-  const bool present =
-      comp_ui::effect_list_contains(shell.effect_kinds.empty() ? nullptr : shell.effect_kinds.data(),
-                                    static_cast<int32_t>(shell.effect_kinds.size()), clamped);
+  const bool present = layer_has_effect(shell, id, static_cast<uint32_t>(clamped));
   wchar_t buffer[256];
   if (present) {
     if (comp_layer_remove_effect(shell.document, id, static_cast<uint32_t>(clamped)) != COMP_OK) {
