@@ -2407,6 +2407,200 @@ inline void layer_transform_scale_rect(int32_t* x, int32_t* y, int32_t* w, int32
   *h = new_h;
 }
 
+/* ------------------------------------------------- 图层变换手柄（S39） */
+
+/*
+ * 变换框：8 个缩放手柄（顺时针：左上、上、右上、右、右下、下、左下、左）
+ * + 1 个旋转旋钮（上边中点外侧）。索引与绘制顺序一致，壳与单测共用一套定义。
+ *
+ * 坐标系：rect 是**未旋转**的文档矩形，rotation 为度（顺时针，与 ABI 同向），
+ * 旋转中心恒为矩形中心——引擎 Layer::map_document_to_pixel 先归一化到中心再逆
+ * 旋转，所以手柄必须绕中心转；绕左上角转出来的框会与画面错位。
+ *
+ * 缩放保持「对角锚点不动」：拖右边时左边固定，拖左上角时右下角固定。旋转过的
+ * 图层锚点也会跟着转，因此算完新局部矩形后还要把中心回移
+ * (anchor_doc - R(rotation)·anchor_local_new)，只改 x/y 不够。
+ */
+inline constexpr int kTransformHandleCount = 8;
+inline constexpr int kTransformHandleNone = -1;
+inline constexpr int kTransformHandleRotate = kTransformHandleCount; /* 8 */
+inline constexpr int kTransformHandleMinSize = 1;                   /* 文档像素 */
+
+inline Point rect_center_point(const Rect& rect) {
+  return Point{static_cast<double>(rect.x) + static_cast<double>(rect.w) * 0.5,
+               static_cast<double>(rect.y) + static_cast<double>(rect.h) * 0.5};
+}
+
+/* 绕 center 旋转 degrees（y 向下 = 顺时针）。 */
+inline Point rotate_doc_point(Point point, Point center, double degrees) {
+  if (!std::isfinite(degrees) || std::fabs(degrees) <= 1e-12) return point;
+  constexpr double kPi = 3.14159265358979323846;
+  const double rad = degrees * kPi / 180.0;
+  const double cos_t = std::cos(rad);
+  const double sin_t = std::sin(rad);
+  const double dx = point.x - center.x;
+  const double dy = point.y - center.y;
+  return Point{center.x + dx * cos_t - dy * sin_t, center.y + dx * sin_t + dy * cos_t};
+}
+
+/* 手柄在未旋转矩形上的位置（文档坐标）。 */
+inline Point transform_local_point(const Rect& rect, int handle) {
+  const double left = static_cast<double>(rect.x);
+  const double top = static_cast<double>(rect.y);
+  const double right = static_cast<double>(rect.right());
+  const double bottom = static_cast<double>(rect.bottom());
+  const double mid_x = (left + right) * 0.5;
+  const double mid_y = (top + bottom) * 0.5;
+  switch (handle) {
+    case 0: return Point{left, top};
+    case 1: return Point{mid_x, top};
+    case 2: return Point{right, top};
+    case 3: return Point{right, mid_y};
+    case 4: return Point{right, bottom};
+    case 5: return Point{mid_x, bottom};
+    case 6: return Point{left, bottom};
+    case 7: return Point{left, mid_y};
+    default: return Point{mid_x, mid_y};
+  }
+}
+
+/* 手柄绕矩形中心旋转后的实际落点（画面上看到的那个小方块）。 */
+inline Point transform_handle_point(const Rect& rect, double rotation, int handle) {
+  return rotate_doc_point(transform_local_point(rect, handle), rect_center_point(rect),
+                          rotation);
+}
+
+/* 旋转旋钮：上边中点向局部 -y 方向偏移 offset 后再整体旋转。 */
+inline Point transform_rotate_knob_point(const Rect& rect, double rotation, double offset) {
+  const Point center = rect_center_point(rect);
+  const Point local{center.x, static_cast<double>(rect.y) - offset};
+  return rotate_doc_point(local, center, rotation);
+}
+
+/* 半径内最近的手柄；没有命中返回 kTransformHandleNone。 */
+inline int transform_handle_at(const Rect& rect, double rotation, Point doc, double radius) {
+  if (rect.empty() || !std::isfinite(rotation) || !(radius > 0.0)) {
+    return kTransformHandleNone;
+  }
+  int best = kTransformHandleNone;
+  double best_distance = radius * radius;
+  for (int handle = 0; handle < kTransformHandleCount; ++handle) {
+    const Point point = transform_handle_point(rect, rotation, handle);
+    const double dx = point.x - doc.x;
+    const double dy = point.y - doc.y;
+    const double distance = dx * dx + dy * dy;
+    if (distance <= best_distance) {
+      best_distance = distance;
+      best = handle;
+    }
+  }
+  return best;
+}
+
+inline bool transform_knob_at(const Rect& rect, double rotation, Point doc, double offset,
+                              double radius) {
+  if (rect.empty() || !std::isfinite(rotation) || !(radius > 0.0)) return false;
+  const Point knob = transform_rotate_knob_point(rect, rotation, offset);
+  const double dx = knob.x - doc.x;
+  const double dy = knob.y - doc.y;
+  return dx * dx + dy * dy <= radius * radius;
+}
+
+/*
+ * 拖手柄缩放：两步——
+ *   1. 把指针逆旋转回局部系，按手柄改对应的边，再把宽高压到 min_size 以上；
+ *   2. 以「对角锚点」在文档里的旧位置为准，回移新矩形原点，补偿中心变化。
+ *
+ * 每帧都从按下时的 base 重新求，不在上一帧结果上叠加：来回拖动不会因取整漂移。
+ * handle 非法 / rect 为空 / 角度非有限时原样返回。
+ */
+inline Rect transform_scale_rect(const Rect& base, double rotation, int handle, Point pointer,
+                                 int min_size) {
+  if (base.empty() || !std::isfinite(rotation)) return base;
+  if (handle < 0 || handle >= kTransformHandleCount) return base;
+  const int minimum = min_size < 1 ? 1 : min_size;
+  const Point center = rect_center_point(base);
+  const Point local = rotate_doc_point(pointer, center, -rotation);
+
+  double left = static_cast<double>(base.x);
+  double top = static_cast<double>(base.y);
+  double right = static_cast<double>(base.right());
+  double bottom = static_cast<double>(base.bottom());
+  switch (handle) {
+    case 0: left = local.x; top = local.y; break;
+    case 1: top = local.y; break;
+    case 2: right = local.x; top = local.y; break;
+    case 3: right = local.x; break;
+    case 4: right = local.x; bottom = local.y; break;
+    case 5: bottom = local.y; break;
+    case 6: left = local.x; bottom = local.y; break;
+    default: left = local.x; break;
+  }
+  if (right - left < static_cast<double>(minimum)) {
+    const bool moves_left = handle == 0 || handle == 6 || handle == 7;
+    if (moves_left) {
+      left = right - static_cast<double>(minimum);
+    } else {
+      right = left + static_cast<double>(minimum);
+    }
+  }
+  if (bottom - top < static_cast<double>(minimum)) {
+    const bool moves_top = handle == 0 || handle == 1 || handle == 2;
+    if (moves_top) {
+      top = bottom - static_cast<double>(minimum);
+    } else {
+      bottom = top + static_cast<double>(minimum);
+    }
+  }
+
+  /* 对角锚点在 base 局部系里的位置：拖角是角、拖边是对边的中点。 */
+  const double mid_x = (static_cast<double>(base.x) + static_cast<double>(base.right())) * 0.5;
+  const double mid_y = (static_cast<double>(base.y) + static_cast<double>(base.bottom())) * 0.5;
+  Point anchor{};
+  switch (handle) {
+    case 0: anchor = Point{right, bottom}; break;
+    case 1: anchor = Point{mid_x, bottom}; break;
+    case 2: anchor = Point{left, bottom}; break;
+    case 3: anchor = Point{left, mid_y}; break;
+    case 4: anchor = Point{left, top}; break;
+    case 5: anchor = Point{mid_x, top}; break;
+    case 6: anchor = Point{right, top}; break;
+    default: anchor = Point{right, mid_y}; break;
+  }
+  const Point anchor_doc = rotate_doc_point(anchor, center, rotation);
+  const Point new_center{(left + right) * 0.5, (top + bottom) * 0.5};
+  const Point anchor_doc_new = rotate_doc_point(anchor, new_center, rotation);
+
+  Rect result{};
+  result.x = static_cast<int>(std::lround(left + (anchor_doc.x - anchor_doc_new.x)));
+  result.y = static_cast<int>(std::lround(top + (anchor_doc.y - anchor_doc_new.y)));
+  result.w = static_cast<int>(std::lround(right - left));
+  result.h = static_cast<int>(std::lround(bottom - top));
+  if (result.w < minimum) result.w = minimum;
+  if (result.h < minimum) result.h = minimum;
+  return result;
+}
+
+/* 拖旋钮的角度增量（度），归一化到 (-180, 180]，避免跨 ±180° 时跳一圈。 */
+inline double transform_rotate_delta(const Rect& base, Point press, Point now) {
+  const Point center = rect_center_point(base);
+  const double from = std::atan2(press.y - center.y, press.x - center.x);
+  const double to = std::atan2(now.y - center.y, now.x - center.x);
+  constexpr double kPi = 3.14159265358979323846;
+  double degrees = (to - from) * 180.0 / kPi;
+  while (degrees <= -180.0) degrees += 360.0;
+  while (degrees > 180.0) degrees -= 360.0;
+  return degrees;
+}
+
+/* 与壳侧 Ctrl+左右 同一口径：多圈累加后归一到 (-360, 360]。 */
+inline double transform_normalize_rotation(double degrees) {
+  if (!std::isfinite(degrees)) return 0.0;
+  while (degrees > 360.0) degrees -= 360.0;
+  while (degrees <= -360.0) degrees += 360.0;
+  return degrees;
+}
+
 /* ------------------------------------------------------- 采样模式（S22） */
 
 /*

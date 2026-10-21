@@ -493,6 +493,28 @@ struct ShellState {
    */
   bool layer_move_copy_failed = false;
   /*
+   * §6.66 变换手柄：Move 工具、单选一个**普通**图层、且该层已有显式变换
+   * （w/h > 0）时，画布上画 8 个缩放手柄 + 1 个旋转旋钮。拖动期间实时写
+   * transform，整次拖动一个事务 = 一步撤销；每帧都从按下时的 base 重新求，
+   * 不在上一帧结果上累加（与整层拖动同一规矩，来回拖不会取整漂移）。
+   *
+   * 组图层不画：组自己的 transform 不参与合成（filter_graph 只烘焙成员），
+   * 拖了也看不出变化。没有显式变换的图层也不画：ABI 没有像素尺寸回读口，
+   * 壳拿不到「按像素尺寸」的真实边界，画一个猜出来的框比不画更糟。
+   */
+  bool layer_handle_active = false;
+  int32_t layer_handle_kind = comp_ui::kTransformHandleNone; /* 0..7 缩放，8 旋转 */
+  comp_layer_id layer_handle_id = 0;
+  comp_rect layer_handle_base{};
+  float layer_handle_base_rotation = 0.0f;
+  comp_ui::Point layer_handle_press{};
+  comp_txn layer_handle_txn = nullptr;
+  comp_document layer_handle_doc = nullptr;
+  bool layer_handle_dirty = false;
+  /* 最近一次写入的矩形/角度：只用于状态栏，避免每帧都去 ABI 回读。 */
+  comp_rect layer_handle_current{};
+  float layer_handle_current_rotation = 0.0f;
+  /*
    * 面板宽度（§6.60）：用户偏好，不是文档状态——不进撤销栈，也不随文档切换复位。
    * 与 `comp_ui::LayoutPrefs` 同构，`client_layout` 是唯一读取点，因此绘制与命中
    * 测试拿到的一定是同一份宽度（两者分叉 = 点不准行，这是本仓反复踩过的坑）。
@@ -6660,6 +6682,209 @@ bool group_members_off_canvas(const ShellState& shell, int32_t dx, int32_t dy) {
   return members_off_canvas(shell.layer_move_members, dx, dy, shell.width, shell.height);
 }
 
+/* ------------------------------------------------------------ 变换手柄（§6.66） */
+
+/*
+ * 手柄的屏幕尺寸不随缩放变化（画出来始终是 9×9 的方块、命中半径 7 px），
+ * 因此命中/旋钮偏移都要先除以 zoom 换成文档像素再交给 ui_core 的纯函数。
+ */
+constexpr int kTransformHandlePx = 4;          /* 方块半边长（屏幕像素） */
+constexpr double kTransformHandleHitPx = 7.0;  /* 命中半径（屏幕像素） */
+constexpr double kTransformKnobOffsetPx = 24.0; /* 旋钮离上边中点（屏幕像素） */
+
+comp_ui::Rect to_ui_rect(const comp_rect& rect) {
+  return comp_ui::Rect{rect.x, rect.y, rect.w, rect.h};
+}
+
+comp_rect to_abi_rect(const comp_ui::Rect& rect) {
+  return comp_rect{rect.x, rect.y, rect.w, rect.h};
+}
+
+bool same_rect(const comp_rect& a, const comp_rect& b) {
+  return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+}
+
+/*
+ * 什么时候画变换框。四条硬条件缺一不可：
+ *   1. Move 工具、且没有别的模态（裁剪/框选/套索）；
+ *   2. 面板**单选**一个普通图层（多选的批量语义是移动，不提供整批缩放）；
+ *   3. 没有像素选区（有选区时落点分流已经在 §5.36 定好，手柄不该抢命中）；
+ *   4. 该层有显式变换（w/h > 0）。ABI 没有像素尺寸回读口，按像素尺寸的图层
+ *      壳算不出真实边界，画一个猜的框比不画更糟——与 Alt+[ ] 拒绝同一理由。
+ */
+bool transform_frame_for(const ShellState& shell, comp_rect* out_rect, float* out_rotation) {
+  if (shell.document == nullptr) return false;
+  if (shell.tool != comp_ui::ToolId::Move) return false;
+  if (shell.crop_active || shell.marquee_active || shell.lasso_active) return false;
+  if (shell.selection_active) return false;
+  if (!shell.extra_selection.empty()) return false;
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr || row->is_group != 0) return false;
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
+    return false;
+  }
+  if (transform.w <= 0 || transform.h <= 0) return false;
+  if (out_rect != nullptr) *out_rect = transform;
+  if (out_rotation != nullptr) *out_rotation = rotation;
+  return true;
+}
+
+void layer_handle_clear(ShellState& shell) {
+  shell.layer_handle_active = false;
+  shell.layer_handle_kind = comp_ui::kTransformHandleNone;
+  shell.layer_handle_id = 0;
+  shell.layer_handle_base = comp_rect{};
+  shell.layer_handle_base_rotation = 0.0f;
+  shell.layer_handle_press = comp_ui::Point{};
+  shell.layer_handle_txn = nullptr;
+  shell.layer_handle_doc = nullptr;
+  shell.layer_handle_dirty = false;
+  shell.layer_handle_current = comp_rect{};
+  shell.layer_handle_current_rotation = 0.0f;
+}
+
+/*
+ * 手柄按下：命中就吃掉这次点击（返回 true），不再落到整层拖动。
+ * 事务名区分缩放/旋转，历史面板里两步操作不该长得一样。一次拖动一个事务，
+ * 途中每帧写入都是 ImplicitTxn 加入，松手 commit = 一步撤销。
+ */
+bool layer_handle_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  comp_rect rect{};
+  float rotation = 0.0f;
+  if (!transform_frame_for(shell, &rect, &rotation)) return false;
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) return false;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const double zoom = shell.view.zoom > 0.0 ? shell.view.zoom : 1.0;
+  const double radius = kTransformHandleHitPx / zoom;
+  const comp_ui::Rect frame = to_ui_rect(rect);
+  int32_t kind = comp_ui::kTransformHandleNone;
+  if (comp_ui::transform_knob_at(frame, rotation, doc, kTransformKnobOffsetPx / zoom, radius)) {
+    kind = comp_ui::kTransformHandleRotate;
+  } else {
+    kind = comp_ui::transform_handle_at(frame, rotation, doc, radius);
+  }
+  if (kind == comp_ui::kTransformHandleNone) return false;
+
+  const bool rotating = kind == comp_ui::kTransformHandleRotate;
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, rotating ? "Rotate Layer" : "Scale Layer", &txn) !=
+      COMP_OK) {
+    set_status(shell, L"变换：无法开始事务");
+    return true; /* 已判定按在手柄上：不要退化成整层拖动 */
+  }
+  shell.layer_handle_active = true;
+  shell.layer_handle_kind = kind;
+  shell.layer_handle_id = row->id;
+  shell.layer_handle_base = rect;
+  shell.layer_handle_base_rotation = rotation;
+  shell.layer_handle_press = doc;
+  shell.layer_handle_txn = txn;
+  shell.layer_handle_doc = shell.document;
+  shell.layer_handle_dirty = false;
+  shell.layer_handle_current = rect;
+  shell.layer_handle_current_rotation = rotation;
+  SetCapture(window);
+
+  wchar_t buffer[224];
+  if (rotating) {
+    wsprintfW(buffer, L"旋转图层：拖动旋钮，Shift = %d° 吸附（松开算一步撤销），当前 %d°",
+              comp_ui::kLayerTransformRotateStep, static_cast<int>(std::lround(rotation)));
+  } else {
+    wsprintfW(buffer, L"缩放图层：拖动手柄改变尺寸（松开算一步撤销），当前 %d×%d", rect.w,
+              rect.h);
+  }
+  set_status(shell, buffer);
+  return true;
+}
+
+void layer_handle_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.layer_handle_active) return;
+  /* 换文档后旧事务随旧文档失效：宁可不动，也不要写进新文档。 */
+  if (shell.document == nullptr || shell.document != shell.layer_handle_doc) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const comp_ui::Rect base = to_ui_rect(shell.layer_handle_base);
+
+  comp_rect target = shell.layer_handle_current;
+  float rotation = shell.layer_handle_current_rotation;
+  if (shell.layer_handle_kind == comp_ui::kTransformHandleRotate) {
+    const double delta = comp_ui::transform_rotate_delta(base, shell.layer_handle_press, doc);
+    double next = static_cast<double>(shell.layer_handle_base_rotation) + delta;
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+      const double step = static_cast<double>(comp_ui::kLayerTransformRotateStep);
+      next = std::round(next / step) * step;
+    }
+    next = comp_ui::transform_normalize_rotation(next);
+    if (std::fabs(next - static_cast<double>(shell.layer_handle_current_rotation)) < 1e-4) {
+      return;
+    }
+    rotation = static_cast<float>(next);
+    target = shell.layer_handle_base; /* 旋转只改角度，矩形不动 */
+  } else {
+    const comp_ui::Rect scaled =
+        comp_ui::transform_scale_rect(base, shell.layer_handle_base_rotation,
+                                      shell.layer_handle_kind, doc,
+                                      comp_ui::kTransformHandleMinSize);
+    target = to_abi_rect(scaled);
+    if (same_rect(target, shell.layer_handle_current)) return;
+    rotation = shell.layer_handle_base_rotation;
+  }
+  if (comp_layer_set_transform(shell.document, shell.layer_handle_id, target, rotation) !=
+      COMP_OK) {
+    set_status(shell, L"变换：写入图层变换失败");
+    return;
+  }
+  shell.layer_handle_dirty = true;
+  shell.layer_handle_current = target;
+  shell.layer_handle_current_rotation = rotation;
+  shell.needs_render = true;
+
+  wchar_t buffer[192];
+  if (shell.layer_handle_kind == comp_ui::kTransformHandleRotate) {
+    wsprintfW(buffer, L"旋转图层：%d°", static_cast<int>(std::lround(rotation)));
+  } else {
+    wsprintfW(buffer, L"缩放图层：%d×%d（位置 (%d, %d)）", target.w, target.h, target.x,
+              target.y);
+  }
+  set_status(shell, buffer);
+}
+
+void layer_handle_end(HWND window, ShellState& shell) {
+  if (!shell.layer_handle_active) return;
+  /* 先清状态再 ReleaseCapture：捕获变更会同步重入 move_cancel。 */
+  const comp_txn txn = shell.layer_handle_txn;
+  const bool dirty = shell.layer_handle_dirty;
+  const bool rotating = shell.layer_handle_kind == comp_ui::kTransformHandleRotate;
+  const comp_rect current = shell.layer_handle_current;
+  const float rotation = shell.layer_handle_current_rotation;
+  layer_handle_clear(shell);
+  ReleaseCapture();
+
+  if (txn == nullptr) return;
+  if (!dirty) {
+    comp_txn_abort(txn);
+    set_status(shell, rotating ? L"旋转：角度未变化" : L"缩放：尺寸未变化");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"变换：提交失败");
+    return;
+  }
+  shell.needs_render = true;
+  wchar_t buffer[192];
+  if (rotating) {
+    wsprintfW(buffer, L"已旋转图层：%d°（一步撤销）", static_cast<int>(std::lround(rotation)));
+  } else {
+    wsprintfW(buffer, L"已缩放图层：%d×%d，位置 (%d, %d)（一步撤销）", current.w, current.h,
+              current.x, current.y);
+  }
+  refresh_history_status(shell, buffer);
+}
+
 void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout,
                       const wchar_t* hint = nullptr) {
   const LayerRow* row = selected_row(shell);
@@ -7028,6 +7253,8 @@ void layer_move_end(HWND window, ShellState& shell) {
 
 void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
   if (!move_available(shell)) return;
+  /* 手柄优先于任何拖动语义：按在手柄上就是缩放/旋转，不做整层平移。 */
+  if (layer_handle_begin(window, shell, x, y, layout)) return;
   if (!shell.selection_active) {
     /* 无选区 = 拖整层（上游 V 的默认行为），不再当成错误。 */
     layer_move_begin(window, shell, x, y, layout);
@@ -7062,6 +7289,10 @@ void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
 }
 
 void move_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (shell.layer_handle_active) {
+    layer_handle_extend(shell, x, y, layout);
+    return;
+  }
   if (shell.layer_move_active) {
     layer_move_extend(shell, x, y, layout);
     return;
@@ -7078,6 +7309,11 @@ void move_cancel(ShellState& shell) {
    * abort 会打到已释放对象上（UAF）。与 color_range 同一规则——只有当事务
    * 属于**当前**文档时才 abort。
    */
+  if (shell.layer_handle_txn != nullptr && shell.layer_handle_doc == shell.document) {
+    comp_txn_abort(shell.layer_handle_txn);
+    shell.needs_render = true; /* abort 把 transform 退回去，画面必须重画 */
+  }
+  layer_handle_clear(shell);
   if (shell.layer_move_txn != nullptr && shell.layer_move_doc == shell.document) {
     comp_txn_abort(shell.layer_move_txn);
     /*
@@ -7105,6 +7341,10 @@ void move_cancel(ShellState& shell) {
 }
 
 void move_end(HWND window, ShellState& shell) {
+  if (shell.layer_handle_active) {
+    layer_handle_end(window, shell);
+    return;
+  }
   if (shell.layer_move_active) {
     layer_move_end(window, shell);
     return;
@@ -9065,6 +9305,72 @@ bool clip_axis_aligned(const comp_ui::Rect& canvas, comp_ui::Point* a, comp_ui::
   return true; /* 非轴对齐线段（当前不产生）原样返回，不做错误裁剪 */
 }
 
+/*
+ * §6.66 变换框：蓝色实线框 + 8 个白底蓝边方块 + 上边外侧的旋转旋钮（带引线）。
+ * 手柄大小固定为屏幕像素，缩放画布时不会跟着变粗变细；位置由 ui_core 的
+ * 纯几何算出（与命中、缩放用的是同一组函数，画在哪就点在哪）。只在
+ * transform_frame_for 认定可用时绘制。
+ */
+void draw_transform_frame(HDC dc, const ShellState& shell, const Layout& layout) {
+  comp_rect rect{};
+  float rotation = 0.0f;
+  if (!transform_frame_for(shell, &rect, &rotation)) return;
+  const comp_ui::Rect frame = to_ui_rect(rect);
+  const double zoom = shell.view.zoom > 0.0 ? shell.view.zoom : 1.0;
+
+  const int corners[4] = {0, 2, 4, 6}; /* 左上、右上、右下、左下 */
+  POINT quad[5];
+  for (int i = 0; i < 4; ++i) {
+    const comp_ui::Point doc = comp_ui::transform_handle_point(frame, rotation, corners[i]);
+    const comp_ui::Point screen =
+        shell.view.doc_to_screen(doc.x, doc.y, layout.canvas, shell.width, shell.height);
+    quad[i].x = static_cast<LONG>(std::lround(screen.x));
+    quad[i].y = static_cast<LONG>(std::lround(screen.y));
+  }
+  quad[4] = quad[0];
+
+  HPEN frame_pen = CreatePen(PS_SOLID, 1, RGB(0, 120, 215));
+  HBRUSH handle_brush = CreateSolidBrush(RGB(255, 255, 255));
+  HGDIOBJ old_pen = SelectObject(dc, frame_pen);
+  HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+  Polyline(dc, quad, 5);
+
+  SelectObject(dc, handle_brush);
+  for (int handle = 0; handle < comp_ui::kTransformHandleCount; ++handle) {
+    const comp_ui::Point doc = comp_ui::transform_handle_point(frame, rotation, handle);
+    const comp_ui::Point screen =
+        shell.view.doc_to_screen(doc.x, doc.y, layout.canvas, shell.width, shell.height);
+    const int hx = static_cast<int>(std::lround(screen.x));
+    const int hy = static_cast<int>(std::lround(screen.y));
+    Rectangle(dc, hx - kTransformHandlePx, hy - kTransformHandlePx,
+              hx + kTransformHandlePx + 1, hy + kTransformHandlePx + 1);
+  }
+
+  /* 旋钮：从上边中点引一条线，圆点与方块同色，拖它转角度。 */
+  const comp_ui::Point top_doc = comp_ui::transform_handle_point(frame, rotation, 1);
+  const comp_ui::Point knob_doc =
+      comp_ui::transform_rotate_knob_point(frame, rotation, kTransformKnobOffsetPx / zoom);
+  const comp_ui::Point top_screen = shell.view.doc_to_screen(top_doc.x, top_doc.y, layout.canvas,
+                                                             shell.width, shell.height);
+  const comp_ui::Point knob_screen = shell.view.doc_to_screen(knob_doc.x, knob_doc.y,
+                                                              layout.canvas, shell.width,
+                                                              shell.height);
+  SelectObject(dc, GetStockObject(NULL_BRUSH));
+  MoveToEx(dc, static_cast<int>(std::lround(top_screen.x)),
+           static_cast<int>(std::lround(top_screen.y)), nullptr);
+  LineTo(dc, static_cast<int>(std::lround(knob_screen.x)),
+         static_cast<int>(std::lround(knob_screen.y)));
+  SelectObject(dc, handle_brush);
+  const int knob_x = static_cast<int>(std::lround(knob_screen.x));
+  const int knob_y = static_cast<int>(std::lround(knob_screen.y));
+  Ellipse(dc, knob_x - 5, knob_y - 5, knob_x + 6, knob_y + 6);
+
+  SelectObject(dc, old_brush);
+  SelectObject(dc, old_pen);
+  DeleteObject(frame_pen);
+  DeleteObject(handle_brush);
+}
+
 void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout) {
   if (layout.canvas.empty()) return;
   const int saved = SaveDC(dc);
@@ -9621,6 +9927,9 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dotted);
   }
 
+  /* 变换手柄画在最后：它压在所有预览之上（可点时必须可见）。 */
+  draw_transform_frame(dc, shell, layout);
+
   RestoreDC(dc, saved);
 }
 
@@ -9906,7 +10215,8 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
     wsprintfW(buffer,
               L"工具：Move（V）· 无选区 = 拖整层、Alt+拖动 = 复制一份再移动；"
               L"有选区 = 选区内搬像素（Alt = 复制）、选区外拖整层；"
-              L"面板多选 = 整批移动（Alt = 整批复制）；方向键微调 1 px（Shift 1 / Ctrl 10）");
+              L"面板多选 = 整批移动（Alt = 整批复制）；方向键微调 1 px（Shift 1 / Ctrl 10）；"
+              L"单选图层时拖四角/边中点 = 缩放，拖上方旋钮 = 旋转（Shift = 15° 吸附）");
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"
@@ -12501,7 +12811,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
-      if (shell != nullptr && (shell->move_active || shell->layer_move_active)) {
+      if (shell != nullptr && (shell->move_active || shell->layer_move_active ||
+                               shell->layer_handle_active)) {
         move_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -12561,9 +12872,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 整层拖动被 abort 后画面必须重画，否则图层会「停在」被拖到的位置。 */
-        const bool layer_move_was_active = shell->layer_move_active;
+        const bool drag_was_active =
+            shell->layer_move_active || shell->layer_handle_active;
         move_cancel(*shell);
-        if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
+        if (drag_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
@@ -12588,9 +12900,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 同上：捕获被抢走时整层拖动也要回滚并重画。 */
-        const bool layer_move_was_active = shell->layer_move_active;
+        const bool drag_was_active =
+            shell->layer_move_active || shell->layer_handle_active;
         move_cancel(*shell);
-        if (layer_move_was_active) InvalidateRect(window, nullptr, FALSE);
+        if (drag_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
         /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
@@ -12699,7 +13012,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             /* 不 return：后面的笔尖/光标跟踪仍要走，否则拖框时光标状态会冻住。 */
             zoom_marquee_extend(*shell, mouse_x, mouse_y);
             InvalidateRect(window, nullptr, FALSE);
-          } else if (shell->move_active || shell->layer_move_active) {
+          } else if (shell->move_active || shell->layer_move_active ||
+                     shell->layer_handle_active) {
             move_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->crop_active) {

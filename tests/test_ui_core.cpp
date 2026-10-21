@@ -3129,3 +3129,105 @@ COMP_TEST(ui_core_adjust_channel_chips_and_curve_editor) {
   /* 少于两点 = 恒等（引擎按容错读，面板也照此画）。 */
   COMP_CHECK(near_value(comp_ui::curve_eval(identity, 1, 77.0), 77.0));
 }
+
+/*
+ * 变换手柄（S39）。
+ *
+ * 只钉可判定的几何，不碰 Win32：
+ *   1. 8 个手柄绕矩形中心转，顺序与绘制一致（左上起顺时针），旋钮在上边外侧。
+ *   2. 命中取半径内最近的手柄，空白处 / 空矩形 / 非法半径返回「无」。
+ *   3. 拖手柄缩放时**对角锚点不动**——0° 与 90° 都要成立；最小尺寸把指针
+ *      越过对边的情况夹住，而不是让宽高变成 0 或负数（引擎会拒绝这种 transform）。
+ *   4. 旋钮角度取夹角增量并归一到 (-180, 180]，跨 ±180° 不跳圈。
+ */
+COMP_TEST(ui_core_transform_handles_track_rotation_and_anchor) {
+  const Rect base{100, 200, 400, 200}; /* 中心 (300, 300) */
+  const Point center = comp_ui::rect_center_point(base);
+
+  /* 1. 0° 时的手柄位置。 */
+  const Point expected[8] = {Point{100, 200}, Point{300, 200}, Point{500, 200},
+                             Point{500, 300}, Point{500, 400}, Point{300, 400},
+                             Point{100, 400}, Point{100, 300}};
+  for (int handle = 0; handle < comp_ui::kTransformHandleCount; ++handle) {
+    COMP_CHECK(same_point(comp_ui::transform_handle_point(base, 0.0, handle),
+                          expected[handle]));
+  }
+  /* 90°：左上角 (-200,-100) 转到 (100,-200)，即 (400, 100)。 */
+  COMP_CHECK(same_point(comp_ui::transform_handle_point(base, 90.0, 0),
+                        Point{400, 100}));
+  COMP_CHECK(same_point(comp_ui::transform_handle_point(base, 90.0, 4),
+                        Point{200, 500}));
+
+  /* 2. 命中。 */
+  COMP_CHECK(comp_ui::transform_handle_at(base, 0.0, Point{500, 300}, 6.0) == 3);
+  COMP_CHECK(comp_ui::transform_handle_at(base, 0.0, Point{503, 297}, 6.0) == 3);
+  COMP_CHECK(comp_ui::transform_handle_at(base, 0.0, Point{340, 300}, 6.0) ==
+             comp_ui::kTransformHandleNone);
+  COMP_CHECK(comp_ui::transform_handle_at(base, 0.0, Point{500, 300}, 0.0) ==
+             comp_ui::kTransformHandleNone);
+  COMP_CHECK(comp_ui::transform_handle_at(Rect{}, 0.0, Point{0, 0}, 6.0) ==
+             comp_ui::kTransformHandleNone);
+  /* 旋转 45° 后手柄转到别处：命中按旋转后的点算，原角落不再命中。 */
+  const Point rotated_br = comp_ui::transform_handle_point(base, 45.0, 4);
+  COMP_CHECK(comp_ui::transform_handle_at(base, 45.0, rotated_br, 6.0) == 4);
+  COMP_CHECK(comp_ui::transform_handle_at(base, 45.0, Point{500, 400}, 6.0) != 4);
+
+  /* 旋钮：上边中点外 offset。 */
+  COMP_CHECK(same_point(comp_ui::transform_rotate_knob_point(base, 0.0, 24.0),
+                        Point{300, 176}));
+  COMP_CHECK(same_point(comp_ui::transform_rotate_knob_point(base, 90.0, 24.0),
+                        Point{424, 300}));
+  COMP_CHECK(comp_ui::transform_knob_at(base, 0.0, Point{301, 175}, 24.0, 6.0));
+  COMP_CHECK(!comp_ui::transform_knob_at(base, 0.0, Point{300, 200}, 24.0, 6.0));
+
+  /* 3. 缩放：0° 下拖各边，锚点侧的边不动。 */
+  const Rect right_drag =
+      comp_ui::transform_scale_rect(base, 0.0, 3, Point{600, 300}, 1);
+  COMP_CHECK(right_drag.x == 100 && right_drag.y == 200 && right_drag.w == 500 &&
+             right_drag.h == 200);
+  const Rect left_drag =
+      comp_ui::transform_scale_rect(base, 0.0, 7, Point{0, 300}, 1);
+  COMP_CHECK(left_drag.x == 0 && left_drag.w == 500 && left_drag.h == 200);
+  const Rect bottom_drag =
+      comp_ui::transform_scale_rect(base, 0.0, 5, Point{300, 500}, 1);
+  COMP_CHECK(bottom_drag.y == 200 && bottom_drag.h == 300 && bottom_drag.w == 400);
+  const Rect corner_drag =
+      comp_ui::transform_scale_rect(base, 0.0, 0, Point{50, 150}, 1);
+  COMP_CHECK(corner_drag.x == 50 && corner_drag.y == 150 && corner_drag.w == 450 &&
+             corner_drag.h == 250);
+  /* 指针越过对边：宽高压到下限，不出现 0 / 负数。 */
+  const Rect clamped =
+      comp_ui::transform_scale_rect(base, 0.0, 3, Point{50, 300}, 8);
+  COMP_CHECK(clamped.x == 100 && clamped.w == 8);
+  /* 非法手柄 / 空矩形原样返回。 */
+  const Rect untouched =
+      comp_ui::transform_scale_rect(base, 0.0, 9, Point{600, 300}, 1);
+  COMP_CHECK(untouched.x == base.x && untouched.w == base.w);
+
+  /*
+   * 90° 下拖右边：局部 x 从 500 拉到 600，中心随之前移，锚点（局部左边中点）
+   * 在文档里必须仍在 (300, 100)。结果 {50, 250, 500, 200}。
+   */
+  const Rect rotated_drag =
+      comp_ui::transform_scale_rect(base, 90.0, 3, Point{300, 600}, 1);
+  COMP_CHECK(rotated_drag.x == 50 && rotated_drag.y == 250 && rotated_drag.w == 500 &&
+             rotated_drag.h == 200);
+  const Point anchor_after = comp_ui::rotate_doc_point(
+      Point{static_cast<double>(rotated_drag.x), comp_ui::rect_center_point(rotated_drag).y},
+      comp_ui::rect_center_point(rotated_drag), 90.0);
+  COMP_CHECK(same_point(anchor_after, Point{300, 100}, 1.5));
+
+  /* 4. 旋钮角度：上 -> 右 = +90°；上 -> 左跨过 180° 后归到 -90°。 */
+  COMP_CHECK(near_value(comp_ui::transform_rotate_delta(base, Point{300, 200},
+                                                        Point{400, 300}), 90.0));
+  COMP_CHECK(near_value(comp_ui::transform_rotate_delta(base, Point{300, 200},
+                                                        Point{200, 300}), -90.0));
+  COMP_CHECK(near_value(comp_ui::transform_rotate_delta(base, Point{300, 200},
+                                                        Point{300, 200}), 0.0));
+  COMP_CHECK(near_value(comp_ui::transform_normalize_rotation(400.0), 40.0));
+  COMP_CHECK(near_value(comp_ui::transform_normalize_rotation(-400.0), -40.0));
+  COMP_CHECK(near_value(comp_ui::transform_normalize_rotation(360.0), 360.0));
+  COMP_CHECK(near_value(comp_ui::transform_normalize_rotation(-360.0), 0.0));
+  /* 中心与实际手柄中心一致（旋钮角度以它为原点）。 */
+  COMP_CHECK(same_point(center, Point{300, 300}));
+}
