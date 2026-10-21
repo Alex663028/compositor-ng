@@ -323,7 +323,6 @@ bool blend_adjusted_in_blend_mode_hdr(const ImageBuffer& adjusted, const ImageBu
       const uint16_t* adj = adj_row + static_cast<size_t>(x) * 4u;
       const uint16_t* below_px = below_row + static_cast<size_t>(x) * 4u;
       uint16_t opaque_above[4] = {adj[0], adj[1], adj[2], one};
-      uint16_t opaque_below[4] = {below_px[0], below_px[1], below_px[2], one};
       uint16_t mixed[4] = {below_px[0], below_px[1], below_px[2], one};
       blend_pixels_half(mixed, opaque_above, mode, 1.0);
       px[0] = mixed[0];
@@ -381,17 +380,6 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
     *out = backdrop;
     return true;
   }
-
-  /*
-   * C5：表面深度跟文档走（有 HDR 图层即 half）。这里从 backdrop 读，
-   * 因为递归的每一条路径都把同一深度的缓冲传下来：再扫一遍图层树只会
-   * 让「哪张表面是 half」出现第二个判定点。
-   */
-  const comp_pixel_format canvas_format =
-      backdrop.empty() ? composite_surface_format(doc)
-                       : (backdrop.format == COMP_PIXEL_RGBA16F ? COMP_PIXEL_RGBA16F
-                                                                : COMP_PIXEL_RGBA8);
-  const bool half_surface = canvas_format == COMP_PIXEL_RGBA16F;
 
   /*
    * 剪贴栈（上游 LiveMaskRenderer.drawComposite:110-150）。

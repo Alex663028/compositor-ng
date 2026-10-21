@@ -540,7 +540,6 @@ bool layer_histogram(const Layer& layer, const uint8_t* coverage, size_t coverag
 
   const size_t w = layer.pixels.width;
   const size_t h = layer.pixels.height;
-  const size_t stride = layer.pixels.stride();
   for (size_t y = 0; y < h; ++y) {
     const uint8_t* px = layer.pixels.row(y);
     const uint8_t* cov = coverage != nullptr ? coverage + y * coverage_stride : nullptr;

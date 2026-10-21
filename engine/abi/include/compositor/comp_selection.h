@@ -74,6 +74,8 @@ typedef struct comp_selection_cubic {
  * 用形状产生/叠加选区。points 是扁平的 (x, y) 序列：
  *   - rect / ellipse：恰好 2 个点；
  *   - polygon：至少 3 个点。
+ * 注意 point_count 数的是**点**（一个点 = x,y 一对 float），不是 float 个数：
+ * 传一个矩形必须给 points_count = 2（4 个 float），传 4 会被判参数非法。
  * antialias 只影响**这一次**栅格化，已经存在的基础蒙版保持原样
  * （1 = 4 行超采样 + 水平解析覆盖率，0 = 每像素中心取一票的硬边）。
  *

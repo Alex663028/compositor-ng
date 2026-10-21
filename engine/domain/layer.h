@@ -277,6 +277,19 @@ struct Layer {
   bool document_to_pixel(int32_t source_width, int32_t source_height, double doc_x,
                          double doc_y, int32_t* out_x, int32_t* out_y) const;
 
+  /*
+   * 上面的逆映射：图层/蒙版像素 (px, py) 的**像素中心**落在文档坐标的哪一点。
+   * 同样按 归一化 → 翻转 → 旋转 → 反归一化 的次序展开，与 document_to_pixel
+   * 严格互逆（那是「文档→像素」的逆旋转 + 反归一化，这里是正变换）。
+   *
+   * 用途：选区混合要给**每一个图层像素**取它在文档空间里的 coverage，旋转/翻转
+   * 后图层像素网格与文档网格不再轴对齐，只能用正变换逐点取样；轴对齐时调用方
+   * 应走整数平移快路径，别绕这里做浮点往返。
+   * 落在源缓冲外返回 false。
+   */
+  bool pixel_to_document(int32_t source_width, int32_t source_height, int32_t px, int32_t py,
+                         double* out_doc_x, double* out_doc_y) const;
+
   bool has_pixels() const { return !pixels.empty(); }
 };
 

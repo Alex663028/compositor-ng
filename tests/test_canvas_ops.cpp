@@ -526,23 +526,50 @@ COMP_TEST(rotate_canvas_carries_the_selection_by_exact_transposition) {
 }
 
 COMP_TEST(rotate_canvas_drops_an_unalignable_empty_selection) {
-  Doc doc(16, 8);
-  COMP_CHECK(doc.document != nullptr);
-  COMP_CHECK(add_solid_layer(doc.document, 16, 8, 120, 120, 120) != 0);
+  /* 两件不同的事，旧用例只看到第一件的一半：
+   *   A. 显式空选区但蒙版网格**已分配**（全 0）——网格能转置，选区保持 active，
+   *      coverage 仍全 0。这不是「幽灵选区」：显式空选区在滤镜/反相里本来就是
+   *      no-op 语义，丢掉它反而会抹掉 feather / 撤销语义。
+   *   B. active 但蒙版**网格为空**（零尺寸）——换坐标系后无法对齐，保守丢弃
+   *      （与 crop 同口径），否则会留下一个尺寸对不上新画布的蒙版。 */
+  {
+    Doc doc(16, 8);
+    COMP_CHECK(doc.document != nullptr);
+    COMP_CHECK(add_solid_layer(doc.document, 16, 8, 120, 120, 120) != 0);
 
-  /* 显式空选区（active 但蒙版全 0）：换坐标系后无法对齐，按保守口径丢弃。 */
-  int32_t changed = 0;
-  COMP_CHECK(rect_select(doc.document, 4.0f, 4.0f, 12.0f, 12.0f, COMP_SELECTION_REPLACE, &changed) ==
-             COMP_OK);
-  COMP_CHECK(comp_selection_modify(doc.document, COMP_SELECTION_CONTRACT, 500, &changed) == COMP_OK);
-  COMP_CHECK(active_of(doc.document) == 1);
-  COMP_CHECK(mask_sum(coverage_of(doc.document, 16, 8)) == 0);
+    int32_t changed = 0;
+    COMP_CHECK(rect_select(doc.document, 4.0f, 4.0f, 12.0f, 12.0f, COMP_SELECTION_REPLACE,
+                           &changed) == COMP_OK);
+    COMP_CHECK(comp_selection_modify(doc.document, COMP_SELECTION_CONTRACT, 500, &changed) ==
+               COMP_OK);
+    COMP_CHECK(active_of(doc.document) == 1);
+    COMP_CHECK(mask_sum(coverage_of(doc.document, 16, 8)) == 0);
 
-  COMP_CHECK(comp_document_rotate_canvas(doc.document, 1, &changed) == COMP_OK);
-  COMP_CHECK(changed == 1);
-  /* 全 0 蒙版转置仍是全 0：没有像素被选中，不会凭空造出幽灵选区。 */
-  COMP_CHECK_MSG(mask_sum(coverage_of(doc.document, 8, 16)) == 0,
-                 "rotating an explicitly empty selection selects no pixel");
+    COMP_CHECK(comp_document_rotate_canvas(doc.document, 1, &changed) == COMP_OK);
+    COMP_CHECK(changed == 1);
+    /* 全 0 蒙版转置仍是全 0：没有像素被选中，不会凭空造出幽灵选区。 */
+    COMP_CHECK_MSG(mask_sum(coverage_of(doc.document, 8, 16)) == 0,
+                   "rotating an explicitly empty selection selects no pixel");
+    COMP_CHECK_MSG(active_of(doc.document) == 1,
+                   "an allocated empty mask survives the turn (it is still alignable)");
+  }
+
+  {
+    Doc doc(16, 8);
+    COMP_CHECK(doc.document != nullptr);
+    COMP_CHECK(add_solid_layer(doc.document, 16, 8, 120, 120, 120) != 0);
+    /* 域层直接摆一个「active 但蒙版缓冲是空的」状态（C ABI 造不出来）。 */
+    compositor::Document* domain = doc.domain();
+    COMP_CHECK(domain != nullptr);
+    domain->state().selection.active = true;
+    COMP_CHECK(domain->state().selection.base.empty());
+
+    int32_t changed = 0;
+    COMP_CHECK(comp_document_rotate_canvas(doc.document, 1, &changed) == COMP_OK);
+    COMP_CHECK(changed == 1);
+    COMP_CHECK_MSG(active_of(doc.document) == 0,
+                   "an unalignable empty grid is dropped, not carried into the new canvas");
+  }
 }
 
 COMP_TEST(rotate_canvas_rejects_origin_overflow_without_partial_state) {
@@ -716,7 +743,7 @@ COMP_TEST(trim_color_based_uses_corner_samples_with_per_channel_tolerance) {
     }
   }
 
-  auto run_trim = [k](comp_document document, comp_trim_options options, int32_t* changed) {
+  auto run_trim = [](comp_document document, comp_trim_options options, int32_t* changed) {
     return comp_document_trim(document, options, changed);
   };
 
@@ -1008,6 +1035,110 @@ COMP_TEST(invert_with_an_offset_layer_uses_the_effective_bounds_origin) {
   }
   COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
   COMP_CHECK(doc.pixels_of(id) == before);
+}
+
+COMP_TEST(invert_maps_the_selection_through_layer_rotation_and_flip) {
+  /* 8x8 画布、8x8 铺满图层，选区是文档左上四分块 (0,0)-(4,4)。
+   * 旋转/翻转后要判的是「图层像素在文档里落在哪」，不是「图层像素自己的左边」：
+   *   90°  → 图层 (x,y) 落在文档 (7-y, x)：选区内 ⇔ x<4 且 y>=4（左下块）
+   *   180° → 落在文档 (7-x, 7-y)：选区内 ⇔ x>=4 且 y>=4（右下块）
+   *   水平翻转 → 落在文档 (7-x, y)：选区内 ⇔ x>=4 且 y<4（右上块）
+   * 旧实现只按 effective_bounds() 原点平移，三种情况都会把「左边」当成选区，
+   * 选区外的像素被误改（S25 复测在 45°/90° 各测到 8 像素）。 */
+  struct Case {
+    float rotation;
+    bool flip_x;
+    const char* label;
+    bool (*inside)(int32_t x, int32_t y);
+  };
+  const Case cases[] = {
+      {90.0f, false, "90 degrees", [](int32_t x, int32_t y) { return x < 4 && y >= 4; }},
+      {180.0f, false, "180 degrees", [](int32_t x, int32_t y) { return x >= 4 && y >= 4; }},
+      {0.0f, true, "flip_x", [](int32_t x, int32_t y) { return x >= 4 && y < 4; }},
+  };
+
+  for (const Case& test : cases) {
+    DomainDoc doc(8, 8);
+    COMP_CHECK(doc.handle() != nullptr);
+    const comp_layer_id id = domain_solid(&doc.document, 8, 8, 100, 150, 200);
+    COMP_CHECK(id != 0);
+    compositor::Layer* layer = doc.document.find(id);
+    COMP_CHECK(layer != nullptr);
+    layer->rotation = test.rotation;
+    layer->flip_x = test.flip_x;
+    const std::vector<uint8_t> before = doc.pixels_of(id);
+
+    int32_t changed = 0;
+    COMP_CHECK(rect_select(doc.handle(), 0.0f, 0.0f, 4.0f, 4.0f, COMP_SELECTION_REPLACE,
+                           &changed) == COMP_OK);
+    changed = -1;
+    COMP_CHECK_MSG(comp_layer_invert(doc.handle(), id, &changed) == COMP_OK, test.label);
+    COMP_CHECK(changed == 1);
+
+    const std::vector<uint8_t> after = doc.pixels_of(id);
+    for (int32_t y = 0; y < 8; ++y) {
+      for (int32_t x = 0; x < 8; ++x) {
+        const size_t i = (static_cast<size_t>(y) * 8 + static_cast<size_t>(x)) * 4u;
+        const bool inside = test.inside(x, y);
+        /* 反相是 c' = 255 - c（alpha 不透明）：155/105/55 与 100/150/200 互判。 */
+        COMP_CHECK_MSG(after[i] == (inside ? 155 : 100), test.label);
+        COMP_CHECK_MSG(after[i + 1] == (inside ? 105 : 150), test.label);
+        COMP_CHECK_MSG(after[i + 2] == (inside ? 55 : 200), test.label);
+        COMP_CHECK_MSG(after[i + 3] == 255, test.label);
+      }
+    }
+
+    COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+    COMP_CHECK_MSG(doc.pixels_of(id) == before, test.label);
+  }
+}
+
+COMP_TEST(invert_maps_the_selection_through_an_arbitrary_rotation) {
+  /* 16x16 图层，rotation = 45°，选区是文档右半 (x >= 8)。
+   * 方形包围盒下图层像素 (x,y) 的文档落点是（cos45 = sin45 = 1/√2）
+   *   doc_x = 7.5 + 0.7071 * (x - y)
+   *   doc_y = 7.5 + 0.7071 * (x + y - 15)
+   * 选区内 ⇔ lround(doc_x) >= 8，且落点仍要落在画布内（45° 旋转会把四角甩出
+   * 画布，画布外的 coverage 定义为 0）。x == y 时 doc_x 恰好是 7.5，取整方向
+   * 属于实现的 tie-break，跳过这条对角线。 */
+  constexpr double kDiag = 0.7071067811865476;
+  DomainDoc doc(16, 16);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_solid(&doc.document, 16, 16, 100, 150, 200);
+  COMP_CHECK(id != 0);
+  compositor::Layer* layer = doc.document.find(id);
+  COMP_CHECK(layer != nullptr);
+  layer->rotation = 45.0f;
+  const std::vector<uint8_t> before = doc.pixels_of(id);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect_select(doc.handle(), 8.0f, 0.0f, 16.0f, 16.0f, COMP_SELECTION_REPLACE,
+                         &changed) == COMP_OK);
+  changed = -1;
+  COMP_CHECK(comp_layer_invert(doc.handle(), id, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+
+  const std::vector<uint8_t> after = doc.pixels_of(id);
+  int32_t inverted = 0;
+  for (int32_t y = 0; y < 16; ++y) {
+    for (int32_t x = 0; x < 16; ++x) {
+      if (x == y) continue;
+      const int32_t ix = static_cast<int32_t>(std::lround(7.5 + kDiag * (x - y)));
+      const int32_t iy = static_cast<int32_t>(std::lround(7.5 + kDiag * (x + y - 15)));
+      const bool on_canvas = ix >= 0 && ix < 16 && iy >= 0 && iy < 16;
+      const bool inside = on_canvas && ix >= 8;
+      if (inside) ++inverted;
+      const size_t i = (static_cast<size_t>(y) * 16 + static_cast<size_t>(x)) * 4u;
+      COMP_CHECK_MSG(after[i] == (inside ? 155 : 100), "45 degrees maps the selection");
+      COMP_CHECK(after[i + 1] == (inside ? 105 : 150));
+      COMP_CHECK(after[i + 2] == (inside ? 55 : 200));
+    }
+  }
+  /* 断言不是空转：45° 下确实有一片像素落在「文档右半但图层自己的左边」。 */
+  COMP_CHECK_MSG(inverted > 0 && inverted < 16 * 16 - 16, "the 45-degree case has both halves");
+
+  COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+  COMP_CHECK_MSG(doc.pixels_of(id) == before, "undo restores the rotated layer");
 }
 
 COMP_TEST(invert_with_an_explicitly_empty_selection_is_a_noop) {

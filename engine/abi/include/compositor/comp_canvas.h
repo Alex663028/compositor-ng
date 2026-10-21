@@ -90,13 +90,15 @@ typedef struct comp_trim_options {
  * 先 flatten 整篇**可见合成**计算边框（不看选区，与 PS 一致），再按
  * comp_crop_apply 的「平移图层 + 换画布」提交，一步撤销。
  *
- * - based_on 枚举未知、四边全关、tolerance > 255 →
- *   COMP_ERR_INVALID_ARGUMENT；
+ * - based_on 枚举未知、四边全关 → COMP_ERR_INVALID_ARGUMENT
+ *   （tolerance 是 uint8_t，天然落在 0..255，不再单独判上限）；
  * - 空文档（无图层）→ COMP_ERR_STATE；
  * - 整篇没有可保留内容（全透明 / 整图同基准色）→ COMP_ERR_STATE
  *   （上游 noContentToTrim），文档不变；
  * - 修出边框后由 crop 口径处理：与当前画布相同 → out_changed = 0；
- *   图层 origin 越界 → COMP_ERR_INVALID_ARGUMENT，文档不变。
+ *   图层 origin 越界 → COMP_ERR_INVALID_ARGUMENT，文档不变；
+ * - **活动选区会被清掉**（换画布后旧坐标失效，与 comp_crop_apply 同口径；
+ *   这一步在事务内，撤销会把选区一起还原）。
  *
  * out_changed 可为 NULL。
  */
@@ -112,9 +114,11 @@ COMP_API comp_result comp_document_trim(comp_document document, comp_trim_option
  * alpha 保持不变——透明像素反相后仍透明，不会变实心。
  *
  * - 活动选区存在时结果按 coverage 与原像素混合（选区按文档坐标解释，
- *   与 comp_filter_apply 同一条 blend 口径）；显式空选区 = 什么都不改，
+ *   与 comp_filter_apply 同一条 blend 口径；图层的 rotation / flip 参与
+ *   文档坐标换算，旋转后的图层不会把选区套错位置）；显式空选区 = 什么都不改，
  *   out_changed = 0；
- * - 16 位图层先落 8 位工作副本（同 comp_filter_apply）；HDR（RGBA16F）
+ * - 16 位图层先落 8 位工作副本（同 comp_filter_apply），**写回后该图层永久
+ *   变成 RGBA8**（深度是有损的，撤销可恢复原 16 位快照）；HDR（RGBA16F）
  *   图层返回 COMP_ERR_UNSUPPORTED；
  * - 图层不存在 / 是组 / 无像素 → COMP_ERR_NOT_FOUND / COMP_ERR_STATE；
  * - 一步撤销（显式事务内加入，否则自成隐式步）。

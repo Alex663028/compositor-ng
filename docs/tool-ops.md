@@ -518,3 +518,12 @@ coverage 把样本盖回当前像素。
   `run_regression.py --require-ohos` 6/6 PASS（OHOS 91 → 93，新增两个 .cpp 参与交叉编译）。
   **边界（待续）**：本轮只做引擎 + ABI 层。壳侧菜单 / 快捷键 / 面板接线（Image 菜单三条 + Select >
   Color Range 面板）尚未做；Trim 的颜色基准预览与 Color Range 的吸管取样 UI 亦未做。
+
+- **P0-0（2026-10-21）选区混合按图层几何映射**：`blend_through_selection` 原先只按
+  `effective_bounds()` 原点平移，忽略 `rotation` / `flip_x` / `flip_y`，45° 与 90° 图层上
+  `comp_layer_invert` / `comp_filter_apply` 各有 8 px **选区外**被误改。现改为接收 `const Layer&`：
+  新增 `Layer::pixel_to_document()`（`document_to_pixel()` 的严格逆），轴对齐走整数平移快路径
+  （既有用例逐字节不变），旋转/翻转/缩放走正变换 + 最近邻取 coverage，落点出画布记 0。
+  `comp_canvas.h` 同步写清「trim 清活动选区」「invert 把 16 位永久降为 8 位」，
+  `comp_selection.h` 写清 `point_count` 数的是点不是 float。基线 523 → **525 用例**，
+  回归 6/6、导出仍 123、壳自检 219 项 SHA256 零变化。

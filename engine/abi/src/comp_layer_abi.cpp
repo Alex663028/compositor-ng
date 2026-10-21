@@ -1334,7 +1334,10 @@ comp_result comp_layer_histogram(comp_document document, comp_layer_id target,
    * 直方图而不报错。
    */
   if (coverage != nullptr) {
-    if (coverage_stride < layer->pixels.width || layer->pixels.height == 0) {
+    /* 先挡非正尺寸再比较：把 int32_t 无符号转换放在后面，负宽度不会被折成巨值
+     * 而让检查失效（-Wsign-compare 也在这里显式对齐）。 */
+    if (layer->pixels.width <= 0 || layer->pixels.height == 0 ||
+        coverage_stride < static_cast<size_t>(layer->pixels.width)) {
       return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
                                    "coverage stride is smaller than the layer width");
     }

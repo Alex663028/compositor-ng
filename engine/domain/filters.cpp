@@ -358,9 +358,8 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
         std::vector<uint8_t> coverage;
         selection_effective_coverage(selection, &coverage);
         blend_through_selection(pixels, layer->pixels.stride(), original.data(),
-                                layer->pixels.width, layer->pixels.height, coverage,
-                                layer->effective_bounds(), document->state().width,
-                                document->state().height);
+                                layer->pixels.width, layer->pixels.height, coverage, *layer,
+                                document->state().width, document->state().height);
       }
     }
   } catch (...) {

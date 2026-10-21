@@ -244,4 +244,38 @@ bool Layer::document_to_pixel(int32_t source_width, int32_t source_height, doubl
   return true;
 }
 
+bool Layer::pixel_to_document(int32_t source_width, int32_t source_height, int32_t px, int32_t py,
+                              double* out_doc_x, double* out_doc_y) const {
+  if (out_doc_x == nullptr || out_doc_y == nullptr) return false;
+  if (source_width <= 0 || source_height <= 0) return false;
+  if (px < 0 || py < 0 || px >= source_width || py >= source_height) return false;
+  const comp_rect bounds = effective_bounds();
+  if (bounds.w <= 0 || bounds.h <= 0) return false;
+
+  /* 像素中心；与 document_to_pixel 的 (doc + 0.5) 对应。 */
+  double us = (static_cast<double>(px) + 0.5) / static_cast<double>(source_width) * 2.0 - 1.0;
+  double vs = (static_cast<double>(py) + 0.5) / static_cast<double>(source_height) * 2.0 - 1.0;
+
+  /* document_to_pixel 是「逆旋转 → 翻转」，逆过来就是「翻转 → 正旋转」。 */
+  if (flip_x) us = -us;
+  if (flip_y) vs = -vs;
+
+  double ud = us;
+  double vd = vs;
+  if (std::fabs(static_cast<double>(rotation)) > 1e-9) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double rad = static_cast<double>(rotation) * kPi / 180.0;
+    const double cos_t = std::cos(rad);
+    const double sin_t = std::sin(rad);
+    ud = us * cos_t - vs * sin_t;
+    vd = us * sin_t + vs * cos_t;
+  }
+
+  *out_doc_x =
+      (ud + 1.0) * 0.5 * static_cast<double>(bounds.w) + static_cast<double>(bounds.x) - 0.5;
+  *out_doc_y =
+      (vd + 1.0) * 0.5 * static_cast<double>(bounds.h) + static_cast<double>(bounds.y) - 0.5;
+  return true;
+}
+
 }  // namespace compositor

@@ -1122,8 +1122,7 @@ comp_result selection_apply_color_range(SelectionState* selection, int32_t canva
 
 void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
                              int32_t height, const std::vector<uint8_t>& coverage,
-                             const comp_rect& bounds, int32_t canvas_width,
-                             int32_t canvas_height) {
+                             const Layer& layer, int32_t canvas_width, int32_t canvas_height) {
   if (coverage.empty() || canvas_width <= 0 || canvas_height <= 0) {
     /* 没有有效 coverage：整层保持原样（显式空选区在上游就是「什么都不改」）。 */
     for (int32_t y = 0; y < height; ++y) {
@@ -1132,16 +1131,36 @@ void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* origin
     }
     return;
   }
+  const comp_rect bounds = layer.effective_bounds();
+  /* 轴对齐快路径：整数平移与旧实现逐字相同，保证既有用例逐字节不变。
+   * 一旦有旋转/翻转，或包围盒与像素尺寸不一致（缩放），图层像素网格与文档
+   * 网格不再同构，必须走正变换逐点取样。 */
+  const bool axis_aligned = static_cast<double>(layer.rotation) == 0.0 && !layer.flip_x &&
+                            !layer.flip_y && bounds.w == width && bounds.h == height;
   for (int32_t y = 0; y < height; ++y) {
     uint8_t* row = rgba + static_cast<size_t>(y) * stride;
     const uint8_t* before = original + static_cast<size_t>(y) * stride;
     for (int32_t x = 0; x < width; ++x) {
       uint8_t* p = row + static_cast<size_t>(x) * 4;
       const uint8_t* o = before + static_cast<size_t>(x) * 4;
-      const int32_t doc_x = bounds.x + x;
-      const int32_t doc_y = bounds.y + y;
+      int32_t doc_x = 0;
+      int32_t doc_y = 0;
+      bool mapped = true;
+      if (axis_aligned) {
+        doc_x = bounds.x + x;
+        doc_y = bounds.y + y;
+      } else {
+        double fx = 0.0;
+        double fy = 0.0;
+        mapped = layer.pixel_to_document(width, height, x, y, &fx, &fy);
+        if (mapped) {
+          /* coverage 是硬边蒙版，采样用最近邻（与文档→图层方向同口径）。 */
+          doc_x = static_cast<int32_t>(std::lround(fx));
+          doc_y = static_cast<int32_t>(std::lround(fy));
+        }
+      }
       int32_t cov = 0;
-      if (doc_x >= 0 && doc_y >= 0 && doc_x < canvas_width && doc_y < canvas_height) {
+      if (mapped && doc_x >= 0 && doc_y >= 0 && doc_x < canvas_width && doc_y < canvas_height) {
         cov = coverage[static_cast<size_t>(doc_y) * static_cast<size_t>(canvas_width) +
                        static_cast<size_t>(doc_x)];
       }

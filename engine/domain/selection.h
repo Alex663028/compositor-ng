@@ -47,6 +47,7 @@
 namespace compositor {
 
 class Document;
+struct Layer;
 
 /* 与 ABI 的 comp_selection_shape / combine / modify 数值一一对应。 */
 enum SelectionShape {
@@ -237,19 +238,22 @@ void selection_effective_coverage(const SelectionState& selection, std::vector<u
  * 把一次像素操作的结果按选区与原像素混合（上游 PixelAdjust.blend）。
  *
  * rgba 是**已经改好**的图层像素（整层视图，stride 由调用方给），original
- * 是改之前的拷贝。coverage 是**文档分辨率**有效选区，图层像素按
- * effective_bounds() 的原点平移到文档坐标（与合成/工具同款约定）；
- * 图层落在画布外的部分 coverage 视为 0（选区之外），保持原像素。
+ * 是改之前的拷贝。coverage 是**文档分辨率**有效选区；每个图层像素按 `layer`
+ * 的几何（effective_bounds 原点 + rotation + flip）换算到文档坐标再取样——
+ * 轴对齐（rotation==0、无翻转、尺寸与包围盒一致）时是整数平移，其余情况走
+ * Layer::pixel_to_document() 的正变换逐点取样（与合成/吸管同一条映射）。
+ * 图层像素落在画布外时 coverage 视为 0（选区之外），保持原像素。
  * coverage 为空 / 画布非法时整层回滚成 original（显式空选区在上游就是
  * 「什么都不改」）。
  *
  * S25 起从 filters.cpp 提取共享：filter_apply 与 invert_layer 共用同一条
  * 选区混合口径，避免两处各写一套互相漂移。
+ * P0-0 修正：此前只按 effective_bounds() 平移，rotation/flip 非零的图层
+ * 会把 coverage 取错位置（45°/90° 实测各误改 8 像素），现按图层几何映射。
  */
 void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
                              int32_t height, const std::vector<uint8_t>& coverage,
-                             const comp_rect& bounds, int32_t canvas_width,
-                             int32_t canvas_height);
+                             const Layer& layer, int32_t canvas_width, int32_t canvas_height);
 
 /* 基础蒙版里非零像素的包围盒，按 ceil(2 * feather) 外扩后裁到画布。
  * 没有选区或显式空选区返回 {0, 0, 0, 0}。 */

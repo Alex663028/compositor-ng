@@ -3705,3 +3705,50 @@ ctypes 探针实测四个新导出的错误码与空文档 noop 契约；`run_re
 Select > Color Range 面板（吸管取样 / fuzziness 滑杆 / 反相勾选）、快捷键接线全部未做；
 Trim 的颜色基准预览与 Color Range 的取样 UI 亦未做。`scripts/visual_check.py` 的 +84/−46
 探针修复（S24 遗留）仍在工作区未提交，等 ALEX 定夺。
+
+### 6.36 P0-0 选区混合按图层几何映射 + S25 复审 8 条清零（2026-10-21，Claude）
+
+**缺陷。** `blend_through_selection`（`domain/selection.cpp`）把图层像素换算成文档坐标时只做
+`bounds.x + x`，**完全忽略 `layer.rotation` / `flip_x` / `flip_y`**。S25 复测在 32×32 画布、
+12×4 偏移图层、选区 (12,12)-(20,20) 上实测：0° 选区外改动 0 px，**45° 与 90° 各有 8 px 选区外
+被改**——不是「只有非 90° 整倍才错」，90° 整倍同样错，因为旋转后的像素网格与文档网格不再同构。
+影响面：`comp_layer_invert` 与 `comp_filter_apply` 两条路径；`comp_layer_set_transform` 是公开
+ABI，rotation/flip 都是合法状态。
+
+**修法（路线图上选的「正变换」而不是「拒绝」）。** 新增 `Layer::pixel_to_document()`——它是
+`document_to_pixel()` 的严格逆（归一化 → 翻转 → 正旋转 → 反归一化，与前者「逆旋转 → 翻转」
+逐项互逆）。`blend_through_selection` 的入参从 `const comp_rect& bounds` 改为 `const Layer&`，
+逐像素取文档坐标后最近邻取 coverage：
+
+- 轴对齐（`rotation == 0`、无翻转、`bounds.w/h == 像素宽高`）仍走**整数平移快路径**——
+  与旧实现逐字相同，既有选区 / 反相 / 滤镜断言与 68 条视觉探针逐字节不变；
+- 其余情况走正变换 + `lround` 取最近的文档像素（coverage 是硬边蒙版，插值只会把边缘抹成
+  半选，与文档→图层方向同口径）；落点出画布或出源缓冲时 coverage 记 0，回滚原像素。
+
+不选「`rotation % 360 != 0` 返回 `COMP_ERR_UNSUPPORTED`」的理由：那会让公开 ABI 上合法可设的
+rotation/flip 直接把 invert 与全部滤镜打成不支持，功能退化且多出一个错误码；而正变换与合成 /
+吸管的映射是**同一条**，语义上没有第二份口径。
+
+**验证。** 新增 2 例（`test_canvas_ops.cpp`）：`invert_maps_the_selection_through_layer_rotation_and_flip`
+用 90° / 180° / flip_x 三个整数变换把「图层第 (x,y) 像素落在文档哪一格」钉成精确象限断言；
+`invert_maps_the_selection_through_an_arbitrary_rotation` 用 45° + 16×16 图层，按
+`doc = center + R(45°)·offset` 独立推导期望，并断言「两边都不是空的」防空转。
+全量 **525 例 / 0 失败**、`run_regression.py --require-ohos` **6/6 PASS**、PE 导出仍 **123**、
+壳自检 **219 项 SHA256 零变化**、`visual_check.py` **68 项 / 0 失败**；**本批改动新增告警 0**
+（干净构建全仓仍有 7 条 S25 之前就在的告警：三个后端头文件的未使用私有字段 + 两个测试辅助
+函数 + `test_rhi.cpp` 的未使用 lambda 捕获，与本次改动无关，未动）。
+
+**同批清零的 8 条复审非阻断项。** ① `canvas_ops.cpp` 的 `siempre` 笔误改回「总是」；② 删掉两处
+`tolerance > 255`（`TrimOptions::tolerance` 是 `uint8_t`，恒假）；③ 删掉旋转里不可达的
+`layer.clipped_empty = false`（空几何已被 bounds 闸跳过）并写清为什么走不到；④ 去掉
+`test_canvas_ops.cpp` 里未使用的 `[k]` 捕获；⑤ 空选区旋转用例补
+`active_of(doc) == 0`，钉住「丢弃」而不是「留着 active 全 0」；⑥ `comp_canvas.h` 的 trim 段补
+「活动选区会被清掉」、invert 段补「16 位写回后永久变 RGBA8」；⑦ `comp_selection.h` 补
+`point_count` 数的是**点**不是 float（矩形传 2）；⑧ `gpu_plan.cpp` 注明「画布转一下就整篇
+掉出原生单元」是既有回退规则的叠加，不是旋转引入的新回退。
+
+**顺手清掉三处死代码 / 告警（不改行为）。** `tool_ops.cpp` 的 `layer_histogram` 里
+`stride` 取了却没用（`pixels.row()` 自带 stride）；`filter_graph.cpp` 里一段只喂给
+「也没人用」的 `half_surface` 的 `canvas_format` 计算整块删除（`-Wunused-variable`）；
+`comp_layer_abi.cpp` 的 coverage stride 闸把 `int32_t` 宽度显式 `static_cast<size_t>` 并先挡
+非正宽度——顺带修掉 `-Wsign-compare`，负宽度也不会再被折成巨值绕过检查。

@@ -122,6 +122,11 @@ uint64_t subtree_bake_key(const Document& doc, const FilterGraph& graph, int32_t
  * 能否把该像素图层原样上传成一张源纹理（原生单元）：
  * 整幅画布、RGBA8、无蒙版/效果/调整、无旋转翻转、几何为恒等。
  * 其余一律走 CPU 烘焙——烘焙路径与 CPU 合成器同函数，不在 GPU 侧重写语义。
+ *
+ * 边界（S25 复核）：`comp_document_rotate_canvas` 会给整页图层累加 rotation，
+ * 因此一次画布旋转就会让全部图层掉出原生单元。这是**既有**回退规则（组、
+ * 非 RGBA8、尺寸≠画布、有蒙版/效果/调整、任何翻转同样落这里）的叠加结果，
+ * 不是旋转功能引入的新回退；性能影响是「转完整篇改走烘焙」，正确性不受影响。
  */
 bool is_native_layer(const Document& doc, const Layer& layer) {
   const DocumentState& state = doc.state();

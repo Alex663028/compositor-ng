@@ -188,7 +188,8 @@ bool rotate_canvas(DocumentState* state, int32_t quarter_turns, bool* changed) {
     layer.transform.w = nw;
     layer.transform.h = nh;
     layer.rotation = rotated;
-    layer.clipped_empty = false;
+    /* clipped_empty 的图层在 effective_bounds() 里就是空矩形，已被上面的
+     * bounds 闸跳过；这里不必（也走不到）清位。 */
   }
 
   state->width = new_w;
@@ -218,7 +219,6 @@ bool trim_calculate_rect(const uint8_t* rgba, size_t stride, int32_t width, int3
   if (rgba == nullptr || width <= 0 || height <= 0) return false;
   if (stride < static_cast<size_t>(width) * 4) return false;
   if (!options.top && !options.bottom && !options.left && !options.right) return false;
-  if (options.tolerance > 255) return false;
 
   const int32_t tol = static_cast<int32_t>(options.tolerance);
 
@@ -317,9 +317,6 @@ comp_result document_trim(Document* doc, const TrimOptions& options, int32_t* ou
    * 之前就拒绝——不为一眼非法的输入花一次整篇合成）。 */
   if (!options.top && !options.bottom && !options.left && !options.right) {
     return fail(COMP_ERR_INVALID_ARGUMENT, "trim needs at least one enabled edge");
-  }
-  if (options.tolerance > 255) {
-    return fail(COMP_ERR_INVALID_ARGUMENT, "trim tolerance out of 0..255");
   }
   if (doc->state().layers.empty()) {
     return fail(COMP_ERR_STATE, "empty document has nothing to trim");
@@ -425,7 +422,7 @@ comp_result invert_layer(Document* doc, comp_layer_id target, int32_t* out_chang
       const int32_t h = layer->pixels.height;
       const size_t stride = layer->pixels.stride();
       /* 预乘 RGBA：c' = a - c（上游 PixelInvert 的 4×4 矩阵），alpha 不动。
-       * 反相** siempre** 改变颜色通道（0 ↔ a），恒等只在整层 alpha=0 时出现，
+       * 反相**总是**改变颜色通道（0 ↔ a），恒等只在整层 alpha=0 时出现，
        * 那种层「无内容」已经被 has_pixels/ui 可见性挡住；此处不设恒等短路，
        * 与上游「反相就是一次落墨」一致。 */
       for (int32_t y = 0; y < h; ++y) {
@@ -441,9 +438,8 @@ comp_result invert_layer(Document* doc, comp_layer_id target, int32_t* out_chang
       if (clip) {
         std::vector<uint8_t> coverage;
         selection_effective_coverage(selection, &coverage);
-        blend_through_selection(pixels, stride, original.data(), w, h, coverage,
-                                layer->effective_bounds(), doc->state().width,
-                                doc->state().height);
+        blend_through_selection(pixels, stride, original.data(), w, h, coverage, *layer,
+                                doc->state().width, doc->state().height);
       }
     }
   } catch (...) {
