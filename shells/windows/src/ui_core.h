@@ -623,7 +623,7 @@ inline int step_swatch(int index, int direction) {
 /* ------------------------------------------------------------ 滤镜面板 */
 
 /*
- * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..3，尾部追加）；
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..6，尾部追加）；
  * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
  */
 enum class FilterId : int {
@@ -631,6 +631,9 @@ enum class FilterId : int {
   TonalContrast = 1,
   Bloom = 2,
   LensCorrection = 3,
+  GaussianBlur = 4,
+  AddNoise = 5,
+  Grain = 6,
   Count
 };
 
@@ -694,6 +697,33 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::GaussianBlur,
+       "Gaussian Blur",
+       2,
+       {{"Radius", 0.0, 250.0, 1.0, 0.0},
+        {"Preserve 0/1", 0.0, 1.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::AddNoise,
+       "Add Noise",
+       4,
+       {{"Amount", 0.0, 400.0, 1.0, 0.0},
+        {"Gaussian 0/1", 0.0, 1.0, 1.0, 0.0},
+        {"Mono 0/1", 0.0, 1.0, 1.0, 0.0},
+        {"Seed", 0.0, 4294967295.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::Grain,
+       "Grain",
+       4,
+       {{"Amount", 0.0, 100.0, 1.0, 0.0},
+        {"Size", 0.5, 20.0, 0.5, 1.5},
+        {"Roughness", 0.0, 100.0, 1.0, 50.0},
+        {"Seed", 0.0, 4294967295.0, 1.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0}}},
   };

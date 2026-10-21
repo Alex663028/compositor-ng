@@ -2933,6 +2933,12 @@ static_assert(static_cast<int>(comp_ui::FilterId::Bloom) == COMP_FILTER_BLOOM,
               "FilterId::Bloom must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::LensCorrection) == COMP_FILTER_LENS_CORRECTION,
               "FilterId::LensCorrection must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::GaussianBlur) == COMP_FILTER_GAUSSIAN_BLUR,
+              "FilterId::GaussianBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::AddNoise) == COMP_FILTER_ADD_NOISE,
+              "FilterId::AddNoise must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Grain) == COMP_FILTER_GRAIN,
+              "FilterId::Grain must match comp_filter_kind");
 
 std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
   const comp_ui::FilterParamSpec* spec = panel.param_at(panel.focused);
@@ -3052,6 +3058,22 @@ void build_filter_desc(const comp_ui::FilterPanel& panel, comp_filter_desc* out)
       break;
     case comp_ui::FilterId::LensCorrection:
       desc.lens_correction.distortion = panel.value(0);
+      break;
+    case comp_ui::FilterId::GaussianBlur:
+      desc.gaussian_blur.radius = panel.value(0);
+      desc.gaussian_blur.preserve_transparency = panel.value(1) >= 0.5 ? 1 : 0;
+      break;
+    case comp_ui::FilterId::AddNoise:
+      desc.add_noise.amount = panel.value(0);
+      desc.add_noise.gaussian = panel.value(1) >= 0.5 ? 1 : 0;
+      desc.add_noise.monochromatic = panel.value(2) >= 0.5 ? 1 : 0;
+      desc.add_noise.seed = static_cast<uint32_t>(std::llround(panel.value(3)));
+      break;
+    case comp_ui::FilterId::Grain:
+      desc.grain.amount = panel.value(0);
+      desc.grain.size = panel.value(1);
+      desc.grain.roughness = panel.value(2);
+      desc.grain.seed = static_cast<uint32_t>(std::llround(panel.value(3)));
       break;
     default:
       break;

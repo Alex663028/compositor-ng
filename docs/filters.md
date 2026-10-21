@@ -7,7 +7,7 @@
 ## 1. 通路与分工
 
 上游把 Filter 菜单收在 `FilterSettings` + `PixelFilter.run` 一条通路上
-（`Filters.swift:63`、`:312-356`）。本仓的四个像素内核早已就位，缺的是**产品入口**：
+（`Filters.swift:63`、`:312-356`）。本仓的七个像素内核早已就位，缺的是**产品入口**：
 参数契约、与图层几何的装配、一步撤销、与选区的混合。`comp_filter_apply` 就是那条入口。
 
 | 滤镜 | 内核 | 上游来源 |
@@ -16,6 +16,9 @@
 | Tonal Contrast | `blur_rgba8_copy` + `adjust_tonal_contrast` | `tonal*` |
 | Bloom / Glow | 本仓显式近似（见 §5） | `bloom*`（Core Image `CIBloom`） |
 | Lens Correction | `lens_distort`（`imaging/LensPixels.h`） | `distortion`（`Filters.swift:238`） |
+| Gaussian Blur | `blur_rgba8_copy`（与 blur 工具、Tonal 的 detail 同一实现） | `radius` / `preserveTransparency` |
+| Add Noise | `noise_add_at`（`imaging/NoisePixels.h`） | `amount` / `gaussian` / `monochromatic` / `seed` |
+| Grain | `adjust_grain`（与 Grain 调整层同一内核） | `grain` / `GrainSettings` |
 
 与工具层（[`docs/tool-ops.md`](tool-ops.md)）的分工：
 
@@ -104,6 +107,49 @@ alpha（预乘不变式），透明像素不会凭空发光。近似口径见 §
 回归护栏直接把「滤镜 distortion = -100」与「工具 k = -0.35」的逐字节结果对齐，
 防止第二份畸变公式漂移。
 
+### 3.5 Gaussian Blur（`COMP_FILTER_GAUSSIAN_BLUR`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `radius` | 0 = 恒等；否则 0.1..250 | 0 | 高斯半径（图层像素；预览再乘 `scale`） |
+| `preserve_transparency` | 0 / 1 | 0 | 1 = 只模糊颜色，轮廓与原 alpha 不动 |
+
+`(0, 0.1)` 是越界（拒绝），不静默夹到 0.1。实现复用共享的
+`blur_rgba8_copy`（三遍盒式近似），`sigma = radius * scale`——与
+Gaussian Blur 调整层（kind 7）同一口径；note 写明
+`box approximation ... (sigma = radius * scale)`。
+
+`preserve_transparency = 1`：用模糊后的 alpha 反预乘取得颜色，再乘回**原**
+alpha。因此 alpha 通道逐字节不变，轮廓不向外扩散，透明邻域也不会把颜色拉暗。
+关掉时整份预乘像素一起模糊，alpha 会向外扩散（上游默认行为）。
+
+### 3.6 Add Noise（`COMP_FILTER_ADD_NOISE`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `amount` | 0 = 恒等；否则 0.1..400 | 0 | Photoshop 百分比 |
+| `gaussian` | 0 / 1 | 0 | 1 = 高斯分布（更密），0 = 均匀分布 |
+| `monochromatic` | 0 / 1 | 0 | 1 = 三通道加同一个值（只改亮度） |
+| `seed` | `uint32` | 0 | 噪声场种子 |
+
+噪声场按**文档坐标**锚定：origin = 图层 `effective_bounds()` 原点，与上游
+`noiseOrigin` 一致。图层移动后图案不会在像素上「游动」；同一 seed + 同一文档
+位置逐字节可复现。
+
+### 3.7 Grain（`COMP_FILTER_GRAIN`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `amount` | 0..100 | 0（恒等） | 颗粒强度；0 = 不改 |
+| `size` | 0.5..20 | 1.5 | 颗粒尺度（文档像素） |
+| `roughness` | 0..100 | 50 | 小尺度不规则细节 |
+| `seed` | `uint32` | 0 | 图案种子 |
+
+与调整层的 Grain 走**同一个内核**（`adjust_grain`），差别只在入口：调整层作用于
+合成后的 backdrop，滤镜作用于目标图层自身的像素。采样在图层像素空间
+（origin 0，`unitsPerPixel = 1 / scale`），与上游
+`grain.apply(job.image, unitsPerPixel: 1 / job.scale, seed: job.seed)` 一致。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -132,6 +178,12 @@ note 写明 `document selection is empty`。
 4. **Bloom 无 16 位通路**：上游对 Bloom 有 `runsAtSixteenBits`；本仓的 8 位内核
    做不到逐位对齐，因此 16 位图层会先落 8 位工作副本（note 写明），
    HDR 图层直接 `COMP_ERR_STATE`。
+5. **Gaussian Blur 是盒式近似**。上游走 Core Image 的
+   `applyingGaussianBlur(sigma:)`；本仓用共享的三遍盒式模糊
+   （`blur_rgba8_copy`），`sigma = radius * scale`。保证「半径越大越糊、
+   alpha 处理按 `preserveTransparency`」这两条可观察口径，不声称逐位一致。
+6. **新三例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain 都跑在
+   8 位工作副本上（见 §6），HDR 拒绝。
 
 ## 6. 16 位与 HDR
 
@@ -145,10 +197,11 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（11 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（16 例，ABI + 域层混合视角）钉住：
 
-- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动）；
-- 越界参数在事务之前拒绝（6 组，含 NaN scale）；
+- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增三个 kind 的零初始化）；
+- 越界参数在事务之前拒绝（13 组，含 NaN scale；覆盖 blur radius、noise amount、
+  grain size / roughness 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -158,6 +211,12 @@ note 写明 `document selection is empty`。
 - 组 / 无像素 / HDR / 未知 id 的错误码；
 - 显式空选区是 no-op；
 - ABI 的 `out_changed` 与 note 两段式（capacity 0 只回报长度）。
+- Gaussian Blur 真的软化边缘；`preserve_transparency` 下 alpha 逐字节不变、
+  结果与默认路径不同；一步撤销；
+- Add Noise 同 seed 逐字节复现、换 seed 不同、**按文档坐标锚定**（缩进图层与
+  全幅图层在重叠处一致）、monochromatic 三通道相等；
+- Grain 同 seed 复现、换 seed 不同、一步撤销；
+- ABI 正确搬运三个新 kind 的字段（含布尔），越界值在 ABI 边界同样被拒。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -173,6 +232,9 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 | Tonal 0..4 | `tonal_contrast.amount/radius/shadows/midtones/highlights` | 0 / 16 / 40 / 60 / 30 |
 | Bloom 0..1 | `bloom.amount/radius` | 0 / 24 |
 | Lens 0 | `lens_correction.distortion` | 0 |
+| Gaussian Blur 0..1 | `gaussian_blur.radius/preserve_transparency` | 0 / 0 |
+| Add Noise 0..3 | `add_noise.amount/gaussian/monochromatic/seed` | 0 / 0 / 0 / 0 |
+| Grain 0..3 | `grain.amount/size/roughness/seed` | 0 / 1.5 / 50 / 0 |
 
 - **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
   值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。

@@ -157,6 +157,13 @@ compositor-ng 是「同引擎、两壳」结构：
   探长度会把滤镜应用两遍；壳用固定 512 字节缓冲一次调用。
 - **面板夹取，ABI 拒绝**：键入手输先用 `clamp_filter_param` 夹到量程内，
   ABI 侧仍是越界拒绝（不静默 clamp）。
+- **七个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
+  （Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
+  Add Noise / Grain）。布尔项（`Preserve` / `Gaussian` / `Mono`）在面板上是
+  0/1 行，`build_filter_desc` 用 `>= 0.5` 转成 ABI 的 int32；`Seed` 用
+  `llround` 转 `uint32`（面板量程 0..4294967295，正好是 uint32 全域）。
+- **Gaussian Blur 的面板量程含 0**（恒等）；步进从 0 直达 1，键入手输
+  `(0, 0.1)` 里的值会被 ABI 拒绝——这是有意的严格口径，不是壳的遗漏。
 - **`Alt+[` / `Alt+]` 调模糊半径**：`[`/`]` 已属笔刷直径、`Ctrl+[`/`]` 已属
   不透明度；Blur 半径 0.5..50。
 - **笔迹去抖**：点间距小于 `kStrokeMinDistance`（0.75 文档像素）不追加，

@@ -322,18 +322,21 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
 COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   size_t count = 0;
   const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
-  COMP_CHECK(count == 4);
+  COMP_CHECK(count == 7);
   COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
 
-  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..3 一一对齐（main.cpp 里也有 static_assert）。 */
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..6 一一对齐（main.cpp 里也有 static_assert）。 */
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::LensCorrection) == 3);
-  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 4);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::GaussianBlur) == 4);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::AddNoise) == 5);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Grain) == 6);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 7);
 
   /* 面板行数：docs/filters.md §3 各表的数据行数。 */
-  const int row_counts[] = {5, 5, 2, 1};
+  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4};
   for (size_t i = 0; i < count; ++i) {
     COMP_CHECK_MSG(table[i].param_count == row_counts[i], "panel row count");
     COMP_CHECK_MSG(table[i].param_count > 0 &&
@@ -380,6 +383,26 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(lens != nullptr && near_value(lens->params[0].min_value, -100.0) &&
              near_value(lens->params[0].max_value, 100.0));
   COMP_CHECK(near_value(lens->params[0].default_value, 0.0)); /* 恒等 */
+
+  const comp_ui::FilterSpec* blur = comp_ui::filter_spec(comp_ui::FilterId::GaussianBlur);
+  COMP_CHECK(blur != nullptr && std::string(blur->name) == "Gaussian Blur");
+  COMP_CHECK(near_value(blur->params[0].min_value, 0.0));
+  COMP_CHECK(near_value(blur->params[0].max_value, 250.0));
+  COMP_CHECK(near_value(blur->params[0].default_value, 0.0)); /* 恒等 */
+  COMP_CHECK(near_value(blur->params[1].default_value, 0.0)); /* Preserve */
+
+  const comp_ui::FilterSpec* noise = comp_ui::filter_spec(comp_ui::FilterId::AddNoise);
+  COMP_CHECK(noise != nullptr && std::string(noise->name) == "Add Noise");
+  COMP_CHECK(near_value(noise->params[0].max_value, 400.0));
+  COMP_CHECK(near_value(noise->params[0].default_value, 0.0)); /* 恒等 */
+  COMP_CHECK(near_value(noise->params[3].max_value, 4294967295.0)); /* Seed */
+
+  const comp_ui::FilterSpec* grain = comp_ui::filter_spec(comp_ui::FilterId::Grain);
+  COMP_CHECK(grain != nullptr && std::string(grain->name) == "Grain");
+  COMP_CHECK(near_value(grain->params[0].default_value, 0.0)); /* 恒等 */
+  COMP_CHECK(near_value(grain->params[1].default_value, 1.5)); /* Size */
+  COMP_CHECK(near_value(grain->params[1].step, 0.5));
+  COMP_CHECK(near_value(grain->params[2].default_value, 50.0)); /* Roughness */
 
   COMP_CHECK(comp_ui::filter_spec_at(-1) == nullptr);
   COMP_CHECK(comp_ui::filter_spec_at(static_cast<int>(count)) == nullptr);

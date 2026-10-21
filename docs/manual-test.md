@@ -129,6 +129,14 @@ CJK 目前**不支持**（只收 ASCII），这是已知边界。
 2. 菜单「滤镜」→ 选 Vignette（或按面板顺序切）：右侧出现滤镜面板，第一参数高亮。
 3. 用 `=` / `-` 或数字键改 Amount：画布**实时**变暗四角、中心保持亮。
 4. `Enter` 应用：状态栏 `Vignette：已应用`；`Esc` 关闭面板回到调整面板。
+5. `,` / `.` 在 7 个滤镜间切换：依次经过 Vignette / Tonal Contrast / Bloom / Lens Correction /
+   Gaussian Blur / Add Noise / Grain，面板行数与第一行高亮随之变化。
+6. Gaussian Blur：`Radius` 调到 8 左右回车：图像变糊；`Preserve 0/1` 设为 1 再应用：
+   轮廓（透明边界）不扩散；`Ctrl+Z` **一次**回到应用前。
+7. Add Noise：`Amount` 调到 40、`Seed` 改成 7 回车：画面加噪点；`Ctrl+Z` 撤销；
+   再按同样参数应用一次，噪点图案应**逐像素相同**（同 seed 可复现）；改 `Seed` 后图案不同。
+8. Grain：`Amount` 60、`Size` 1.5、`Roughness` 50 回车：出现颗粒；`Ctrl+Z` 一次回退。
+   把 `Amount` 调回 0 回车：状态栏提示恒等、不产生撤销步。
 
 👁 关注：实时预览的帧率是否可接受（CPU 全幅重算，大图会慢）；面板参数多时是否滚动。
 

@@ -2,8 +2,9 @@
 /*
  * comp_filter.h — Filter 菜单的 C ABI（P1 滤镜批次）。
  *
- * 语义唯一真源见 `domain/filters.h` 的文件头：四个算子（Vignette / Tonal
- * Contrast / Bloom / Lens Correction）的像素口径、选区混合与能力边界都写在那里。
+ * 语义唯一真源见 `domain/filters.h` 的文件头：七个算子（Vignette / Tonal
+ * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain）的像素
+ * 口径、选区混合与能力边界都写在那里。
  *
  * 本头文件只暴露一件事：一次「整层」滤镜调用。
  *
@@ -38,7 +39,10 @@ typedef enum comp_filter_kind {
   COMP_FILTER_VIGNETTE        = 0,
   COMP_FILTER_TONAL_CONTRAST  = 1,
   COMP_FILTER_BLOOM           = 2,
-  COMP_FILTER_LENS_CORRECTION = 3
+  COMP_FILTER_LENS_CORRECTION = 3,
+  COMP_FILTER_GAUSSIAN_BLUR   = 4,
+  COMP_FILTER_ADD_NOISE       = 5,
+  COMP_FILTER_GRAIN           = 6
 } comp_filter_kind;
 
 /*
@@ -85,6 +89,44 @@ typedef struct comp_filter_lens_correction {
 } comp_filter_lens_correction;
 
 /*
+ * Gaussian Blur（上游 FilterSettings.radius / preserveTransparency）。
+ *   radius                0 = 恒等；否则 0.1..250（图层像素，预览再乘 scale）
+ *   preserve_transparency 1 = 只模糊颜色，轮廓与原 alpha 不动
+ */
+typedef struct comp_filter_gaussian_blur {
+  double radius;
+  int32_t preserve_transparency;
+} comp_filter_gaussian_blur;
+
+/*
+ * Add Noise（上游 FilterSettings.amount / gaussian / monochromatic / seed）。
+ *   amount          0 = 恒等；否则 0.1..400（Photoshop 百分比）
+ *   gaussian        1 = 高斯分布，0 = 均匀分布
+ *   monochromatic   1 = 三通道加同一个值（只改亮度）
+ *   seed            噪声场种子；同 seed + 同图层原点逐字节可复现
+ */
+typedef struct comp_filter_add_noise {
+  double amount;
+  int32_t gaussian;
+  int32_t monochromatic;
+  uint32_t seed;
+} comp_filter_add_noise;
+
+/*
+ * Grain（上游 FilterSettings.grain / GrainSettings）。
+ *   amount     0..100，0 = 恒等
+ *   size       0.5..20（颗粒尺度，文档像素）
+ *   roughness  0..100
+ *   seed       图案种子
+ */
+typedef struct comp_filter_grain {
+  double amount;
+  double size;
+  double roughness;
+  uint32_t seed;
+} comp_filter_grain;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
  */
@@ -94,6 +136,9 @@ typedef struct comp_filter_desc {
   comp_filter_tonal_contrast   tonal_contrast;
   comp_filter_bloom            bloom;
   comp_filter_lens_correction  lens_correction;
+  comp_filter_gaussian_blur    gaussian_blur;
+  comp_filter_add_noise        add_noise;
+  comp_filter_grain            grain;
 } comp_filter_desc;
 
 /*
@@ -109,8 +154,8 @@ typedef struct comp_filter_desc {
  *   分配失败                         -> COMP_ERR_OUT_OF_MEMORY
  *
  * note 可为 NULL；非 NULL 时写入 UTF-8 非致命说明（16 位降位、选区裁切、
- * Bloom 的近似口径），两段式：note_capacity 为 0 时只回报所需长度，
- * out_note_size 写入含 '\0' 的长度。out_changed 可为 NULL。
+ * Bloom / Gaussian Blur 的近似口径），两段式：note_capacity 为 0 时只回报所需
+ * 长度，out_note_size 写入含 '\0' 的长度。out_changed 可为 NULL。
  */
 COMP_API comp_result comp_filter_apply(comp_document document, comp_layer_id target,
                                        const comp_filter_desc* desc, double scale,

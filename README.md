@@ -1658,11 +1658,11 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Patch | `COMP_TOOL_HEAL` | `patch_fill` | — |
 | Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
 | Lens | `COMP_TOOL_LENS` / `COMP_FILTER_LENS_CORRECTION` | `lens_distort`（工具收 `|k| <= 1`，滤镜收 `-100..100` 再换算 `k`） | — |
-| Blur | `COMP_TOOL_BLUR` / Tonal Contrast、Bloom 的 detail 模糊 | `blur_rgba8_copy`（三趟滑动窗口盒式近似，与 Gaussian Blur 调整层同一实现） | — |
+| Blur | `COMP_TOOL_BLUR` / `COMP_FILTER_GAUSSIAN_BLUR` / Tonal Contrast、Bloom 的 detail 模糊 | `blur_rgba8_copy`（三趟滑动窗口盒式近似，与 Gaussian Blur 调整层同一实现） | — |
 | Dodge / Burn / Sponge（P1 新增，域层算子） | `COMP_TOOL_DODGE` / `COMP_TOOL_BURN` / `COMP_TOOL_SPONGE` | `engine/domain/tool_ops.cpp` 的色调分支（直通色空间混合 + Range 权重，alpha 不变；选区在文档分辨率裁剪） | 无独立内核函数（上游同为工具层逻辑） |
 | Shape（S10 新增，非上游 `.c` 内核） | `COMP_TOOL_SHAPE` | `shape_raster::shape_rasterize`（矩形 / 椭圆 / 三次贝塞尔路径的填充 + 胶囊距离描边 + 圆角矩形 + 窗口化覆盖率，4 行超采样 AA）；路径基元来自 S10 抽出的 `path_raster`（与选区共用，行为中立） | 贝塞尔路径只有 ABI 通路（外壳 `U` 只能拖出矩形/椭圆/直线；钢笔仍用于提交选区） |
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
-| Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
+| Noise | `COMP_TOOL_STROKE`（经 brush 字段）/ `COMP_FILTER_ADD_NOISE` | `noise_add_at`（origin 锚定） | — |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19）、**`deep_take_painted`/`deep_take_painted_hdr`**（落笔族在 RGBA16 / RGBA16F 上保留深像素，§6.1.21） | — |
@@ -4186,6 +4186,47 @@ RGBA16 笔尖外保深 + 两次撤销逐字节复原）；UI 层 1 例（工具�
 **6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/tool-ops.md` §4.14、
 `docs/shell-parity.md` §5.20 + 矩阵一行，`docs/manual-test.md` 新增 **M24**
 （M1 的工具顺序改为 20 个）。
+
+### 6.45 P1 滤镜库扩容：Gaussian Blur / Add Noise / Grain（2026-10-21，Claude）
+
+**立项口径。** 路线图 P1「滤镜库扩容 + 历史记录画笔」的另一半（§6.44 是画笔）。
+三个算子的像素内核在本仓早已就位（`blur_rgba8_copy`、`noise_add_at`、`adjust_grain`），
+缺的只是 Filter 菜单的产品入口。本批只做装配：参数契约 → 参数闸 → 内核 →
+选区混合 → 一步撤销，不新增任何像素算法。
+
+**零新增导出。** `comp_filter_kind` 尾部追加 `COMP_FILTER_GAUSSIAN_BLUR = 4` /
+`COMP_FILTER_ADD_NOISE = 5` / `COMP_FILTER_GRAIN = 6`；`comp_filter_desc` 尾部追加
+`gaussian_blur` / `add_noise` / `grain` 三个子结构。既有枚举值、既有字段偏移、
+既有导出一个不动，宿主照旧只认 `comp_filter_apply`。PE 导出仍 **138**。
+
+**零初始化 = 恒等**（与既有四个滤镜同规矩）：blur `radius = 0`、noise `amount = 0`、
+grain `amount = 0` 都不碰像素、不开事务、`out_changed = 0`。参数闸仍是「0 或上游量程」：
+blur `0.1..250`、noise `0.1..400`、grain `amount 0..100 / size 0.5..20 / roughness 0..100`；
+`(0, 0.1)` 这类夹缝显式拒绝，不静默夹到端点。
+
+**三条口径各对齐上游。** ① Gaussian Blur 复用共享的三遍盒式模糊，
+`sigma = radius * scale`——与 Gaussian Blur 调整层（kind 7）同一实现，note 写明
+`box approximation ... (sigma = radius * scale)`，不声称与 CI 逐位一致；
+`preserve_transparency = 1` 时用模糊后的 alpha 反预乘颜色、再乘回**原** alpha，
+因此 alpha 逐字节不变、轮廓不扩散。② Add Noise 的噪声场锚在**文档坐标**
+（origin = 图层 `effective_bounds()` 原点，对齐上游 `noiseOrigin`），图层移动后图案
+不会在像素上「游动」；同 seed + 同文档位置逐字节可复现。③ Grain 与 Grain 调整层
+同一内核，采样在图层像素空间（origin 0，`unitsPerPixel = 1 / scale`）。
+
+**外壳。** `FilterId` 追加 4/5/6（`Count` 移到 7），`filter_table()` 追加三行
+（面板行数 2 / 4 / 4），菜单与面板仍从同一张表生成；`build_filter_desc` 是唯一映射点，
+布尔项按 `>= 0.5` 转 int32、`Seed` 用 `llround` 转 uint32（面板量程正好是 uint32 全域）。
+`main.cpp` 的三条 `static_assert` 把壳枚举与 ABI 数值锁死。
+
+**验证。** 领域 / ABI 层 16 例（新增 5 例）：三个新 kind 的零初始化恒等；越界闸
+（blur radius 0.05 / 250.1、noise amount 0.05 / 400.1、grain size 0.4 / 20.1、
+roughness 101）；Blur 真软化 + preserve 下 alpha 逐字节不变且结果与默认路径不同；
+Noise 同 seed 复现 / 换 seed 不同 / **文档坐标锚定**（缩进图层与全幅图层重叠处一致）/
+monochromatic 三通道相等；Grain 同 seed 复现 / 换 seed 不同；三者均恰好一步撤销并可
+逐字节还原；ABI 字段搬运与越界拒绝。单测 575 → **580 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/filters.md` §1 / §3.5–3.7 /
+§5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，`docs/manual-test.md` M9 追加 5–8 条。
 
 
 

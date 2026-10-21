@@ -2,12 +2,14 @@
 /*
  * filters.h — Filter 菜单的领域层（P1 滤镜批次）。
  *
- * 背景：Vignette / Tonal Contrast / Bloom / Lens Correction 在上游是
- * FilterSettings + PixelFilter.run 的一条通路（Filters.swift:63、:312-356）。
- * 这四个算子的像素内核在本仓早已就位（AdjustPixels.h 的
- * adjust_colored_vignette / adjust_tonal_contrast、LensPixels.h 的
- * lens_distort），缺的是**产品入口**：参数契约、与图层几何的装配、一步撤销、
- * 与选区的混合。本文件把那条通路收口成一个领域入口。
+ * 背景：Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
+ * Add Noise / Grain 在上游是 FilterSettings + PixelFilter.run 的一条通路
+ * （Filters.swift:63、:312-356）。这七个算子的像素内核在本仓早已就位
+ * （AdjustPixels.h 的 adjust_colored_vignette / adjust_tonal_contrast /
+ * adjust_grain、LensPixels.h 的 lens_distort、NoisePixels.h 的 noise_add_at、
+ * adjustment_eval.h 的 blur_rgba8_copy），缺的是**产品入口**：参数契约、
+ * 与图层几何的装配、一步撤销、与选区的混合。本文件把那条通路收口成一个
+ * 领域入口。
  *
  * 与工具层（tool_ops.h）的分工：
  *   - 工具层按「笔迹 / coverage」工作，一次调用通常落一笔；
@@ -105,12 +107,67 @@ struct LensCorrectionSettings {
   double distortion = 0.0;
 };
 
+/*
+ * Gaussian Blur（上游 FilterSettings.radius / preserveTransparency）。
+ *
+ * `radius` 是图层像素的高斯半径（0.1..250，上游量程）。**0 = 恒等**（零初始化
+ * 口径），(0, 0.1) 是越界，不静默夹到 0.1——与既有的「越界拒绝」同规矩。
+ *
+ * `preserve_transparency`：只模糊颜色，轮廓与原 alpha 不动（上游
+ * `unpremultiplyingAlpha` + `settingAlphaOne` + alpha 掩码的等价做法：
+ * 用模糊后的 alpha 反预乘取得颜色，再乘回**原** alpha）。关掉时整份预乘像素
+ * 一起模糊，alpha 会向外扩散（上游默认行为）。
+ */
+struct GaussianBlurSettings {
+  double radius = 0.0;
+  bool preserve_transparency = false;
+};
+
+/*
+ * Add Noise（上游 FilterSettings.amount / gaussian / monochromatic / seed）。
+ *
+ * `amount` 是 Photoshop 百分比，0.1..400；**0 = 恒等**。`gaussian` 为真时噪声
+ * 按高斯分布（更密），否则均匀分布；`monochromatic` 为真时三通道加同一个值，
+ * 只改亮度。`seed` 决定噪声场，同一 seed + 同一原点逐字节可复现。
+ *
+ * 噪声场按**文档坐标**锚定（`noise_add_at` 的 origin = 图层 effective_bounds
+ * 原点取整），图层移动后图案不会在像素上「游动」——与实时调整层的
+ * `noiseOrigin` 口径一致。
+ */
+struct AddNoiseSettings {
+  double amount = 0.0;
+  bool gaussian = false;
+  bool monochromatic = false;
+  uint32_t seed = 0;
+};
+
+/*
+ * Grain（上游 FilterSettings.grain / GrainSettings）。
+ *
+ * `amount` 0..100（0 = 恒等）；`size` 0.5..20 是颗粒尺度（文档像素）；
+ * `roughness` 0..100 控制小尺度不规则细节。`seed` 决定图案。
+ *
+ * 与调整层的 Grain 走**同一个内核**（`adjust_grain`），差别只在入口：
+ * 调整层作用于合成后的 backdrop，滤镜作用于目标图层自身的像素。
+ * 采样在图层像素空间（origin 0，unitsPerPixel = 1 / scale），与上游
+ * `grain.apply(job.image, unitsPerPixel: 1 / job.scale, seed: job.seed)` 一致。
+ */
+struct GrainSettings {
+  double amount = 0.0;
+  double size = 1.5;
+  double roughness = 50.0;
+  uint32_t seed = 0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
   kFilterTonalContrast = 1,
   kFilterBloom = 2,
   kFilterLensCorrection = 3,
+  kFilterGaussianBlur = 4,
+  kFilterAddNoise = 5,
+  kFilterGrain = 6,
 };
 
 /*
@@ -123,6 +180,9 @@ struct FilterSettings {
   TonalContrastSettings tonal_contrast;
   BloomSettings bloom;
   LensCorrectionSettings lens_correction;
+  GaussianBlurSettings gaussian_blur;
+  AddNoiseSettings add_noise;
+  GrainSettings grain;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

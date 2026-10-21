@@ -58,6 +58,19 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.bloom.radius = desc.bloom.radius;
 
   settings.lens_correction.distortion = desc.lens_correction.distortion;
+
+  settings.gaussian_blur.radius = desc.gaussian_blur.radius;
+  settings.gaussian_blur.preserve_transparency = desc.gaussian_blur.preserve_transparency != 0;
+
+  settings.add_noise.amount = desc.add_noise.amount;
+  settings.add_noise.gaussian = desc.add_noise.gaussian != 0;
+  settings.add_noise.monochromatic = desc.add_noise.monochromatic != 0;
+  settings.add_noise.seed = desc.add_noise.seed;
+
+  settings.grain.amount = desc.grain.amount;
+  settings.grain.size = desc.grain.size;
+  settings.grain.roughness = desc.grain.roughness;
+  settings.grain.seed = desc.grain.seed;
   return settings;
 }
 
