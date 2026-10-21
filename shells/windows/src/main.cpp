@@ -109,6 +109,18 @@ constexpr UINT kCmdLayerFlipVertical = 1501;   /* S24：垂直镜像 */
 constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..5，菜单勾选 = 已启用 */
 constexpr UINT kCmdEffectClear = 1520;         /* S24：清除选中图层的全部效果 */
 constexpr UINT kCmdHistogramReset = 1521;      /* S24：直方图区间复位（双击同效） */
+/*
+ * P0-1 命令号（1530 段）：图层面板的四个「上游有、本壳没有」的动作。
+ * 重命名与精确不透明度需要键入，沿用本壳既有的「状态栏输入态」而不是另开对话框
+ * ——输入态已经是全壳唯一的模态约定（颜色 / 羽化 / 文字 / 调整面板同款）。
+ */
+constexpr UINT kCmdLayerDelete = 1530;      /* Del：删除选中图层（含子树） */
+constexpr UINT kCmdLayerDuplicate = 1531;   /* Ctrl+J：复制选中图层 */
+constexpr UINT kCmdLayerRename = 1532;      /* F2：重命名（键入态） */
+constexpr UINT kCmdLayerNewGroup = 1533;    /* Ctrl+G：新建组（选区非空时收纳进组） */
+constexpr UINT kCmdLayerOpacitySet = 1534;  /* 精确不透明度（键入态） */
+/* 与 Document::kMaxLayerNameBytes 同一个上限（comp_layer.h 的 set_name 约定）。 */
+constexpr size_t kLayerNameCapacity = 1024;
 constexpr UINT kCmdLayerMoveLeft = 1036;  /* S21：图层平移（Shift=微调、Ctrl=粗调） */
 constexpr UINT kCmdLayerMoveRight = 1037;
 constexpr UINT kCmdLayerMoveUp = 1038;
@@ -176,7 +188,16 @@ struct LayerRow {
   uint8_t flip_x = 0;
   uint8_t flip_y = 0;
   int32_t effect_count = 0; /* 本层已有效果的个数（菜单标勾、面板标 fxN） */
+  /*
+   * P0-1：名字来自 comp_layer_get_name（UTF-8），面板只读回读结果。
+   * 壳侧**不再自持名字**——重命名、撤销、合并、读盘之后名字都可能变，
+   * 存第二份就会与文档漂移（与 opacity / blend 同一口径）。
+   */
+  std::string name;
 };
+
+/* P0-1：图层面板键入态（重命名 / 精确不透明度）。 */
+enum class LayerInput { None, Rename, Opacity };
 
 struct ShellState {
   comp_engine engine = nullptr;
@@ -193,6 +214,21 @@ struct ShellState {
   std::vector<LayerRow> layers;
   std::vector<std::pair<comp_layer_id, uint8_t>> visibility; /* id -> visible */
   int32_t selected_layer = 0; /* 面板行索引（0 = 最上层显示行） */
+  /*
+   * P0-1：多选。selected_layer 仍是「主选中行」——所有既有单层命令的输入不变；
+   * extra_selection 只是额外选中的图层 id。批量命令 = 主选中 + 额外，且整批放进
+   * 一个显式事务（comp_txn_begin/commit），N 层删除/复制只占一步撤销。
+   * 存 id 而不是行索引：重排/撤销之后行号会变，id 不会。
+   */
+  std::vector<comp_layer_id> extra_selection;
+  /*
+   * P0-1：图层面板的键入态（重命名 / 精确不透明度）。与本壳颜色、羽化、文字面板
+   * 同一约定：进入即模态——Esc 取消、Enter 提交，其它快捷键一律让路。
+   * layer_input_text 是宽字符，提交时一次性转 UTF-8（引擎只收 UTF-8）。
+   */
+  LayerInput layer_input = LayerInput::None;
+  std::wstring layer_input_text;
+  comp_layer_id layer_input_id = 0;
   /* 调整面板状态：只经 C ABI 元数据/写入接口工作，壳内不解析也不拼装 JSON。 */
   std::vector<uint32_t> adj_kinds;       /* 选中图层已有调整的 kind（数组序） */
   std::vector<std::string> adj_settings; /* 与 adj_kinds 对齐的 settings JSON */
@@ -431,14 +467,22 @@ comp_layer_id selected_layer_id(const ShellState& shell);
 /* ASCII -> wstring（面板/状态栏展示引擎返回的 ASCII 名称）。 */
 std::wstring widen_ascii(const char* text);
 
+/* UTF-8 <-> UTF-16。图层名是 UTF-8（comp_layer.h 契约），面板是 UTF-16。 */
+std::wstring widen_utf8(const std::string& text);
+std::string narrow_utf8(const std::wstring& text);
+
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
 void refresh_layers(ShellState& shell) {
   shell.layers.clear();
-  if (shell.document == nullptr) return;
+  if (shell.document == nullptr) {
+    shell.extra_selection.clear();
+    return;
+  }
 
   size_t count = 0;
   if (comp_layer_count(shell.document, &count) != COMP_OK || count == 0) {
     shell.selected_layer = 0;
+    shell.extra_selection.clear();
     return;
   }
   std::vector<comp_layer_id> ids(count, 0);
@@ -449,6 +493,21 @@ void refresh_layers(ShellState& shell) {
   for (comp_layer_id id : ids) {
     LayerRow row;
     row.id = id;
+    /*
+     * P0-1：名字走两段式读取（先问长度再取字节）。名字是 UTF-8，可能长于一行的
+     * 显示宽度，绘制侧再截断；这里不截断——截断后写回去就不是原名了。
+     * 查询失败（旧引擎/已删除）留空串，面板回落到 id 显示。
+     */
+    size_t name_required = 0;
+    if (comp_layer_get_name(shell.document, id, nullptr, 0, &name_required) == COMP_OK &&
+        name_required > 1u && name_required <= kLayerNameCapacity) {
+      std::vector<char> name_bytes(name_required, '\0');
+      size_t name_written = 0;
+      if (comp_layer_get_name(shell.document, id, name_bytes.data(), name_bytes.size(),
+                              &name_written) == COMP_OK) {
+        row.name.assign(name_bytes.data(), name_bytes.size() - 1u);
+      }
+    }
     float opacity = 1.0f;
     if (comp_layer_get_opacity(shell.document, id, &opacity) == COMP_OK) {
       row.opacity = opacity;
@@ -521,6 +580,23 @@ void refresh_layers(ShellState& shell) {
   if (shell.selected_layer < 0) shell.selected_layer = 0;
   if (shell.selected_layer >= static_cast<int32_t>(shell.layers.size())) {
     shell.selected_layer = static_cast<int32_t>(shell.layers.size()) - 1;
+  }
+  /*
+   * 多选集合随图层事实收敛：被删掉的图层（删除/合并/撤销/拼合）必须从额外选中里
+   * 摘掉，否则下一次批量命令会对着已失效 id 发写入，状态栏报错而用户不知道是谁。
+   */
+  if (!shell.extra_selection.empty()) {
+    std::vector<comp_layer_id> alive;
+    alive.reserve(shell.extra_selection.size());
+    for (comp_layer_id id : shell.extra_selection) {
+      for (const LayerRow& row : shell.layers) {
+        if (row.id == id) {
+          alive.push_back(id);
+          break;
+        }
+      }
+    }
+    shell.extra_selection.swap(alive);
   }
   /* 选中图层变化后，调整面板必须跟着换数据源。 */
   refresh_adjustments(shell);
@@ -1222,16 +1298,46 @@ void panel_histogram_commit_drag(ShellState& shell, const comp_ui::Rect& plot) {
   histogram_view_status(shell);
 }
 
+/* P0-1：按 id 选中（定义在多选辅助段，拖拽落点先用到）。 */
+void panel_select_layer_id(ShellState& shell, comp_layer_id id);
+
 /*
- * 拖行重排落点（S24）：从面板行 from_shown 拖到 to_shown。
+ * 拖行重排落点（S24 + P0-1）：从面板行 from_shown 拖到 to_shown。
  *
  * 规划（行→数组下标换算、同父校验、锚点选择）全在 comp_ui::plan_layer_drag；
- * 这里只做「把纯函数的结果翻译成一次 comp_layer_reorder」。跨组如实拒绝：
- * 面板是扁平列表、不画缩进，静默改父级会让图层「消失」在别的组里。
+ * 这里只做「把纯函数的结果翻译成一次 comp_layer_reorder」。
+ *
+ * P0-1 起多了两条跨父级路径（面板仍是扁平列表，只能在落点几何上区分）：
+ *   - 落点是组行的中间带（drop_into_group_item=true）  -> 拖进该组（末尾）；
+ *   - 其它跨父级落点且目标行在根级                 -> 移出到根级，放到目标行下方。
+ * 其余跨父级（目标在组内、拖到自己子树里）仍然明确拒绝：静默改父级会让图层
+ * 「消失」在别的组里。所有路径都只发一次 comp_layer_move，一步撤销。
  */
-void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown) {
+void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown,
+                      bool drop_into_group_item) {
   const int32_t count = static_cast<int32_t>(shell.layers.size());
   if (count <= 0) return;
+  const comp_layer_id self =
+      shell.layers[static_cast<size_t>(comp_ui::layer_array_index(count, from_shown))].id;
+  if (drop_into_group_item && to_shown != from_shown) {
+    const LayerRow& target = shell.layers[static_cast<size_t>(count - 1 - to_shown)];
+    if (target.is_group != 0 && target.id != self) {
+      if (comp_layer_move(shell.document, self, target.id, 0) != COMP_OK) {
+        /* 常见原因：把自己/自己的祖先拖进自己的子树。引擎里已拒绝，原样透出。 */
+        set_status(shell, L"移入组失败（不能把组拖进自己的子树）");
+        return;
+      }
+      refresh_layers(shell);
+      panel_select_layer_id(shell, self);
+      shell.needs_render = true;
+      wchar_t buffer[160];
+      wsprintfW(buffer, L"已把图层 #%I64u 移入组 #%I64u",
+                static_cast<unsigned long long>(self),
+                static_cast<unsigned long long>(target.id));
+      refresh_history_status(shell, buffer);
+      return;
+    }
+  }
   std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
   for (int32_t i = 0; i < count; ++i) {
     const LayerRow& row = shell.layers[static_cast<size_t>(i)];
@@ -1245,9 +1351,28 @@ void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown) {
     case comp_ui::DragTarget::kSameRow:
       set_status(shell, L"拖回原位，图层顺序未变");
       return;
-    case comp_ui::DragTarget::kCrossParent:
-      set_status(shell, L"跨图层组拖拽暂不支持（两侧父级不同，未修改任何数据）");
+    case comp_ui::DragTarget::kCrossParent: {
+      /* 跨父级且不是「拖进组」：只有目标行在根级时解释成「移出组」。 */
+      const LayerRow& target = shell.layers[static_cast<size_t>(count - 1 - to_shown)];
+      const LayerRow& dragged =
+          shell.layers[static_cast<size_t>(comp_ui::layer_array_index(count, from_shown))];
+      if (target.parent == 0 && dragged.parent != 0) {
+        if (comp_layer_move(shell.document, self, 0, target.id) != COMP_OK) {
+          set_status(shell, L"移出组失败（未修改任何数据）");
+          return;
+        }
+        refresh_layers(shell);
+        panel_select_layer_id(shell, self);
+        shell.needs_render = true;
+        wchar_t buffer[160];
+        wsprintfW(buffer, L"已把图层 #%I64u 移出组到根级",
+                  static_cast<unsigned long long>(self));
+        refresh_history_status(shell, buffer);
+        return;
+      }
+      set_status(shell, L"跨组拖拽需落在组行中间（拖进组）或根级行（拖出组），未修改任何数据");
       return;
+    }
     case comp_ui::DragTarget::kInvalid:
       return;
     case comp_ui::DragTarget::kOk:
@@ -1257,8 +1382,6 @@ void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown) {
   if (plan.before_index >= 0) {
     before = shell.layers[static_cast<size_t>(plan.before_index)].id;
   }
-  const comp_layer_id self = shell.layers[static_cast<size_t>(
-      comp_ui::layer_array_index(count, from_shown))].id;
   if (comp_layer_reorder(shell.document, self, before) != COMP_OK) {
     set_status(shell, L"拖行重排失败（跨组需与目标同组）");
     return;
@@ -1513,6 +1636,373 @@ void panel_add_layer(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------- 图层多选 / 批量操作（P0-1） */
+
+/*
+ * 多选集合 = 主选中 + extra_selection。
+ *
+ * 主选中仍是唯一的「当前图层」（调整面板、效果面板、绘图目标都只认它）；
+ * extra_selection 只影响批量命令（删除/复制/不透明度）。这样上游 PS 的
+ * 「一级选中 + 多选扩展」语义在壳里不打架：单击永远收敛成一个。
+ */
+bool panel_selection_contains(const ShellState& shell, comp_layer_id id) {
+  if (id == 0) return false;
+  const LayerRow* row = selected_row(shell);
+  if (row != nullptr && row->id == id) return true;
+  for (comp_layer_id extra : shell.extra_selection) {
+    if (extra == id) return true;
+  }
+  return false;
+}
+
+/*
+ * 批量命令的 id 列表（面板显示序：从上到下，即数组逆序）。
+ *
+ * 已经「被选中祖先覆盖」的图层要从列表里摘掉：删/复制一个组时整棵子树
+ * 已经跟着走了，再对子层发一次写入只会失败——而且是那种「第一层成功、
+ * 第二层报 not found」的半成品失败。
+ */
+std::vector<comp_layer_id> panel_selection_ids(const ShellState& shell, bool drop_covered) {
+  std::vector<comp_layer_id> ids;
+  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  for (int32_t shown = 0; shown < count; ++shown) {
+    const LayerRow& row = shell.layers[static_cast<size_t>(count - 1 - shown)];
+    if (!panel_selection_contains(shell, row.id)) continue;
+    if (drop_covered) {
+      bool covered = false;
+      comp_layer_id parent = row.parent;
+      int guard = 0;
+      while (parent != 0 && guard++ < 4096) {
+        if (panel_selection_contains(shell, parent)) {
+          covered = true;
+          break;
+        }
+        comp_layer_id next_parent = 0;
+        bool found = false;
+        for (const LayerRow& other : shell.layers) {
+          if (other.id == parent) {
+            next_parent = other.parent;
+            found = true;
+            break;
+          }
+        }
+        if (!found) break;
+        parent = next_parent;
+      }
+      if (covered) continue;
+    }
+    ids.push_back(row.id);
+  }
+  return ids;
+}
+
+/* 按 id 选中（selected_layer 是面板显示行号，必须反算）。 */
+void panel_select_layer_id(ShellState& shell, comp_layer_id id) {
+  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  for (int32_t i = 0; i < count; ++i) {
+    if (shell.layers[static_cast<size_t>(i)].id == id) {
+      shell.selected_layer = count - 1 - i;
+      return;
+    }
+  }
+}
+
+/*
+ * 新建组（Ctrl+G，对齐上游 Group Layers）。
+ *
+ * 有选区时把选中图层搬进新组（上游语义：Cmd+G 直接建组并收入选区，
+ * 而不是建一个空组让用户再拖）。整批写入走一个显式事务，一步撤销。
+ * 新组落在根级栈顶；组内顺序按原数组序（自下而上）搬入，堆叠关系不变。
+ */
+void panel_add_group(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const std::vector<comp_layer_id> moving = panel_selection_ids(shell, true);
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Group Layers", &txn) != COMP_OK) {
+    set_status(shell, L"新建组：无法开始事务");
+    return;
+  }
+  comp_layer_desc desc{};
+  desc.name = nullptr; /* 引擎自动命名 */
+  desc.blend = static_cast<comp_blend_mode>(0);
+  desc.opacity = 1.0f;
+  desc.is_group = 1;
+  desc.parent = 0;
+  desc.sampling = static_cast<comp_sampling>(0);
+  comp_layer_id group_id = 0;
+  if (comp_layer_add(shell.document, &desc, &group_id) != COMP_OK) {
+    comp_txn_abort(txn);
+    set_status(shell, L"新建组失败");
+    return;
+  }
+  set_visible_cache(shell, group_id, static_cast<uint8_t>(1));
+  /*
+   * **从下往上搬**（moving 是面板显示序，即从上到下，所以反向遍历）。
+   * comp_layer_move(id, group, 0) 的语义是「移到组内末尾 = 数组末尾 = 组顶」，
+   * 每搬一层它都落在组顶。按显示序搬的话，最后搬的最底层会跑到组顶，整组堆叠序
+   * 被静默反转（Ctrl+G 两层后画面上下颠倒）。从下往上搬，最后落下的是原顶层。
+   */
+  for (auto it = moving.rbegin(); it != moving.rend(); ++it) {
+    if (comp_layer_move(shell.document, *it, group_id, 0) != COMP_OK) {
+      comp_txn_abort(txn);
+      set_status(shell, L"新建组失败（无法把图层移入组，已整体回滚）");
+      return;
+    }
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"新建组：提交失败");
+    return;
+  }
+  shell.extra_selection.clear();
+  refresh_layers(shell);
+  panel_select_layer_id(shell, group_id);
+  shell.needs_render = true;
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"已新建组 #%I64u（收入 %d 个图层）",
+            static_cast<unsigned long long>(group_id),
+            static_cast<int>(moving.size()));
+  refresh_history_status(shell, buffer);
+}
+
+/* 删除选中图层（Del）：多选时一个显式事务 = 一步撤销。 */
+void panel_delete_layer(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const std::vector<comp_layer_id> ids = panel_selection_ids(shell, true);
+  if (ids.empty()) {
+    set_status(shell, L"无图层可删除");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Delete Layers", &txn) != COMP_OK) {
+    set_status(shell, L"删除图层：无法开始事务");
+    return;
+  }
+  for (comp_layer_id id : ids) {
+    if (comp_layer_remove(shell.document, id) != COMP_OK) {
+      comp_txn_abort(txn);
+      set_status(shell, L"删除图层失败（已整体回滚）");
+      return;
+    }
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"删除图层：提交失败");
+    return;
+  }
+  shell.extra_selection.clear();
+  refresh_layers(shell);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"已删除 %d 个图层", static_cast<int>(ids.size()));
+  refresh_history_status(shell, buffer);
+}
+
+/* 复制图层（Ctrl+J，对齐上游 Duplicate Layer）：多选 = 一次事务一步撤销。 */
+void panel_duplicate_layer(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const std::vector<comp_layer_id> ids = panel_selection_ids(shell, true);
+  if (ids.empty()) {
+    set_status(shell, L"无图层可复制");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Duplicate Layers", &txn) != COMP_OK) {
+    set_status(shell, L"复制图层：无法开始事务");
+    return;
+  }
+  comp_layer_id first_copy = 0;
+  for (comp_layer_id id : ids) {
+    comp_layer_id copy_id = 0;
+    if (comp_layer_duplicate(shell.document, id, &copy_id) != COMP_OK) {
+      comp_txn_abort(txn);
+      set_status(shell, L"复制图层失败（已整体回滚）");
+      return;
+    }
+    if (first_copy == 0) first_copy = copy_id;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"复制图层：提交失败");
+    return;
+  }
+  shell.extra_selection.clear();
+  refresh_layers(shell);
+  if (first_copy != 0) panel_select_layer_id(shell, first_copy);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"已复制 %d 个图层", static_cast<int>(ids.size()));
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------- 图层名 / 不透明度键入 */
+
+void refresh_layer_input_status(ShellState& shell) {
+  wchar_t buffer[224];
+  if (shell.layer_input == LayerInput::Rename) {
+    wsprintfW(buffer, L"重命名图层 #%I64u：%s（回车确认 / Esc 取消）",
+              static_cast<unsigned long long>(shell.layer_input_id),
+              shell.layer_input_text.c_str());
+  } else {
+    wsprintfW(buffer, L"图层不透明度：%s%%（回车应用 / Esc 取消，0..100）",
+              shell.layer_input_text.c_str());
+  }
+  set_status(shell, buffer);
+}
+
+/* 重命名（F2 / 双击行）：预填当前名字，UTF-8 → UTF-16 后交给 WM_CHAR 追加。 */
+void panel_begin_rename(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr || shell.document == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  shell.layer_input = LayerInput::Rename;
+  shell.layer_input_id = row->id;
+  shell.layer_input_text = widen_utf8(row->name);
+  refresh_layer_input_status(shell);
+}
+
+/* 直接键入不透明度（对齐上游双击不透明度数值）：预填当前百分比。 */
+void panel_begin_opacity_set(ShellState& shell) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr || shell.document == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  int percent = static_cast<int>(row->opacity * 100.0f + 0.5f);
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  wchar_t buffer[16];
+  wsprintfW(buffer, L"%d", percent);
+  shell.layer_input = LayerInput::Opacity;
+  shell.layer_input_id = row->id;
+  shell.layer_input_text = buffer;
+  refresh_layer_input_status(shell);
+}
+
+void panel_cancel_layer_input(ShellState& shell) {
+  shell.layer_input = LayerInput::None;
+  shell.layer_input_id = 0;
+  shell.layer_input_text.clear();
+}
+
+/*
+ * 键入一个字符。名字接受任意可打印字符（含 CJK —— WM_CHAR/WM_IME_CHAR 送来的
+ * 就是 UTF-16，不用在这里做编码转换）；不透明度只接受数字与一个小数点。
+ * 名字长度上限按 UTF-16 码元粗夹到 kLayerNameCapacity（UTF-8 字节超限由
+ * comp_layer_set_name 精确拒绝并给出原因）。
+ */
+void panel_layer_input_char(ShellState& shell, wchar_t ch) {
+  if (shell.layer_input == LayerInput::None) return;
+  if (ch < 0x20 || ch == 0x7F) return; /* 控制字符（回车/退格/Esc 由 WM_KEYDOWN 处理） */
+  if (shell.layer_input == LayerInput::Opacity) {
+    if ((ch < L'0' || ch > L'9') && ch != L'.') return;
+    if (ch == L'.' && shell.layer_input_text.find(L'.') != std::wstring::npos) return;
+    if (shell.layer_input_text.size() >= 6) return;
+  } else if (shell.layer_input_text.size() >= kLayerNameCapacity) {
+    return;
+  }
+  shell.layer_input_text.push_back(ch);
+  refresh_layer_input_status(shell);
+}
+
+void panel_layer_input_backspace(ShellState& shell) {
+  if (shell.layer_input == LayerInput::None) return;
+  if (shell.layer_input_text.empty()) return;
+  shell.layer_input_text.pop_back();
+  refresh_layer_input_status(shell);
+}
+
+/* 提交键入：改名走 comp_layer_set_name（严格 UTF-8），不透明度走批量设置。 */
+void panel_commit_layer_input(ShellState& shell) {
+  if (shell.layer_input == LayerInput::None) return;
+  if (shell.document == nullptr) {
+    panel_cancel_layer_input(shell);
+    set_status(shell, L"无文档");
+    return;
+  }
+  const LayerInput mode = shell.layer_input;
+  const comp_layer_id id = shell.layer_input_id;
+  const std::wstring text = shell.layer_input_text;
+  if (mode == LayerInput::Rename) {
+    const std::string name = narrow_utf8(text);
+    if (name.empty()) {
+      /* 空名会让图层在没有标识的情况下落盘；拒绝并保持输入态让用户改。 */
+      set_status(shell, L"图层名不能为空");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    if (comp_layer_set_name(shell.document, id, name.c_str()) != COMP_OK) {
+      /* 引擎 last_error 已由 set_status 附上（空名/坏编码/超长/未知 id）。 */
+      set_status(shell, L"重命名失败");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    panel_cancel_layer_input(shell);
+    refresh_layers(shell);
+    wchar_t buffer[160];
+    wsprintfW(buffer, L"已重命名图层 #%I64u", static_cast<unsigned long long>(id));
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  /* 不透明度：百分比输入，夹到 0..100；作用于整个多选集合，一步撤销。 */
+  const std::wstring digits = [&text]() {
+    std::wstring trimmed = text;
+    while (!trimmed.empty() && trimmed.back() == L'%') trimmed.pop_back();
+    return trimmed;
+  }();
+  wchar_t* end = nullptr;
+  const double parsed = wcstod(digits.c_str(), &end);
+  if (digits.empty() || end == digits.c_str() || *end != L'\0' || !(parsed >= 0.0)) {
+    set_status(shell, L"不透明度：请输入 0..100 的数值");
+    refresh_layer_input_status(shell);
+    return;
+  }
+  double percent = parsed;
+  if (percent > 100.0) percent = 100.0;
+  const float opacity = static_cast<float>(percent / 100.0);
+  const std::vector<comp_layer_id> ids = panel_selection_ids(shell, false);
+  if (ids.empty()) {
+    panel_cancel_layer_input(shell);
+    set_status(shell, L"无图层");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Set Layer Opacity", &txn) != COMP_OK) {
+    set_status(shell, L"设置不透明度：无法开始事务");
+    refresh_layer_input_status(shell);
+    return;
+  }
+  for (comp_layer_id target : ids) {
+    if (comp_layer_set_opacity(shell.document, target, opacity) != COMP_OK) {
+      comp_txn_abort(txn);
+      set_status(shell, L"设置不透明度失败（已整体回滚）");
+      refresh_layer_input_status(shell);
+      return;
+    }
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"设置不透明度：提交失败");
+    refresh_layer_input_status(shell);
+    return;
+  }
+  panel_cancel_layer_input(shell);
+  refresh_layers(shell);
+  shell.needs_render = true;
+  wchar_t buffer[128];
+  wsprintfW(buffer, L"不透明度 %d%%（%d 个图层）",
+            static_cast<int>(percent + 0.5), static_cast<int>(ids.size()));
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 调整面板 */
 
 comp_layer_id selected_layer_id(const ShellState& shell) {
@@ -1577,6 +2067,39 @@ std::wstring widen_ascii(const char* text) {
     wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*cursor)));
   }
   return wide;
+}
+
+/*
+ * UTF-8 -> UTF-16。失败返回空串：调用方（面板绘制）宁可显示 id 也不显示乱码。
+ * MB_ERR_INVALID_CHARS 让坏编码显式失败，而不是被系统替换成 U+FFFD——后者会让
+ * 一个本已损坏的名字在面板上看起来「正常」，掩盖真正的数据问题。
+ */
+std::wstring widen_utf8(const std::string& text) {
+  if (text.empty()) return std::wstring();
+  const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                         static_cast<int>(text.size()), nullptr, 0);
+  if (needed <= 0) return std::wstring();
+  std::wstring wide(static_cast<size_t>(needed), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                          static_cast<int>(text.size()), wide.data(), needed) != needed) {
+    return std::wstring();
+  }
+  return wide;
+}
+
+/* UTF-16 -> UTF-8（重命名提交路径）。未配对代理被系统替换为 U+FFFD，
+ * 引擎侧 is_valid_utf8 随后会如实拒绝，不会把坏名字写进文档。 */
+std::string narrow_utf8(const std::wstring& text) {
+  if (text.empty()) return std::string();
+  const int needed = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+  if (needed <= 0) return std::string();
+  std::string narrow(static_cast<size_t>(needed), '\0');
+  if (WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), narrow.data(),
+                          needed, nullptr, nullptr) != needed) {
+    return std::string();
+  }
+  return narrow;
 }
 
 /* 名称经 ABI 取自引擎键名表，外壳不复制任何键名。 */
@@ -3893,6 +4416,22 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerAdd:
       panel_add_layer(shell);
       break;
+    /* ---- P0-1：图层面板补全（删除 / 复制 / 改名 / 建组 / 直设不透明度） ---- */
+    case kCmdLayerDelete:
+      panel_delete_layer(shell);
+      break;
+    case kCmdLayerDuplicate:
+      panel_duplicate_layer(shell);
+      break;
+    case kCmdLayerRename:
+      panel_begin_rename(shell);
+      break;
+    case kCmdLayerNewGroup:
+      panel_add_group(shell);
+      break;
+    case kCmdLayerOpacitySet:
+      panel_begin_opacity_set(shell);
+      break;
     case kCmdLayerMergeDown:
       panel_merge_down(shell);
       break;
@@ -4241,7 +4780,22 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
       DeleteObject(selected);
       SetTextColor(dc, RGB(255, 255, 255));
     } else {
-      SetTextColor(dc, RGB(206, 208, 216));
+      /*
+       * P0-1 多选：主选中之外的多选行用更暗的底色区分（调整/效果面板仍只认
+       * 主选中——批量命令才看多选集合）。拖到组行中间带的落点同样高亮：面板
+       * 是扁平列表，没有这个提示用户看不出「拖进组」与「拖到组上方」的区别。
+       */
+      const bool multi_selected = panel_selection_contains(shell, row.id);
+      const bool drop_into_group = shell.layer_drag_active && row.is_group != 0 &&
+                                   shell.layer_drag_target == line;
+      if (multi_selected || drop_into_group) {
+        RECT highlight{row_rect.x + 2, row_rect.y + 1, row_rect.right() - 2,
+                       row_rect.bottom() - 1};
+        HBRUSH tint = CreateSolidBrush(drop_into_group ? RGB(48, 92, 72) : RGB(40, 46, 60));
+        FillRect(dc, &highlight, tint);
+        DeleteObject(tint);
+      }
+      SetTextColor(dc, multi_selected ? RGB(228, 232, 240) : RGB(206, 208, 216));
     }
     /* 混合模式名先转宽字符再拼：wsprintfW 的 %hs 行为不可靠（与既有 widen_ascii 用法一致）。 */
     const std::wstring blend_name = widen_ascii(comp_ui::blend_mode_name(row.blend));
@@ -4262,16 +4816,27 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     if (row.flip_x != 0) marks += L"H";
     if (row.flip_y != 0) marks += L"V";
     if (row.effect_count > 0) marks += L"fx";
-    wchar_t line_text[224];
-    if (!marks.empty()) {
-      wsprintfW(line_text, L"%s #%I64u  %s %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
-                static_cast<unsigned long long>(row.id), blend_name.c_str(), marks.c_str(),
-                static_cast<int>(row.opacity * 100.0f + 0.5f));
-    } else {
-      wsprintfW(line_text, L"%s #%I64u  %s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
-                static_cast<unsigned long long>(row.id), blend_name.c_str(),
-                static_cast<int>(row.opacity * 100.0f + 0.5f));
+    /*
+     * P0-1：行内显示图层名（引擎是唯一真源，refresh_layers 回读）。
+     * 名称为空（旧引擎 / 查询失败）时回落到 id，面板不至于变成空行。
+     * 栏宽 248px 排不下一整行，名字按宽字符截到 12 个并加省略号——截断只影响
+     * 显示，写回的一律是原名。
+     */
+    std::wstring display_name =
+        row.name.empty() ? (L"#" + std::to_wstring(static_cast<unsigned long long>(row.id)))
+                         : widen_utf8(row.name);
+    if (display_name.size() > 12) {
+      display_name.resize(11);
+      display_name += L"…";
     }
+    std::wstring marks_line;
+    if (!marks.empty()) {
+      marks_line = L" " + marks;
+    }
+    wchar_t line_text[224];
+    wsprintfW(line_text, L"%s %s  %s%s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
+              display_name.c_str(), blend_name.c_str(), marks_line.c_str(),
+              static_cast<int>(row.opacity * 100.0f + 0.5f));
     TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
   }
 
@@ -4387,9 +4952,9 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
-  const wchar_t* hint = L"Ctrl+[ ] 不透明度 · 拖行图层可重排";
+  const wchar_t* hint = L"Del 删除 · Ctrl+J 复制 · F2 改名 · Ctrl+G 建组";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 46, hint, lstrlenW(hint));
-  const wchar_t* hint2 = L"Shift+B/N 混合 · Ctrl+Shift+H/F 镜像 · 效果菜单";
+  const wchar_t* hint2 = L"Ctrl 点选多选 · Shift+O 直设不透明度 · Ctrl+[ ] 步进";
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
@@ -5431,6 +5996,28 @@ void commit_color_input(ShellState& shell) {
 }
 
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
+  /*
+   * P0-1：图层名 / 不透明度键入态是最高的模态。字符本体由 WM_CHAR 送进来
+   * （CJK 走 WM_IME_CHAR），这里只处理编辑键；其余按键一律吞掉，理由同其它
+   * 键入态——输入到一半按到 B，把混合模式改掉而输入框还在，状态不可解释。
+   */
+  if (shell.layer_input != LayerInput::None) {
+    if (key == VK_ESCAPE) {
+      panel_cancel_layer_input(shell);
+      set_status(shell, L"已取消图层输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      panel_layer_input_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      panel_commit_layer_input(shell);
+      return;
+    }
+    return;
+  }
+
   /* 前景色十六进制键入态最先生效：它是模态输入，不能漏到工具快捷键。 */
   if (!shell.color_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -5754,6 +6341,15 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           run_shell_command(window, shell, kCmdAdjKindPrev);
           return;
         }
+        /* Ctrl+J 复制图层（对齐上游 Duplicate Layer 的 ⌘J）。 */
+        run_shell_command(window, shell, kCmdLayerDuplicate);
+        return;
+      case 'G':
+        /* Ctrl+G 建组（对齐上游 Group Layers）；Ctrl+Alt+G 剪贴蒙版走 SYSKEYDOWN。 */
+        if (!shift) {
+          run_shell_command(window, shell, kCmdLayerNewGroup);
+          return;
+        }
         break;
       case 'D':
         /* Ctrl+Shift+D 删除选中的调整；Ctrl+D 取消选区。 */
@@ -5905,6 +6501,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     case VK_TAB:
       panel_move_param(shell, shift ? -1 : 1);
       break;
+    /* P0-1：图层删除 / 重命名（面板焦点不独立，快捷键作用于当前选中图层）。 */
+    case VK_DELETE:
+      run_shell_command(window, shell, kCmdLayerDelete);
+      break;
+    case VK_F2:
+      run_shell_command(window, shell, kCmdLayerRename);
+      break;
     case VK_RETURN:
       /* 钢笔：回车 = 提交闭合路径；其余工具里回车仍是调整面板的落值键。 */
       if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
@@ -5929,6 +6532,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       /* 数字键在调整面板里开始键入数值；其余字母按上游工具键位映射。 */
       if (key >= '0' && key <= '9') {
         panel_begin_input(shell, static_cast<wchar_t>(key));
+        break;
+      }
+      /* Shift+O = 直接键入图层不透明度（对齐上游双击数值的做法，比 ±10% 步进精确）。 */
+      if (key == 'O' && shift && !ctrl) {
+        run_shell_command(window, shell, kCmdLayerOpacitySet);
         break;
       }
       /* X = 下一项色板；Shift+X = 键入十六进制。前景色是画笔与吸管的公共落点。 */
@@ -6099,6 +6707,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
       }
       break;
+    /*
+     * P0-1：图层名 / 不透明度键入的字符入口。
+     *
+     * 用 WM_CHAR 而不是在 WM_KEYDOWN 里按 VK 转字符：前者是 TranslateMessage
+     * 与 IME 的共同出口，CJK 才能原样进来（WM_CHAR 的 wParam 就是 UTF-16 码元）。
+     * 编辑键（回车/退格/Esc）仍由 WM_KEYDOWN 处理，这里把控制字符挡掉。
+     */
+    case WM_CHAR:
+      if (shell != nullptr && shell->layer_input != LayerInput::None) {
+        panel_layer_input_char(*shell, static_cast<wchar_t>(wparam));
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      break;
     case WM_LBUTTONDOWN:
       if (shell != nullptr) {
         Layout layout{};
@@ -6144,26 +6766,83 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
               row_top);
           if (row >= 0) {
-            shell->selected_layer = row;
+            const bool click_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool click_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            const int32_t layer_count = static_cast<int32_t>(shell->layers.size());
+            const comp_layer_id clicked_id =
+                shell->layers[static_cast<size_t>(layer_count - 1 - row)].id;
             /*
-             * S24 拖行重排：按下即 pending（记录起点行与 y），移动超过阈值才进入
-             * active。单击必须还是「选中」，手抖 1px 不该把层挪走；捕获在
-             * WM_LBUTTONUP / WM_CAPTURECHANGED 里释放。
+             * P0-1 多选（对齐上游图层面板）：
+             *   Ctrl+点 = 切换该层是否在多选集合里；点主选中层则把它从选中里摘掉
+             *             （若还有其它多选层，用第一个顶上做主选中）。
+             *   Shift+点 = 从主选中行到该行整段成为多选。
+             * 两种修饰下都不进入拖行 pending：多选拖拽需要「整组一起挪」的语义，
+             * 而当前拖行只搬一层，按下就先别埋一个会误触的 pending。
              */
-            shell->layer_drag_row = row;
-            shell->layer_drag_target = row;
-            shell->layer_drag_press_y = mouse_y;
-            shell->layer_drag_pending = true;
-            shell->layer_drag_active = false;
-            SetCapture(window);
+            if (click_ctrl) {
+              if (panel_selection_contains(*shell, clicked_id)) {
+                if (row == shell->selected_layer) {
+                  if (!shell->extra_selection.empty()) {
+                    const comp_layer_id promoted = shell->extra_selection.front();
+                    shell->extra_selection.erase(shell->extra_selection.begin());
+                    for (int32_t i = 0; i < layer_count; ++i) {
+                      if (shell->layers[static_cast<size_t>(i)].id == promoted) {
+                        shell->selected_layer = layer_count - 1 - i;
+                        break;
+                      }
+                    }
+                  }
+                } else {
+                  auto& extras = shell->extra_selection;
+                  for (size_t i = 0; i < extras.size(); ++i) {
+                    if (extras[i] == clicked_id) {
+                      extras.erase(extras.begin() + static_cast<std::ptrdiff_t>(i));
+                      break;
+                    }
+                  }
+                }
+              } else {
+                shell->extra_selection.push_back(clicked_id);
+              }
+            } else if (click_shift && shell->selected_layer >= 0) {
+              const int32_t from = shell->selected_layer < row ? shell->selected_layer : row;
+              const int32_t to = shell->selected_layer < row ? row : shell->selected_layer;
+              shell->extra_selection.clear();
+              for (int32_t line = from; line <= to; ++line) {
+                const comp_layer_id id =
+                    shell->layers[static_cast<size_t>(layer_count - 1 - line)].id;
+                if (id != clicked_id) shell->extra_selection.push_back(id);
+              }
+              shell->selected_layer = row;
+            } else {
+              shell->extra_selection.clear();
+              shell->selected_layer = row;
+              /*
+               * S24 拖行重排：按下即 pending（记录起点行与 y），移动超过阈值才进入
+               * active。单击必须还是「选中」，手抖 1px 不该把层挪走；捕获在
+               * WM_LBUTTONUP / WM_CAPTURECHANGED 里释放。
+               */
+              shell->layer_drag_row = row;
+              shell->layer_drag_target = row;
+              shell->layer_drag_press_y = mouse_y;
+              shell->layer_drag_pending = true;
+              shell->layer_drag_active = false;
+              SetCapture(window);
+            }
             refresh_adjustments(*shell);
             /* S24：效果列表同样跟随选中图层，否则菜单勾选与 fx 标记会停在上一层。 */
             refresh_effects(*shell);
             const LayerRow* selected = selected_row(*shell);
             if (selected != nullptr) {
-              wchar_t buffer[128];
-              wsprintfW(buffer, L"已选中图层 #%I64u（第 %d 行）",
-                        static_cast<unsigned long long>(selected->id), row + 1);
+              wchar_t buffer[160];
+              if (panel_selection_ids(*shell, false).size() > 1) {
+                wsprintfW(buffer, L"已选中 %d 个图层（主选中 #%I64u，第 %d 行；Ctrl+J/Del 批量）",
+                          static_cast<int>(panel_selection_ids(*shell, false).size()),
+                          static_cast<unsigned long long>(selected->id), row + 1);
+              } else {
+                wsprintfW(buffer, L"已选中图层 #%I64u（第 %d 行）",
+                          static_cast<unsigned long long>(selected->id), row + 1);
+              }
               set_status(*shell, buffer);
             }
             InvalidateRect(window, nullptr, FALSE);
@@ -6243,6 +6922,25 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           InvalidateRect(window, nullptr, FALSE);
           return 0;
         }
+        /*
+         * P0-1：双击图层行 = 重命名（与上游图层面板一致）。
+         * 必须先于「还原成普通按下」——否则第二次点击只会重选一次，双击永远
+         * 进不了改名态。
+         */
+        if (client_layout(*shell, &layout) && layout.layer_panel.contains(mouse_x, mouse_y)) {
+          const int row = comp_ui::layer_row_at(
+              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
+              comp_ui::layer_rows_top(shell->histogram_open));
+          if (row >= 0) {
+            shell->extra_selection.clear();
+            shell->selected_layer = row;
+            refresh_adjustments(*shell);
+            refresh_effects(*shell);
+            panel_begin_rename(*shell);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        }
       }
       return SendMessageW(window, WM_LBUTTONDOWN, wparam, lparam);
     case WM_MBUTTONDOWN:
@@ -6278,13 +6976,27 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         const bool dragged = shell->layer_drag_active;
         const int32_t from_row = shell->layer_drag_row;
         const int32_t to_row = shell->layer_drag_target;
+        bool drop_into_group = false;
+        if (dragged && to_row >= 0) {
+          Layout layout{};
+          const int32_t count = static_cast<int32_t>(shell->layers.size());
+          if (client_layout(*shell, &layout) && to_row < count) {
+            const LayerRow& target = shell->layers[static_cast<size_t>(count - 1 - to_row)];
+            /* 只有组行、且指针停在行中间带时才解释成「拖进组」。 */
+            drop_into_group =
+                target.is_group != 0 &&
+                comp_ui::layer_drag_inner_band(layout.layer_panel, count, to_row,
+                                               static_cast<double>(mouse_y),
+                                               comp_ui::layer_rows_top(shell->histogram_open));
+          }
+        }
         shell->layer_drag_pending = false;
         shell->layer_drag_active = false;
         shell->layer_drag_row = -1;
         shell->layer_drag_target = -1;
         ReleaseCapture();
         if (dragged && shell->document != nullptr) {
-          panel_drop_layer(*shell, from_row, to_row);
+          panel_drop_layer(*shell, from_row, to_row, drop_into_group);
         }
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -6661,6 +7373,16 @@ HMENU build_menu() {
 
   HMENU layer_menu = CreatePopupMenu();
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerAdd, L"新建图层(&A)\tCtrl+Shift+N");
+  /*
+   * P0-1：图层面板补全。这五条此前壳里完全没有入口——引擎早就支持建组
+   * （is_group）与改名，但壳固定传 0、也没有 set_name；删除/复制更是连 ABI
+   * 都没有。现在导出补齐（comp_layer_set_name / duplicate / move），入口在这里。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerNewGroup, L"新建组(&G)\tCtrl+G");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerDuplicate, L"复制图层(&P)\tCtrl+J");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerDelete, L"删除图层(&X)\tDel");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerRename, L"重命名图层(&N)\tF2");
+  AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeDown, L"向下合并(&M)\tCtrl+E");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlatten, L"拼合图像(&F)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
@@ -6714,7 +7436,9 @@ HMENU build_menu() {
   AppendMenuW(effect_menu, MF_STRING, kCmdEffectClear, L"清除全部效果(&C)");
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(effect_menu), L"效果(&E)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityDown, L"降低不透明度(&-)\tCtrl+[");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacityUp, L"提高不透明度(&+)\tCtrl+]");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerOpacitySet, L"设置不透明度…(&O)\tShift+O");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveLeft, L"平移左(&L)	Shift+←");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMoveRight, L"平移右(&R)	Shift+→");

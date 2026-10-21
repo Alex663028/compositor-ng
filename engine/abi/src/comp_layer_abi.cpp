@@ -437,8 +437,126 @@ comp_result comp_layer_get_visible(comp_document document, comp_layer_id id,
   return compositor::abi::ok(engine);
 }
 
+comp_result comp_layer_get_name(comp_document document, comp_layer_id id, char* buffer,
+                                size_t capacity, size_t* out_required) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  const size_t required = layer->name.size() + 1; /* 含结尾 NUL */
+  *out_required = required;
+  /* 查询模式：只问长度（capacity 为 0 也算），不碰 buffer。 */
+  if (buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    /* 不静默截断：截断可能切掉一个多字节字符的尾部，宿主拿到的是坏 UTF-8。 */
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "name buffer is too small (see out_required)");
+  }
+  std::memcpy(buffer, layer->name.c_str(), required);
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_layer_set_name(comp_document document, comp_layer_id id,
+                                const char* name_utf8) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (doc->find(id) == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (name_utf8 == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "name is null");
+  }
+  /* 有界扫描：调用方可能传未以 NUL 结尾的缓冲，不能直接交给 std::string。 */
+  size_t length = 0;
+  while (length <= Document::kMaxLayerNameBytes && name_utf8[length] != '\0') ++length;
+  if (length > Document::kMaxLayerNameBytes) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "layer name exceeds 1024 bytes");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Rename Layer");
+  if (!doc->rename_layer(id, std::string(name_utf8, length))) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "invalid layer name (empty, contains NUL, or malformed UTF-8)");
+  }
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_move(comp_document document, comp_layer_id id, comp_layer_id parent,
+                            comp_layer_id before) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (doc->find(id) == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (parent != 0) {
+    const Layer* target = doc->find(parent);
+    if (target == nullptr) {
+      return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "parent layer not found");
+    }
+    if (!target->is_group) {
+      return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "parent is not a group");
+    }
+  }
+  if (before != 0 && doc->find(before) == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "anchor layer not found");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, parent != 0 ? "Move Layer Into Group" : "Move Layer Out");
+  if (!doc->move_layer(id, parent, before)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "illegal move (cycle, cross-parent anchor, or empty target)");
+  }
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_duplicate(comp_document document, comp_layer_id id,
+                                 comp_layer_id* out_id) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_id == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_id is null");
+  }
+  if (doc->find(id) == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Duplicate Layer");
+  comp_layer_id copy_id = 0;
+  if (!doc->duplicate_layer(id, &copy_id)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "duplicate failed");
+  }
+  txn.commit();
+  *out_id = copy_id;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 comp_result comp_layer_get_transform(comp_document document, comp_layer_id id,
-                                    comp_rect* out_transform, float* out_rotation) {
+                                     comp_rect* out_transform, float* out_rotation) {
   Document* doc = nullptr;
   Engine* engine = nullptr;
   if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {

@@ -12,6 +12,7 @@
  *
  * 本文件只使用 comp_*.h 中的 C 符号，与三端外壳的集成路径一致。
  */
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -914,6 +915,358 @@ COMP_TEST(group_reorder_changes_stacking_order) {
   canvas = flatten(document, 4, 4);
   COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 0, 255, 255),
                  "in-group reorder is undoable");
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* ------------------------------------------ P0-1：图层名读写（get/set_name） */
+
+/* 名字一直在文档里（desc 写入、.comp 落盘），此前没有读出口：宿主只能自己
+ * 记一份，撤销/合并/读盘之后就和文档漂移。本用例钉住「文档是唯一真源」。 */
+COMP_TEST(layer_name_round_trips_through_utf8_and_history) {
+  comp_engine_desc desc = mutation_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  COMP_CHECK(background != 0);
+
+  /* 新建文档的默认名是 Background（10 字节 + NUL）。查询模式只回长度。 */
+  size_t required = 0;
+  COMP_CHECK(comp_layer_get_name(document, background, nullptr, 0, &required) == COMP_OK);
+  COMP_CHECK_MSG(required == 11u, "default layer name is 'Background' + NUL");
+  char initial[16] = {};
+  COMP_CHECK(comp_layer_get_name(document, background, initial, sizeof(initial), &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(initial, "Background") == 0, "default name reads back verbatim");
+
+  /* UTF-8 名字往返（中文 + 空格）。 */
+  const char* chinese = "背景 副本";
+  size_t undo_before = 0;
+  size_t redo_before = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_before, &redo_before) == COMP_OK);
+  COMP_CHECK(comp_layer_set_name(document, background, chinese) == COMP_OK);
+  size_t undo_after = 0;
+  size_t redo_after = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_after, &redo_after) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1u, "rename is exactly one undo step");
+
+  COMP_CHECK(comp_layer_get_name(document, background, nullptr, 0, &required) == COMP_OK);
+  COMP_CHECK_MSG(required == std::strlen(chinese) + 1u, "required bytes follow the UTF-8 length");
+  char round_trip[32] = {};
+  COMP_CHECK(comp_layer_get_name(document, background, round_trip, sizeof(round_trip), &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(round_trip, chinese) == 0, "UTF-8 name round trips");
+
+  /* 缓冲区不够：拒绝且不截断（out_required 仍然如实回报）。 */
+  char too_small[4] = {'x', 'x', 'x', 0};
+  size_t needed = 0;
+  COMP_CHECK(comp_layer_get_name(document, background, too_small, sizeof(too_small), &needed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK_MSG(needed == required && too_small[0] == 'x',
+                 "small buffer is rejected without truncation");
+
+  /* 撤销回到旧名字，重做回到新名字。 */
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  char undone[16] = {};
+  COMP_CHECK(comp_layer_get_name(document, background, undone, sizeof(undone), &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(undone, "Background") == 0, "undo restores the previous name");
+  COMP_CHECK(comp_document_redo(document) == COMP_OK);
+  char redone[32] = {};
+  COMP_CHECK(comp_layer_get_name(document, background, redone, sizeof(redone), &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(redone, chinese) == 0, "redo restores the renamed value");
+
+  /* 参数闸：空名 / 坏 UTF-8 / 控制字符 / 超长 / 不存在图层。 */
+  COMP_CHECK(comp_layer_set_name(document, background, "") == COMP_ERR_INVALID_ARGUMENT);
+  const char truncated_utf8[] = {'\xC3', '\x28', '\0'}; /* 两字节序列缺续字节 */
+  COMP_CHECK(comp_layer_set_name(document, background, truncated_utf8) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  const char surrogate[] = {'\xED', '\xA0', '\x80', '\0'}; /* U+D800 代理区 */
+  COMP_CHECK(comp_layer_set_name(document, background, surrogate) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_set_name(document, background, "line\nbreak") ==
+             COMP_ERR_INVALID_ARGUMENT);
+  std::string too_long(1025u, 'x');
+  COMP_CHECK(comp_layer_set_name(document, background, too_long.c_str()) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_set_name(document, 999999, "x") == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_set_name(document, background, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_name(document, 999999, nullptr, 0, &required) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_get_name(document, background, nullptr, 0, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  /* 被拒绝的写入没有改掉旧名字。 */
+  char after_rejects[32] = {};
+  COMP_CHECK(comp_layer_get_name(document, background, after_rejects, sizeof(after_rejects),
+                                 &required) == COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(after_rejects, chinese) == 0,
+                 "rejected names leave the previous name untouched");
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* ----------------------------------------------- P0-1：复制图层（Ctrl+J） */
+
+COMP_TEST(duplicate_layer_deep_copies_and_is_one_undo_step) {
+  comp_engine_desc desc = mutation_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  COMP_CHECK(background != 0);
+  const SolidImage red(4, 4, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "blue";
+  child_desc.blend = COMP_BLEND_NORMAL;
+  /* 不透明度 1：副本叠在原件之上时画面逐字节不变（半透明层再叠一次会改变
+   * 合成结果——那是正确的重复绘制，不是深拷贝的判据）。 */
+  child_desc.opacity = 1.0f;
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id blue = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &blue) == COMP_OK);
+  const SolidImage blue_image(4, 4, 0, 0, 255, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, blue, &blue_image.image) == COMP_OK);
+
+  size_t count_before = 0;
+  COMP_CHECK(comp_layer_count(document, &count_before) == COMP_OK);
+  size_t undo_before = 0;
+  size_t redo_before = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_before, &redo_before) == COMP_OK);
+  const std::vector<uint8_t> canvas_before_copy = flatten(document, 4, 4);
+
+  comp_layer_id copy = 0;
+  COMP_CHECK_MSG(comp_layer_duplicate(document, blue, &copy) == COMP_OK, "duplicate succeeds");
+  COMP_CHECK_MSG(copy != 0 && copy != blue, "duplicate gets a fresh layer id");
+  size_t count_after = 0;
+  COMP_CHECK(comp_layer_count(document, &count_after) == COMP_OK);
+  COMP_CHECK_MSG(count_after == count_before + 1u, "duplicate adds exactly one layer");
+  size_t undo_after = 0;
+  size_t redo_after = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_after, &redo_after) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1u, "duplicate is exactly one undo step");
+
+  /* 属性与像素深拷贝：混合、不透明度、像素都跟原件一致。 */
+  comp_blend_mode copy_blend = COMP_BLEND_NORMAL;
+  COMP_CHECK(comp_layer_get_blend(document, copy, &copy_blend) == COMP_OK);
+  COMP_CHECK_MSG(copy_blend == COMP_BLEND_NORMAL, "blend mode is copied");
+  float copy_opacity = 1.0f;
+  COMP_CHECK(comp_layer_get_opacity(document, copy, &copy_opacity) == COMP_OK);
+  COMP_CHECK_MSG(std::fabs(copy_opacity - 1.0f) < 1e-6f, "opacity is copied");
+  char copy_name[64] = {};
+  size_t required = 0;
+  COMP_CHECK(comp_layer_get_name(document, copy, copy_name, sizeof(copy_name), &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(std::strcmp(copy_name, "blue copy") == 0, "duplicate name gets a ' copy' suffix");
+
+  /* 画面逐字节不变（同像素、同属性、落在原件之上）。 */
+  std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(canvas == canvas_before_copy, "duplicate is render-invariant");
+
+  /* 改副本不影响原件：深拷贝而不是共享像素。 */
+  const SolidImage green(4, 4, 0, 255, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, copy, &green.image) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(canvas != canvas_before_copy, "editing the copy changes the canvas");
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(canvas == canvas_before_copy,
+                 "the original keeps its own pixels after undo of the copy edit");
+
+  /* 撤销一次复制：图层消失。 */
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  size_t count_undone = 0;
+  COMP_CHECK(comp_layer_count(document, &count_undone) == COMP_OK);
+  COMP_CHECK_MSG(count_undone == count_before, "undo removes the duplicated layer");
+  comp_layer_id copy_after_undo = 0;
+  COMP_CHECK(comp_layer_duplicate(document, blue, &copy_after_undo) == COMP_OK);
+
+  /* 组的复制 = 整棵子树深拷贝。 */
+  comp_layer_desc group_desc{};
+  group_desc.name = "G";
+  group_desc.blend = COMP_BLEND_NORMAL;
+  group_desc.opacity = 1.0f;
+  group_desc.transform = comp_rect{0, 0, 4, 4};
+  group_desc.is_group = 1;
+  comp_layer_id group = 0;
+  COMP_CHECK(comp_layer_add(document, &group_desc, &group) == COMP_OK);
+  comp_layer_desc inner_desc{};
+  inner_desc.name = "inner";
+  inner_desc.blend = COMP_BLEND_NORMAL;
+  inner_desc.opacity = 1.0f;
+  inner_desc.transform = comp_rect{0, 0, 4, 4};
+  inner_desc.parent = group;
+  comp_layer_id inner = 0;
+  COMP_CHECK(comp_layer_add(document, &inner_desc, &inner) == COMP_OK);
+  const SolidImage yellow(4, 4, 255, 255, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, inner, &yellow.image) == COMP_OK);
+
+  size_t before_group_copy = 0;
+  COMP_CHECK(comp_layer_count(document, &before_group_copy) == COMP_OK);
+  comp_layer_id group_copy = 0;
+  COMP_CHECK(comp_layer_duplicate(document, group, &group_copy) == COMP_OK);
+  size_t after_group_copy = 0;
+  COMP_CHECK(comp_layer_count(document, &after_group_copy) == COMP_OK);
+  COMP_CHECK_MSG(after_group_copy == before_group_copy + 2u,
+                 "duplicating a group deep copies its subtree");
+  int32_t copy_is_group = 0;
+  comp_layer_id copy_parent = 0;
+  comp_layer_id copy_clipping = 0;
+  COMP_CHECK(comp_layer_get_group_info(document, group_copy, &copy_is_group, &copy_parent,
+                                       &copy_clipping) == COMP_OK);
+  COMP_CHECK_MSG(copy_is_group != 0 && copy_parent == 0, "the group copy is a root-level group");
+
+  /* 参数闸。 */
+  COMP_CHECK(comp_layer_duplicate(document, 999999, &group_copy) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_duplicate(document, blue, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* ---------------------------------- P0-1：跨父级移动（图层面板拖进/拖出组） */
+
+COMP_TEST(move_layer_reparents_and_changes_stacking) {
+  comp_engine_desc desc = mutation_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  COMP_CHECK(background != 0);
+  const SolidImage red(4, 4, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "G";
+  group_desc.blend = COMP_BLEND_NORMAL;
+  group_desc.opacity = 1.0f;
+  group_desc.transform = comp_rect{0, 0, 4, 4};
+  group_desc.is_group = 1;
+  comp_layer_id group = 0;
+  COMP_CHECK(comp_layer_add(document, &group_desc, &group) == COMP_OK);
+
+  /* 根级蓝层（在组之上）：画面是蓝。 */
+  comp_layer_desc child_desc{};
+  child_desc.name = "blue";
+  child_desc.blend = COMP_BLEND_NORMAL;
+  child_desc.opacity = 1.0f;
+  child_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id blue = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &blue) == COMP_OK);
+  const SolidImage blue_image(4, 4, 0, 0, 255, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, blue, &blue_image.image) == COMP_OK);
+  std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK(matches(canvas, 4, 1, 1, 0, 0, 255, 255));
+
+  int32_t is_group = 0;
+  comp_layer_id parent = 0;
+  comp_layer_id clipping = 0;
+  COMP_CHECK(comp_layer_get_group_info(document, blue, &is_group, &parent, &clipping) == COMP_OK);
+  COMP_CHECK(parent == 0);
+
+  /* 拖进组：parent 变成组，画面不变（组按子层逐个合成，属性全默认）。 */
+  size_t undo_before = 0;
+  size_t redo_before = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_before, &redo_before) == COMP_OK);
+  COMP_CHECK_MSG(comp_layer_move(document, blue, group, 0) == COMP_OK, "move into group");
+  size_t undo_after = 0;
+  size_t redo_after = 0;
+  COMP_CHECK(comp_document_history_stats(document, &undo_after, &redo_after) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1u, "move is exactly one undo step");
+  COMP_CHECK(comp_layer_get_group_info(document, blue, &is_group, &parent, &clipping) == COMP_OK);
+  COMP_CHECK_MSG(parent == group, "get_group_info reports the new parent");
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK(matches(canvas, 4, 1, 1, 0, 0, 255, 255));
+
+  /* 组内再加绿层（比蓝更靠上），然后把绿移到蓝之前：画面翻成蓝。 */
+  child_desc.name = "green";
+  child_desc.parent = group;
+  comp_layer_id green = 0;
+  COMP_CHECK(comp_layer_add(document, &child_desc, &green) == COMP_OK);
+  const SolidImage green_image(4, 4, 0, 255, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, green, &green_image.image) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 255, 0, 255), "later sibling stacks on top");
+
+  COMP_CHECK_MSG(comp_layer_move(document, green, group, blue) == COMP_OK,
+                 "move before a sibling inside the group");
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 0, 255, 255),
+                 "moving before the sibling changes the rendered order");
+
+  /* 撤销一次回到「绿在上」。 */
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 255, 0, 255), "the move is undoable");
+
+  /*
+   * 回归：`before = 0` 是「移到组末尾（最上层）」，即使最后一个同父兄弟恰好是
+   * 数组末元素也一样。旧写法用 `pos == end()` 判断「没找到兄弟」，那个情况下会
+   * 误走「组还没有子层」分支，把新层插到组自身后面（= 组底），于是每拖一层进组
+   * 都落到最下面——Ctrl+G 批量收层时整组堆叠序被静默反转。
+   */
+  comp_layer_desc cyan_desc{};
+  cyan_desc.name = "cyan";
+  cyan_desc.blend = COMP_BLEND_NORMAL;
+  cyan_desc.opacity = 1.0f;
+  cyan_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id cyan = 0;
+  COMP_CHECK(comp_layer_add(document, &cyan_desc, &cyan) == COMP_OK);
+  const SolidImage cyan_image(4, 4, 0, 255, 255, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, cyan, &cyan_image.image) == COMP_OK);
+  COMP_CHECK_MSG(comp_layer_move(document, cyan, group, 0) == COMP_OK,
+                 "move into a non-empty group");
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK_MSG(matches(canvas, 4, 1, 1, 0, 255, 255, 255),
+                 "before=0 lands on top of the group, not under its last child");
+
+  /* 拖出组：parent = 0，root 末尾（最上层）仍是蓝；层级事实必须为 0。 */
+  COMP_CHECK_MSG(comp_layer_move(document, blue, 0, 0) == COMP_OK, "move out of the group");
+  COMP_CHECK(comp_layer_get_group_info(document, blue, &is_group, &parent, &clipping) == COMP_OK);
+  COMP_CHECK_MSG(parent == 0 && is_group == 0, "moved layer is back at root level");
+
+  /* 参数闸：非组父级 / 跨级锚点 / 成环 / 不存在的 id 与锚点。 */
+  COMP_CHECK_MSG(comp_layer_move(document, blue, background, 0) == COMP_ERR_INVALID_ARGUMENT,
+                 "parent must be a group");
+  COMP_CHECK_MSG(comp_layer_move(document, blue, group, background) == COMP_ERR_INVALID_ARGUMENT,
+                 "anchor must share the target parent");
+  comp_layer_desc nested_desc{};
+  nested_desc.name = "inner";
+  nested_desc.blend = COMP_BLEND_NORMAL;
+  nested_desc.opacity = 1.0f;
+  nested_desc.transform = comp_rect{0, 0, 4, 4};
+  nested_desc.is_group = 1;
+  nested_desc.parent = group;
+  comp_layer_id inner = 0;
+  COMP_CHECK(comp_layer_add(document, &nested_desc, &inner) == COMP_OK);
+  COMP_CHECK_MSG(comp_layer_move(document, group, inner, 0) == COMP_ERR_INVALID_ARGUMENT,
+                 "a group cannot be moved into its own subtree");
+  COMP_CHECK(comp_layer_move(document, group, group, 0) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_move(document, 999999, group, 0) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_move(document, group, 999999, 0) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_move(document, group, 0, 999999) == COMP_ERR_NOT_FOUND);
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

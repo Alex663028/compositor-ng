@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -266,6 +268,237 @@ bool Document::reorder_layer(comp_layer_id id, comp_layer_id before) {
     }
   }
   invalidate_composite();
+  return true;
+}
+
+namespace {
+
+/*
+ * 严格 UTF-8 校验（拒绝超长编码、代理区 U+D800..U+DFFF、> U+10FFFF 与截断）。
+ *
+ * 为什么在领域层挡而不是交给宿主：图层名会被 .comp 原样写进 JSON 字符串，
+ * 坏字节要么让落盘结构损坏，要么在宿主侧显示成替换字符后**再也无法还原**。
+ * 本仓的文字通路（P0-5）同样要按这条口径收 UTF-8，这里是唯一的判定实现。
+ */
+bool is_valid_utf8(const std::string& text) {
+  size_t i = 0;
+  const size_t n = text.size();
+  while (i < n) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    if (c < 0x80) {
+      ++i;
+      continue;
+    }
+    size_t extra = 0;
+    uint32_t code = 0;
+    if ((c & 0xE0) == 0xC0) {
+      extra = 1;
+      code = c & 0x1Fu;
+    } else if ((c & 0xF0) == 0xE0) {
+      extra = 2;
+      code = c & 0x0Fu;
+    } else if ((c & 0xF8) == 0xF0) {
+      extra = 3;
+      code = c & 0x07u;
+    } else {
+      return false; /* 0x80..0xBF 的孤立续字节、或 0xF8..0xFF */
+    }
+    if (i + extra >= n) return false; /* 截断：续字节不够 */
+    for (size_t k = 1; k <= extra; ++k) {
+      const unsigned char cc = static_cast<unsigned char>(text[i + k]);
+      if ((cc & 0xC0) != 0x80) return false;
+      code = (code << 6) | (cc & 0x3Fu);
+    }
+    /* 超长编码与代理区/越界码点：一律拒绝（RFC 3629 的合法性判定）。 */
+    if (extra == 1 && code < 0x80) return false;
+    if (extra == 2 && code < 0x800) return false;
+    if (extra == 3 && code < 0x10000) return false;
+    if (code >= 0xD800 && code <= 0xDFFF) return false;
+    if (code > 0x10FFFF) return false;
+    i += extra + 1;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool Document::rename_layer(comp_layer_id id, const std::string& name) {
+  Layer* layer = find(id);
+  if (layer == nullptr) return false;
+  if (name.empty() || name.size() > kMaxLayerNameBytes) return false;
+  if (!is_valid_utf8(name)) return false;
+  /* 控制字符（含内嵌 NUL）一律拒绝：名字要单行显示、要进 JSON 字符串，
+   * 换行或 NUL 只会让面板与 .comp 各自截断出两个不同的名字。 */
+  for (unsigned char c : name) {
+    if (c < 0x20 || c == 0x7F) return false;
+  }
+  layer->name = name;
+  /* 名字只进面板与 .comp，不参与像素求值——不动内容修订号，也不让合成缓存
+   * 失效（否则改个名字就要重绘整篇）。 */
+  dirty_ = true;
+  return true;
+}
+
+bool Document::move_layer(comp_layer_id id, comp_layer_id parent, comp_layer_id before) {
+  Layer* layer = find(id);
+  if (layer == nullptr) return false;
+  if (before == id) return false;
+  if (parent == id) return false;
+
+  if (parent != 0) {
+    const Layer* target = find(parent);
+    if (target == nullptr || !target->is_group) return false;
+    /* 不许把组塞进自己的子树：从目标父级沿 parent 链上溯，遇到 id 即拒绝。
+     * 不挡这一步会造出「自己是自己的祖先」的环，之后 remove/合成都会死循环。 */
+    const Layer* probe = target;
+    size_t guard = 0;
+    while (probe != nullptr) {
+      if (probe->id == id) return false;
+      probe = probe->parent != 0 ? find(probe->parent) : nullptr;
+      if (++guard > state_.layers.size()) return false; /* 已经是环（防御） */
+    }
+  }
+  if (before != 0) {
+    const Layer* anchor = find(before);
+    if (anchor == nullptr || anchor->parent != parent) return false;
+  }
+
+  if (layer->parent == parent) {
+    /* 同级移动与 reorder 同义；交给它保持两处口径一致。 */
+    return reorder_layer(id, before);
+  }
+
+  const comp_layer_id old_parent = layer->parent;
+  auto it = std::find_if(state_.layers.begin(), state_.layers.end(),
+                         [id](const Layer& l) { return l.id == id; });
+  if (it == state_.layers.end()) return false;
+  Layer moved = std::move(*it);
+  state_.layers.erase(it);
+  moved.parent = parent;
+
+  auto pos = state_.layers.end();
+  bool positioned = false;
+  if (before != 0) {
+    pos = std::find_if(state_.layers.begin(), state_.layers.end(),
+                       [before](const Layer& l) { return l.id == before; });
+    if (pos == state_.layers.end()) return false;
+    positioned = true;
+  } else if (parent != 0) {
+    /* 目标组末尾：插到最后一个同父兄弟之后；组还没有子层时插在组自身后面。 */
+    for (auto scan = state_.layers.begin(); scan != state_.layers.end(); ++scan) {
+      if (scan->parent == parent) {
+        pos = scan + 1;
+        positioned = true;
+      }
+    }
+    if (!positioned) {
+      auto group = std::find_if(state_.layers.begin(), state_.layers.end(),
+                                [parent](const Layer& l) { return l.id == parent; });
+      if (group != state_.layers.end()) {
+        pos = group + 1;
+        positioned = true;
+      }
+    }
+  }
+  state_.layers.insert(pos, std::move(moved));
+
+  /* 新旧父级的 children 按权威向量序重建（同 reorder_layer 的理由）。 */
+  auto rebuild = [&](comp_layer_id owner) {
+    if (owner == 0) return true;
+    Layer* p = find(owner);
+    if (p == nullptr) return false;
+    p->children.clear();
+    for (const Layer& l : state_.layers) {
+      if (l.parent == owner) p->children.push_back(l.id);
+    }
+    return true;
+  };
+  if (!rebuild(old_parent) || !rebuild(parent)) return false;
+  invalidate_composite();
+  return true;
+}
+
+bool Document::duplicate_layer(comp_layer_id id, comp_layer_id* out_id) {
+  const Layer* original = find(id);
+  if (original == nullptr) return false;
+
+  /*
+   * 收集整棵子树（BFS，按 children 簿记序）。组的副本必须带上全部后代：
+   * 只复制组壳会得到一个空组，画面直接少掉一层——比拒绝更糟。
+   */
+  std::vector<comp_layer_id> subtree;
+  subtree.push_back(id);
+  for (size_t i = 0; i < subtree.size(); ++i) {
+    const Layer* node = find(subtree[i]);
+    if (node == nullptr) continue;
+    for (comp_layer_id child : node->children) subtree.push_back(child);
+  }
+
+  /*
+   * 先分配全部新 id / 新修订号再做引用重映射。id 在 state_.next_layer_id 上只增，
+   * 修订号同理——副本是独立内容，与原件共享修订号会让 GPU 缓存把原件纹理当成
+   * 副本的（见 layer.h 的 content_revision 不变量）。
+   */
+  std::unordered_map<comp_layer_id, comp_layer_id> remap;
+  std::vector<Layer> clones;
+  clones.reserve(subtree.size());
+  for (comp_layer_id old_id : subtree) {
+    const Layer* source = find(old_id);
+    if (source == nullptr) return false;
+    Layer clone = *source;
+    clone.id = state_.next_layer_id++;
+    clone.content_revision = allocate_revision();
+    remap.emplace(old_id, clone.id);
+    clones.push_back(std::move(clone));
+  }
+  for (Layer& clone : clones) {
+    auto parent_hit = remap.find(clone.parent);
+    if (parent_hit != remap.end()) clone.parent = parent_hit->second;
+    auto clipping_hit = remap.find(clone.clipping_source);
+    if (clipping_hit != remap.end()) clone.clipping_source = clipping_hit->second;
+    for (comp_layer_id& child : clone.children) {
+      auto child_hit = remap.find(child);
+      if (child_hit != remap.end()) child = child_hit->second;
+    }
+  }
+
+  /* 副本名字追加 " copy"，并按 UTF-8 字符边界截到长度上限内（不能切半个汉字）。 */
+  std::string copy_name = clones.front().name + " copy";
+  if (copy_name.size() > kMaxLayerNameBytes) {
+    size_t limit = kMaxLayerNameBytes;
+    while (limit > 0 && (static_cast<unsigned char>(copy_name[limit]) & 0xC0u) == 0x80u) {
+      --limit;
+    }
+    copy_name.resize(limit);
+  }
+  clones.front().name = copy_name;
+
+  const comp_layer_id root_parent = clones.front().parent;
+  /* 落点：原子树之后的第一个位置（同级、紧贴原件之上）。 */
+  size_t insert_at = state_.layers.size();
+  for (size_t i = 0; i < state_.layers.size(); ++i) {
+    if (remap.find(state_.layers[i].id) != remap.end()) insert_at = i + 1;
+  }
+  const comp_layer_id new_root = clones.front().id;
+  state_.layers.insert(state_.layers.begin() + static_cast<std::ptrdiff_t>(insert_at),
+                       std::make_move_iterator(clones.begin()),
+                       std::make_move_iterator(clones.end()));
+
+  /* 父级 children 簿记：新根紧跟在原件之后（组内复制的叠放次序与原层一致）。 */
+  if (root_parent != 0) {
+    Layer* parent = find(root_parent);
+    if (parent == nullptr) return false;
+    for (size_t i = 0; i < parent->children.size(); ++i) {
+      if (parent->children[i] == id) {
+        parent->children.insert(parent->children.begin() + static_cast<std::ptrdiff_t>(i + 1),
+                                new_root);
+        break;
+      }
+    }
+  }
+
+  invalidate_composite();
+  if (out_id != nullptr) *out_id = new_root;
   return true;
 }
 

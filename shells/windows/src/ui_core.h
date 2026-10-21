@@ -2250,6 +2250,19 @@ inline int32_t layer_drag_target_row(const Rect& panel, int32_t count, double y,
   return static_cast<int32_t>(row);
 }
 
+/*
+ * 拖到目标行的**中间带**（P0-1，拖进组）：行高 22px，上下各 30% 仍是插入位，
+ * 中间 40% 才解释成「放进这个组」。同父重排的语义不受影响——只有落点是组、
+ * 且指针在中间带时，才走跨父级 move；边缘拖拽仍是原来的同父插入。
+ */
+inline bool layer_drag_inner_band(const Rect& panel, int32_t count, int32_t row, double y,
+                                  int row_top) {
+  if (row < 0 || row >= count) return false;
+  const double top = static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
+  const double local = y - top - static_cast<double>(row) * kLayerRowHeight;
+  return local > kLayerRowHeight * 0.3 && local < kLayerRowHeight * 0.7;
+}
+
 /* -------------------------------------------------- 直方图区间缩放（S24） */
 
 /*

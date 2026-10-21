@@ -3752,3 +3752,50 @@ rotation/flip 直接把 invert 与全部滤镜打成不支持，功能退化且�
 「也没人用」的 `half_surface` 的 `canvas_format` 计算整块删除（`-Wunused-variable`）；
 `comp_layer_abi.cpp` 的 coverage stride 闸把 `int32_t` 宽度显式 `static_cast<size_t>` 并先挡
 非正宽度——顺带修掉 `-Wsign-compare`，负宽度也不会再被折成巨值绕过检查。
+
+### 6.37 P0-1 图层面板补全 + `move_layer` 末尾落位缺陷（2026-10-21，Claude）
+
+**缺口。** P0-0 结束时图层面板只有新增、显示与 ±10% 不透明度：删除/复制/改名/建组/多选/
+拖进组全部没有 UI；ABI 侧还缺 `set_name` / `get_name` / `move` / `duplicate` 四个入口。
+验收标准原话：**建组 → 拖两层进组 → 改名 → 复制 → 不透明度改 37% → 删层，每步恰好一次撤销**。
+
+**ABI（纯尾部追加，123 → 127）。** `comp_layer_get_name` / `comp_layer_set_name` /
+`comp_layer_move` / `comp_layer_duplicate`；既有枚举、结构体与签名一个不动。名字的权威留在
+引擎：壳每次 `refresh_layers` 都重取名（两段式探长），撤销重命名、合并、读盘之后面板不会
+显示旧名字。`set_name` 严格 UTF-8，空名/坏编码/超长/未知 id 显式失败（不静默截断）。
+
+**壳侧命令。** `Ctrl+G` 建组（先 `comp_layer_add` 建组再逐层 `move`）、`Ctrl+J` 复制、
+`Del` 删除、`F2`/双击行重命名（预填 + `WM_CHAR` 键入，UTF-16 → UTF-8 一次转换，
+中文名可输入）、`Shift+O` 精确不透明度（0..100 百分比键入）。Ctrl 点行多选，追加选中
+存 **id** 不存行号（重排/撤销后行号失效）。**批量命令整批放进一个显式事务**，N 层删除/复制
+只占一步撤销；拖行重排 / 拖进组 / 拖出组各只发一次 `reorder`/`move`。拖拽只作用于主选中层，
+多选批量拖拽未做。
+
+**拖进/拖出组。** 面板仍是扁平列表，跨父级靠落点区分：落到组行中间带（30%..70%）= 拖进该组
+末尾；落到根级行 = 移出到根级、放在目标行下方；其余跨父级（目标在别的组、拖进自己子树）
+明确拒绝并说明原因，不静默改父级。
+
+**修掉的引擎缺陷（真缺陷，不是适配）。** `Document::move_layer` 在 `before = 0` 时用
+`pos == state_.layers.end()` 判断「该组还没有子层」；但 `pos = 最后一个同父兄弟 + 1`，当最后
+一个兄弟恰好是数组末元素时也等于 `end()`，于是误走 fallback，插到 `group + 1`（= 组底）。
+后果：**每一次** `before = 0` 的移动都落在组的最下面，与 `comp_layer.h` 明写的「移到目标父级
+的末尾」相反；`Ctrl+G` 批量收层时整组堆叠序被静默反转（两层直接上下颠倒，画面上表现为选中的
+上层跑到下层下面）。修法：用独立的 `positioned` 标志区分「找到位置」与「插入点在末尾」，
+`end()` 从此是合法插入点。壳侧 `panel_add_group` 相应**从下往上搬**（`moving.rbegin()`），
+让最后落下的保持原顶层。回归补在 `test_layer_mutation.cpp` 既有用例
+`move_layer_reparents_and_changes_stacking` 内（不增用例数）：非空组上 `move(id, group, 0)`
+后展平，断言新层盖住原组顶。
+
+**验证。** 全量 **528 例 / 0 失败**（P0-0 的 525 + P0-1 新增 3 例）；PE 导出 **127**；
+`run_regression.py --require-ohos` **6/6 PASS**；壳自检 **219 项 SHA256 零变化**
+（`e277a4c4…`，未加自检项）；`visual_check.py` **68 项 / 0 失败**；**本批新增告警 0**。
+图层面板 UI 路径由仓库外的临时验收脚本（`p0_1_ui_check.py`，走 `visual_check.py` 的
+真 `PostMessage` 键鼠 + 像素抓取）跑完整验收路径：每一步做「操作前 ≡ 一次 Ctrl+Z 后」
+与「操作后 ≡ 一次 Ctrl+Y 后」的**逐像素相等**，共 **30 项全过**；其中建组一条额外断言
+「长名层仍在第 0 行」，专门守堆叠序不被反转。
+
+**边界。** ① 组行显示在子层**下方**（`move_layer` 把子层插在组下标 +1，数组序自下而上；
+面板未做树形缩进/折叠，与上游 PS 相反，属沿用既有落位口径）；② 多选不支持 Shift 连续区间、
+不支持批量拖拽；③ 验收证据是机器抓的像素，手感/跨 DPI/多显示器仍待 ALEX 目视
+（`docs/manual-test.md`）；④ `scripts/visual_check.py` 的工作区改动按约定仍未提交。
+

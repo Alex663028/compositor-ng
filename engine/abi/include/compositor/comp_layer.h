@@ -902,6 +902,71 @@ COMP_API comp_result comp_tool_coverage_bounds(const uint8_t* coverage,
                                                int32_t height,
                                                int32_t bounds[4]);
 
+/* ------------------------------------------------- 名称 / 跨组移动（P0-1） */
+
+/*
+ * 读取图层名（UTF-8，含结尾 NUL）。
+ *
+ * 名字一直在文档里（`comp_layer_desc.name` 写入、`.comp` 原样落盘），此前
+ * 唯一的读法是宿主持有自己那份 desc——撤销/重做、合并、读盘之后就对不上了。
+ * 本入口是唯一的读出口：
+ *   - `out_required` 写**所需字节数（含 NUL）**，即使 buffer 不够也照写；
+ *   - `buffer == NULL` 或 `capacity == 0` 是**查询模式**：只回长度，返回 COMP_OK；
+ *   - 缓冲区不够时**拒绝**（COMP_ERR_INVALID_ARGUMENT），不静默截断——截断
+ *     后的 UTF-8 可能把一个汉字的三个字节切掉一个，宿主拿到的就是坏编码；
+ *   - 只读：不开事务、不进撤销栈。
+ */
+COMP_API comp_result comp_layer_get_name(comp_document document,
+                                         comp_layer_id id,
+                                         char* buffer,
+                                         size_t capacity,
+                                         size_t* out_required);
+
+/*
+ * 设置图层名（UTF-8）。对齐上游图层面板的双击重命名：
+ *   - name_utf8 必须非空、是严格合法的 UTF-8（拒绝超长编码、代理区与截断），
+ *     且不超过 1024 字节；否则 COMP_ERR_INVALID_ARGUMENT，且不改旧名字；
+ *   - 与其它属性写入一样**一步撤销**（加入调用方的显式事务，或自成一个隐式步）；
+ *   - 名字不参与像素求值，因此不使合成缓存失效，宿主无需重绘画面。
+ */
+COMP_API comp_result comp_layer_set_name(comp_document document,
+                                         comp_layer_id id,
+                                         const char* name_utf8);
+
+/*
+ * 跨父级移动图层（图层面板把层拖进/拖出组）。
+ *
+ *   - `parent = 0` 表示根级，否则必须是已存在的**组**；
+ *   - `before = 0` 表示移到目标父级的末尾；非 0 时必须与 parent 同级
+ *     （与 comp_layer_reorder 同一把尺子，跨级锚点拒绝）；
+ *   - 不许把组移进自己的子树（含 `parent == id`），否则出现祖先环；
+ *   - 同级移动等价于 `comp_layer_reorder`（走同一条实现）；
+ *   - 一步撤销；成功后堆叠序随新位置改变（数组序即堆叠序）。
+ *
+ * 与 comp_layer_reorder 的分工：后者**只**维持同父级次序，是既有的冻结语义；
+ * 需要换父级时用本入口。错误码：图层/父级/锚点不存在 -> NOT_FOUND，
+ * 父级不是组或锚点不同级 -> INVALID_ARGUMENT，成环 -> INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_layer_move(comp_document document,
+                                     comp_layer_id id,
+                                     comp_layer_id parent,
+                                     comp_layer_id before);
+
+/*
+ * 复制图层（对齐上游 Duplicate Layer，⌘J / Ctrl+J）。
+ *
+ *   - 像素层：像素、蒙版、调整、效果与全部几何/混合属性深拷贝；
+ *   - 组：整棵子树深拷贝（父子关系与组内剪贴引用按新 id 重映射）；
+ *   - 副本落在原型之上、同级；名字追加 " copy"（按 UTF-8 边界截到 1024 字节内）；
+ *   - 新的 layer id 与内容修订号都重新分配（副本是独立内容）；
+ *   - 一步撤销，成功后 `out_id` 为副本 id。
+ *
+ * 错误码：图层不存在 -> NOT_FOUND；`out_id == NULL` -> INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_layer_duplicate(comp_document document,
+                                          comp_layer_id id,
+                                          comp_layer_id* out_id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

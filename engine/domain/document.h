@@ -69,6 +69,36 @@ class Document {
   /* 在同级中把 id 移到 before 之前（before = 0 表示移到同级末尾）。 */
   bool reorder_layer(comp_layer_id id, comp_layer_id before);
 
+  /*
+   * 改图层名（对齐上游图层面板的双击重命名）。name 是 UTF-8，必须非空、
+   * 每字符合法且总长（字节）不超过 kMaxLayerNameBytes——名字会被 .comp
+   * 原样落盘，超长/坏编码一旦入库就再也无法在宿主侧显示成一行。
+   * 只改名字：不动像素、不改堆叠序、不使合成缓存失效。
+   */
+  static constexpr size_t kMaxLayerNameBytes = 1024;
+  bool rename_layer(comp_layer_id id, const std::string& name);
+
+  /*
+   * 跨父级移动（图层面板拖拽：拖进/拖出组）。parent = 0 表示根级，
+   * before = 0 表示移到目标父级的**末尾**。校验：
+   *   - parent 必须存在且是组（0 例外）；
+   *   - before 必须存在且与 parent 同级（与 reorder_layer 同一把尺子）；
+   *   - 不许把组移进自己的子树（含 parent == id）。
+   * 与 reorder_layer 的区别只有一个：允许换 parent。堆叠序的权威仍是
+   * state_.layers 的向量序，成功后按新序重建新旧父级的 children 簿记。
+   */
+  bool move_layer(comp_layer_id id, comp_layer_id parent, comp_layer_id before);
+
+  /*
+   * 复制图层（对齐上游 Duplicate Layer，⌘J）：
+   *   - 像素层：像素 / 蒙版 / 调整 / 效果 / 全部几何与混合属性深拷贝；
+   *   - 组：整棵子树深拷贝（父子关系、组内剪贴引用一并重映射）。
+   * 副本落在原层（组为原组）之上，同级；名字追加 " copy"（UTF-8 边界安全地
+   * 截到 1024 字节上限内）。新 layer id 与内容修订号都重新分配——副本是独立内容，
+   * 不能共享修订号（否则 GPU 会把原层纹理当成副本的）。一步撤销。
+   */
+  bool duplicate_layer(comp_layer_id id, comp_layer_id* out_id);
+
   /* ------------------------------------------------------- 合并 / 拼合 */
 
   /*
