@@ -235,6 +235,16 @@ struct ShellState {
   std::vector<std::pair<comp_layer_id, uint8_t>> visibility; /* id -> visible */
   int32_t selected_layer = 0; /* 面板行索引（0 = 最上层显示行） */
   /*
+   * S44：面板显示序改为树。数组序（layers）自下而上，组行与其子层在数组里紧邻，
+   * 但面板要「组行在上、子层缩进在下」，且折叠的组不展开——显示序不再等于数组
+   * 逆序。这两个向量与 layers 同长度刷新，元素是 layers 下标与缩进层级；
+   * selected_layer 仍然是**显示行号**，所以选层 / 绘制 / 拖拽一律经 display 换算。
+   */
+  std::vector<int32_t> layer_display;
+  std::vector<int32_t> layer_depth;
+  /* 折叠的组 id（只存组，换文档 / 删组时在 refresh_layers 里收敛）。 */
+  std::vector<comp_layer_id> collapsed_groups;
+  /*
    * P0-1：多选。selected_layer 仍是「主选中行」——所有既有单层命令的输入不变；
    * extra_selection 只是额外选中的图层 id。批量命令 = 主选中 + 额外，且整批放进
    * 一个显式事务（comp_txn_begin/commit），N 层删除/复制只占一步撤销。
@@ -788,11 +798,143 @@ std::string number_text(double value);
 std::wstring widen_utf8(const std::string& text);
 std::string narrow_utf8(const std::wstring& text);
 
+/*
+ * S44：重建树形显示序（组行在上、子层缩进在下、折叠的组不展开）。
+ *
+ * layers 变了（换文档 / 撤销 / 增删层）或折叠状态变了都要调。折叠集合先按「仍是组」
+ * 收敛：撤销或删除之后 id 可能已经不在了，留着它只会让以后新建的同 id 组莫名其妙
+ * 处于折叠态。
+ */
+void rebuild_layer_display(ShellState& shell) {
+  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  if (!shell.collapsed_groups.empty()) {
+    std::vector<comp_layer_id> alive;
+    alive.reserve(shell.collapsed_groups.size());
+    for (comp_layer_id id : shell.collapsed_groups) {
+      for (const LayerRow& row : shell.layers) {
+        if (row.id == id && row.is_group != 0) {
+          alive.push_back(id);
+          break;
+        }
+      }
+    }
+    shell.collapsed_groups.swap(alive);
+  }
+
+  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
+  std::vector<uint8_t> collapsed(static_cast<size_t>(count), 0);
+  for (int32_t i = 0; i < count; ++i) {
+    const LayerRow& row = shell.layers[static_cast<size_t>(i)];
+    entries[static_cast<size_t>(i)] = comp_ui::LayerStackEntry{
+        static_cast<int64_t>(row.id), static_cast<int64_t>(row.parent),
+        static_cast<int64_t>(row.clipping)};
+    for (comp_layer_id id : shell.collapsed_groups) {
+      if (id == row.id) {
+        collapsed[static_cast<size_t>(i)] = 1;
+        break;
+      }
+    }
+  }
+  shell.layer_display.assign(static_cast<size_t>(count), 0);
+  shell.layer_depth.assign(static_cast<size_t>(count), 0);
+  const int32_t rows = comp_ui::build_layer_display(
+      entries.data(), count, collapsed.data(), shell.layer_display.data(),
+      shell.layer_depth.data(), count);
+  shell.layer_display.resize(static_cast<size_t>(rows));
+  shell.layer_depth.resize(static_cast<size_t>(rows));
+}
+
+/* 面板显示行数（折叠之后可能少于图层数）。 */
+int32_t panel_row_count(const ShellState& shell) {
+  return static_cast<int32_t>(shell.layer_display.size());
+}
+
+/* 把面板镜像投影成 ui_core 的纯数据（数组序、自下而上），供纯函数规划用。 */
+std::vector<comp_ui::LayerStackEntry> layer_stack_entries(const ShellState& shell) {
+  std::vector<comp_ui::LayerStackEntry> entries(shell.layers.size());
+  for (size_t i = 0; i < shell.layers.size(); ++i) {
+    const LayerRow& row = shell.layers[i];
+    entries[i] = comp_ui::LayerStackEntry{static_cast<int64_t>(row.id),
+                                          static_cast<int64_t>(row.parent),
+                                          static_cast<int64_t>(row.clipping)};
+  }
+  return entries;
+}
+
+/* 显示行 -> 图层；越界 / 被折叠返回 nullptr。所有面板读路径都必须走这里。 */
+const LayerRow* layer_row_at(const ShellState& shell, int32_t row) {
+  if (row < 0 || row >= panel_row_count(shell)) return nullptr;
+  const int32_t index = shell.layer_display[static_cast<size_t>(row)];
+  if (index < 0 || index >= static_cast<int32_t>(shell.layers.size())) return nullptr;
+  return &shell.layers[static_cast<size_t>(index)];
+}
+
+/* 图层 id -> 显示行；不存在或被折叠返回 -1。 */
+int32_t panel_row_of_id(const ShellState& shell, comp_layer_id id) {
+  const int32_t rows = panel_row_count(shell);
+  for (int32_t row = 0; row < rows; ++row) {
+    const LayerRow* layer = layer_row_at(shell, row);
+    if (layer != nullptr && layer->id == id) return row;
+  }
+  return -1;
+}
+
+bool layer_group_collapsed(const ShellState& shell, comp_layer_id id) {
+  for (comp_layer_id collapsed : shell.collapsed_groups) {
+    if (collapsed == id) return true;
+  }
+  return false;
+}
+
+/*
+ * 组折叠开关（S44）：只改壳侧显示状态，不写文档、不进撤销——上游的折叠三角
+ * 同样是视图态。折叠后选中的子层会被藏起来，选中态落到组行上，避免「看不见却
+ * 还在选中」导致下一次快捷键作用到不可见的层。
+ */
+void panel_toggle_group_collapsed(ShellState& shell, comp_layer_id id) {
+  const LayerRow* selected_before = layer_row_at(shell, shell.selected_layer);
+  const comp_layer_id selected_id = selected_before != nullptr ? selected_before->id : 0;
+
+  bool removed = false;
+  for (size_t i = 0; i < shell.collapsed_groups.size(); ++i) {
+    if (shell.collapsed_groups[i] == id) {
+      shell.collapsed_groups.erase(shell.collapsed_groups.begin() +
+                                   static_cast<std::ptrdiff_t>(i));
+      removed = true;
+      break;
+    }
+  }
+  if (!removed) shell.collapsed_groups.push_back(id);
+
+  rebuild_layer_display(shell);
+  const int32_t rows = panel_row_count(shell);
+  if (shell.selected_layer >= rows) shell.selected_layer = rows > 0 ? rows - 1 : 0;
+  if (shell.selected_layer < 0) shell.selected_layer = 0;
+  if (selected_id != 0 && panel_row_of_id(shell, selected_id) < 0) {
+    const int32_t group_row = panel_row_of_id(shell, id);
+    if (group_row >= 0) shell.selected_layer = group_row;
+  }
+  /*
+   * 多选集合同样只保留看得见的层：批量命令按可见行枚举 id，留着被折叠的子层
+   * 只会让「已选中 N 个图层」的计数与真正被执行的数量对不上。
+   */
+  if (!shell.extra_selection.empty()) {
+    std::vector<comp_layer_id> visible;
+    visible.reserve(shell.extra_selection.size());
+    for (comp_layer_id extra : shell.extra_selection) {
+      if (panel_row_of_id(shell, extra) >= 0) visible.push_back(extra);
+    }
+    shell.extra_selection.swap(visible);
+  }
+}
+
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
 void refresh_layers(ShellState& shell) {
   shell.layers.clear();
   if (shell.document == nullptr) {
     shell.extra_selection.clear();
+    shell.layer_display.clear();
+    shell.layer_depth.clear();
     return;
   }
 
@@ -800,11 +942,18 @@ void refresh_layers(ShellState& shell) {
   if (comp_layer_count(shell.document, &count) != COMP_OK || count == 0) {
     shell.selected_layer = 0;
     shell.extra_selection.clear();
+    shell.layer_display.clear();
+    shell.layer_depth.clear();
     return;
   }
   std::vector<comp_layer_id> ids(count, 0);
   size_t written = 0;
-  if (comp_layer_list(shell.document, ids.data(), ids.size(), &written) != COMP_OK) return;
+  if (comp_layer_list(shell.document, ids.data(), ids.size(), &written) != COMP_OK) {
+    /* 列表读失败：显示序必须一起清掉，否则行数还停在上一份文档。 */
+    shell.layer_display.clear();
+    shell.layer_depth.clear();
+    return;
+  }
   if (written < ids.size()) ids.resize(written);
 
   for (comp_layer_id id : ids) {
@@ -894,9 +1043,14 @@ void refresh_layers(ShellState& shell) {
     shell.layers.push_back(row);
   }
 
+  /* S44：显示序跟着 layers 重建，再按显示行数夹取选中行（折叠后行数会变少）。 */
+  rebuild_layer_display(shell);
+  const int32_t rows = panel_row_count(shell);
   if (shell.selected_layer < 0) shell.selected_layer = 0;
-  if (shell.selected_layer >= static_cast<int32_t>(shell.layers.size())) {
-    shell.selected_layer = static_cast<int32_t>(shell.layers.size()) - 1;
+  if (rows <= 0) {
+    shell.selected_layer = 0;
+  } else if (shell.selected_layer >= rows) {
+    shell.selected_layer = rows - 1;
   }
   /*
    * 多选集合随图层事实收敛：被删掉的图层（删除/合并/撤销/拼合）必须从额外选中里
@@ -928,16 +1082,13 @@ void refresh_layers(ShellState& shell) {
   refresh_histogram(shell);
 }
 
-/* 面板显示序：数组序是自下而上，UI 需要自上而下（顶层在第一行）。 */
+/* 面板显示行 -> 图层：S44 起行号经树形 display 换算，不再假设「行 = 逆序下标」。 */
 const LayerRow* selected_row(const ShellState& shell) {
-  if (shell.layers.empty()) return nullptr;
-  const int32_t count = static_cast<int32_t>(shell.layers.size());
-  if (shell.selected_layer < 0 || shell.selected_layer >= count) return nullptr;
-  return &shell.layers[static_cast<size_t>(count - 1 - shell.selected_layer)];
+  return layer_row_at(shell, shell.selected_layer);
 }
 
 void panel_move_selection(ShellState& shell, int32_t delta) {
-  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  const int32_t count = panel_row_count(shell);
   if (count == 0) {
     set_status(shell, L"无图层");
     return;
@@ -1181,7 +1332,7 @@ void panel_toggle_clipping(ShellState& shell) {
    * S22 这里取的是 self_index + 1（**上方**一层），并且守卫拒绝的是顶层、提示却
    * 写「最底层无法剪贴」。取反之后剪贴栈永远不成形：FilterGraph 路径画面不变，
    * 而 compositor.cpp 的单层视图只看 clipping_source != 0 就按基底求值，于是同一
-   * 份文档在不同视图下画得不一样。换算现在全部交给 comp_ui::plan_clipping_base，
+   * 份文档在不同视图下画得不一样。换算现在全部交给 comp_ui::plan_clipping_base_index，
    * 由 test_ui_core.cpp 表驱动穷举（同父相邻、跨组、已有剪贴栈、边界）。
    */
   std::vector<comp_ui::LayerStackEntry> stack;
@@ -1191,8 +1342,11 @@ void panel_toggle_clipping(ShellState& shell) {
                                              static_cast<int64_t>(item.parent),
                                              static_cast<int64_t>(item.clipping)});
   }
-  const comp_ui::ClippingPlan plan = comp_ui::plan_clipping_base(
-      stack.data(), static_cast<int32_t>(stack.size()), shell.selected_layer);
+  /* S44：行号先经 display 换成数组下标——树形面板里两者不再是 count-1-row。 */
+  const comp_ui::ClippingPlan plan = comp_ui::plan_clipping_base_index(
+      stack.data(), static_cast<int32_t>(stack.size()),
+      comp_ui::layer_index_at_row(shell.layer_display.data(), panel_row_count(shell),
+                                  shell.selected_layer));
   if (!plan.ok()) {
     switch (plan.target) {
       case comp_ui::ClippingTarget::kNoSiblingBelow:
@@ -1275,8 +1429,18 @@ void panel_reorder_layer(ShellState& shell, int direction) {
     return;
   }
   const int32_t count = static_cast<int32_t>(shell.layers.size());
+  const int32_t index = comp_ui::layer_index_at_row(
+      shell.layer_display.data(), panel_row_count(shell), shell.selected_layer);
+  const LayerRow* row = layer_row_at(shell, shell.selected_layer);
+  if (index < 0 || row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const comp_layer_id self = row->id;
+
+  const std::vector<comp_ui::LayerStackEntry> entries = layer_stack_entries(shell);
   const comp_ui::ReorderPlan plan =
-      comp_ui::plan_layer_reorder(count, shell.selected_layer, direction);
+      comp_ui::plan_layer_reorder(entries.data(), count, index, direction);
 
   if (!plan.ok) {
     /* 已在端头：如实提示，不静默无操作（否则用户以为菜单坏了）。 */
@@ -1284,20 +1448,14 @@ void panel_reorder_layer(ShellState& shell, int direction) {
     return;
   }
 
-  const comp_layer_id self =
-      shell.layers[static_cast<size_t>(
-          comp_ui::layer_array_index(count, shell.selected_layer))].id;
-
   /*
-   * before_row < 0 表示引擎约定的 before = 0（同级末尾 = 顶层）；
-   * 否则锚点是那一行对应的图层 id。锚点必须与被移动层同级——跨父锚点会被
-   * Document::reorder_layer 拒绝（返回 false）而不是静默错位，这里是壳侧
-   * 唯一可能越级的地方（面板是扁平列表，组内层也在其中）。
+   * before_index < 0 表示引擎约定的 before = 0（同级末尾 = 顶层）；否则锚点是
+   * 那个数组下标对应的图层 id。锚点由纯函数保证与被移动层同级——跨父锚点会被
+   * Document::reorder_layer 拒绝（返回 false）而不是静默错位。
    */
   comp_layer_id before = 0;
-  if (plan.before_row >= 0) {
-    const int32_t anchor_index = comp_ui::layer_array_index(count, plan.before_row);
-    before = shell.layers[static_cast<size_t>(anchor_index)].id;
+  if (plan.before_index >= 0) {
+    before = shell.layers[static_cast<size_t>(plan.before_index)].id;
   }
 
   if (comp_layer_reorder(shell.document, self, before) != COMP_OK) {
@@ -1306,12 +1464,12 @@ void panel_reorder_layer(ShellState& shell, int direction) {
   }
   refresh_layers(shell);
   /*
-   * 选中态跟着该图层走：重排后数组换了位置，selected_layer 是**面板行索引**，
-   * 必须用纯函数给出的 next_row 重算，否则「刚移动的那一层」在面板上换了行，
-   * 后续快捷键会作用到别层——这一类错误不报任何异常，只会让用户觉得软件
-   * 选不中自己要的那层。
+   * 选中态跟着该图层走：重排后数组与显示序都变了，selected_layer 是**面板行号**，
+   * 按 id 重选。树形面板里行号还会因展开的子树而整体平移，所以不能沿用旧行号 +
+   * 固定偏移——那类错误不报任何异常，只会让后续快捷键作用到别层。
    */
-  shell.selected_layer = comp_ui::clamp_selected_row(plan.next_row, count);
+  const int32_t new_row = panel_row_of_id(shell, self);
+  if (new_row >= 0) shell.selected_layer = new_row;
   shell.needs_render = true;
   if (direction == -2) {
     refresh_history_status(shell, L"图层置顶");
@@ -2068,10 +2226,12 @@ void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown,
                       bool drop_into_group_item) {
   const int32_t count = static_cast<int32_t>(shell.layers.size());
   if (count <= 0) return;
-  const comp_layer_id self =
-      shell.layers[static_cast<size_t>(comp_ui::layer_array_index(count, from_shown))].id;
+  const LayerRow* source = layer_row_at(shell, from_shown);
+  const LayerRow* target_row = layer_row_at(shell, to_shown);
+  if (source == nullptr || target_row == nullptr) return;
+  const comp_layer_id self = source->id;
   if (drop_into_group_item && to_shown != from_shown) {
-    const LayerRow& target = shell.layers[static_cast<size_t>(count - 1 - to_shown)];
+    const LayerRow& target = *target_row;
     if (target.is_group != 0 && target.id != self) {
       if (comp_layer_move(shell.document, self, target.id, 0) != COMP_OK) {
         /* 常见原因：把自己/自己的祖先拖进自己的子树。引擎里已拒绝，原样透出。 */
@@ -2089,24 +2249,18 @@ void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown,
       return;
     }
   }
-  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
-  for (int32_t i = 0; i < count; ++i) {
-    const LayerRow& row = shell.layers[static_cast<size_t>(i)];
-    entries[static_cast<size_t>(i)].id = static_cast<int64_t>(row.id);
-    entries[static_cast<size_t>(i)].parent = static_cast<int64_t>(row.parent);
-    entries[static_cast<size_t>(i)].clipping = static_cast<int64_t>(row.clipping);
-  }
-  const comp_ui::DragPlan plan =
-      comp_ui::plan_layer_drag(entries.data(), count, from_shown, to_shown);
+  const std::vector<comp_ui::LayerStackEntry> entries = layer_stack_entries(shell);
+  const comp_ui::DragPlan plan = comp_ui::plan_layer_drag(
+      entries.data(), count, shell.layer_display.data(), panel_row_count(shell), from_shown,
+      to_shown);
   switch (plan.target) {
     case comp_ui::DragTarget::kSameRow:
       set_status(shell, L"拖回原位，图层顺序未变");
       return;
     case comp_ui::DragTarget::kCrossParent: {
       /* 跨父级且不是「拖进组」：只有目标行在根级时解释成「移出组」。 */
-      const LayerRow& target = shell.layers[static_cast<size_t>(count - 1 - to_shown)];
-      const LayerRow& dragged =
-          shell.layers[static_cast<size_t>(comp_ui::layer_array_index(count, from_shown))];
+      const LayerRow& target = *target_row;
+      const LayerRow& dragged = *source;
       if (target.parent == 0 && dragged.parent != 0) {
         if (comp_layer_move(shell.document, self, 0, target.id) != COMP_OK) {
           set_status(shell, L"移出组失败（未修改任何数据）");
@@ -2138,11 +2292,16 @@ void panel_drop_layer(ShellState& shell, int32_t from_shown, int32_t to_shown,
     return;
   }
   refresh_layers(shell);
-  /* 选中态跟着被拖动的那一层走（selected_layer 是面板行索引，必须重算）。 */
-  shell.selected_layer = comp_ui::clamp_selected_row(plan.next_row, count);
+  /*
+   * 选中态跟着被拖动的那一层走：按 id 重选。树形面板里落点行号会因展开的子树
+   * 整体平移（next_row 只在扁平文档里精确），沿用行号会选中别的层。
+   */
+  panel_select_layer_id(shell, self);
   shell.needs_render = true;
+  const int32_t landed = panel_row_of_id(shell, self);
   wchar_t buffer[128];
-  wsprintfW(buffer, L"拖行重排：第 %d 行 → 第 %d 行", from_shown + 1, plan.next_row + 1);
+  wsprintfW(buffer, L"拖行重排：第 %d 行 → 第 %d 行", from_shown + 1,
+            landed >= 0 ? landed + 1 : to_shown + 1);
   refresh_history_status(shell, buffer);
 }
 
@@ -2266,26 +2425,20 @@ void sync_menu_state(HWND window, ShellState& shell) {
         state.can_merge_down = true;
       }
     }
+    const std::vector<comp_ui::LayerStackEntry> entries = layer_stack_entries(shell);
+    const int32_t count = static_cast<int32_t>(entries.size());
+    const int32_t index = comp_ui::layer_index_at_row(
+        shell.layer_display.data(), panel_row_count(shell), shell.selected_layer);
     /* 未剪贴时要能找到同父基底；已在剪贴态时任何一层都能取消。 */
     if (row->clipping != 0) {
       state.clipping_available = true;
     } else if (shell.layers.size() >= 2) {
-      std::vector<comp_ui::LayerStackEntry> stack;
-      stack.reserve(shell.layers.size());
-      for (const LayerRow& item : shell.layers) {
-        stack.push_back(comp_ui::LayerStackEntry{static_cast<int64_t>(item.id),
-                                                 static_cast<int64_t>(item.parent),
-                                                 static_cast<int64_t>(item.clipping)});
-      }
       state.clipping_available =
-          comp_ui::plan_clipping_base(stack.data(), static_cast<int32_t>(stack.size()),
-                                      shell.selected_layer)
-              .ok();
+          comp_ui::plan_clipping_base_index(entries.data(), count, index).ok();
     }
     /* 端头直接置灰，而不是点完才在状态栏说「已经是顶层」。 */
-    const int32_t count = state.layer_count;
-    state.can_move_up = comp_ui::plan_layer_reorder(count, shell.selected_layer, -1).ok;
-    state.can_move_down = comp_ui::plan_layer_reorder(count, shell.selected_layer, 1).ok;
+    state.can_move_up = comp_ui::plan_layer_reorder(entries.data(), count, index, -1).ok;
+    state.can_move_down = comp_ui::plan_layer_reorder(entries.data(), count, index, 1).ok;
   }
 
   const comp_ui::LayerMenuChecks checks = comp_ui::layer_menu_checks(state);
@@ -2683,7 +2836,7 @@ bool panel_selection_contains(const ShellState& shell, comp_layer_id id) {
 }
 
 /*
- * 批量命令的 id 列表（面板显示序：从上到下，即数组逆序）。
+ * 批量命令的 id 列表（面板显示序：从上到下；S44 起树形序，子层紧跟组行）。
  *
  * 已经「被选中祖先覆盖」的图层要从列表里摘掉：删/复制一个组时整棵子树
  * 已经跟着走了，再对子层发一次写入只会失败——而且是那种「第一层成功、
@@ -2691,9 +2844,11 @@ bool panel_selection_contains(const ShellState& shell, comp_layer_id id) {
  */
 std::vector<comp_layer_id> panel_selection_ids(const ShellState& shell, bool drop_covered) {
   std::vector<comp_layer_id> ids;
-  const int32_t count = static_cast<int32_t>(shell.layers.size());
-  for (int32_t shown = 0; shown < count; ++shown) {
-    const LayerRow& row = shell.layers[static_cast<size_t>(count - 1 - shown)];
+  const int32_t rows = panel_row_count(shell);
+  for (int32_t shown = 0; shown < rows; ++shown) {
+    const LayerRow* layer = layer_row_at(shell, shown);
+    if (layer == nullptr) continue;
+    const LayerRow& row = *layer;
     if (!panel_selection_contains(shell, row.id)) continue;
     if (drop_covered) {
       bool covered = false;
@@ -2723,15 +2878,10 @@ std::vector<comp_layer_id> panel_selection_ids(const ShellState& shell, bool dro
   return ids;
 }
 
-/* 按 id 选中（selected_layer 是面板显示行号，必须反算）。 */
+/* 按 id 选中（selected_layer 是面板显示行号，S44 起经树形 display 反查）。 */
 void panel_select_layer_id(ShellState& shell, comp_layer_id id) {
-  const int32_t count = static_cast<int32_t>(shell.layers.size());
-  for (int32_t i = 0; i < count; ++i) {
-    if (shell.layers[static_cast<size_t>(i)].id == id) {
-      shell.selected_layer = count - 1 - i;
-      return;
-    }
-  }
+  const int32_t row = panel_row_of_id(shell, id);
+  if (row >= 0) shell.selected_layer = row;
 }
 
 /*
@@ -8695,10 +8845,40 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    */
   const int row_top = comp_ui::layer_rows_top(shell.histogram_open);
 
-  const int32_t count = static_cast<int32_t>(shell.layers.size());
+  const int32_t count = panel_row_count(shell);
   for (int32_t line = 0; line < count; ++line) {
     const comp_ui::Rect row_rect = comp_ui::layer_row_rect(panel_rect, line, row_top);
-    const LayerRow& row = shell.layers[static_cast<size_t>(count - 1 - line)];
+    const LayerRow* layer = layer_row_at(shell, line);
+    if (layer == nullptr) continue;
+    const LayerRow& row = *layer;
+    /*
+     * S44：子层缩进 + 组折叠三角。三角槽位在**所有**行上都留出（kLayerTreeMarker），
+     * 同一层级的名字才会对齐；只有组行真的画三角。缩进有上限（见 ui_core），
+     * 名字不会被推出栏外。
+     */
+    const int32_t depth = line < static_cast<int32_t>(shell.layer_depth.size())
+                              ? shell.layer_depth[static_cast<size_t>(line)]
+                              : 0;
+    const int indent = comp_ui::layer_row_indent(depth);
+    if (row.is_group != 0) {
+      const comp_ui::Rect tri = comp_ui::layer_triangle_rect(row_rect, depth);
+      const bool folded = layer_group_collapsed(shell, row.id);
+      POINT points[3];
+      if (folded) {
+        points[0] = POINT{tri.x, tri.y};
+        points[1] = POINT{tri.x, tri.bottom()};
+        points[2] = POINT{tri.right(), tri.y + tri.h / 2};
+      } else {
+        points[0] = POINT{tri.x, tri.y};
+        points[1] = POINT{tri.right(), tri.y};
+        points[2] = POINT{tri.x + tri.w / 2, tri.bottom()};
+      }
+      HBRUSH tri_brush = CreateSolidBrush(RGB(196, 202, 214));
+      HGDIOBJ old_brush = SelectObject(dc, tri_brush);
+      Polygon(dc, points, 3);
+      SelectObject(dc, old_brush);
+      DeleteObject(tri_brush);
+    }
     if (line == shell.selected_layer) {
       RECT highlight{row_rect.x + 2, row_rect.y + 1, row_rect.right() - 2,
                      row_rect.bottom() - 1};
@@ -8764,7 +8944,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     wsprintfW(line_text, L"%s %s  %s%s  %d%%", row.visible != 0 ? L"[o]" : L"[-]",
               display_name.c_str(), blend_name.c_str(), marks_line.c_str(),
               static_cast<int>(row.opacity * 100.0f + 0.5f));
-    TextOutW(dc, row_rect.x + 10, row_rect.y + 3, line_text, lstrlenW(line_text));
+    TextOutW(dc, row_rect.x + 10 + indent + comp_ui::kLayerTreeMarker, row_rect.y + 3,
+             line_text, lstrlenW(line_text));
   }
 
   /*
@@ -12689,15 +12870,43 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             }
           }
           const int row_top = comp_ui::layer_rows_top(shell->histogram_open);
-          const int row = comp_ui::layer_row_at(
-              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
-              row_top);
+          /* S44：行数用可见行数（折叠后子层不占行），行号经 display 换算成图层。 */
+          const int row = comp_ui::layer_row_at(layout.layer_panel, panel_row_count(*shell),
+                                                mouse_x, mouse_y, row_top);
           if (row >= 0) {
+            const LayerRow* clicked_layer = layer_row_at(*shell, row);
+            if (clicked_layer != nullptr && clicked_layer->is_group != 0) {
+              /*
+               * S44 组折叠：三角落在行首的固定槽位里，只对组行生效，且必须先于
+               * 行选中与双击改名——否则点三角会顺手把该组选上/改起名来。
+               */
+              const comp_ui::Rect row_rect = comp_ui::layer_row_rect(
+                  layout.layer_panel, row, row_top);
+              const int depth = row < static_cast<int>(shell->layer_depth.size())
+                                    ? shell->layer_depth[static_cast<size_t>(row)]
+                                    : 0;
+              const comp_ui::Rect triangle = comp_ui::layer_triangle_rect(row_rect, depth);
+              if (triangle.contains(mouse_x, mouse_y)) {
+                panel_toggle_group_collapsed(*shell, clicked_layer->id);
+                refresh_effects(*shell);
+                /* 组内层数取全量数组（折叠后子层不在可见行里，数不到）。 */
+                int32_t children = 0;
+                for (const LayerRow& layer : shell->layers) {
+                  if (layer.parent == clicked_layer->id) ++children;
+                }
+                wchar_t buffer[192];
+                wsprintfW(buffer, L"%s组 #%I64u（%d 层）",
+                          layer_group_collapsed(*shell, clicked_layer->id) ? L"已折叠 "
+                                                                          : L"已展开 ",
+                          static_cast<unsigned long long>(clicked_layer->id), children);
+                set_status(*shell, buffer);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+              }
+            }
             const bool click_ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool click_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            const int32_t layer_count = static_cast<int32_t>(shell->layers.size());
-            const comp_layer_id clicked_id =
-                shell->layers[static_cast<size_t>(layer_count - 1 - row)].id;
+            const comp_layer_id clicked_id = clicked_layer != nullptr ? clicked_layer->id : 0;
             /*
              * P0-1 多选（对齐上游图层面板）：
              *   Ctrl+点 = 切换该层是否在多选集合里；点主选中层则把它从选中里摘掉
@@ -12712,12 +12921,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                   if (!shell->extra_selection.empty()) {
                     const comp_layer_id promoted = shell->extra_selection.front();
                     shell->extra_selection.erase(shell->extra_selection.begin());
-                    for (int32_t i = 0; i < layer_count; ++i) {
-                      if (shell->layers[static_cast<size_t>(i)].id == promoted) {
-                        shell->selected_layer = layer_count - 1 - i;
-                        break;
-                      }
-                    }
+                    /* S44：行号随折叠变化，按 id 反查可见行，而不是数组逆序推算。 */
+                    panel_select_layer_id(*shell, promoted);
                   }
                 } else {
                   auto& extras = shell->extra_selection;
@@ -12736,9 +12941,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               const int32_t to = shell->selected_layer < row ? row : shell->selected_layer;
               shell->extra_selection.clear();
               for (int32_t line = from; line <= to; ++line) {
-                const comp_layer_id id =
-                    shell->layers[static_cast<size_t>(layer_count - 1 - line)].id;
-                if (id != clicked_id) shell->extra_selection.push_back(id);
+                const LayerRow* line_layer = layer_row_at(*shell, line);
+                if (line_layer != nullptr && line_layer->id != clicked_id) {
+                  shell->extra_selection.push_back(line_layer->id);
+                }
               }
               shell->selected_layer = row;
             } else {
@@ -13117,10 +13323,25 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
          * 进不了改名态。
          */
         if (client_layout(*shell, &layout) && layout.layer_panel.contains(mouse_x, mouse_y)) {
-          const int row = comp_ui::layer_row_at(
-              layout.layer_panel, static_cast<int>(shell->layers.size()), mouse_x, mouse_y,
-              comp_ui::layer_rows_top(shell->histogram_open));
+          const int row = comp_ui::layer_row_at(layout.layer_panel, panel_row_count(*shell),
+                                                mouse_x, mouse_y,
+                                                comp_ui::layer_rows_top(shell->histogram_open));
           if (row >= 0) {
+            /*
+             * S44：双击三角槽位只是「折叠再折叠」的连击，不能顺手进改名——
+             * 否则用户想展开组，却先弹出组名编辑框。
+             */
+            const LayerRow* row_layer = layer_row_at(*shell, row);
+            const comp_ui::Rect triangle = comp_ui::layer_triangle_rect(
+                comp_ui::layer_row_rect(layout.layer_panel, row,
+                                        comp_ui::layer_rows_top(shell->histogram_open)),
+                row < static_cast<int>(shell->layer_depth.size())
+                    ? shell->layer_depth[static_cast<size_t>(row)]
+                    : 0);
+            if (row_layer != nullptr && row_layer->is_group != 0 &&
+                triangle.contains(mouse_x, mouse_y)) {
+              return 0;
+            }
             shell->extra_selection.clear();
             shell->selected_layer = row;
             refresh_adjustments(*shell);
@@ -13205,13 +13426,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         bool drop_into_group = false;
         if (dragged && to_row >= 0) {
           Layout layout{};
-          const int32_t count = static_cast<int32_t>(shell->layers.size());
-          if (client_layout(*shell, &layout) && to_row < count) {
-            const LayerRow& target = shell->layers[static_cast<size_t>(count - 1 - to_row)];
+          /* S44：行号是可见行，目标图层经树形 display 反查。 */
+          const int32_t rows = panel_row_count(*shell);
+          const LayerRow* target = layer_row_at(*shell, to_row);
+          if (client_layout(*shell, &layout) && target != nullptr) {
             /* 只有组行、且指针停在行中间带时才解释成「拖进组」。 */
             drop_into_group =
-                target.is_group != 0 &&
-                comp_ui::layer_drag_inner_band(layout.layer_panel, count, to_row,
+                target->is_group != 0 &&
+                comp_ui::layer_drag_inner_band(layout.layer_panel, rows, to_row,
                                                static_cast<double>(mouse_y),
                                                comp_ui::layer_rows_top(shell->histogram_open));
           }
@@ -13449,9 +13671,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               shell->layer_drag_active = true;
             }
             if (shell->layer_drag_active) {
-              const int32_t count = static_cast<int32_t>(shell->layers.size());
+              /* S44：目标行只在可见行里找——折叠掉的子层不该成为落点。 */
               shell->layer_drag_target = comp_ui::layer_drag_target_row(
-                  layout.layer_panel, count, static_cast<double>(mouse_y),
+                  layout.layer_panel, panel_row_count(*shell), static_cast<double>(mouse_y),
                   comp_ui::layer_rows_top(shell->histogram_open));
               InvalidateRect(window, nullptr, FALSE);
               return 0;

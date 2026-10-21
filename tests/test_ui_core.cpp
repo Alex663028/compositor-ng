@@ -2302,26 +2302,41 @@ COMP_TEST(ui_core_layer_rows_hit_test_respects_histogram_offset) {
  * 「用户在面板上看到什么」去比。
  */
 std::vector<int64_t> simulate_engine_reorder(const std::vector<int64_t>& bottom_to_top,
-                                             int32_t shown, int32_t direction) {
-  std::vector<int64_t> layers = bottom_to_top;
-  const int32_t count = static_cast<int32_t>(layers.size());
-  const comp_ui::ReorderPlan plan = comp_ui::plan_layer_reorder(count, shown, direction);
-  if (!plan.ok) return layers; /* 已在端头：不产生任何变更 */
+                                             const comp_ui::LayerStackEntry* layers,
+                                             const int32_t* display, int32_t rows, int32_t row,
+                                             int32_t direction) {
+  std::vector<int64_t> array = bottom_to_top;
+  const int32_t count = static_cast<int32_t>(array.size());
+  const int32_t index = comp_ui::layer_index_at_row(display, rows, row);
+  const comp_ui::ReorderPlan plan = comp_ui::plan_layer_reorder(layers, count, index, direction);
+  if (!plan.ok) return array; /* 已在端头：不产生任何变更 */
 
-  const int32_t index = comp_ui::layer_array_index(count, shown);
-  const int64_t self = layers[static_cast<size_t>(index)];
+  const int64_t self = array[static_cast<size_t>(index)];
+  const int64_t parent = layers[index].parent;
+  int32_t last_sibling = -1;
+  for (int32_t i = 0; i < count; ++i) {
+    if (i == index || layers[i].parent != parent) continue;
+    last_sibling = i;
+  }
   int64_t before = 0;
-  if (plan.before_row >= 0) {
-    before = layers[static_cast<size_t>(comp_ui::layer_array_index(count, plan.before_row))];
+  if (plan.before_index >= 0) {
+    before = array[static_cast<size_t>(plan.before_index)];
   }
-  layers.erase(layers.begin() + index);
+  array.erase(array.begin() + index);
   if (before == 0) {
-    layers.push_back(self);
+    /* 引擎（document.cpp）：before == 0 = 插到「同级最后一个」之后；根级即数组末尾。 */
+    if (parent == 0 || last_sibling < 0) {
+      array.push_back(self);
+    } else {
+      const size_t pos = last_sibling < index ? static_cast<size_t>(last_sibling + 1)
+                                              : static_cast<size_t>(last_sibling);
+      array.insert(array.begin() + pos, self);
+    }
   } else {
-    auto pos = std::find(layers.begin(), layers.end(), before);
-    layers.insert(pos, self);
+    auto pos = std::find(array.begin(), array.end(), before);
+    array.insert(pos, self);
   }
-  return layers;
+  return array;
 }
 
 std::vector<int64_t> panel_order_of(const std::vector<int64_t>& bottom_to_top) {
@@ -2344,6 +2359,12 @@ COMP_TEST(ui_core_layer_reorder_matches_engine_semantics) {
         /* 数组序自下而上：10 是底层；面板行序相反（行 0 是顶层）。 */
         std::vector<int64_t> bottom = {10, 11, 12};
         bottom.resize(static_cast<size_t>(count));
+        std::vector<comp_ui::LayerStackEntry> entries;
+        for (int64_t id : bottom) entries.push_back(comp_ui::LayerStackEntry{id, 0, 0});
+        /* 扁平文档：显示序仍是数组逆序，行 -> 下标 = count-1-row。 */
+        int32_t display[3] = {0, 0, 0};
+        for (int32_t i = 0; i < count; ++i) display[i] = count - 1 - i;
+
         const std::vector<int64_t> panel = panel_order_of(bottom);
         const int64_t self = panel[static_cast<size_t>(shown)];
 
@@ -2364,30 +2385,30 @@ COMP_TEST(ui_core_layer_reorder_matches_engine_semantics) {
         expected.erase(expected.begin() + shown);
         expected.insert(expected.begin() + target, self);
 
-        const std::vector<int64_t> actual =
-            panel_order_of(simulate_engine_reorder(bottom, shown, direction));
+        const std::vector<int64_t> actual = panel_order_of(
+            simulate_engine_reorder(bottom, entries.data(), display, count, shown, direction));
         COMP_CHECK(actual == expected);
 
-        const comp_ui::ReorderPlan plan =
-            comp_ui::plan_layer_reorder(count, shown, direction);
+        const comp_ui::ReorderPlan plan = comp_ui::plan_layer_reorder(
+            entries.data(), count, count - 1 - shown, direction);
         if (target == shown) {
           COMP_CHECK(!plan.ok); /* 端头必须如实拒绝，不静默无操作 */
         } else {
           COMP_CHECK(plan.ok);
-          COMP_CHECK(plan.next_row == target); /* 选中态跟着这一层走 */
         }
       }
     }
   }
 
-  /* 空文档不产生计划。 */
-  COMP_CHECK(!comp_ui::plan_layer_reorder(0, 0, -1).ok);
-  COMP_CHECK(!comp_ui::plan_layer_reorder(0, 0, 0).ok);
+  /* 空文档 / 空表不产生计划。 */
+  COMP_CHECK(!comp_ui::plan_layer_reorder(nullptr, 0, 0, -1).ok);
+  COMP_CHECK(!comp_ui::plan_layer_reorder(nullptr, 0, 0, 0).ok);
 
-  /* 选中行越界时按夹取后的行算（99 → 最后一行 2，即数组最底层），上移落在行 1。 */
-  const comp_ui::ReorderPlan clamped = comp_ui::plan_layer_reorder(3, 99, -1);
-  COMP_CHECK(clamped.ok);
-  COMP_CHECK(clamped.next_row == 1);
+  /* 越界下标不夹取：树形面板里「行 → 下标」不再单调，猜一个比拒绝更糟。 */
+  const comp_ui::LayerStackEntry flat[3] = {{10, 0, 0}, {11, 0, 0}, {12, 0, 0}};
+  COMP_CHECK(!comp_ui::plan_layer_reorder(flat, 3, 99, -1).ok);
+  COMP_CHECK(!comp_ui::plan_layer_reorder(flat, 3, -1, -1).ok);
+  COMP_CHECK(!comp_ui::plan_layer_reorder(flat, 3, 0, 7).ok);
 }
 
 /*
@@ -2532,18 +2553,33 @@ namespace {
 
 /* 按引擎「先 erase 后插到锚点之前」语义复算一次拖拽，返回落定后的数组（自下而上）。 */
 std::vector<int64_t> simulate_layer_drag(const std::vector<int64_t>& array,
-                                         const comp_ui::DragPlan& plan, int32_t from_shown) {
+                                         const comp_ui::DragPlan& plan,
+                                         const comp_ui::LayerStackEntry* layers,
+                                         const int32_t* display, int32_t rows, int32_t from_row) {
   if (!plan.ok()) return array;
-  const int32_t from_index = static_cast<int32_t>(array.size()) - 1 - from_shown;
+  const int32_t from_index = comp_ui::layer_index_at_row(display, rows, from_row);
   if (from_index < 0 || from_index >= static_cast<int32_t>(array.size())) return array;
   const int64_t dragged = array[static_cast<size_t>(from_index)];
+  const int64_t parent = layers[from_index].parent;
+  const int32_t count = static_cast<int32_t>(array.size());
+  int32_t last_sibling = -1;
+  for (int32_t i = 0; i < count; ++i) {
+    if (i == from_index || layers[i].parent != parent) continue;
+    last_sibling = i;
+  }
   const int64_t anchor =
       plan.before_index < 0 ? 0 : array[static_cast<size_t>(plan.before_index)];
   std::vector<int64_t> result = array;
   result.erase(result.begin() + from_index);
   if (anchor == 0) {
-    /* comp_layer_reorder 的 before == 0 = 同级末尾（栈顶）。 */
-    result.push_back(dragged);
+    /* comp_layer_reorder 的 before == 0 = 同级末尾；根级即数组末尾。 */
+    if (parent == 0 || last_sibling < 0) {
+      result.push_back(dragged);
+    } else {
+      const size_t pos = last_sibling < from_index ? static_cast<size_t>(last_sibling + 1)
+                                                   : static_cast<size_t>(last_sibling);
+      result.insert(result.begin() + pos, dragged);
+    }
   } else {
     const auto it = std::find(result.begin(), result.end(), anchor);
     result.insert(it == result.end() ? result.end() : it, dragged);
@@ -2790,10 +2826,13 @@ COMP_TEST(ui_core_plan_layer_drag_keeps_engine_semantics) {
       {101, 0, 0}, {102, 0, 0}, {103, 0, 0}, {104, 0, 0}, {105, 0, 0}};
   const std::vector<int64_t> array = {101, 102, 103, 104, 105};
   const int32_t count = 5;
+  /* 扁平文档的显示序：行 -> 数组下标，逆序。 */
+  const int32_t display[5] = {4, 3, 2, 1, 0};
 
   for (int32_t from = 0; from < count; ++from) {
     for (int32_t to = 0; to < count; ++to) {
-      const comp_ui::DragPlan plan = comp_ui::plan_layer_drag(same_parent, count, from, to);
+      const comp_ui::DragPlan plan =
+          comp_ui::plan_layer_drag(same_parent, count, display, count, from, to);
       if (from == to) {
         COMP_CHECK_MSG(!plan.ok(), "落点即原行：不得产生写入");
         COMP_CHECK(plan.target == comp_ui::DragTarget::kSameRow);
@@ -2802,11 +2841,10 @@ COMP_TEST(ui_core_plan_layer_drag_keeps_engine_semantics) {
         continue;
       }
       COMP_CHECK(plan.ok());
-      const int64_t dragged = array[static_cast<size_t>(count - 1 - from)];
-      const std::vector<int64_t> after = simulate_layer_drag(array, plan, from);
-      COMP_CHECK_MSG(shown_row_of(after, dragged) == to, "落点行必须是 to_shown");
-      COMP_CHECK_MSG(shown_row_of(after, dragged) == plan.next_row,
-                     "选中态必须跟到 next_row（否则拖完选错层）");
+      const int64_t dragged = array[static_cast<size_t>(display[from])];
+      const std::vector<int64_t> after =
+          simulate_layer_drag(array, plan, same_parent, display, count, from);
+      COMP_CHECK_MSG(shown_row_of(after, dragged) == to, "落点行必须是 to_row");
       /* 未参与拖拽的元素相对顺序不得变化（拖一层不能顺手重排别层）。 */
       std::vector<int64_t> others_before;
       for (int64_t id : array) {
@@ -2821,7 +2859,7 @@ COMP_TEST(ui_core_plan_layer_drag_keeps_engine_semantics) {
   }
 
   /* 拖到最顶 = 锚点取「同级末尾」(-1)；其余方向锚点是当前数组里的真实下标。 */
-  comp_ui::DragPlan plan = comp_ui::plan_layer_drag(same_parent, count, 4, 0);
+  comp_ui::DragPlan plan = comp_ui::plan_layer_drag(same_parent, count, display, count, 4, 0);
   COMP_CHECK(plan.ok());
   COMP_CHECK(plan.before_index == -1);
   COMP_CHECK(plan.next_row == 0);
@@ -2829,27 +2867,212 @@ COMP_TEST(ui_core_plan_layer_drag_keeps_engine_semantics) {
   /* 跨父级：如实拒绝，next_row 停原位（不回 0、不乱跳）。 */
   const comp_ui::LayerStackEntry mixed[4] = {
       {201, 0, 0}, {202, 0, 0}, {203, 77, 0}, {204, 77, 0}};
+  const int32_t mixed_display[4] = {3, 2, 1, 0};
   /* 面板行 0 = 204(77)、1 = 203(77)、2 = 202(根)、3 = 201(根)。 */
-  plan = comp_ui::plan_layer_drag(mixed, 4, 0, 2);
+  plan = comp_ui::plan_layer_drag(mixed, 4, mixed_display, 4, 0, 2);
   COMP_CHECK(!plan.ok());
   COMP_CHECK(plan.target == comp_ui::DragTarget::kCrossParent);
   COMP_CHECK(plan.next_row == 0);
-  plan = comp_ui::plan_layer_drag(mixed, 4, 0, 1); /* 同组内 204 -> 203 上面 */
+  plan = comp_ui::plan_layer_drag(mixed, 4, mixed_display, 4, 0, 1); /* 同组内 204 -> 203 上面 */
   COMP_CHECK(plan.ok());
-  plan = comp_ui::plan_layer_drag(mixed, 4, 2, 3); /* 根级相邻 */
+  plan = comp_ui::plan_layer_drag(mixed, 4, mixed_display, 4, 2, 3); /* 根级相邻 */
   COMP_CHECK(plan.ok());
 
-  /* 非法输入：空指针 / 空表 / 越界下标一律 kInvalid，不得越界读。 */
-  COMP_CHECK(!comp_ui::plan_layer_drag(nullptr, 4, 0, 1).ok());
-  COMP_CHECK(comp_ui::plan_layer_drag(nullptr, 4, 0, 1).target == comp_ui::DragTarget::kInvalid);
-  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, 0, 0, 0).target ==
+  /* 非法输入：空指针 / 空表 / 越界行号一律 kInvalid，不得越界读。 */
+  COMP_CHECK(!comp_ui::plan_layer_drag(nullptr, 4, display, 4, 0, 1).ok());
+  COMP_CHECK(comp_ui::plan_layer_drag(nullptr, 4, display, 4, 0, 1).target ==
              comp_ui::DragTarget::kInvalid);
-  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, -1, 0).target ==
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, 0, display, 0, 0, 0).target ==
              comp_ui::DragTarget::kInvalid);
-  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, 0, -1).target ==
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, nullptr, count, 0, 1).target ==
              comp_ui::DragTarget::kInvalid);
-  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, 0, count).target ==
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, display, count, -1, 0).target ==
              comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, display, count, 0, -1).target ==
+             comp_ui::DragTarget::kInvalid);
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, display, count, 0, count).target ==
+             comp_ui::DragTarget::kInvalid);
+  /* display 内容越界（被折叠的行数比显示行数少时可能出现）也必须拒绝。 */
+  const int32_t bogus[5] = {4, 3, 2, 1, 99};
+  COMP_CHECK(comp_ui::plan_layer_drag(same_parent, count, bogus, count, 0, 4).target ==
+             comp_ui::DragTarget::kInvalid);
+}
+
+/*
+ * 树形显示序（S44）。
+ *
+ * 旧面板直接按「数组逆序」画，于是组行总在它的子层**下面**（引擎把子层插在
+ * 组自身下标 +1，逆序后跑到上面），与上游 PS 相反；用户看到的是「子层挂在组
+ * 下面那层」而不是「组展开的成员」。这里钉死三件事：
+ *   1. 组行先于它的子层，子层按数组逆序（顶层先）排在组行下方，缩进 +1；
+ *   2. 折叠的组整支不显示（孙层也不显示），别的组不受影响；
+ *   3. 父 id 不存在的孤儿 / 成环的层仍要出现在面板上（补到根级），绝不静默消失。
+ */
+COMP_TEST(ui_core_layer_tree_display_puts_group_above_children) {
+  /* 数组自下而上：301 | 302(组) 303 304 | 305，其中 303/304 属于 302。 */
+  const comp_ui::LayerStackEntry layers[5] = {
+      {301, 0, 0}, {302, 0, 0}, {303, 302, 0}, {304, 302, 0}, {305, 0, 0}};
+  int32_t display[8] = {0};
+  int32_t depth[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+
+  int32_t rows = comp_ui::build_layer_display(layers, 5, nullptr, display, depth, 8);
+  COMP_CHECK(rows == 5);
+  const int32_t want_display[5] = {4, 1, 3, 2, 0}; /* 305 | 302 | 304 303 | 301 */
+  const int32_t want_depth[5] = {0, 0, 1, 1, 0};
+  for (int32_t i = 0; i < 5; ++i) {
+    COMP_CHECK(display[i] == want_display[i]);
+    COMP_CHECK(depth[i] == want_depth[i]);
+  }
+
+  /* 折叠 302：组行保留，两个子层消失，别的层不受影响。 */
+  uint8_t collapsed[5] = {0, 1, 0, 0, 0};
+  rows = comp_ui::build_layer_display(layers, 5, collapsed, display, depth, 8);
+  COMP_CHECK(rows == 3);
+  COMP_CHECK(display[0] == 4 && display[1] == 1 && display[2] == 0);
+  COMP_CHECK(comp_ui::layer_row_of_index(display, rows, 2) == -1); /* 303 被折叠 */
+  COMP_CHECK(comp_ui::layer_row_of_index(display, rows, 3) == -1); /* 304 被折叠 */
+  COMP_CHECK(comp_ui::layer_row_of_index(display, rows, 4) == 0);
+  COMP_CHECK(comp_ui::layer_index_at_row(display, rows, 1) == 1);
+  COMP_CHECK(comp_ui::layer_index_at_row(display, rows, rows) == -1);
+
+  /* 缩进有上限：极深的层不再右移，但行本身仍在（折叠三角照样能点）。 */
+  COMP_CHECK(comp_ui::layer_row_indent(0) == 0);
+  COMP_CHECK(comp_ui::layer_row_indent(2) == 2 * comp_ui::kLayerIndentStep);
+  COMP_CHECK(comp_ui::layer_row_indent(99) == comp_ui::kLayerIndentLimit);
+  const Rect row{10, 100, 248, comp_ui::kLayerRowHeight};
+  const Rect tri0 = comp_ui::layer_triangle_rect(row, 0);
+  const Rect tri2 = comp_ui::layer_triangle_rect(row, 2);
+  COMP_CHECK(tri2.x - tri0.x == 2 * comp_ui::kLayerIndentStep);
+  COMP_CHECK(tri0.y >= row.y && tri0.bottom() <= row.bottom());
+
+  /* 孤儿 / 环：父 id 不在表里、或互相指成环，都必须补到根级显示出来。 */
+  const comp_ui::LayerStackEntry broken[4] = {
+      {401, 0, 0}, {402, 999, 0}, {403, 404, 0}, {404, 403, 0}};
+  rows = comp_ui::build_layer_display(broken, 4, nullptr, display, depth, 8);
+  COMP_CHECK(rows == 4);
+  COMP_CHECK(display[0] == 0); /* 根级 401 第一行 */
+  /* 剩下三个按数组逆序补：404、403、402。成环的两个会互相「嵌套」一层，
+     这是数据损坏时的显示形态；这里只要求存在、不要求层级正确。 */
+  COMP_CHECK(display[1] == 3 && display[2] == 2 && display[3] == 1);
+  COMP_CHECK(depth[0] == 0);
+  for (int32_t i = 0; i < 4; ++i) COMP_CHECK(depth[i] >= 0 && depth[i] < 4);
+
+  /* 容量不足按容量截断，不写越界。 */
+  int32_t small_display[2] = {-1, -1};
+  int32_t small_depth[2] = {-1, -1};
+  rows = comp_ui::build_layer_display(layers, 5, nullptr, small_display, small_depth, 2);
+  COMP_CHECK(rows == 2);
+  COMP_CHECK(small_display[0] == 4 && small_display[1] == 1);
+
+  /* 空输入一律 0 行。 */
+  COMP_CHECK(comp_ui::build_layer_display(nullptr, 5, nullptr, display, depth, 8) == 0);
+  COMP_CHECK(comp_ui::build_layer_display(layers, 0, nullptr, display, depth, 8) == 0);
+  COMP_CHECK(comp_ui::build_layer_display(layers, 5, nullptr, nullptr, depth, 8) == 0);
+  COMP_CHECK(comp_ui::build_layer_display(layers, 5, nullptr, display, depth, 0) == 0);
+}
+
+/*
+ * 同级重排（S44）：菜单的上移 / 下移只换**同一父级里相邻的兄弟**。
+ *
+ * 旧实现按数组相邻取锚点，树形文档里「组内层上移一格」会跨进组外的层——引擎的
+ * 跨父校验会拒绝，用户看到的是「菜单点了没反应」；更糟的是有时恰好同父，于是
+ * 子层一口气跳过整个别组，落点完全不对。
+ */
+COMP_TEST(ui_core_layer_tree_reorder_stays_within_siblings) {
+  /* 301 | 302(组) 303 304 | 305 */
+  const comp_ui::LayerStackEntry layers[5] = {
+      {301, 0, 0}, {302, 0, 0}, {303, 302, 0}, {304, 302, 0}, {305, 0, 0}};
+
+  /* 根级兄弟序（自下而上）= 301、302、305；301 上移一格应越过 302（不能只挪下标）。 */
+  comp_ui::ReorderPlan plan = comp_ui::plan_layer_reorder(layers, 5, 0, -1);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == 4); /* 锚点 305 */
+
+  /* 301 置顶：before = 0（同级末尾），不是数组末尾的下标。 */
+  plan = comp_ui::plan_layer_reorder(layers, 5, 0, -2);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == -1);
+
+  /* 302 下移：根级兄弟里 302 上面没有别的根级层？有 305，所以目标锚点是 301。 */
+  plan = comp_ui::plan_layer_reorder(layers, 5, 1, 1);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == 0);
+
+  /* 组内 303 上移一格：只在 303/304 之间换，锚点绝不允许是根级的 302 或 305。 */
+  plan = comp_ui::plan_layer_reorder(layers, 5, 2, -1);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == -1); /* 304 之上没有兄弟了，落到组内末尾 */
+  COMP_CHECK(comp_ui::plan_layer_reorder(layers, 5, 3, -1).ok == false); /* 304 已是组内顶层 */
+  COMP_CHECK(comp_ui::plan_layer_reorder(layers, 5, 3, -2).ok == false);
+  /* 304 下移一格：锚点是 303。 */
+  plan = comp_ui::plan_layer_reorder(layers, 5, 3, 1);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == 2);
+  /* 304 置底：锚点是组内最低的 303。 */
+  plan = comp_ui::plan_layer_reorder(layers, 5, 3, 0);
+  COMP_CHECK(plan.ok);
+  COMP_CHECK(plan.before_index == 2);
+
+  /* 用引擎语义复算「303 上移」：它的落点必须在 304 之上、仍在 302 的子树里。 */
+  const std::vector<int64_t> array = {301, 302, 303, 304, 305};
+  const int32_t flat_display[5] = {4, 3, 2, 1, 0}; /* 行 2 = 下标 2 = 303 */
+  const std::vector<int64_t> after =
+      simulate_engine_reorder(array, layers, flat_display, 5, 2, -1);
+  COMP_CHECK(after.size() == 5);
+  auto pos_of = [&](int64_t id) {
+    return static_cast<int32_t>(std::find(after.begin(), after.end(), id) - after.begin());
+  };
+  COMP_CHECK(pos_of(302) + 1 == pos_of(304)); /* 子树仍紧贴组行 */
+  COMP_CHECK(pos_of(304) + 1 == pos_of(303)); /* 303 换到 304 之上 */
+}
+
+/*
+ * 树形拖拽（S44）：落点行先经 display[] 换成数组下标，再按**兄弟序号**取锚点。
+ *
+ * 关键场景：两个根级兄弟之间夹着已展开的组，行号不相邻。旧实现拿行号直接做
+ * count-1-row 换算，会把「拖到另一个根级层下面」算成组内的位置。
+ */
+COMP_TEST(ui_core_layer_tree_drag_uses_sibling_ordinals) {
+  /* 数组：401 | 402(组) 403 404 | 405；显示：405 402 404 403 401 */
+  const comp_ui::LayerStackEntry layers[5] = {
+      {401, 0, 0}, {402, 0, 0}, {403, 402, 0}, {404, 402, 0}, {405, 0, 0}};
+  int32_t display[8] = {0};
+  int32_t depth[8] = {0};
+  const int32_t rows = comp_ui::build_layer_display(layers, 5, nullptr, display, depth, 8);
+  COMP_CHECK(rows == 5);
+  COMP_CHECK(display[0] == 4 && display[1] == 1 && display[2] == 3 && display[3] == 2 &&
+             display[4] == 0);
+
+  /* 把 402（行 1）拖到根级最底（行 4）：ps=1、ts=0，锚点 = 401。 */
+  comp_ui::DragPlan plan = comp_ui::plan_layer_drag(layers, 5, display, rows, 1, 4);
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.before_index == 0);
+  std::vector<int64_t> array = {401, 402, 403, 404, 405};
+  std::vector<int64_t> after = simulate_layer_drag(array, plan, layers, display, rows, 1);
+  COMP_CHECK(after[0] == 402 && after[1] == 401);
+  /* 组内的 403/404 必须仍然紧跟 402（子树整体跟着组走）。 */
+  COMP_CHECK(std::find(after.begin(), after.end(), 403) - after.begin() == 2);
+  COMP_CHECK(std::find(after.begin(), after.end(), 404) - after.begin() == 3);
+
+  /* 组内 403（行 3）拖到 404（行 2）之上：同父，锚点 = 组内末尾（before = -1）。 */
+  plan = comp_ui::plan_layer_drag(layers, 5, display, rows, 3, 2);
+  COMP_CHECK(plan.ok());
+  COMP_CHECK(plan.before_index == -1);
+  after = simulate_layer_drag(array, plan, layers, display, rows, 3);
+  COMP_CHECK(std::find(after.begin(), after.end(), 403) - after.begin() == 3);
+
+  /* 组内层拖到根级层上 / 根级层拖进组内：跨父，如实拒绝。 */
+  COMP_CHECK(comp_ui::plan_layer_drag(layers, 5, display, rows, 3, 4).target ==
+             comp_ui::DragTarget::kCrossParent);
+  COMP_CHECK(comp_ui::plan_layer_drag(layers, 5, display, rows, 0, 2).target ==
+             comp_ui::DragTarget::kCrossParent);
+
+  /* 折叠后行号变短，跨父判定也不能错位（折叠时组内层根本不在显示序里）。 */
+  uint8_t collapsed[5] = {0, 1, 0, 0, 0};
+  const int32_t folded_rows =
+      comp_ui::build_layer_display(layers, 5, collapsed, display, depth, 8);
+  COMP_CHECK(folded_rows == 3);
+  COMP_CHECK(comp_ui::plan_layer_drag(layers, 5, display, folded_rows, 0, 2).ok());
 }
 
 /*

@@ -2725,67 +2725,11 @@ inline int32_t layer_row_of_array_index(int32_t count, int32_t array_index) {
  * 的那层（依次递推，见下）。
  */
 struct ReorderPlan {
-  bool ok;           /* false = 已经到头，界面上应如实提示而不是静默无操作。 */
-  bool at_top;       /* ok=false 时的原因是「已是顶层」还是「已是底层」。 */
-  int32_t before_row; /* 锚点所在的面板行；-1 表示 before = 0（同级末尾）。 */
-  int32_t next_row;   /* 重排后该图层应占的面板行，用于跟随选中态。 */
+  bool ok = false;           /* false = 已经到头，界面上应如实提示而不是静默无操作。 */
+  bool at_top = true;        /* ok=false 时的原因是「已是同级顶层」还是「已是同级底层」。 */
+  int32_t before_index = -1; /* 锚点的数组下标；-1 表示 before = 0（同级末尾）。 */
 };
-
-/*
- * direction: -2 置顶, -1 上移一层, +1 下移一层, 0 置底。
- *
- * 设 idx = count-1-shown。
- *   上移（-1）：idx+1 <= count-1 才可行；移完后它占 idx+1，锚点 = idx+2 那层，
- *               若 idx+1 已经是尾（顶层）则 before=0。next_row = shown-1。
- *   下移（+1）：idx-1 >= 0 才可行；移完后占 idx-1，锚点 = idx 现在的前一位
- *               = 原 idx-1 那层（erase 之后它就是 idx 位置，仍是「插到它前面」）。
- *               next_row = shown+1。
- *   置顶（-2）：before=0，next_row=0。
- *   置底（0）  ：锚点 = 数组 0（原栈底），next_row=count-1。
- */
-inline ReorderPlan plan_layer_reorder(int32_t count, int32_t shown, int32_t direction) {
-  ReorderPlan plan{};
-  plan.ok = false;
-  plan.at_top = true;
-  plan.before_row = -1;
-  plan.next_row = 0;
-  if (count <= 0) return plan;
-  const int32_t row = clamp_selected_row(shown, count);
-  const int32_t idx = count - 1 - row;
-  plan.next_row = row;
-
-  if (direction == -2) { /* 置顶 */
-    if (idx == count - 1) { plan.at_top = true; plan.next_row = row; return plan; }
-    plan.ok = true;
-    plan.before_row = -1; /* before = 0 */
-    plan.next_row = 0;
-    return plan;
-  }
-  if (direction == 0) { /* 置底 */
-    if (idx == 0) { plan.at_top = false; plan.next_row = row; return plan; }
-    plan.ok = true;
-    plan.before_row = count - 1; /* 数组 0 = 面板最后一行 */
-    plan.next_row = count - 1;
-    return plan;
-  }
-  if (direction < 0) { /* 上移一层 */
-    if (idx + 1 >= count) { plan.at_top = true; plan.next_row = row; return plan; }
-    plan.ok = true;
-    /* 目标数组下标 = idx+1；锚点 = 目前 idx+2 那层，越界则同级末尾。 */
-    plan.before_row = (idx + 2 < count) ? (count - 1 - (idx + 2)) : -1;
-    plan.next_row = row - 1;
-    return plan;
-  }
-  if (direction > 0) { /* 下移一层 */
-    if (idx == 0) { plan.at_top = false; plan.next_row = row; return plan; }
-    plan.ok = true;
-    /* 目标数组下标 = idx-1；锚点 = 目前 idx-1 那层（面板行 count-1-(idx-1)）。 */
-    plan.before_row = count - 1 - (idx - 1);
-    plan.next_row = row + 1;
-    return plan;
-  }
-  return plan;
-}
+/* S44：实现在 LayerStackEntry 之后——同一级兄弟要按 parent 找，不能只看数组相邻。 */
 
 /*
  * 剪贴基底规划（S23）：输入是「面板所见的一层」（数组序、自下而上）。
@@ -2810,6 +2754,218 @@ struct LayerStackEntry {
   int64_t clipping; /* 该层当前剪贴到的基底 id；0 = 不是剪贴成员 */
 };
 
+/*
+ * direction: -2 置顶, -1 上移一层, +1 下移一层, 0 置底。
+ *
+ * S44：面板变成树之后，「一层」必须理解为**同一父级里的相邻兄弟**，而不是
+ * 数组里相邻的那个下标——组内层往上一格不该跳进组外的层，也不该被引擎的跨父
+ * 校验拒绝。兄弟按数组序自下而上，越靠后越靠上：
+ *   上移（-1）：目标 = 自己之上第一个兄弟；锚点 = 它再上一个兄弟，没有则末尾（before=0）。
+ *   下移（+1）：目标 = 自己之下第一个兄弟；锚点 = 那个兄弟（erase 之后它就在目标位）。
+ *   置顶（-2）：before = 0（同级末尾）。
+ *   置底（0） ：锚点 = 最低的那个兄弟。
+ */
+inline ReorderPlan plan_layer_reorder(const LayerStackEntry* layers, int32_t count,
+                                      int32_t index, int32_t direction) {
+  ReorderPlan plan{};
+  if (layers == nullptr || count <= 0 || index < 0 || index >= count) return plan;
+  const int64_t parent = layers[index].parent;
+  int32_t position = 0; /* 自己在兄弟里的序号（自下而上，0 开始） */
+  int32_t siblings = 0;
+  for (int32_t i = 0; i < count; ++i) {
+    if (layers[i].parent != parent) continue;
+    if (i < index) ++position;
+    ++siblings;
+  }
+
+  /* 第 ordinal 个兄弟（自下而上，0 开始）的数组下标；越界返回 -1。 */
+  const auto sibling_at = [&](int32_t ordinal) -> int32_t {
+    int32_t seen = 0;
+    for (int32_t i = 0; i < count; ++i) {
+      if (layers[i].parent != parent) continue;
+      if (seen == ordinal) return i;
+      ++seen;
+    }
+    return -1;
+  };
+
+  if (direction == -2) { /* 置顶 */
+    if (position == siblings - 1) {
+      plan.at_top = true;
+      return plan;
+    }
+    plan.ok = true;
+    plan.before_index = -1;
+    return plan;
+  }
+  if (direction == 0) { /* 置底 */
+    if (position == 0) {
+      plan.at_top = false;
+      return plan;
+    }
+    plan.ok = true;
+    plan.before_index = sibling_at(0);
+    return plan;
+  }
+  if (direction < 0) { /* 上移一层 */
+    if (position + 1 >= siblings) {
+      plan.at_top = true;
+      return plan;
+    }
+    plan.ok = true;
+    plan.before_index = sibling_at(position + 2); /* -1 = 已经是同级顶层 */
+    return plan;
+  }
+  if (direction > 0) { /* 下移一层 */
+    if (position == 0) {
+      plan.at_top = false;
+      return plan;
+    }
+    plan.ok = true;
+    plan.before_index = sibling_at(position - 1);
+    return plan;
+  }
+  return plan;
+}
+
+/* --------------------------------------------------- 树形图层面板（S44） */
+
+/*
+ * 面板行的缩进与折叠三角。
+ *
+ * 缩进有上限：248px 的栏宽、12 字的层名，一直往右推会把名字挤没。超过 6 级的
+ * 层仍然可折叠，只是不再继续右移——「看不见的缩进」比「看不到的名字」好。
+ */
+inline constexpr int kLayerIndentStep = 12;
+inline constexpr int kLayerIndentLimit = 72;
+/* 三角槽位对所有行都留出，同一级的名字才会对齐（只有组行真的画三角）。 */
+inline constexpr int kLayerTreeMarker = 14;
+
+inline int layer_row_indent(int32_t depth) {
+  if (depth <= 0) return 0;
+  const int indent = depth * kLayerIndentStep;
+  return indent > kLayerIndentLimit ? kLayerIndentLimit : indent;
+}
+
+inline Rect layer_triangle_rect(const Rect& row, int32_t depth) {
+  const int x = row.x + 6 + layer_row_indent(depth);
+  const int y = row.y + (kLayerRowHeight - 10) / 2;
+  return Rect{x, y, 10, 10};
+}
+
+namespace detail {
+
+/*
+ * 递归铺设一层显示：同一父级的子层按**数组逆序**（顶层先）排，组行先于它的
+ * 子层。emit=false 表示这一支在折叠组里：照样往下走（把整支标记掉，免得后面
+ * 被当成孤儿补出来），但不写进输出。
+ */
+inline void layer_display_walk(const LayerStackEntry* layers, int32_t count,
+                               const uint8_t* collapsed, int64_t parent, int32_t level,
+                               bool emit, uint8_t* seen, int32_t* display, int32_t* depth,
+                               int32_t capacity, int32_t* written) {
+  if (level > count) return; /* 数据有环时的护栏：宁可少画几层也不死循环 */
+  for (int32_t i = count - 1; i >= 0; --i) {
+    if (seen[i] != 0 || layers[i].parent != parent) continue;
+    seen[i] = 1;
+    if (emit && *written < capacity) {
+      display[*written] = i;
+      depth[*written] = level;
+      ++(*written);
+    }
+    const bool folded = collapsed != nullptr && collapsed[i] != 0;
+    layer_display_walk(layers, count, collapsed, layers[i].id, level + 1, emit && !folded,
+                       seen, display, depth, capacity, written);
+  }
+}
+
+}  // namespace detail
+
+/* 父链能不能走到根（true = 会被根级那一轮铺进显示序）。环 / 断链一律 false。 */
+inline bool layer_reaches_root(const LayerStackEntry* layers, int32_t count, int32_t index) {
+  if (layers == nullptr || count <= 0 || index < 0 || index >= count) return false;
+  int64_t current = layers[index].parent;
+  for (int32_t guard = 0; guard <= count; ++guard) {
+    if (current == 0) return true;
+    int32_t next = -1;
+    for (int32_t i = 0; i < count; ++i) {
+      if (layers[i].id == current) {
+        next = i;
+        break;
+      }
+    }
+    if (next < 0) return false; /* 父 id 不在表里：断链 */
+    current = layers[next].parent;
+  }
+  return false; /* 环 */
+}
+
+/*
+ * 显示序（S44）：面板是树，不再是「数组逆序」。
+ *
+ * 数组序自下而上，组的子层紧跟在组自身之后（引擎的落位口径）。直接取数组逆序
+ * 会把子层画在组行**上面**，与 PS 相反；这里改成：
+ *   - 根级层按数组逆序（顶层在第一行）；
+ *   - 每个组的子层按数组逆序排在组行**下面**，再递归；
+ *   - 折叠的组不展开子层（子层与更深层都不显示）。
+ *
+ * 输出 display[row] = 数组下标、depth[row] = 缩进层级，两者等长；缓冲不足按容量
+ * 截断。父 id 不在表里的层（孤儿 / 环）不会被丢掉——从面板上消失比画错位置更糟，
+ * 它们按数组逆序补到根级。
+ *
+ * 返回值 = 行数。
+ */
+inline int32_t build_layer_display(const LayerStackEntry* layers, int32_t count,
+                                   const uint8_t* collapsed, int32_t* display, int32_t* depth,
+                                   int32_t capacity) {
+  if (layers == nullptr || count <= 0 || display == nullptr || depth == nullptr ||
+      capacity <= 0) {
+    return 0;
+  }
+  /* seen 是局部缓冲：ui_core 的约定是不分配内存，这里借调用方的输出缓冲又不合适
+     （output 与 seen 长度无关），所以用静态上限的栈数组。图层数超过这个量级时
+     面板本身也已经不能用了。 */
+  static constexpr int32_t kMaxLayers = 4096;
+  if (count > kMaxLayers) {
+    /* 极端图层数：退回旧的「数组逆序」显示。树/折叠失效，但面板不会空。 */
+    const int32_t rows = count < capacity ? count : capacity;
+    for (int32_t i = 0; i < rows; ++i) {
+      display[i] = count - 1 - i;
+      depth[i] = 0;
+    }
+    return rows;
+  }
+  uint8_t seen[kMaxLayers];
+  for (int32_t i = 0; i < count; ++i) seen[i] = 0;
+
+  int32_t written = 0;
+  detail::layer_display_walk(layers, count, collapsed, 0, 0, true, seen, display, depth,
+                             capacity, &written);
+  /* 断链 / 环：补到根级，避免「层在文档里、面板上看不见」。 */
+  for (int32_t i = count - 1; i >= 0 && written < capacity; --i) {
+    if (seen[i] != 0) continue;
+    if (layer_reaches_root(layers, count, i)) continue;
+    detail::layer_display_walk(layers, count, collapsed, layers[i].parent, 0, true, seen,
+                               display, depth, capacity, &written);
+  }
+  return written;
+}
+
+/* 行 -> 数组下标；越界 -1。树形面板里这就是唯一合法的换算。 */
+inline int32_t layer_index_at_row(const int32_t* display, int32_t rows, int32_t row) {
+  if (display == nullptr || row < 0 || row >= rows) return -1;
+  return display[row];
+}
+
+/* 数组下标 -> 行；不在显示序里（被折叠 / 越界）返回 -1。 */
+inline int32_t layer_row_of_index(const int32_t* display, int32_t rows, int32_t index) {
+  if (display == nullptr || index < 0) return -1;
+  for (int32_t row = 0; row < rows; ++row) {
+    if (display[row] == index) return row;
+  }
+  return -1;
+}
+
 enum class ClippingTarget {
   kBase,           /* 成功，base_index 可用 */
   kNoSiblingBelow, /* 下方没有同父图层：如实拒绝，不静默无操作 */
@@ -2819,7 +2975,7 @@ enum class ClippingTarget {
 
 struct ClippingPlan {
   ClippingTarget target = ClippingTarget::kInvalid;
-  int32_t base_index = -1;           /* 数组下标，调用方按 count-1-base_row 换算 */
+  int32_t base_index = -1;           /* 数组下标（base_row = count-1-base_index 仅扁平时成立） */
   bool joins_existing_stack = false; /* true = 并入下方邻居已有的剪贴栈 */
   bool ok() const { return target == ClippingTarget::kBase; }
 };
@@ -2854,12 +3010,10 @@ inline bool layer_in_subtree(const LayerStackEntry* layers, int32_t count, int64
   return false; /* 环：当作不属于，绝不死循环 */
 }
 
-inline ClippingPlan plan_clipping_base(const LayerStackEntry* layers, int32_t count,
-                                       int32_t shown) {
+inline ClippingPlan plan_clipping_base_index(const LayerStackEntry* layers, int32_t count,
+                                             int32_t index) {
   ClippingPlan plan{};
-  if (layers == nullptr || count <= 0) return plan;
-  const int32_t index = layer_array_index(count, shown);
-  if (index < 0) return plan;
+  if (layers == nullptr || count <= 0 || index < 0 || index >= count) return plan;
   plan.target = ClippingTarget::kInvalid;
 
   const int64_t parent = layers[index].parent;
@@ -2900,6 +3054,17 @@ inline ClippingPlan plan_clipping_base(const LayerStackEntry* layers, int32_t co
   plan.target = ClippingTarget::kBase;
   plan.base_index = base;
   return plan;
+}
+
+/*
+ * 行号版本（旧接口，扁平面板的调用点用它）。S44 的树形面板没有「行号 = 数组逆序」
+ * 这条等式了，壳必须先把行号经 display[] 换成数组下标，再调 _index 版本；保留这个
+ * 包装是为了既有用例与「剪贴只看同父相邻」的语义不被改写。
+ */
+inline ClippingPlan plan_clipping_base(const LayerStackEntry* layers, int32_t count,
+                                       int32_t shown) {
+  if (layers == nullptr || count <= 0) return ClippingPlan{};
+  return plan_clipping_base_index(layers, count, layer_array_index(count, shown));
 }
 
 /* ------------------------------------------------- 直方图几何（S23） */
@@ -3453,44 +3618,72 @@ struct DragPlan {
 };
 
 /*
- * 把面板第 from_shown 行拖到第 to_shown 行（0 = 最上层）。
+ * 把面板第 from_row 行拖到第 to_row 行（0 = 最上层）。
  *
- * 只允许同父拖拽：跨组会改 parent，而面板是扁平列表（不画缩进），用户看不出自己
- * 把层拖进了哪个组——「拖完层没了」比「明确拒绝」糟得多。
+ * S44：行号先经 display[] 换算成数组下标（面板是树，行号不再等于 count-1-下标）。
+ * 只允许同父拖拽：跨父会改 parent，跨父的两种合法路径（拖进组 / 拖出到根级）由
+ * 壳按落点几何另行处理；其余跨父落点明确拒绝，「拖完层没了」比「拒绝」糟得多。
  *
- * 换算（数组序自下而上，shown = count-1-array）：
- *   i0 = count-1-from，it = count-1-to，引擎语义是「erase 后插到锚点之前」：
- *     it == count-1（拖到最顶） -> 锚点 = 同级末尾（before = 0，before_index = -1）；
- *     it <  i0（往上拖）        -> 锚点 = 当前数组 it 那一层（删掉下方元素后它上位）；
- *     it >  i0（往下拖）        -> 锚点 = 当前数组 it+1 那一层（erase 后原 it+1 顶到 it，
- *                                  插到它之前才落在 it）。
- * 三种情形都能用「先删后插」的模型复算，见 tests/test_ui_core.cpp 的表驱动用例。
+ * 引擎语义是「erase 后插到锚点之前」。设 ps / ts 为拖拽层与目标层在**同一父级的
+ * 兄弟序列**里的序号（自下而上）：
+ *   ts == 兄弟数 - 1（落到同级最顶） -> 锚点 = 同级末尾（before = 0）；
+ *   ts <  ps（往上拖）              -> 锚点 = 原序号 ts+1 的兄弟（erase 后它顶到 ts）；
+ *   ts >  ps（往下拖）              -> 锚点 = 原序号 ts 的兄弟。
+ * 扁平文档（全是根级层）时 ps/ts 与数组下标一一对应，行为与旧实现逐位相同。
+ * 树形文档里兄弟之间可能夹着别的组，序号换算绕开它们——这正是旧实现会错的地方。
+ *
+ * next_row 只在「显示序 = 数组逆序」的扁平文档里精确；树形文档拖完行号会因展开
+ * 的子树而变，调用方应按 id 重新选中（见 main.cpp panel_drop_layer）。
  */
-inline DragPlan plan_layer_drag(const LayerStackEntry* layers, int32_t count, int32_t from_shown,
-                                int32_t to_shown) {
+inline DragPlan plan_layer_drag(const LayerStackEntry* layers, int32_t count,
+                                const int32_t* display, int32_t rows, int32_t from_row,
+                                int32_t to_row) {
   DragPlan plan{};
-  if (layers == nullptr || count <= 0) return plan;
-  if (from_shown < 0 || from_shown >= count || to_shown < 0 || to_shown >= count) return plan;
-  if (from_shown == to_shown) {
+  if (layers == nullptr || display == nullptr || count <= 0 || rows <= 0) return plan;
+  if (from_row < 0 || from_row >= rows || to_row < 0 || to_row >= rows) return plan;
+  if (from_row == to_row) {
     plan.target = DragTarget::kSameRow;
-    plan.next_row = from_shown;
+    plan.next_row = from_row;
     return plan;
   }
-  const int32_t from_index = layer_array_index(count, from_shown);
-  const int32_t to_index = layer_array_index(count, to_shown);
+  const int32_t from_index = display[from_row];
+  const int32_t to_index = display[to_row];
+  if (from_index < 0 || from_index >= count || to_index < 0 || to_index >= count) {
+    return plan;
+  }
   if (layers[from_index].parent != layers[to_index].parent) {
     plan.target = DragTarget::kCrossParent;
-    plan.next_row = from_shown;
+    plan.next_row = from_row;
     return plan;
   }
+  const int64_t parent = layers[from_index].parent;
+  int32_t ps = 0; /* 自己在兄弟里的序号 */
+  int32_t ts = 0; /* 目标在兄弟里的序号 */
+  int32_t siblings = 0;
+  for (int32_t i = 0; i < count; ++i) {
+    if (layers[i].parent != parent) continue;
+    if (i < from_index) ++ps;
+    if (i < to_index) ++ts;
+    ++siblings;
+  }
+  /* 第 ordinal 个兄弟（自下而上）的数组下标；越界 -1。 */
+  const auto sibling_at = [&](int32_t ordinal) -> int32_t {
+    int32_t seen = 0;
+    for (int32_t i = 0; i < count; ++i) {
+      if (layers[i].parent != parent) continue;
+      if (seen == ordinal) return i;
+      ++seen;
+    }
+    return -1;
+  };
   plan.target = DragTarget::kOk;
-  plan.next_row = to_shown;
-  if (to_index == count - 1) {
+  plan.next_row = to_row;
+  if (ts == siblings - 1) {
     plan.before_index = -1;
-  } else if (to_index < from_index) {
-    plan.before_index = to_index;
+  } else if (ts < ps) {
+    plan.before_index = sibling_at(ts);
   } else {
-    plan.before_index = to_index + 1;
+    plan.before_index = sibling_at(ts + 1);
   }
   return plan;
 }

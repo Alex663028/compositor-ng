@@ -5089,6 +5089,41 @@ PE 导出 **138 不变**；壳自检 **245 项 / 失败 0**（基线 SHA256 仍 
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.39 项 9，`docs/manual-test.md` M39。
 
+### 6.71 树形图层面板：组在上、缩进、可折叠（2026-10-21，Claude）
+
+**补掉 §5.12 项 8 的三条边界。** 面板显示序一直是「数组逆序」，而组在数组里排在子层
+**下方**，逆序后子层跑到了组行上面——与 PS 相反；同时没有缩进、没有折叠。
+
+**1. 显示序抽成纯函数。** `comp_ui::build_layer_display` 输出 `display[row] = 数组下标` +
+`depth[row]`：根层按数组逆序遍历，遇到组先输出组行、再递归输出子层（子层按堆叠序缩进在
+下方）。折叠的组只留组行；悬空 parent 与成环的层不丢，收尾追加到根级且每层只出现一次；
+行数超过 4096 整段回落到旧逆序，宁可没有树也不截断真实文档。**引擎落位不动**——只改
+显示方式。
+
+**2. 缩进 6 级封顶 + 全局三角槽位。** 每级 12px、上限 72px（更深的嵌套不再右推，否则名字
+被挤出 248px 栏宽）；每行都留 14px 三角槽位，同层级名字才对齐，只有组行画 ▸/▾。
+
+**3. 行号不再能反推图层。** 折叠改变行数、展开的子树平移后续行，于是点击、双击、Ctrl
+晋升、Shift 区间、剪贴基底、重排、拖拽命中、批量枚举全部改走
+`layer_row_at`/`layer_index_at_row`/`panel_row_of_id`；结构变化后选中态**按 id 重选**。
+
+**4. 重排/拖拽改「同级序」。** 树形显示下相邻两行未必同级，`plan_layer_reorder` 与
+`plan_layer_drag` 改为在同父集合里数兄弟序号；端头判定也按同级集合（否则组里唯一子层会
+被告知还能上移）。`before = 0` 的引擎语义（非根插到最后一个同父兄弟之后、根追加到数组末尾）
+被写进单测模拟器——原来的模拟器按「一律追加到末尾」写，是树形用例抓出来的偏差。
+
+**5. 折叠是视图态。** 只改壳侧 `collapsed_groups`，不写文档、不进撤销。折叠后主选中层被
+藏起来则选中落到组行，多选集合里被藏起来的 id 一并摘掉（批量命令按可见行枚举 id，
+留着会让计数与执行数对不上）；双击三角槽位被吞掉，不会顺手弹改名框。
+
+**验证。** 单测 **603 例 / 0 失败**（新增 `ui_core_layer_tree_display_puts_group_above_children`、
+`ui_core_layer_tree_reorder_stays_within_siblings`、`ui_core_layer_tree_drag_uses_sibling_ordinals`）；
+PE 导出 **138 不变**（零新增 ABI）；壳自检 **245 项 / 失败 0**（基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.42（并回填 §5.12 项 8），
+`docs/manual-test.md` M40。
+
+
 
 
 
