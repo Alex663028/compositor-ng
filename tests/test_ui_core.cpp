@@ -2142,6 +2142,53 @@ COMP_TEST(ui_core_layer_rect_touches_canvas) {
       5000, 5000, 100, 100, std::numeric_limits<double>::quiet_NaN(), 1280, 720));
 }
 
+/*
+ * Move 工具「拖选区外 = 移图层」的分流判定：只有 coverage >= 阈值的点才算在选区内。
+ * 最容易错的两处：① 越界/NaN 必须判成「不在选区内」（否则画布外一拖就去搬像素）；
+ * ② 羽化边上按阈值切，不能让 127 这种半透明边缘算成「里面」。
+ */
+COMP_TEST(ui_core_selection_contains_point) {
+  /* 4×3 蒙版、stride 6（带填充垃圾）：步长写错会立刻读到别的值。 */
+  uint8_t mask[3 * 6];
+  std::fill(mask, mask + sizeof(mask), static_cast<uint8_t>(0xCD));
+  const auto put = [&](int x, int y, uint8_t value) {
+    mask[static_cast<std::size_t>(y) * 6 + static_cast<std::size_t>(x)] = value;
+  };
+  for (int y = 0; y < 3; ++y) {
+    for (int x = 0; x < 4; ++x) put(x, y, 0);
+  }
+  /* 一块 255 的实心区（x 1..2、y 0..1），外加羽化边上的 128 与 127。 */
+  put(1, 0, 255);
+  put(2, 0, 255);
+  put(1, 1, 255);
+  put(2, 1, 255);
+  put(0, 0, 128);
+  put(3, 0, 127);
+
+  COMP_CHECK(comp_ui::selection_contains_point(mask, 4, 3, 6, 1.0, 0.0, 128));
+  COMP_CHECK(comp_ui::selection_contains_point(mask, 4, 3, 6, 1.9, 1.9, 128)); /* floor */
+  COMP_CHECK(comp_ui::selection_contains_point(mask, 4, 3, 6, 0.5, 0.5, 128)); /* 恰为阈值 */
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 3.0, 0.0, 128)); /* 127 不够 */
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 0.0, 2.0, 128)); /* 未选中 */
+
+  /* 阈值夹取：0/负值按 1，>255 按 255。 */
+  COMP_CHECK(comp_ui::selection_contains_point(mask, 4, 3, 6, 3.0, 0.0, 0));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 3.0, 0.0, 400));
+
+  /* 越界与 NaN 一律「不在选区内」：画布外拖动 = 移动整层。 */
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, -0.1, 0.0, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 0.0, -0.1, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 4.0, 0.0, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, 3, 6, 0.0, 3.0, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(
+      mask, 4, 3, 6, std::numeric_limits<double>::quiet_NaN(), 0.0, 128));
+
+  /* 判断不了的输入：空指针 / 非正尺寸返回 false，且不读内存。 */
+  COMP_CHECK(!comp_ui::selection_contains_point(nullptr, 4, 3, 6, 0.0, 0.0, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 0, 3, 6, 0.0, 0.0, 128));
+  COMP_CHECK(!comp_ui::selection_contains_point(mask, 4, -1, 6, 0.0, 0.0, 128));
+}
+
 /* ------------------------------------------------------- 采样模式（S22） */
 
 /*

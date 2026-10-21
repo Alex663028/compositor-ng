@@ -436,8 +436,8 @@ struct ShellState {
   comp_ui::Point move_current{};
   bool move_duplicate = false;
   /*
-   * 整层拖动（Move 工具、无选区时，S21 补的鼠标入口）：与上面的选区搬移是两件事
-   * ——它只改图层的 transform（origin 平移），像素一个字节都不搬。
+   * 整层拖动（Move 工具：无选区时，或 §6.63 有选区但落点在选区外）：与上面的
+   * 选区搬移是两件事——它只改图层的 transform（origin 平移），像素一个字节都不搬。
    * 拖动期间在一个显式事务里实时写 transform（所见即所得），松手 commit = 一步撤销；
    * 失焦 / 捕获丢失 / Esc 走 abort 回滚。txn 属于 layer_move_doc，换文档后旧句柄
    * 随文档一起失效，**不能再 abort**（与 color_range 同一 UAF 规则）。
@@ -6392,10 +6392,12 @@ bool move_available(const ShellState& shell) {
 }
 
 /*
- * 整层拖动（Move 工具、无选区）。与选区搬移分开实现：
+ * 整层拖动（Move 工具、无选区；§6.63 起「有选区但落点在选区外」也走这里）。
+ * 与选区搬移分开实现：
  *   - 选区搬移改的是**像素**（comp_selection_move_pixels），只动当前图层选区内的字节；
  *   - 整层拖动改的是**transform 的 origin**（comp_layer_set_transform），像素不动。
- * 上游 V 在没有选区时拖的是整层，这里对齐该语义。
+ * 上游 V 在没有选区时拖的是整层；有选区时按落点分流（选区内 = 搬像素、选区外 = 整层），
+ * 这里对齐该语义。整层拖动**不动选区蒙版**——蚂蚁线留在原地，与上游一致。
  *
  * 拖动期间实时写 transform（所见即所得），与调整滑杆同一套事务写法：
  * 按下开显式事务，途中每个整数像素变化写一次（ImplicitTxn 加入该事务），
@@ -6456,7 +6458,8 @@ bool group_members_off_canvas(const ShellState& shell, int32_t dx, int32_t dy) {
   return members_off_canvas(shell.layer_move_members, dx, dy, shell.width, shell.height);
 }
 
-void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout,
+                      const wchar_t* hint = nullptr) {
   const LayerRow* row = selected_row(shell);
   if (row == nullptr) {
     set_status(shell, L"移动：请先选择一个图层");
@@ -6507,7 +6510,7 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
   shell.layer_move_duplicated = false;
   SetCapture(window);
 
-  wchar_t buffer[192];
+  wchar_t buffer[256];
   const size_t member_count = shell.layer_move_members.size();
   if (is_group) {
     if (shell.layer_move_alt) {
@@ -6523,6 +6526,10 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
   } else {
     wsprintfW(buffer, L"移动图层：拖动改变位置（松开算一步撤销），当前 (%d, %d)", transform.x,
               transform.y);
+  }
+  if (hint != nullptr) {
+    /* 补一句「为什么这一拖动的是整层」：落点在选区外，选区自己不会跟着走。 */
+    wsprintfW(buffer + lstrlenW(buffer), L" · %s", hint);
   }
   set_status(shell, buffer);
 }
@@ -6731,8 +6738,24 @@ void move_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
     layer_move_begin(window, shell, x, y, layout);
     return;
   }
+  /*
+   * §6.63 有选区时按**落点**分流（上游 V 的语义）：
+   *   - 落点在选区内 -> 搬选区像素（旧行为，蚂蚁线跟着走）；
+   *   - 落点在选区外 -> 搬整层（transform），选区原地不动。
+   * 蒙版读不到（`selection_mask` 空）时不猜：退回搬像素的旧行为，因为这时
+   * 「in/out」没有依据，改走整层拖动才是真的猜。
+   */
   const comp_ui::Point doc =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const bool mask_known = !shell.selection_mask.empty() && shell.width > 0 && shell.height > 0;
+  const bool inside =
+      !mask_known || comp_ui::selection_contains_point(
+                         shell.selection_mask.data(), shell.width, shell.height,
+                         static_cast<std::size_t>(shell.width), doc.x, doc.y, 128);
+  if (!inside) {
+    layer_move_begin(window, shell, x, y, layout, L"落点在选区外：移动整层，选区不动");
+    return;
+  }
   shell.move_active = true;
   shell.move_start = doc;
   shell.move_current = doc;
@@ -9574,7 +9597,8 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   } else if (id == comp_ui::ToolId::Move) {
     wsprintfW(buffer,
               L"工具：Move（V）· 无选区 = 拖整层、Alt+拖动 = 复制一份再移动；"
-              L"有选区 = 搬选区像素（Alt = 复制）；方向键微调 1 px（Shift 1 / Ctrl 10）");
+              L"有选区 = 选区内搬像素（Alt = 复制）、选区外拖整层；"
+              L"方向键微调 1 px（Shift 1 / Ctrl 10）");
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"

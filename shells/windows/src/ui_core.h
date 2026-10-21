@@ -1978,6 +1978,32 @@ inline bool intersect_coverage_with_selection(uint8_t* coverage, const uint8_t* 
 }
 
 /*
+ * 文档坐标 (x, y) 是否落在选区**内部**（coverage >= threshold，与蚂蚁线同一口径 128）。
+ *
+ * Move 工具用它分流：有选区时，落点在选区内 = 搬选区像素；落在选区外 = 搬整层
+ * （上游 V 的语义）。坐标是连续值，取整用 floor——面板/画布的变换算出的小数点
+ * 不应让边界像素来回跳。
+ *
+ * 越界（点在画布外）一律算「不在选区内」：画布外没有选中像素可搬，而用户在画布
+ * 边缘外拖动时想动的是整层。mask 为空 / 尺寸非正时也返回 false，但调用方必须先
+ * 自己判断「蒙版是不是根本读不到」——那种情况下 false 的含义是「不知道」，应退回
+ * 旧行为而不是改走整层拖动。
+ */
+inline bool selection_contains_point(const uint8_t* mask, int width, int height,
+                                     size_t stride, double x, double y, int threshold) {
+  if (mask == nullptr || width <= 0 || height <= 0) return false;
+  if (threshold < 1) threshold = 1;
+  if (threshold > 255) threshold = 255;
+  /* 写成 !(x >= 0) 而不是 x < 0：NaN 两个都比较为假，必须显式判成「不在选区内」。 */
+  if (!(x >= 0.0) || !(y >= 0.0)) return false;
+  if (!(x < static_cast<double>(width)) || !(y < static_cast<double>(height))) return false;
+  const int px = static_cast<int>(x);
+  const int py = static_cast<int>(y);
+  return mask[static_cast<size_t>(py) * stride + static_cast<size_t>(px)] >=
+         static_cast<uint8_t>(threshold);
+}
+
+/*
  * 色彩范围容差（P0-4 第二批）：0..200，与引擎 kMaxColorRangeFuzziness 同口径。
  * 缺省 40 抄自上游 `ColorRangeEdit.fuzziness`；**0 是合法值**（只选完全同色），
  * 与扩展/收缩的下限 1 不同，别把两个夹取函数合并。
