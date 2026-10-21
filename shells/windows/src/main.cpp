@@ -478,6 +478,21 @@ struct ShellState {
    */
   bool layer_move_is_group = false;
   /*
+   * §6.64 多选批量移动：面板选中集合里有 2 个以上顶层图层时，按下时把**每个**选中项
+   * 展开成实际要写 transform 的成员快照（组 = 子树成员、普通层 = 自己），拖动/方向键
+   * 只写「基准 + 总位移」，整批一次事务 = 一步撤销。layer_move_ids 记住顶层选中集合，
+   * Alt 拖动时按它逐个复制（副本集合再重建快照）。
+   *
+   * multi 与 is_group 互斥：组单选仍走整组文案与既有分支（§6.61）。
+   */
+  bool layer_move_multi = false;
+  std::vector<comp_layer_id> layer_move_ids;
+  /*
+   * 多选 Alt 拖动里某个复制失败：本次拖动作废（不写任何 transform），松手 abort
+   * 把已建的副本一起回滚，状态栏说明原因而不是含糊的「位置未变化」。
+   */
+  bool layer_move_copy_failed = false;
+  /*
    * 面板宽度（§6.60）：用户偏好，不是文档状态——不进撤销栈，也不随文档切换复位。
    * 与 `comp_ui::LayoutPrefs` 同构，`client_layout` 是唯一读取点，因此绘制与命中
    * 测试拿到的一定是同一份宽度（两者分叉 = 点不准行，这是本仓反复踩过的坑）。
@@ -2099,6 +2114,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
  */
 void collect_group_members(const ShellState& shell, comp_layer_id root,
                            std::vector<ShellState::GroupMemberMove>* out);
+void build_move_targets(const ShellState& shell,
+                        std::vector<ShellState::GroupMemberMove>* out);
 bool members_off_canvas(const std::vector<ShellState::GroupMemberMove>& members, int32_t dx,
                         int32_t dy, int32_t view_width, int32_t view_height);
 
@@ -2114,6 +2131,50 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
   const LayerRow* row = selected_row(shell);
   if (row == nullptr) {
     set_status(shell, L"无图层");
+    return;
+  }
+  /*
+   * §6.64 多选：选中集合里不止一个顶层图层时，整批一起微调（一次按键 = 一个事务
+   * = 一步撤销）。主选中层仍决定「当前图层」，但位移是所有选中项共享的。
+   */
+  if (!shell.extra_selection.empty()) {
+    std::vector<ShellState::GroupMemberMove> members;
+    build_move_targets(shell, &members);
+    if (members.empty()) {
+      set_status(shell, L"图层位置：选中的图层没有可移动的成员，无位移");
+      return;
+    }
+    comp_txn txn = nullptr;
+    if (comp_txn_begin(shell.document, "Nudge Layers", &txn) != COMP_OK) {
+      set_status(shell, L"平移图层：无法开始事务");
+      return;
+    }
+    size_t moved = 0;
+    for (const ShellState::GroupMemberMove& member : members) {
+      comp_rect target = member.base;
+      target.x += dx;
+      target.y += dy;
+      if (comp_layer_set_transform(shell.document, member.id, target, member.rotation) ==
+          COMP_OK) {
+        ++moved;
+      }
+    }
+    if (moved == 0) {
+      comp_txn_abort(txn);
+      set_status(shell, L"平移图层失败");
+      return;
+    }
+    if (comp_txn_commit(txn) != COMP_OK) {
+      set_status(shell, L"平移图层：提交失败");
+      return;
+    }
+    shell.needs_render = true;
+    const wchar_t* off_canvas =
+        members_off_canvas(members, dx, dy, shell.width, shell.height) ? L" · 已拖出画布" : L"";
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"图层：位移 (%d, %d)，%u 个成员（方向键微调）%s", dx, dy,
+              static_cast<unsigned>(moved), off_canvas);
+    refresh_history_status(shell, buffer);
     return;
   }
   if (row->is_group != 0) {
@@ -6436,6 +6497,36 @@ void collect_group_members(const ShellState& shell, comp_layer_id root,
 }
 
 /*
+ * §6.64 多选批量移动的目标快照：面板选中集合（已去掉「被选中祖先覆盖」的子层）×
+ * 每项实际要写 transform 的成员——组贡献子树成员（组自身不写，§6.61），普通层
+ * 贡献它自己。按下时快照一次，拖动/方向键只写「基准 + 总位移」，不累加。
+ */
+void build_move_targets(const ShellState& shell,
+                        std::vector<ShellState::GroupMemberMove>* out) {
+  out->clear();
+  const std::vector<comp_layer_id> ids = panel_selection_ids(shell, true);
+  for (comp_layer_id id : ids) {
+    bool is_group = false;
+    for (const LayerRow& item : shell.layers) {
+      if (item.id != id) continue;
+      is_group = item.is_group != 0;
+      break;
+    }
+    if (is_group) {
+      collect_group_members(shell, id, out);
+      continue;
+    }
+    ShellState::GroupMemberMove member{};
+    member.id = id;
+    if (comp_layer_get_transform(shell.document, member.id, &member.base, &member.rotation) !=
+        COMP_OK) {
+      continue;
+    }
+    out->push_back(member);
+  }
+}
+
+/*
  * 组整体是否已完全离开画布：**所有**成员都离开才算（与单层同一保守口径——少报
  * 「拖出画布」只是少一句提示，误报会让人以为图层丢了）。
  * 直接收成员快照而不是读 ShellState：方向键微调用的是局部清单，不经过拖动状态。
@@ -6469,10 +6560,22 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
    * §6.61 整组：组自己的 transform 不参与合成（filter_graph 只烘焙成员），写进去
    * 等于静默无操作。移动组 = 平移子树里每个成员，成员清单在按下时快照一次。
    * 空组照样允许按下：拖动是空操作，与「选中空组按住拖」在 PS 里的表现一致。
+   *
+   * §6.64 多选：选中集合里不止一个顶层图层时，整批一起搬（成员快照把所有选中项
+   * 展开成实际要写的 transform），文案与事务名都换成「多个图层」。
    */
+  const std::vector<comp_layer_id> batch_ids = panel_selection_ids(shell, true);
+  const bool multi = batch_ids.size() > 1;
+  std::vector<ShellState::GroupMemberMove> batch_members;
+  if (multi) build_move_targets(shell, &batch_members);
   std::vector<ShellState::GroupMemberMove> group_members;
-  const bool is_group = row->is_group != 0;
+  const bool is_group = !multi && row->is_group != 0;
   if (is_group) collect_group_members(shell, row->id, &group_members);
+  if (multi && batch_members.empty()) {
+    /* 全部选中项都是空组：没有可写的成员，别开一个空事务让撤销栈多一步。 */
+    set_status(shell, L"移动多个图层：选中的图层没有可移动的成员，无位移");
+    return;
+  }
   comp_rect transform{};
   float rotation = 0.0f;
   if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
@@ -6485,7 +6588,8 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
    */
   const bool alt_copy = (GetKeyState(VK_MENU) & 0x8000) != 0;
   const char* txn_name = "Move Layer";
-  if (is_group) txn_name = alt_copy ? "Duplicate & Move Layer Group" : "Move Layer Group";
+  if (multi) txn_name = alt_copy ? "Duplicate & Move Layers" : "Move Layers";
+  else if (is_group) txn_name = alt_copy ? "Duplicate & Move Layer Group" : "Move Layer Group";
   else if (alt_copy) txn_name = "Duplicate & Move Layer";
   comp_txn txn = nullptr;
   if (comp_txn_begin(shell.document, txn_name, &txn) != COMP_OK) {
@@ -6499,7 +6603,9 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
   shell.layer_move_id = row->id;
   shell.layer_move_base = transform;
   shell.layer_move_rotation = rotation;
-  shell.layer_move_members = std::move(group_members);
+  shell.layer_move_multi = multi;
+  shell.layer_move_ids = batch_ids;
+  shell.layer_move_members = multi ? std::move(batch_members) : std::move(group_members);
   shell.layer_move_is_group = is_group;
   shell.layer_move_start =
       shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
@@ -6508,11 +6614,21 @@ void layer_move_begin(HWND window, ShellState& shell, int x, int y, const Layout
   /* Alt 语义见上：只记标志，复制推迟到首次位移。 */
   shell.layer_move_alt = alt_copy;
   shell.layer_move_duplicated = false;
+  shell.layer_move_copy_failed = false;
   SetCapture(window);
 
   wchar_t buffer[256];
   const size_t member_count = shell.layer_move_members.size();
-  if (is_group) {
+  if (multi) {
+    if (shell.layer_move_alt) {
+      wsprintfW(buffer,
+                L"复制并移动多个图层：拖动即复制整批再移动（%u 个成员，松开算一步撤销）",
+                static_cast<unsigned>(member_count));
+    } else {
+      wsprintfW(buffer, L"移动多个图层：拖动移动 %u 个成员（松开算一步撤销）",
+                static_cast<unsigned>(member_count));
+    }
+  } else if (is_group) {
     if (shell.layer_move_alt) {
       wsprintfW(buffer, L"复制并移动图层组：拖动即复制整组再移动（%u 个成员，松开算一步撤销）",
                 static_cast<unsigned>(member_count));
@@ -6544,6 +6660,35 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
   const int32_t dx = static_cast<int32_t>(std::lround(doc.x - shell.layer_move_start.x));
   const int32_t dy = static_cast<int32_t>(std::lround(doc.y - shell.layer_move_start.y));
   if (dx == shell.layer_move_applied_dx && dy == shell.layer_move_applied_dy) return;
+
+  /*
+   * §6.64 多选 Alt 拖动：逐个复制选中项（组会深拷贝整棵子树），再把新的副本集合
+   * 当作选中项、重建成员快照——副本的成员 id 全变了，沿用旧快照会去写原图层。
+   * 任何一个复制失败：本次拖动作废（不写 transform），松手 abort 连部分副本一起回滚。
+   */
+  if (shell.layer_move_multi && shell.layer_move_alt && !shell.layer_move_duplicated) {
+    std::vector<comp_layer_id> copies;
+    bool ok = true;
+    for (comp_layer_id id : shell.layer_move_ids) {
+      comp_layer_id copy_id = 0;
+      if (comp_layer_duplicate(shell.document, id, &copy_id) != COMP_OK || copy_id == 0) {
+        ok = false;
+        break;
+      }
+      copies.push_back(copy_id);
+    }
+    if (!ok || copies.empty()) {
+      shell.layer_move_alt = false;
+      shell.layer_move_copy_failed = true;
+      return;
+    }
+    shell.layer_move_duplicated = true;
+    shell.layer_move_ids = copies;
+    shell.extra_selection.assign(copies.begin() + 1, copies.end());
+    refresh_layers(shell);
+    panel_select_layer_id(shell, copies.front());
+    build_move_targets(shell, &shell.layer_move_members);
+  }
 
   /*
    * Alt 拖动：第一次真正产生位移时才复制。副本落在同一个显式事务里，
@@ -6587,12 +6732,13 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
   }
 
   /*
-   * §6.61 整组：逐成员写「按下基准 + 总位移」。成员为空（空组）时什么都不写：
+   * §6.61 整组 / §6.64 多选：逐成员写「按下基准 + 总位移」。成员为空时什么都不写：
    * 组自己的 transform 不参与合成，写进去只会让状态栏的数字动、画面不动。
    */
-  if (shell.layer_move_is_group) {
+  if (shell.layer_move_is_group || shell.layer_move_multi) {
     if (shell.layer_move_members.empty()) {
-      set_status(shell, L"移动图层组：组内没有成员，无位移");
+      set_status(shell, shell.layer_move_multi ? L"移动多个图层：没有可移动的成员，无位移"
+                                                : L"移动图层组：组内没有成员，无位移");
       return;
     }
     size_t moved = 0;
@@ -6613,7 +6759,16 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
 
     const wchar_t* off_canvas = group_members_off_canvas(shell, dx, dy) ? L" · 已拖出画布" : L"";
     wchar_t group_buffer[224];
-    if (shell.layer_move_duplicated) {
+    if (shell.layer_move_multi) {
+      if (shell.layer_move_duplicated) {
+        wsprintfW(group_buffer,
+                  L"复制并移动多个图层：位移 (%d, %d)，%u 个成员（松开算一步撤销）%s", dx, dy,
+                  static_cast<unsigned>(moved), off_canvas);
+      } else {
+        wsprintfW(group_buffer, L"移动多个图层：位移 (%d, %d)，%u 个成员（松开算一步撤销）%s", dx,
+                  dy, static_cast<unsigned>(moved), off_canvas);
+      }
+    } else if (shell.layer_move_duplicated) {
       wsprintfW(group_buffer, L"复制并移动图层组：位移 (%d, %d)，%u 个成员（松开算一步撤销）%s",
                 dx, dy, static_cast<unsigned>(moved), off_canvas);
     } else {
@@ -6673,6 +6828,8 @@ void layer_move_end(HWND window, ShellState& shell) {
    */
   const size_t member_count = shell.layer_move_members.size();
   const bool was_group = shell.layer_move_is_group;
+  const bool was_multi = shell.layer_move_multi;
+  const bool copy_failed = shell.layer_move_copy_failed;
   const bool group_off_canvas = group_members_off_canvas(shell, dx, dy);
   shell.layer_move_active = false;
   shell.layer_move_dirty = false;
@@ -6681,6 +6838,9 @@ void layer_move_end(HWND window, ShellState& shell) {
   shell.layer_move_alt = false;
   shell.layer_move_duplicated = false;
   shell.layer_move_is_group = false;
+  shell.layer_move_multi = false;
+  shell.layer_move_copy_failed = false;
+  shell.layer_move_ids.clear();
   shell.layer_move_members.clear();
   ReleaseCapture();
 
@@ -6691,16 +6851,40 @@ void layer_move_end(HWND window, ShellState& shell) {
     /* 万一复制成功但紧接着写 transform 失败，abort 会把副本一起回滚，
      * 面板里那个 id 已经不存在——重取一次，别留着悬空选中。 */
     if (duplicated) refresh_layers(shell);
-    set_status(shell, was_group ? L"移动图层组：位置未变化" : L"移动：位置未变化");
+    if (copy_failed) {
+      /* 多选 Alt：部分副本已经在事务里，abort 把它们连根回滚了。 */
+      refresh_layers(shell);
+      set_status(shell, L"复制多个图层失败：已回滚，位置未变化");
+    } else if (was_multi) {
+      set_status(shell, L"移动多个图层：位置未变化");
+    } else if (was_group) {
+      set_status(shell, L"移动图层组：位置未变化");
+    } else {
+      set_status(shell, L"移动：位置未变化");
+    }
     return;
   }
   if (comp_txn_commit(txn) != COMP_OK) {
-    set_status(shell, was_group ? L"移动图层组：提交失败" : L"移动图层：提交失败");
+    set_status(shell, was_multi ? L"移动多个图层：提交失败"
+                                : was_group ? L"移动图层组：提交失败" : L"移动图层：提交失败");
     return;
   }
 
   shell.needs_render = true;
   wchar_t buffer[224];
+  if (was_multi) {
+    const wchar_t* off_canvas =
+        group_off_canvas ? L" · 已拖出画布（图层仍在面板里，可拖回或 Ctrl+Z）" : L"";
+    if (duplicated) {
+      wsprintfW(buffer, L"已复制并移动多个图层：位移 (%d, %d)，%u 个成员（一步撤销）%s", dx, dy,
+                static_cast<unsigned>(member_count), off_canvas);
+    } else {
+      wsprintfW(buffer, L"已移动多个图层：位移 (%d, %d)，%u 个成员（一步撤销）%s", dx, dy,
+                static_cast<unsigned>(member_count), off_canvas);
+    }
+    refresh_history_status(shell, buffer);
+    return;
+  }
   if (was_group) {
     const wchar_t* off_canvas =
         group_off_canvas ? L" · 已拖出画布（组仍在面板里，可拖回或 Ctrl+Z）" : L"";
@@ -6777,6 +6961,7 @@ void move_extend(ShellState& shell, int x, int y, const Layout& layout) {
 }
 
 void move_cancel(ShellState& shell) {
+  bool rolled_back_copy = false;
   /*
    * 换文档路径也会走到这里，而那时旧文档已经 destroy：事务句柄随文档失效，
    * abort 会打到已释放对象上（UAF）。与 color_range 同一规则——只有当事务
@@ -6784,6 +6969,11 @@ void move_cancel(ShellState& shell) {
    */
   if (shell.layer_move_txn != nullptr && shell.layer_move_doc == shell.document) {
     comp_txn_abort(shell.layer_move_txn);
+    /*
+     * Alt 拖动已经复制过（单层或 §6.64 整批）：abort 把副本一起撤了，面板里这些
+     * 副本 id 已经不存在——不重取会让选中项悬空，下一次命令对着死 id 发写入。
+     */
+    rolled_back_copy = shell.layer_move_duplicated;
   }
   shell.layer_move_txn = nullptr;
   shell.layer_move_doc = nullptr;
@@ -6792,7 +6982,14 @@ void move_cancel(ShellState& shell) {
   shell.layer_move_alt = false;
   shell.layer_move_duplicated = false;
   shell.layer_move_is_group = false;
+  shell.layer_move_multi = false;
+  shell.layer_move_copy_failed = false;
+  shell.layer_move_ids.clear();
   shell.layer_move_members.clear();
+  if (rolled_back_copy) {
+    refresh_layers(shell);
+    shell.needs_render = true;
+  }
   shell.move_active = false;
 }
 
@@ -9598,7 +9795,7 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
     wsprintfW(buffer,
               L"工具：Move（V）· 无选区 = 拖整层、Alt+拖动 = 复制一份再移动；"
               L"有选区 = 选区内搬像素（Alt = 复制）、选区外拖整层；"
-              L"方向键微调 1 px（Shift 1 / Ctrl 10）");
+              L"面板多选 = 整批移动（Alt = 整批复制）；方向键微调 1 px（Shift 1 / Ctrl 10）");
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"

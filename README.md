@@ -4892,6 +4892,41 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.36，`docs/manual-test.md` M32。
 
+### 6.64 多选批量移动：拖动与方向键一次搬整批（2026-10-21，Claude）
+
+**补掉 §5.12 遗留 5。** 面板早就支持 Ctrl 点选多个图层，但拖动只作用于**主选中层**，
+其余选中项原地不动——选中三行、拖一下只动一行，是明确的假象。本项让整批一起走，
+零新增 ABI 导出。
+
+**1. 选中集合先展开成「真正要写 transform 的成员」。** 新增 `build_move_targets`：
+用已有的 `panel_selection_ids(shell, true)` 取批量集合（会自动丢掉被**选中的祖先组**
+覆盖的子层，避免同一像素被写两次），再对每个顶层项分流——组用 `collect_group_members`
+展开成子树成员（组自身 transform 不参与合成，写了等于没写），普通层只取自己。
+两种来源最后是同一个 `GroupMemberMove` 快照格式，后续只有一套写入循环。
+
+**2. 拖动：按下快照，每帧重写「基准 + 总位移」。** 选中集合多于 1 个顶层图层时，
+`layer_move_begin` 把 `multi` 与成员快照一起记进状态，并开**一个**事务
+（`Move Layers` / Alt 时 `Duplicate & Move Layers`）；`layer_move_extend` 逐成员写
+`base + (dx, dy)`，不累加，来回拖不漂移，松手 commit = **一步撤销**。组单选仍走 §6.61
+的整组分支与文案，`multi` 与 `is_group` 互斥，不会互相抢。全部选中项都是空组时不开始
+事务，直接 `移动多个图层：选中的图层没有可移动的成员，无位移`，不在撤销栈里留空格。
+
+**3. Alt 拖动 = 整批复制的原子操作。** 首次产生位移时逐个 `comp_layer_duplicate`
+（组是深拷贝整棵子树），再把**副本集合**设为选中集合、按副本重建成员快照——副本成员 id
+全变了，沿用旧快照会去写原图层，画面看起来像「复制了但没复制」。任一副本失败就整批作废：
+不写任何 transform，松手 abort 把已建的副本一起回滚，状态栏
+`复制多个图层失败：已回滚，位置未变化`，不留半个副本。
+
+**4. 方向键走同一条路。** `panel_move_layer` 在 `extra_selection` 非空时也批量平移
+（事务 `Nudge Layers`，一次按键一步撤销），文案 `图层：位移 (dx, dy)，N 个成员（方向键微调）`，
+拖出画布时补 ` · 已拖出画布`（复用既有的 `members_off_canvas`）。Move 工具帮助也加了一句
+`面板多选 = 整批移动（Alt = 整批复制）`，免得只能靠试出来。
+
+**验证。** 单测 **597 例 / 0 失败**（本项只改壳层，无新增纯函数）；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.37，`docs/manual-test.md` M33。
+
 
 
 
