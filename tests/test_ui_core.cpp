@@ -628,6 +628,40 @@ COMP_TEST(ui_core_trim_rows_hit_test_matches_geometry) {
                                   panel.y + comp_ui::kTrimRowsTop + 1.0) == -1);
 }
 
+COMP_TEST(ui_core_clone_stroke_offset_matches_engine_rounding) {
+  /*
+   * 引擎在 has_offset == 0 时按 round(source - first_point) 定首笔偏移；宿主
+   * 必须算出同一组整数，否则「首笔正确、后续每一笔都错位」——而且这种错位
+   * 看起来像引擎的锅，实际上是宿主截断/取整口径不同。
+   */
+  double ox = 0.0;
+  double oy = 0.0;
+  comp_ui::clone_stroke_offset(100.0, 50.0, 10.4, 20.6, &ox, &oy);
+  COMP_CHECK(ox == 90.0); /* 89.6 -> 90 */
+  COMP_CHECK(oy == 29.0); /* 29.4 -> 29 */
+
+  /* .5 远离零（std::lround）：正负都要对，static_cast<int> 会两边都变 0。 */
+  comp_ui::clone_stroke_offset(0.0, 0.0, 0.5, -0.5, &ox, &oy);
+  COMP_CHECK(ox == -1.0);
+  COMP_CHECK(oy == 1.0);
+
+  /* 负偏移（源在落点左上）：-2.5 -> -3、-2.4 -> -2，不能 floor 成 -3/-3。 */
+  comp_ui::clone_stroke_offset(10.0, 10.0, 12.5, 12.4, &ox, &oy);
+  COMP_CHECK(ox == -3.0);
+  COMP_CHECK(oy == -2.0);
+
+  /* 两个分量可以只取一个（壳里没有这种调用，但空指针必须安全）。 */
+  ox = 123.0;
+  comp_ui::clone_stroke_offset(5.0, 5.0, 1.0, 1.0, &ox, nullptr);
+  COMP_CHECK(ox == 4.0);
+
+  /* 笔迹种类互不相同：提交分支按等值分发，撞值会把仿制送进别的算子。 */
+  COMP_CHECK(comp_ui::StrokeKind::Clone != comp_ui::StrokeKind::None);
+  COMP_CHECK(comp_ui::StrokeKind::Clone != comp_ui::StrokeKind::Paint);
+  COMP_CHECK(comp_ui::StrokeKind::Clone != comp_ui::StrokeKind::Retouch);
+  COMP_CHECK(comp_ui::StrokeKind::Clone != comp_ui::StrokeKind::HistoryBrush);
+}
+
 COMP_TEST(ui_core_retouch_modes_cycle_and_blur_radius_is_bounded) {
   /* R 键循环：Blur -> Smudge -> Liquify -> Blur（对齐上游 retouch 组）。 */
   COMP_CHECK(comp_ui::kRetouchModeCount == 3);

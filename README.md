@@ -4362,6 +4362,49 @@ Right / Tolerance，无堆分配；行几何 `trim_row_rect` 同时供绘制与�
 `build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.21、
 `docs/manual-test.md` M25。
 
+### 6.49 仿制图章接进外壳（S）（2026-10-21，Claude）
+
+**第三个「引擎有、壳没接」的工具。** 工具栏从第一版起就有 `Clone Stamp`（`S`）按钮，
+引擎自 F3 起就有 `COMP_TOOL_CLONE` 与 `comp_tool_clone`，但壳里**一个调用点都没有**：
+点画布只会落到 `canvas_click` 写一行坐标，按钮是死的。本轮把两段式交互补齐。
+
+**ABI 是两段式的，宿主必须自己记偏移。** 引擎不保存「上一次的源点」：
+`has_offset == 0` 时按 `round(source - first_point)` 现算首笔偏移，而
+`comp_tool_apply` 的 desc 是 `const`，算出来的值不会回填。所以壳在首笔成功后用
+`comp_ui::clone_stroke_offset`（`std::lround`，.5 远离零）算出同一组整数存进
+`ShellState`，之后每一笔带 `has_offset = 1` 复用——这就是 `aligned = 1` 的对齐语义。
+取整口径必须与引擎一致：`static_cast<int>` 是截断，首笔会差半像素，而症状是
+「第一笔对、之后每一笔整体偏一点」，极难归因。
+
+**交互。** Alt+点击画布 = 落源点（不落笔），源点吸附到像素（`floor`）并清零偏移；
+同时按住 Shift = `sample_all_layers`（整篇合成取样，否则只取目标图层）。
+普通拖动才落笔；单击也是一记 dab（单点折线）。未设源点时按下不捕获、
+状态栏直接写「先 Alt+点击画布设置源点」。源点跟随会话保留（切走再切回仍有效），
+但**换文档必须复位**：源点是旧文档的像素坐标，新建 / 打开 .comp / 拖入位图三条
+路径都调 `clone_reset_source`。提交参数与画笔同源（直径 / 硬度 / 满压 / flow 1 /
+seed 0），`clone.opacity` 显式给 1——零初始化等于 0，引擎会当成「什么都不改」。
+
+**反馈。** 笔迹拖影复用既有 `stroke_points` 通路（非落色笔迹用高对比青）；
+画布上按文档坐标画源点十字（每帧 `doc_to_screen` 现算，缩放 / 平移后跟着走，
+只在选中该工具且已设源点时出现）；工具栏与状态栏常显「源 x,y / 图层|合并」，
+未设源点时写「未设源点」。成功文案带折点数、源点、取样口径，引擎有 note 时附在
+「｜」后，随后 `refresh_history_status` 回读撤销计数。
+
+**复用纪律。** 与 Retouch / Tone / History Brush / Paint 同一条
+「鼠标折线 → `comp_tool_apply`」通路：`StrokeKind::Clone` 只决定松手时装配哪个算子。
+折线仍**先 swap 再 ReleaseCapture**（S15 的坑：`ReleaseCapture` 会同步派发
+`WM_CAPTURECHANGED` → `stroke_cancel` 清空点集），失焦 / 捕获丢失走同一个 `stroke_cancel`。
+零新增 ABI 导出。
+
+**验证。** UI 层 1 例（首笔偏移的四舍五入：89.6→90、29.4→29、±0.5 远离零、
+负偏移 -2.5→-3 / -2.4→-2、空指针安全，以及 `StrokeKind::Clone` 与其余取值互不相同）。
+单测 588 → **589 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**
+（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.22、
+`docs/manual-test.md` M26。遗留：Spot Healing（`J`）仍是死按钮——引擎要的是
+整层 `comp_tool_heal.coverage` 蒙版，不是折线，需要先定「笔迹 → 蒙版」的宿主侧规则；
+仿制不透明度也还没给调节入口（固定 1.0）。
+
 
 
 

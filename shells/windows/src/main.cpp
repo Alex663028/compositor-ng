@@ -304,6 +304,20 @@ struct ShellState {
    */
   int history_brush_state = -1;
   double history_brush_opacity = 1.0;
+  /*
+   * 仿制图章（S）：源点是**文档像素坐标**，Alt+点击设置；Shift+Alt = 整篇合成取样。
+   * 首笔偏移由引擎按 round(source - first_point) 现算，宿主用
+   * comp_ui::clone_stroke_offset 算出同一组整数存下来，后续笔画带 has_offset
+   * 复用（aligned = 1）。换文档必须复位——旧文档的源点在新像素网格上没有意义，
+   * 留着会把「A 图的天空」仿到 B 图的随机位置。
+   */
+  bool clone_source_set = false;
+  double clone_source_x = 0.0;
+  double clone_source_y = 0.0;
+  bool clone_has_offset = false;
+  double clone_offset_x = 0.0;
+  double clone_offset_y = 0.0;
+  bool clone_sample_all = false;
   /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
   comp_ui::FilterPanel filter;
   bool filter_open = false;
@@ -5617,6 +5631,149 @@ void paint_stroke_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 仿制图章 */
+
+/*
+ * 仿制图章 = 一条 COMP_TOOL_CLONE 折线 + 宿主保存的源点/偏移。
+ * Alt+点击只落源点（不改像素），普通拖动才落笔——这是引擎 ABI 的两段式：
+ * 引擎自己不记「上一次的源点」，对齐完全靠宿主把 offset 带回来。
+ */
+bool clone_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Clone;
+}
+
+/* 换文档 / 复位：源点属于旧文档的像素网格。 */
+void clone_reset_source(ShellState& shell) {
+  shell.clone_source_set = false;
+  shell.clone_source_x = 0.0;
+  shell.clone_source_y = 0.0;
+  shell.clone_has_offset = false;
+  shell.clone_offset_x = 0.0;
+  shell.clone_offset_y = 0.0;
+  shell.clone_sample_all = false;
+}
+
+/* Alt+点击：只落源点，不改像素（同时按住 Shift = 整篇合成取样）。 */
+void clone_pick_source(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!clone_stroke_available(shell)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  /* layout.canvas 是整个中间区域（不是文档范围）：缩放后点击可能落在文档外，
+   * 那种坐标不能当源点（引擎会逐像素跳过，等于白设）。 */
+  if (doc.x < 0.0 || doc.y < 0.0 || doc.x >= static_cast<double>(shell.width) ||
+      doc.y >= static_cast<double>(shell.height)) {
+    set_status(shell, L"仿制图章：源点必须在画布内");
+    return;
+  }
+  shell.clone_source_set = true;
+  shell.clone_source_x = std::floor(doc.x); /* 吸附到像素：偏移也随之为整数 */
+  shell.clone_source_y = std::floor(doc.y);
+  shell.clone_has_offset = false; /* 换源点 = 重算首笔偏移 */
+  shell.clone_sample_all = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"仿制图章：源点 (%d, %d)｜%s取样｜拖动开始仿制",
+            static_cast<int>(shell.clone_source_x), static_cast<int>(shell.clone_source_y),
+            shell.clone_sample_all ? L"整篇合成" : L"当前图层");
+  set_status(shell, buffer);
+}
+
+void clone_stroke_begin(HWND window, ShellState& shell, int x, int y,
+                        const Layout& layout) {
+  if (!clone_stroke_available(shell)) return;
+  if (!shell.clone_source_set) {
+    set_status(shell, L"仿制图章：先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
+    return;
+  }
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Clone)) return;
+  SetCapture(window);
+  wchar_t buffer[256];
+  wsprintfW(buffer, L"仿制图章：源 (%d, %d) · %s取样，松开鼠标落笔（直径 %d px）",
+            static_cast<int>(shell.clone_source_x), static_cast<int>(shell.clone_source_y),
+            shell.clone_sample_all ? L"整篇合成" : L"当前图层",
+            static_cast<int>(shell.brush_size + 0.5));
+  set_status(shell, buffer);
+}
+
+void clone_stroke_end(HWND window, ShellState& shell) {
+  if (shell.stroke_kind != comp_ui::StrokeKind::Clone) return;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
+
+  /* 同 paint_stroke_end：折线必须先搬走，ReleaseCapture 会同步触发取消。 */
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  ReleaseCapture();
+  if (points.empty()) return;
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"仿制图章：请先选择一个图层");
+    return;
+  }
+  if (!shell.clone_source_set) {
+    set_status(shell, L"仿制图章：源点已失效，请重新 Alt+点击设置");
+    return;
+  }
+
+  /*
+   * 对齐：首笔不带 offset（引擎按 round(source - first_point) 现算），宿主
+   * 在这一笔成功后存下同一组整数；之后每一笔都带 has_offset 复用。
+   * 顺序不能反——先带 offset 再存，首笔就会用上一次会话的偏移。
+   */
+  const bool establish_offset = !shell.clone_has_offset;
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_CLONE;
+  desc.clone.source_x = shell.clone_source_x;
+  desc.clone.source_y = shell.clone_source_y;
+  desc.clone.has_source = 1;
+  if (!establish_offset) {
+    desc.clone.offset_x = shell.clone_offset_x;
+    desc.clone.offset_y = shell.clone_offset_y;
+    desc.clone.has_offset = 1;
+  }
+  desc.clone.aligned = 1;
+  desc.clone.sample_all_layers = shell.clone_sample_all ? 1 : 0;
+  desc.clone.opacity = 1.0f; /* 笔迹总强度；零初始化 = 不动，必须显式给 1 */
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  desc.brush.flow = 1.0f;
+  desc.brush.seed = 0; /* 仿制是解析式采样；固定值守住「同参数同结果」 */
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"仿制图章失败（错误码 %d）", static_cast<int>(result));
+    set_status(shell, buffer);
+    return;
+  }
+  if (establish_offset) {
+    comp_ui::clone_stroke_offset(shell.clone_source_x, shell.clone_source_y, points[0],
+                                 points[1], &shell.clone_offset_x, &shell.clone_offset_y);
+    shell.clone_has_offset = true;
+  }
+
+  const wchar_t* sample_name = shell.clone_sample_all ? L"整篇合成" : L"当前图层";
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s）｜%s",
+              desc.stroke_point_count, static_cast<int>(shell.clone_source_x),
+              static_cast<int>(shell.clone_source_y), sample_name,
+              widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s · 直径 %d px）",
+              desc.stroke_point_count, static_cast<int>(shell.clone_source_x),
+              static_cast<int>(shell.clone_source_y), sample_name,
+              static_cast<int>(shell.brush_size + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 吸管（只读取色） */
 
 /*
@@ -5836,6 +5993,8 @@ bool create_document(ShellState& shell) {
   /* Progressive Blur 的渐变轴端点是旧文档坐标，换文档后一并作废。 */
   shell.progressive_axis_set = false;
   shell.progressive_axis_dragging = false;
+  /* 仿制图章的源点同理：它属于旧文档的像素网格。 */
+  clone_reset_source(shell);
   stroke_cancel(shell);
   move_cancel(shell);
   eyedropper_cancel(shell);
@@ -5874,6 +6033,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.filter.select(comp_ui::FilterId::Vignette);
   shell.progressive_axis_set = false;
   shell.progressive_axis_dragging = false;
+  clone_reset_source(shell);
   stroke_cancel(shell);
   move_cancel(shell);
   eyedropper_cancel(shell);
@@ -6016,6 +6176,7 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
     shell.visibility.clear();
     shell.filter_open = false;
     shell.filter_input.clear();
+    clone_reset_source(shell);
     stroke_cancel(shell);
     move_cancel(shell);
     eyedropper_cancel(shell);
@@ -6512,6 +6673,15 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     /* 取样源与不透明度必须常显：这支笔画出来的东西完全由它们决定。 */
     wsprintfW(extra, L"   取样 #%d / 不透明度 %d%%", history_brush_resolved_state(shell),
               static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
+  } else if (shell.tool == comp_ui::ToolId::Clone) {
+    /* 源点决定仿出来的位置，必须常显；未设源点时明说，否则用户会以为工具坏了。 */
+    if (shell.clone_source_set) {
+      wsprintfW(extra, L"   源 %d,%d%s", static_cast<int>(shell.clone_source_x),
+                static_cast<int>(shell.clone_source_y),
+                shell.clone_sample_all ? L" 合并" : L" 图层");
+    } else {
+      wsprintfW(extra, L"   未设源点");
+    }
   }
   wchar_t info_text[192];
   wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%   渲染 %s%s",
@@ -6557,6 +6727,10 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
   } else if (shell.tool == comp_ui::ToolId::HistoryBrush) {
     wsprintfW(extra, L" · 取样 #%d · 不透明度 %d%%", history_brush_resolved_state(shell),
               static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
+  } else if (shell.tool == comp_ui::ToolId::Clone && shell.clone_source_set) {
+    wsprintfW(extra, L" · 源 (%d, %d)%s", static_cast<int>(shell.clone_source_x),
+              static_cast<int>(shell.clone_source_y),
+              shell.clone_sample_all ? L" 合并" : L" 图层");
   }
   wchar_t line[768];
   wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%%%s · %s", tool_name,
@@ -8107,6 +8281,38 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(handle_pen);
   }
 
+  /*
+   * 仿制图章的源点十字：源点是文档坐标，缩放/平移后必须跟着画布走，所以每帧
+   * 由 doc_to_screen 现算，不缓存屏幕坐标。取像素中心（+0.5）让十字压在像素上。
+   * 只在选中该工具、且已设源点时画——别的工具下画一个没有意义的准星只会误导。
+   */
+  if (shell.tool == comp_ui::ToolId::Clone && shell.clone_source_set) {
+    const comp_ui::Point cross = shell.view.doc_to_screen(
+        shell.clone_source_x + 0.5, shell.clone_source_y + 0.5, layout.canvas, shell.width,
+        shell.height);
+    const int cx = static_cast<int>(std::lround(cross.x));
+    const int cy = static_cast<int>(std::lround(cross.y));
+    HPEN source_pen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HPEN source_inner = CreatePen(PS_DOT, 1, RGB(255, 255, 255));
+    HGDIOBJ old_pen = SelectObject(dc, source_pen);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Ellipse(dc, cx - 6, cy - 6, cx + 6, cy + 6);
+    MoveToEx(dc, cx - 10, cy, nullptr);
+    LineTo(dc, cx + 10, cy);
+    MoveToEx(dc, cx, cy - 10, nullptr);
+    LineTo(dc, cx, cy + 10);
+    SelectObject(dc, source_inner);
+    Ellipse(dc, cx - 6, cy - 6, cx + 6, cy + 6);
+    MoveToEx(dc, cx - 10, cy, nullptr);
+    LineTo(dc, cx + 10, cy);
+    MoveToEx(dc, cx, cy - 10, nullptr);
+    LineTo(dc, cx, cy + 10);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(source_pen);
+    DeleteObject(source_inner);
+  }
+
   /* 进行中的笔迹折线（文档像素 -> 屏幕）：落色用前景色，重绘用高对比度青。 */
   if (stroke_in_progress(shell) && shell.stroke_points.size() >= 4) {
     const COLORREF trail_color =
@@ -8362,6 +8568,18 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               L"Alt+[ / ] 调不透明度（当前 %d%%）",
               history_brush_resolved_state(shell),
               static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
+  } else if (id == comp_ui::ToolId::Clone) {
+    if (shell.clone_source_set) {
+      wsprintfW(buffer,
+                L"工具：Clone Stamp（S）· 源 (%d, %d) · %s取样｜Alt+点击换源点，"
+                L"Shift+Alt = 整篇合成",
+                static_cast<int>(shell.clone_source_x),
+                static_cast<int>(shell.clone_source_y),
+                shell.clone_sample_all ? L"整篇合成" : L"当前图层");
+    } else {
+      wsprintfW(buffer,
+                L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
+    }
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
               info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
@@ -10350,6 +10568,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
               paint_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (clone_stroke_available(*shell) &&
+                       (GetKeyState(VK_MENU) & 0x8000) != 0) {
+              /* Alt+点击 = 落源点，不落笔（Shift 同时按住则整篇合成取样）。 */
+              clone_pick_source(*shell, mouse_x, mouse_y, layout);
+            } else if (clone_stroke_available(*shell)) {
+              clone_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (eyedropper_available(*shell)) {
               eyedropper_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (move_available(*shell)) {
@@ -10546,6 +10770,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Retouch) {
         retouch_stroke_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Clone) {
+        clone_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }

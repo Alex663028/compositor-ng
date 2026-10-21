@@ -405,8 +405,31 @@ enum class StrokeKind : int {
   Retouch,      /* COMP_TOOL_BLUR / SMUDGE / LIQUIFY */
   Tone,         /* COMP_TOOL_DODGE / BURN / SPONGE */
   Paint,        /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
-  HistoryBrush  /* COMP_TOOL_HISTORY_BRUSH，取样状态来自历史面板 */
+  HistoryBrush, /* COMP_TOOL_HISTORY_BRUSH，取样状态来自历史面板 */
+  Clone         /* COMP_TOOL_CLONE，源点/对齐偏移由壳自己保存 */
 };
+
+/*
+ * 仿制图章的首笔偏移（文档像素）。
+ *
+ * 引擎在 `has_offset == 0` 时按 `round(source - first_point)` 现算，并把结果
+ * 用在这一笔里；ABI 的 `comp_tool_apply` 是 const desc，宿主拿不到回填值，
+ * 所以宿主必须自己算出同一组整数，才能在后续笔画里以 `has_offset = 1` 复用
+ * （这就是「对齐」：同一会话的源点相对位置固定）。
+ *
+ * 必须用 `std::lround`：它四舍五入且 .5 远离零，与引擎的 `round(...)` 一致；
+ * `static_cast<int>` 是截断，正负半像素都会差一格，症状是后续笔画整体错半像素
+ * 且很难看出是哪一笔开始错的。
+ */
+inline void clone_stroke_offset(double source_x, double source_y, double first_x,
+                                double first_y, double* offset_x, double* offset_y) {
+  if (offset_x != nullptr) {
+    *offset_x = static_cast<double>(std::lround(source_x - first_x));
+  }
+  if (offset_y != nullptr) {
+    *offset_y = static_cast<double>(std::lround(source_y - first_y));
+  }
+}
 
 /* ------------------------------------------------------------ 笔刷状态 */
 

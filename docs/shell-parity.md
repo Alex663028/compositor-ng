@@ -948,3 +948,51 @@ Tab / Shift+Tab 切行（夹住不环绕）；`-` / `=` 对基准行循环三档
 --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M25**。
 
+### 5.22 仿制图章（`S`）接线（2026-10-21）
+
+**第三个「引擎有、壳没接」的工具。** 工具栏从工具栏表第一版就有 `Clone Stamp`
+（键位 `s`），`comp_tool_op` 里 `COMP_TOOL_CLONE` 与 `comp_tool_clone` 也早已存在，
+但 `shells/windows` 中 `ToolId::Clone` **没有任何分支**：点画布会一路落到
+`canvas_click`，只往状态栏写一行文档坐标。本项把源点、落笔、对齐与反馈补齐，
+**零新增导出**（PE 仍 138）。
+
+**1. ABI 是两段式的：源点与偏移都由宿主保存。** 引擎不记「上一次的源点」：
+`has_offset == 0` 时按 `round(source - first_point)` 现算首笔偏移并只用在这一笔；
+`comp_tool_apply` 的 desc 是 `const`，算出来的值不会回填。因此壳必须在首笔成功后
+自己算出同一组整数（`comp_ui::clone_stroke_offset`，`std::lround` 与引擎 `round`
+同口径、.5 远离零），后续笔画带 `has_offset = 1` 复用，`aligned = 1` 才成立。
+用 `static_cast<int>` 截断会让首笔差半像素，症状是「第一笔正确、之后每一笔整体偏
+一格」——归因成本极高，所以这条规则放进 `ui_core.h` 并有单测钉住。
+
+**2. 交互与状态机。** Alt+点击画布 = 落源点（吸附到整数像素，清零偏移），
+不进入笔迹、不落撤销步；Shift+Alt+点击 = `sample_all_layers`（整篇合成取样，
+否则只取目标图层）。普通按下 / 拖动 = `StrokeKind::Clone` 笔迹，单击也是一记 dab。
+未设源点时按下不捕获，状态栏直接写「先 Alt+点击画布设置源点」。
+源点在一个工具会话内保留（切走再切回仍有效，与上游一致）；**换文档必须复位**：
+新建 / `load_document` / 拖入位图三条路径都调 `clone_reset_source`——旧文档的源点
+在新像素网格上没有意义。
+
+**3. 提交参数与画笔同源。** `stroke_points` + `brush`（直径 / 硬度 / 满压 / flow 1 /
+seed 0）与画笔、Retouch、历史记录画笔完全一致；`clone.opacity` 显式给 `1.0`
+（ABI 零初始化 = opacity 0 = 逐字节不动，漏掉就「工具像坏了」）。
+折线仍是**先 swap 再 `ReleaseCapture`**（S15：释放捕获会同步派发
+`WM_CAPTURECHANGED` → `stroke_cancel` 清空点集），失焦 / 捕获丢失走同一个取消路径。
+
+**4. 源点可见。** 画布按文档坐标画十字（`doc_to_screen` 每帧现算，缩放 / 平移后
+跟着画布走），只在选中该工具且已设源点时出现；工具栏与状态栏常显
+「源 x,y / 图层|合并」，未设源点写「未设源点」。笔迹拖影复用既有折线预览
+（非落色笔迹统一高对比青）。落笔后文案含折点数、源点、取样口径，引擎有 note 时
+附在「｜」后，再 `refresh_history_status` 回读撤销计数。
+
+**5. 验证。** UI 层 1 例（偏移四舍五入：89.6→90、29.4→29、±0.5 远离零、
+-2.5→-3 与 -2.4→-2、空指针安全；`StrokeKind::Clone` 与其余取值互不相同）。
+单测 588 → **589 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**
+（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。目视项见 `docs/manual-test.md` **M26**。
+
+**6. 仍未做。** ① Spot Healing（`J`）仍是死按钮：引擎要的是整层
+`comp_tool_heal.coverage` 蒙版，不是折线，宿主侧得先定「笔迹 → 蒙版」规则；
+② 仿制没有不透明度调节入口（固定 1.0，未占 `Alt+[ / ]`）；③ 无「对齐」开关
+（壳里恒 `aligned = 1`），无 `sample_all_layers` 的菜单勾选态。
+
+
