@@ -5934,7 +5934,7 @@ void heal_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layou
   wchar_t buffer[256];
   wsprintfW(buffer,
             L"修补：拖过要修补的区域，松开应用（%s · 直径 %d px · 不透明度 %d%%；"
-            L"再按 J 切算法，Alt+[ / ] 调不透明度）",
+            L"再按 J 切算法，Alt+[ / ] 调不透明度；有选区时只修补选区内）",
             widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
             static_cast<int>(shell.brush_size + 0.5),
             static_cast<int>(comp_ui::clamp_heal_opacity(shell.heal_opacity) * 100.0 + 0.5));
@@ -6014,6 +6014,22 @@ void heal_stroke_end(HWND window, ShellState& shell) {
   std::vector<uint8_t> coverage(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
   heal_rasterize_stroke(&coverage, width, height, layer_points, radius, shell.brush_hardness);
 
+  /*
+   * 选区内修补：coverage 是壳侧自己光栅化的，引擎的选区闸只作用在它自己的
+   * 落笔路径上，不会替我们裁这张蒙版。蒙版按文档分辨率维护，与 coverage 同一
+   * 坐标系；尺寸对不上（理论上不该发生）就老实报出来，不假装裁过。
+   */
+  bool selection_clipped = false;
+  bool selection_mask_mismatch = false;
+  if (shell.selection_active && !shell.selection_mask.empty()) {
+    if (shell.selection_mask.size() == coverage.size()) {
+      selection_clipped = comp_ui::intersect_coverage_with_selection(
+          coverage.data(), shell.selection_mask.data(), coverage.size());
+    } else {
+      selection_mask_mismatch = true;
+    }
+  }
+
   comp_tool_op_desc desc{};
   desc.kind = COMP_TOOL_HEAL;
   desc.heal.opacity = static_cast<float>(comp_ui::clamp_heal_opacity(shell.heal_opacity));
@@ -6045,15 +6061,18 @@ void heal_stroke_end(HWND window, ShellState& shell) {
   }
 
   const int stroke_count = static_cast<int>(layer_points.size() / 2);
+  const wchar_t* selection_note =
+      selection_clipped ? L" · 按选区裁剪"
+                        : (selection_mask_mismatch ? L" · 选区未裁剪（蒙版尺寸不一致）" : L"");
   if (note[0] != '\0' && note_size > 1) {
-    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px）｜%s", stroke_count,
+    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px）%s｜%s", stroke_count,
               widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
-              static_cast<int>(radius * 2.0 + 0.5), widen_ascii(note).c_str());
+              static_cast<int>(radius * 2.0 + 0.5), selection_note, widen_ascii(note).c_str());
   } else {
-    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px · 不透明度 %d%%）",
+    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px · 不透明度 %d%%）%s",
               stroke_count, widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
               static_cast<int>(radius * 2.0 + 0.5),
-              static_cast<int>(desc.heal.opacity * 100.0 + 0.5));
+              static_cast<int>(desc.heal.opacity * 100.0 + 0.5), selection_note);
   }
   refresh_history_status(shell, buffer);
 }

@@ -4591,6 +4591,32 @@ AND/XOR 两个位平面（`AND=1,XOR=0` 透明、`AND=0,XOR=0` 黑、`AND=0,XOR=
 遗留：④ 拖动过程中连续缩放（上游是点按式，本壳同为松手结算）；
 拖框不支持拖出画布边缘自动平移；放大镜是单色反色光标，不跟随系统深色主题。
 
+### 6.55 修补工具按当前选区裁剪（2026-10-21，Claude）
+
+**补掉 §6.52 的唯一遗留：有选区时修补仍涂满整幅画布。** 其它工具（画笔、
+橡皮、仿制图章）都走 `comp_tool_apply`，引擎在落笔路径上统一叠选区闸；
+修补不一样——外壳自己光栅化 8 位 coverage 再交给 `COMP_TOOL_HEAL`，
+引擎拿到的已经是成品蒙版（`engine/domain/tool_ops.cpp` 里 `spot_heal` 直接写
+图层像素，没有任何选区参数），所以**这个闸只能由壳侧补**。
+
+**实现。** 新增纯函数 `comp_ui::intersect_coverage_with_selection(coverage, mask, count)`，
+逐像素 `(coverage * mask + 127) / 255`：`255*255` 仍是 `255`（全保留不变形），
+`±127` 做四舍五入而不是截断，半透明边缘不会因为叠一次就整体变暗。
+`heal_stroke_end` 在光栅化之后、调 ABI 之前，若 `selection_active` 且蒙版非空就叠一次。
+蒙版本来就是文档分辨率（与 coverage 同坐标系），尺寸对不上属于不该出现的状态，
+这时**如实报「选区未裁剪（蒙版尺寸不一致）」而不是假装裁过**——宁可提示，也不静默
+越界涂。结果以 `selection_note` 后缀并进两条成功状态串，避免中途 `set_status`
+被后面的成功文案覆盖。
+
+**验证。** 新增 1 个单测（`ui_core_coverage_intersects_selection_mask`：255/128/0 三档、
+`200×64 → 50` 的取整、零 coverage 恒零、全掩版恒等、空指针返回 false 且不写字节），
+单测 **591 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**
+（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.28（并回填 §5.25），`docs/manual-test.md` M28 补步 12–13。
+遗留：选区只在落笔结算时生效（`spot_heal` 内部按补丁扩散采样，选区外像素不参与
+作为**源**，只被排除在**目标**之外），与 PS「选区同时限制采样」仍有差别。
+
 
 
 

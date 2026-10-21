@@ -1894,6 +1894,23 @@ inline int step_selection_grow(int radius, int direction) {
 }
 
 /*
+ * 把工具 coverage 与选区蒙版逐像素相乘（255 = 全保留，0 = 全丢弃）。
+ * 修补（Heal）的 coverage 由外壳自己光栅化，引擎的选区闸不覆盖这条路径，
+ * 所以壳侧必须自己叠一次，否则「有选区时画笔受限、修补却涂满全画布」。
+ * count 是像素数，调用方保证两个缓冲等长；任一为空指针返回 false 且不写字节。
+ */
+inline bool intersect_coverage_with_selection(uint8_t* coverage, const uint8_t* mask,
+                                              size_t count) {
+  if (coverage == nullptr || mask == nullptr) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const unsigned value =
+        static_cast<unsigned>(coverage[i]) * static_cast<unsigned>(mask[i]);
+    coverage[i] = static_cast<uint8_t>((value + 127u) / 255u); /* 四舍五入，255*255 仍是 255 */
+  }
+  return true;
+}
+
+/*
  * 色彩范围容差（P0-4 第二批）：0..200，与引擎 kMaxColorRangeFuzziness 同口径。
  * 缺省 40 抄自上游 `ColorRangeEdit.fuzziness`；**0 是合法值**（只选完全同色），
  * 与扩展/收缩的下限 1 不同，别把两个夹取函数合并。

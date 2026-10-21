@@ -1210,6 +1210,32 @@ COMP_TEST(ui_core_selection_grow_clamps_to_engine_range) {
   COMP_CHECK(comp_ui::step_selection_grow(1, -5) == 1);
 }
 
+COMP_TEST(ui_core_coverage_intersects_selection_mask) {
+  /* 255 旁路、0 全丢、中间值按比例并四舍五入。 */
+  uint8_t coverage[] = {255, 255, 255, 200, 0, 0};
+  const uint8_t mask[] = {255, 128, 0, 64, 255, 0};
+  COMP_CHECK(comp_ui::intersect_coverage_with_selection(coverage, mask, 6));
+  COMP_CHECK(coverage[0] == 255);
+  COMP_CHECK(coverage[1] == 128); /* 255*128/255 */
+  COMP_CHECK(coverage[2] == 0);
+  COMP_CHECK(coverage[3] == 50);  /* 200*64/255 = 50.2 -> 50 */
+  COMP_CHECK(coverage[4] == 0);    /* coverage 为 0 时无论蒙版多大都留 0 */
+  COMP_CHECK(coverage[5] == 0);
+
+  /* 四舍五入不能把 255*255 溢出成 254：全选必须原样不动。 */
+  uint8_t full[] = {255, 128};
+  const uint8_t full_mask[] = {255, 255};
+  COMP_CHECK(comp_ui::intersect_coverage_with_selection(full, full_mask, 2));
+  COMP_CHECK(full[0] == 255);
+  COMP_CHECK(full[1] == 128);
+
+  /* 空指针是调用方缺陷：返回 false 且不改字节。 */
+  uint8_t untouched[] = {77};
+  COMP_CHECK(!comp_ui::intersect_coverage_with_selection(untouched, nullptr, 1));
+  COMP_CHECK(!comp_ui::intersect_coverage_with_selection(nullptr, untouched, 1));
+  COMP_CHECK(untouched[0] == 77);
+}
+
 /* ------------------------------------------ P0-4 第二批: 色彩范围面板 */
 
 COMP_TEST(ui_core_color_range_fuzziness_is_zero_based) {
