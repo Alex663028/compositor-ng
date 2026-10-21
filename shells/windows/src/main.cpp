@@ -242,6 +242,19 @@ struct ShellState {
    */
   std::vector<comp_layer_id> extra_selection;
   /*
+   * 连续方向键微调合并成一步撤销（§5.30 的「仍未做」）。
+   *
+   * 按住方向键时 Windows 会连发 WM_KEYDOWN，若每次按键各自开事务，历史面板会
+   * 被 1 px 的步进刷满；上游把整段连续微调合成一步。做法是第一次按键开**显式
+   * 事务**并保持到 WM_KEYUP（或任何别的操作之前）：引擎的事务是「begin 时快照、
+   * commit 时压一条撤销记录」，所以跨多次 set_transform 也只占一步。
+   * nudge_anchor 记开始时的选中层 id——换层就该另起一步，不能并进同一事务。
+   * nudge_dirty 防止「一次都没写成功」也压一条空撤销记录。
+   */
+  comp_txn nudge_txn = nullptr;
+  comp_layer_id nudge_anchor = 0;
+  bool nudge_dirty = false;
+  /*
    * P0-1：图层面板的键入态（重命名 / 精确不透明度）。与本壳颜色、羽化、文字面板
    * 同一约定：进入即模态——Esc 取消、Enter 提交，其它快捷键一律让路。
    * layer_input_text 是宽字符，提交时一次性转 UTF-8（引擎只收 UTF-8）。
@@ -2379,6 +2392,50 @@ bool members_off_canvas(const std::vector<ShellState::GroupMemberMove>& members,
                         int32_t dy, int32_t view_width, int32_t view_height);
 
 /*
+ * 连续微调的事务收口（§5.30 补）。
+ *
+ * nudge_flush 只做「把已开的事务结束掉」：有写入才 commit（commit 才压撤销记录），
+ * 一次都没写成功就 abort，免得历史面板里出现一条什么都没改的步骤。调用点是
+ * 「任何可能改变文档或另开事务的动作」——见 WM_KEYUP/WM_LBUTTONDOWN/WM_INITMENU/
+ * WM_KILLFOCUS/WM_CLOSE 与 run_shell_command 入口，都是先收口再干活。
+ * 返回值 = 这次是否真的压进了一条撤销记录（WM_KEYUP 用它决定要不要刷新历史栏）。
+ */
+bool nudge_flush(ShellState& shell) {
+  if (shell.nudge_txn == nullptr) return false;
+  comp_txn txn = shell.nudge_txn;
+  const bool dirty = shell.nudge_dirty;
+  shell.nudge_txn = nullptr;
+  shell.nudge_anchor = 0;
+  shell.nudge_dirty = false;
+  if (!dirty) {
+    comp_txn_abort(txn);
+    return false;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"微调事务提交失败");
+    return false;
+  }
+  return true;
+}
+
+/*
+ * 取当前这段连续微调的事务：锚点相同就沿用（这是「合并成一步」的全部机关），
+ * 锚点变了先收口再新开。返回 nullptr = 开不了事务，调用方应如实报错而不是
+ * 退回隐式事务——那会把合并语义悄悄丢掉。
+ */
+comp_txn nudge_begin(ShellState& shell, comp_layer_id anchor, const char* label) {
+  if (shell.nudge_txn != nullptr && shell.nudge_anchor == anchor) return shell.nudge_txn;
+  nudge_flush(shell);
+  comp_txn txn = nullptr;
+  if (shell.document == nullptr || comp_txn_begin(shell.document, label, &txn) != COMP_OK) {
+    return nullptr;
+  }
+  shell.nudge_txn = txn;
+  shell.nudge_anchor = anchor;
+  return txn;
+}
+
+/*
  * 图层平移（S21）：对选中图层做整层几何位移——与 Move 工具的选区搬移
  * （comp_selection_move_pixels，只动当前图层的选区像素）是两件事，勿混。
  *
@@ -2393,8 +2450,8 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
     return;
   }
   /*
-   * §6.64 多选：选中集合里不止一个顶层图层时，整批一起微调（一次按键 = 一个事务
-   * = 一步撤销）。主选中层仍决定「当前图层」，但位移是所有选中项共享的。
+   * §6.64 多选：选中集合里不止一个顶层图层时，整批一起微调（整段连续微调 = 一个
+   * 事务 = 一步撤销）。主选中层仍决定「当前图层」，但位移是所有选中项共享的。
    */
   if (!shell.extra_selection.empty()) {
     std::vector<ShellState::GroupMemberMove> members;
@@ -2403,8 +2460,8 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
       set_status(shell, L"图层位置：选中的图层没有可移动的成员，无位移");
       return;
     }
-    comp_txn txn = nullptr;
-    if (comp_txn_begin(shell.document, "Nudge Layers", &txn) != COMP_OK) {
+    comp_txn txn = nudge_begin(shell, row->id, "Nudge Layers");
+    if (txn == nullptr) {
       set_status(shell, L"平移图层：无法开始事务");
       return;
     }
@@ -2416,15 +2473,11 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
       if (comp_layer_set_transform(shell.document, member.id, target, member.rotation) ==
           COMP_OK) {
         ++moved;
+        shell.nudge_dirty = true;
       }
     }
     if (moved == 0) {
-      comp_txn_abort(txn);
       set_status(shell, L"平移图层失败");
-      return;
-    }
-    if (comp_txn_commit(txn) != COMP_OK) {
-      set_status(shell, L"平移图层：提交失败");
       return;
     }
     shell.needs_render = true;
@@ -2439,8 +2492,8 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
   if (row->is_group != 0) {
     /*
      * §6.61 组图层：组自身的 transform 不参与合成（filter_graph 只烘焙成员），
-     * 写进去是静默无操作。微调组 = 平移子树里每个成员，一次按键一个事务，
-     * 于是「一步撤销」回到按键之前——与拖动松手同一口径。
+     * 写进去是静默无操作。微调组 = 平移子树里每个成员；整段连续微调共用一个
+     * 事务（松键收口），于是「一步撤销」回到按键之前——与拖动松手同一口径。
      */
     std::vector<ShellState::GroupMemberMove> members;
     collect_group_members(shell, row->id, &members);
@@ -2449,8 +2502,8 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
       set_status(shell, L"图层位置：组内没有成员，无位移");
       return;
     }
-    comp_txn txn = nullptr;
-    if (comp_txn_begin(shell.document, "Nudge Layer Group", &txn) != COMP_OK) {
+    comp_txn txn = nudge_begin(shell, row->id, "Nudge Layer Group");
+    if (txn == nullptr) {
       set_status(shell, L"平移图层组：无法开始事务");
       return;
     }
@@ -2462,15 +2515,11 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
       if (comp_layer_set_transform(shell.document, member.id, target, member.rotation) ==
           COMP_OK) {
         ++moved;
+        shell.nudge_dirty = true;
       }
     }
     if (moved == 0) {
-      comp_txn_abort(txn);
       set_status(shell, L"平移图层组失败");
-      return;
-    }
-    if (comp_txn_commit(txn) != COMP_OK) {
-      set_status(shell, L"平移图层组：提交失败");
       return;
     }
     shell.needs_render = true;
@@ -2480,6 +2529,11 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
     wsprintfW(buffer, L"图层组：位移 (%d, %d)，%u 个成员（方向键微调）%s", dx, dy,
               static_cast<unsigned>(moved), off_canvas);
     refresh_history_status(shell, buffer);
+    return;
+  }
+  /* 单层也要显式事务：跨按键合并成一步的全部依据，见 nudge_begin 的注释。 */
+  if (nudge_begin(shell, row->id, "Nudge Layer") == nullptr) {
+    set_status(shell, L"平移图层：无法开始事务");
     return;
   }
   comp_rect transform{};
@@ -2494,6 +2548,7 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
     set_status(shell, L"平移图层失败");
     return;
   }
+  shell.nudge_dirty = true;
   shell.needs_render = true;
   /* 微调也能把图层提出画布：与拖动同一句提示，否则照样像丢了图层。 */
   const wchar_t* off_canvas = comp_ui::layer_rect_touches_canvas(
@@ -2502,7 +2557,8 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
                                  ? L""
                                  : L" · 已拖出画布";
   wchar_t buffer[192];
-  wsprintfW(buffer, L"图层位置：(%d, %d)（方向键微调）%s", transform.x, transform.y, off_canvas);
+  wsprintfW(buffer, L"图层位置：(%d, %d)（方向键微调，松键合并为一步）%s", transform.x, transform.y,
+            off_canvas);
   refresh_history_status(shell, buffer);
 }
 
@@ -7923,6 +7979,12 @@ void view_zoom_step(ShellState& shell, double factor);
 
 /* 菜单与快捷键共用同一入口，保证两条路径行为不分叉。 */
 void run_shell_command(HWND window, ShellState& shell, UINT id) {
+  /*
+   * 任何命令之前先给连续微调收口：撤销/重做/新建/打开都要求「没有活动事务」，
+   * 而微调事务是跨按键保持的（见 nudge_begin）。这里也是菜单路径的分步点——
+   * 每点一次菜单项都是一条独立撤销记录。
+   */
+  nudge_flush(shell);
   switch (id) {
     case kCmdNew:
       create_document(shell);
@@ -12483,6 +12545,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       DragAcceptFiles(window, TRUE);
       return 0;
     case WM_DROPFILES:
+      /* 导入要求「没有活动事务」（comp_io.h 的前置条件），先收口连续微调。 */
+      if (shell != nullptr) nudge_flush(*shell);
       if (shell != nullptr) handle_drop_files(window, *shell, reinterpret_cast<HDROP>(wparam));
       return 0;
     case WM_PAINT:
@@ -12493,7 +12557,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
        * S24：菜单勾选态在这里刷新。**不重建菜单**——重建会让已打开的 HMENU 悬空，
        * 且每次弹菜单都闪一下；勾选是纯显示状态，按命令 id 递归改标记即可。
        */
-      if (shell != nullptr) sync_menu_state(window, *shell);
+      if (shell != nullptr) {
+        /* 菜单打开即收口连续微调：勾选/置灰读到的必须是已提交的状态。 */
+        nudge_flush(*shell);
+        sync_menu_state(window, *shell);
+      }
       return 0;
     case WM_KEYDOWN:
       if (shell != nullptr) {
@@ -12537,6 +12605,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         end_pan(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
       }
+      /*
+       * 方向键松开 = 这段连续微调结束（§5.30 补）：整套位移压成一条撤销记录。
+       * 用 KEYUP 而不是定时器收口——按键重复本来就是一串 KEYDOWN + 一个 KEYUP，
+       * 语义边界与用户「按住」的动作完全对齐，也不需要在空转时跑计时器。
+       */
+      if (shell != nullptr &&
+          (wparam == VK_LEFT || wparam == VK_RIGHT || wparam == VK_UP || wparam == VK_DOWN)) {
+        if (nudge_flush(*shell)) {
+          refresh_history_status(*shell, shell->status.c_str());
+          InvalidateRect(window, nullptr, FALSE);
+        }
+      }
       break;
     /*
      * P0-1：图层名 / 不透明度键入的字符入口。
@@ -12554,6 +12634,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_LBUTTONDOWN:
       if (shell != nullptr) {
+        /* 鼠标一按就结束连续微调：拖拽/画笔/面板行都会自己开事务，不能撞在活动事务上。 */
+        nudge_flush(*shell);
         Layout layout{};
         if (client_layout(*shell, &layout)) {
           const int button =
@@ -12986,6 +13068,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
        * ——否则第二次点击会被 DBLCLK 吃掉，画笔连点就少一笔。
        */
       if (shell != nullptr) {
+        nudge_flush(*shell);
         Layout layout{};
         /*
          * §6.60 双击分界线 = 复位该面板宽度。必须先于「还原成普通按下」，
@@ -13059,6 +13142,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       return SendMessageW(window, WM_LBUTTONDOWN, wparam, lparam);
     case WM_MBUTTONDOWN:
       if (shell != nullptr) {
+        nudge_flush(*shell);
         Layout layout{};
         if (client_layout(*shell, &layout) && layout.canvas.contains(mouse_x, mouse_y)) {
           begin_pan(window, *shell, mouse_x, mouse_y);
@@ -13225,6 +13309,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_KILLFOCUS:
       /* 失焦后收不到 KEYUP / MOUSEUP：必须主动清状态，否则会「粘住」。 */
       if (shell != nullptr) {
+        /* 先收口连续微调：下面各 cancel 会 abort 自己的拖动事务，不能撞上活动事务。 */
+        nudge_flush(*shell);
         shell->space_down = false;
         /* S24：拖行/框选是「按住鼠标」的临时态，失焦必须取消，否则指示线一直挂着。 */
         shell->layer_drag_pending = false;
@@ -13580,6 +13666,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_MOUSEWHEEL:
       if (shell != nullptr) {
+        nudge_flush(*shell);
         /* WM_MOUSEWHEEL 的坐标是屏幕坐标，先换算到客户区。 */
         POINT cursor{mouse_x, mouse_y};
         ScreenToClient(window, &cursor);
@@ -13666,6 +13753,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) InvalidateRect(window, nullptr, FALSE);
       break;
     case WM_CLOSE:
+      /* 关窗也收口：微调事务里的位移已经生效，不 commit 就丢掉那一步的撤销能力。 */
+      if (shell != nullptr) nudge_flush(*shell);
       DestroyWindow(window);
       return 0;
     case WM_DESTROY:

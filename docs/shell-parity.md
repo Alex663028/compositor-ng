@@ -1285,8 +1285,32 @@ Move 工具下用户正在摆图层，与上游语义一致。`Shift` 维持 1 p
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M27 步 16–17**。
 
-**5. 仍未做。** 每按一次 = 一步撤销（上游把连续微调合成一步）；要合并得做按键节流，
-否则按住方向键会把历史面板刷满。
+**5. 连续微调合并成一步撤销（§5.42）。** 引擎的事务语义决定了合并方式：`comp_txn_begin`
+取快照、`comp_txn_commit` 才压一条撤销记录，所以**一个事务 = 一步撤销**。此前
+`panel_move_layer` 每按一次就自开自交，按住方向键（自动重复 = 一串 `WM_KEYDOWN` +
+**一个** `WM_KEYUP`）会把历史面板刷成几十步。现在同一段按键重复共用一个显式事务：
+
+- `ShellState` 加 `nudge_txn` / `nudge_anchor`（事务归属的图层 id）/ `nudge_dirty`
+  （事务内是否真的写过）。
+- `nudge_begin(shell, anchor, label)`：锚点相同就复用未提交的事务；锚点换了先 flush 再开新的。
+  三条分支（单层 / 多选 `Nudge Layers` / 组 `Nudge Layer Group`）都改成走它。
+- `nudge_flush()`：没有事务返回 false；`nudge_dirty == false` 时 **abort**（空事务不该占
+  一步撤销）；否则 commit 并返回 true，调用方据此刷新历史面板。
+- 收口点选 `WM_KEYUP`（方向键），不选定时器：上游的边界是「松键」，`WM_KEYUP` 天然给出
+  这个边界，而定时器还得处理「按着键切走窗口」之类的情况，反而更容易把事务拖长。
+- 反方向的保险：任何**可能是另一件事**的入口在开自己的事务前都先 flush ——
+  `run_shell_command` 入口（菜单项每次仍各自一步）、`WM_INITMENU`、鼠标按下/双击/中键/
+  滚轮、`WM_KILLFOCUS`、`WM_DROPFILES`、`WM_CLOSE`。否则菜单撤销会撞上「已有事务」被拒。
+
+状态栏文案改为「图层位置：(x, y)（方向键微调，松键合并为一步）」。
+
+**6. 验证（§5.42）。** 纯外壳时序，没新增纯函数、没新增单测：单测 **599 例 / 0 失败**；
+PE 导出 **138 不变**；壳自检 **245 项 / 失败 0**（基线 SHA256 仍 `26b3e910…09423`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+冒烟脚本 `%TEMP%\nudge_smoke.ps1` 连发 5 次 `WM_KEYDOWN`(→) + 一次 `WM_KEYUP`，
+再 Undo/Redo、菜单微调 ×2 + Undo，进程存活且窗口仍响应（`alive … = True` /
+`responding = True`）——只能证明没有死锁/崩溃；合并粒度本身进目视项
+`docs/manual-test.md` **M38**。
 
 ### 5.31 仿制图章：取样范围做成持久开关（2026-10-21）
 
@@ -1530,7 +1554,7 @@ x, y, threshold)`：文档坐标 `floor` 后读 8 位 coverage，`>= threshold` 
 的副本一起回滚，状态栏 `复制多个图层失败：已回滚，位置未变化`，不留半个副本。
 
 **5. 方向键同一条路。** `panel_move_layer` 在 `extra_selection` 非空时批量平移
-（事务 `Nudge Layers`，一次按键一步撤销），状态栏
+（事务 `Nudge Layers`，一连串按键共用它 = 一步撤销，见 §5.30 项 5），状态栏
 `图层：位移 (dx, dy)，N 个成员（方向键微调）`，出画布补 ` · 已拖出画布`（复用
 `members_off_canvas`）。Move 工具帮助补了一句 `面板多选 = 整批移动（Alt = 整批复制）`。
 

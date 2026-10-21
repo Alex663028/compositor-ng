@@ -5042,6 +5042,30 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 真实窗口用 `WM_INITMENU` 后逐项读 `GetMenuState` 验证过三种状态的置灰矩阵。
 文档：`docs/shell-parity.md` §5.41，`docs/manual-test.md` M37。
 
+### 6.69 连续方向键微调合并成一步撤销（2026-10-21，Claude）
+
+**补掉 §5.30 的遗留：按住方向键会把历史面板刷满。** 引擎里「一个事务 = 一条撤销记录」
+（`comp_txn_begin` 取快照、`comp_txn_commit` 才入栈），而键盘自动重复是「一串
+`WM_KEYDOWN` + 一个 `WM_KEYUP`」——原来每按一次自开自交一次事务，按两秒就有几十步。
+
+**1. 事务挂在按键重复段上。** `ShellState` 加 `nudge_txn` / `nudge_anchor` / `nudge_dirty`；
+`nudge_begin()` 同锚点复用事务、换层则先收口；`nudge_flush()` 在 `nudge_dirty` 为假时
+直接 abort，不给撤销栈留空步。三条分支（单层 / 多选 / 组）共用这套。
+
+**2. 收口点选 `WM_KEYUP`。** 上游的边界是「松键」，`WM_KEYUP` 天然就是这个边界，不需要
+定时器节流；定时器还要处理「按着键切走窗口」之类的情况，容易把事务拖长。
+
+**3. 到处先收口。** 菜单命令入口、`WM_INITMENU`、鼠标按下/双击/中键/滚轮、失焦、拖放、
+关窗都先 flush：既让「菜单一次点击 = 一步撤销」保持不变，也避免下一个操作撞上「已有事务」
+被引擎拒绝。状态栏补「松键合并为一步」。
+
+**验证。** 单测 **599 例 / 0 失败**（无新增：这是外壳时序，纯层测不到）；PE 导出
+**138 不变**；壳自检 **245 项 / 失败 0**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+冒烟：连发 5 次 `WM_KEYDOWN` + 一次 `WM_KEYUP`，再撤销/重做、菜单微调 ×2 + 撤销，
+进程存活、窗口仍响应。
+文档：`docs/shell-parity.md` §5.30 项 5–6，`docs/manual-test.md` M38。
+
 
 
 
