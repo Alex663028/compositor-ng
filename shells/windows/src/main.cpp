@@ -318,6 +318,12 @@ struct ShellState {
   double clone_offset_x = 0.0;
   double clone_offset_y = 0.0;
   bool clone_sample_all = false;
+  /*
+   * Spot Healing（J）：模式与不透明度。coverage 不走 ABI 之外的持久状态——
+   * 每一笔在松手时按折线现光栅化，画布大小、笔刷直径与硬度都取当前值。
+   */
+  int heal_mode = comp_ui::kHealContentAware;
+  double heal_opacity = 1.0;
   /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
   comp_ui::FilterPanel filter;
   bool filter_open = false;
@@ -5791,6 +5797,248 @@ void clone_stroke_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ Spot Healing（修补） */
+
+/*
+ * 修补工具是本仓唯一「壳侧光栅化 coverage」的落笔族：ABI 的
+ * `comp_tool_heal.coverage` 要的是**图层像素空间**的整层 8 位蒙版，而引擎不提供
+ * 折线参数（不像画笔 / 仿制那样在域层自己 stamp）。壳因此做三件事：
+ *   1. 沿用 stroke_points（文档像素折线）；
+ *   2. 松手时把折线按图层变换逆映射到图层像素空间，按笔刷直径/硬度盖圆点；
+ *   3. 调一次 comp_tool_apply = 恰好一步撤销。
+ */
+bool heal_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Heal;
+}
+
+/*
+ * 文档坐标 -> 图层像素坐标。与 engine/domain/layer.cpp 的 map_document_to_pixel
+ * 同一套「归一化 -> 逆旋转 -> 翻转 -> 像素」，输出尺度只能取画布尺寸：壳自己
+ * 新建的图层像素尺寸就是画布；导入层的像素尺寸 ABI 没有读口，同样按画布尺度
+ * 解释（层更宽/更高时由 stride / 行数闸在写像素前拒绝，见 §5.25）。
+ */
+bool heal_layer_point(const comp_rect& transform, float rotation, bool flip_x, bool flip_y,
+                      int width, int height, double doc_x, double doc_y, double* out_x,
+                      double* out_y) {
+  if (out_x == nullptr || out_y == nullptr || width <= 0 || height <= 0) return false;
+  const comp_rect bounds = transform.w > 0 && transform.h > 0
+                               ? transform
+                               : comp_rect{transform.x, transform.y, width, height};
+  if (bounds.w <= 0 || bounds.h <= 0) return false;
+
+  const double ud = (doc_x + 0.5 - static_cast<double>(bounds.x)) /
+                        static_cast<double>(bounds.w) * 2.0 - 1.0;
+  const double vd = (doc_y + 0.5 - static_cast<double>(bounds.y)) /
+                        static_cast<double>(bounds.h) * 2.0 - 1.0;
+
+  double us = ud;
+  double vs = vd;
+  if (std::fabs(static_cast<double>(rotation)) > 1e-9) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double rad = static_cast<double>(rotation) * kPi / 180.0;
+    const double cos_t = std::cos(rad);
+    const double sin_t = std::sin(rad);
+    us = ud * cos_t + vd * sin_t;
+    vs = -ud * sin_t + vd * cos_t;
+  }
+  if (flip_x) us = -us;
+  if (flip_y) vs = -vs;
+
+  *out_x = (us + 1.0) * 0.5 * static_cast<double>(width) - 0.5;
+  *out_y = (vs + 1.0) * 0.5 * static_cast<double>(height) - 0.5;
+  return true;
+}
+
+/*
+ * 一个圆形笔尖。取 max 而不是累加：折线相邻 stamp 重叠是必然的，累加会让
+ * 慢速拖动把同一块涂到 255 以外的「更满」，等于 secretly 依赖鼠标采样率。
+ */
+void heal_stamp_round(std::vector<uint8_t>* coverage, int width, int height, double cx,
+                      double cy, double radius, double hardness) {
+  if (coverage == nullptr || width <= 0 || height <= 0 || radius <= 0.0) return;
+  const int x0 = std::max(0, static_cast<int>(std::floor(cx - radius)));
+  const int x1 = std::min(width - 1, static_cast<int>(std::ceil(cx + radius)));
+  const int y0 = std::max(0, static_cast<int>(std::floor(cy - radius)));
+  const int y1 = std::min(height - 1, static_cast<int>(std::ceil(cy + radius)));
+  if (x0 > x1 || y0 > y1) return;
+
+  const double h = std::min(std::max(hardness, 0.0), 1.0);
+  const double inner = radius * h; /* 硬芯半径：从这里到外沿线性降到 0 */
+  const double falloff = radius - inner;
+  for (int y = y0; y <= y1; ++y) {
+    uint8_t* row = coverage->data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+    const double dy = static_cast<double>(y) - cy;
+    for (int x = x0; x <= x1; ++x) {
+      const double dx = static_cast<double>(x) - cx;
+      const double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist > radius) continue;
+      double amount = 1.0;
+      if (falloff > 1e-9 && dist > inner) amount = (radius - dist) / falloff;
+      const int value = static_cast<int>(amount * 255.0 + 0.5);
+      uint8_t& cell = row[x];
+      if (value > cell) cell = static_cast<uint8_t>(std::min(255, value));
+    }
+  }
+}
+
+/*
+ * 沿折线 stamp：先在每个端点盖一记，再按 <= 半径 1/4 的步长补中间点，避免
+ * 快速拖动时圆点之间留缝（与域层 stamp_polyline 的采样密度同量级）。
+ */
+void heal_rasterize_stroke(std::vector<uint8_t>* coverage, int width, int height,
+                           const std::vector<double>& points, double radius, double hardness) {
+  if (coverage == nullptr || points.size() < 2) return;
+  heal_stamp_round(coverage, width, height, points[0], points[1], radius, hardness);
+  for (size_t i = 2; i + 1 < points.size(); i += 2) {
+    const double ax = points[i - 2];
+    const double ay = points[i - 1];
+    const double bx = points[i];
+    const double by = points[i + 1];
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double dist = std::sqrt(dx * dx + dy * dy);
+    const double spacing = std::max(0.75, radius * 0.25);
+    int steps = static_cast<int>(std::ceil(dist / spacing));
+    if (steps < 1) steps = 1;
+    if (steps > 8192) steps = 8192; /* 折点本身已按 1 px 采样；上限只防病态输入 */
+    for (int s = 1; s <= steps; ++s) {
+      const double t = static_cast<double>(s) / static_cast<double>(steps);
+      heal_stamp_round(coverage, width, height, ax + dx * t, ay + dy * t, radius, hardness);
+    }
+  }
+}
+
+void heal_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!heal_stroke_available(shell)) return;
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Heal)) return;
+  SetCapture(window);
+  wchar_t buffer[256];
+  wsprintfW(buffer,
+            L"修补：拖过要修补的区域，松开应用（%s · 直径 %d px · 不透明度 %d%%；"
+            L"再按 J 切算法，Alt+[ / ] 调不透明度）",
+            widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
+            static_cast<int>(shell.brush_size + 0.5),
+            static_cast<int>(comp_ui::clamp_heal_opacity(shell.heal_opacity) * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void heal_stroke_end(HWND window, ShellState& shell) {
+  if (shell.stroke_kind != comp_ui::StrokeKind::Heal) return;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
+
+  /* 同 paint_stroke_end：折线必须先搬走，ReleaseCapture 会同步触发取消。 */
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  ReleaseCapture();
+  if (points.empty()) return;
+
+  if (shell.document == nullptr) {
+    set_status(shell, L"修补：没有文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  const LayerRow* row = selected_row(shell);
+  if (id == 0) {
+    set_status(shell, L"修补：请先选择一个图层");
+    return;
+  }
+  if (row != nullptr && row->is_group != 0) {
+    set_status(shell, L"修补：组图层没有像素，无法修补（先选中组里的成员图层）");
+    return;
+  }
+
+  comp_rect transform{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.document, id, &transform, &rotation) != COMP_OK) {
+    set_status(shell, L"修补：读取图层变换失败");
+    return;
+  }
+  int32_t flip_x = 0;
+  int32_t flip_y = 0;
+  if (comp_layer_get_flip(shell.document, id, &flip_x, &flip_y) != COMP_OK) {
+    flip_x = 0;
+    flip_y = 0;
+  }
+
+  const int width = shell.width;
+  const int height = shell.height;
+  if (width <= 0 || height <= 0) {
+    set_status(shell, L"修补：画布尺寸无效");
+    return;
+  }
+
+  /* 折线映射到图层像素空间。映射失败（几何不可用）时整笔放弃，不写半张蒙版。 */
+  std::vector<double> layer_points;
+  layer_points.reserve(points.size());
+  for (size_t i = 0; i + 1 < points.size(); i += 2) {
+    double lx = 0.0;
+    double ly = 0.0;
+    if (!heal_layer_point(transform, rotation, flip_x != 0, flip_y != 0, width, height,
+                          points[i], points[i + 1], &lx, &ly)) {
+      set_status(shell, L"修补：图层几何不可用，未应用");
+      return;
+    }
+    layer_points.push_back(lx);
+    layer_points.push_back(ly);
+  }
+  if (layer_points.empty()) return;
+
+  /* 文档像素 -> 图层像素的尺度。transform 为 0 时两轴都退化成 1（见 heal_layer_point）。 */
+  const comp_rect bounds = transform.w > 0 && transform.h > 0
+                               ? transform
+                               : comp_rect{transform.x, transform.y, width, height};
+  const double scale_x = static_cast<double>(width) / static_cast<double>(std::max(1, bounds.w));
+  const double scale_y = static_cast<double>(height) / static_cast<double>(std::max(1, bounds.h));
+  const double radius =
+      std::max(0.5, shell.brush_size * 0.5 * (scale_x + scale_y) * 0.5);
+
+  std::vector<uint8_t> coverage(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+  heal_rasterize_stroke(&coverage, width, height, layer_points, radius, shell.brush_hardness);
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_HEAL;
+  desc.heal.opacity = static_cast<float>(comp_ui::clamp_heal_opacity(shell.heal_opacity));
+  desc.heal.mode = shell.heal_mode;
+  desc.heal.seed = 1u; /* 固定 seed：同参数同结果，PatchMatch 才不会每笔都换答案 */
+  desc.heal_coverage = coverage.data();
+  desc.heal_coverage_stride = static_cast<size_t>(width);
+  desc.heal_coverage_rows = static_cast<size_t>(height);
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    if (result == COMP_ERR_INVALID_ARGUMENT) {
+      /* 行数/stride 闸：导入层的像素尺寸可以不是画布尺寸。 */
+      wsprintfW(buffer, L"修补失败：图层像素尺寸大于画布，当前 coverage 装不下（错误码 %d）",
+                static_cast<int>(result));
+    } else if (result == COMP_ERR_STATE) {
+      wsprintfW(buffer, L"修补失败：图层没有可修补的像素（错误码 %d）", static_cast<int>(result));
+    } else {
+      wsprintfW(buffer, L"修补失败（错误码 %d）", static_cast<int>(result));
+    }
+    set_status(shell, buffer);
+    return;
+  }
+
+  const int stroke_count = static_cast<int>(layer_points.size() / 2);
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px）｜%s", stroke_count,
+              widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
+              static_cast<int>(radius * 2.0 + 0.5), widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"修补工具：已应用 %d 个折点（%s · 直径 %d px · 不透明度 %d%%）",
+              stroke_count, widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
+              static_cast<int>(radius * 2.0 + 0.5),
+              static_cast<int>(desc.heal.opacity * 100.0 + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 吸管（只读取色） */
 
 /*
@@ -8732,6 +8980,12 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
       wsprintfW(buffer,
                 L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
     }
+  } else if (id == comp_ui::ToolId::Heal) {
+    wsprintfW(buffer,
+              L"工具：Spot Healing（J）· %s｜拖动涂抹要修补的区域，松开应用；"
+              L"再按 J 切算法，[ / ] 调直径、Shift+[ / ] 调硬度、Alt+[ / ] 调不透明度（%d%%）",
+              widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str(),
+              static_cast<int>(comp_ui::clamp_heal_opacity(shell.heal_opacity) * 100.0 + 0.5));
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍，Alt+点击缩小；以点击点为锚；"
@@ -10307,6 +10561,23 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           set_tone_state(shell, shell.tool == comp_ui::ToolId::Tone
                                     ? comp_ui::next_tone_state(shell.tone_state)
                                     : comp_ui::kToneDodgeMidtone);
+        } else if (id == comp_ui::ToolId::Heal) {
+          /*
+           * 重复按 J 在三种修补算法里循环；从别的工具切进来回到 Content-Aware
+           * （最慢但最像 PS 的默认档），避免上一次会话的算法静默生效。
+           */
+          if (shell.tool == comp_ui::ToolId::Heal) {
+            shell.heal_mode = comp_ui::next_heal_mode(shell.heal_mode);
+            wchar_t buffer[224];
+            wsprintfW(buffer,
+                      L"修补算法：%s（再按 J 切换；Content-Aware / Create Texture / "
+                      L"Proximity Match）",
+                      widen_ascii(comp_ui::heal_mode_name(shell.heal_mode)).c_str());
+            set_status(shell, buffer);
+          } else {
+            shell.heal_mode = comp_ui::kHealContentAware;
+            set_tool(shell, comp_ui::ToolId::Heal);
+          }
         } else if (id != comp_ui::ToolId::Count) {
           set_tool(shell, id);
         }
@@ -10768,6 +11039,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
               paint_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (heal_stroke_available(*shell)) {
+              heal_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (clone_stroke_available(*shell) &&
                        (GetKeyState(VK_MENU) & 0x8000) != 0) {
               /* Alt+点击 = 落源点，不落笔（Shift 同时按住则整篇合成取样）。 */
@@ -10970,6 +11243,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Retouch) {
         retouch_stroke_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Heal) {
+        heal_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -11223,6 +11501,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           wsprintfW(buffer, L"历史记录画笔不透明度 %d%%（取样第 %d 个状态）",
                     static_cast<int>(shell->history_brush_opacity * 100.0 + 0.5),
                     history_brush_resolved_state(*shell));
+        } else if (shell->tool == comp_ui::ToolId::Heal) {
+          /* P1：Alt+[ / ] 调修补不透明度（下限 10%，0 会被域层拒）。 */
+          shell->heal_opacity = comp_ui::step_heal_opacity(shell->heal_opacity, direction);
+          wsprintfW(buffer, L"修补不透明度 %d%%（%s · 直径 %d px）",
+                    static_cast<int>(comp_ui::clamp_heal_opacity(shell->heal_opacity) * 100.0 + 0.5),
+                    widen_ascii(comp_ui::heal_mode_name(shell->heal_mode)).c_str(),
+                    static_cast<int>(shell->brush_size + 0.5));
         } else if (shell->tool == comp_ui::ToolId::Tone) {
           /* P1：Alt+[ / ] 调减淡/加深/海绵的强度（Exposure / Flow 口径，10% 一步）。 */
           shell->tone_strength = comp_ui::step_tone_strength(shell->tone_strength, direction);

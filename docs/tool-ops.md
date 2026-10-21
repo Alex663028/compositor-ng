@@ -24,7 +24,10 @@
 引擎显式做文档 → 图层的平移（用 `effective_bounds()` 的原点，对齐合成路径）。
 种子落在图层之外 ⇒ `COMP_ERR_INVALID_ARGUMENT`，不做静默夹取。
 
-`heal_coverage` 的尺寸与**图层像素**一致，不是画布。
+`heal_coverage` 的尺寸与**图层像素**一致，不是画布。宿主必须用
+`desc->heal_coverage_rows` 报出缓冲实际行数：域层只校验 stride（≥ 图层宽），
+执行时却按图层像素高逐行读；`0` = 旧宿主按图层高信任，
+`0 < rows < 图层高` 会被 ABI 在写像素前拒绝（`COMP_ERR_INVALID_ARGUMENT`）。
 
 ## 3. 通用契约
 

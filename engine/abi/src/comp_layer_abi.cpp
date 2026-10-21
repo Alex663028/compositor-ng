@@ -1269,8 +1269,21 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   if (desc == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "tool op desc is null");
   }
-  if (doc->find(target) == nullptr) {
+  const Layer* target_layer = doc->find(target);
+  if (target_layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /*
+   * Heal 的行数闸（`heal_coverage_rows` 尾部追加，0 = 旧宿主按图层高信任）。
+   *
+   * 域层的 heal 闸只校验 stride：它拿不到宿主缓冲到底有多少行，而执行时按
+   * **图层像素高**逐行 memcpy。图层比画布高（导入层的像素尺寸可以是任意值）时，
+   * 宿主按画布分配缓冲就会被读到尾外。行数由宿主显式报上来，这里在写入前拒绝。
+   */
+  if (desc->kind == COMP_TOOL_HEAL && desc->heal_coverage_rows != 0 &&
+      desc->heal_coverage_rows < static_cast<size_t>(target_layer->pixels.height)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "heal coverage rows smaller than the layer height");
   }
 
   /*

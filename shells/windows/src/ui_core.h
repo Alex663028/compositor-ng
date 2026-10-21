@@ -406,7 +406,8 @@ enum class StrokeKind : int {
   Tone,         /* COMP_TOOL_DODGE / BURN / SPONGE */
   Paint,        /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
   HistoryBrush, /* COMP_TOOL_HISTORY_BRUSH，取样状态来自历史面板 */
-  Clone         /* COMP_TOOL_CLONE，源点/对齐偏移由壳自己保存 */
+  Clone,        /* COMP_TOOL_CLONE，源点/对齐偏移由壳自己保存 */
+  Heal          /* COMP_TOOL_HEAL，coverage 由壳按笔迹折线自己光栅化 */
 };
 
 /*
@@ -1164,6 +1165,47 @@ inline double step_history_brush_opacity(double current, int direction) {
   const double base = clamp_history_brush_opacity(current);
   if (direction > 0) return clamp_history_brush_opacity(base + 0.1);
   if (direction < 0) return clamp_history_brush_opacity(base - 0.1);
+  return base;
+}
+
+/* ------------------------------------------------------------ Spot Healing 模式 */
+
+/*
+ * 上游 Spot Healing 的三种修补算法（comp_tool_heal.mode 的 0..2）。
+ * 重复按 J 依次切换，模式名进状态栏——与 R / O 的循环口径一致。
+ */
+inline constexpr int kHealModeCount = 3;
+inline constexpr int kHealContentAware = 0; /* PatchMatch，最慢也最像 PS 的内容识别 */
+inline constexpr int kHealCreateTexture = 1; /* 只借纹理，不借结构 */
+inline constexpr int kHealProximity = 2;    /* 邻近取色，最快 */
+
+inline const char* heal_mode_name(int mode) {
+  switch (mode) {
+    case kHealContentAware: return "Content-Aware";
+    case kHealCreateTexture: return "Create Texture";
+    case kHealProximity: return "Proximity Match";
+    default: return "?";
+  }
+}
+
+inline int next_heal_mode(int mode) {
+  if (mode < 0 || mode >= kHealModeCount - 1) return 0;
+  return mode + 1;
+}
+
+/* 修补不透明度（comp_tool_heal.opacity 的 0..1；0 被引擎的闸拒绝）。10% 一步。 */
+inline constexpr double kMinHealOpacity = 0.1;
+inline constexpr double kMaxHealOpacity = 1.0;
+
+inline double clamp_heal_opacity(double value) {
+  if (!(value > 0.0)) return kMinHealOpacity; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinHealOpacity), kMaxHealOpacity);
+}
+
+inline double step_heal_opacity(double current, int direction) {
+  const double base = clamp_heal_opacity(current);
+  if (direction > 0) return clamp_heal_opacity(base + 0.1);
+  if (direction < 0) return clamp_heal_opacity(base - 0.1);
   return base;
 }
 

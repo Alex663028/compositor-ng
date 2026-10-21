@@ -4401,8 +4401,7 @@ seed 0），`clone.opacity` 显式给 1——零初始化等于 0，引擎会当
 单测 588 → **589 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**
 （基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
 `build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.22、
-`docs/manual-test.md` M26。遗留：Spot Healing（`J`）仍是死按钮——引擎要的是
-整层 `comp_tool_heal.coverage` 蒙版，不是折线，需要先定「笔迹 → 蒙版」的宿主侧规则；
+`docs/manual-test.md` M26。遗留：Spot Healing（`J`）当时仍是死按钮，已在 §6.52 接线；
 仿制不透明度也还没给调节入口（固定 1.0）。
 
 ### 6.50 缩放工具接进外壳（Z）（2026-10-21，Claude）
@@ -4476,6 +4475,48 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 遗留：`Alt` 拖动 = 边移边复制图层、方向键微调、拖出画布时的位置提示、
 旋转/缩放手柄（transform 的尺寸与角度目前只能由引擎侧命令改）、
 组图层整体移动（要先让合成侧读组 transform）。
+
+### 6.52 Spot Healing 接进外壳（J）（2026-10-21，Claude）
+
+**最后一个「有按钮、没行为」的绘制工具。** `J` 的工具栏按钮与画笔轮廓从第一版就在，
+但壳里没有调用点，点画布只会写文档坐标。引擎侧其实早就完整：`COMP_TOOL_HEAL`
+带 PatchMatch、三种模式、不透明度和 `seed`（同一 `seed` 结果确定），
+缺的只是宿主怎么把一条笔迹变成它要的整层蒙版。
+
+**笔迹 → 蒙版。** 折点仍走既有 `stroke_begin / stroke_extend`（文档坐标）。松手时
+`heal_layer_point` 对每个折点做与引擎 `Layer::map_document_to_pixel` **同一套逆变换**
+（归一化 → 逆旋转 → 翻转 → 像素），得到图层像素坐标；`heal_rasterize_stroke`
+再沿折线按 `spacing = max(0.75, radius * 0.25)` 细分，逐点盖软圆章
+（`inner = radius * hardness`，到 `radius` 线性衰减，重叠取 `max`）。
+硬度、直径直接复用画笔的 `[` `]` 与 `Shift+[` `]`，没有第二套参数。
+蒙版容器按**画布**尺寸分配——这是壳在纯 origin、无缩放时唯一可靠的尺寸来源。
+
+**一笔一步撤销。** 光栅化完只调一次 `comp_tool_apply(COMP_TOOL_HEAL)`，
+`opacity / mode / seed = 1` 一起传；引擎按 `coverage × opacity` 替换像素。
+
+**一个必须先堵的洞。** 域层的 heal 闸只校验 `coverage_stride >= 图层宽`，
+看不到宿主缓冲有几行，执行时却按**图层像素高**逐行 `memcpy`。
+而图层像素尺寸并不总等于画布：`comp_io_import_layer` 按解码图的原始尺寸建像素，
+导入一张比画布高的图，宿主画布大小的缓冲就会被读到尾外。修法是
+`comp_tool_op_desc` **尾部追加** `heal_coverage_rows`（既有字段布局不动、导出数 138 不变），
+宿主填实际行数；ABI 在写入前发现 `0 < rows < 图层高` 就返回
+`COMP_ERR_INVALID_ARGUMENT`，壳翻成「图层像素尺寸大于画布，当前 coverage 装不下」。
+`0` = 旧宿主按图层高信任，行为与追加前完全一致。
+
+**键位。** 重复按 `J` 在三档算法里循环（Content-Aware / Create Texture /
+Proximity Match），从别的工具切进来一律回到 Content-Aware，避免上次的算法静默生效；
+`Alt+[ / ]` 调不透明度（10% 一步、下限 10%，与历史记录画笔同口径）；
+取消走通用 `stroke_cancel`（`Esc`、失焦、捕获丢失都覆盖），没有 Heal 专属残留状态。
+
+**验证。** 无新增单测（本轮没有新的纯模型代码，`ui_core` 里只是三个与既有
+`step_*` 同构的夹取函数）。单测 **589 例 / 0 失败**；PE 导出 **138 不变**；
+壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+文档：`docs/shell-parity.md` §5.25（并回填 §5.11 表格、§5.22 遗留项）、
+`docs/manual-test.md` M28、`docs/tool-ops.md` 的 coverage 行数说明。
+遗留：修补不看当前选区、非等比缩放时半径取两轴平均、无拖动中预览、
+无「采样全部图层」开关、导入层像素尺寸与画布不一致时蒙版坐标按画布尺度解释
+（ABI 没有像素尺寸读口；装不下时由 stride / 行数闸明确拒绝）。
 
 
 

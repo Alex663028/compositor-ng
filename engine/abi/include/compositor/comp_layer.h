@@ -851,7 +851,8 @@ typedef struct comp_tool_history_brush {
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
  * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
- * 按 `heal.coverage_stride`（字节/行，至少等于图层宽）逐行解释。
+ * 按 `heal.coverage_stride`（字节/行，至少等于图层宽）逐行解释；
+ * `heal_coverage_rows` 为缓冲实际行数（0 = 旧宿主，按图层高信任）。
  */
 typedef struct comp_tool_op_desc {
   comp_tool_op     kind;
@@ -912,6 +913,18 @@ typedef struct comp_tool_op_desc {
    * comp_tool_history_brush；笔迹折线与笔刷几何仍走 `stroke_points` 与 `brush`。
    */
   comp_tool_history_brush history;
+  /*
+   * 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   *
+   * COMP_TOOL_HEAL 的 coverage 行数（宿主缓冲实际有多少行）。引擎按图层像素高
+   * 逐行读 coverage；宿主若只分配了画布大小的缓冲、图层又比画布高，逐行读就会
+   * 越过缓冲尾（域层在此之前只校验了 stride，看不到行数）。
+   *
+   * 0 = 旧宿主，按图层高信任（行为与追加前完全一致，既有测试不受影响）。
+   * 非 0 且小于图层高 -> COMP_ERR_INVALID_ARGUMENT，宿主据此把「缓冲装不下」
+   * 变成一次明确的拒绝，而不是未定义行为。
+   */
+  size_t           heal_coverage_rows;
 } comp_tool_op_desc;
 
 /*

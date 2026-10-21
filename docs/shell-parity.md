@@ -397,8 +397,9 @@ CPU 烘焙后照样上 GPU，§6.27），仍整篇回落的是调整层与 HDR/R
 | 缺口 | 状态 | 原因 |
 |------|------|------|
 | Move 工具拖拽平移图层 | 已做（2026-10-21，§5.24） | 无选区 + 选中图层时拖动 = 改 transform；一次拖动一步撤销 |
+| Spot Healing（`J`） | 已做（2026-10-21，§5.25） | 折线在宿主侧光栅化成图层像素空间的 coverage 蒙版，一次 `comp_tool_apply` |
 | 工具按钮图标 | 未做 | 当前为文字快捷键字母，避免引入图标资源/字体 |
-| 选区羽化 / 扩缩手柄 | 未做 | ABI `comp_selection_modify` 已有；壳层只接了矩形框选与全选/取消/反选 |
+| 选区扩缩手柄 | 未做 | ABI `comp_selection_modify` 已有；壳层只接了矩形框选与全选/取消/反选（羽化已接） |
 | Brush/Eraser 逐笔撤销粒度 | 部分做 | 已有可视笔迹预览与笔尖轮廓；Brush/Eraser 的像素提交仍走既有 Stroke 通路 |
 | 滤镜实时预览 | 未做 | 当前是「回车应用一次」，无拖动滑杆的增量预览缓存 |
 | 面板缩放 / 停靠 | 未做 | 固定布局，窄窗口按规则收起 |
@@ -990,8 +991,7 @@ seed 0）与画笔、Retouch、历史记录画笔完全一致；`clone.opacity` 
 （基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
 **6/6 通过**；`build_windows_shell.py` 零警告。目视项见 `docs/manual-test.md` **M26**。
 
-**6. 仍未做。** ① Spot Healing（`J`）仍是死按钮：引擎要的是整层
-`comp_tool_heal.coverage` 蒙版，不是折线，宿主侧得先定「笔迹 → 蒙版」规则；
+**6. 仍未做。** ① Spot Healing（`J`）已接线，见 §5.25；
 ② 仿制没有不透明度调节入口（固定 1.0，未占 `Alt+[ / ]`）；③ 无「对齐」开关
 （壳里恒 `aligned = 1`），无 `sample_all_layers` 的菜单勾选态。
 
@@ -1063,6 +1063,51 @@ PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3
 ④ 旋转 / 缩放手柄（transform 的尺寸与角度目前只能由引擎侧命令改）；
 ⑤ PS 那个「拖选区外 = 移图层」的细节本项不模拟（有选区就只搬像素）；
 ⑥ 组图层整体移动——必须先让合成侧读组的 transform，壳侧才有意义。
+
+### 5.25 Spot Healing（`J`）接线（2026-10-21）
+
+**1. 缺口。** `J` 从工具栏第一版起就存在、`tool_has_brush_tip` 也已经把它算进画笔，
+但壳里没有任何调用点：按下拖动落到 `canvas_click`，只写文档坐标。
+引擎侧 `COMP_TOOL_HEAL` 早已完整（PatchMatch、三种模式、不透明度、`seed` 决定确定性），
+难点全在宿主：它要的是**整层像素空间的 8 位蒙版** `heal.coverage`，不是一条折线。
+
+**2. 宿主规则：折线 → 蒙版。** 笔迹折点仍由既有 `stroke_begin / stroke_extend` 收集
+（文档坐标）。松手时对每个折点做与引擎 `Layer::map_document_to_pixel` **同一套**逆变换
+（归一化 → 逆旋转 → 翻转 → 像素坐标），再在图层像素空间里沿折线按
+`spacing = max(0.75, radius * 0.25)` 细分、逐点盖软圆章（`inner = radius * hardness`，
+从 `inner` 到 `radius` 线性衰减，同一点多次覆盖取 `max`）写进蒙版。
+因此硬度/直径直接复用画笔的 `[` `]`、`Shift+[` `]`，不新增第二套参数。
+
+**3. 一次一笔 = 一步撤销。** 蒙版光栅化完只调一次 `comp_tool_apply(COMP_TOOL_HEAL)`，
+`opacity`、`mode`、`seed = 1` 一并传入；引擎的 `spot_heal` 按
+`coverage × opacity` 替换像素。撤销栈只加一步，`Ctrl+Z` 整笔回退。
+
+**4. `heal_coverage_rows`（ABI 尾部追加）。** 域层的 heal 闸只校验
+`coverage_stride >= 图层宽`，看不到宿主缓冲**到底有几行**，而执行时按
+**图层像素高**逐行 `memcpy`。图层像素尺寸并不总是等于画布：`comp_io_import_layer`
+会按解码图的原始尺寸建像素。图层比画布高时，宿主按画布分配的缓冲会被读越尾。
+修法是尾部追加 `size_t heal_coverage_rows`（既有字段布局不动、导出数 138 不变），
+宿主填实际行数；ABI 在写入前发现 `0 < rows < 图层高` 直接返回
+`COMP_ERR_INVALID_ARGUMENT`，壳把它翻成「图层像素尺寸大于画布，当前 coverage 装不下」。
+`0` = 旧宿主按图层高信任，行为与追加前完全一致，既有测试不受影响。
+
+**5. 键位。** 重复按 `J` 在三档算法里循环（Content-Aware / Create Texture /
+Proximity Match），从别的工具切进来一律回到 Content-Aware；`Alt+[ / ]` 调不透明度
+（10% 一步，下限 10%，与历史记录画笔同一口径）。取消走通用 `stroke_cancel`
+（`Esc` 关闭、失焦、捕获丢失），它只清 `stroke_kind` 与折点，没有 Heal 专属残留状态。
+
+**6. 验证。** 纯外壳 + 一个尾部字段，无新增单测。单测 **589 例 / 0 失败**；
+PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M28**。
+
+**7. 仍未做。** ① 修补**不看当前选区**（蒙版只由笔迹决定，PS 会叠选区）；
+② 非等比缩放的图层用 `(scale_x + scale_y) / 2` 近似半径，宽度与高度比例悬殊时有偏差；
+③ 拖动中没有蒙版预览，只有松手后一次性落墨；④ 没有「采样全部图层」开关
+（固定 `mode` 自带的取样口径）；⑤ 蒙版坐标按**画布**尺度解释：图层像素尺寸与画布
+不一致的导入层（ABI 没有像素尺寸读口），笔迹落点会整体缩放到画布范围；
+装不下时（层更宽/更高）由 stride / 行数闸明确拒绝，不会越界。
+
 
 
 
