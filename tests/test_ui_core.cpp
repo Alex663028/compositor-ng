@@ -246,6 +246,127 @@ COMP_TEST(ui_core_layout_never_overlaps_at_any_size) {
   COMP_CHECK(wide.canvas.bottom() == 720 - Layout::kStatusHeight);
 }
 
+COMP_TEST(ui_core_layout_respects_panel_width_prefs) {
+  /* §6.60：偏好宽度生效时仍必须三块横向铺满，且收起口径按偏好宽度判断。 */
+  const int prefs_layer[] = {Layout::kLayerPanelMinWidth, 200, Layout::kLayerPanelWidth, 400,
+                             Layout::kLayerPanelMaxWidth};
+  const int prefs_adjust[] = {Layout::kAdjustPanelMinWidth, 300, Layout::kAdjustPanelWidth, 470,
+                              Layout::kAdjustPanelMaxWidth};
+  const int widths[] = {300, 427, 660, 700, 800, 1000, 1280, 1920};
+
+  for (int layer_pref : prefs_layer) {
+    for (int adjust_pref : prefs_adjust) {
+      comp_ui::LayoutPrefs prefs;
+      prefs.layer_panel_width = layer_pref;
+      prefs.adjust_panel_width = adjust_pref;
+      for (int width : widths) {
+        const Layout layout = comp_ui::compute_layout(width, 720, prefs);
+
+        COMP_CHECK_MSG(layout.layer_panel.w + layout.canvas.w + layout.adjust_panel.w == width,
+                       "prefs layout must still tile the full width");
+        COMP_CHECK_MSG(layout.canvas.w >= 0, "canvas must never go negative with prefs");
+
+        /* 宽度只能是 0（放不下）或偏好值本身——不存在「挤成一半」的中间态。 */
+        COMP_CHECK_MSG(layout.layer_panel.w == 0 || layout.layer_panel.w == layer_pref,
+                       "layer panel width must be the pref or collapsed");
+        COMP_CHECK_MSG(layout.adjust_panel.w == 0 || layout.adjust_panel.w == adjust_pref,
+                       "adjust panel width must be the pref or collapsed");
+
+        if (width >= layer_pref + Layout::kMinCanvasWidth) {
+          COMP_CHECK_MSG(layout.layer_panel.w == layer_pref,
+                         "layer panel shown when pref + min canvas fits");
+        } else {
+          COMP_CHECK_MSG(layout.layer_panel.w == 0, "layer panel collapsed when it cannot fit");
+        }
+      }
+    }
+  }
+
+  /* 面板变宽必然压缩画布，且画布左边界跟着面板右边界走。 */
+  comp_ui::LayoutPrefs wide_prefs;
+  wide_prefs.layer_panel_width = 400;
+  const Layout wide = comp_ui::compute_layout(1280, 720, wide_prefs);
+  const Layout standard = comp_ui::compute_layout(1280, 720);
+  COMP_CHECK(wide.layer_panel.w == 400);
+  COMP_CHECK(wide.canvas.x == 400);
+  COMP_CHECK(wide.canvas.w == standard.canvas.w - (400 - Layout::kLayerPanelWidth));
+}
+
+COMP_TEST(ui_core_panel_width_clamp_and_drag) {
+  /* 夹取：低于下限抬到下限，高于上限压到上限，范围内原样。 */
+  COMP_CHECK(comp_ui::clamp_layer_panel_width(0) == Layout::kLayerPanelMinWidth);
+  COMP_CHECK(comp_ui::clamp_layer_panel_width(-999) == Layout::kLayerPanelMinWidth);
+  COMP_CHECK(comp_ui::clamp_layer_panel_width(200) == 200);
+  COMP_CHECK(comp_ui::clamp_layer_panel_width(9999) == Layout::kLayerPanelMaxWidth);
+  COMP_CHECK(comp_ui::clamp_adjust_panel_width(0) == Layout::kAdjustPanelMinWidth);
+  COMP_CHECK(comp_ui::clamp_adjust_panel_width(300) == 300);
+  COMP_CHECK(comp_ui::clamp_adjust_panel_width(9999) == Layout::kAdjustPanelMaxWidth);
+
+  /* 图层面板在左：向右拖变宽。 */
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, 0.0) == 248);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, 40.0) == 288);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, -40.0) == 208);
+  /* 右侧面板在右：向左拖变宽（同一屏位移，符号相反）。 */
+  COMP_CHECK(comp_ui::adjust_panel_width_from_drag(330, 0.0) == 330);
+  COMP_CHECK(comp_ui::adjust_panel_width_from_drag(330, -40.0) == 370);
+  COMP_CHECK(comp_ui::adjust_panel_width_from_drag(330, 40.0) == 290);
+
+  /*
+   * 拖到边界后立刻反向：位移从**基准**算，不存在死区——夹取只作用在结果上。
+   * 若先夹基准再加位移，回拖时得先抵消掉溢出量面板才开始动。
+   */
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(500, 200.0) == Layout::kLayerPanelMaxWidth);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(500, 10.0) == 510);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(180, -100.0) == Layout::kLayerPanelMinWidth);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(180, 4.0) == 184);
+
+  /* 位移取整：.5 向上取整，保证来回拖回原点能精确回到原宽度。 */
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, 2.5) == 251);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, 2.4) == 250);
+  COMP_CHECK(comp_ui::layer_panel_width_from_drag(248, 40.0) ==
+             comp_ui::layer_panel_width_from_drag(248, 40.4));
+}
+
+COMP_TEST(ui_core_panel_splitter_hit_test) {
+  const Layout layout = comp_ui::compute_layout(1280, 720);
+  const double mid_y = layout.canvas.y + layout.canvas.h / 2.0;
+
+  /* 图层面板：命中带是面板最后 5px，整条落在面板内，不占画布。 */
+  COMP_CHECK(layout.layer_splitter.w == Layout::kPanelSplitterWidth);
+  COMP_CHECK(layout.layer_splitter.right() == layout.layer_panel.right());
+  COMP_CHECK(layout.layer_splitter.x >= layout.layer_panel.x);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w - 1.0, mid_y) == 1);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w - 5.0, mid_y) == 1);
+  /* 画布第一列像素不属于分界线：画到边上不应变成拉宽。 */
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w, mid_y) == 0);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w - 6.0, mid_y) == 0);
+
+  /* 调整面板：命中带是面板最左 5px。 */
+  COMP_CHECK(layout.adjust_splitter.w == Layout::kPanelSplitterWidth);
+  COMP_CHECK(layout.adjust_splitter.x == layout.adjust_panel.x);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.adjust_panel.x + 0.0, mid_y) == 2);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.adjust_panel.x + 4.0, mid_y) == 2);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.adjust_panel.x - 1.0, mid_y) == 0);
+  /* 画布右边界内侧一像素同样不是分界线。 */
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.adjust_panel.x - 1.0, mid_y) == 0);
+
+  /* 纵向：只在内容行生效，工具条与状态栏里不命中。 */
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w - 1.0,
+                                        static_cast<double>(layout.toolbar.bottom()) - 1.0) == 0);
+  COMP_CHECK(comp_ui::panel_splitter_at(layout, layout.layer_panel.w - 1.0,
+                                        static_cast<double>(layout.status.y) + 1.0) == 0);
+
+  /* 面板收起时命中带为空矩形，任何点都不得命中——否则窄窗口里拖不到画布边。 */
+  const Layout narrow = comp_ui::compute_layout(300, 720);
+  COMP_CHECK(narrow.layer_panel.w == 0);
+  COMP_CHECK(narrow.adjust_panel.w == 0);
+  COMP_CHECK(narrow.layer_splitter.empty());
+  COMP_CHECK(narrow.adjust_splitter.empty());
+  COMP_CHECK(comp_ui::panel_splitter_at(narrow, 0.0, mid_y) == 0);
+  COMP_CHECK(comp_ui::panel_splitter_at(narrow, 299.0, mid_y) == 0);
+  COMP_CHECK(comp_ui::panel_splitter_at(narrow, narrow.canvas.x, mid_y) == 0);
+}
+
 COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
   const Rect panel{0, Layout::kToolbarHeight, Layout::kLayerPanelWidth, 600};
   const int count = 3;

@@ -176,6 +176,11 @@ struct CanvasView {
  * 布局：顶部工具条、左侧图层面板、右侧调整面板、底部状态栏，其余为画布。
  * 窄窗口优先收起右侧面板，再收起左侧面板，保证画布至少 kMinCanvasWidth，
  * 任何尺寸下矩形都不出现负宽高。
+ *
+ * 面板宽度可由用户拖动（§6.60）：`LayoutPrefs` 装用户偏好，`compute_layout`
+ * 仍然负责「放不放得下」。收起规则与固定宽度时代同一套口径——按**偏好宽度**
+ * 判断放不放得下，放不下就整块收起，不做「挤成 120px 的面板」：宽度不对的
+ * 面板比没有面板更难用（层名截断到 4 个字、滑杆只剩刻度）。
  */
 struct Layout {
   static constexpr int kToolbarHeight = 46;
@@ -183,6 +188,18 @@ struct Layout {
   static constexpr int kLayerPanelWidth = 248;
   static constexpr int kAdjustPanelWidth = 330;
   static constexpr int kMinCanvasWidth = 180;
+  /* 拖动范围（§6.60）：下限=还能看清层名/滑杆，上限=不能让画布消失。 */
+  static constexpr int kLayerPanelMinWidth = 168;
+  static constexpr int kLayerPanelMaxWidth = 520;
+  static constexpr int kAdjustPanelMinWidth = 240;
+  static constexpr int kAdjustPanelMaxWidth = 560;
+  /*
+   * 分界线命中带的宽度：整条带子落在**面板内侧**（图层面板取最右 5px，调整
+   * 面板取最左 5px），不吃画布像素。画布边缘是用户最常落笔的地方之一，把
+   * 那里的 3px 抢去做缩放会让「画到边上」变成「面板变宽」——这类误触找起来
+   * 比点不准行更难。代价是面板最后 5px 内的点击用于拉宽，面板内容不会画到那里。
+   */
+  static constexpr int kPanelSplitterWidth = 5;
   /*
    * S22 直方图面板：叠在图层面板顶部（不新增一栏，否则 248px 的图层栏会被
    * 压到无法读层名）。高度是排版密度，不参与命中测试——它纯展示、不可点。
@@ -197,9 +214,40 @@ struct Layout {
   Rect canvas{};
   Rect status{};
   Rect histogram{}; /* S22：图层面板顶部的直方图区域；未启用时为空矩形 */
+  /* 面板分界线命中带（§6.60）：面板收起时为空矩形，命中测试因此自动失效。 */
+  Rect layer_splitter{};
+  Rect adjust_splitter{};
 };
 
-inline Layout compute_layout(int width, int height) {
+/* 面板宽度偏好（§6.60）：用户拖到哪儿就记到哪儿，跨窗口尺寸沿用。 */
+struct LayoutPrefs {
+  int layer_panel_width = Layout::kLayerPanelWidth;
+  int adjust_panel_width = Layout::kAdjustPanelWidth;
+};
+
+/* 宽度是整数像素，不存在 NaN 输入，夹取只需一次 min/max。 */
+inline int clamp_layer_panel_width(int width) {
+  return std::min(std::max(width, Layout::kLayerPanelMinWidth), Layout::kLayerPanelMaxWidth);
+}
+
+inline int clamp_adjust_panel_width(int width) {
+  return std::min(std::max(width, Layout::kAdjustPanelMinWidth), Layout::kAdjustPanelMaxWidth);
+}
+
+/*
+ * 拖动换算：图层面板在画布左侧，向右拖 = 变宽；调整面板在右侧，向左拖 = 变宽。
+ * 取整后再夹取，夹取只在**结果**上做一次——先夹基准再加位移会让拖动到边界后
+ * 反向拖回时出现一段「死区」（位移得先抵消掉溢出量，面板才开始动）。
+ */
+inline int layer_panel_width_from_drag(int base_width, double dx) {
+  return clamp_layer_panel_width(base_width + static_cast<int>(std::lround(dx)));
+}
+
+inline int adjust_panel_width_from_drag(int base_width, double dx) {
+  return clamp_adjust_panel_width(base_width - static_cast<int>(std::lround(dx)));
+}
+
+inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   if (width < 0) width = 0;
   if (height < 0) height = 0;
 
@@ -209,12 +257,13 @@ inline Layout compute_layout(int width, int height) {
   const int body_h = height - toolbar_h - status_h;
 
   int layer_w = 0;
-  if (width >= Layout::kLayerPanelWidth + Layout::kMinCanvasWidth) {
-    layer_w = Layout::kLayerPanelWidth;
+  if (width >= clamp_layer_panel_width(prefs.layer_panel_width) + Layout::kMinCanvasWidth) {
+    layer_w = clamp_layer_panel_width(prefs.layer_panel_width);
   }
   int adjust_w = 0;
-  if (width - layer_w >= Layout::kAdjustPanelWidth + Layout::kMinCanvasWidth) {
-    adjust_w = Layout::kAdjustPanelWidth;
+  if (width - layer_w >=
+      clamp_adjust_panel_width(prefs.adjust_panel_width) + Layout::kMinCanvasWidth) {
+    adjust_w = clamp_adjust_panel_width(prefs.adjust_panel_width);
   }
 
   Layout out;
@@ -223,7 +272,25 @@ inline Layout compute_layout(int width, int height) {
   out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
   out.canvas = Rect{layer_w, body_top, width - layer_w - adjust_w, body_h};
   out.status = Rect{0, body_top + body_h, width, status_h};
+  if (layer_w > 0) {
+    out.layer_splitter = Rect{layer_w - Layout::kPanelSplitterWidth, body_top,
+                              Layout::kPanelSplitterWidth, body_h};
+  }
+  if (adjust_w > 0) {
+    out.adjust_splitter = Rect{width - adjust_w, body_top, Layout::kPanelSplitterWidth, body_h};
+  }
   return out;
+}
+
+inline Layout compute_layout(int width, int height) {
+  return compute_layout(width, height, LayoutPrefs{});
+}
+
+/* 分界线命中：0 = 未命中，1 = 图层面板分界线，2 = 调整面板分界线。 */
+inline int panel_splitter_at(const Layout& layout, double x, double y) {
+  if (layout.layer_splitter.contains(x, y)) return 1;
+  if (layout.adjust_splitter.contains(x, y)) return 2;
+  return 0;
 }
 
 /* ------------------------------------------------------------ 工具条 */

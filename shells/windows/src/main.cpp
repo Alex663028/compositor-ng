@@ -451,6 +451,23 @@ struct ShellState {
    */
   bool layer_move_alt = false;
   bool layer_move_duplicated = false;
+  /*
+   * 面板宽度（§6.60）：用户偏好，不是文档状态——不进撤销栈，也不随文档切换复位。
+   * 与 `comp_ui::LayoutPrefs` 同构，`client_layout` 是唯一读取点，因此绘制与命中
+   * 测试拿到的一定是同一份宽度（两者分叉 = 点不准行，这是本仓反复踩过的坑）。
+   */
+  int layer_panel_width = comp_ui::Layout::kLayerPanelWidth;
+  int adjust_panel_width = comp_ui::Layout::kAdjustPanelWidth;
+  /*
+   * 分界线拖动：target 1 = 图层面板、2 = 调整面板、0 = 未拖动；
+   * base_width 是按下瞬间的宽度，拖动只算总位移（不在上一帧结果上累加，
+   * 与整层拖动同一写法，来回拖不会漂移）。
+   */
+  int panel_resize_target = 0;
+  int panel_resize_base_width = 0;
+  int panel_resize_start_x = 0;
+  /* 悬停高亮：只用于把分界线画亮一点，不影响命中。 */
+  int panel_splitter_hover = 0;
   /* 吸管拖拽（S6）：按住拖动时连续取样；只读，不产生撤销步。 */
   bool eyedropper_drag = false;
   /*
@@ -8946,6 +8963,47 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
   RestoreDC(dc, saved);
 }
 
+/*
+ * §6.60 面板分界线。几何全在 ui_core::Layout（panel_splitter_at 命中用的就是同一
+ * 块矩形），这里只画：常态 1px 暗线标出边界；悬停/拖动时整条 5px 带提亮——否则
+ * 用户根本看不出来这里能拖。
+ */
+void draw_panel_dividers(HDC dc, const ShellState& shell, const Layout& layout) {
+  if (layout.layer_splitter.w <= 0 && layout.adjust_splitter.w <= 0) return;
+
+  const bool left_hot = shell.panel_resize_target == 1 || shell.panel_splitter_hover == 1;
+  const bool right_hot = shell.panel_resize_target == 2 || shell.panel_splitter_hover == 2;
+
+  if (layout.layer_splitter.w > 0) {
+    if (left_hot) {
+      RECT band{layout.layer_splitter.x, layout.layer_splitter.y,
+                layout.layer_splitter.right(), layout.layer_splitter.bottom()};
+      HBRUSH hot = CreateSolidBrush(RGB(46, 54, 68));
+      FillRect(dc, &band, hot);
+      DeleteObject(hot);
+    }
+    RECT line{layout.layer_splitter.right() - 1, layout.layer_splitter.y,
+              layout.layer_splitter.right(), layout.layer_splitter.bottom()};
+    HBRUSH brush = CreateSolidBrush(left_hot ? RGB(86, 130, 200) : RGB(16, 18, 22));
+    FillRect(dc, &line, brush);
+    DeleteObject(brush);
+  }
+  if (layout.adjust_splitter.w > 0) {
+    if (right_hot) {
+      RECT band{layout.adjust_splitter.x, layout.adjust_splitter.y,
+                layout.adjust_splitter.right(), layout.adjust_splitter.bottom()};
+      HBRUSH hot = CreateSolidBrush(RGB(46, 54, 68));
+      FillRect(dc, &band, hot);
+      DeleteObject(hot);
+    }
+    RECT line{layout.adjust_splitter.x, layout.adjust_splitter.y,
+              layout.adjust_splitter.x + 1, layout.adjust_splitter.bottom()};
+    HBRUSH brush = CreateSolidBrush(right_hot ? RGB(86, 130, 200) : RGB(16, 18, 22));
+    FillRect(dc, &line, brush);
+    DeleteObject(brush);
+  }
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -9051,6 +9109,8 @@ void present(HWND window, ShellState& shell) {
       draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
     }
   }
+  /* 分界线最后画：盖在面板底色之上，1px 线才不会被面板自己的填充吃掉。 */
+  draw_panel_dividers(memory_dc, shell, layout);
   draw_status_bar(memory_dc, shell, layout.status);
 
   BitBlt(dc, 0, 0, client_width, client_height, memory_dc, 0, 0, SRCCOPY);
@@ -9232,8 +9292,130 @@ void brush_step(ShellState& shell, int direction, bool hardness) {
 bool client_layout(const ShellState& shell, Layout* out) {
   RECT client{};
   if (shell.window == nullptr || !GetClientRect(shell.window, &client)) return false;
-  *out = comp_ui::compute_layout(client.right - client.left, client.bottom - client.top);
+  comp_ui::LayoutPrefs prefs;
+  prefs.layer_panel_width = shell.layer_panel_width;
+  prefs.adjust_panel_width = shell.adjust_panel_width;
+  *out = comp_ui::compute_layout(client.right - client.left, client.bottom - client.top, prefs);
   return true;
+}
+
+/*
+ * 面板分界线拖动（§6.60）。宽度偏好在 ShellState 里，**不进撤销栈**：布局不是
+ * 文档状态，撤销一次不该把面板宽度回退（PS 亦然，`Ctrl+Z` 只动像素/图层）。
+ *
+ * 拖动只算「按下点 -> 当前点」的总位移，不在上一帧结果上累加——与整层拖动同一
+ * 写法：来回拖回原点必然回到原宽度，不会因取整漂移。
+ *
+ * 画布中心会随面板宽度移动，这里把差额补偿到 pan 上，画面里的文档因此**待在原地**
+ * 不动：用户拖的是面板，不该顺带把正在看的图像推走。
+ */
+void panel_resize_begin(HWND window, ShellState& shell, int target, int mouse_x) {
+  if (target != 1 && target != 2) return;
+  shell.panel_resize_target = target;
+  shell.panel_resize_start_x = mouse_x;
+  shell.panel_resize_base_width =
+      target == 1 ? shell.layer_panel_width : shell.adjust_panel_width;
+  SetCapture(window);
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"%s：拖动调宽，双击分界线复位（%d px），Esc 取消",
+            target == 1 ? L"图层面板" : L"右侧面板",
+            target == 1 ? comp_ui::Layout::kLayerPanelWidth : comp_ui::Layout::kAdjustPanelWidth);
+  set_status(shell, buffer);
+}
+
+void panel_resize_extend(ShellState& shell, int mouse_x) {
+  if (shell.panel_resize_target == 0) return;
+  Layout before{};
+  if (!client_layout(shell, &before)) return;
+
+  const int dx = mouse_x - shell.panel_resize_start_x;
+  const int next =
+      shell.panel_resize_target == 1
+          ? comp_ui::layer_panel_width_from_drag(shell.panel_resize_base_width, dx)
+          : comp_ui::adjust_panel_width_from_drag(shell.panel_resize_base_width, dx);
+  const int current = shell.panel_resize_target == 1 ? shell.layer_panel_width
+                                                     : shell.adjust_panel_width;
+  if (next == current) return;
+  if (shell.panel_resize_target == 1) {
+    shell.layer_panel_width = next;
+  } else {
+    shell.adjust_panel_width = next;
+  }
+
+  Layout after{};
+  bool shown = true;
+  if (client_layout(shell, &after)) {
+    const comp_ui::Point was = comp_ui::CanvasView::canvas_center(before.canvas);
+    const comp_ui::Point now = comp_ui::CanvasView::canvas_center(after.canvas);
+    shell.view.pan_by(was.x - now.x, was.y - now.y);
+    /* 面板被窗口宽度收走时如实说明：拖动改了偏好，但这一尺寸下放不下。 */
+    shown = shell.panel_resize_target == 1 ? after.layer_panel.w > 0
+                                          : after.adjust_panel.w > 0;
+  }
+
+  wchar_t buffer[176];
+  wsprintfW(buffer, L"%s宽度 %d px%s", shell.panel_resize_target == 1 ? L"图层面板" : L"右侧面板",
+            next, shown ? L"" : L"（当前窗口放不下，已收起；放宽窗口后生效）");
+  set_status(shell, buffer);
+}
+
+void panel_resize_end(ShellState& shell) {
+  if (shell.panel_resize_target == 0) return;
+  const int target = shell.panel_resize_target;
+  const int width =
+      target == 1 ? shell.layer_panel_width : shell.adjust_panel_width;
+  /* 与滑杆同一顺序：先清状态再 ReleaseCapture，捕获变更会重入 cancel。 */
+  shell.panel_resize_target = 0;
+  shell.panel_resize_base_width = 0;
+  ReleaseCapture();
+
+  wchar_t buffer[176];
+  wsprintfW(buffer, L"%s宽度：%d px（双击分界线复位）",
+            target == 1 ? L"图层面板" : L"右侧面板", width);
+  set_status(shell, buffer);
+}
+
+void panel_resize_cancel(ShellState& shell) {
+  if (shell.panel_resize_target == 0) return;
+  Layout before{};
+  client_layout(shell, &before);
+  const int target = shell.panel_resize_target;
+  const int restore = shell.panel_resize_base_width;
+  if (target == 1) {
+    shell.layer_panel_width = restore;
+  } else {
+    shell.adjust_panel_width = restore;
+  }
+  shell.panel_resize_target = 0;
+  shell.panel_resize_base_width = 0;
+
+  Layout after{};
+  if (client_layout(shell, &after)) {
+    const comp_ui::Point was = comp_ui::CanvasView::canvas_center(before.canvas);
+    const comp_ui::Point now = comp_ui::CanvasView::canvas_center(after.canvas);
+    shell.view.pan_by(was.x - now.x, was.y - now.y);
+  }
+}
+
+/* 双击分界线 = 复位缺省宽度（PS 双击分隔条复位同一手感，方便拖坏了收场）。 */
+void panel_resize_reset(ShellState& shell, int target) {
+  Layout before{};
+  if (!client_layout(shell, &before)) return;
+  if (target == 1) {
+    shell.layer_panel_width = comp_ui::Layout::kLayerPanelWidth;
+  } else if (target == 2) {
+    shell.adjust_panel_width = comp_ui::Layout::kAdjustPanelWidth;
+  } else {
+    return;
+  }
+  Layout after{};
+  if (client_layout(shell, &after)) {
+    const comp_ui::Point was = comp_ui::CanvasView::canvas_center(before.canvas);
+    const comp_ui::Point now = comp_ui::CanvasView::canvas_center(after.canvas);
+    shell.view.pan_by(was.x - now.x, was.y - now.y);
+  }
+  set_status(shell, target == 1 ? L"图层面板宽度已复位为 248 px"
+                                : L"右侧面板宽度已复位为 330 px");
 }
 
 void view_fit(ShellState& shell) {
@@ -10980,6 +11162,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           run_shell_command(window, *shell, kCmdHistogramToggle);
           return 0;
         }
+        /*
+         * §6.60 Esc 取消面板拖动：回到按下前的宽度（与滑杆/曲线拖动同一手感）。
+         * 必须先回滚再 ReleaseCapture——释放捕获会重入 cancel，那时目标已清空即为空操作。
+         */
+        if (wparam == VK_ESCAPE && shell->panel_resize_target != 0) {
+          panel_resize_cancel(*shell);
+          ReleaseCapture();
+          InvalidateRect(window, nullptr, FALSE);
+          return 0;
+        }
         /* 文字键入态下空格是字符，不是临时抓手。 */
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
         if (wparam == VK_SPACE && !(shell->type_active && !ctrl)) {
@@ -11026,6 +11218,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (button >= 0) {
             const comp_ui::ToolInfo* info = comp_ui::tool_info_at(button);
             if (info != nullptr) set_tool(*shell, info->id);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          /*
+           * §6.60：面板分界线必须先于面板行命中——它是面板内侧 5px 的窄带，
+           * 落在图层行/滑杆行里，顺序反了永远点不到（只会选行）。
+           */
+          const int splitter = comp_ui::panel_splitter_at(layout, mouse_x, mouse_y);
+          if (splitter != 0) {
+            panel_resize_begin(window, *shell, splitter, mouse_x);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
@@ -11430,6 +11632,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
        */
       if (shell != nullptr) {
         Layout layout{};
+        /*
+         * §6.60 双击分界线 = 复位该面板宽度。必须先于「还原成普通按下」，
+         * 也必须先于直方图/路径/图层行：分界线窄带压在这些控件之上。
+         */
+        if (client_layout(*shell, &layout)) {
+          const int splitter = comp_ui::panel_splitter_at(layout, mouse_x, mouse_y);
+          if (splitter != 0) {
+            panel_resize_reset(*shell, splitter);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        }
         if (client_layout(*shell, &layout) && shell->histogram_open &&
             !shell->histogram_bins.empty() &&
             comp_ui::histogram_plot_rect(layout.layer_panel).contains(mouse_x, mouse_y)) {
@@ -11498,6 +11712,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      /* §6.60 面板分界线松手：宽度已在拖动中实时生效，这里只收尾捕获与状态栏。 */
+      if (shell != nullptr && shell->panel_resize_target != 0) {
+        panel_resize_end(*shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       /* 缩放拖框：单击/拖框在松手时区分，必须最先结算（它持有鼠标捕获）。 */
       if (shell != nullptr && shell->zoom_marquee_active) {
         zoom_marquee_end(window, *shell);
@@ -11699,9 +11919,27 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         gradient_cancel(*shell);
         progressive_axis_cancel(*shell);
         shape_cancel(*shell);
+        /* §6.60 面板宽度拖动：捕获被抢走时回到按下前宽度（幂等，目标已清空则跳过）。 */
+        if (shell->panel_resize_target != 0) {
+          panel_resize_cancel(*shell);
+          InvalidateRect(window, nullptr, FALSE);
+        }
       }
       break;
     case WM_SETCURSOR:
+      /*
+       * §6.60 面板分界线：左右箭头。悬停档位由 WM_MOUSEMOVE 维护；拖动中用 target
+       * 判定——此时指针可能已拖出分界线甚至拖出窗口，但形状必须一直保持到松手。
+       */
+      if (shell != nullptr && LOWORD(lparam) == HTCLIENT &&
+          (shell->panel_resize_target != 0 || shell->panel_splitter_hover != 0)) {
+        /* IDC_SIZEWE 在本 SDK 里展开成 char*，与 LoadCursorW 的 LPCWSTR 不符，按同文件既有写法转换。 */
+        HCURSOR cursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_SIZEWE));
+        if (cursor != nullptr) {
+          SetCursor(cursor);
+          return TRUE;
+        }
+      }
       /*
        * 缩放工具在画布内显示自绘放大镜（Alt 按下 = 缩小形态）；平移中保持抓手，
        * 其它区域/工具交给 DefWindowProc 维持默认光标。
@@ -11725,6 +11963,21 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
+          /* §6.60 面板分界线拖动优先：宽度实时生效，画面不动（pan 已补偿）。 */
+          if (shell->panel_resize_target != 0) {
+            panel_resize_extend(*shell, mouse_x);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          /*
+           * 分界线悬停高亮：5px 窄带 + 1px 分隔线，没有高亮用户找不到可拖的地方。
+           * 只在档位变化时重画，移动量大时不产生额外闪烁。
+           */
+          const int hover = comp_ui::panel_splitter_at(layout, mouse_x, mouse_y);
+          if (hover != shell->panel_splitter_hover) {
+            shell->panel_splitter_hover = hover;
+            InvalidateRect(window, nullptr, FALSE);
+          }
           /* P0-3 曲线拖动优先：几何用按下时冻结的绘图区，写入落在同一个事务里。 */
           if (shell->curve_drag_point >= 0) {
             curve_drag_to(*shell, shell->curve_drag_plot, static_cast<double>(mouse_x),
@@ -11806,11 +12059,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         /*
          * 笔尖轮廓跟随光标：只在笔刷类工具下刷新，避免每帧重画。
          * WM_MOUSELEAVE 是一次性的，收到后要重新 Track 才能再收到。
+         * 分界线悬停同样要 Track：否则指针从面板直接移出窗口，高亮会一直留着。
          */
-        if (comp_ui::tool_has_brush_tip(shell->tool)) {
-          shell->cursor_x = mouse_x;
-          shell->cursor_y = mouse_y;
-          shell->cursor_valid = true;
+        const bool want_track =
+            comp_ui::tool_has_brush_tip(shell->tool) || shell->panel_splitter_hover != 0;
+        if (want_track) {
+          if (comp_ui::tool_has_brush_tip(shell->tool)) {
+            shell->cursor_x = mouse_x;
+            shell->cursor_y = mouse_y;
+            shell->cursor_valid = true;
+          }
           if (!shell->tracking_leave) {
             TRACKMOUSEEVENT track{};
             track.cbSize = sizeof(track);
@@ -11819,7 +12077,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             TrackMouseEvent(&track);
             shell->tracking_leave = true;
           }
-          InvalidateRect(window, nullptr, FALSE);
+          /* 只有笔尖要跟随光标重画；纯悬停高亮已在档位变化时重画过，不必每帧刷。 */
+          if (comp_ui::tool_has_brush_tip(shell->tool)) {
+            InvalidateRect(window, nullptr, FALSE);
+          }
         }
       }
       break;
@@ -11827,6 +12088,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         shell->cursor_valid = false;
         shell->tracking_leave = false;
+        /* §6.60 指针离开窗口：分界线高亮必须一起熄灭，否则会留一条亮边。 */
+        shell->panel_splitter_hover = 0;
         InvalidateRect(window, nullptr, FALSE);
       }
       break;
