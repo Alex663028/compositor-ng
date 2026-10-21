@@ -157,6 +157,8 @@ constexpr UINT kCmdSelectInvert = 1033;
 constexpr UINT kCmdSelectExpand = 1047;
 constexpr UINT kCmdSelectContract = 1048;
 constexpr UINT kCmdSelectLoadPixels = 1049;
+/* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
+constexpr UINT kCmdSelectColorRange = 1050;
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -429,6 +431,19 @@ struct ShellState {
   comp_selection_modify_op modify_op = COMP_SELECTION_EXPAND;
   std::wstring modify_input; /* 扩展/收缩半径键入缓冲；非空 = 输入态 */
   int selection_grow = comp_ui::kMinSelectionGrow;
+  /*
+   * 色彩范围（P0-4 第二批）：对齐上游 ColorRangeSheet——打开面板就开一个显式
+   * 事务，之后每次取色/改容差都在事务里重算选区（预览不单独占撤销步）；
+   * 回车提交 = 一步撤销，Esc/从没取过色 = 事务回滚到打开前。
+   * include/exclude 是扁平 RGB 三元组（引擎 ABI 的数组口径，按**颜色数**计数）。
+   */
+  bool color_range_open = false;
+  comp_txn color_range_txn = nullptr;
+  std::vector<uint8_t> color_range_include;
+  std::vector<uint8_t> color_range_exclude;
+  int color_range_fuzziness = comp_ui::kDefaultColorRangeFuzziness;
+  int color_range_invert = 0;
+  std::wstring color_range_input; /* 容差键入缓冲；非空 = 输入态 */
   /*
    * 钢笔路径（S8）：锚点与控制柄都在文档坐标；pen_dragging = 按下后正在拖
    * 最后一个锚点的控制柄。路径本身不产生撤销步，Enter/点首锚点才提交选区。
@@ -1400,11 +1415,15 @@ bool effect_present(const ShellState& shell, int kind) {
       static_cast<int32_t>(shell.effect_kinds.size()), kind);
 }
 
+/* P0-4 第二批：色彩范围面板持有显式事务，被其它面板顶掉时必须先 abort。 */
+void color_range_cancel(ShellState& shell);
+
 void open_effect_panel(ShellState& shell, int kind) {
   if (selected_row(shell) == nullptr) {
     set_status(shell, L"无图层");
     return;
   }
+  if (shell.color_range_open) color_range_cancel(shell);
   /* 右栏一次只挂一个面板：滤镜与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.filter_open = false;
   shell.filter_input.clear();
@@ -2884,7 +2903,8 @@ std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
 }
 
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
-  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板。 */
+  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板与色彩范围。 */
+  if (shell.color_range_open) color_range_cancel(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.filter.select(id);
@@ -3341,6 +3361,262 @@ void load_layer_pixels_selection(ShellState& shell) {
   wchar_t buffer[224];
   wsprintfW(buffer, L"已按图层「%s」的像素载入选区", name.c_str());
   finish_selection_command(shell, buffer);
+}
+
+/* --------------------------------------------------- 色彩范围（P0-4 第二批） */
+
+/*
+ * 上游 `ColorRangeSheet` 的壳内等价物（Select > Color Range）：
+ *   - 打开面板 = `comp_txn_begin`，事务快照停在「打开前」；
+ *   - 每次取色 / 改容差 / 切反相都在事务里重算**整个**选区（REPLACE），
+ *     所以预览本身不产生撤销步，松手也不会有几十步垃圾；
+ *   - 回车提交 = 一步撤销；Esc 或从没取过色 = 事务 abort，选区回到打开前。
+ * 与魔棒的本质区别：色彩范围匹配**整篇可见合成**里所有同色像素，不要求连通。
+ */
+
+/* 状态栏共用文案：颜色数用 include.size()/3 换算（ABI 按颜色数计数，不是字节数）。 */
+void color_range_status(ShellState& shell, const wchar_t* prefix) {
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：取色 %d / 排除 %d · 容差 %d · 反相 %s",
+            prefix, static_cast<int>(shell.color_range_include.size() / 3),
+            static_cast<int>(shell.color_range_exclude.size() / 3),
+            shell.color_range_fuzziness, shell.color_range_invert ? L"是" : L"否");
+  set_status(shell, buffer);
+}
+
+/* 事务重开：没取过色时上游「恢复原选区」，abort 正好把我们送回那个快照。 */
+void color_range_restart_txn(ShellState& shell) {
+  if (shell.document == nullptr) {
+    shell.color_range_txn = nullptr;
+    return;
+  }
+  if (shell.color_range_txn != nullptr) {
+    comp_txn_abort(shell.color_range_txn);
+    shell.color_range_txn = nullptr;
+  }
+  if (comp_txn_begin(shell.document, "Color Range", &shell.color_range_txn) != COMP_OK) {
+    shell.color_range_txn = nullptr;
+  }
+  refresh_selection(shell);
+  shell.needs_render = true;
+}
+
+void color_range_begin(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"色彩范围：还没有文档");
+    return;
+  }
+  if (shell.color_range_open) {
+    /* 再点一次菜单 = 回到打开前的选区再重开，避免两个事务叠在同一个文档上。 */
+    if (shell.color_range_txn != nullptr) comp_txn_abort(shell.color_range_txn);
+    shell.color_range_txn = nullptr;
+    shell.color_range_open = false;
+  }
+  /* 右栏一次只挂一个面板（与滤镜/效果互斥，避免两块矩形互相遮住）。 */
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.color_range_include.clear();
+  shell.color_range_exclude.clear();
+  shell.color_range_fuzziness = comp_ui::kDefaultColorRangeFuzziness;
+  shell.color_range_invert = 0;
+  shell.color_range_input.clear();
+  shell.color_range_open = true;
+  if (comp_txn_begin(shell.document, "Color Range", &shell.color_range_txn) != COMP_OK) {
+    shell.color_range_txn = nullptr;
+    /* 没有事务就没有「预览后回滚」，不如直接不开面板，别让用户改一堆无效参数。 */
+    shell.color_range_open = false;
+    set_status(shell, L"色彩范围：无法开启事务（未改动）");
+    return;
+  }
+  set_status(shell,
+             L"色彩范围：点画布取色（Shift 加色 · Alt 减色）· -/= 容差 · I 反相 · "
+             L"回车应用 · Esc 取消");
+}
+
+void color_range_cancel(ShellState& shell) {
+  const comp_txn txn = shell.color_range_txn;
+  shell.color_range_txn = nullptr;
+  shell.color_range_open = false;
+  shell.color_range_input.clear();
+  if (txn != nullptr) comp_txn_abort(txn);
+  refresh_selection(shell);
+  shell.needs_render = true;
+  set_status(shell, L"已取消色彩范围（选区回到打开前）");
+}
+
+void color_range_commit(ShellState& shell) {
+  const comp_txn txn = shell.color_range_txn;
+  const bool has_colors = !shell.color_range_include.empty();
+  shell.color_range_txn = nullptr;
+  shell.color_range_open = false;
+  shell.color_range_input.clear();
+  bool committed = false;
+  if (txn != nullptr) {
+    if (!has_colors) {
+      /* 没取过色 = 上游的「什么都不选」：回滚，不留一步空撤销。 */
+      comp_txn_abort(txn);
+    } else {
+      committed = comp_txn_commit(txn) == COMP_OK;
+    }
+  }
+  refresh_selection(shell);
+  shell.needs_render = true;
+  if (!has_colors) {
+    set_status(shell, L"色彩范围：还没取色（选区未改动）");
+    return;
+  }
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"色彩范围：已应用（取色 %d / 排除 %d · 容差 %d%s）",
+            static_cast<int>(shell.color_range_include.size() / 3),
+            static_cast<int>(shell.color_range_exclude.size() / 3),
+            shell.color_range_fuzziness, shell.color_range_invert ? L" · 反相" : L"");
+  refresh_history_status(shell, committed ? buffer : L"色彩范围：提交失败（已回滚）");
+}
+
+/*
+ * 重算预览选区。没有 include 颜色时上游回到原选区（不是全不选），这里用
+ * 「事务重开」实现：abort 回快照 + 重新 begin，快照随之变成当前（= 打开前）状态。
+ * 引擎对 0 匹配的定义是「不改选区」，而上游面板此时显示空选区，所以显式 deselect。
+ */
+void color_range_refresh(ShellState& shell) {
+  if (shell.document == nullptr || !shell.color_range_open) return;
+  if (!shell.color_range_input.empty()) return; /* 键入态还没落值，不预览 */
+  if (shell.color_range_include.empty()) {
+    color_range_restart_txn(shell);
+    return;
+  }
+  if (shell.color_range_txn == nullptr) return;
+
+  int32_t changed = 0;
+  const comp_result result = comp_selection_apply_color_range(
+      shell.document,
+      shell.color_range_include.empty() ? nullptr : shell.color_range_include.data(),
+      shell.color_range_include.size() / 3,
+      shell.color_range_exclude.empty() ? nullptr : shell.color_range_exclude.data(),
+      shell.color_range_exclude.size() / 3, shell.color_range_fuzziness, shell.color_range_invert,
+      COMP_SELECTION_REPLACE, &changed);
+  if (result != COMP_OK) {
+    set_status(shell, L"色彩范围：计算失败（参数被引擎拒绝）");
+    return;
+  }
+  if (changed == 0) {
+    int32_t deselected = 0;
+    comp_selection_deselect(shell.document, &deselected);
+  }
+  refresh_selection(shell);
+  shell.needs_render = true;
+}
+
+/* 取色：合并源 + 3×3 均值（上游 color(in:at:) 的口径），坐标落在画布内才取。 */
+void color_range_sample(ShellState& shell, int x, int y, const Layout& layout) {
+  if (!shell.color_range_open || shell.document == nullptr) return;
+  if (!layout.canvas.contains(x, y)) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  if (doc.x < 0.0 || doc.y < 0.0 || doc.x >= static_cast<double>(shell.width) ||
+      doc.y >= static_cast<double>(shell.height)) {
+    set_status(shell, L"色彩范围：点在画布外，没有取样");
+    return;
+  }
+  float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (comp_eyedropper_sample(shell.document, 0, doc.x, doc.y, /*sample_size=*/3,
+                             COMP_EYEDROPPER_MERGED, rgba) != COMP_OK) {
+    set_status(shell, L"色彩范围：取样失败（合成不可用）");
+    return;
+  }
+  const comp_ui::ColorRGB color = comp_ui::color_from_unit(rgba[0], rgba[1], rgba[2]);
+  const uint8_t triple[3] = {color.r, color.g, color.b};
+  const bool remove = (GetKeyState(VK_MENU) & 0x8000) != 0;
+  const bool add = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  const wchar_t* action = L"取色";
+  if (remove) {
+    shell.color_range_exclude.insert(shell.color_range_exclude.end(), triple, triple + 3);
+    action = L"排除";
+  } else if (add) {
+    shell.color_range_include.insert(shell.color_range_include.end(), triple, triple + 3);
+    action = L"加色";
+  } else {
+    /* replace：与上游 sampleMode = .replace 一致，重开取色并把排除清空。 */
+    shell.color_range_include.assign(triple, triple + 3);
+    shell.color_range_exclude.clear();
+  }
+  color_range_refresh(shell);
+
+  char hex[8] = {0};
+  comp_ui::color_to_hex(color, hex);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"色彩范围：%s %s（取色 %d / 排除 %d · 容差 %d%s）", action,
+            widen_ascii(hex).c_str(), static_cast<int>(shell.color_range_include.size() / 3),
+            static_cast<int>(shell.color_range_exclude.size() / 3),
+            shell.color_range_fuzziness, shell.color_range_invert ? L" · 反相" : L"");
+  set_status(shell, buffer);
+}
+
+/* 点掉一个色块：取色行删 include，排除行删 exclude；删空即回到打开前的选区。 */
+void color_range_remove_swatch(ShellState& shell, int slot) {
+  const int include_count = static_cast<int>(shell.color_range_include.size() / 3);
+  if (slot < 0) return;
+  if (slot < include_count) {
+    auto& list = shell.color_range_include;
+    list.erase(list.begin() + static_cast<std::ptrdiff_t>(slot) * 3,
+               list.begin() + static_cast<std::ptrdiff_t>(slot) * 3 + 3);
+  } else {
+    const int index = slot - include_count;
+    auto& list = shell.color_range_exclude;
+    if (index * 3 + 3 > static_cast<int>(list.size())) return;
+    list.erase(list.begin() + static_cast<std::ptrdiff_t>(index) * 3,
+               list.begin() + static_cast<std::ptrdiff_t>(index) * 3 + 3);
+  }
+  color_range_refresh(shell);
+  color_range_status(shell, L"色彩范围：已移除一个取样色");
+}
+
+void color_range_step_fuzziness(ShellState& shell, int direction) {
+  shell.color_range_fuzziness =
+      comp_ui::step_color_range_fuzziness(shell.color_range_fuzziness, direction);
+  color_range_refresh(shell);
+  wchar_t buffer[240];
+  wsprintfW(buffer, L"色彩范围：容差 %d（%d..%d）%s", shell.color_range_fuzziness,
+            comp_ui::kMinColorRangeFuzziness, comp_ui::kMaxColorRangeFuzziness,
+            shell.color_range_txn != nullptr ? L"· 实时预览，回车应用" : L"");
+  set_status(shell, buffer);
+}
+
+void color_range_toggle_invert(ShellState& shell) {
+  shell.color_range_invert = shell.color_range_invert ? 0 : 1;
+  color_range_refresh(shell);
+  color_range_status(shell, shell.color_range_invert ? L"色彩范围：反相开" : L"色彩范围：反相关");
+}
+
+void color_range_clear_colors(ShellState& shell) {
+  shell.color_range_include.clear();
+  shell.color_range_exclude.clear();
+  color_range_refresh(shell);
+  set_status(shell, L"色彩范围：已清空取样色（选区回到打开前）");
+}
+
+void color_range_begin_input(ShellState& shell, wchar_t character) {
+  if (shell.color_range_input.size() >= 3) return;
+  shell.color_range_input.push_back(character);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"输入中：%s", shell.color_range_input.c_str());
+  set_status(shell, buffer);
+}
+
+/* 键入值夹到 0..200 再落值：面板永不产生越界参数（ABI 仍会拒绝越界）。 */
+void color_range_commit_input(ShellState& shell) {
+  if (shell.color_range_input.empty()) return;
+  const std::wstring text = shell.color_range_input;
+  shell.color_range_input.clear();
+  int value = 0;
+  for (size_t i = 0; i < text.size(); ++i) value = value * 10 + static_cast<int>(text[i] - L'0');
+  shell.color_range_fuzziness = comp_ui::clamp_color_range_fuzziness(value);
+  color_range_refresh(shell);
+  wchar_t buffer[200];
+  wsprintfW(buffer, L"色彩范围：容差 = %d", shell.color_range_fuzziness);
+  set_status(shell, buffer);
 }
 
 /* ------------------------------------------------------------ 套索（S7） */
@@ -4592,6 +4868,19 @@ void move_end(HWND window, ShellState& shell) {
 
 /* ------------------------------------------------------------ 文件与命令 */
 
+/*
+ * 文档要被替换/销毁：色彩范围的预览事务属于旧文档，句柄必须直接丢掉。
+ * 这里**不能**调 color_range_cancel——它会 abort 事务，而旧文档马上就要被
+ * destroy，abort 会打到已经释放的对象上（UAF）。关面板只是顺带效果。
+ */
+void forget_color_range(ShellState& shell) {
+  shell.color_range_txn = nullptr;
+  shell.color_range_open = false;
+  shell.color_range_include.clear();
+  shell.color_range_exclude.clear();
+  shell.color_range_input.clear();
+}
+
 bool create_document(ShellState& shell) {
   comp_document_desc desc{};
   desc.width = kDefaultWidth;
@@ -4604,6 +4893,7 @@ bool create_document(ShellState& shell) {
     set_status(shell, L"新建文档失败");
     return false;
   }
+  forget_color_range(shell);
   if (shell.document != nullptr) comp_document_destroy(shell.document);
   shell.document = document;
 
@@ -4640,6 +4930,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
     set_status(shell, L"打开 .comp 失败");
     return false;
   }
+  forget_color_range(shell);
   if (shell.document != nullptr) comp_document_destroy(shell.document);
   shell.document = document;
 
@@ -4782,6 +5073,7 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
       set_status(shell, L"打开位图失败：格式不支持或文件损坏");
       return;
     }
+    forget_color_range(shell);
     if (shell.document != nullptr) comp_document_destroy(shell.document);
     shell.document = document;
     comp_size size{};
@@ -4988,6 +5280,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdSelectLoadPixels:
       load_layer_pixels_selection(shell);
+      break;
+    /* ---- P0-4 第二批：色彩范围 ---- */
+    case kCmdSelectColorRange:
+      color_range_begin(shell);
       break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
@@ -5971,6 +6267,110 @@ void draw_effect_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
 }
 
 /*
+ * 色彩范围面板（P0-4 第二批）。排版与命中都走 ui_core.h 的
+ * color_range_swatch_rect / color_range_row_rect——尤其是色块，
+ * 画在哪里就必须点在哪里（点掉一个取错的颜色是本面板唯一的纠正入口）。
+ */
+void draw_color_range_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[288];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"色彩范围（Color Range）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+
+  const int include_count = static_cast<int>(shell.color_range_include.size() / 3);
+  const int exclude_count = static_cast<int>(shell.color_range_exclude.size() / 3);
+  SetTextColor(dc, RGB(150, 210, 255));
+  wsprintfW(line, L"取色 %d · 排除 %d（画布点选：Shift 加色 · Alt 减色）", include_count,
+            exclude_count);
+  TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+
+  /* 色块：首屏放得下的才画（超出宽度的颜色仍生效，只是这里不显示/不可点）。 */
+  const int capacity = comp_ui::color_range_swatch_capacity(panel_rect);
+  const int shown_include = include_count < capacity ? include_count : capacity;
+  const int shown_exclude = exclude_count < capacity ? exclude_count : capacity;
+  if (capacity > 0) {
+    HBRUSH border = CreateSolidBrush(RGB(110, 114, 126));
+    for (int i = 0; i < shown_include; ++i) {
+      const comp_ui::Rect rect = comp_ui::color_range_swatch_rect(panel_rect, false, i);
+      RECT swatch{rect.x, rect.y, rect.right(), rect.bottom()};
+      const uint8_t* color = shell.color_range_include.data() + static_cast<size_t>(i) * 3;
+      HBRUSH brush = CreateSolidBrush(RGB(color[0], color[1], color[2]));
+      FillRect(dc, &swatch, brush);
+      DeleteObject(brush);
+      FrameRect(dc, &swatch, border);
+    }
+    for (int i = 0; i < shown_exclude; ++i) {
+      const comp_ui::Rect rect = comp_ui::color_range_swatch_rect(panel_rect, true, i);
+      RECT swatch{rect.x, rect.y, rect.right(), rect.bottom()};
+      const uint8_t* color = shell.color_range_exclude.data() + static_cast<size_t>(i) * 3;
+      HBRUSH brush = CreateSolidBrush(RGB(color[0], color[1], color[2]));
+      FillRect(dc, &swatch, brush);
+      DeleteObject(brush);
+      FrameRect(dc, &swatch, border);
+      /* 排除色画一道斜杠，避免与取色行同色时看不出来。 */
+      HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 100, 100));
+      HGDIOBJ old_pen = SelectObject(dc, pen);
+      MoveToEx(dc, rect.x + 3, rect.y + 3, nullptr);
+      LineTo(dc, rect.right() - 3, rect.bottom() - 3);
+      SelectObject(dc, old_pen);
+      DeleteObject(pen);
+    }
+    DeleteObject(border);
+    if (include_count == 0) {
+      SetTextColor(dc, RGB(170, 150, 110));
+      const wchar_t* empty = L"还没有取过色：点画布任意位置开始";
+      TextOutW(dc, left + 12, panel_rect.y + comp_ui::kColorRangeIncludeTop + 2, empty,
+               lstrlenW(empty));
+    }
+  }
+
+  const int fuzziness_y = panel_rect.y + comp_ui::kColorRangeRowsTop;
+  SetTextColor(dc, RGB(206, 208, 216));
+  wsprintfW(line, L"容差 Fuzziness = %d  (%d..%d)", shell.color_range_fuzziness,
+            comp_ui::kMinColorRangeFuzziness, comp_ui::kMaxColorRangeFuzziness);
+  TextOutW(dc, left + 12, fuzziness_y, line, lstrlenW(line));
+  wsprintfW(line, L"反相 Invert = %s  (I 切换)", shell.color_range_invert ? L"开" : L"关");
+  TextOutW(dc, left + 12, fuzziness_y + comp_ui::kColorRangeRowHeight, line, lstrlenW(line));
+
+  SetTextColor(dc, RGB(180, 184, 196));
+  const wchar_t* note = shell.color_range_txn != nullptr
+                            ? L"预览中：选区随取样/容差实时变化，回车才落一步撤销"
+                            : L"（没有预览事务：改动会直接落盘）";
+  TextOutW(dc, left + 12, fuzziness_y + comp_ui::kColorRangeRowHeight * 2 + 4, note,
+           lstrlenW(note));
+
+  if (!shell.color_range_input.empty()) {
+    SetTextColor(dc, RGB(255, 240, 160));
+    wsprintfW(line, L"输入中：%s", shell.color_range_input.c_str());
+    TextOutW(dc, left + 10, bottom - 124, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"画布点选 = 取色（替换）",
+      L"Shift+点 = 加色 · Alt+点 = 排除",
+      L"点色块 = 移除该取样色",
+      L"- / = 调容差 · 数字键输入",
+      L"I 切换反相 · Backspace 清空取样",
+      L"回车应用（一步撤销）· Esc 取消",
+  };
+  int hint_y = bottom - 120;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 文字属性面板。行几何来自 ui_core.h 的 type_param_row_rect——绘制与命中同源，
  * 避免「看得见点不中」。面板改的是「下一段文字」的参数；键入态仍照常显示，
  * 因为键入中的文字也读同一组值（状态栏数字与预览框会立刻跟着变）。
@@ -6627,7 +7027,9 @@ void present(HWND window, ShellState& shell) {
   draw_toolbar(memory_dc, shell, layout.toolbar);
   if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
   if (layout.adjust_panel.w > 0) {
-    if (shell.effect_open) {
+    if (shell.color_range_open) {
+      draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.effect_open) {
       draw_effect_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.filter_open) {
       draw_filter_panel(memory_dc, shell, layout.adjust_panel);
@@ -7499,6 +7901,79 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return;
   }
 
+  /* 色彩范围容差键入态（P0-4 第二批）：只吃数字/退格/回车/Esc。 */
+  if (!shell.color_range_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.color_range_input.clear();
+      set_status(shell, L"已取消容差输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      shell.color_range_input.pop_back();
+      if (shell.color_range_input.empty()) {
+        set_status(shell, L"已取消容差输入");
+      } else {
+        wchar_t buffer[96];
+        wsprintfW(buffer, L"输入中：%s", shell.color_range_input.c_str());
+        set_status(shell, buffer);
+      }
+      return;
+    }
+    if (key == VK_RETURN) {
+      color_range_commit_input(shell);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      color_range_begin_input(shell, static_cast<wchar_t>(key));
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /*
+   * 色彩范围面板打开时，键盘归面板（P0-4 第二批）。与滤镜/效果面板不同，
+   * 这里连 Ctrl 组合也要拦：预览挂在显式事务上，撤销/新建/打开会把事务快照
+   * 和当前文档撕开，abort 时就会「复活」一个本来已经不该存在的选区。
+   * 其余 Ctrl 组合（缩放等）不影响事务，照常穿透。
+   */
+  if (shell.color_range_open) {
+    if (ctrl) {
+      if (key == 'Z' || key == 'Y' || key == 'N' || key == 'O' || key == 'S' || key == 'A' ||
+          key == 'D') {
+        set_status(shell, L"色彩范围预览中：先回车应用或 Esc 取消，再执行该命令");
+        return;
+      }
+    } else {
+      switch (key) {
+        case VK_ESCAPE:
+          color_range_cancel(shell);
+          return;
+        case VK_RETURN:
+          color_range_commit(shell);
+          return;
+        case VK_OEM_MINUS:
+          color_range_step_fuzziness(shell, -1);
+          return;
+        case VK_OEM_PLUS:
+          color_range_step_fuzziness(shell, 1);
+          return;
+        case VK_BACK:
+          color_range_clear_colors(shell);
+          return;
+        case 'I':
+          color_range_toggle_invert(shell);
+          return;
+        default:
+          break;
+      }
+      if (key >= '0' && key <= '9') {
+        color_range_begin_input(shell, static_cast<wchar_t>(key));
+        return;
+      }
+      /* 其余按键在面板打开时吞掉（含工具字母键）：模态，避免面板与工具打架。 */
+      return;
+    }
+  }
+
   /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
   if (!shell.type_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -8247,7 +8722,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             }
           }
           if (!shell->effect_open && !shell->filter_open && !type_panel_visible(*shell) &&
-              layout.adjust_panel.w > 0 &&
+              !shell->color_range_open && layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
             /*
              * P0-3 调整面板：上半行 = 聚焦，下半行（滑道）= 聚焦 + 开始拖动。
@@ -8339,6 +8814,39 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               InvalidateRect(window, nullptr, FALSE);
               return 0;
             }
+          }
+          if (shell->color_range_open && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 色彩范围面板：点色块 = 删掉该取样色；点「反相」行 = 切换；
+             * 点「容差」行 = 提示键入（数字键在任何位置都能起键入态）。
+             */
+            const int slot = comp_ui::color_range_swatch_at(
+                layout.adjust_panel,
+                static_cast<int>(shell->color_range_include.size() / 3),
+                static_cast<int>(shell->color_range_exclude.size() / 3), mouse_x, mouse_y);
+            if (slot >= 0) {
+              color_range_remove_swatch(*shell, slot);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+            const int row = comp_ui::color_range_row_at(layout.adjust_panel, mouse_x, mouse_y);
+            if (row == 1) {
+              color_range_toggle_invert(*shell);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+            if (row == 0) {
+              set_status(*shell,
+                         L"色彩范围：- / = 步进容差，或直接按数字键入（回车落值）");
+              return 0;
+            }
+          }
+          if (shell->color_range_open && layout.canvas.contains(mouse_x, mouse_y)) {
+            /* 面板打开时画布点击只取样，不交给当前工具（上游 sheet 同语义）。 */
+            color_range_sample(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
           }
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
@@ -9006,6 +9514,8 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_STRING, kCmdSelectAll, L"全选(&A)\tCtrl+A");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectNone, L"取消选择(&D)\tCtrl+D");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectInvert, L"反选(&I)\tCtrl+Shift+I");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectColorRange, L"色彩范围(&C)...");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectExpand, L"扩展(&E)...");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectContract, L"收缩(&O)...");
@@ -10772,6 +11282,165 @@ int run_selftest(const wchar_t* out_path) {
   verify(comp_selection_deselect(document, &deselect_changed) == COMP_OK,
          "deselect after the P0-4 probes");
 
+
+  /*
+   * P0-4 第二批：色彩范围（comp_selection_apply_color_range）。
+   * 壳侧面板的顺序是「begin txn -> 取色/容差/反相各重算一次（REPLACE）-> 回车 commit」，
+   * 这里按同一顺序打 ABI。断言重点不是像素效果，而是三条壳层依赖的契约：
+   *   ① 同色全选**不要求连通**（与魔棒的本质区别）；
+   *   ② 越界/空指针参数被 ABI 闸拦下，且 out_changed 不被写、不进撤销栈；
+   *   ③ 显式事务里连改多次只落一步撤销，abort 把选区还原成打开前。
+   */
+  const uint8_t color_grey_rgb[3] = {200, 200, 200};
+  const uint8_t color_black_rgb[3] = {0, 0, 0};
+  size_t depth_before_range = 0;
+  comp_document_history_stats(document, &depth_before_range, &redo_depth);
+  int32_t range_changed = 0;
+  const bool range_grey_ok =
+      wand_fixture_ok &&
+      comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 0, 0,
+                                       COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+      range_changed == 1 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(10) * stride + 10u] == 255 &&
+      coverage[static_cast<size_t>(10) * stride + 50u] == 0 &&
+      coverage[static_cast<size_t>(height - 1) * stride + 5u] == 255;
+  size_t depth_after_range = 0;
+  comp_document_history_stats(document, &depth_after_range, &redo_depth);
+  verify(range_grey_ok, "comp_selection_apply_color_range(fuzziness 0) matches every same-colour pixel");
+  verify(range_grey_ok && depth_after_range == depth_before_range + 1,
+         "color range selection is exactly one undo step");
+
+  /* 撤销一次 = 回到「打开色彩范围前」的无选区状态（不是退回半张图）。 */
+  verify(comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_active(document, &selection_active) == COMP_OK &&
+             selection_active == 0,
+         "one undo returns the color range selection to the pre-open (inactive) state");
+
+  /* 反相 = 补集；再撤销一次回到未反相的那次（一步就是一步）。 */
+  verify(range_grey_ok &&
+             comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 0, 0,
+                                              COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+             range_changed == 1,
+         "color range re-applies after undo");
+  range_changed = 0;
+  verify(comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 0, 1,
+                                          COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+             range_changed == 1 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 0 &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 255,
+         "color range invert selects the complement of the sampled colour");
+  verify(comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 255 &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 0,
+         "one undo leaves the un-inverted color range selection in place");
+
+  /* 容差 200 = 三通道最大差，测试图两半都进选区（容差上界是闭区间）。 */
+  range_changed = 0;
+  verify(comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 200, 0,
+                                          COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+             range_changed == 1 && comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 255,
+         "color range fuzziness 200 matches the far colour as well (inclusive bound)");
+  verify(comp_document_undo(document) == COMP_OK,
+         "comp_document_undo(fuzziness 200 step)");
+
+  /* include 与 exclude 是同一组颜色 = 一个都不匹配；引擎不动选区、不落撤销步。 */
+  size_t depth_before_empty = 0;
+  comp_document_history_stats(document, &depth_before_empty, &redo_depth);
+  range_changed = 99;
+  size_t depth_after_empty = 0;
+  const bool range_empty_ok =
+      comp_selection_apply_color_range(document, color_black_rgb, 1, color_black_rgb, 1, 0, 0,
+                                       COMP_SELECTION_REPLACE, &range_changed) == COMP_OK;
+  comp_document_history_stats(document, &depth_after_empty, &redo_depth);
+  verify(range_empty_ok && range_changed == 0 &&
+             depth_after_empty == depth_before_empty &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 255,
+         "color range with include == exclude matches nothing and leaves the selection alone");
+
+  /* 参数闸：越界容差 / 空指针，都是「拒绝且不写 out_changed、不进撤销栈」。 */
+  range_changed = 99;
+  verify(comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 201, 0,
+                                          COMP_SELECTION_REPLACE, &range_changed) ==
+                 COMP_ERR_INVALID_ARGUMENT &&
+             range_changed == 99,
+         "color range fuzziness 201 is rejected before touching the selection");
+  range_changed = 99;
+  verify(comp_selection_apply_color_range(document, nullptr, 1, nullptr, 0, 40, 0,
+                                          COMP_SELECTION_REPLACE, &range_changed) ==
+                 COMP_ERR_INVALID_ARGUMENT &&
+             range_changed == 99,
+         "color range NULL include with a nonzero count is rejected");
+
+  /*
+   * 事务预览：打开面板 = begin，每次改参数只是事务内重算，回车才 commit。
+   * 两次 REPLACE 在同一个显式事务里 => 只落一步，且以最后一次为准。
+   */
+  const comp_ui::Rect preview_panel{0, 0, 330, 560};
+  verify(comp_ui::clamp_color_range_fuzziness(-5) == 0 &&
+             comp_ui::clamp_color_range_fuzziness(201) == 200 &&
+             comp_ui::step_color_range_fuzziness(0, -1) == 0 &&
+             comp_ui::step_color_range_fuzziness(200, 1) == 200 &&
+             comp_ui::step_color_range_fuzziness(19, 1) == 20 &&
+             comp_ui::step_color_range_fuzziness(20, 1) == 25,
+         "ui_core color range fuzziness clamps to 0..200 and steps 1/5/10");
+  verify(comp_ui::color_range_swatch_capacity(preview_panel) == 13 &&
+             comp_ui::color_range_swatch_at(preview_panel, 2, 1, 13.0, 51.0) == 0 &&
+             comp_ui::color_range_swatch_at(preview_panel, 2, 1, 13.0, 75.0) == 2 &&
+             comp_ui::color_range_swatch_at(preview_panel, 2, 1, 320.0, 51.0) == -1 &&
+             comp_ui::color_range_row_at(preview_panel, 100.0, 101.0) == 0 &&
+             comp_ui::color_range_row_at(preview_panel, 100.0, 125.0) == 1 &&
+             comp_ui::color_range_row_at(preview_panel, 100.0, 149.0) == -1,
+         "ui_core color range swatch/row geometry hits what it paints");
+
+  comp_txn range_txn = nullptr;
+  const size_t depth_before_preview = depth_after_empty;
+  const bool range_txn_ok =
+      comp_txn_begin(document, "Color Range", &range_txn) == COMP_OK && range_txn != nullptr &&
+      comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 0, 0,
+                                       COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+      comp_selection_apply_color_range(document, color_black_rgb, 1, nullptr, 0, 0, 0,
+                                       COMP_SELECTION_REPLACE, &range_changed) == COMP_OK;
+  size_t depth_inside_preview = 0;
+  comp_document_history_stats(document, &depth_inside_preview, &redo_depth);
+  const bool preview_visible =
+      comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(10) * stride + 50u] == 255 &&
+      coverage[static_cast<size_t>(10) * stride + 10u] == 0;
+  size_t depth_after_commit = 0;
+  const bool preview_commit_ok = range_txn_ok && comp_txn_commit(range_txn) == COMP_OK;
+  comp_document_history_stats(document, &depth_after_commit, &redo_depth);
+  verify(range_txn_ok && preview_visible && preview_commit_ok &&
+             depth_inside_preview == depth_before_preview &&
+             depth_after_commit == depth_before_preview + 1,
+         "color range preview inside a txn shows the last apply and commits one step");
+
+  /* abort 回滚到事务开启时的选区（= 上一次提交的右半），不动撤销栈。 */
+  range_txn = nullptr;
+  const bool range_abort_txn_ok =
+      comp_txn_begin(document, "Color Range", &range_txn) == COMP_OK && range_txn != nullptr &&
+      comp_selection_apply_color_range(document, color_grey_rgb, 1, nullptr, 0, 200, 0,
+                                       COMP_SELECTION_REPLACE, &range_changed) == COMP_OK &&
+      comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+      coverage[static_cast<size_t>(10) * stride + 50u] == 255;
+  const bool range_abort_ok = range_abort_txn_ok && comp_txn_abort(range_txn) == COMP_OK;
+  size_t depth_after_abort = 0;
+  comp_document_history_stats(document, &depth_after_abort, &redo_depth);
+  verify(range_abort_ok && depth_after_abort == depth_after_commit &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 0 &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 255,
+         "comp_txn_abort restores the pre-open color range selection without an undo step");
+
+  verify(comp_document_undo(document) == COMP_OK &&
+             comp_selection_get_coverage(document, &coverage_mask) == COMP_OK &&
+             coverage[static_cast<size_t>(10) * stride + 10u] == 255 &&
+             coverage[static_cast<size_t>(10) * stride + 50u] == 0,
+         "one undo after the color range commit returns to the previous selection");
+  verify(comp_selection_deselect(document, &deselect_changed) == COMP_OK,
+         "deselect after the color range probes");
 
   /* 测试图用完即删：它是全画布不透明层，留着会盖住后面 S6 的 flatten 断言。 */
   verify(comp_layer_remove(document, wand_layer) == COMP_OK,

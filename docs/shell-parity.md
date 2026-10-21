@@ -25,7 +25,8 @@ compositor-ng 是「同引擎、两壳」结构：
 | 调整图层参数编辑 | 调整面板 | （未接 UI） | 调整 ABI 全套 | 已达成（鸿蒙无面板） |
 | 调整控件元数据 | `refresh_adjustments` | 预留 | `comp_layer_adjustment_param_at` 等 | 已达成 |
 | 调整滑杆 + 曲线/色阶编辑器（P0-3） | 调整面板：拖动滑杆实时预览；曲线加点/拖点/删点；色阶 20 参数分页 | （未接 UI） | `comp_layer_update_adjustment_at` + `comp_layer_curves_*` | **已达成**（P0-3，见 §5.14）：一次拖动 = **一个**撤销步，空拖动不产生撤销步 |
-| 选区补齐第一批（P0-4） | 「选择(&S)」菜单：扩展…/收缩…/按图层像素载入选区 | （未接 UI） | `comp_selection_modify`(EXPAND/CONTRACT) / `comp_selection_load_layer`(LOAD_PIXELS) | **部分达成**（§5.15）：三条入口接线完成；色彩范围对话框留待第二批 |
+| 选区补齐第一批（P0-4） | 「选择(&S)」菜单：扩展…/收缩…/按图层像素载入选区 | （未接 UI） | `comp_selection_modify`(EXPAND/CONTRACT) / `comp_selection_load_layer`(LOAD_PIXELS) | **已达成**（§5.15）：三条入口接线完成 |
+| 色彩范围对话框（P0-4 第二批） | 「选择 → 色彩范围…」+ 右侧面板（色板 / 容差 / 反相 / 加减取样，事务预览） | （未接 UI） | `comp_selection_apply_color_range` / `comp_eyedropper_sample` / `comp_txn_*` | **已达成**（§5.16）：预览不落步，回车 = 一步撤销，Esc 回到打开前 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
@@ -582,8 +583,70 @@ P0-4 的前提是「引擎与 ABI 全齐，只差 UI」。实测三个入口确�
 `tests/test_ui_core.cpp` 加 `ui_core_selection_grow_clamps_to_engine_range`（钳位与步进，
 含「步进不得推到 1 以下」）。单测 **554 例 / 0 失败**。
 
-**5. 边界。** ① 色彩范围对话框**本批未做**（下一批）；② 扩展/收缩在引擎里是
+**5. 边界。** ① 色彩范围对话框当时未做，已在第二批补齐（见 §5.16）；② 扩展/收缩在引擎里是
 「按距离变换外扩/内缩」，拐角是圆角、超出画布的部分被裁掉，这是上游口径不是缺陷；
 ③ 空选区调用扩展会被引擎当无操作（`changed = 0`），壳在入口就先拒绝并提示；
 ④ 菜单项暂未做置灰（无选区时点了给状态栏提示，不给假成功）。
+
+### 5.16 色彩范围对话框（P0-4 第二批，2026-10-21）
+
+第一批留下的那半条。引擎侧 `comp_selection_apply_color_range` 早就存在
+（`engine/domain/selection.cpp:1030`），壳里同样**零调用点**；本批只做接线与面板，
+ABI 零改动。语义对齐上游 `UI/ColorRangeSheet.swift` + `Document/ColorRangeSelection.swift`。
+
+**1. 入口。** 「选择(&S)」菜单新增 `色彩范围(&C)…`（命令 ID 1050），与
+`扩展…/收缩…` 之间用分隔线隔开。面板挂在右侧同一列（`layout.adjust_panel`），
+与滤镜面板、图层效果面板**互斥**：开一个时把另一个按各自的 cancel 路径关掉，
+避免两块矩形互相遮住、也避免两份事务同时挂在同一个文档上。
+
+**2. 预览 = 一条显式事务（与 P0-3 滑杆同一套手法）。**
+- 打开面板即 `comp_txn_begin("Color Range")`，快照停在「打开前的选区」；
+- 每次取色 / 改容差 / 切反相都在事务里**整篇重算**一次（`COMP_SELECTION_REPLACE`），
+  因此预览不产生撤销步，也不会攒出几十步垃圾；
+- `回车` = `comp_txn_commit` → **恰好一步撤销**；`Esc`、或从没取过色就回车 =
+  `comp_txn_abort` → 选区回到打开前，撤销栈不动。
+- 取色退到空表（点掉所有色块 / `Backspace` 清空）时，上游是「回到原选区」而不是
+  「全不选」。实现是 abort 当前事务再立刻 begin 一条新的：快照随之变成当前（= 打开前）
+  状态，后续再取色仍然只落一步。
+
+**3. 取色与色板。** 画布单击取样：`comp_eyedropper_sample(..., sample_size=3,
+COMP_EYEDROPPER_MERGED)`，即**合并合成的 3×3 均值**（上游 `color(in:at:)` 同口径）。
+单击 = 替换（清空旧取色与排除，对应上游 `sampleMode = .replace`）；`Shift+单击` = 加色；
+`Alt+单击` = 加入排除表。取色行/排除行各画一行 18 px 色块（行距 4 px），排除色块上叠
+一道红斜杠以便与取色行区分；**点色块 = 删掉该取样色**并立即重算。
+
+**4. 参数。** 容差 `0..200`（缺省 40，抄 `ColorRangeEdit.fuzziness`），`-` / `=` 步进
+（<20 走 1、<100 走 5、其余走 10），数字键进入键入态、`回车` 落值（键入值同样夹到
+`0..200`，面板永不把越界参数递给引擎）；`I` 切反相；`Backspace` 清空取样色。
+`0` 在这里是合法容差（只选完全同色），与扩展/收缩的下限 1 不同 —— 所以
+`clamp_color_range_fuzziness` 没有复用 `clamp_selection_grow`。
+
+**5. 0 匹配的语义缝。** 引擎对「一个像素都没匹配」的定义是**不改选区**（与魔棒
+「点空处不留下空蒙版」同口径），而上游面板此时显示空选区。壳侧在
+`changed == 0` 时显式调 `comp_selection_deselect`（仍在事务内），于是「反相取一个不存在的
+颜色」也能得到上游那样的空选区，且回车后是一步可撤销的操作。
+
+**6. 键盘归属。** 面板打开时键盘归面板（工具字母键被吞掉）。与滤镜/效果面板不同，
+这里**连部分 Ctrl 组合也拦**：`Ctrl+Z/Y/N/O/S/A/D` 会先把事务快照与当前文档撕开，
+abort 时「复活」一个本不该存在的选区，所以只在状态栏提示「先回车应用或 Esc 取消」；
+缩放等与事务无关的 Ctrl 组合照常穿透。
+
+**7. 文档替换时的 UAF 防护。** `新建 / 打开 .comp / 打开位图` 三条路径都会销毁旧文档，
+而 `color_range_txn` 是挂在旧文档上的裸句柄。三处都在 `comp_document_destroy` **之前**
+调 `forget_color_range`（只丢句柄、关面板、清取样，**不 abort**）——对已释放文档 abort
+才是真 UAF，这与「面板没关」是两码事。
+
+**8. 验证。** `--selftest` 追加 17 项（228 → **245**，基线已显式重定，连续两次运行
+SHA256 一致）：同色全选不要求连通（左半灰 + 底行取样点）、恰好一步撤销、撤销回到打开前的
+无选区状态、反相 = 补集且一步撤回未反相、容差 200 是闭区间（两半全选）、
+`include == exclude` 零匹配且不动选区/不落步、容差 201 与 `NULL + count>0` 被 ABI 闸拒绝
+且 `out_changed` 不被写、事务内连改两次只落一步且以最后一次为准、
+`comp_txn_abort` 还原选区且不增步。`tests/test_ui_core.cpp` 加 2 例
+（`ui_core_color_range_fuzziness_is_zero_based`、`ui_core_color_range_swatch_geometry_hits_what_it_paints`：
+钳位/步进与色块·参数行几何的绘制↔命中共源）。单测 **556 例 / 0 失败**。
+
+**9. 边界。** ① 色块只画首屏放得下的（330 宽 → 13 个）：超出的颜色仍然生效，只是点不到；
+要减掉它们按 `Backspace` 清空后重取；② 没有「取样半径」可选项（固定 3×3）；
+③ 未做上游的「存储/载入取样」(Save/Load selection colors)；④ 取色基于合成结果，
+16 位/HDR 文档走 8 位视图（与魔棒同一家族），不是逐通道深比较。
 

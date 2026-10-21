@@ -904,6 +904,57 @@ COMP_TEST(ui_core_selection_grow_clamps_to_engine_range) {
   COMP_CHECK(comp_ui::step_selection_grow(1, -5) == 1);
 }
 
+/* ------------------------------------------ P0-4 第二批: 色彩范围面板 */
+
+COMP_TEST(ui_core_color_range_fuzziness_is_zero_based) {
+  /* 与扩展/收缩不同，**0 是合法容差**（只选完全同色），不能照抄 clamp_selection_grow。 */
+  COMP_CHECK(comp_ui::kMinColorRangeFuzziness == 0);
+  COMP_CHECK(comp_ui::kMaxColorRangeFuzziness == 200);
+  COMP_CHECK(comp_ui::kDefaultColorRangeFuzziness == 40);
+  COMP_CHECK(comp_ui::clamp_color_range_fuzziness(-1) == 0);
+  COMP_CHECK(comp_ui::clamp_color_range_fuzziness(0) == 0);
+  COMP_CHECK(comp_ui::clamp_color_range_fuzziness(200) == 200);
+  COMP_CHECK(comp_ui::clamp_color_range_fuzziness(201) == 200);
+
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(0, -1) == 0);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(0, 1) == 1);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(19, 1) == 20);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(20, 1) == 25);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(99, 1) == 104);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(100, 1) == 110);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(200, 1) == 200);
+  COMP_CHECK(comp_ui::step_color_range_fuzziness(95, -1) == 90);
+}
+
+COMP_TEST(ui_core_color_range_swatch_geometry_hits_what_it_paints) {
+  const comp_ui::Rect panel{724, 46, 330, 560};
+  /* 330 宽、左右各 12 px 边距 = 306 px 可用，每格 22 px => 13 个色块。 */
+  COMP_CHECK(comp_ui::color_range_swatch_capacity(panel) == 13);
+  COMP_CHECK(comp_ui::color_range_swatch_capacity(comp_ui::Rect{0, 0, 30, 560}) == 0);
+  COMP_CHECK(comp_ui::color_range_swatch_capacity(comp_ui::Rect{0, 0, 332, 560}) == 14);
+
+  const comp_ui::Rect include0 = comp_ui::color_range_swatch_rect(panel, false, 0);
+  const comp_ui::Rect exclude0 = comp_ui::color_range_swatch_rect(panel, true, 0);
+  COMP_CHECK(include0.x == 736 && include0.y == 96 && include0.w == 18);
+  COMP_CHECK(exclude0.x == 736 && exclude0.y == 120);
+
+  /* 命中值 = 取色行 -> 排除行连续编号；色块之间的 4 px 缝不算命中。 */
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 2, 1, 737.0, 97.0) == 0);
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 2, 1, 759.0, 97.0) == 1);
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 2, 1, 737.0, 121.0) == 2);
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 2, 1, 781.0, 97.0) == -1);
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 2, 1, 737.0, 140.0) == -1);
+  /* 只认首屏画得出来的：15 个取色色块，第 14 个之后点不到（画不出就不给删）。 */
+  COMP_CHECK(comp_ui::color_range_swatch_at(panel, 15, 0, 736.0 + 13 * 22, 97.0) == -1);
+
+  /* 参数行：容差（0）/ 反相（1），再往下不是行。 */
+  COMP_CHECK(comp_ui::color_range_row_at(panel, 800.0, 147.0) == 0);
+  COMP_CHECK(comp_ui::color_range_row_at(panel, 800.0, 170.0) == 1);
+  COMP_CHECK(comp_ui::color_range_row_at(panel, 800.0, 194.0) == -1);
+  COMP_CHECK(comp_ui::color_range_row_at(panel, 800.0, 145.0) == -1);
+  COMP_CHECK(comp_ui::color_range_row_at(comp_ui::Rect{724, 46, 0, 560}, 724.0, 147.0) == -1);
+}
+
 /* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
 
 COMP_TEST(ui_core_pen_anchors_build_symmetric_segments) {

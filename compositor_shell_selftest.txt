@@ -215,6 +215,23 @@
 [OK] comp_selection_load_layer(LOAD_PIXELS, threshold 1) selects every opaque pixel
 [OK] comp_document_undo(load layer pixels step)
 [OK] deselect after the P0-4 probes
+[OK] comp_selection_apply_color_range(fuzziness 0) matches every same-colour pixel
+[OK] color range selection is exactly one undo step
+[OK] one undo returns the color range selection to the pre-open (inactive) state
+[OK] color range re-applies after undo
+[OK] color range invert selects the complement of the sampled colour
+[OK] one undo leaves the un-inverted color range selection in place
+[OK] color range fuzziness 200 matches the far colour as well (inclusive bound)
+[OK] comp_document_undo(fuzziness 200 step)
+[OK] color range with include == exclude matches nothing and leaves the selection alone
+[OK] color range fuzziness 201 is rejected before touching the selection
+[OK] color range NULL include with a nonzero count is rejected
+[OK] ui_core color range fuzziness clamps to 0..200 and steps 1/5/10
+[OK] ui_core color range swatch/row geometry hits what it paints
+[OK] color range preview inside a txn shows the last apply and commits one step
+[OK] comp_txn_abort restores the pre-open color range selection without an undo step
+[OK] one undo after the color range commit returns to the previous selection
+[OK] deselect after the color range probes
 [OK] comp_layer_remove(wand fixture) keeps later flatten assertions honest
 [OK] deselect after the S7 probes restores the S6 precondition
 [OK] ui_core tool_shortcut_target(E) toggles brush/eraser

@@ -1501,6 +1501,28 @@ inline int step_selection_grow(int radius, int direction) {
   return next < kMinSelectionGrow ? kMinSelectionGrow : (next > kMaxSelectionGrow ? kMaxSelectionGrow : next);
 }
 
+/*
+ * 色彩范围容差（P0-4 第二批）：0..200，与引擎 kMaxColorRangeFuzziness 同口径。
+ * 缺省 40 抄自上游 `ColorRangeEdit.fuzziness`；**0 是合法值**（只选完全同色），
+ * 与扩展/收缩的下限 1 不同，别把两个夹取函数合并。
+ */
+inline constexpr int kMinColorRangeFuzziness = 0;
+inline constexpr int kMaxColorRangeFuzziness = 200;
+inline constexpr int kDefaultColorRangeFuzziness = 40;
+
+inline int clamp_color_range_fuzziness(int value) {
+  if (value < kMinColorRangeFuzziness) return kMinColorRangeFuzziness;
+  if (value > kMaxColorRangeFuzziness) return kMaxColorRangeFuzziness;
+  return value;
+}
+
+/* 容差步进：<20 走 1、<100 走 5、其余走 10（同一手感，量程 200 不至于走不动）。 */
+inline int step_color_range_fuzziness(int fuzziness, int direction) {
+  const int current = clamp_color_range_fuzziness(fuzziness);
+  const int step = current < 20 ? 1 : (current < 100 ? 5 : 10);
+  return clamp_color_range_fuzziness(current + (direction > 0 ? step : -step));
+}
+
 /* ------------------------------------------------------------ 钢笔路径（S8） */
 
 /*
@@ -2234,6 +2256,69 @@ inline double step_effect_param(double current, int direction, double min_value,
   return clamp_effect_param(base + effect_param_step(min_value, max_value) *
                                          static_cast<double>(direction),
                             min_value, max_value);
+}
+
+/* ---------------------------------------------- 色彩范围面板（P0-4 第二批） */
+
+/*
+ * 排版：标题（8+22+20）之后是取样色块两行（取色 / 排除），再往下是容差与反相
+ * 两行参数。色块行与参数行都只画**首屏**能放下的数量——面板固定宽 330，
+ * 超出部分不影响命中（点不到就删不掉，但 Alt+点画布可以少加一个颜色，
+ * 所以不存在「加错了没法撤销」的死角）。
+ */
+inline constexpr int kColorRangeSwatchSize = 18;
+inline constexpr int kColorRangeSwatchGap = 4;
+inline constexpr int kColorRangeSwatchLeft = 12;
+inline constexpr int kColorRangeIncludeTop = 50;
+inline constexpr int kColorRangeExcludeTop = 74;
+inline constexpr int kColorRangeRowHeight = 24;
+inline constexpr int kColorRangeRowsTop = 100;
+
+inline int color_range_swatch_capacity(const Rect& panel) {
+  const int usable = panel.w - 2 * kColorRangeSwatchLeft;
+  if (usable <= 0) return 0;
+  return usable / (kColorRangeSwatchSize + kColorRangeSwatchGap);
+}
+
+inline Rect color_range_swatch_rect(const Rect& panel, bool exclude, int index) {
+  return Rect{panel.x + kColorRangeSwatchLeft +
+                  index * (kColorRangeSwatchSize + kColorRangeSwatchGap),
+              panel.y + (exclude ? kColorRangeExcludeTop : kColorRangeIncludeTop),
+              kColorRangeSwatchSize, kColorRangeSwatchSize};
+}
+
+/*
+ * 命中取样色块：返回 0..include_count-1 = 取色行第 i 个色块，
+ * include_count.. = 排除行第 (i - include_count) 个；未命中返回 -1。
+ * 只认首屏画得出来的那些，避免点到空白处删掉看不见的颜色。
+ */
+inline int color_range_swatch_at(const Rect& panel, int include_count, int exclude_count,
+                                 double x, double y) {
+  const int capacity = color_range_swatch_capacity(panel);
+  if (capacity <= 0) return -1;
+  const int shown_include = include_count < capacity ? include_count : capacity;
+  const int shown_exclude = exclude_count < capacity ? exclude_count : capacity;
+  for (int i = 0; i < shown_include; ++i) {
+    if (color_range_swatch_rect(panel, false, i).contains(x, y)) return i;
+  }
+  for (int i = 0; i < shown_exclude; ++i) {
+    if (color_range_swatch_rect(panel, true, i).contains(x, y)) return shown_include + i;
+  }
+  return -1;
+}
+
+inline Rect color_range_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kColorRangeRowsTop + row * kColorRangeRowHeight, panel.w,
+              kColorRangeRowHeight};
+}
+
+inline int color_range_row_at(const Rect& panel, double x, double y) {
+  if (!panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kColorRangeRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kColorRangeRowHeight)));
+  if (row < 0 || row > 1) return -1;
+  return row;
 }
 
 /* ------------------------------------------------ 调整参数面板（P0-3） */
