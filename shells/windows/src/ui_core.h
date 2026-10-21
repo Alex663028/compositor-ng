@@ -2259,6 +2259,41 @@ inline double clamp_layer_scale(double scale) {
 }
 
 /*
+ * 图层矩形（可旋转）是否还与画布有交集。给 Move 拖动的「拖出画布」提示用：
+ * 图层被拖到完全离开文档后，画面上一点痕迹都没有，不提示就像把图层拖丢了。
+ *
+ * 先把旋转后的矩形取 AABB（保守上界）再与 [0, doc_w) × [0, doc_h) 求交。
+ * 保守 = AABB 还相交就不提示，宁可少报也不误报（旋转 45° 的大图 AABB 明明还在
+ * 画布上时，报「已拖出」会比不报更让人困惑）。
+ * 宽高或画布不为正（读不到有效 transform）、角度非有限时返回 true：判断不了就不提示。
+ */
+inline bool layer_rect_touches_canvas(int32_t x, int32_t y, int32_t w, int32_t h,
+                                      double rotation_deg, int doc_w, int doc_h) {
+  if (w <= 0 || h <= 0 || doc_w <= 0 || doc_h <= 0) return true;
+  if (!std::isfinite(rotation_deg)) return true; /* 脏角度：判断不了就不提示 */
+  double half_w = static_cast<double>(w) * 0.5;
+  double half_h = static_cast<double>(h) * 0.5;
+  if (std::fabs(rotation_deg) > 1e-9) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double rad = rotation_deg * kPi / 180.0;
+    const double c = std::fabs(std::cos(rad));
+    const double s = std::fabs(std::sin(rad));
+    const double rotated_w = half_w * c + half_h * s;
+    const double rotated_h = half_w * s + half_h * c;
+    half_w = rotated_w;
+    half_h = rotated_h;
+  }
+  /* transform.x/y 是图层左上角（heal_layer_point 用同一口径），中心 = 左上 + 半宽高。 */
+  const double center_x = static_cast<double>(x) + static_cast<double>(w) * 0.5;
+  const double center_y = static_cast<double>(y) + static_cast<double>(h) * 0.5;
+  const bool right_of_canvas = center_x - half_w >= static_cast<double>(doc_w);
+  const bool left_of_canvas = center_x + half_w <= 0.0;
+  const bool below_canvas = center_y - half_h >= static_cast<double>(doc_h);
+  const bool above_canvas = center_y + half_h <= 0.0;
+  return !(right_of_canvas || left_of_canvas || below_canvas || above_canvas);
+}
+
+/*
  * 缩放步进：按当前宽高的等比例增量，锚点为图层中心（origin 随之收缩/展开，
  * 保持中心不动——上游拖角缩放的行为，比左上角固定更符合直觉）。
  */

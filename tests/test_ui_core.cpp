@@ -1946,6 +1946,44 @@ COMP_TEST(ui_core_layer_transform_scale_clamps_and_holds_center) {
   comp_ui::layer_transform_scale_rect(nullptr, nullptr, nullptr, nullptr, 1.0);
 }
 
+/*
+ * 「拖出画布」提示的判定：只看矩形与画布的相交，不关心是否真被裁剪。
+ * 最容易写错的两处：① 边界刚好贴住（left == doc_w）算拖出，不能被判成「还看得见」；
+ * ② 旋转后必须用 AABB 求交——不旋转时 45° 的宽高会算错整整一倍。
+ */
+COMP_TEST(ui_core_layer_rect_touches_canvas) {
+  /* 完全在画布内 / 部分伸出：都算「还看得见」，不提示。 */
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(10, 10, 100, 100, 0.0, 1280, 720));
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(-50, -50, 100, 100, 0.0, 1280, 720));
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(1279, 719, 100, 100, 0.0, 1280, 720));
+
+  /* 整块跑到画布外侧：四个方向都要能判出来。 */
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(1280, 0, 100, 100, 0.0, 1280, 720));
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(-100, 0, 100, 100, 0.0, 1280, 720));
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(0, 720, 100, 100, 0.0, 1280, 720));
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(0, -100, 100, 100, 0.0, 1280, 720));
+  /* 贴边（右边界与画布左边界重合）也算离开：像素一个都不在画布内。 */
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(-100, 10, 100, 100, 0.0, 1280, 720));
+
+  /* 旋转：100×100 的正方形转 45° 后 AABB 半宽 = 50*(|cos|+|sin|) ≈ 70.7。 */
+  const double diag = 50.0 * (std::fabs(std::cos(3.14159265358979323846 / 4.0)) +
+                              std::fabs(std::sin(3.14159265358979323846 / 4.0)));
+  COMP_CHECK(near_value(diag, 50.0 * std::sqrt(2.0)));
+  /* 中心在 (-60, 50)：AABB 右边界 ≈ -60 + 70.71 > 0 ⇒ 还压在画布上。 */
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(-110, 0, 100, 100, 45.0, 1280, 720));
+  /* 同尺寸不旋转时右边界 = -10 ⇒ 完全在画布外。 */
+  COMP_CHECK(!comp_ui::layer_rect_touches_canvas(-110, 0, 100, 100, 0.0, 1280, 720));
+  /* 转 90° 后 AABB 与未旋转一致（正方形），转轴不影响判断口径。 */
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(10, 10, 100, 100, 90.0, 1280, 720));
+
+  /* 判断不了的输入一律「当作还在画布上」：宁可少提示，也不误报拖丢。 */
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(5000, 5000, 0, 100, 0.0, 1280, 720));
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(5000, 5000, 100, 0, 0.0, 1280, 720));
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(5000, 5000, 100, 100, 0.0, 0, 720));
+  COMP_CHECK(comp_ui::layer_rect_touches_canvas(
+      5000, 5000, 100, 100, std::numeric_limits<double>::quiet_NaN(), 1280, 720));
+}
+
 /* ------------------------------------------------------- 采样模式（S22） */
 
 /*

@@ -2074,8 +2074,14 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
     return;
   }
   shell.needs_render = true;
-  wchar_t buffer[128];
-  wsprintfW(buffer, L"图层位置：(%d, %d)（方向键微调）", transform.x, transform.y);
+  /* 微调也能把图层提出画布：与拖动同一句提示，否则照样像丢了图层。 */
+  const wchar_t* off_canvas = comp_ui::layer_rect_touches_canvas(
+                                 transform.x, transform.y, transform.w, transform.h,
+                                 static_cast<double>(rotation), shell.width, shell.height)
+                                 ? L""
+                                 : L" · 已拖出画布";
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"图层位置：(%d, %d)（方向键微调）%s", transform.x, transform.y, off_canvas);
   refresh_history_status(shell, buffer);
 }
 
@@ -6307,13 +6313,24 @@ void layer_move_extend(ShellState& shell, int x, int y, const Layout& layout) {
   shell.layer_move_dirty = true;
   shell.needs_render = true;
 
-  wchar_t buffer[192];
+  /*
+   * 拖到完全离开画布时补一句：画面上会一点痕迹都不剩，不提示就像图层被拖丢了。
+   * 判断是纯函数（ui_core::layer_rect_touches_canvas，AABB 保守求交），
+   * 每帧重算：拖回来提示自动消失，不需要额外状态。
+   */
+  const wchar_t* off_canvas = comp_ui::layer_rect_touches_canvas(
+                                 target.x, target.y, target.w, target.h,
+                                 static_cast<double>(shell.layer_move_rotation), shell.width,
+                                 shell.height)
+                                 ? L""
+                                 : L" · 已拖出画布";
+  wchar_t buffer[224];
   if (shell.layer_move_duplicated) {
-    wsprintfW(buffer, L"复制并移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x,
-              target.y, dx, dy);
+    wsprintfW(buffer, L"复制并移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）%s", target.x,
+              target.y, dx, dy, off_canvas);
   } else {
-    wsprintfW(buffer, L"移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）", target.x, target.y,
-              dx, dy);
+    wsprintfW(buffer, L"移动图层：(%d, %d)，位移 (%d, %d)（松开算一步撤销）%s", target.x, target.y,
+              dx, dy, off_canvas);
   }
   set_status(shell, buffer);
 }
@@ -6351,11 +6368,19 @@ void layer_move_end(HWND window, ShellState& shell) {
   }
 
   shell.needs_render = true;
-  wchar_t buffer[192];
+  /* 松手时同样提示（拖拽中的提示会被这条覆盖）：base + 位移就是刚提交的矩形。 */
+  const wchar_t* off_canvas =
+      comp_ui::layer_rect_touches_canvas(
+          shell.layer_move_base.x + dx, shell.layer_move_base.y + dy, shell.layer_move_base.w,
+          shell.layer_move_base.h, static_cast<double>(shell.layer_move_rotation), shell.width,
+          shell.height)
+          ? L""
+          : L" · 已拖出画布（图层仍在面板里，可拖回或 Ctrl+Z）";
+  wchar_t buffer[224];
   if (duplicated) {
-    wsprintfW(buffer, L"已复制并移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+    wsprintfW(buffer, L"已复制并移动图层：位移 (%d, %d)（一步撤销）%s", dx, dy, off_canvas);
   } else {
-    wsprintfW(buffer, L"已移动图层：位移 (%d, %d)（一步撤销）", dx, dy);
+    wsprintfW(buffer, L"已移动图层：位移 (%d, %d)（一步撤销）%s", dx, dy, off_canvas);
   }
   refresh_history_status(shell, buffer);
 }
