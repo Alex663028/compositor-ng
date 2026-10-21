@@ -1209,6 +1209,26 @@ inline double step_heal_opacity(double current, int direction) {
   return base;
 }
 
+/* ------------------------------------------------------------ 仿制不透明度 */
+/*
+ * 仿制图章的笔迹总强度（comp_tool_clone.opacity）。引擎的闸允许 0，但 0 = 什么都不画，
+ * 对外壳用户是无反馈的死调节，因此与修补同口径取 10% 下限。
+ */
+inline constexpr double kMinCloneOpacity = 0.1;
+inline constexpr double kMaxCloneOpacity = 1.0;
+
+inline double clamp_clone_opacity(double value) {
+  if (!(value > 0.0)) return kMinCloneOpacity; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinCloneOpacity), kMaxCloneOpacity);
+}
+
+inline double step_clone_opacity(double current, int direction) {
+  const double base = clamp_clone_opacity(current);
+  if (direction > 0) return clamp_clone_opacity(base + 0.1);
+  if (direction < 0) return clamp_clone_opacity(base - 0.1);
+  return base;
+}
+
 /* ------------------------------------------------------------ 渐变工具（S9） */
 
 /* 渐变类型（镜像 ABI comp_tool_gradient.type；数值必须与 ABI 一致）。 */

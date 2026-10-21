@@ -319,6 +319,12 @@ struct ShellState {
   double clone_offset_y = 0.0;
   bool clone_sample_all = false;
   /*
+   * 仿制选项：不透明度与「对齐」。对齐关 = 每一笔都以源点重新对位（offset 不携带），
+   * 因此关掉时要顺手清掉已存偏移，重新打开才会由下一笔现算，而不是复用旧偏移。
+   */
+  double clone_opacity = 1.0;
+  bool clone_aligned = true;
+  /*
    * Spot Healing（J）：模式与不透明度。coverage 不走 ABI 之外的持久状态——
    * 每一笔在松手时按折线现光栅化，画布大小、笔刷直径与硬度都取当前值。
    */
@@ -5741,21 +5747,23 @@ void clone_stroke_end(HWND window, ShellState& shell) {
    * 对齐：首笔不带 offset（引擎按 round(source - first_point) 现算），宿主
    * 在这一笔成功后存下同一组整数；之后每一笔都带 has_offset 复用。
    * 顺序不能反——先带 offset 再存，首笔就会用上一次会话的偏移。
+   * 关掉对齐（Shift+S）时不携带也不保存 offset：每笔都由引擎现算，
+   * 这正是上游 aligned = false 的语义。
    */
-  const bool establish_offset = !shell.clone_has_offset;
+  const bool establish_offset = shell.clone_aligned && !shell.clone_has_offset;
   comp_tool_op_desc desc{};
   desc.kind = COMP_TOOL_CLONE;
   desc.clone.source_x = shell.clone_source_x;
   desc.clone.source_y = shell.clone_source_y;
   desc.clone.has_source = 1;
-  if (!establish_offset) {
+  if (shell.clone_aligned && !establish_offset) {
     desc.clone.offset_x = shell.clone_offset_x;
     desc.clone.offset_y = shell.clone_offset_y;
     desc.clone.has_offset = 1;
   }
-  desc.clone.aligned = 1;
+  desc.clone.aligned = shell.clone_aligned ? 1 : 0;
   desc.clone.sample_all_layers = shell.clone_sample_all ? 1 : 0;
-  desc.clone.opacity = 1.0f; /* 笔迹总强度；零初始化 = 不动，必须显式给 1 */
+  desc.clone.opacity = static_cast<float>(comp_ui::clamp_clone_opacity(shell.clone_opacity));
   desc.stroke_points = points.data();
   desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
   desc.brush.diameter = static_cast<float>(shell.brush_size);
@@ -5783,16 +5791,19 @@ void clone_stroke_end(HWND window, ShellState& shell) {
   }
 
   const wchar_t* sample_name = shell.clone_sample_all ? L"整篇合成" : L"当前图层";
+  const int opacity_percent = static_cast<int>(desc.clone.opacity * 100.0 + 0.5);
   if (note[0] != '\0' && note_size > 1) {
-    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s）｜%s",
+    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s · %s · 不透明度 %d%%）｜%s",
               desc.stroke_point_count, static_cast<int>(shell.clone_source_x),
               static_cast<int>(shell.clone_source_y), sample_name,
+              shell.clone_aligned ? L"对齐" : L"不对齐", opacity_percent,
               widen_ascii(note).c_str());
   } else {
-    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s · 直径 %d px）",
+    wsprintfW(buffer, L"仿制图章：已应用 %d 个折点（源 (%d, %d) · %s · %s · 直径 %d px · 不透明度 %d%%）",
               desc.stroke_point_count, static_cast<int>(shell.clone_source_x),
               static_cast<int>(shell.clone_source_y), sample_name,
-              static_cast<int>(shell.brush_size + 0.5));
+              shell.clone_aligned ? L"对齐" : L"不对齐",
+              static_cast<int>(shell.brush_size + 0.5), opacity_percent);
   }
   refresh_history_status(shell, buffer);
 }
@@ -8978,7 +8989,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
                 shell.clone_sample_all ? L"整篇合成" : L"当前图层");
     } else {
       wsprintfW(buffer,
-                L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）");
+                L"工具：Clone Stamp（S）· 先 Alt+点击画布设置源点（Shift+Alt = 整篇合成取样）；"
+                L"Shift+S 切对齐（%s），Alt+[ / ] 调不透明度（%d%%）",
+                shell.clone_aligned ? L"开" : L"关",
+                static_cast<int>(comp_ui::clamp_clone_opacity(shell.clone_opacity) * 100.0 + 0.5));
     }
   } else if (id == comp_ui::ToolId::Heal) {
     wsprintfW(buffer,
@@ -10549,6 +10563,22 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         break;
       }
       if (key < 128) {
+        /*
+         * Shift+S = 仿制「对齐」开关（只在仿制工具激活时拦截）。PS 把它放在选项栏，
+         * 本壳没有选项栏，用同一字母的 Shift 组合最省记忆；不带 Shift 的 S 仍是选工具。
+         * 关掉对齐必须清掉已存偏移，否则重新打开时会复用关掉之前的首笔偏移。
+         */
+        if (key == 'S' && shift && shell.tool == comp_ui::ToolId::Clone) {
+          shell.clone_aligned = !shell.clone_aligned;
+          if (!shell.clone_aligned) shell.clone_has_offset = false;
+          wchar_t buffer[192];
+          wsprintfW(buffer,
+                    shell.clone_aligned
+                        ? L"仿制对齐：开（整段会话复用首笔偏移；Shift+S 切换）"
+                        : L"仿制对齐：关（每一笔都以源点重新对位；Shift+S 切换）");
+          set_status(shell, buffer);
+          break;
+        }
         const comp_ui::ToolId id =
             comp_ui::tool_shortcut_target(shell.tool, static_cast<char>(key));
         if (id == comp_ui::ToolId::Retouch) {
@@ -11508,6 +11538,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     static_cast<int>(comp_ui::clamp_heal_opacity(shell->heal_opacity) * 100.0 + 0.5),
                     widen_ascii(comp_ui::heal_mode_name(shell->heal_mode)).c_str(),
                     static_cast<int>(shell->brush_size + 0.5));
+        } else if (shell->tool == comp_ui::ToolId::Clone) {
+          /* 仿制不透明度：10% 一步，下限 10%（引擎允许 0，但 0 = 什么都不画）。 */
+          shell->clone_opacity =
+              comp_ui::step_clone_opacity(shell->clone_opacity, direction);
+          wsprintfW(buffer, L"仿制不透明度 %d%%（%s）",
+                    static_cast<int>(comp_ui::clamp_clone_opacity(shell->clone_opacity) * 100.0 + 0.5),
+                    shell->clone_aligned ? L"对齐" : L"不对齐");
         } else if (shell->tool == comp_ui::ToolId::Tone) {
           /* P1：Alt+[ / ] 调减淡/加深/海绵的强度（Exposure / Flow 口径，10% 一步）。 */
           shell->tone_strength = comp_ui::step_tone_strength(shell->tone_strength, direction);
