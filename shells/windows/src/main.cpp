@@ -286,6 +286,13 @@ struct ShellState {
    */
   int tone_state = comp_ui::kToneDodgeMidtone;
   double tone_strength = 0.5; /* comp_tool_tone.strength（Exposure / Flow） */
+  /*
+   * P1 历史记录画笔：取样状态是历史面板的**下标**（不是撤销步数）。
+   * -1 = 自动（取当前状态的上一格），Shift+点行显式指定某个下标。
+   * opacity 走 Alt+[ / ]，下限 10%（引擎的闸拒绝 0）。
+   */
+  int history_brush_state = -1;
+  double history_brush_opacity = 1.0;
   /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
   comp_ui::FilterPanel filter;
   bool filter_open = false;
@@ -4171,6 +4178,22 @@ void history_step(ShellState& shell, int delta) {
   history_jump_to(shell, target);
 }
 
+/*
+ * 历史记录画笔的取样下标（面板下标，不是撤销步数）。
+ * -1 = 自动 = 当前状态的上一格：「往回刷一步」是最常用的用法，也正好是「刚
+ * 画错一笔，拿历史画笔抹掉」的直觉。显式下标（Shift+点行）夹到 [0, count-1]，
+ * 面板行数变少（回跳后重做侧消失不可能，但换文档会）也不会越界。
+ */
+int history_brush_resolved_state(const ShellState& shell) {
+  const int count = history_state_count(shell);
+  if (count <= 0) return 0;
+  if (shell.history_brush_state < 0) {
+    const int target = history_current(shell) - 1;
+    return target < 0 ? 0 : target;
+  }
+  return std::min(shell.history_brush_state, count - 1);
+}
+
 void history_panel_toggle(ShellState& shell) {
   if (shell.history_open) {
     shell.history_open = false;
@@ -5066,6 +5089,88 @@ void tone_stroke_end(HWND window, ShellState& shell) {
     wsprintfW(buffer, L"%s：已应用 %d 个折点（强度 %d%%）",
               widen_ascii(state_name).c_str(), desc.stroke_point_count,
               static_cast<int>(shell.tone_strength * 100.0 + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------------------------ 历史记录画笔（P1） */
+
+/*
+ * 与 Tone / Retouch 共用同一条「鼠标折线 -> comp_tool_apply」通路：折线在文档
+ * 坐标累积，松开鼠标时一次性提交（= 恰好一个撤销步）。取样状态只在提交时读
+ * 一次——笔画途中点开历史面板、回跳都不会改变这一笔的来源。
+ */
+bool history_brush_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::HistoryBrush;
+}
+
+void history_brush_stroke_begin(HWND window, ShellState& shell, int x, int y,
+                                const Layout& layout) {
+  if (!history_brush_stroke_available(shell)) return;
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::HistoryBrush)) return;
+  SetCapture(window);
+  const int sample = history_brush_resolved_state(shell);
+  wchar_t buffer[320];
+  wsprintfW(buffer, L"历史记录画笔：取样第 %d 个状态（%s），松开鼠标刷回｜不透明度 %d%%", sample,
+            history_state_label(shell, sample).c_str(),
+            static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void history_brush_stroke_end(HWND window, ShellState& shell) {
+  if (shell.stroke_kind != comp_ui::StrokeKind::HistoryBrush) return;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
+
+  /* 同 tone_stroke_end：折线必须先搬走，ReleaseCapture 会同步触发取消。 */
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  ReleaseCapture();
+  if (points.empty()) return;
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"历史记录画笔：请先选择一个图层");
+    return;
+  }
+
+  const int sample = history_brush_resolved_state(shell);
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_HISTORY_BRUSH;
+  desc.history.state = sample;
+  desc.history.opacity =
+      static_cast<float>(comp_ui::clamp_history_brush_opacity(shell.history_brush_opacity));
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  desc.brush.flow = 1.0f;
+  desc.brush.seed = 0; /* 不用随机数；固定值保证同参数同结果 */
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    /*
+     * 最常见的拒绝：取样状态里还没有当前图层（图层是后加的），引擎给
+     * COMP_ERR_STATE。把「取样下标」写进状态栏，用户才知道该换一格。
+     */
+    wsprintfW(buffer, L"历史记录画笔失败：取样第 %d 个状态（该状态下可能没有此图层）",
+              sample);
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"历史记录画笔：取样第 %d 个状态，已应用 %d 个折点｜%s", sample,
+              desc.stroke_point_count, widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"历史记录画笔：取样第 %d 个状态，已应用 %d 个折点（不透明度 %d%%）",
+              sample, desc.stroke_point_count,
+              static_cast<int>(desc.history.opacity * 100.0f + 0.5f));
   }
   refresh_history_status(shell, buffer);
 }
@@ -6031,6 +6136,10 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
                 widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
                 static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
     }
+  } else if (shell.tool == comp_ui::ToolId::HistoryBrush) {
+    /* 取样源与不透明度必须常显：这支笔画出来的东西完全由它们决定。 */
+    wsprintfW(extra, L"   取样 #%d / 不透明度 %d%%", history_brush_resolved_state(shell),
+              static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
   }
   wchar_t info_text[192];
   wsprintfW(info_text, L"缩放 %d%%   笔刷 %d px / %d%%   渲染 %s%s",
@@ -6073,6 +6182,9 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
       wsprintfW(extra, L" · 强度 %d%%",
                 static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
     }
+  } else if (shell.tool == comp_ui::ToolId::HistoryBrush) {
+    wsprintfW(extra, L" · 取样 #%d · 不透明度 %d%%", history_brush_resolved_state(shell),
+              static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
   }
   wchar_t line[768];
   wsprintfW(line, L"%s（%c） · 缩放 %d%% · 笔刷 %d px / %d%%%s · %s", tool_name,
@@ -6946,13 +7058,17 @@ void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pa
     if (index >= count) break;
     const comp_ui::Rect rect = comp_ui::history_row_rect(panel_rect, row);
     const bool selected = index == current;
+    /* 显式取样源（Shift+点行）单独标出来：这支笔画什么完全取决于它。 */
+    const bool sampled = shell.history_brush_state >= 0 && index == shell.history_brush_state;
     if (selected) {
       RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
       HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
       FillRect(dc, &band, highlight);
       DeleteObject(highlight);
     }
-    if (selected) {
+    if (sampled) {
+      SetTextColor(dc, RGB(255, 206, 112));
+    } else if (selected) {
       SetTextColor(dc, RGB(250, 250, 255));
     } else if (index > current) {
       /* 当前状态之后 = 重做侧：暗色，一眼看出「还没发生」。 */
@@ -6960,17 +7076,24 @@ void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pa
     } else {
       SetTextColor(dc, RGB(196, 200, 210));
     }
-    wsprintfW(line, L"%d. %s", index, history_state_label(shell, index).c_str());
+    const std::wstring label = history_state_label(shell, index);
+    if (sampled) {
+      wsprintfW(line, L"%d. %s   ← 画笔取样", index, label.c_str());
+    } else {
+      wsprintfW(line, L"%d. %s", index, label.c_str());
+    }
     TextOutW(dc, left + 12, rect.y + 3, line, lstrlenW(line));
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
   const wchar_t* hints[] = {
       L"点行 / ↑ / ↓ 回跳（不新增撤销步）",
+      L"Shift+点行 = 只指定历史记录画笔的取样源（不回跳）",
       L"Ctrl+Z / Ctrl+Y 仍按步撤销 / 重做",
       L"Escape 关闭面板",
   };
-  int hint_y = bottom - 8 - 3 * 18 + 4;
+  const int hint_count = static_cast<int>(sizeof(hints) / sizeof(hints[0]));
+  int hint_y = bottom - 8 - hint_count * 18 + 4;
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;
@@ -7690,6 +7813,13 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   /* 切到文字工具时丢掉调整面板的数值缓冲：两个面板共用 Tab/数字键，不能同时有输入态。 */
   if (id == comp_ui::ToolId::Type) shell.adj_input.clear();
   shell.tool = id;
+  /*
+   * 切到历史记录画笔：顺手把历史面板打开——否则「取样哪一格」既看不见也点不到，
+   * 自动取样虽然能画，但用户不知道自己在刷什么。没有文档时静默（面板打开也无意义）。
+   */
+  if (id == comp_ui::ToolId::HistoryBrush && !shell.history_open && shell.document != nullptr) {
+    history_panel_toggle(shell);
+  }
   const comp_ui::ToolInfo* info = comp_ui::tool_info(id);
   if (info == nullptr) return;
   wchar_t buffer[192];
@@ -7737,6 +7867,12 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               shell.wand_tolerance, shell.wand_radius * 2 + 1, shell.wand_radius * 2 + 1,
               shell.wand_merged ? L"合并" : L"当前图层",
               shell.wand_contiguous ? L"连通" : L"全图");
+  } else if (id == comp_ui::ToolId::HistoryBrush) {
+    wsprintfW(buffer,
+              L"工具：History Brush（Y）· 取样第 %d 个状态｜Shift+点历史面板的行改取样源，"
+              L"Alt+[ / ] 调不透明度（当前 %d%%）",
+              history_brush_resolved_state(shell),
+              static_cast<int>(shell.history_brush_opacity * 100.0 + 0.5));
   } else {
     wsprintfW(buffer, L"工具：%s（%c）", widen_ascii(info->name).c_str(),
               info->shortcut != 0 ? static_cast<wchar_t>(info->shortcut - 'a' + 'A') : L' ');
@@ -9582,6 +9718,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             /*
              * 历史记录面板：点行 = 直接回跳到该状态（单击即落动作，与路径面板不同——
              * 回跳本身可再回跳，不产生历史记录，误点没有破坏性）。空白处吞掉。
+             * Shift+点行 = 只把它指定给历史记录画笔当取样状态，**不回跳**：
+             * 取样源必须能停在「过去某一格」而当前画面保持在最新，否则这支笔
+             * 就没有意义了。
              */
             const int count = history_state_count(*shell);
             const int scroll =
@@ -9589,7 +9728,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             const int index =
                 comp_ui::history_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
             if (index >= 0) {
-              history_jump_to(*shell, index);
+              if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+                shell->history_brush_state = index;
+                wchar_t buffer[288];
+                wsprintfW(buffer, L"历史记录画笔取样：第 %d 个状态（%s）· 当前画面未回跳",
+                          index, history_state_label(*shell, index).c_str());
+                set_status(*shell, buffer);
+              } else {
+                history_jump_to(*shell, index);
+              }
             }
             InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -9620,6 +9767,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               shape_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (type_available(*shell)) {
               type_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (history_brush_stroke_available(*shell)) {
+              history_brush_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (tone_stroke_available(*shell)) {
               tone_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
@@ -9802,6 +9951,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr && shell->eyedropper_drag) {
         shell->eyedropper_drag = false;
         ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::HistoryBrush) {
+        history_brush_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -10042,6 +10196,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               comp_ui::step_shape_stroke_width(shell->shape_stroke_width, direction);
           wsprintfW(buffer, L"形状描边宽度 %d px（直线描边用）",
                     static_cast<int>(shell->shape_stroke_width + 0.5));
+        } else if (shell->tool == comp_ui::ToolId::HistoryBrush) {
+          /* P1：Alt+[ / ] 调历史记录画笔的不透明度（下限 10%，0 会被引擎拒）。 */
+          shell->history_brush_opacity =
+              comp_ui::step_history_brush_opacity(shell->history_brush_opacity, direction);
+          wsprintfW(buffer, L"历史记录画笔不透明度 %d%%（取样第 %d 个状态）",
+                    static_cast<int>(shell->history_brush_opacity * 100.0 + 0.5),
+                    history_brush_resolved_state(*shell));
         } else if (shell->tool == comp_ui::ToolId::Tone) {
           /* P1：Alt+[ / ] 调减淡/加深/海绵的强度（Exposure / Flow 口径，10% 一步）。 */
           shell->tone_strength = comp_ui::step_tone_strength(shell->tone_strength, direction);

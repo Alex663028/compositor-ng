@@ -98,6 +98,7 @@ std::string label(uint32_t kind) {
     case kToolOpDodge: return "dodge";
     case kToolOpBurn: return "burn";
     case kToolOpSponge: return "sponge";
+    case kToolOpHistoryBrush: return "history brush";
     default: return "none";
   }
 }
@@ -117,6 +118,18 @@ bool seed_to_layer(const Layer& layer, int32_t doc_x, int32_t doc_y, int32_t* ou
   *out_x = x;
   *out_y = y;
   return true;
+}
+
+/*
+ * 在历史快照里按 id 找图层（历史记录画笔用）。
+ * `Document::find` 只查活文档，快照是独立的一份 DocumentState，只能自己扫。
+ * 图层被删除 / 合并后历史状态里就没有同 id 的层：返回 nullptr，由参数闸拒绝。
+ */
+const Layer* find_state_layer(const DocumentState& state, comp_layer_id id) {
+  for (const Layer& layer : state.layers) {
+    if (layer.id == id) return &layer;
+  }
+  return nullptr;
 }
 
 /* 累积蒙版：新 coverage 与既有蒙版取最大（反复点选是"加选"，对齐上游）。 */
@@ -386,7 +399,9 @@ bool is_stroke_family(uint32_t kind) {
           */
          kind == static_cast<uint32_t>(kToolOpDodge) ||
          kind == static_cast<uint32_t>(kToolOpBurn) ||
-         kind == static_cast<uint32_t>(kToolOpSponge);
+         kind == static_cast<uint32_t>(kToolOpSponge) ||
+         /* 历史记录画笔同样只改笔尖盖到的像素，笔尖之外保住 16 位 / HDR 精度。 */
+         kind == static_cast<uint32_t>(kToolOpHistoryBrush);
 }
 
 struct DeepPaintCopy {
@@ -825,6 +840,50 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
             std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
           return bad_arg("tone point is not finite or out of range");
         }
+      }
+      break;
+    }
+
+    case kToolOpHistoryBrush: {
+      if (params.point_count <= 0 || params.point_count > kMaxStrokePoints) {
+        return bad_arg("history brush needs 1..65536 points");
+      }
+      if (params.points == nullptr) return bad_arg("history brush points are null");
+      if (!std::isfinite(params.brush.diameter) || params.brush.diameter <= 0.0f ||
+          params.brush.diameter > kMaxBrushDiameter) {
+        return bad_arg("history brush diameter out of range");
+      }
+      if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
+      if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
+      if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+      /* opacity 0 = 逐字节不动：与 tone strength 0 同口径，拒绝而不是记空撤销。 */
+      if (!std::isfinite(params.history_brush.opacity) ||
+          params.history_brush.opacity <= 0.0f || params.history_brush.opacity > 1.0f) {
+        return bad_arg("history brush opacity must be within 0..1 and non-zero");
+      }
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i]) ||
+            std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
+          return bad_arg("history brush point is not finite or out of range");
+        }
+      }
+      /*
+       * 取样状态必须在面板下标范围内，且该状态里得有一张同 id 的图层——
+       * 后者在「图层是后来新建的」时会失败：历史里没有它，也就没有可取的像素。
+       * 这一步放在开事务之前，失败不留半成品。
+       */
+      if (params.history_brush.state < 0) {
+        return bad_arg("history brush state index is negative");
+      }
+      const DocumentState* past =
+          document->history().state_at(static_cast<std::size_t>(params.history_brush.state));
+      if (past == nullptr) return bad_arg("history brush state index is out of range");
+      const Layer* source = find_state_layer(*past, target);
+      if (source == nullptr) {
+        return bad_state("the sampled history state has no layer with this id");
+      }
+      if (!source->has_pixels()) {
+        return bad_state("the sampled history layer has no pixels");
       }
       break;
     }
@@ -1473,6 +1532,146 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       }
       if (masked && note != nullptr) {
         *note += "tone is masked by the active selection (coverage 0 pixels are unchanged); ";
+      }
+      break;
+    }
+
+    case kToolOpHistoryBrush: {
+      /*
+       * 历史记录画笔：从第 N 个历史状态取样，按笔迹刷回当前图层。
+       *
+       * 三件容易踩错的事：
+       *   1) 快照是只读借用：`History::state_at` 的指针在下一次 push/undo 后
+       *      失效。本次调用期间事务还没提交，历史栈不会动，因此可以安全使用；
+       *      像素在循环里逐点读，不持有跨调用的指针。
+       *   2) 历史图层的**包围盒可能和现在不同**（图层被移动/缩放过）：先把当前
+       *      图层像素映射到文档坐标，再映射回历史图层像素坐标；两级都只认
+       *      effective_bounds 原点（与 clone / 渐变同一套口径，不认旋转）。
+       *   3) 预乘空间的线性插值就是 source-over：不需要反预乘。反预乘会在
+       *      alpha 很低的边缘把颜色放大到 1.0 再乘回，产生可见偏差。
+       */
+      const DocumentState* past = document->history().state_at(
+          static_cast<std::size_t>(params.history_brush.state));
+      const Layer* source = past != nullptr ? find_state_layer(*past, target) : nullptr;
+      if (source == nullptr) {
+        /* 闸里查过：这里只可能是借用失效，按状态错误回报，不静默画空。 */
+        ok = bad_state("the sampled history state is no longer available");
+        break;
+      }
+
+      ImageBuffer converted;
+      const ImageBuffer* src = &source->pixels;
+      if (src->format == COMP_PIXEL_RGBA16F) {
+        if (!hdr_to_rgba8(*src, &converted)) {
+          ok = oom("history brush could not flatten the HDR source layer");
+          break;
+        }
+        src = &converted;
+      } else if (src->format == COMP_PIXEL_RGBA16) {
+        if (!deep_to_rgba8(*src, &converted)) {
+          ok = oom("history brush could not bring the source layer to 8-bit");
+          break;
+        }
+        src = &converted;
+      }
+      if (src->format != COMP_PIXEL_RGBA8) {
+        ok = bad_state("the sampled history layer is not an 8-bit, 16-bit or HDR raster");
+        break;
+      }
+
+      const bool masked = document->selection().active;
+      std::vector<uint8_t> selection_coverage;
+      const int32_t canvas_width = document->state().width;
+      const int32_t canvas_height = document->state().height;
+      if (masked) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+        if (selection_coverage.size() != static_cast<size_t>(canvas_width) *
+                                            static_cast<size_t>(canvas_height)) {
+          ok = bad_state("active selection has no coverage at the document resolution");
+          break;
+        }
+      }
+
+      const comp_rect b = target_layer->effective_bounds();
+      const comp_rect source_bounds = source->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        local[i] = params.points[i] - ((i & 1) ? b.y : b.x);
+      }
+      const StrokeShape shape(local.data(), params.point_count, params.brush.diameter,
+                              params.brush.hardness, params.brush.pressure * params.brush.flow);
+      int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (shape.empty() ||
+          !shape.bounds(target_layer->pixels.width, target_layer->pixels.height, &x0, &y0, &x1,
+                        &y1)) {
+        noop = true;
+        if (note != nullptr) {
+          *note += "history brush stroke does not intersect the layer (no pixels changed); ";
+        }
+        break;
+      }
+
+      bool changed = false;
+      const double opacity = static_cast<double>(params.history_brush.opacity);
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const size_t stride = target_layer->pixels.stride();
+      for (int32_t y = y0; y <= y1; ++y) {
+        uint8_t* row = pixels + static_cast<size_t>(y) * stride;
+        for (int32_t x = x0; x <= x1; ++x) {
+          const float cov =
+              shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+          if (cov <= 0.0f) continue;
+          double weight = static_cast<double>(cov) * opacity;
+          if (masked) {
+            const int32_t canvas_x = b.x + x;
+            const int32_t canvas_y = b.y + y;
+            if (canvas_x < 0 || canvas_y < 0 || canvas_x >= canvas_width ||
+                canvas_y >= canvas_height) {
+              continue; /* 画布外 = 选区之外：逐字节不动 */
+            }
+            weight *= static_cast<double>(
+                          selection_coverage[static_cast<size_t>(canvas_y) *
+                                                 static_cast<size_t>(canvas_width) +
+                                             static_cast<size_t>(canvas_x)]) /
+                      255.0;
+          }
+          if (weight <= 0.0) continue;
+
+          /* 当前图层像素 (x,y) -> 文档坐标 -> 历史图层像素；越界即透明。 */
+          const int32_t source_x = b.x + x - source_bounds.x;
+          const int32_t source_y = b.y + y - source_bounds.y;
+          uint8_t sample[4] = {0, 0, 0, 0};
+          if (source_x >= 0 && source_y >= 0 && source_x < src->width &&
+              source_y < src->height) {
+            std::memcpy(sample, src->row(source_y) + static_cast<size_t>(source_x) * 4u, 4u);
+          }
+
+          /* 预乘空间插值（含 alpha）：out = src*w + dst*(1-w)。 */
+          uint8_t* px = row + static_cast<size_t>(x) * 4u;
+          bool pixel_changed = false;
+          for (int c = 0; c < 4; ++c) {
+            double value = static_cast<double>(sample[c]) * weight +
+                           static_cast<double>(px[c]) * (1.0 - weight);
+            value = std::min(std::max(value, 0.0), 255.0);
+            const uint8_t quantized = static_cast<uint8_t>(std::lround(value));
+            if (quantized != px[c]) {
+              px[c] = quantized;
+              pixel_changed = true;
+            }
+          }
+          if (pixel_changed) changed = true;
+        }
+      }
+      if (!changed) {
+        noop = true;
+        if (note != nullptr) {
+          *note += "history brush changed no pixel (the sample equals the current pixels); ";
+        }
+        break;
+      }
+      if (masked && note != nullptr) {
+        *note +=
+            "history brush is masked by the active selection (coverage 0 pixels are unchanged); ";
       }
       break;
     }

@@ -340,6 +340,37 @@ coverage 把样本盖回当前像素。
   `Alt+[ / ]` 调强度（0.01..1.0，10% 一步）。状态栏文案与下发的 `(kind, mode)`
   由同一张状态表换算，壳内不另存第二份。
 
+### 4.14 历史记录画笔（`COMP_TOOL_HISTORY_BRUSH`，P1 尾部追加）
+
+从第 N 个历史状态**取样**，按笔迹刷回当前图层的对应像素。上游 `HistoryBrush.swift`
+同样只是工具层逻辑（读写的是它自己的快照缓存），本仓把取样源换成引擎的
+`History::state_at(index)`，因此取样与撤销栈天然同源，不会有第二份快照。
+
+- **`state` 是历史面板下标**（0 = 最初状态，N = 第 N 步之后），不是「撤销几步」。
+  越界 / 负数在参数闸里就 `COMP_ERR_INVALID_ARGUMENT`；下标合法但那一份状态里
+  **没有这个图层**（图层是后加的）→ `COMP_ERR_STATE`。两种拒绝都不开事务、不留撤销步。
+- `opacity` 必须满足 `0 < opacity <= 1`（0 / NaN / Inf → `INVALID_ARGUMENT`），
+  逐像素权重 = `笔迹覆盖率 × opacity × 选区覆盖率`，按预乘空间线性插值：
+  `out = sample × w + current × (1 - w)`。预乘下的线性插值就是 source-over，
+  **不反预乘**（反预乘会在低 alpha 边缘把颜色放大再缩回，产生可见偏差）。
+- **快照是只读借用**：`state_at()` 的指针在下一次 push / undo 后失效。本次调用期间
+  事务未提交、历史栈不动，像素逐点读，不持有跨调用指针；16 位 / HDR 取样源
+  （`deep_to_rgba8` / `hdr_to_rgba8`）先转成 8 位工作副本，**不改写快照本身**。
+  写回是 8 位落笔族的深像素路径（`is_stroke_family`）：只有真正被改动的像素
+  拿到 `8 位值 × 257` 的深值，笔迹之外保持原深度。
+- **包围盒可能不同**（图层被移动/缩放过）：当前图层像素 → 文档坐标 → 取样图层
+  像素坐标，两级都只认 `effective_bounds()` 原点（与 clone / 渐变同口径，不认旋转）。
+- **成功 no-op 不落撤销步**：笔尖与图层不相交 → note
+  `history brush stroke does not intersect the layer (no pixels changed)`；
+  取样值与本像素**逐字节相同** → note
+  `history brush changed no pixel (the sample equals the current pixels)`；
+  被选区整体遮住时另有 `history brush is masked by the active selection…`。
+  三种情况都返回 `COMP_OK`，`Ctrl+Z` 撤的是上一笔。
+- 外壳（P1，`Y`）：默认取样 = 当前状态的上一格；`Shift+点历史面板行` 显式指定
+  取样源且**不回跳**，面板该行标 `← 画笔取样`。`Alt+[ / ]` 调不透明度
+  （10% 一步，键盘下限 10%——引擎拒绝 0）。笔迹走 `StrokeKind::HistoryBrush`，
+  松手一次 `comp_tool_apply`（= 一个撤销步），切到该工具会自动打开历史面板。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。

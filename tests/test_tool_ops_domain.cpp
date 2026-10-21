@@ -1527,6 +1527,301 @@ COMP_TEST(tool_ops_domain_tone_rejects_bad_mode_and_strength_before_transaction)
                  "a tone stroke is exactly one undo step");
 }
 
+/* ============================================ [G] 历史记录画笔（P1 追加） */
+
+namespace {
+
+ToolOpParams history_brush_params(int32_t state, float opacity, const float* points,
+                                  int32_t point_count) {
+  ToolOpParams params;
+  params.kind = kToolOpHistoryBrush;
+  params.points = points;
+  params.point_count = point_count;
+  params.brush.diameter = 5.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+  params.history_brush.state = state;
+  params.history_brush.opacity = opacity;
+  return params;
+}
+
+/* 一次覆盖整幅画布的纯色笔迹（直径远大于画布，hardness/flow 拉满）。 */
+ToolOpParams solid_stroke_params(uint8_t r, uint8_t g, uint8_t b, const float* points,
+                                 int32_t point_count) {
+  ToolOpParams params;
+  params.kind = kToolOpStroke;
+  params.points = points;
+  params.point_count = point_count;
+  params.brush.color[0] = r;
+  params.brush.color[1] = g;
+  params.brush.color[2] = b;
+  params.brush.diameter = 64.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+  return params;
+}
+
+/* 历史快照里的图层查找（与域层 find_state_layer 同口径，测试侧独立写一份）。 */
+const Layer* state_layer(const DocumentState& state, comp_layer_id id) {
+  for (const Layer& layer : state.layers) {
+    if (layer.id == id) return &layer;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+/*
+ * [G1] 历史面板下标 -> 状态的映射。
+ *
+ * 三种栈形态都要对：撤销栈非空、撤销栈空而重做栈非空、两栈都空（借活文档）。
+ * 映射错一位的后果是「历史记录画笔静默刷回错误的那一步」，比直接失败更难查。
+ */
+COMP_TEST(tool_ops_domain_history_state_at_maps_panel_indices) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  const std::vector<uint8_t> gray = flat_pixels(16, 16, 128, 128, 128, 255);
+  layer->pixels.resize(16, 16, COMP_PIXEL_RGBA8);
+  std::memcpy(layer->pixels.writable_pixels().data(), gray.data(), gray.size());
+
+  /* 两栈全空：index 0 借给活文档，之后的 index 越界。 */
+  COMP_CHECK(document.history().step_count() == 0);
+  const DocumentState* live = document.history().state_at(0);
+  COMP_CHECK_MSG(live != nullptr, "index 0 with an empty stack borrows the live document");
+  COMP_CHECK(state_layer(*live, id) != nullptr);
+  COMP_CHECK_MSG(document.history().state_at(1) == nullptr, "index past step_count() is null");
+
+  const float center[2] = {8.0f, 8.0f};
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  ToolOpParams first = tone_params(kToolOpDodge, 0, 0.5f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, first, &code, &error, nullptr),
+                 "first dodge: " + error);
+  const std::vector<uint8_t> after_first = pixels_of(document, id);
+  ToolOpParams second = tone_params(kToolOpDodge, 0, 0.5f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, second, &code, &error, nullptr),
+                 "second dodge: " + error);
+  const std::vector<uint8_t> after_second = pixels_of(document, id);
+  COMP_CHECK_MSG(after_first != after_second, "the second dodge really changes the midtone");
+
+  const auto state_pixels = [&](std::size_t index) -> std::vector<uint8_t> {
+    const DocumentState* state = document.history().state_at(index);
+    if (state == nullptr) return {};
+    const Layer* found = state_layer(*state, id);
+    return found == nullptr ? std::vector<uint8_t>{} : found->pixels.pixel_data();
+  };
+
+  COMP_CHECK_MSG(state_pixels(0) == gray, "index 0 is the state before step 1");
+  COMP_CHECK_MSG(state_pixels(1) == after_first, "index 1 is the state after step 1");
+  COMP_CHECK_MSG(state_pixels(2) == after_second, "index 2 is the state after step 2");
+  COMP_CHECK(document.history().state_at(3) == nullptr);
+
+  document.undo();
+  COMP_CHECK_MSG(document.history().current_index() == 1, "undo moves the current index to 1");
+  COMP_CHECK_MSG(state_pixels(0) == gray, "undoing keeps index 0 attached to the initial state");
+  COMP_CHECK_MSG(state_pixels(1) == after_first, "undoing keeps index 1 attached to step 1");
+  COMP_CHECK_MSG(state_pixels(2) == after_second,
+                 "index 2 still reads step 2 from the redo stack (LIFO back = step 1)");
+
+  document.undo();
+  COMP_CHECK_MSG(document.history().current_index() == 0, "a second undo lands on index 0");
+  COMP_CHECK_MSG(state_pixels(0) == gray && state_pixels(1) == after_first &&
+                     state_pixels(2) == after_second,
+                 "a fully undone history still maps every panel index");
+
+  document.redo();
+  COMP_CHECK_MSG(state_pixels(1) == after_first, "redo restores the same mapping");
+}
+
+/*
+ * [G2] 典型用法：画错的一笔被盖住，从最初状态取样把它「刷回」笔尖下。
+ * 断言：只有笔尖下的像素被改、颜色等于取样状态、alpha 跟着取样走、一步撤销。
+ */
+COMP_TEST(tool_ops_domain_history_brush_paints_the_sampled_state_under_the_tip) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  const std::vector<uint8_t> red = flat_pixels(16, 16, 255, 0, 0, 255);
+  layer->pixels.resize(16, 16, COMP_PIXEL_RGBA8);
+  std::memcpy(layer->pixels.writable_pixels().data(), red.data(), red.size());
+
+  const float across[4] = {0.0f, 8.0f, 15.0f, 8.0f};
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  ToolOpParams cover = solid_stroke_params(0, 0, 255, across, 2);
+  COMP_CHECK_MSG(run_tool_op(&document, id, cover, &code, &error, nullptr),
+                 "covering stroke: " + error);
+  const std::vector<uint8_t> blue = pixels_of(document, id);
+  const size_t at_center = (8u * 16u + 8u) * 4u;
+  const size_t at_corner = 0u;
+  COMP_CHECK_MSG(blue[at_center] == 0 && blue[at_center + 1] == 0 && blue[at_center + 2] == 255,
+                 "the covering stroke turned the layer blue");
+
+  const float tip[2] = {8.0f, 8.0f};
+  ToolOpParams brush = history_brush_params(0, 1.0f, tip, 1);
+  brush.brush.diameter = 5.0f;
+  COMP_CHECK_MSG(run_tool_op(&document, id, brush, &code, &error, nullptr),
+                 "the history brush is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+  const std::vector<uint8_t> patched = pixels_of(document, id);
+  COMP_CHECK_MSG(patched[at_center] == 255 && patched[at_center + 1] == 0 &&
+                     patched[at_center + 2] == 0,
+                 "the brush restored the sampled red under the tip");
+  COMP_CHECK_MSG(patched[at_corner + 2] == 255,
+                 "pixels outside the tip keep the blue stroke");
+  COMP_CHECK_MSG(patched[at_center + 3] == 255, "alpha follows the sampled state");
+  COMP_CHECK_MSG(document.history().undo_depth() == 2,
+                 "the history brush is exactly one undo step");
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == blue, "undo restores the blue byte for byte");
+}
+
+/*
+ * [G3] 参数闸：状态越界 / 状态里没有该图层 / opacity / points 都在开事务之前拒绝；
+ * 取样与当前像素相同时是 noop（不记空撤销）。
+ */
+COMP_TEST(tool_ops_domain_history_brush_gates_bad_state_before_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  const float tip[2] = {4.0f, 4.0f};
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = document.history().undo_depth();
+
+  comp_result code = COMP_OK;
+  std::string error;
+  {
+    ToolOpParams params = history_brush_params(1, 1.0f, tip, 1);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "an empty history has no state 1");
+    COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "an out-of-range state is an arg error");
+  }
+  {
+    ToolOpParams params = history_brush_params(-1, 1.0f, tip, 1);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a negative state index is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = history_brush_params(0, 0.0f, tip, 1);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "opacity 0 is rejected instead of recording an empty undo step");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params =
+        history_brush_params(0, std::numeric_limits<float>::quiet_NaN(), tip, 1);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a NaN opacity is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = history_brush_params(0, 1.0f, nullptr, 1);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a null point array is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+
+  COMP_CHECK_MSG(!document.txn_active(), "the gate runs before txn_begin: no txn left open");
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before,
+                 "rejected history brush strokes add no undo step");
+  COMP_CHECK_MSG(pixels_of(document, id) == before,
+                 "rejected history brush strokes leave pixels byte-identical");
+
+  /* 合法但取样等于当前像素（空历史 + state 0 = 活文档）：noop，不记撤销步。 */
+  std::string note;
+  ToolOpParams same = history_brush_params(0, 1.0f, tip, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, same, &code, &error, &note),
+                 "a history brush on an unchanged state still succeeds: " + error);
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(note.find("changed no pixel") != std::string::npos,
+                 "the note says the history brush changed nothing: " + note);
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before,
+                 "a history stroke that changes no byte records no undo step");
+
+  /*
+   * 取样状态里没有同 id 的图层（图层是后来新建的）-> STATE，而不是参数错误：
+   * 调用本身合法，是文档状态不满足「那一份历史里得有这一层」。
+   */
+  const float across[2] = {2.0f, 2.0f};
+  ToolOpParams dodge = tone_params(kToolOpDodge, 0, 0.5f, across, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, dodge, &code, &error, nullptr),
+                 "a dodge step gives the history something to sample: " + error);
+  const comp_layer_id later = add_pixel_layer(document); /* 不进历史：只存在于活文档 */
+  const std::vector<uint8_t> later_before = pixels_of(document, later);
+  const size_t undo_before_missing = document.history().undo_depth();
+  ToolOpParams missing = history_brush_params(1, 1.0f, tip, 1);
+  COMP_CHECK_MSG(!run_tool_op(&document, later, missing, &code, &error, nullptr),
+                 "state 1 predates the new layer: there is nothing to sample");
+  COMP_CHECK_MSG(code == COMP_ERR_STATE, "a missing layer in the sampled state is a state error");
+  COMP_CHECK_MSG(pixels_of(document, later) == later_before,
+                 "the rejected stroke leaves the newer layer byte-identical");
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before_missing,
+                 "the rejected stroke adds no undo step");
+}
+
+/* [G4] 16 位图层：笔尖外保住深精度，笔尖内取 8 位取样值（×257）。 */
+COMP_TEST(tool_ops_domain_history_brush_keeps_sixteen_bit_depth_outside_the_tip) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_wide_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  const float center[2] = {4.0f, 4.0f};
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  ToolOpParams dodge = tone_params(kToolOpDodge, 0, 1.0f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, dodge, &code, &error, nullptr),
+                 "a dodge stroke on a 16-bit layer: " + error);
+  const std::vector<uint8_t> after_dodge = pixels_of(document, id);
+
+  /* 从第 0 步（dodge 之前）取样，只刷回笔尖下的一小块。 */
+  ToolOpParams brush = history_brush_params(0, 1.0f, center, 1);
+  brush.brush.diameter = 3.0f;
+  COMP_CHECK_MSG(run_tool_op(&document, id, brush, &code, &error, nullptr),
+                 "the history brush on a 16-bit layer is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16,
+                 "the history brush joins the stroke family and keeps the layer at 16 bits");
+
+  const uint16_t* now = reinterpret_cast<const uint16_t*>(layer->pixels.pixel_data().data());
+  const uint16_t* old = reinterpret_cast<const uint16_t*>(before.data());
+  const size_t count = 8u * 8u;
+  size_t changed = 0;
+  bool only_eight_bit_values = true;
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t* p = now + i * 4u;
+    const uint16_t* b = old + i * 4u;
+    if (p[0] == b[0] && p[1] == b[1] && p[2] == b[2] && p[3] == b[3]) continue;
+    ++changed;
+    for (int c = 0; c < 4; ++c) {
+      if (p[c] % 257u != 0u || p[c] / 257u > 255u) only_eight_bit_values = false;
+    }
+  }
+  COMP_CHECK_MSG(changed > 0, "the history brush actually painted something");
+  COMP_CHECK_MSG(changed < count, "pixels outside the tip keep their 16-bit precision");
+  COMP_CHECK_MSG(only_eight_bit_values,
+                 "a painted pixel takes the 8-bit sample * 257 (deep_take_painted)");
+
+  /* 两次撤销：先回到 dodge 之后、再回到最初；深像素都必须逐字节复原。 */
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                 "undo restores the 16-bit asset");
+  COMP_CHECK(pixels_of(document, id) == after_dodge);
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
+}
+
 /* [F4] 16 位图层：色调工具按落笔族往返，笔尖外保持深精度。 */
 COMP_TEST(tool_ops_domain_tone_keeps_sixteen_bit_depth_outside_the_stroke) {
   Engine engine(test_engine_desc());

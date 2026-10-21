@@ -243,7 +243,7 @@ COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
 COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
   size_t count = 0;
   comp_ui::tool_table(&count);
-  COMP_CHECK(count == 19);
+  COMP_CHECK(count == 20);
   COMP_CHECK(static_cast<int>(ToolId::Count) == static_cast<int>(count));
 
   /* 逐条对齐上游 KeyboardShortcuts.swift 的工具默认键。 */
@@ -259,7 +259,8 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
                   {'m', ToolId::Marquee},    {'w', ToolId::Wand},
                   {'l', ToolId::Lasso},      {'r', ToolId::Retouch},
                   {'o', ToolId::Tone},
-                  {'c', ToolId::Crop},       {'p', ToolId::Pen}};
+                  {'c', ToolId::Crop},       {'p', ToolId::Pen},
+                  {'y', ToolId::HistoryBrush}};
   COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == count);
   for (const auto& entry : expected) {
     COMP_CHECK_MSG(comp_ui::tool_for_shortcut(entry.key) == entry.id,
@@ -684,6 +685,7 @@ COMP_TEST(ui_core_brush_tip_and_retouch_strength_are_bounded) {
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Retouch));
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Tone));
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Clone));
+  COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::HistoryBrush));
   COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Marquee));
   COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Hand));
 
@@ -751,6 +753,32 @@ COMP_TEST(ui_core_tone_states_map_to_abi_operators_and_modes) {
   COMP_CHECK(near_value(strength, comp_ui::kMaxToneStrength));
   for (int i = 0; i < 100; ++i) strength = comp_ui::step_tone_strength(strength, -1);
   COMP_CHECK(near_value(strength, comp_ui::kMinToneStrength));
+}
+
+COMP_TEST(ui_core_history_brush_opacity_steps_stay_inside_the_engine_gate) {
+  /* 追加式工具表：历史记录画笔排最后，旧工具下标不移动。 */
+  COMP_CHECK(comp_ui::tool_index(comp_ui::ToolId::HistoryBrush) == 19);
+  COMP_CHECK(static_cast<int>(comp_ui::StrokeKind::HistoryBrush) == 4);
+
+  /* 引擎的闸只接受 (0, 1]，键盘步进不得停在会被拒的 0 上。 */
+  COMP_CHECK(comp_ui::kMinHistoryBrushOpacity > 0.0);
+  COMP_CHECK(near_value(comp_ui::clamp_history_brush_opacity(0.0),
+                        comp_ui::kMinHistoryBrushOpacity));
+  COMP_CHECK(near_value(comp_ui::clamp_history_brush_opacity(-0.5),
+                        comp_ui::kMinHistoryBrushOpacity));
+  COMP_CHECK(near_value(comp_ui::clamp_history_brush_opacity(std::nan("")),
+                        comp_ui::kMinHistoryBrushOpacity));
+  COMP_CHECK(near_value(comp_ui::clamp_history_brush_opacity(7.0),
+                        comp_ui::kMaxHistoryBrushOpacity));
+  COMP_CHECK(near_value(comp_ui::step_history_brush_opacity(0.5, 1), 0.6));
+  COMP_CHECK(near_value(comp_ui::step_history_brush_opacity(0.5, -1), 0.4));
+  COMP_CHECK(near_value(comp_ui::step_history_brush_opacity(0.5, 0), 0.5));
+
+  double opacity = comp_ui::kMinHistoryBrushOpacity;
+  for (int i = 0; i < 100; ++i) opacity = comp_ui::step_history_brush_opacity(opacity, 1);
+  COMP_CHECK(near_value(opacity, comp_ui::kMaxHistoryBrushOpacity));
+  for (int i = 0; i < 100; ++i) opacity = comp_ui::step_history_brush_opacity(opacity, -1);
+  COMP_CHECK(near_value(opacity, comp_ui::kMinHistoryBrushOpacity));
 }
 
 COMP_TEST(ui_core_brush_steps_are_geometric_and_bounded) {

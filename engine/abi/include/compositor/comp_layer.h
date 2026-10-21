@@ -527,7 +527,13 @@ typedef enum comp_tool_op {
    */
   COMP_TOOL_DODGE = 16,
   COMP_TOOL_BURN = 17,
-  COMP_TOOL_SPONGE = 18
+  COMP_TOOL_SPONGE = 18,
+  /*
+   * P1 尾部追加：历史记录画笔。从历史面板下标 `history.state` 指向的那一份
+   * 历史状态里取样（同一 id 的图层），按 `stroke_points` 折线与 `brush` 几何
+   * 刷回**当前**图层。语义见 `comp_tool_history_brush`。
+   */
+  COMP_TOOL_HISTORY_BRUSH = 19
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -821,6 +827,27 @@ typedef struct comp_tool_tone {
 } comp_tool_tone;
 
 /*
+ * 历史记录画笔参数（P1 尾部追加，COMP_TOOL_HISTORY_BRUSH）。
+ *
+ * `state` 是历史面板下标：0 = 文档最初状态，i = 第 i 步之后（与
+ * `comp_document_history_step_count` / `comp_document_history_stats` 推出的
+ * 面板编号同一套）。越界、或该状态里没有同 id 的
+ * 图层（例如图层是后来新建的）→ 参数闸拒绝，不开事务、不改像素。
+ *
+ * 取样按 `effective_bounds` 原点平移（与渐变 / 仿制图章同一套口径，不认
+ * 旋转）；历史图层若是 16 位 / HDR，按显示口径降到 8 位再取；落在历史图层
+ * 像素之外视为透明。混合是预乘空间的线性插值：
+ *   out = src * w + dst * (1 - w)，w = 笔迹 coverage × opacity × 选区覆盖率。
+ *
+ * `opacity` 0..1 为本笔总量，参数闸拒绝 <= 0（恒等操作不记空撤销）；逐字节
+ * 比较后确实无改动（取样与当前像素相同）时同样按 noop 撤回事务。
+ */
+typedef struct comp_tool_history_brush {
+  int32_t state;
+  float   opacity;
+} comp_tool_history_brush;
+
+/*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
  * `heal.coverage` 为 8 位灰度蒙版（255 = 待修补），尺寸与图层像素一致，
@@ -879,6 +906,12 @@ typedef struct comp_tool_op_desc {
    * 笔迹折线与笔刷几何仍走 `stroke_points` 与 `brush`。
    */
   comp_tool_tone   tone;
+  /*
+   * P1 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * COMP_TOOL_HISTORY_BRUSH 读取：取样状态下标与不透明度，语义见
+   * comp_tool_history_brush；笔迹折线与笔刷几何仍走 `stroke_points` 与 `brush`。
+   */
+  comp_tool_history_brush history;
 } comp_tool_op_desc;
 
 /*

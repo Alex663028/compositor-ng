@@ -247,6 +247,35 @@ struct ToneParams {
   float strength = 0.5f;
 };
 
+/* ============================================================== 历史记录画笔 */
+
+/*
+ * 历史记录画笔参数（P1，2026-10-21）。
+ *
+ * 口径：从 `state` 号历史状态取样，按笔迹刷回**当前**图层。
+ *   - `state` 是历史面板下标：0 = 文档最初状态，i = 第 i 步之后（与
+ *     `History::current_index()` 同一套编号）。越界、或该状态里没有同 id 的
+ *     图层 → 参数闸拒绝，不开事务；
+ *   - 取样用 `effective_bounds()` 原点平移（与渐变 / clone 同一套口径，
+ *     **不认旋转与缩放**：历史图层若被旋转过，取到的位置会有偏差，这是本仓
+ *     落笔族的既有边界，不是新问题）；
+ *   - 历史图层是 RGBA16 / RGBA16F 时按显示口径降到 8 位再取（与 clone 的
+ *     整篇合成同一套 hdr_to_rgba8 / deep_to_rgba8）；落在历史图层像素之外
+ *     → 视为透明 (0,0,0,0)；
+ *   - 混合在**预乘**空间逐通道线性插值：out = src*w + dst*(1-w)，
+ *     w = 笔迹 coverage × opacity × 选区覆盖率。预乘空间的线性插值就是
+ *     「以 w 为 alpha 的 source-over」，不会出现反预乘再乘回时的半透明边缘偏差；
+ *   - 选区口径与其余落笔族一致：文档分辨率 coverage，按 effective_bounds 原点
+ *     取样，画布外 = 选区之外（覆盖率 0，逐字节不动）。
+ *
+ * opacity 0 被参数闸拒绝：恒等操作不该记一步空撤销。逐字节比较后确实没有
+ * 改动（例如取样点与当前像素恰好相同）时按 noop 撤回事务，撤销栈不增长。
+ */
+struct HistoryBrushParams {
+  int32_t state = 0;
+  float opacity = 1.0f;
+};
+
 /* ============================================================== 渐变 */
 
 /* 渐变类型（数值与 ABI `comp_tool_gradient.type` 一一对应）。 */
@@ -533,6 +562,7 @@ enum ToolOpKind {
   kToolOpDodge = 16,      /* 减淡 -> 按笔迹提亮（P1 尾部追加） */
   kToolOpBurn = 17,       /* 加深 -> 按笔迹压暗（P1 尾部追加） */
   kToolOpSponge = 18,     /* 海绵 -> 按笔迹去色/加色（P1 尾部追加） */
+  kToolOpHistoryBrush = 19, /* 历史记录画笔 -> 从第 N 个历史状态取样刷回当前层（P1 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -602,6 +632,9 @@ struct ToolOpParams {
 
   /* Dodge / Burn / Sponge 用（笔迹折线复用 points，几何复用 brush，见 ToneParams）。 */
   ToneParams tone;
+
+  /* History Brush 用（笔迹折线复用 points，几何复用 brush，见 HistoryBrushParams）。 */
+  HistoryBrushParams history_brush;
 };
 
 /* ============================================================== 执行 */

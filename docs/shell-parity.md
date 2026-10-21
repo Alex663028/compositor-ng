@@ -33,6 +33,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 减淡 / 加深 / 海绵（P1） | `O` 循环 8 档，画布折线 → 一次 `COMP_TOOL_DODGE` / `_BURN` / `_SPONGE` | （未接 UI） | `comp_tool_apply` | **已达成**（§5.19）：`Alt+[ / ]` 调强度，受选区约束 |
+| 历史记录画笔（P1） | `Y` 工具 + 历史面板取样（Shift+点行），画布折线 → 一次 `COMP_TOOL_HISTORY_BRUSH` | （未接 UI） | `comp_tool_apply`（kind 尾部追加，导出数仍 138） | **已达成**（§5.20）：取样不回跳；一笔 = 一个撤销步；`Alt+[ / ]` 调不透明度 |
 | 渐变工具（S9） | 画布拖拽两端点 → 一次 `COMP_TOOL_GRADIENT` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；线性/径向、Shift 反向） |
 | 形状工具（S10） | 画布拖拽对角点/两端点 → 一次 `COMP_TOOL_SHAPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；矩形/椭圆/直线，Shift 正方、Alt 从中心） |
 | 文字工具（S11） | 点击落插入点 + 键入 ASCII → 一次 `COMP_TOOL_TYPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；内置 5×7 点阵，ASCII-only） |
@@ -42,7 +43,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | PSD 只读导入 | 可用 | 可用 | `comp_io_import` | 已达成（stb） |
 | 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读；**HWND 直呈已落地（S16，`caps().window_present`）** | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_present` / `comp_render_flatten` | **部分达成**：Windows 的设备侧离屏（S13）与交换链直呈（S16）都已落地；鸿蒙设备侧交换链未落地，窗口表面如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
-| 工具条 / 画布导航 | 19 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
+| 工具条 / 画布导航 | 20 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
 `COMP_ERR_UNSUPPORTED`**，不伪造成功。Windows 侧已在 S16 补上 D3D12 交换链直呈
@@ -838,4 +839,43 @@ ABI 的 `(kind, mode)` 由 `tone_state_tool()` / `tone_state_mode()` 从同一�
 PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M23**。
+
+### 5.20 历史记录画笔（P1，2026-10-21）
+
+路线图 P1「滤镜库扩容 + 历史记录画笔」里可独立交付的一半。历史快照与回跳在 §5.18
+已经具备，缺的只是「从第 N 个状态取样，随笔迹刷回当前层」。
+
+**1. 取样源 = 历史面板下标，不是撤销步数。** 引擎直接读 `History::state_at(index)`，
+因此取样与撤销栈同源，壳内没有第二份快照。下标越界 / 负数在参数闸就
+`INVALID_ARGUMENT`；下标合法但那一份状态里没有当前图层（图层是后加的）→ `STATE`。
+两种拒绝都不开事务、不改像素、不留撤销步。
+
+**2. 自动 / 显式两种取样。** 壳侧只存一个 `history_brush_state`：`-1` = 自动 =
+当前状态的上一格（「刚画错一笔，拿这支笔抹掉」的直觉路径），`>= 0` = Shift+点历史
+面板某行显式指定。显式路径**不回跳**——当前画面必须停在最新，否则这支笔就失去意义；
+面板里该行显示 `← 画笔取样`（琥珀色），与「当前状态」的高亮（蓝底）互不覆盖。
+普通点行仍是 §5.18 的回跳，两者互不干扰。
+
+**3. 一笔 = 一个撤销步。** 沿用 `StrokeKind` 通路（新增 `HistoryBrush`），松手时
+一次 `comp_tool_apply`；`ReleaseCapture` 之前先把折点搬走（S15 的同一条防线）。
+取样状态**只在提交时读一次**，笔画途中打开/回跳面板不改变这一笔的来源。
+
+**4. 失败与 no-op 都说清楚。** 引擎的三种「成功但没改像素」（笔尖不相交 / 取样
+逐字节相同 / 被选区整片遮住）都带 note，状态栏直接显示，且不落撤销步；取样的
+状态里没有该图层时状态栏写「历史记录画笔失败：取样第 N 个状态（该状态下可能没有
+此图层）」——把取样下标写出来，用户才知道该换一格。
+
+**5. 入口。** `ToolId::HistoryBrush` **追加在工具表末尾**（`Y`，与上游一致），
+旧工具下标全部不动；`tool_table` 仍是工具条 / 菜单 / 快捷键的唯一来源。
+切到该工具时自动打开历史面板（右栏单挂位，其余面板按 §5.16/§5.17 的规则让位）。
+`Alt+[ / ]` 调不透明度（10% 一步，键盘下限 10%，因为引擎拒绝 0）；状态栏与工具栏
+都常显「取样 #N / 不透明度 X%」。
+
+**6. 验证。** ABI 层 2 例（经 `comp_tool_apply` 的取样刷回 + 恰好一步撤销、
+参数闸先于事务且 no-op 不留步），领域层 1 例（RGBA16 笔尖外保深 + 两次撤销逐字节
+复原），UI 层 1 例（工具下标 19 / `StrokeKind` 值 / 不透明度钳位与步进）。单测
+568 → **575 例 / 0 失败**；PE 导出 **138 不变**（本项零新增导出）；壳自检
+**245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py
+--require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M24**（M1 的工具顺序改为 20 个）。
 

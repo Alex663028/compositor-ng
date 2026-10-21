@@ -4133,5 +4133,59 @@ UI 层新增 1 例（8 档映射、越界归位、文案、强度钳位与步进
 `docs/shell-parity.md` §5.19 + 矩阵一行，`docs/manual-test.md` 新增 **M23**
 （M1 的工具顺序改为 19 个）。
 
+### 6.44 P1 历史记录画笔：从任意历史状态取样，随笔迹刷回（2026-10-21，Claude）
+
+**立项口径。** 路线图 P1「滤镜库扩容 + 历史记录画笔」里可独立交付的一半。历史快照
+（`HistoryEntry{before, after}` 整状态快照）与按状态回跳（§6.42）都已具备，缺的只是
+「从第 N 个状态取样，按笔迹刷回当前层」。
+
+**零新增导出。** `comp_tool_op` 尾部追加 `COMP_TOOL_HISTORY_BRUSH = 19`，
+`comp_tool_op_desc` 尾部追加 `comp_tool_history_brush { int32_t state; float opacity; }`；
+既有枚举值、既有字段布局、既有导出一个不动，宿主照旧只认 `comp_tool_apply`。
+PE 导出仍 **138**。
+
+**`state` 是面板下标，不是撤销步数。** 引擎直接读 `History::state_at(index)`，取样
+与撤销栈天然同源，不存在第二份快照。越界 / 负数在参数闸就 `INVALID_ARGUMENT`；
+下标合法但那一份状态里**没有这个图层**（图层是后加的）→ `STATE`。两种拒绝都在
+`txn_begin` 之前返回：不改像素、不留撤销步、不动历史栈。
+
+**只读借用 + 深像素。** 快照是定长借用，事务未提交期间历史栈不动，因此可以逐点读、
+不持有跨调用指针；16 位 / HDR 取样源经 `deep_to_rgba8` / `hdr_to_rgba8` 转成 8 位
+工作副本（**不改写快照**）。写回走落笔族的深像素路径（`is_stroke_family`）：只有
+真正被改动的像素拿到 `8 位值 × 257` 的深值，笔尖之外保持原深度——两次撤销后深像素
+逐字节复原。
+
+**混合口径。** 逐像素权重 = `笔迹覆盖率 × opacity × 选区覆盖率`，预乘空间线性插值
+`sample × w + current × (1 - w)`。预乘下的线性插值就是 source-over，**不反预乘**：
+反预乘会在低 alpha 边缘把颜色放大到 1.0 再乘回，产生可见偏差。包围盒可能已经变了
+（图层被移动/缩放过），因此按「当前图层像素 → 文档坐标 → 取样图层像素」两级映射，
+两级都只认 `effective_bounds()` 原点（与 clone / 渐变同口径，不认旋转）。
+
+**成功 no-op 不落撤销步。** 笔尖与图层不相交、取样值逐字节等于当前像素、被选区
+整片遮住，三种情况都 `txn_abort` + `COMP_OK` + note
+（`history brush stroke does not intersect the layer…` /
+`history brush changed no pixel (the sample equals the current pixels)` /
+`history brush is masked by the active selection…`）。
+
+**外壳（`Y`）。** `ToolId::HistoryBrush` **追加在工具表末尾**（旧工具下标全部不动，
+Clone 仍是 11、Pen 仍是 4）。壳侧只存 `history_brush_state`：`-1` = 自动 = 当前状态
+的上一格（「刚画错一笔，拿这支笔抹掉」），`>= 0` = Shift+点历史面板某行显式指定——
+**显式取样不回跳**，当前画面必须停在最新；面板该行标 `← 画笔取样`（琥珀色），与
+「当前状态」的蓝底高亮互不覆盖。普通点行仍是回跳，两者互不干扰。切到该工具自动
+打开历史面板；`Alt+[` / `Alt+]` 调不透明度（10% 一步，键盘下限 10%，因为引擎拒绝 0）；
+状态栏与工具栏常显「取样 #N / 不透明度 X%」。笔迹走 `StrokeKind::HistoryBrush`，
+松手一次 `comp_tool_apply`（= 恰好一个撤销步），`ReleaseCapture` 之前先把折点搬走
+（S15 缺陷的同一条防线）。取样状态**只在提交时读一次**：笔画途中打开/回跳面板不会
+改变这一笔的来源。
+
+**验证。** ABI 层 2 例（经 `comp_tool_apply` 取样刷回 + 恰好一步撤销、参数闸先于
+事务且 no-op 不留步）；领域层 4 例（`state_at` 下标映射、笔尖下取样生效、闸先于事务、
+RGBA16 笔尖外保深 + 两次撤销逐字节复原）；UI 层 1 例（工具下标 19 / `StrokeKind` 值 /
+不透明度钳位与步进）。单测 568 → **575 例 / 0 失败**；PE 导出 **138 不变**；壳自检
+**245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/tool-ops.md` §4.14、
+`docs/shell-parity.md` §5.20 + 矩阵一行，`docs/manual-test.md` 新增 **M24**
+（M1 的工具顺序改为 20 个）。
+
 
 

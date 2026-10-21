@@ -77,6 +77,17 @@ class History {
   /* 第 step 步（1..step_count()）的标签；step == 0 或越界返回 nullptr。 */
   const std::string* step_label(std::size_t step) const;
 
+  /*
+   * 面板下标 index（0..step_count()）对应的文档状态（P1 历史记录画笔）。
+   * 只读借用，返回指针指向栈内快照，**下一次 push/undo/redo/trim 后失效**，
+   * 调用方必须即时用完，不得长期持有。
+   *
+   * 两种边界：栈为空时 index 0 借给活文档（live_，可能为 nullptr）；
+   * 越界返回 nullptr。index 0 在「撤销栈为空、重做栈非空」时取重做栈队尾的
+   * before——重做栈是 LIFO，队尾才是第 1 步，before 即最初状态。
+   */
+  const DocumentState* state_at(std::size_t index) const;
+
   /* 设置步数上限（0 视为默认 200）；超限丢弃最旧记录。 */
   void set_limit(std::size_t limit);
   std::size_t limit() const { return limit_; }

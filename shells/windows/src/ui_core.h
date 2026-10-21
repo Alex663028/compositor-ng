@@ -280,6 +280,7 @@ enum class ToolId : int {
   Type,
   Hand,
   Zoom,
+  HistoryBrush, /* P1：从历史面板的某个状态取样，随笔迹刷回当前层 */
   Count
 };
 
@@ -310,6 +311,8 @@ inline const ToolInfo* tool_table(size_t* out_count) {
       {ToolId::Type, "Type", 't'},
       {ToolId::Hand, "Hand", 'h'},
       {ToolId::Zoom, "Zoom", 'z'},
+      /* P1：Y 与上游 History Brush 一致；追加在末尾，旧工具的下标不移动。 */
+      {ToolId::HistoryBrush, "History Brush", 'y'},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kTools) / sizeof(kTools[0]);
@@ -345,8 +348,9 @@ inline const ToolInfo* tool_info(ToolId id) {
 
 /*
  * 哪些工具需要画「笔尖轮廓」。Brush / Eraser / Spot Healing / Clone Stamp 与
- * Retouch 族（Blur / Smudge / Liquify）、Tone 族（Dodge / Burn / Sponge）都吃
- * `brush_size`，画同一个圆；选区类工具不吃笔刷直径，不画（避免误导）。
+ * Retouch 族（Blur / Smudge / Liquify）、Tone 族（Dodge / Burn / Sponge）、
+ * 历史记录画笔都吃 `brush_size`，画同一个圆；选区类工具不吃笔刷直径，不画
+ * （避免误导）。
  */
 inline bool tool_has_brush_tip(ToolId id) {
   switch (id) {
@@ -356,6 +360,7 @@ inline bool tool_has_brush_tip(ToolId id) {
     case ToolId::Clone:
     case ToolId::Retouch:
     case ToolId::Tone:
+    case ToolId::HistoryBrush:
       return true;
     default:
       return false;
@@ -397,9 +402,10 @@ inline ToolId tool_shortcut_target(ToolId current, char key) {
  */
 enum class StrokeKind : int {
   None = 0,
-  Retouch, /* COMP_TOOL_BLUR / SMUDGE / LIQUIFY */
-  Tone,    /* COMP_TOOL_DODGE / BURN / SPONGE */
-  Paint    /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
+  Retouch,      /* COMP_TOOL_BLUR / SMUDGE / LIQUIFY */
+  Tone,         /* COMP_TOOL_DODGE / BURN / SPONGE */
+  Paint,        /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
+  HistoryBrush  /* COMP_TOOL_HISTORY_BRUSH，取样状态来自历史面板 */
 };
 
 /* ------------------------------------------------------------ 笔刷状态 */
@@ -945,6 +951,26 @@ inline double step_tone_strength(double current, int direction) {
   const double base = clamp_tone_strength(current);
   if (direction > 0) return clamp_tone_strength(base + 0.1);
   if (direction < 0) return clamp_tone_strength(base - 0.1);
+  return base;
+}
+
+/*
+ * 历史记录画笔的不透明度（口径对齐 comp_tool_history_brush.opacity：0..1，
+ * 0 会被引擎的闸拒掉）。Alt+[ / ] 以 10% 一步，下限就取按住前进得到的最低位
+ * 10%——键盘不该能把参数步进到一个必然被拒的值上。
+ */
+inline constexpr double kMinHistoryBrushOpacity = 0.1;
+inline constexpr double kMaxHistoryBrushOpacity = 1.0;
+
+inline double clamp_history_brush_opacity(double value) {
+  if (!(value > 0.0)) return kMinHistoryBrushOpacity; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinHistoryBrushOpacity), kMaxHistoryBrushOpacity);
+}
+
+inline double step_history_brush_opacity(double current, int direction) {
+  const double base = clamp_history_brush_opacity(current);
+  if (direction > 0) return clamp_history_brush_opacity(base + 0.1);
+  if (direction < 0) return clamp_history_brush_opacity(base - 0.1);
   return base;
 }
 

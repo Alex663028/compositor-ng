@@ -1411,6 +1411,10 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   params.tone.mode = desc->tone.mode;
   params.tone.strength = desc->tone.strength;
 
+  /* P1 尾部追加：历史记录画笔同样只多两个标量（取样下标 + 不透明度）。 */
+  params.history_brush.state = desc->history.state;
+  params.history_brush.opacity = desc->history.opacity;
+
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;
   std::string note_text;

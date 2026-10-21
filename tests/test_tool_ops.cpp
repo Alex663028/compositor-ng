@@ -676,6 +676,10 @@ uint8_t red_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
   return buf[(static_cast<size_t>(y) * kW + x) * 4 + 0];
 }
 
+uint8_t blue_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
+  return buf[(static_cast<size_t>(y) * kW + x) * 4 + 2];
+}
+
 }  // namespace
 
 COMP_TEST(tool_ops_blur_is_reachable_through_the_abi_and_undoes_in_one_step) {
@@ -884,6 +888,134 @@ COMP_TEST(tool_ops_tone_rejects_bad_mode_and_strength_before_opening_the_transac
                  "the legal sponge goes through");
 }
 
+/* ================================================== 5c. P1：历史记录画笔 */
+
+COMP_TEST(tool_ops_history_brush_is_reachable_through_the_abi_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_HISTORY_BRUSH) == 19,
+                 "COMP_TOOL_HISTORY_BRUSH stays at 19");
+
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(255, 0, 0);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  /* 第一步：把中心刷成蓝色，制造一个「可回取」的历史状态。 */
+  float paint[4] = {8.0f, 8.0f, 8.0f, 8.0f};
+  comp_tool_op_desc blue = base(COMP_TOOL_STROKE);
+  blue.stroke_points = paint;
+  blue.stroke_point_count = 2;
+  blue.brush.color[0] = 0;
+  blue.brush.color[1] = 0;
+  blue.brush.color[2] = 255;
+  blue.brush.color[3] = 255;
+  blue.brush.diameter = 9.0f;
+  blue.brush.hardness = 1.0f;
+  blue.brush.pressure = 1.0f;
+  blue.brush.flow = 1.0f;
+  COMP_CHECK(apply(fx.doc, fx.layer, blue) == COMP_OK);
+  const std::vector<uint8_t> painted = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(painted, 8, 8) == 0, "the paint step really covered the centre");
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  /*
+   * 第二步：从面板下标 2（「Set Layer Pixels」之后、刷蓝之前）取红，用细笔
+   * 只刷中心。下标 0/1 是图层刚建立、还没有红色像素的时刻，见下一组用例。
+   */
+  float tip[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_HISTORY_BRUSH);
+  desc.stroke_points = tip;
+  desc.stroke_point_count = 1;
+  desc.brush.diameter = 3.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.history.state = 2;
+  desc.history.opacity = 1.0f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_OK,
+                 "the history brush reaches the engine through comp_tool_apply");
+
+  const std::vector<uint8_t> restored = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(restored, 8, 8) == 255,
+                 "the sampled state puts the red pixels back under the tip");
+  COMP_CHECK_MSG(blue_at(restored, 8, 8) == 0, "the sampled pixel no longer carries the blue");
+  COMP_CHECK_MSG(red_at(restored, 0, 0) == 255 && blue_at(restored, 0, 0) == 0,
+                 "pixels outside the tip keep the current state");
+  COMP_CHECK_MSG(alpha_at(restored, 8, 8) == 255, "coverage stays opaque under the tip");
+
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before + 1,
+                 "one history brush stroke is exactly one undo step");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == painted, "one undo puts the painted state back");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "a second undo reaches the original pixels");
+}
+
+COMP_TEST(tool_ops_history_brush_rejects_bad_state_before_opening_the_transaction) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(40, 60, 80);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float tip[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_HISTORY_BRUSH);
+  desc.stroke_points = tip;
+  desc.stroke_point_count = 1;
+  desc.brush.diameter = 5.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.history.state = 2;
+  desc.history.opacity = 1.0f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  /* 历史是「Add Layer」+「Set Layer Pixels」两步：合法下标 0..2，3 与负数是参数错误。 */
+  desc.history.state = 3;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT,
+                 "a state past the end of history is an argument error");
+  desc.history.state = -1;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT,
+                 "a negative state index is an argument error");
+
+  /*
+   * 下标 0 是「这一层还没建立」的那一刻：调用本身合法，是文档状态不满足
+   * （那一份历史里根本没有这个 id），按 STATE 拒绝而不是参数错误。
+   */
+  desc.history.state = 0;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_STATE,
+                 "a sampled state without this layer is a state error");
+
+  /* opacity 0 是恒等操作，拒绝而不是记一步空撤销。 */
+  desc.history.state = 2;
+  desc.history.opacity = 0.0f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT,
+                 "opacity 0 is an argument error rather than a silent no-op");
+
+  size_t undo_rejected = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_rejected, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_rejected == undo_before, "rejected history brush ops leave no undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "rejected history brush ops change no pixel");
+
+  /* 合法下标、取样与当前像素相同：成功、无改动、同样不留空撤销步。 */
+  desc.history.opacity = 1.0f;
+  char note[256] = {};
+  size_t note_size = 0;
+  COMP_CHECK_MSG(comp_tool_apply(fx.doc, fx.layer, &desc, note, sizeof(note), &note_size) == COMP_OK,
+                 "sampling the unchanged state is a legal no-op");
+  COMP_CHECK_MSG(note_size > 0 && std::string(note).find("changed no pixel") != std::string::npos,
+                 "the note reports that the sample equals the current pixels");
+  size_t undo_noop = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_noop, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_noop == undo_before, "an identity history brush leaves no undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "an identity history brush changes no pixel");
+}
+
 /* ================================================== 6. S5：橡皮擦模式 */
 
 COMP_TEST(tool_ops_eraser_subtracts_coverage_instead_of_painting) {
@@ -940,10 +1072,6 @@ COMP_TEST(tool_ops_eraser_with_zero_pressure_is_a_no_op) {
 /* ================================================== 7. S9：渐变填充 */
 
 namespace {
-
-uint8_t blue_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
-  return buf[(static_cast<size_t>(y) * kW + x) * 4 + 2];
-}
 
 /* 水平线性渐变（第一色标在左边界、第二色标在右边界像素）。 */
 comp_tool_op_desc linear_gradient(const uint8_t color0[4], const uint8_t color1[4]) {

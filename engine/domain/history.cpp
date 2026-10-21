@@ -154,6 +154,22 @@ const std::string* History::step_label(std::size_t step) const {
   return &redo_stack_[redo_stack_.size() - 1 - from_back].label;
 }
 
+const DocumentState* History::state_at(std::size_t index) const {
+  if (index > step_count()) return nullptr;
+  if (index <= undo_stack_.size()) {
+    if (index == 0) {
+      /* 最初状态：有撤销记录取队首 before；否则取重做队尾（第 1 步）的 before。 */
+      if (!undo_stack_.empty()) return &undo_stack_.front().before;
+      if (!redo_stack_.empty()) return &redo_stack_.back().before;
+      return live_; /* 没有任何记录：当前文档就是最初状态 */
+    }
+    return &undo_stack_[index - 1].after;
+  }
+  /* 重做栈 LIFO：back 是下一步会重做的记录，即第 undo_depth + 1 步。 */
+  const std::size_t from_back = index - undo_stack_.size() - 1;
+  return &redo_stack_[redo_stack_.size() - 1 - from_back].after;
+}
+
 void History::set_limit(std::size_t limit) {
   limit_ = limit == 0 ? 200 : limit;
   trim();
