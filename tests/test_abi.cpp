@@ -475,6 +475,98 @@ COMP_TEST(abi_history_truncated_flag) {
   comp_engine_destroy(engine);
 }
 
+/*
+ * P1 历史面板：步数 / 逐步标签 / 按步回跳。三者都只是「在既有撤销栈上取信息
+ * 或移动下标」，不新增历史记录——所以回跳后 Ctrl+Z/Ctrl+Y 的语义与逐次撤销
+ * 完全一致（这里用 flatten 像素验证落点，用 history_stats 验证下标）。
+ */
+COMP_TEST(abi_history_panel_steps_labels_and_jump) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id background = background_layer(document);
+  const SolidImage red(4, 4, 255, 0, 0, 255);
+  const SolidImage blue(4, 4, 0, 0, 255, 255);
+
+  /* 基线步数：新建文档通常为 0，但按引擎实际值取，避免绑定实现细节。 */
+  size_t base_steps = 12345;
+  COMP_CHECK(comp_document_history_step_count(document, &base_steps) == COMP_OK);
+
+  comp_txn txn = nullptr;
+  COMP_CHECK(comp_txn_begin(document, "Alpha", &txn) == COMP_OK);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+  COMP_CHECK(comp_txn_commit(txn) == COMP_OK);
+  COMP_CHECK(comp_txn_begin(document, "Beta", &txn) == COMP_OK);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &blue.image) == COMP_OK);
+  COMP_CHECK(comp_txn_commit(txn) == COMP_OK);
+
+  size_t steps = 0;
+  COMP_CHECK(comp_document_history_step_count(document, &steps) == COMP_OK);
+  COMP_CHECK_MSG(steps == base_steps + 2, "each committed txn adds one step");
+  /* out_steps 可为 NULL（与 history_stats 同口径）。 */
+  COMP_CHECK(comp_document_history_step_count(document, nullptr) == COMP_OK);
+
+  /* 标签：查询模式回所需长度（含 NUL），并原样写入缓冲区。 */
+  size_t required = 0;
+  COMP_CHECK(comp_document_history_step_label(document, steps, nullptr, 0, &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(required == 5, "label length includes the trailing NUL");
+  char label[16] = {};
+  COMP_CHECK(comp_document_history_step_label(document, steps, label, sizeof(label),
+                                              &required) == COMP_OK);
+  COMP_CHECK(std::strcmp(label, "Beta") == 0);
+  COMP_CHECK(comp_document_history_step_label(document, base_steps + 1, label, sizeof(label),
+                                              &required) == COMP_OK);
+  COMP_CHECK(std::strcmp(label, "Alpha") == 0);
+
+  /* 边界：index 0 = 最初状态（没有标签）；越界、缓冲区不够、缺 out 参数都拒绝。 */
+  COMP_CHECK(comp_document_history_step_label(document, 0, label, sizeof(label), &required) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_document_history_step_label(document, steps + 1, label, sizeof(label),
+                                              &required) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_document_history_step_label(document, steps, label, 2, &required) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_document_history_step_label(document, steps, label, sizeof(label), nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  /* 回跳到最初：像素回到空文档，下标归零，标签仍在（记录进了重做栈）。 */
+  COMP_CHECK(comp_document_history_jump(document, base_steps) == COMP_OK);
+  std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  COMP_CHECK(matches(canvas, 4, 0, 0, 0, 0, 0, 0, 0));
+  size_t undo_depth = 999;
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_depth == base_steps, "jump backwards moves the current index");
+  COMP_CHECK(comp_document_history_step_label(document, steps, label, sizeof(label),
+                                              &required) == COMP_OK);
+  COMP_CHECK(std::strcmp(label, "Beta") == 0);
+
+  /* 跳回最新：像素回来；同一下标再跳是空操作（不多出撤销步）。 */
+  COMP_CHECK(comp_document_history_jump(document, steps) == COMP_OK);
+  canvas = flatten(document, 4, 4);
+  COMP_CHECK(matches(canvas, 4, 0, 0, 0, 0, 255, 255, 0));
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  COMP_CHECK(undo_depth == steps);
+  COMP_CHECK(comp_document_history_jump(document, steps) == COMP_OK);
+  COMP_CHECK(comp_document_history_stats(document, &undo_depth, nullptr) == COMP_OK);
+  COMP_CHECK(undo_depth == steps);
+
+  /* 越界拒绝；活动事务内拒绝（否则 commit 会把事务快照与回跳状态撕开）。 */
+  COMP_CHECK(comp_document_history_jump(document, steps + 1) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_begin(document, "Gamma", &txn) == COMP_OK);
+  COMP_CHECK(comp_document_history_jump(document, base_steps) == COMP_ERR_STATE);
+  COMP_CHECK(comp_txn_abort(txn) == COMP_OK);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
 COMP_TEST(abi_explicit_transaction) {
   comp_engine_desc desc = test_engine_desc();
   comp_engine engine = nullptr;

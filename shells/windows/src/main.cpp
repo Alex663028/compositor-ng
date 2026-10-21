@@ -160,6 +160,7 @@ constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
 constexpr UINT kCmdSelectPaths = 1051; /* P0-4 可选：路径面板（Ctrl+Shift+P） */
+constexpr UINT kCmdHistoryPanel = 1052; /* P1：历史记录面板（Ctrl+Alt+H） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -465,6 +466,13 @@ struct ShellState {
   int path_selected = 0;
   int path_scroll = 0;
   int path_serial = 0; /* 命名用流水号（删除后不复用，避免重名） */
+  /*
+   * 历史记录面板（P1）：列出撤销栈里的每一步，点行/↑↓ 回跳。高亮行**不单独记账**
+   * ——它就是引擎的 current_index（undo_depth），面板只存滚动偏移。这样撤销、
+   * 重做、新操作之后都不会出现「面板高亮停在一个不存在的状态上」。
+   */
+  bool history_open = false;
+  int history_scroll = 0;
   /* 鼠标是否停在画布上（决定画不画笔尖轮廓），客户区坐标。 */
   bool cursor_valid = false;
   bool tracking_leave = false;
@@ -1439,10 +1447,11 @@ void open_effect_panel(ShellState& shell, int kind) {
     return;
   }
   if (shell.color_range_open) color_range_cancel(shell);
-  /* 右栏一次只挂一个面板：滤镜、路径与效果共用同一块矩形，同时打开会互相遮住。 */
+  /* 右栏一次只挂一个面板：滤镜、路径、历史与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.path_open = false;
+  shell.history_open = false;
   shell.effect_open = true;
   shell.effect_kind = comp_ui::clamp_effect_kind(kind);
   reset_effect_values(shell);
@@ -2919,11 +2928,12 @@ std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
 }
 
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
-  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板、色彩范围与路径面板。 */
+  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板、色彩范围、路径与历史面板。 */
   if (shell.color_range_open) color_range_cancel(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = false;
+  shell.history_open = false;
   shell.filter.select(id);
   shell.filter_open = true;
   shell.filter_input.clear();
@@ -3432,12 +3442,13 @@ void color_range_begin(ShellState& shell) {
     shell.color_range_txn = nullptr;
     shell.color_range_open = false;
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果/路径互斥，避免两块矩形互相遮住）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史互斥，避免两块矩形互相遮住）。 */
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = false;
+  shell.history_open = false;
   shell.color_range_include.clear();
   shell.color_range_exclude.clear();
   shell.color_range_fuzziness = comp_ui::kDefaultColorRangeFuzziness;
@@ -4038,6 +4049,7 @@ void path_panel_toggle(ShellState& shell) {
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = true;
+  shell.history_open = false;
   const int count = static_cast<int>(shell.paths.size());
   if (shell.path_selected >= count) shell.path_selected = count - 1;
   if (shell.path_selected < 0) shell.path_selected = 0;
@@ -4053,6 +4065,134 @@ void path_panel_toggle(ShellState& shell) {
     return;
   }
   set_status(shell, L"路径面板：↑/↓ 选行 · 回车（或双击行）转成选区 · Del 删除 · Esc 关闭");
+}
+
+/* ------------------------------------------------------ 历史记录面板（P1） */
+
+/*
+ * 面板列的是「状态」而不是「步」：index 0 = 最初状态（新建/打开），index i =
+ * 第 i 步之后的状态。高亮行不单独记账——它就是引擎的 current_index，所以撤销/
+ * 重做/新操作之后不会出现「高亮停在不存在的状态上」。列表本身来自
+ * comp_document_history_step_count / step_label（ABI 尾部追加，零结构体改动）。
+ */
+bool history_panel_visible(const ShellState& shell) {
+  return shell.history_open && shell.tool != comp_ui::ToolId::Type;
+}
+
+int history_state_count(const ShellState& shell) {
+  if (shell.document == nullptr) return 1;
+  size_t steps = 0;
+  if (comp_document_history_step_count(shell.document, &steps) != COMP_OK) return 1;
+  return static_cast<int>(steps) + 1;
+}
+
+int history_current(const ShellState& shell) {
+  if (shell.document == nullptr) return 0;
+  size_t undo = 0;
+  size_t redo = 0;
+  if (comp_document_history_stats(shell.document, &undo, &redo) != COMP_OK) return 0;
+  return static_cast<int>(undo);
+}
+
+/* 第 index 个状态的标题；标签是 UTF-8（写入方给的），面板只负责展示。 */
+std::wstring history_state_label(const ShellState& shell, int index) {
+  if (index <= 0) return L"最初状态（新建 / 打开）";
+  char utf8[192];
+  size_t required = 0;
+  if (shell.document == nullptr ||
+      comp_document_history_step_label(shell.document, static_cast<size_t>(index), nullptr, 0,
+                                       &required) != COMP_OK ||
+      required == 0 || required > sizeof(utf8) ||
+      comp_document_history_step_label(shell.document, static_cast<size_t>(index), utf8,
+                                       sizeof(utf8), &required) != COMP_OK) {
+    return L"（无法读取标签）";
+  }
+  return widen_utf8(utf8);
+}
+
+void history_status(ShellState& shell) {
+  const int count = history_state_count(shell);
+  const int current = history_current(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"历史 第 %d / %d 个状态：%s · ↑/↓ 或点行回跳 · Esc 关闭",
+            current + 1, count, history_state_label(shell, current).c_str());
+  set_status(shell, buffer);
+}
+
+/*
+ * 回跳：一次 ABI 调用把当前下标移到目标（内部连续 undo/redo），不新增历史记录。
+ * 回跳等于换整篇文档状态（图层、选区、调整都可能变），所以刷新口径与
+ * undo_document/redo_document 完全一致，只是把两次刷新合成一次。
+ */
+void history_jump_to(ShellState& shell, int target) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"历史记录：还没有文档");
+    return;
+  }
+  const int count = history_state_count(shell);
+  if (target < 0) target = 0;
+  if (target >= count) target = count - 1;
+  const int current = history_current(shell);
+  if (target == current) {
+    set_status(shell, L"已在该状态（未改动，不产生撤销步）");
+    return;
+  }
+  if (comp_document_history_jump(shell.document, static_cast<size_t>(target)) != COMP_OK) {
+    set_status(shell, L"回跳失败");
+    return;
+  }
+  shell.needs_render = true;
+  refresh_layers(shell);
+  refresh_selection(shell);
+  const int after = history_current(shell);
+  Layout layout{};
+  if (client_layout(shell, &layout)) {
+    shell.history_scroll = comp_ui::history_ensure_visible(layout.adjust_panel, count, after,
+                                                           shell.history_scroll);
+  }
+  wchar_t prefix[224];
+  wsprintfW(prefix, L"已回跳到第 %d/%d 个状态：%s", after + 1, count,
+            history_state_label(shell, after).c_str());
+  refresh_history_status(shell, prefix);
+}
+
+void history_step(ShellState& shell, int delta) {
+  const int count = history_state_count(shell);
+  int target = history_current(shell) + delta;
+  if (target < 0) target = 0;
+  if (target >= count) target = count - 1;
+  history_jump_to(shell, target);
+}
+
+void history_panel_toggle(ShellState& shell) {
+  if (shell.history_open) {
+    shell.history_open = false;
+    set_status(shell, L"已关闭历史记录面板");
+    return;
+  }
+  if (shell.document == nullptr) {
+    set_status(shell, L"历史记录：还没有文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板：色彩范围持有显式事务，必须先 abort 再让位。 */
+  if (shell.color_range_open) color_range_cancel(shell);
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.path_open = false;
+  shell.history_open = true;
+  Layout layout{};
+  if (client_layout(shell, &layout)) {
+    shell.history_scroll = comp_ui::history_ensure_visible(
+        layout.adjust_panel, history_state_count(shell), history_current(shell),
+        shell.history_scroll);
+  }
+  if (!history_panel_visible(shell)) {
+    set_status(shell, L"历史记录面板已打开（T 文字工具占着右栏，切走后可见）");
+    return;
+  }
+  history_status(shell);
 }
 
 void pen_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
@@ -5118,6 +5258,11 @@ void forget_color_range(ShellState& shell) {
   shell.color_range_input.clear();
   /* 路径面板的锚点同样是旧文档坐标：换文档时一起丢掉（关面板只是顺带）。 */
   path_store_clear(shell);
+  /*
+   * 历史面板没有壳侧数据（列表直接来自引擎），换文档后可以继续开着显示新文档的
+   * 历史；只把滚动归零，否则可能停在新文档根本到不了的行上。
+   */
+  shell.history_scroll = 0;
 }
 
 bool create_document(ShellState& shell) {
@@ -5527,6 +5672,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     /* ---- P0-4 可选：路径面板 ---- */
     case kCmdSelectPaths:
       path_panel_toggle(shell);
+      break;
+    /* ---- P1：历史记录面板 ---- */
+    case kCmdHistoryPanel:
+      history_panel_toggle(shell);
       break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
@@ -6676,6 +6825,69 @@ void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
 }
 
 /*
+ * 历史记录面板（P1）。行几何走 ui_core.h 的 history_row_rect / history_row_at，
+ * 与命中同源。当前状态（= 引擎 current_index）高亮；它之后的行是「可重做」的
+ * 未来状态，用暗色区分。标签直接来自 ABI，不在这里改写成中文。
+ */
+void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[288];
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"历史（History）";
+  TextOutW(dc, left + 10, panel_rect.y + 8, title, lstrlenW(title));
+
+  const int count = history_state_count(shell);
+  const int current = history_current(shell);
+  SetTextColor(dc, RGB(150, 210, 255));
+  wsprintfW(line, L"%d 个状态 · 当前第 %d 个（点行 / ↑↓ 回跳）", count, current + 1);
+  TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+
+  const int scroll = comp_ui::history_clamp_scroll(panel_rect, count, shell.history_scroll);
+  const int visible = comp_ui::history_visible_rows(panel_rect);
+  for (int row = 0; row < visible; ++row) {
+    const int index = scroll + row;
+    if (index >= count) break;
+    const comp_ui::Rect rect = comp_ui::history_row_rect(panel_rect, row);
+    const bool selected = index == current;
+    if (selected) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
+      FillRect(dc, &band, highlight);
+      DeleteObject(highlight);
+    }
+    if (selected) {
+      SetTextColor(dc, RGB(250, 250, 255));
+    } else if (index > current) {
+      /* 当前状态之后 = 重做侧：暗色，一眼看出「还没发生」。 */
+      SetTextColor(dc, RGB(130, 136, 148));
+    } else {
+      SetTextColor(dc, RGB(196, 200, 210));
+    }
+    wsprintfW(line, L"%d. %s", index, history_state_label(shell, index).c_str());
+    TextOutW(dc, left + 12, rect.y + 3, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"点行 / ↑ / ↓ 回跳（不新增撤销步）",
+      L"Ctrl+Z / Ctrl+Y 仍按步撤销 / 重做",
+      L"Escape 关闭面板",
+  };
+  int hint_y = bottom - 8 - 3 * 18 + 4;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 文字属性面板。行几何来自 ui_core.h 的 type_param_row_rect——绘制与命中同源，
  * 避免「看得见点不中」。面板改的是「下一段文字」的参数；键入态仍照常显示，
  * 因为键入中的文字也读同一组值（状态栏数字与预览框会立刻跟着变）。
@@ -7334,6 +7546,8 @@ void present(HWND window, ShellState& shell) {
   if (layout.adjust_panel.w > 0) {
     if (path_panel_visible(shell)) {
       draw_path_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (history_panel_visible(shell)) {
+      draw_history_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.color_range_open) {
       draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.effect_open) {
@@ -8319,6 +8533,43 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return;
   }
 
+  /* 历史记录面板打开且可见时键盘归面板（P1）。Ctrl 组合仍可穿透：面板不留事务。 */
+  if (history_panel_visible(shell) && !ctrl) {
+    /*
+     * 钢笔落点中的回车/Esc 归钢笔（与路径面板同一条例外）：否则画布上点了锚点
+     * 之后回车会被面板吞掉，路径永远提交不了；Del 也不会落到「删除图层」上。
+     */
+    if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
+      if (key == VK_RETURN) {
+        commit_pen_path(shell);
+      } else if (key == VK_ESCAPE) {
+        pen_cancel(shell);
+      }
+      return;
+    }
+    switch (key) {
+      case VK_ESCAPE:
+        shell.history_open = false;
+        set_status(shell, L"已关闭历史记录面板");
+        return;
+      case VK_UP:
+        history_step(shell, -1);
+        return;
+      case VK_DOWN:
+        history_step(shell, 1);
+        return;
+      case VK_HOME:
+        history_jump_to(shell, 0);
+        return;
+      case VK_END:
+        history_jump_to(shell, history_state_count(shell) - 1);
+        return;
+      default:
+        break;
+    }
+    return; /* 其余按键吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+  }
+
   /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
   if (!shell.type_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -9078,7 +9329,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           if (!shell->effect_open && !shell->filter_open && !type_panel_visible(*shell) &&
               !shell->color_range_open && !path_panel_visible(*shell) &&
-              layout.adjust_panel.w > 0 &&
+              !history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
             /*
              * P0-3 调整面板：上半行 = 聚焦，下半行（滑道）= 聚焦 + 开始拖动。
@@ -9214,6 +9465,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               path_status(*shell);
               InvalidateRect(window, nullptr, FALSE);
             }
+            return 0;
+          }
+          if (history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 历史记录面板：点行 = 直接回跳到该状态（单击即落动作，与路径面板不同——
+             * 回跳本身可再回跳，不产生历史记录，误点没有破坏性）。空白处吞掉。
+             */
+            const int count = history_state_count(*shell);
+            const int scroll =
+                comp_ui::history_clamp_scroll(layout.adjust_panel, count, shell->history_scroll);
+            const int index =
+                comp_ui::history_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+            if (index >= 0) {
+              history_jump_to(*shell, index);
+            }
+            InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
           if (shell->color_range_open && layout.canvas.contains(mouse_x, mouse_y)) {
@@ -9609,6 +9877,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       /*
+       * P1：Ctrl+Alt+H = 历史记录面板。Ctrl+Shift+H 已是「水平翻转」且走 WM_KEYDOWN，
+       * 这里必须带 Alt，否则 H 单独按是抓手工具。
+       */
+      if (shell != nullptr && wparam == 'H') {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl) {
+          run_shell_command(window, *shell, kCmdHistoryPanel);
+          return 0;
+        }
+      }
+      /*
        * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化模式调强度。
        * 普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，因此放到 Alt 组合，
        * 且必须在这里吞掉，否则 DefWindowProc 会响铃。
@@ -9711,6 +9990,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   history_panel_visible(*shell) &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* 历史记录面板滚轮翻列表：一格 3 行，夹取在 ui_core。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int count = history_state_count(*shell);
+            const int next = shell->history_scroll + (delta > 0 ? -3 : 3);
+            shell->history_scroll =
+                comp_ui::history_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
                    !shell->effect_open && !shell->filter_open &&
                    !type_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
@@ -9782,6 +10073,7 @@ HMENU build_menu() {
   AppendMenuW(edit_menu, MF_STRING, kCmdRedo, L"重做(&R)\tCtrl+Y");
   AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
   /* 选区三条（全选/取消/反选）已搬到单独的「选择」菜单，ID 不变。 */
+  AppendMenuW(edit_menu, MF_STRING, kCmdHistoryPanel, L"历史记录(&H)…\tCtrl+Alt+H");
   AppendMenuW(edit_menu, MF_STRING, kCmdListCommands, L"枚举引擎命令(&L)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit_menu), L"编辑(&E)");
 

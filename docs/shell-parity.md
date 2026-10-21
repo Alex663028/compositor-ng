@@ -28,6 +28,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 选区补齐第一批（P0-4） | 「选择(&S)」菜单：扩展…/收缩…/按图层像素载入选区 | （未接 UI） | `comp_selection_modify`(EXPAND/CONTRACT) / `comp_selection_load_layer`(LOAD_PIXELS) | **已达成**（§5.15）：三条入口接线完成 |
 | 色彩范围对话框（P0-4 第二批） | 「选择 → 色彩范围…」+ 右侧面板（色板 / 容差 / 反相 / 加减取样，事务预览） | （未接 UI） | `comp_selection_apply_color_range` / `comp_eyedropper_sample` / `comp_txn_*` | **已达成**（§5.16）：预览不落步，回车 = 一步撤销，Esc 回到打开前 |
 | 路径面板最小版（P0-4 可选） | 「选择 → 路径面板…」+ 右侧列表（已提交钢笔路径 / ↑↓ 选行 / 回车或双击转选区 / Del 删除） | （未接 UI） | 无（纯外壳；引擎无路径实体，转选区走 `comp_selection_apply_path`） | **已达成**（§5.17）：转选区 = 一步撤销；入列与删除只动壳侧列表，不落撤销步 |
+| 历史记录面板（P1） | 「编辑 → 历史记录…」+ 右侧列表（状态 0..N / 点行、↑↓、Home/End 回跳） | （未接 UI） | `comp_document_history_step_count` / `_step_label` / `_jump`（ABI 尾部追加，135 → 138） | **已达成**（§5.18）：回跳不新增撤销步；高亮 = 引擎 `current_index`，壳侧无第二份真相 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
@@ -713,4 +714,84 @@ SHA256 一致）：同色全选不要求连通（左半灰 + 底行取样点）�
 ② 不画路径本身（没有「路径作为图形」这条能力），只列名字与锚点数；
 ③ 不能加选/减选、不能重命名/复制；④ 锚点坐标系不随文档裁剪变化，裁剪后旧路径可能
 部分落到画布外（引擎会裁掉，选区变为可见部分）。
+
+### 5.18 历史记录面板（P1，2026-10-21）
+
+路线图里「历史记录面板」的验收口径是「面板列出每一步，点选可回跳，与撤销栈同源」。
+之前 `History` 只在状态栏露一个数字（`comp_document_history_stats` 的 undo/redo 深度），
+没有任何「看得见的历史」。这一节把撤销栈**原样**列成列表，并加一条「回跳到第 N 个状态」
+的入口——**ABI 尾部追加 3 个导出（135 → 138）**，既有枚举/结构体/签名一个不动。
+
+**1. 列的是「状态」不是「步」。** `index 0 = 文档最初状态（新建/打开）`，
+`index i = 第 i 步之后的状态`，行数 = `step_count() + 1`。这样列表与 Photoshop
+的历史面板同构：最上面一行永远「点回原样」，不用额外记「第 0 步」这种概念。
+
+**2. 高亮没有第二份真相。** 当前行**不单独存**，它就是引擎的 `current_index()`
+（= `undo_depth`，`comp_document_history_stats` 已经能给，所以**没有**为「当前位置」
+新增 ABI）。后果：撤销 / 重做 / 新操作 / 回跳之后，面板不可能把高亮停在一个不存在的
+状态上，也不可能出现「列表说第 3 步、引擎在第 5 步」。壳侧只存一个 `history_scroll`。
+
+**3. 三个新导出（纯尾部追加）。**
+
+| 导出 | 语义 |
+| --- | --- |
+| `comp_document_history_step_count` | 总步数（不含最初状态）；`out_steps` 可为 `NULL`（此时只做参数校验） |
+| `comp_document_history_step_label` | 第 `step` 步的标签；`step == 0` 或越界 → `INVALID_ARGUMENT`。查询口径同 `comp_layer_get_name`：`out_required` **含 NUL**，`buffer == NULL \\|\\| capacity == 0` 为查询模式，容量不足 → `INVALID_ARGUMENT`（绝不静默截断） |
+| `comp_document_history_jump` | 回跳到第 `step` 个状态。小于当前 = 连续 `undo`，大于 = 连续 `redo`；相等 = `COMP_OK` 空操作；越界 → `INVALID_ARGUMENT`；**活动事务内 → `COMP_ERR_STATE`** |
+
+**4. 标签的顺序不随撤销漂移。** `History` 的撤销栈是 `deque`、重做栈是 LIFO
+（back = 下一步会重做的那条），所以第 `undo_depth + 1` 步对应
+`redo_stack_[size - 1 - k]`。`step_label()` 按这个映射取值，于是「A/B/C 三步，
+撤销两步」之后第 1..3 步仍报 A/B/C，而不是倒序或串位。
+
+**5. 回跳不新增历史记录。** 引擎内部就是连续调 `Document::undo()/redo()`——它们只
+搬栈，不 push 新记录。因此「回跳 → 再回跳」不会把历史越点越长，撤销栈的标签与
+字节账本也不变。两条失败路径都被显式挡掉并报错：
+① 目标越界（调用方先问 `step_count`）；② 重做过程中 `History::trim()` 把刚推入的
+撤销记录挤掉、目标变得不可达（预算过小时可能发生）——这时返回 `COMP_ERR_STATE`
+「history was trimmed during jump」，而不是让循环空转或假装成功。
+
+**6. 入口与互斥。** 「编辑(&E)」菜单新增 `历史记录(&H)…`（命令 ID **1052**，
+`Ctrl+Alt+H`；`Ctrl+Shift+H` 已被「水平翻转」占用，且它走 `WM_KEYDOWN`，
+Alt 组合才落在 `WM_SYSKEYDOWN`）。面板占用右栏 `layout.adjust_panel`，与路径 /
+色彩范围 / 效果 / 滤镜 / 文字面板**互斥**：开历史会关掉前四个并 `color_range_cancel`
+（先 abort，不能留显式事务），其余四个打开时也会把 `history_open` 置假。
+
+**7. 文字工具占栏。** 与 §5.17 同一条规矩：`history_panel_visible()`
+（`history_open && tool != Type`）同时约束绘制、键盘、鼠标、滚轮与调整面板的命中排除；
+`T` 占栏时状态栏提示「T 文字工具占着右栏，切走后可见」，不存在「画了但点不到」。
+
+**8. 操作。** 面板打开时键盘归面板（工具字母键被吞）：`↑` / `↓` 回跳一格、
+`Home` / `End` 回跳最前 / 最后、`Esc` 关面板。一个例外：**钢笔正在落点**时
+回车/Esc 归钢笔（提交或取消当前路径），其余键仍吞掉——否则画布上点了锚点之后
+回车会被面板吃掉，路径永远提交不了。鼠标**单击行**即回跳（与路径面板不同：
+回跳本身可再回跳、不产生历史记录，误点无破坏性），点空白吞掉不落到画布；滚轮一格 3 行。
+面板之后的状态行（重做侧）用暗色画，一眼分出「已发生 / 未发生」。
+
+**9. 刷新口径。** 回跳等于换整篇文档状态（图层、选区、调整都可能变），所以
+`history_jump_to` 的刷新与 `undo_document` / `redo_document` 完全一致：
+`needs_render` + `refresh_layers` + `refresh_selection`，只是把两次刷新合成一次，
+再把目标行滚进可视区。状态栏随后走 `refresh_history_status(prefix)`，保留原有的
+「撤销 N / 重做 M / 字节数」尾巴。
+
+**10. 几何单源。** 行高 22、列表顶 64、底部提示 96 与路径面板同款，抽成
+`ui_core.h` 的通用 `list_*`（`list_visible_rows` / `list_max_scroll` /
+`list_clamp_scroll` / `list_ensure_visible` / `list_row_rect` / `list_row_at`），
+`path_*` 与 `history_*` 两组包装都委托给它——路径面板的既有用例原样通过，
+历史面板的绘制与命中也调同一组函数。
+
+**11. 验证。** `tests/test_domain.cpp` 加 `history_step_labels_follow_undo_and_redo`
+（A/B/C 三步：步号↔标签稳定、撤销两步不倒序、push 丢弃重做链后越界标签消失、
+`clear()` 后归零）；`tests/test_abi.cpp` 加 `abi_history_panel_steps_labels_and_jump`
+（步数 / 查询模式 required / 容量不足与 `NULL out_required` 被拒 / 前后回跳的像素与
+`undo_depth` / 相等回跳为空操作 / 越界被拒 / 事务内回跳 `COMP_ERR_STATE` 且 abort 后可用）；
+`tests/test_ui_core.cpp` 加 `ui_core_history_panel_rows_hit_what_they_paint`（可见行数、
+行矩形、命中上/下边界与行尾、滚动钳位、`ensure_visible`）。单测 557 → **560 例 / 0 失败**；
+`--selftest` **245 项不变**（面板本身不进自检脚本，基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**。
+
+**12. 边界。** ① 只读不写：不能重命名 / 删除单条 / 清空历史（上游面板的右键菜单未做）；
+② 标签是写入方给的（壳里是英文操作名），面板不改写成中文；③ 历史被预算裁掉后
+列表随之收缩，不提示「更早的记录已丢弃」（状态栏的字节数仍在）；
+④ 快照粒度是「一步」，笔迹仍然是每笔一步，没有上游的「合成笔迹」分组。
 

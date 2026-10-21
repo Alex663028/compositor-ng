@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **557 用例 0 失败**；Windows 外壳实机自检 **245 项全 OK**（与仓内基线逐字节一致）。
+  全量 **560 用例 0 失败**；Windows 外壳实机自检 **245 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -4007,6 +4007,69 @@ PE 导出 **135**；`run_regression.py --require-ohos` **6/6 PASS**（壳自检 
 不画路径本身，也不能加选/减选、重命名、复制；③ 锚点坐标不随裁剪重映射，裁剪后旧路径
 可能部分落到画布外（引擎裁掉，选区只剩可见部分）；④ 列表不在文档历史里，`Del` 删除
 不可撤销（状态栏已写明「选区不动」）；⑤ 面板手感与双击时序待 ALEX 目视（M21）。
+
+
+### 6.42 P1 历史记录面板：把撤销栈列出来，并支持回跳（2026-10-21，Claude）
+
+**立项口径。** 路线图 P1「历史记录面板」：面板列出每一步，点选可回跳，与撤销栈同源。
+此前 `History` 只在状态栏露一个数字（`undo_depth` / `redo_depth`），没有任何「看得见的
+历史」。这一项把撤销栈原样列成列表，并加「回跳到第 N 个状态」入口。
+
+**ABI 纯尾部追加（135 → 138）。** `comp_document_history_step_count` /
+`comp_document_history_step_label` / `comp_document_history_jump`。既有枚举、结构体、
+签名一个不动；标签走与 `comp_layer_get_name` 同一套 string-out 规矩（`out_required`
+含 NUL、查询模式 `COMP_OK`、容量不足 `INVALID_ARGUMENT`、绝不静默截断）。
+**没有**为「当前位置」新增导出：`comp_document_history_stats` 的 `undo_depth` 就是当前
+状态下标，多一个导出只会多一份可能不同步的真相。
+
+**列的是状态，不是步。** 第 0 行 = 文档最初状态（新建 / 打开），第 i 行 = 第 i 步之后。
+面板高亮不单独记账——它就是引擎的 `current_index()`，所以撤销 / 重做 / 新操作 / 回跳
+之后不可能出现「高亮停在不存在的状态上」。壳侧只存一个 `history_scroll`。
+
+**标签顺序不随撤销漂移。** 撤销栈是 `deque`、重做栈是 LIFO，`step_label()` 按
+`redo_stack_[size - 1 - k]` 反查，于是「A/B/C 三步、撤销两步」之后第 1..3 步仍报
+A/B/C（不是倒序、不串位），新记录丢弃重做链后越界标签自动消失。
+
+**回跳不新增历史记录。** 引擎内部就是连续 `undo()` / `redo()`（只搬栈、不 push），
+所以「回跳 → 再回跳」不会把历史越点越长，标签与字节账本就都不变。两条失败路径显式
+挡掉：目标越界（`INVALID_ARGUMENT`，调用方先问 `step_count`）；预算过小导致
+`trim()` 把刚推入的撤销记录挤掉、目标变得不可达（`COMP_ERR_STATE`，不让循环空转）。
+**活动事务内拒绝回跳**（`COMP_ERR_STATE`），与 undo/redo 同一条理由：事务快照会被劈开。
+
+**入口与互斥。** 「编辑 → 历史记录…」（命令 ID **1052**，`Ctrl+Alt+H`；
+`Ctrl+Shift+H` 已是「水平翻转」且走 `WM_KEYDOWN`，Alt 组合才落 `WM_SYSKEYDOWN`）。
+面板占右栏 `layout.adjust_panel`，与路径 / 色彩范围 / 效果 / 滤镜 / 文字面板互斥；
+色彩范围若开着先 `color_range_cancel`（先 abort 再让位）。`T` 文字工具独占右栏，
+仍用一条 `history_panel_visible() = history_open && tool != Type` 同时约束**绘制、
+键盘、鼠标、滚轮、调整面板命中排除**五处，挂而不见时状态栏点明「切走后可见」。
+
+**操作。** `↑`/`↓` 回跳一格、`Home`/`End` 回跳最前/最后、`Esc` 关闭；工具字母键被吞。
+单击行即回跳（与路径面板不同：回跳可再回跳、不产生记录，误点无破坏性），
+点空白不落画布，滚轮一格 3 行；重做侧用暗色画。钢笔正在落点时回车/Esc 归钢笔，
+否则「画布点了锚点、回车却被面板吃掉」会让路径永远提交不了。
+
+**刷新口径。** 回跳 = 换整篇文档状态（图层、选区、调整都可能变），所以刷新与
+`undo_document` / `redo_document` 完全一致（`needs_render` + `refresh_layers` +
+`refresh_selection`），只是两次刷新合成一次，再把目标行滚进可视区。
+
+**几何单源。** 面板行几何抽成 `ui_core.h` 的通用 `list_*`
+（`list_visible_rows` / `list_max_scroll` / `list_clamp_scroll` /
+`list_ensure_visible` / `list_row_rect` / `list_row_at`），`path_*` 与 `history_*`
+两组包装都委托给它——路径面板的既有用例原样通过，历史面板的绘制与命中同源。
+
+**验证。** 领域层加 `history_step_labels_follow_undo_and_redo`；ABI 层加
+`abi_history_panel_steps_labels_and_jump`（查询模式 / 容量不足被拒 / 前后回跳的像素与
+`undo_depth` / 相等回跳空操作 / 越界被拒 / 事务内被拒且 abort 后可用）；UI 层加
+`ui_core_history_panel_rows_hit_what_they_paint`。单测 557 → **560 例 / 0 失败**；
+PE 导出 **138**；壳自检 **245 项不变**（面板不进自检脚本，基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.18 + 矩阵一行，
+`docs/manual-test.md` 新增 **M22**。
+
+**边界。** ① 只读面板：不能重命名 / 删除单条 / 清空历史（上游右键菜单未做）；
+② 标签是写入方给的（壳里是英文操作名），面板不改写成中文；③ 历史被预算裁掉后
+列表跟着收缩，不额外提示「更早的记录已丢弃」（状态栏字节数仍在）；④ 粒度是一步，
+笔迹仍是每笔一步，没有上游的「合成笔迹」分组；⑤ 回跳手感与高亮跟手度待 ALEX 目视（M22）。
 
 
 

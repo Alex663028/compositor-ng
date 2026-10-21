@@ -4,6 +4,7 @@
  */
 #include "compositor/comp_undo.h"
 
+#include <cstring>
 #include <new>
 #include <string>
 
@@ -255,6 +256,86 @@ comp_result comp_document_history_truncated(comp_document document, int32_t* out
   }
   *out_truncated = doc->history().truncated() ? 1 : 0;
   return compositor::abi::ok(engine);
+}
+
+/* ------------------------------------------------- 历史面板（P1，尾部追加） */
+
+comp_result comp_document_history_step_count(comp_document document, size_t* out_steps) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_steps != nullptr) *out_steps = doc->history().step_count();
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_document_history_step_label(comp_document document, size_t step,
+                                             char* buffer, size_t capacity,
+                                             size_t* out_required) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  const std::string* label = doc->history().step_label(step);
+  if (label == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "step out of range");
+  }
+  const size_t required = label->size() + 1; /* 含结尾 NUL */
+  *out_required = required;
+  /* 查询模式：只问长度（capacity 为 0 也算），不碰 buffer。 */
+  if (buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    /* 不静默截断：与 comp_layer_get_name 同口径，截断可能切坏一个多字节字符。 */
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "label buffer is too small (see out_required)");
+  }
+  std::memcpy(buffer, label->c_str(), required);
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_document_history_jump(comp_document document, size_t step) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 活动事务内拒绝：理由同 undo/redo——事务快照会与回跳后的状态撕开。 */
+  if (doc->txn_active()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "cannot jump while a transaction is active");
+  }
+  const std::size_t total = doc->history().step_count();
+  if (step > total) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "step out of range (see history_step_count)");
+  }
+  while (doc->history().current_index() > step) {
+    if (!doc->undo()) {
+      return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "undo failed during jump");
+    }
+  }
+  /*
+   * 重做会调用 History::trim()：极端预算下可能在途中淘汰最旧记录，下标整体
+   * 前移、目标从此不可达。用「原步数 + 1」封顶，宁可报错也不无限循环。
+   */
+  const std::size_t cap = total + 1;
+  for (std::size_t i = 0; i < cap && doc->history().current_index() < step; ++i) {
+    if (!doc->redo()) {
+      return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "redo failed during jump");
+    }
+  }
+  if (doc->history().current_index() < step) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "history was trimmed during jump; target unreachable");
+  }
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
 }
 
 } /* extern "C" */

@@ -64,6 +64,19 @@ class History {
   std::size_t undo_depth() const { return undo_stack_.size(); }
   std::size_t redo_depth() const { return redo_stack_.size(); }
 
+  /* ------------------------------------------------- 历史面板（P1，2026-10-21） */
+  /*
+   * 面板口径：index 0 = 文档最初状态（打开/新建），index i (1..step_count())
+   * = 第 i 步之后的状态。current_index() = 当前落在哪个状态上。
+   * 撤销/重做不改变「第几步 = 哪条记录」的对应关系，只移动当前下标；因此面板
+   * 可以拿着同一份列表在回跳前后继续用（下标只在 push 或 trim 淘汰时变化）。
+   */
+  std::size_t step_count() const { return undo_stack_.size() + redo_stack_.size(); }
+  std::size_t current_index() const { return undo_stack_.size(); }
+
+  /* 第 step 步（1..step_count()）的标签；step == 0 或越界返回 nullptr。 */
+  const std::string* step_label(std::size_t step) const;
+
   /* 设置步数上限（0 视为默认 200）；超限丢弃最旧记录。 */
   void set_limit(std::size_t limit);
   std::size_t limit() const { return limit_; }

@@ -69,6 +69,39 @@ COMP_API comp_result comp_document_history_bytes(comp_document document, size_t*
 COMP_API comp_result comp_document_history_truncated(comp_document document,
                                                      int32_t* out_truncated);
 
+/* ---------------------------------------------- 历史面板（P1，尾部追加） */
+
+/*
+ * 历史步数 = 撤销栈 + 重做栈（当前状态本身不算一步）。
+ * index 0 = 文档最初状态，index i (1..steps) = 第 i 步之后的状态。
+ * out_steps 可为 NULL（与 history_stats 同口径）。
+ */
+COMP_API comp_result comp_document_history_step_count(comp_document document,
+                                                      size_t* out_steps);
+
+/*
+ * 第 step 步（1..steps）的标签（UTF-8，含结尾 NUL）。
+ *   - step == 0 或越界 -> COMP_ERR_INVALID_ARGUMENT（index 0 是最初状态，没有标签）；
+ *   - `buffer == NULL` 或 `capacity == 0` 是查询模式：只回所需长度，返回 COMP_OK；
+ *   - 缓冲区不够 -> COMP_ERR_INVALID_ARGUMENT，不静默截断（与 comp_layer_get_name 同口径）。
+ * 标签由写入方（comp_txn_begin / 引擎内部步骤）给定，面板只负责展示。
+ */
+COMP_API comp_result comp_document_history_step_label(comp_document document,
+                                                      size_t step,
+                                                      char* buffer,
+                                                      size_t capacity,
+                                                      size_t* out_required);
+
+/*
+ * 回跳到第 step 个状态（0..steps）：小于当前下标 = 连续撤销，大于 = 连续重做。
+ *   - step 越界 -> COMP_ERR_INVALID_ARGUMENT，文档不动；
+ *   - 相等 -> COMP_OK 空操作（不产生撤销步）；
+ *   - 活动事务内拒绝（COMP_ERR_STATE），先 commit/abort。
+ * 回跳不新增历史记录：它只是在既有撤销栈上移动当前下标，因此面板点哪一步
+ * 之后，Ctrl+Z / Ctrl+Y 的语义与逐次撤销/重做完全一致。
+ */
+COMP_API comp_result comp_document_history_jump(comp_document document, size_t step);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

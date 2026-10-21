@@ -143,6 +143,17 @@ bool History::redo(DocumentState* out) {
   return true;
 }
 
+const std::string* History::step_label(std::size_t step) const {
+  if (step == 0 || step > step_count()) return nullptr;
+  if (step <= undo_stack_.size()) return &undo_stack_[step - 1].label;
+  /*
+   * 重做栈是 LIFO：undo() 把记录 push_back 进来，redo() 从 back 取。
+   * 因此 back 是「下一步会重做的记录」，即第 undo_depth + 1 步。
+   */
+  const std::size_t from_back = step - undo_stack_.size() - 1;
+  return &redo_stack_[redo_stack_.size() - 1 - from_back].label;
+}
+
 void History::set_limit(std::size_t limit) {
   limit_ = limit == 0 ? 200 : limit;
   trim();

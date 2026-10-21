@@ -255,6 +255,49 @@ COMP_TEST(history_limit_and_clear) {
   COMP_CHECK(!history.can_undo());
 }
 
+/*
+ * P1 历史面板：记录在撤销/重做之间「步号 → 标签」的对应关系必须稳定。
+ * 重做栈是 LIFO，所以这里重点验撤销两步后第 1..3 步仍报 A/B/C（而不是倒序）。
+ */
+COMP_TEST(history_step_labels_follow_undo_and_redo) {
+  History history;
+  DocumentState state{};
+  history.push("A", state, state);
+  history.push("B", state, state);
+  history.push("C", state, state);
+
+  COMP_CHECK(history.step_count() == 3);
+  COMP_CHECK(history.current_index() == 3);
+  /* index 0 是最初状态，没有标签；越界也不给。 */
+  COMP_CHECK(history.step_label(0) == nullptr);
+  COMP_CHECK(history.step_label(4) == nullptr);
+  COMP_CHECK(history.step_label(1) != nullptr && *history.step_label(1) == "A");
+  COMP_CHECK(history.step_label(2) != nullptr && *history.step_label(2) == "B");
+  COMP_CHECK(history.step_label(3) != nullptr && *history.step_label(3) == "C");
+
+  COMP_CHECK(history.undo(nullptr));
+  COMP_CHECK(history.undo(nullptr));
+  COMP_CHECK(history.current_index() == 1);
+  COMP_CHECK(history.step_count() == 3);
+  /* 撤销不改记录顺序：B、C 现在在重做栈里，但步号不变。 */
+  COMP_CHECK(history.step_label(2) != nullptr && *history.step_label(2) == "B");
+  COMP_CHECK(history.step_label(3) != nullptr && *history.step_label(3) == "C");
+
+  COMP_CHECK(history.redo(nullptr));
+  COMP_CHECK(history.current_index() == 2);
+  COMP_CHECK(history.step_label(3) != nullptr && *history.step_label(3) == "C");
+
+  /* 新记录丢弃重做链：步数收缩，越界标签消失。 */
+  history.push("D", state, state);
+  COMP_CHECK(history.step_count() == 3);
+  COMP_CHECK(history.step_label(3) != nullptr && *history.step_label(3) == "D");
+  COMP_CHECK(history.step_label(4) == nullptr);
+
+  history.clear();
+  COMP_CHECK(history.step_count() == 0);
+  COMP_CHECK(history.step_label(1) == nullptr);
+}
+
 COMP_TEST(history_byte_budget_evicts_oldest) {
   History history;
   COMP_CHECK(history.budget_bytes() == kDefaultHistoryBudgetBytes);

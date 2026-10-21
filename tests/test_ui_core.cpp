@@ -995,6 +995,32 @@ COMP_TEST(ui_core_path_panel_rows_hit_what_they_paint) {
   COMP_CHECK(comp_ui::path_ensure_visible(panel, 30, 25, 99) == 12);
 }
 
+/*
+ * P1 历史面板：与路径面板共用 list_* 几何，但指数的是「状态数」——index 0 是最初
+ * 状态，所以行数 = 步数 + 1。这里只验几何（绘制与命中同源），跳转语义在 ABI 用例里。
+ */
+COMP_TEST(ui_core_history_panel_rows_hit_what_they_paint) {
+  const comp_ui::Rect panel{724, 46, 330, 560};
+  COMP_CHECK(comp_ui::history_visible_rows(panel) == 18);
+  COMP_CHECK(comp_ui::history_visible_rows(comp_ui::Rect{724, 46, 330, 120}) == 0);
+
+  const comp_ui::Rect first = comp_ui::history_row_rect(panel, 0);
+  COMP_CHECK(first.x == 724 && first.y == 110 && first.w == 330 && first.h == 22);
+  COMP_CHECK(comp_ui::history_row_rect(panel, 17).y == 110 + 17 * 22);
+
+  /* 下标 0 = 最初状态（「新建/打开」行），下标 i = 第 i 步。 */
+  COMP_CHECK(comp_ui::history_row_at(panel, 5, 0, 800.0, 111.0) == 0);
+  COMP_CHECK(comp_ui::history_row_at(panel, 5, 0, 800.0, 133.0) == 1);
+  COMP_CHECK(comp_ui::history_row_at(panel, 3, 0, 800.0, 176.0) == -1); /* 超出条数 */
+  COMP_CHECK(comp_ui::history_row_at(panel, 5, 0, 800.0, 109.0) == -1); /* 表头区 */
+  COMP_CHECK(comp_ui::history_row_at(panel, 5, 0, 100.0, 111.0) == -1); /* 面板外 */
+
+  COMP_CHECK(comp_ui::history_clamp_scroll(panel, 30, -5) == 0);
+  COMP_CHECK(comp_ui::history_clamp_scroll(panel, 30, 99) == 12);
+  COMP_CHECK(comp_ui::history_ensure_visible(panel, 30, 25, 5) == 8);
+  COMP_CHECK(comp_ui::history_ensure_visible(panel, 30, 12, 5) == 5);
+}
+
 /* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
 COMP_TEST(ui_core_pen_anchors_build_symmetric_segments) {
   /* 容量语义：只受 kPenMaxAnchors 约束，负数/越界都不得写入。 */

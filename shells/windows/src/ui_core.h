@@ -2335,48 +2335,116 @@ inline constexpr int kPathPanelFooter = 96;
 /* 上限按「够用且不无限涨内存」取整：超出后丢最旧一条（FIFO），状态栏会说。 */
 inline constexpr int kPathMaxEntries = 64;
 
-inline int path_visible_rows(const Rect& panel) {
-  const int space = panel.h - kPathRowsTop - kPathPanelFooter;
-  if (space <= 0) return 0;
-  return space / kPathRowHeight;
+/*
+ * 通用「右栏列表」几何：标题/摘要在 top 之内，底部 footer 留给提示，中间按
+ * row_height 切行。路径面板与历史面板共用这一组，差别只在常量。
+ * 命中只认画得出来的行（visible_rows 的同一口径），避免滚到底时点空白命中行尾。
+ */
+inline int list_visible_rows(const Rect& panel, int top, int footer, int row_height) {
+  const int space = panel.h - top - footer;
+  if (space <= 0 || row_height <= 0) return 0;
+  return space / row_height;
 }
 
-inline int path_max_scroll(const Rect& panel, int count) {
-  const int visible = path_visible_rows(panel);
+inline int list_max_scroll(const Rect& panel, int count, int top, int footer, int row_height) {
+  const int visible = list_visible_rows(panel, top, footer, row_height);
   if (visible <= 0 || count <= visible) return 0;
   return count - visible;
 }
 
-inline int path_clamp_scroll(const Rect& panel, int count, int scroll) {
+inline int list_clamp_scroll(const Rect& panel, int count, int scroll, int top, int footer,
+                             int row_height) {
   if (scroll < 0) scroll = 0;
-  const int max_scroll = path_max_scroll(panel, count);
+  const int max_scroll = list_max_scroll(panel, count, top, footer, row_height);
   return scroll > max_scroll ? max_scroll : scroll;
 }
 
-/* 让 index 落进可视区（↑/↓ 选行、新建路径入列时用）：只滚到刚好够，不居中。 */
-inline int path_ensure_visible(const Rect& panel, int count, int index, int scroll) {
-  const int clamped = path_clamp_scroll(panel, count, scroll);
+/* 让 index 落进可视区（↑/↓ 选行、新项入列时用）：只滚到刚好够，不居中。 */
+inline int list_ensure_visible(const Rect& panel, int count, int index, int scroll, int top,
+                               int footer, int row_height) {
+  const int clamped = list_clamp_scroll(panel, count, scroll, top, footer, row_height);
   if (index < 0 || index >= count) return clamped;
-  const int visible = path_visible_rows(panel);
+  const int visible = list_visible_rows(panel, top, footer, row_height);
   if (visible <= 0) return clamped;
   if (index < clamped) return index;
   if (index >= clamped + visible) return index - visible + 1;
   return clamped;
 }
 
-inline Rect path_row_rect(const Rect& panel, int row) {
-  return Rect{panel.x, panel.y + kPathRowsTop + row * kPathRowHeight, panel.w, kPathRowHeight};
+inline Rect list_row_rect(const Rect& panel, int row, int top, int row_height) {
+  return Rect{panel.x, panel.y + top + row * row_height, panel.w, row_height};
 }
 
-/* 返回面板内路径下标（= scroll + 可视行号）；空白/超出行尾返回 -1。 */
-inline int path_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+/* 返回面板内列表下标（= scroll + 可视行号）；空白/超出行尾返回 -1。 */
+inline int list_row_at(const Rect& panel, int count, int scroll, double x, double y, int top,
+                       int footer, int row_height) {
   if (!panel.contains(x, y)) return -1;
-  const double local = y - static_cast<double>(panel.y + kPathRowsTop);
+  const double local = y - static_cast<double>(panel.y + top);
   if (local < 0.0) return -1;
-  const int row = static_cast<int>(std::floor(local / static_cast<double>(kPathRowHeight)));
-  if (row < 0 || row >= path_visible_rows(panel)) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(row_height)));
+  if (row < 0 || row >= list_visible_rows(panel, top, footer, row_height)) return -1;
   const int index = scroll + row;
   return index >= 0 && index < count ? index : -1;
+}
+
+inline int path_visible_rows(const Rect& panel) {
+  return list_visible_rows(panel, kPathRowsTop, kPathPanelFooter, kPathRowHeight);
+}
+
+inline int path_max_scroll(const Rect& panel, int count) {
+  return list_max_scroll(panel, count, kPathRowsTop, kPathPanelFooter, kPathRowHeight);
+}
+
+inline int path_clamp_scroll(const Rect& panel, int count, int scroll) {
+  return list_clamp_scroll(panel, count, scroll, kPathRowsTop, kPathPanelFooter,
+                           kPathRowHeight);
+}
+
+inline int path_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  return list_ensure_visible(panel, count, index, scroll, kPathRowsTop, kPathPanelFooter,
+                             kPathRowHeight);
+}
+
+inline Rect path_row_rect(const Rect& panel, int row) {
+  return list_row_rect(panel, row, kPathRowsTop, kPathRowHeight);
+}
+
+inline int path_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  return list_row_at(panel, count, scroll, x, y, kPathRowsTop, kPathPanelFooter,
+                     kPathRowHeight);
+}
+
+/* ---------------------------------------- 历史面板（P1，2026-10-21） */
+
+/*
+ * 与路径面板同一套列表排版：index 0 = 最初状态，行 i = 第 i 步。行数 = 步数 + 1。
+ * 底部留 3 行提示（回车/双击回跳、Ctrl+Z/Y、Esc 关闭），所以 footer 与路径同值。
+ */
+inline constexpr int kHistoryRowHeight = 22;
+inline constexpr int kHistoryRowsTop = 64;
+inline constexpr int kHistoryPanelFooter = 96;
+
+inline int history_visible_rows(const Rect& panel) {
+  return list_visible_rows(panel, kHistoryRowsTop, kHistoryPanelFooter, kHistoryRowHeight);
+}
+
+inline int history_clamp_scroll(const Rect& panel, int count, int scroll) {
+  return list_clamp_scroll(panel, count, scroll, kHistoryRowsTop, kHistoryPanelFooter,
+                           kHistoryRowHeight);
+}
+
+inline int history_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  return list_ensure_visible(panel, count, index, scroll, kHistoryRowsTop,
+                             kHistoryPanelFooter, kHistoryRowHeight);
+}
+
+inline Rect history_row_rect(const Rect& panel, int row) {
+  return list_row_rect(panel, row, kHistoryRowsTop, kHistoryRowHeight);
+}
+
+inline int history_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  return list_row_at(panel, count, scroll, x, y, kHistoryRowsTop, kHistoryPanelFooter,
+                     kHistoryRowHeight);
 }
 
 /* ------------------------------------------------ 调整参数面板（P0-3） */
