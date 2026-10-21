@@ -2182,11 +2182,34 @@ void menu_radio_check_recursive(HMENU menu, UINT first, UINT last, UINT selected
 }
 
 /*
+ * 置灰/恢复（S41）：EnableMenuItem 与 CheckMenuItem 一样按单个 HMENU 生效，
+ * 混合模式/采样/效果都在二级子菜单里，所以同样要递归下去找命令 id。
+ */
+void menu_set_enabled_recursive(HMENU menu, UINT id, bool enabled) {
+  if (menu == nullptr) return;
+  const int count = GetMenuItemCount(menu);
+  for (int i = 0; i < count; ++i) {
+    const UINT state = GetMenuState(menu, static_cast<UINT>(i), MF_BYPOSITION);
+    if (state == static_cast<UINT>(-1)) continue;
+    if ((state & MF_POPUP) != 0) {
+      menu_set_enabled_recursive(GetSubMenu(menu, i), id, enabled);
+    } else if (GetMenuItemID(menu, i) == id) {
+      EnableMenuItem(menu, id, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
+    }
+  }
+}
+
+/*
  * WM_INITMENU 的唯一入口：把当前状态映射成勾选态。
  *
  * 判定规则在纯函数 comp_ui::layer_menu_checks 里（无选中层不勾、非组的 isolated
  * 不算、采样/混合夹到合法档位），这里只做「状态 → 菜单」的搬运，所以规则部分
  * 可以表驱动单测，不需要起窗口。
+ *
+ * S41 起同一入口还负责置灰：前置条件（有无选区/蒙版/可撤销/能否合并/重排端头）
+ * 先填进 LayerMenuState，再由 comp_ui::layer_menu_enabled 折成逐项可用态。
+ * **只影响菜单**：快捷键仍直接进 run_shell_command，各面板函数保留自己的拒绝提示，
+ * 键盘路径的口径不做任何改变。
  */
 void sync_menu_state(HWND window, ShellState& shell) {
   HMENU menu = GetMenu(window);
@@ -2204,6 +2227,54 @@ void sync_menu_state(HWND window, ShellState& shell) {
     state.blend = row->blend;
   }
   state.histogram_open = shell.histogram_open;
+
+  /*
+   * S41：置灰需要的前置条件。全部读实况，不在壳里另设缓存——
+   *   - 撤销/重做问引擎（can_undo/can_redo）；
+   *   - 合并问 comp_layer_can_merge_down（ABI 注释里写明「供外壳置灰菜单」）；
+   *   - 剪贴/重排复用各自的纯函数计划，与真正执行时同一套判定，
+   *     不会出现「菜单说能做、点了说不行」。
+   */
+  state.has_selection = shell.selection_active && !shell.selection_mask.empty();
+  state.layer_count = static_cast<int32_t>(shell.layers.size());
+  state.multi_selected = !shell.extra_selection.empty();
+  state.effect_count = static_cast<int32_t>(shell.effect_kinds.size());
+  if (shell.document != nullptr) {
+    int32_t can = 0;
+    if (comp_document_can_undo(shell.document, &can) == COMP_OK && can != 0) state.can_undo = true;
+    can = 0;
+    if (comp_document_can_redo(shell.document, &can) == COMP_OK && can != 0) state.can_redo = true;
+  }
+  if (row != nullptr) {
+    state.has_mask = row->has_mask != 0;
+    if (shell.document != nullptr) {
+      int32_t can = 0;
+      if (comp_layer_can_merge_down(shell.document, row->id, &can) == COMP_OK && can != 0) {
+        state.can_merge_down = true;
+      }
+    }
+    /* 未剪贴时要能找到同父基底；已在剪贴态时任何一层都能取消。 */
+    if (row->clipping != 0) {
+      state.clipping_available = true;
+    } else if (shell.layers.size() >= 2) {
+      std::vector<comp_ui::LayerStackEntry> stack;
+      stack.reserve(shell.layers.size());
+      for (const LayerRow& item : shell.layers) {
+        stack.push_back(comp_ui::LayerStackEntry{static_cast<int64_t>(item.id),
+                                                 static_cast<int64_t>(item.parent),
+                                                 static_cast<int64_t>(item.clipping)});
+      }
+      state.clipping_available =
+          comp_ui::plan_clipping_base(stack.data(), static_cast<int32_t>(stack.size()),
+                                      shell.selected_layer)
+              .ok();
+    }
+    /* 端头直接置灰，而不是点完才在状态栏说「已经是顶层」。 */
+    const int32_t count = state.layer_count;
+    state.can_move_up = comp_ui::plan_layer_reorder(count, shell.selected_layer, -1).ok;
+    state.can_move_down = comp_ui::plan_layer_reorder(count, shell.selected_layer, 1).ok;
+  }
+
   const comp_ui::LayerMenuChecks checks = comp_ui::layer_menu_checks(state);
 
   menu_set_checked_recursive(menu, kCmdLayerToggleVisible, checks.visible);
@@ -2239,6 +2310,61 @@ void sync_menu_state(HWND window, ShellState& shell) {
     menu_set_checked_recursive(menu, kCmdLayerFlipHorizontal, row->flip_x != 0);
     menu_set_checked_recursive(menu, kCmdLayerFlipVertical, row->flip_y != 0);
   }
+
+  /*
+   * S41：置灰。逐组按命令 id 应用『状态 → 可用』的判定（规则在
+   * comp_ui::layer_menu_enabled）。置灰只针对菜单；如果同一命令还有快捷键，
+   * 按键仍会进 run_shell_command 并得到各面板函数原有的拒绝提示——
+   * 那是有意保留的第二条路径：键盘用户不该因为菜单项变灰就失去提示。
+   */
+  const comp_ui::LayerMenuEnabled enabled = comp_ui::layer_menu_enabled(state);
+  menu_set_enabled_recursive(menu, kCmdUndo, enabled.undo);
+  menu_set_enabled_recursive(menu, kCmdRedo, enabled.redo);
+  /* 需要选中图层的整组项。新增图层/新建组不属于这一组（无层也能建）。 */
+  const UINT layer_present_items[] = {
+      kCmdLayerDelete,        kCmdLayerDuplicate,     kCmdLayerRename,
+      kCmdLayerToggleVisible, kCmdLayerOpacityDown,   kCmdLayerOpacityUp,
+      kCmdLayerOpacitySet,    kCmdLayerBlendPrev,     kCmdLayerBlendNext,
+      kCmdLayerFlipHorizontal, kCmdLayerFlipVertical, kCmdLayerMoveLeft,
+      kCmdLayerMoveRight,     kCmdLayerMoveUp,        kCmdLayerMoveDown,
+      kCmdLayerRotateLeft,    kCmdLayerRotateRight,   kCmdLayerScaleDown,
+      kCmdLayerScaleUp,
+  };
+  for (UINT id : layer_present_items) {
+    menu_set_enabled_recursive(menu, id, enabled.layer_present);
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerMergeDown, enabled.layer_merge_down);
+  menu_set_enabled_recursive(menu, kCmdLayerFlatten, enabled.layer_flatten);
+  menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
+  menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
+  menu_set_enabled_recursive(menu, kCmdLayerBringForward, enabled.move_up);
+  menu_set_enabled_recursive(menu, kCmdLayerBringToFront, enabled.move_up);
+  menu_set_enabled_recursive(menu, kCmdLayerSendBackward, enabled.move_down);
+  menu_set_enabled_recursive(menu, kCmdLayerSendToBack, enabled.move_down);
+  for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
+    menu_set_enabled_recursive(menu, kCmdEffectBase + static_cast<UINT>(kind),
+                               enabled.effect_toggle);
+  }
+  menu_set_enabled_recursive(menu, kCmdEffectEdit, enabled.effect_edit);
+  menu_set_enabled_recursive(menu, kCmdEffectClear, enabled.effect_clear);
+  for (int mode = 0; mode < comp_ui::kBlendCount; ++mode) {
+    menu_set_enabled_recursive(menu, kCmdBlendBase + static_cast<UINT>(mode),
+                               enabled.layer_present);
+  }
+  for (int mode = 0; mode < comp_ui::kSamplingCount; ++mode) {
+    menu_set_enabled_recursive(menu, kCmdSamplingBase + static_cast<UINT>(mode),
+                               enabled.layer_present);
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
+  menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
+  menu_set_enabled_recursive(menu, kCmdLayerMaskRemove, enabled.mask_remove);
+  menu_set_enabled_recursive(menu, kCmdLayerToggleClipping, enabled.clipping);
+  menu_set_enabled_recursive(menu, kCmdLayerToggleIsolated, enabled.isolated);
+  menu_set_enabled_recursive(menu, kCmdSelectNone, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectInvert, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectExpand, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectContract, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectLoadPixels, enabled.selection_load_pixels);
 }
 
 /*

@@ -5012,6 +5012,36 @@ Shift 等比、吸附画布边缘均未做。
 **6/6 通过**；`build_windows_shell.py` 零警告。
 文档：`docs/shell-parity.md` §5.40，`docs/manual-test.md` M36。
 
+### 6.68 菜单项按前置条件置灰（2026-10-21，Claude）
+
+**补掉 §5.15 边界 ④「菜单项暂未做置灰」。** 以前无选区点「取消选择」、单层点「向下合并」、
+顶层点「上移一层」都能点，点完才在状态栏回一句不行。现在入口本身就说得清哪些项此刻没意义。
+
+**1. 规则在纯函数里，壳只搬运。** `comp_ui::LayerMenuState` 扩出前置条件字段，
+`comp_ui::layer_menu_enabled` 折成逐项可用态。`EnableMenuItem` 要真窗口才能验证，
+所以单测覆盖规则表而不是调用点——这也是把判定抽净的理由。
+
+**2. 前置条件读实况，复用执行路径。** 撤销/重做问 `comp_document_can_undo/can_redo`；
+向下合并直接问 `comp_layer_can_merge_down`（ABI 注释里写的就是「供外壳置灰菜单」）；
+剪贴与重排复用执行时的同一对纯函数（`plan_clipping_base`、`plan_layer_reorder`），
+不会出现「菜单说能做、点了说不行」。拼合/上下选层要 ≥2 层，清除效果要已有效果，
+组的效果项默认灰、有多选集合时放开。
+
+**3. 只置灰「会拒绝或纯空转」的项。** 不按「有没有选中层」一刀切，而是照各处理函数的
+真实前提逐条对，所以删除/复制/改名/变换/混合模式/采样这些有层就能做的项不会误灰。
+
+**4. 键盘路径刻意不动。** 置灰只管菜单；同一命令的快捷键仍进 `run_shell_command`，
+保留各处理函数原有的拒绝提示。键盘用户不该因为菜单变灰就失去「为什么不行」。
+
+**5. 边界。** 工具栏按钮没有禁用态（自绘按钮，留待与 hover/按下态一起做）；
+不细化到剪贴态的每一项；状态以 `WM_INITMENU` 时刻为准。
+
+**验证。** 单测 **599 例 / 0 失败**（新增 `ui_core_layer_menu_enabled_follows_preconditions`）；
+PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+真实窗口用 `WM_INITMENU` 后逐项读 `GetMenuState` 验证过三种状态的置灰矩阵。
+文档：`docs/shell-parity.md` §5.41，`docs/manual-test.md` M37。
+
 
 
 

@@ -2609,6 +2609,86 @@ COMP_TEST(ui_core_layer_menu_checks_follow_state_rules) {
 }
 
 /*
+ * 菜单可用态（S41）。
+ *
+ * 与勾选态同一套路：Win32 的 EnableMenuItem 不可测，可测的是「什么前提下这
+ * 一项有动作」。三条最容易被写错的规则在这里钉住：
+ *  1. 无层时「需要选中层」的整组项全灭，但撤销/重做只跟历史走（无层也能撤销
+ *     删除操作的历史步——那一步本身才把层删掉的）；
+ *  2. 组图层的效果项只有多选时才可用（批量会跳过组）；
+ *  3. 端头重排看 can_move_up/can_move_down，而不是「有层就点亮」。
+ */
+COMP_TEST(ui_core_layer_menu_enabled_follows_preconditions) {
+  /* 1. 空状态：一切需要层/选区的项都不可用。 */
+  comp_ui::LayerMenuState state;
+  comp_ui::LayerMenuEnabled enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK(!enabled.undo && !enabled.redo);
+  COMP_CHECK(!enabled.layer_present && !enabled.layer_merge_down && !enabled.layer_flatten);
+  COMP_CHECK(!enabled.layer_step && !enabled.move_up && !enabled.move_down);
+  COMP_CHECK(!enabled.effect_toggle && !enabled.effect_edit && !enabled.effect_clear);
+  COMP_CHECK(!enabled.mask_from_selection && !enabled.mask_to_selection && !enabled.mask_remove);
+  COMP_CHECK(!enabled.clipping && !enabled.isolated);
+  COMP_CHECK(!enabled.selection_modify && !enabled.selection_load_pixels);
+
+  /* 撤销不依赖选中层：删掉最后一层之后仍然要能撤销回去。 */
+  state.can_undo = true;
+  enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK(enabled.undo);
+  COMP_CHECK(!enabled.redo && !enabled.layer_present);
+
+  /* 2. 普通图层：属性项全开；蒙版/选区项各看自己的前置；单层不能拼合/换层。 */
+  state = comp_ui::LayerMenuState{};
+  state.has_layer = true;
+  state.layer_count = 1;
+  state.can_move_up = false; /* 单层：上下都是端头 */
+  state.can_move_down = false;
+  enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK(enabled.layer_present);
+  COMP_CHECK(!enabled.layer_merge_down);
+  COMP_CHECK_MSG(!enabled.layer_flatten, "只有一层时拼合是空操作，应置灰");
+  COMP_CHECK(!enabled.layer_step);
+  COMP_CHECK(!enabled.move_up && !enabled.move_down);
+  COMP_CHECK(enabled.effect_toggle && enabled.effect_edit);
+  COMP_CHECK(!enabled.effect_clear);
+  COMP_CHECK(!enabled.mask_to_selection && !enabled.mask_remove);
+  COMP_CHECK(!enabled.mask_from_selection); /* 无选区 */
+  COMP_CHECK(!enabled.clipping && !enabled.isolated);
+  COMP_CHECK(enabled.selection_load_pixels);
+
+  state.has_selection = true;
+  state.has_mask = true;
+  state.effect_count = 2;
+  state.clipping_available = true;
+  state.can_merge_down = true;
+  state.can_move_up = false; /* 顶层：只能下移 */
+  state.can_move_down = true;
+  enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK(enabled.mask_from_selection);
+  COMP_CHECK(enabled.mask_to_selection);
+  COMP_CHECK(enabled.mask_remove);
+  COMP_CHECK(enabled.clipping);
+  COMP_CHECK(enabled.effect_clear);
+  COMP_CHECK(enabled.layer_merge_down);
+  COMP_CHECK(enabled.selection_modify);
+  COMP_CHECK(enabled.move_down && !enabled.move_up);
+  COMP_CHECK_MSG(!enabled.isolated, "非组的 isolated 必须保持置灰（引擎忽略）");
+
+  /* 3. 组图层：效果项默认灭；多选时可用（批量作用于组外成员）；隔离开。 */
+  state = comp_ui::LayerMenuState{};
+  state.has_layer = true;
+  state.is_group = true;
+  state.layer_count = 3;
+  enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK_MSG(!enabled.effect_toggle, "组图层的效果不参与求值，单选的档位应置灰");
+  COMP_CHECK(!enabled.effect_edit);
+  COMP_CHECK(enabled.isolated);
+
+  state.multi_selected = true;
+  enabled = comp_ui::layer_menu_enabled(state);
+  COMP_CHECK_MSG(enabled.effect_toggle, "多选时批量会跳过组、作用于其余成员，档位应可用");
+}
+
+/*
  * 效果档位表（S24）。
  *
  * 数值 0..5 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序

@@ -610,7 +610,7 @@ P0-4 的前提是「引擎与 ABI 全齐，只差 UI」。实测三个入口确�
 **5. 边界。** ① 色彩范围对话框当时未做，已在第二批补齐（见 §5.16）；② 扩展/收缩在引擎里是
 「按距离变换外扩/内缩」，拐角是圆角、超出画布的部分被裁掉，这是上游口径不是缺陷；
 ③ 空选区调用扩展会被引擎当无操作（`changed = 0`），壳在入口就先拒绝并提示；
-④ 菜单项暂未做置灰（无选区时点了给状态栏提示，不给假成功）。
+④ 菜单项置灰已在本轮补齐（见 §5.41）；快捷键路径不变，无选区时按快捷键仍给状态栏提示。
 
 ### 5.16 色彩范围对话框（P0-4 第二批，2026-10-21）
 
@@ -1644,6 +1644,51 @@ x, y, threshold)`：文档坐标 `floor` 后读 8 位 coverage，`>= threshold` 
 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M36**。
+
+### 5.41 菜单项按前置条件置灰（2026-10-21）
+
+**1. 缺口。** 菜单项一直是「永远可点」：没有选区也能点「取消选择」、单层也能点「向下合并」、
+顶层也能点「上移一层」。点了之后靠处理函数在状态栏回一句「没有选区」——不给假结果，
+但**入口本身不诚实**：用户看不出来哪些项此刻没有意义。§5.15 边界 ④ 记的就是这条。
+
+**2. 判定放在纯函数里，壳只搬运。** `comp_ui::LayerMenuState` 扩出前置条件字段
+（`has_selection` / `has_mask` / `can_undo` / `can_redo` / `can_merge_down` / `can_move_up` /
+`can_move_down` / `clipping_available` / `multi_selected` / `effect_count` / `layer_count`），
+`comp_ui::layer_menu_enabled` 折成逐项可用态 `LayerMenuEnabled`。`EnableMenuItem` 的调用
+本身无法单测（要真窗口），所以单测只覆盖规则表，这也是把规则抽净的理由。
+
+**3. 只置灰「点了会拒绝或纯空转」的项。** 判据不是「有没有选中层」一刀切，而是照各处理
+函数的实际前提逐条对：
+- 撤销/重做问 `comp_document_can_undo/can_redo`，与图层无关；
+- 向下合并直接用 `comp_layer_can_merge_down`——ABI 注释里写的就是「供外壳置灰菜单」；
+- 剪贴/重排复用执行时同一套纯函数（`plan_clipping_base`、`plan_layer_reorder`），
+  所以不会出现「菜单说能做、点了说不行」；
+- 组的效果项默认置灰（效果作用于成员层，组本身不挂效果），有多选集合时放开——
+  那条路径本来就支持批量跳过组；
+- 拼合/上下选层要求 ≥2 层；清除效果要求已有效果；蒙版三项分别按有无选区、有无蒙版。
+
+**4. 递归应用。** `EnableMenuItem` 与 `CheckMenuItem` 一样只作用于单个 `HMENU`，
+混合模式/采样/效果都在二级子菜单里，所以新增 `menu_set_enabled_recursive`，按位置下钻
+（`MF_BYPOSITION` + `GetMenuItemID`）找到命令 id 再改。整个动作仍挂在
+`WM_INITMENU → sync_menu_state` 这一个入口，不重建菜单。
+
+**5. 键盘路径刻意不动。** 置灰只影响菜单。同一命令若还有快捷键，按键仍直接进
+`run_shell_command`，各处理函数保留自己原有的拒绝提示——键盘用户不该因为菜单项变灰
+就失去「为什么不行」的说明。这是有意的双路径，不是漏改。
+
+**6. 边界。** ① 没有工具栏按钮的置灰（工具栏按钮是自绘的，没有 Win32 禁用态可复用，
+留待与按钮 hover/按下态一起做）；② 不按「组/剪贴」细化到每一项（例如剪贴态下部分变换项
+仍可点，由处理函数兜底）；③ 已知的真实状态以 `WM_INITMENU` 时刻为准，长按菜单不刷新
+（Win32 菜单常态）。
+
+**7. 验证。** `tests/test_ui_core.cpp` 加
+`ui_core_layer_menu_enabled_follows_preconditions`（空状态、单层、组+多选三段），单测
+**599 例 / 0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。真实窗口另用 `%TEMP%\menu_state_probe.ps1` 验证：
+按 `WM_INITMENU` 后逐项读 `GetMenuState`，新建文档时 Undo/Redo/合并/拼合/选层/蒙版/
+选择修改全灰、添加图层后合并/拼合/选层/剪贴转可用（顶层仍在「上移一层」置灰），
+全选后「从选区建立蒙版」与选择修改项转可用。目视项见 `docs/manual-test.md` **M37**。
 
 
 

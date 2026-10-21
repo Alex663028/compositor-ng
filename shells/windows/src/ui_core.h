@@ -2907,6 +2907,19 @@ struct LayerMenuState {
   int32_t sampling = 0;
   int32_t blend = 0;
   bool histogram_open = false;
+
+  /* ---- S41：置灰用的前置条件（每项都由调用方从引擎/壳读实况填入） ---- */
+  bool has_mask = false;          /* 选中层带蒙版 */
+  bool has_selection = false;     /* 有活动选区（含 coverage） */
+  bool can_undo = false;
+  bool can_redo = false;
+  bool can_merge_down = false;    /* comp_layer_can_merge_down 判定 */
+  bool can_move_up = false;       /* 重排纯函数：上移一层可行 */
+  bool can_move_down = false;     /* 重排纯函数：下移一层可行 */
+  bool clipping_available = false; /* 剪贴计划成立，或已处于剪贴态（可取消） */
+  bool multi_selected = false;    /* 面板多选集合 > 1 */
+  int32_t effect_count = 0;       /* 选中层已有效果数 */
+  int32_t layer_count = 0;
 };
 
 struct LayerMenuChecks {
@@ -2930,6 +2943,61 @@ inline LayerMenuChecks layer_menu_checks(const LayerMenuState& state) {
   checks.sampling = clamp_sampling_mode(state.sampling);
   checks.blend = clamp_blend_mode(state.blend);
   return checks;
+}
+
+/*
+ * 菜单可用态（S41）。与勾选态同一套理由：Win32 的 EnableMenuItem 不可测，
+ * 可测的是「哪一项在什么前提下有动作」。判定集中在这里，外壳只按命令 id 置灰。
+ *
+ * 口径：**只有调用会如实拒绝（或纯属无操作）的项才置灰**。凡是有副作用、
+ * 只是结果可能为空（如按像素载入选区选中 0 个像素）的，一律保持可用——
+ * 置灰等于替用户判断「你不想要」，比给一句状态栏提示更武断。
+ */
+struct LayerMenuEnabled {
+  bool undo = false;
+  bool redo = false;
+  bool layer_present = false; /* 需要选中图层的整组项（复制/删除/改名/属性/变换…） */
+  bool layer_merge_down = false;
+  bool layer_flatten = false;
+  bool layer_step = false;    /* 选择上一/下一图层：至少两层才有换的意义 */
+  bool move_up = false;       /* 上移一层 / 置于顶层 */
+  bool move_down = false;     /* 下移一层 / 置于底层 */
+  bool effect_toggle = false; /* 效果 6 档：组只能通过多选批量跳过它 */
+  bool effect_edit = false;
+  bool effect_clear = false;
+  bool mask_from_selection = false;
+  bool mask_to_selection = false;
+  bool mask_remove = false;
+  bool clipping = false;
+  bool isolated = false;
+  bool selection_modify = false; /* 取消选择/反选/扩展/收缩：都要先有选区 */
+  bool selection_load_pixels = false;
+};
+
+inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
+  LayerMenuEnabled enabled{};
+  enabled.undo = state.can_undo;
+  enabled.redo = state.can_redo;
+  enabled.layer_present = state.has_layer;
+  enabled.layer_merge_down = state.has_layer && state.can_merge_down;
+  /* 只有一层时拼合/换层都是空操作（还会白记一步历史）。 */
+  enabled.layer_flatten = state.layer_count >= 2;
+  enabled.layer_step = state.layer_count >= 2;
+  enabled.move_up = state.has_layer && state.can_move_up;
+  enabled.move_down = state.has_layer && state.can_move_down;
+  /* 组的 effects 不参与求值（filter_graph 的 kGroup 分支只合成子树）；多选时
+     主选中层是组也仍有意义——批量会跳过组、作用于其余成员。 */
+  enabled.effect_toggle = state.has_layer && (!state.is_group || state.multi_selected);
+  enabled.effect_edit = enabled.effect_toggle;
+  enabled.effect_clear = state.has_layer && state.effect_count > 0;
+  enabled.mask_from_selection = state.has_layer && state.has_selection;
+  enabled.mask_to_selection = state.has_layer && state.has_mask;
+  enabled.mask_remove = state.has_layer && state.has_mask;
+  enabled.clipping = state.has_layer && state.clipping_available;
+  enabled.isolated = state.has_layer && state.is_group;
+  enabled.selection_modify = state.has_selection;
+  enabled.selection_load_pixels = state.has_layer;
+  return enabled;
 }
 
 /* ------------------------------------------------------------ 效果档位（S24） */
