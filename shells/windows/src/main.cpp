@@ -341,6 +341,14 @@ struct ShellState {
   bool filter_open = false;
   std::wstring filter_input; /* 滤镜面板的键入缓冲；非空 = 输入态 */
   /*
+   * §6.62 滤镜实时预览：预览帧**只活在 framebuffer 里**，文档始终停在「改参数之前」。
+   * 每次改参数走一遍 begin -> 应用一次 -> render_canvas -> abort，事务回滚把像素还回去，
+   * 画面留在这帧。于是没有半开的事务要在关闭面板/换文档/切工具的路上收拾，预览也不可能
+   * 把别的命令的写入卷进同一个撤销步。pending = 当前 framebuffer 是预览帧（不是文档真
+   * 状态）；回车真应用、或任何离开预览的路径都会把它清掉。
+   */
+  bool filter_preview_pending = false;
+  /*
    * Progressive Blur 的渐变轴（P1 滤镜收官）：面板打开时在画布上拖一条线
    * 即「从 start 到 end」，松手只记端点（不提交滤镜，回车才应用）。
    * axis_set 为假 = 交给引擎的缺省轴（图层自身像素矩形中线）。
@@ -667,6 +675,16 @@ void refresh_history_status(ShellState& shell, const wchar_t* prefix) {
             static_cast<unsigned>(undo_depth), static_cast<unsigned>(redo_depth), kib,
             truncated != 0 ? L"，已截断" : L"");
   set_status(shell, buffer);
+}
+
+/*
+ * §6.62 滤镜实时预览的收尾：预览帧只在 framebuffer 里，像素从未改过。任何「离开预览」
+ * 的路径（关面板、换面板、换文档、切到文字工具）都要清 pending 并强制重画一帧，
+ * 否则画面会停在参数已经作废的预览上。needs_render 已为真的调用点重复置位无害。
+ */
+void filter_preview_forget(ShellState& shell) {
+  shell.filter_preview_pending = false;
+  shell.needs_render = true;
 }
 
 /* ------------------------------------------------------------ 图层面板 */
@@ -1595,6 +1613,7 @@ void open_effect_panel(ShellState& shell, int kind) {
   /* 右栏一次只挂一个面板：滤镜、路径、历史与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell); /* 滤镜预览帧不能留在新面板底下 */
   shell.path_open = false;
   shell.history_open = false;
   shell.effect_open = true;
@@ -3143,6 +3162,11 @@ std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
          widen_ascii(number_text(panel.value(panel.focused)).c_str());
 }
 
+/* 画布渲染定义在绘制段；预览要在事务里借它出一帧，先声明。 */
+bool render_canvas(ShellState& shell);
+/* 定义在 build_filter_desc 之后：预览必须用同一条「面板值 -> ABI 结构」映射。 */
+bool filter_preview_render(ShellState& shell, const wchar_t* lead);
+
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
   /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板、色彩范围、路径与历史面板。 */
   if (shell.color_range_open) color_range_cancel(shell);
@@ -3153,23 +3177,28 @@ void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
   shell.filter.select(id);
   shell.filter_open = true;
   shell.filter_input.clear();
+  filter_preview_forget(shell); /* 上一个滤镜的预览帧不能留在新滤镜面板底下 */
   const comp_ui::FilterSpec* spec = shell.filter.spec();
   wchar_t buffer[192];
-  wsprintfW(buffer, L"滤镜：%s（Tab 选参数 · -/= 调值 · 数字键入 · 回车应用 · Esc 关闭）",
+  wsprintfW(buffer, L"滤镜：%s（Tab 选参数 · -/= 调值即预览 · 数字键入 · 回车应用 · Esc 关闭）",
             widen_ascii(spec != nullptr ? spec->name : "?").c_str());
   set_status(shell, buffer);
 }
 
 void close_filter_panel(ShellState& shell) {
+  const bool had_preview = shell.filter_preview_pending;
   shell.filter_open = false;
   shell.filter_input.clear();
-  set_status(shell, L"已关闭滤镜面板");
+  filter_preview_forget(shell); /* 预览帧作废：Document 从未改动，重画即回真状态 */
+  set_status(shell, had_preview ? L"已关闭滤镜面板（预览已丢弃，图层未改动）"
+                                : L"已关闭滤镜面板");
 }
 
 void filter_reset_values(ShellState& shell) {
   shell.filter_input.clear();
   shell.filter.reset_values();
-  set_status(shell, L"滤镜参数已重置为默认值");
+  /* 复位也是一次参数变化：照样出预览；默认值若正好恒等，助手会如实回报「无预览」。 */
+  filter_preview_render(shell, L"滤镜参数已重置为默认值");
 }
 
 void filter_focus_row(ShellState& shell, int delta) {
@@ -3191,7 +3220,7 @@ void filter_step_value(ShellState& shell, int direction) {
   wchar_t buffer[192];
   wsprintfW(buffer, L"%s（步长 %s）", text.c_str(),
             widen_ascii(number_text(spec->step).c_str()).c_str());
-  set_status(shell, buffer);
+  filter_preview_render(shell, buffer); /* 状态行由助手补「预览中 / 恒等 / 失败」后缀 */
 }
 
 void filter_begin_input(ShellState& shell, wchar_t character) {
@@ -3207,8 +3236,10 @@ void filter_backspace(ShellState& shell) {
   shell.filter_input.pop_back();
 }
 
-/* 键入值先夹到面板量程再落值：面板永不产生越界参数（ABI 仍会拒绝越界）。 */
-void filter_commit_input(ShellState& shell) {
+/* 键入值先夹到面板量程再落值：面板永不产生越界参数（ABI 仍会拒绝越界）。
+ * with_preview = false 只用于「键入后紧接一次真应用」的回车：那一帧随时被应用结果盖掉，
+ * 先预览等于白算一遍全分辨率滤镜。 */
+void filter_commit_input(ShellState& shell, bool with_preview) {
   if (shell.filter_input.empty()) return;
   const std::string text(shell.filter_input.begin(), shell.filter_input.end());
   char* end = nullptr;
@@ -3222,7 +3253,11 @@ void filter_commit_input(ShellState& shell) {
   const std::wstring shown = param_status_text(shell.filter);
   wchar_t buffer[192];
   wsprintfW(buffer, L"已设置 %s", shown.c_str());
-  set_status(shell, buffer);
+  if (with_preview) {
+    filter_preview_render(shell, buffer);
+  } else {
+    set_status(shell, buffer);
+  }
 }
 
 /* 面板值按固定行序搬进 ABI 结构（唯一映射点；顺序见 ui_core 的 filter_table）。
@@ -3297,6 +3332,77 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
   *out = desc;
 }
 
+/*
+ * §6.62 滤镜实时预览：改一个参数就出一帧，但**文档不动**。
+ *
+ * 引擎的 comp_filter_apply 会加入宿主已开的事务（owns_txn = !txn_active()），所以这里
+ * 开事务 -> 应用一次 -> 先把这一帧画进 framebuffer -> abort 把像素回滚。文档因此始终停在
+ * 「预览前」，预览只存在于画面里。相比「像色彩范围那样长期挂着事务」，这条路的好处是：
+ *   - 关面板/换面板/换文档/切工具都不需要记忆并收拾一个半开事务（漏一处就会把别的
+ *     命令的写入卷进同一个撤销步，甚至 abort 到已销毁的文档上）；
+ *   - 预览失败的代价是「画面停在旧预览」，ram 而不是数据——最坏情况重画一帧即可。
+ * 代价是回车真应用时同一组参数算两遍，这是明知故犯：结果正确比少算一次重要。
+ *
+ * 返回 true = 画面已经是本组参数的预览帧。状态行一律由这里写（含失败与恒等）。
+ */
+bool filter_preview_render(ShellState& shell, const wchar_t* lead) {
+  if (!shell.filter_open) return false;
+  if (shell.document == nullptr) {
+    set_status(shell, L"无文档");
+    return false;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  const comp_ui::FilterSpec* spec = shell.filter.spec();
+  if (id == 0 || spec == nullptr) {
+    set_status(shell, L"滤镜预览：请先用 ↑↓ 选择一个图层");
+    return false;
+  }
+
+  comp_filter_desc desc{};
+  build_filter_desc(shell, &desc);
+
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.document, "Filter Preview", &txn) != COMP_OK) {
+    /* 没有事务就没有回滚：宁可不预览，也不把像素留在半改状态。 */
+    filter_preview_forget(shell);
+    set_status(shell, L"滤镜预览：无法开启事务，像素未改动（回车仍可直接应用）");
+    return false;
+  }
+
+  int32_t changed = 0;
+  char note[512] = {0};
+  size_t note_size = 0;
+  const comp_result result = comp_filter_apply(shell.document, id, &desc, 1.0, &changed, note,
+                                               sizeof(note), &note_size);
+  bool drawn = false;
+  if (result == COMP_OK && changed != 0) {
+    drawn = render_canvas(shell); /* 必须在 abort 之前取帧：此时像素还是「应用后」 */
+  }
+  comp_txn_abort(txn);
+
+  if (!drawn) {
+    /* 这一帧不能留着上一组参数的预览：参数已经变了，旧预览是错的。 */
+    filter_preview_forget(shell);
+    wchar_t buffer[384];
+    if (result != COMP_OK) {
+      wsprintfW(buffer, L"%s · 预览失败，像素未改动", lead);
+    } else if (changed == 0) {
+      wsprintfW(buffer, L"%s · 参数为恒等，无预览", lead);
+    } else {
+      wsprintfW(buffer, L"%s · 预览渲染失败，像素未改动", lead);
+    }
+    set_status(shell, buffer);
+    return false;
+  }
+
+  /* render_canvas 已清掉 needs_render：这一帧是预览，下次绘制别从文档覆盖它。 */
+  shell.filter_preview_pending = true;
+  wchar_t buffer[384];
+  wsprintfW(buffer, L"%s · 预览中（回车应用 · Esc 取消）", lead);
+  set_status(shell, buffer);
+  return true;
+}
+
 void apply_filter(ShellState& shell) {
   if (shell.document == nullptr) {
     set_status(shell, L"无文档");
@@ -3320,6 +3426,7 @@ void apply_filter(ShellState& shell) {
   const comp_result result = comp_filter_apply(shell.document, id, &desc, 1.0, &changed, note,
                                                sizeof(note), &note_size);
   shell.needs_render = true;
+  shell.filter_preview_pending = false; /* 真应用已落文档：画面重画即真状态 */
 
   wchar_t buffer[768];
   const std::wstring name = widen_ascii(spec->name);
@@ -3438,6 +3545,7 @@ void trim_begin(ShellState& shell) {
   if (shell.color_range_open) color_range_cancel(shell);
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = false;
@@ -3912,6 +4020,7 @@ void color_range_begin(ShellState& shell) {
   /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史互斥，避免两块矩形互相遮住）。 */
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = false;
@@ -4513,6 +4622,7 @@ void path_panel_toggle(ShellState& shell) {
   if (shell.color_range_open) color_range_cancel(shell);
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = true;
@@ -4661,6 +4771,7 @@ void history_panel_toggle(ShellState& shell) {
   if (shell.color_range_open) color_range_cancel(shell);
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
   shell.path_open = false;
@@ -4848,7 +4959,7 @@ void progressive_axis_begin(HWND window, ShellState& shell, int x, int y, const 
   shell.progressive_axis_dragging = true;
   SetCapture(window);
   set_status(shell,
-             L"Progressive Blur：拖出渐变轴（起点 = From 端、终点 = To 端；松手后回车应用）");
+             L"Progressive Blur：拖出渐变轴（起点 = From 端、终点 = To 端；松手出预览，回车应用）");
 }
 
 void progressive_axis_extend(ShellState& shell, int x, int y, const Layout& layout) {
@@ -4875,9 +4986,10 @@ void progressive_axis_end(HWND window, ShellState& shell) {
   shell.progressive_axis_final = end;
   shell.progressive_axis_set = true;
   wchar_t buffer[224];
-  wsprintfW(buffer, L"Progressive Blur 渐变轴：(%.0f, %.0f) → (%.0f, %.0f)，回车应用",
+  wsprintfW(buffer, L"Progressive Blur 渐变轴：(%.0f, %.0f) → (%.0f, %.0f)",
             start.x, start.y, end.x, end.y);
-  set_status(shell, buffer);
+  /* 轴是滤镜参数的一部分：定完轴立刻按新轴出一帧预览。 */
+  filter_preview_render(shell, buffer);
 }
 
 /* ------------------------------------------------------------ 形状（S10） */
@@ -5065,6 +5177,7 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
   shell.effect_input.clear();
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell); /* 文字工具接管键盘：别让滤镜预览帧留在画布上 */
   type_refresh_status(shell);
 }
 
@@ -6778,6 +6891,7 @@ bool create_document(ShellState& shell) {
   /* 新文档没有「之前的滤镜面板/未完成笔迹」可言，一并复位，避免跨文档误应用。 */
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell); /* 旧文档的预览帧绝不能留在新文档的画布上 */
   shell.filter.select(comp_ui::FilterId::Vignette);
   /* Progressive Blur 的渐变轴端点是旧文档坐标，换文档后一并作废。 */
   shell.progressive_axis_set = false;
@@ -6819,6 +6933,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.visibility.clear();
   shell.filter_open = false;
   shell.filter_input.clear();
+  filter_preview_forget(shell);
   shell.filter.select(comp_ui::FilterId::Vignette);
   shell.progressive_axis_set = false;
   shell.progressive_axis_dragging = false;
@@ -6965,6 +7080,7 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
     shell.visibility.clear();
     shell.filter_open = false;
     shell.filter_input.clear();
+    filter_preview_forget(shell);
     clone_reset_source(shell);
     stroke_cancel(shell);
     move_cancel(shell);
@@ -7388,8 +7504,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
   InvalidateRect(window, nullptr, FALSE);
 }
 
-void render_canvas(ShellState& shell) {
-  if (shell.document == nullptr || shell.rgba.empty()) return;
+/* 返回 false = 这一帧没画出来（无文档 / 空缓冲 / flatten 失败），framebuffer 仍是旧内容。
+ * 滤镜预览要靠这个返回值决定「预览帧到底成不成立」。 */
+bool render_canvas(ShellState& shell) {
+  if (shell.document == nullptr || shell.rgba.empty()) return false;
   const size_t stride = static_cast<size_t>(shell.width) * 4;
   const comp_result result =
       comp_render_flatten(shell.document, shell.rgba.data(), COMP_PIXEL_RGBA8, stride);
@@ -7406,6 +7524,7 @@ void render_canvas(ShellState& shell) {
     }
   }
   shell.needs_render = false;
+  return result == COMP_OK;
 }
 
 /* 工具条：按钮几何与命中共享 ui_core.h，壳只负责把选中态画出来。 */
@@ -9218,7 +9337,14 @@ void draw_panel_dividers(HDC dc, const ShellState& shell, const Layout& layout) 
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
-  if (shell.needs_render) render_canvas(shell);
+  if (shell.needs_render) {
+    render_canvas(shell);
+    /*
+     * 从文档重画这一帧 = 滤镜预览帧被顶掉了：pending 只描述 framebuffer 里那一帧，
+     * 不是文档状态。放在这个唯一的上屏入口，撤销/换工具/任何 needs_render 都能自洽。
+     */
+    shell.filter_preview_pending = false;
+  }
 
   RECT client{};
   GetClientRect(window, &client);
@@ -10464,8 +10590,8 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       return;
     }
     if (key == VK_RETURN) {
-      /* 键入 + 回车 = 落值并立刻应用，少一次按键。 */
-      filter_commit_input(shell);
+      /* 键入 + 回车 = 落值并立刻应用，少一次按键（应用结果会盖掉预览，不必先预览）。 */
+      filter_commit_input(shell, false);
       apply_filter(shell);
       return;
     }
@@ -11777,6 +11903,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (shell->color_range_open && layout.canvas.contains(mouse_x, mouse_y)) {
             /* 面板打开时画布点击只取样，不交给当前工具（上游 sheet 同语义）。 */
             color_range_sample(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          if (shell->filter_open && layout.canvas.contains(mouse_x, mouse_y) &&
+              !progressive_axis_available(*shell)) {
+            /*
+             * §6.62 滤镜面板是模态的（与色彩范围同规矩）：预览帧只在画面里，文档还是
+             * 干净状态，这时让画笔/选框落笔，等于在「看不见的那份文档」上画——预览会
+             * 被 needs_render 冲掉，用户以为改的是他看到的那张图。
+             * 唯一例外是 Progressive Blur 的轴拖拽（它本来就要画布坐标）。
+             */
+            set_status(*shell, L"滤镜面板打开中：画布点击不作用于工具（Esc 关闭面板）");
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
