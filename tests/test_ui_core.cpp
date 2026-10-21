@@ -955,8 +955,47 @@ COMP_TEST(ui_core_color_range_swatch_geometry_hits_what_it_paints) {
   COMP_CHECK(comp_ui::color_range_row_at(comp_ui::Rect{724, 46, 0, 560}, 724.0, 147.0) == -1);
 }
 
-/* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
+/*
+ * 路径面板（P0-4 可选）：列表行的绘制与命中必须同源。这里用 330x560 的面板
+ * （外壳右栏的常见尺寸）把行高、滚动、可见行数和「只认画得出来的行」钉住。
+ */
+COMP_TEST(ui_core_path_panel_rows_hit_what_they_paint) {
+  const comp_ui::Rect panel{724, 46, 330, 560};
+  /* 560 - 64（表头）- 96（页脚）= 400，每行 22 => 18 行。 */
+  COMP_CHECK(comp_ui::path_visible_rows(panel) == 18);
+  COMP_CHECK(comp_ui::path_visible_rows(comp_ui::Rect{724, 46, 330, 120}) == 0);
 
+  const comp_ui::Rect first = comp_ui::path_row_rect(panel, 0);
+  COMP_CHECK(first.x == 724 && first.y == 110 && first.w == 330 && first.h == 22);
+  COMP_CHECK(comp_ui::path_row_rect(panel, 17).y == 110 + 17 * 22);
+
+  /* 命中 = scroll + 可视行号；行内任意一点都算，行尾之外不算。 */
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 800.0, 111.0) == 0);
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 800.0, 132.0) == 1);
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 800.0, 154.0) == 2);
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 800.0, 176.0) == -1); /* 行号超出条数 */
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 800.0, 109.0) == -1); /* 表头区 */
+  COMP_CHECK(comp_ui::path_row_at(panel, 3, 0, 100.0, 111.0) == -1); /* 面板外 */
+  /* 滚到第 2 条之后：第一可视行对应下标 2。 */
+  COMP_CHECK(comp_ui::path_row_at(panel, 5, 2, 800.0, 111.0) == 2);
+  COMP_CHECK(comp_ui::path_row_at(panel, 5, 2, 800.0, 133.0) == 3);
+  /* 画不出来的行不给命中（滚动值比最大滚动量还大也不越界）。 */
+  COMP_CHECK(comp_ui::path_row_at(panel, 5, 99, 800.0, 500.0) == -1);
+
+  COMP_CHECK(comp_ui::path_max_scroll(panel, 3) == 0);
+  COMP_CHECK(comp_ui::path_max_scroll(panel, 30) == 12);
+  COMP_CHECK(comp_ui::path_clamp_scroll(panel, 30, -5) == 0);
+  COMP_CHECK(comp_ui::path_clamp_scroll(panel, 30, 99) == 12);
+  COMP_CHECK(comp_ui::path_clamp_scroll(panel, 30, 4) == 4);
+
+  /* ensure_visible：只滚到刚好够，已经可见就不动。 */
+  COMP_CHECK(comp_ui::path_ensure_visible(panel, 30, 3, 5) == 3);
+  COMP_CHECK(comp_ui::path_ensure_visible(panel, 30, 12, 5) == 5);
+  COMP_CHECK(comp_ui::path_ensure_visible(panel, 30, 25, 5) == 8);
+  COMP_CHECK(comp_ui::path_ensure_visible(panel, 30, 25, 99) == 12);
+}
+
+/* ============================================ S8: 钢笔路径 / 魔棒取样窗口 */
 COMP_TEST(ui_core_pen_anchors_build_symmetric_segments) {
   /* 容量语义：只受 kPenMaxAnchors 约束，负数/越界都不得写入。 */
   COMP_CHECK(comp_ui::pen_can_append(0));

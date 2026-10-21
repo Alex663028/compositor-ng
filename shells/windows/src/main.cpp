@@ -159,6 +159,7 @@ constexpr UINT kCmdSelectContract = 1048;
 constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
+constexpr UINT kCmdSelectPaths = 1051; /* P0-4 可选：路径面板（Ctrl+Shift+P） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -450,6 +451,20 @@ struct ShellState {
    */
   std::vector<comp_ui::PenAnchor> pen_anchors;
   bool pen_dragging = false;
+  /*
+   * 路径面板（P0-4 可选，S26）：引擎没有「路径」实体——路径的唯一用途就是
+   * 转成选区。所以壳侧自己存已闭合的钢笔锚点，双击/回车重新落成选区。
+   * 锚点是**文档坐标**，换文档后没有意义：新建/打开时整表清空。
+   */
+  struct StoredPath {
+    std::wstring name;
+    std::vector<comp_ui::PenAnchor> anchors;
+  };
+  bool path_open = false;
+  std::vector<StoredPath> paths;
+  int path_selected = 0;
+  int path_scroll = 0;
+  int path_serial = 0; /* 命名用流水号（删除后不复用，避免重名） */
   /* 鼠标是否停在画布上（决定画不画笔尖轮廓），客户区坐标。 */
   bool cursor_valid = false;
   bool tracking_leave = false;
@@ -1424,9 +1439,10 @@ void open_effect_panel(ShellState& shell, int kind) {
     return;
   }
   if (shell.color_range_open) color_range_cancel(shell);
-  /* 右栏一次只挂一个面板：滤镜与效果共用同一块矩形，同时打开会互相遮住。 */
+  /* 右栏一次只挂一个面板：滤镜、路径与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.filter_open = false;
   shell.filter_input.clear();
+  shell.path_open = false;
   shell.effect_open = true;
   shell.effect_kind = comp_ui::clamp_effect_kind(kind);
   reset_effect_values(shell);
@@ -2903,10 +2919,11 @@ std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
 }
 
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
-  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板与色彩范围。 */
+  /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板、色彩范围与路径面板。 */
   if (shell.color_range_open) color_range_cancel(shell);
   shell.effect_open = false;
   shell.effect_input.clear();
+  shell.path_open = false;
   shell.filter.select(id);
   shell.filter_open = true;
   shell.filter_input.clear();
@@ -3169,7 +3186,9 @@ void invert_selection(ShellState& shell) {
  */
 void finish_new_selection(ShellState& shell, const char* label, const wchar_t* ok_text,
                           const wchar_t* noop_text, const wchar_t* fail_text,
-                          const std::function<comp_result(int32_t*)>& apply) {
+                          const std::function<comp_result(int32_t*)>& apply,
+                          bool* applied = nullptr) {
+  if (applied != nullptr) *applied = false;
   if (shell.document == nullptr) {
     set_status(shell, L"无文档");
     return;
@@ -3205,6 +3224,7 @@ void finish_new_selection(ShellState& shell, const char* label, const wchar_t* o
     set_status(shell, L"选区：提交失败");
     return;
   }
+  if (applied != nullptr) *applied = true;
   finish_selection_command(shell, ok_text);
 }
 
@@ -3412,11 +3432,12 @@ void color_range_begin(ShellState& shell) {
     shell.color_range_txn = nullptr;
     shell.color_range_open = false;
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果互斥，避免两块矩形互相遮住）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/路径互斥，避免两块矩形互相遮住）。 */
   shell.filter_open = false;
   shell.filter_input.clear();
   shell.effect_open = false;
   shell.effect_input.clear();
+  shell.path_open = false;
   shell.color_range_include.clear();
   shell.color_range_exclude.clear();
   shell.color_range_fuzziness = comp_ui::kDefaultColorRangeFuzziness;
@@ -3757,6 +3778,44 @@ void pen_cancel(ShellState& shell) {
   if (had_path) set_status(shell, L"钢笔：已取消当前路径");
 }
 
+/* 实现在下面的「路径面板」一节；提交路径时要顺手入列。 */
+bool path_store_add(ShellState& shell, const std::vector<comp_ui::PenAnchor>& anchors);
+
+/*
+ * 锚点 -> 贝塞尔段（闭合）。钢笔提交与路径面板「转选区」共用同一条装配口径，
+ * 免得两条入口对控制柄的加减、闭合末段处理走偏。
+ * 返回可用段数；0 = 没有段（调用方报失败，不改选区）。
+ */
+int path_build_cubics(const std::vector<comp_ui::PenAnchor>& anchors,
+                      std::vector<comp_selection_cubic>* cubics) {
+  if (cubics == nullptr) return 0;
+  const int anchor_count = static_cast<int>(anchors.size());
+  const int segment_count = comp_ui::pen_segment_count(anchor_count, /*closed=*/true);
+  if (segment_count <= 0) return 0;
+  std::vector<comp_ui::PenSegment> segments(static_cast<size_t>(segment_count));
+  const int built = comp_ui::pen_build_segments(anchors.data(), anchor_count,
+                                                /*closed=*/true, segments.data(),
+                                                segment_count);
+  if (built <= 0) return 0;
+  const int path_count = std::min(built, segment_count);
+  cubics->assign(static_cast<size_t>(path_count), comp_selection_cubic{});
+  for (int i = 0; i < path_count; ++i) {
+    const comp_ui::PenSegment& source = segments[static_cast<size_t>(i)];
+    comp_selection_cubic& target = (*cubics)[static_cast<size_t>(i)];
+    target.start[0] = static_cast<float>(source.start.x);
+    target.start[1] = static_cast<float>(source.start.y);
+    target.control1[0] = static_cast<float>(source.control1.x);
+    target.control1[1] = static_cast<float>(source.control1.y);
+    target.control2[0] = static_cast<float>(source.control2.x);
+    target.control2[1] = static_cast<float>(source.control2.y);
+    target.end[0] = static_cast<float>(source.end.x);
+    target.end[1] = static_cast<float>(source.end.y);
+    /* start 只在第一段（new_subpath = 1）有意义，其余段接着上一段的 end。 */
+    target.new_subpath = i == 0 ? 1 : 0;
+  }
+  return path_count;
+}
+
 /*
  * 提交路径：把锚点 + 控制柄装配成 comp_selection_cubic 段，走
  * comp_selection_apply_path（与套索/框选共用 finish_new_selection 的事务与
@@ -3770,30 +3829,11 @@ void commit_pen_path(ShellState& shell) {
     return;
   }
 
-  const int segment_count = comp_ui::pen_segment_count(anchor_count, /*closed=*/true);
-  std::vector<comp_ui::PenSegment> segments(static_cast<size_t>(segment_count));
-  const int built = comp_ui::pen_build_segments(shell.pen_anchors.data(), anchor_count,
-                                                /*closed=*/true, segments.data(),
-                                                segment_count);
-  if (built <= 0) {
+  std::vector<comp_selection_cubic> cubics;
+  const int path_count = path_build_cubics(shell.pen_anchors, &cubics);
+  if (path_count <= 0) {
     set_status(shell, L"钢笔失败：路径没有段");
     return;
-  }
-  const int path_count = std::min(built, segment_count);
-  std::vector<comp_selection_cubic> cubics(static_cast<size_t>(path_count));
-  for (int i = 0; i < path_count; ++i) {
-    const comp_ui::PenSegment& source = segments[static_cast<size_t>(i)];
-    comp_selection_cubic& target = cubics[static_cast<size_t>(i)];
-    target.start[0] = static_cast<float>(source.start.x);
-    target.start[1] = static_cast<float>(source.start.y);
-    target.control1[0] = static_cast<float>(source.control1.x);
-    target.control1[1] = static_cast<float>(source.control1.y);
-    target.control2[0] = static_cast<float>(source.control2.x);
-    target.control2[1] = static_cast<float>(source.control2.y);
-    target.end[0] = static_cast<float>(source.end.x);
-    target.end[1] = static_cast<float>(source.end.y);
-    /* start 只在第一段（new_subpath = 1）有意义，其余段接着上一段的 end。 */
-    target.new_subpath = i == 0 ? 1 : 0;
   }
 
   comp_selection_combine combine = COMP_SELECTION_REPLACE;
@@ -3806,16 +3846,213 @@ void commit_pen_path(ShellState& shell) {
                            : combine == COMP_SELECTION_SUBTRACT ? L"钢笔：已减选"
                                                                 : L"钢笔：已应用闭合选区";
 
+  /* 路径面板要留一份副本：提交后 pen_anchors 就清空了。 */
+  const std::vector<comp_ui::PenAnchor> saved_path = shell.pen_anchors;
   /* 先清状态再提交：路径已经变成选区参数，失败也不该留下半截预览。 */
   shell.pen_anchors.clear();
   shell.pen_dragging = false;
   ReleaseCapture();
+  bool applied = false;
   finish_new_selection(
       shell, "Pen Selection", ok_text, L"钢笔：选区未变化", L"钢笔失败：路径无效",
       [&](int32_t* changed) {
         return comp_selection_apply_path(shell.document, cubics.data(), path_count, combine,
                                          /*antialias=*/1, changed);
+      },
+      &applied);
+  /*
+   * 入列不产生撤销步——它只动壳侧列表，不碰文档。选区没变（changed == 0）时
+   * finish_new_selection 会回滚事务、applied 保持 false；那种情况下路径没被提交，
+   * 但锚点本身有效，仍然值得留在面板里重新用一次。
+   */
+  const bool evicted = path_store_add(shell, saved_path);
+  if (evicted) {
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"｜路径已入列 %s（到 %d 条上限，最旧一条被挤掉）",
+              shell.paths.back().name.c_str(), comp_ui::kPathMaxEntries);
+    shell.status += buffer;
+  } else if (applied) {
+    wchar_t buffer[256];
+    wsprintfW(buffer, L"%s；路径已入列 %s（双击路径面板可再落一次）", ok_text,
+              shell.paths.back().name.c_str());
+    set_status(shell, buffer);
+  }
+}
+
+/* ------------------------------------------------------ 路径面板（P0-4 可选） */
+
+/* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
+ * 按真实面板矩形夹滚动位置。 */
+bool client_layout(const ShellState& shell, Layout* out);
+
+/*
+ * 面板挂什么：已提交过的钢笔路径（锚点）。引擎没有路径实体，所以「保存路径」
+ * 就是壳侧留一份锚点副本，用途只有一个——再落一次选区。因此这里没有重命名/
+ * 复制/导出，只有选中、删除、转选区三件事。
+ */
+bool path_store_add(ShellState& shell, const std::vector<comp_ui::PenAnchor>& anchors) {
+  if (anchors.size() < 2) return false;
+  bool evicted = false;
+  if (static_cast<int>(shell.paths.size()) >= comp_ui::kPathMaxEntries) {
+    shell.paths.erase(shell.paths.begin());
+    evicted = true;
+  }
+  ShellState::StoredPath entry;
+  ++shell.path_serial;
+  wchar_t name[32];
+  wsprintfW(name, L"路径 %d", shell.path_serial);
+  entry.name = name;
+  entry.anchors = anchors;
+  shell.paths.push_back(std::move(entry));
+  shell.path_selected = static_cast<int>(shell.paths.size()) - 1;
+  return evicted;
+}
+
+/* 文档被替换/新建：锚点是旧文档坐标，留着只会把选区落到错误的位置。 */
+void path_store_clear(ShellState& shell) {
+  shell.path_open = false;
+  shell.paths.clear();
+  shell.path_selected = 0;
+  shell.path_scroll = 0;
+  shell.path_serial = 0;
+}
+
+/* 文字工具（T）独占右栏显示它自己的属性面板：此时路径面板只是「挂着不显示」。 */
+bool path_panel_visible(const ShellState& shell) {
+  return shell.path_open && shell.tool != comp_ui::ToolId::Type;
+}
+
+void path_status(ShellState& shell) {
+  if (shell.paths.empty()) {
+    set_status(shell, L"路径：还没有保存的路径（钢笔闭合提交后自动入列）");
+    return;
+  }
+  const int count = static_cast<int>(shell.paths.size());
+  int index = shell.path_selected;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  const ShellState::StoredPath& path = shell.paths[static_cast<size_t>(index)];
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"路径 %d/%d：%s（%d 个锚点）· 回车转选区 · Del 删除", index + 1, count,
+            path.name.c_str(), static_cast<int>(path.anchors.size()));
+  set_status(shell, buffer);
+}
+
+void path_select(ShellState& shell, int delta) {
+  const int count = static_cast<int>(shell.paths.size());
+  if (count <= 0) {
+    path_status(shell);
+    return;
+  }
+  int index = shell.path_selected + delta;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  shell.path_selected = index;
+  /* 键盘选行要把高亮滚进可视区，否则↑/↓ 走到看不见的行就没反馈了。 */
+  Layout layout{};
+  if (client_layout(shell, &layout)) {
+    shell.path_scroll = comp_ui::path_ensure_visible(layout.adjust_panel, count, index,
+                                                     shell.path_scroll);
+  }
+  path_status(shell);
+}
+
+/* 重新落成选区：与钢笔提交同一条装配口径，同样一步撤销（套索/形状同款）。 */
+void path_apply_selected(ShellState& shell) {
+  if (shell.document == nullptr) {
+    set_status(shell, L"路径：还没有文档");
+    return;
+  }
+  const int count = static_cast<int>(shell.paths.size());
+  if (count <= 0 || shell.path_selected < 0 || shell.path_selected >= count) {
+    set_status(shell, L"路径面板：先选中一条路径");
+    return;
+  }
+  const ShellState::StoredPath& path = shell.paths[static_cast<size_t>(shell.path_selected)];
+  std::vector<comp_selection_cubic> cubics;
+  const int path_count = path_build_cubics(path.anchors, &cubics);
+  if (path_count <= 0) {
+    set_status(shell, L"路径：该条没有可用的段（未改动）");
+    return;
+  }
+  wchar_t ok_text[192];
+  wsprintfW(ok_text, L"路径「%s」已转成选区（一步撤销）", path.name.c_str());
+  finish_new_selection(
+      shell, "Path Selection", ok_text, L"路径：这次没有圈到选区（未改动）",
+      L"路径：转选区失败（未改动）", [&](int32_t* changed) {
+        return comp_selection_apply_path(shell.document, cubics.data(), path_count,
+                                         COMP_SELECTION_REPLACE, /*antialias=*/1, changed);
       });
+}
+
+/* 删一条路径只动壳侧列表：文档没变，所以不产生撤销步（状态栏里说清楚）。 */
+void path_delete_selected(ShellState& shell) {
+  const int count = static_cast<int>(shell.paths.size());
+  if (count <= 0) {
+    set_status(shell, L"路径面板：没有可删除的路径");
+    return;
+  }
+  int index = shell.path_selected;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  const std::wstring name = shell.paths[static_cast<size_t>(index)].name;
+  shell.paths.erase(shell.paths.begin() + index);
+  if (shell.path_selected >= static_cast<int>(shell.paths.size())) {
+    shell.path_selected = static_cast<int>(shell.paths.size()) - 1;
+  }
+  if (shell.paths.empty()) {
+    shell.path_selected = 0;
+    shell.path_scroll = 0;
+  } else {
+    Layout layout{};
+    if (client_layout(shell, &layout)) {
+      shell.path_scroll = comp_ui::path_ensure_visible(
+          layout.adjust_panel, static_cast<int>(shell.paths.size()), shell.path_selected,
+          shell.path_scroll);
+    }
+  }
+  wchar_t buffer[192];
+  if (shell.paths.empty()) {
+    wsprintfW(buffer, L"已删除路径「%s」（列表清空，选区不动）", name.c_str());
+  } else {
+    wsprintfW(buffer, L"已删除路径「%s」（剩 %d 条，选区不动）", name.c_str(),
+              static_cast<int>(shell.paths.size()));
+  }
+  set_status(shell, buffer);
+}
+
+void path_panel_toggle(ShellState& shell) {
+  if (shell.path_open) {
+    shell.path_open = false;
+    set_status(shell, L"已关闭路径面板");
+    return;
+  }
+  if (shell.document == nullptr) {
+    set_status(shell, L"路径面板：还没有文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板：色彩范围持有显式事务，必须先 abort 再让位。 */
+  if (shell.color_range_open) color_range_cancel(shell);
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.path_open = true;
+  const int count = static_cast<int>(shell.paths.size());
+  if (shell.path_selected >= count) shell.path_selected = count - 1;
+  if (shell.path_selected < 0) shell.path_selected = 0;
+  if (!shell.paths.empty()) {
+    Layout layout{};
+    if (client_layout(shell, &layout)) {
+      shell.path_scroll = comp_ui::path_ensure_visible(layout.adjust_panel, count,
+                                                       shell.path_selected, shell.path_scroll);
+    }
+  }
+  if (!path_panel_visible(shell)) {
+    set_status(shell, L"路径面板已打开（T 文字工具占着右栏，切走后可见）");
+    return;
+  }
+  set_status(shell, L"路径面板：↑/↓ 选行 · 回车（或双击行）转成选区 · Del 删除 · Esc 关闭");
 }
 
 void pen_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
@@ -4879,6 +5116,8 @@ void forget_color_range(ShellState& shell) {
   shell.color_range_include.clear();
   shell.color_range_exclude.clear();
   shell.color_range_input.clear();
+  /* 路径面板的锚点同样是旧文档坐标：换文档时一起丢掉（关面板只是顺带）。 */
+  path_store_clear(shell);
 }
 
 bool create_document(ShellState& shell) {
@@ -5284,6 +5523,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     /* ---- P0-4 第二批：色彩范围 ---- */
     case kCmdSelectColorRange:
       color_range_begin(shell);
+      break;
+    /* ---- P0-4 可选：路径面板 ---- */
+    case kCmdSelectPaths:
+      path_panel_toggle(shell);
       break;
     case kCmdLayerAdd:
       panel_add_layer(shell);
@@ -6371,6 +6614,68 @@ void draw_color_range_panel(HDC dc, const ShellState& shell, const comp_ui::Rect
 }
 
 /*
+ * 路径面板（P0-4 可选）。行几何走 ui_core.h 的 path_row_rect / path_row_at：
+ * 画在哪一行，双击就命中哪一行——这是面板唯一的手势入口。
+ */
+void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"路径（Paths）";
+  TextOutW(dc, left + 10, panel_rect.y + 8, title, lstrlenW(title));
+
+  const int count = static_cast<int>(shell.paths.size());
+  SetTextColor(dc, RGB(150, 210, 255));
+  wsprintfW(line, L"已存 %d / %d 条（钢笔闭合提交后自动入列）", count,
+            comp_ui::kPathMaxEntries);
+  TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+
+  const int scroll = comp_ui::path_clamp_scroll(panel_rect, count, shell.path_scroll);
+  const int visible = comp_ui::path_visible_rows(panel_rect);
+  if (count == 0) {
+    SetTextColor(dc, RGB(170, 150, 110));
+    const wchar_t* empty = L"还没有路径：用钢笔（P）画一条闭合路径";
+    TextOutW(dc, left + 12, panel_rect.y + comp_ui::kPathRowsTop, empty, lstrlenW(empty));
+  }
+  for (int row = 0; row < visible; ++row) {
+    const int index = scroll + row;
+    if (index >= count) break;
+    const comp_ui::Rect rect = comp_ui::path_row_rect(panel_rect, row);
+    const bool selected = index == shell.path_selected;
+    if (selected) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
+      FillRect(dc, &band, highlight);
+      DeleteObject(highlight);
+    }
+    const ShellState::StoredPath& path = shell.paths[static_cast<size_t>(index)];
+    SetTextColor(dc, selected ? RGB(250, 250, 255) : RGB(196, 200, 210));
+    wsprintfW(line, L"%d. %s  ·  %d 个锚点", index + 1, path.name.c_str(),
+              static_cast<int>(path.anchors.size()));
+    TextOutW(dc, left + 12, rect.y + 3, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"↑ / ↓ 选择 · 回车转成选区",
+      L"双击行转成选区（一步撤销）",
+      L"Del 删除该条（选区不动）· Esc 关闭",
+  };
+  int hint_y = bottom - 8 - 3 * 18 + 4;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 文字属性面板。行几何来自 ui_core.h 的 type_param_row_rect——绘制与命中同源，
  * 避免「看得见点不中」。面板改的是「下一段文字」的参数；键入态仍照常显示，
  * 因为键入中的文字也读同一组值（状态栏数字与预览框会立刻跟着变）。
@@ -7027,7 +7332,9 @@ void present(HWND window, ShellState& shell) {
   draw_toolbar(memory_dc, shell, layout.toolbar);
   if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
   if (layout.adjust_panel.w > 0) {
-    if (shell.color_range_open) {
+    if (path_panel_visible(shell)) {
+      draw_path_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.color_range_open) {
       draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.effect_open) {
       draw_effect_panel(memory_dc, shell, layout.adjust_panel);
@@ -7974,6 +8281,44 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     }
   }
 
+  /* 路径面板打开且可见时键盘归面板（P0-4 可选）。Ctrl 组合仍可穿透：面板不留事务。 */
+  if (path_panel_visible(shell) && !ctrl) {
+    /*
+     * 钢笔正在落点时（面板多半是上一条路径留下的）键归钢笔：回车提交当前路径、
+     * Esc 取消当前路径；其余键仍吞掉——若放行，Del 会落到「删除选中图层」上。
+     */
+    if (shell.tool == comp_ui::ToolId::Pen && !shell.pen_anchors.empty()) {
+      if (key == VK_RETURN) {
+        commit_pen_path(shell);
+      } else if (key == VK_ESCAPE) {
+        pen_cancel(shell);
+      }
+      return;
+    }
+    switch (key) {
+      case VK_ESCAPE:
+        shell.path_open = false;
+        set_status(shell, L"已关闭路径面板");
+        return;
+      case VK_UP:
+        path_select(shell, -1);
+        return;
+      case VK_DOWN:
+        path_select(shell, 1);
+        return;
+      case VK_RETURN:
+        path_apply_selected(shell);
+        return;
+      case VK_DELETE:
+        path_delete_selected(shell);
+        return;
+      default:
+        break;
+    }
+    /* 其余按键吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
   /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
   if (!shell.type_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -8218,6 +8563,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         /* Ctrl+Shift+O 打开位图，Ctrl+O 打开 .comp——两条路径语义不同，不能合并。 */
         run_shell_command(window, shell, shift ? kCmdOpenImage : kCmdOpen);
         return;
+      /*
+       * P0-4 可选：Ctrl+Shift+P = 路径面板。P 本身是钢笔工具键位，带 Ctrl 不冲突；
+       * 不用 Ctrl+Shift+Q（无实义）是因为 P 更像 Paths。
+       */
+      case 'P':
+        if (shift) {
+          run_shell_command(window, shell, kCmdSelectPaths);
+          return;
+        }
+        break;
       case 'S':
         /* Ctrl+Shift+S 另存为位图，Ctrl+S 保存 .comp。 */
         run_shell_command(window, shell, shift ? kCmdExportImage : kCmdSave);
@@ -8722,7 +9077,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             }
           }
           if (!shell->effect_open && !shell->filter_open && !type_panel_visible(*shell) &&
-              !shell->color_range_open && layout.adjust_panel.w > 0 &&
+              !shell->color_range_open && !path_panel_visible(*shell) &&
+              layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
             /*
              * P0-3 调整面板：上半行 = 聚焦，下半行（滑道）= 聚焦 + 开始拖动。
@@ -8842,6 +9198,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (path_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 路径面板：点行 = 选中该条；转选区走双击（WM_LBUTTONDBLCLK）或回车，
+             * 单击不落动作——避免误点把用户已有选区顶掉。空白处也吞掉，别漏给调整面板。
+             */
+            const int count = static_cast<int>(shell->paths.size());
+            const int scroll =
+                comp_ui::path_clamp_scroll(layout.adjust_panel, count, shell->path_scroll);
+            const int index =
+                comp_ui::path_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+            if (index >= 0) {
+              shell->path_selected = index;
+              path_status(*shell);
+              InvalidateRect(window, nullptr, FALSE);
+            }
+            return 0;
+          }
           if (shell->color_range_open && layout.canvas.contains(mouse_x, mouse_y)) {
             /* 面板打开时画布点击只取样，不交给当前工具（上游 sheet 同语义）。 */
             color_range_sample(*shell, mouse_x, mouse_y, layout);
@@ -8899,6 +9273,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           panel_histogram_reset(*shell);
           InvalidateRect(window, nullptr, FALSE);
           return 0;
+        }
+        /*
+         * P0-4 可选：双击路径行 = 该路径转成选区。方向键 + 回车是等价入口；
+         * 单击只选中（见 WM_LBUTTONDOWN），所以双击不会先被「选中」吃掉。
+         */
+        if (client_layout(*shell, &layout) && path_panel_visible(*shell) &&
+            layout.adjust_panel.w > 0) {
+          const int count = static_cast<int>(shell->paths.size());
+          const int scroll =
+              comp_ui::path_clamp_scroll(layout.adjust_panel, count, shell->path_scroll);
+          const int index =
+              comp_ui::path_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+          if (index >= 0) {
+            shell->path_selected = index;
+            path_apply_selected(*shell);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
         }
         /*
          * P0-1：双击图层行 = 重命名（与上游图层面板一致）。
@@ -9521,6 +9913,8 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_STRING, kCmdSelectContract, L"收缩(&O)...");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectPaths, L"路径面板(&T)...\tCtrl+Shift+P");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(select_menu), L"选择(&S)");
 
   HMENU view_menu = CreatePopupMenu();

@@ -2321,6 +2321,64 @@ inline int color_range_row_at(const Rect& panel, double x, double y) {
   return row;
 }
 
+/* -------------------------------------------- 路径面板（P0-4 可选，S26） */
+
+/*
+ * 引擎没有持久化路径实体：路径在本壳里就是「已闭合的钢笔锚点」，唯一用途是
+ * 重新落成选区。所以面板只列名字与锚点数，排版也按列表来做——标题（8+22）
+ * 之后一行摘要，列表从 y+64 起，底部留 3 行提示。
+ * 可见行数随面板高度变化；命中只认画得出来的行，与列表滚动的口径一致。
+ */
+inline constexpr int kPathRowHeight = 22;
+inline constexpr int kPathRowsTop = 64;
+inline constexpr int kPathPanelFooter = 96;
+/* 上限按「够用且不无限涨内存」取整：超出后丢最旧一条（FIFO），状态栏会说。 */
+inline constexpr int kPathMaxEntries = 64;
+
+inline int path_visible_rows(const Rect& panel) {
+  const int space = panel.h - kPathRowsTop - kPathPanelFooter;
+  if (space <= 0) return 0;
+  return space / kPathRowHeight;
+}
+
+inline int path_max_scroll(const Rect& panel, int count) {
+  const int visible = path_visible_rows(panel);
+  if (visible <= 0 || count <= visible) return 0;
+  return count - visible;
+}
+
+inline int path_clamp_scroll(const Rect& panel, int count, int scroll) {
+  if (scroll < 0) scroll = 0;
+  const int max_scroll = path_max_scroll(panel, count);
+  return scroll > max_scroll ? max_scroll : scroll;
+}
+
+/* 让 index 落进可视区（↑/↓ 选行、新建路径入列时用）：只滚到刚好够，不居中。 */
+inline int path_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  const int clamped = path_clamp_scroll(panel, count, scroll);
+  if (index < 0 || index >= count) return clamped;
+  const int visible = path_visible_rows(panel);
+  if (visible <= 0) return clamped;
+  if (index < clamped) return index;
+  if (index >= clamped + visible) return index - visible + 1;
+  return clamped;
+}
+
+inline Rect path_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kPathRowsTop + row * kPathRowHeight, panel.w, kPathRowHeight};
+}
+
+/* 返回面板内路径下标（= scroll + 可视行号）；空白/超出行尾返回 -1。 */
+inline int path_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  if (!panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kPathRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kPathRowHeight)));
+  if (row < 0 || row >= path_visible_rows(panel)) return -1;
+  const int index = scroll + row;
+  return index >= 0 && index < count ? index : -1;
+}
+
 /* ------------------------------------------------ 调整参数面板（P0-3） */
 
 /*
