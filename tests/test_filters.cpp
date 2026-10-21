@@ -1,14 +1,14 @@
 // AI生成
 /*
  * test_filters.cpp — P1 滤镜批次（Vignette / Tonal Contrast / Bloom /
- * Lens Correction / Gaussian Blur / Add Noise / Grain）的回归护栏。
+ * Lens Correction / Gaussian Blur / Add Noise / Grain / Motion Blur）的回归护栏。
  *
- * 为什么需要这组用例：这七个算子在上游是 Filter 菜单的一条通路
+ * 为什么需要这组用例：这八个算子在上游是 Filter 菜单的一条通路
  * （Filters.swift + PixelFilter.run），本仓的像素内核早已就位，缺的是产品入口。
  * 本组用例冻结入口落地之后的契约：
  *   1. 恒等设置是**真 no-op**：不动像素、不开事务、out_changed = 0；
  *   2. 参数闸在开事务之前：越界参数 -> INVALID_ARGUMENT，不进撤销栈；
- *   3. 七个算子分别可观察地改变像素，且各恰好一步撤销；
+ *   3. 八个算子分别可观察地改变像素，且各恰好一步撤销；
  *   4. Bloom 只加光、不改 alpha（预乘不变式：颜色不超过 alpha）；
  *   5. 选区委剪按**文档坐标**混合；图层带偏移时用 effective_bounds() 的原点；
  *   6. 16 位图层落 8 位工作副本并在 note 里写明，撤销恢复 16 位；
@@ -235,7 +235,8 @@ COMP_TEST(filters_new_kinds_are_identity_at_zero_initialisation) {
   const std::vector<uint8_t> before = pixels_of(document, id);
   const size_t undo_before = undo_depth(document);
 
-  const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain};
+  const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain,
+                              kFilterMotionBlur};
   for (FilterKind kind : kinds) {
     FilterSettings settings;
     settings.kind = kind; /* 其余字段零初始化：radius / amount 为 0 = 恒等 */
@@ -341,6 +342,32 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
     s.grain.roughness = 101.0;
     cases.push_back({"grain roughness above 100", s});
   }
+  {
+    FilterSettings s;
+    s.kind = kFilterMotionBlur;
+    s.motion_blur.angle = 90.5;
+    s.motion_blur.distance = 10.0;
+    cases.push_back({"motion blur angle above 90", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMotionBlur;
+    s.motion_blur.angle = -90.5;
+    s.motion_blur.distance = 10.0;
+    cases.push_back({"motion blur angle below -90", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMotionBlur;
+    s.motion_blur.distance = 0.5; /* (0, 1) 与 Gaussian Blur 的 (0, 0.1) 同理：越界 */
+    cases.push_back({"motion blur distance between 0 and 1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMotionBlur;
+    s.motion_blur.distance = 2000.5;
+    cases.push_back({"motion blur distance above 2000", s});
+  }
 
   for (const Case& item : cases) {
     comp_result code = COMP_OK;
@@ -370,7 +397,7 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
   COMP_CHECK_MSG(pixels_of(document, id) == before, "rejected filters leave pixels byte-identical");
 }
 
-/* ================================================== 2. 七个算子的像素通路 */
+/* ================================================== 2. 八个算子的像素通路 */
 
 COMP_TEST(filters_vignette_darkens_the_edges_and_is_one_step_undo) {
   Engine engine(test_engine_desc());
@@ -743,6 +770,97 @@ COMP_TEST(filters_grain_is_seeded_and_is_one_step_undo) {
   COMP_CHECK_MSG(pixels_of(first, first_id) == flat, "one undo restores the source");
 }
 
+/* ================================================== 2c. Motion Blur */
+
+namespace {
+
+/* 不透明黑底 + 中心 4x4 白光：条纹的方向与长度都能在单通道上读出来。 */
+std::vector<uint8_t> dot_on_opaque_black(int32_t width, int32_t height) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                 static_cast<size_t>(x)) * 4u;
+      p[3] = 255;
+      if (x >= width / 2 - 2 && x < width / 2 + 2 && y >= height / 2 - 2 && y < height / 2 + 2) {
+        p[0] = p[1] = p[2] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+bool row_identical(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int32_t width,
+                   int32_t y) {
+  const size_t begin = static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
+  return std::memcmp(a.data() + begin, b.data() + begin,
+                     static_cast<size_t>(width) * 4u) == 0;
+}
+
+}  // namespace
+
+COMP_TEST(filters_motion_blur_streaks_along_the_angle_and_is_one_step_undo) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 48;
+  const std::vector<uint8_t> dot = dot_on_opaque_black(size, size);
+
+  FilterSettings settings;
+  settings.kind = kFilterMotionBlur;
+  settings.motion_blur.angle = 0.0;
+  settings.motion_blur.distance = 16.0;
+
+  Document horizontal(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id horizontal_id = add_layer_with(&horizontal, dot, comp_rect{0, 0, size, size});
+  const size_t undo_before = undo_depth(horizontal);
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&horizontal, horizontal_id, settings, 1.0, &code, &changed, &note,
+                              &error),
+                 "motion blur is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(undo_depth(horizontal) == undo_before + 1,
+                 "one motion blur is exactly one undo step");
+  COMP_CHECK_MSG(note.find("box streak") != std::string::npos,
+                 "the note records the box streak instead of claiming CI parity");
+
+  const std::vector<uint8_t> streaked = pixels_of(horizontal, horizontal_id);
+  COMP_CHECK_MSG(changed_pixels(streaked, dot) > 0, "the streak actually moves pixels");
+  /* 水平条纹：中心行被拉向左右，远端行完全不动。 */
+  COMP_CHECK_MSG(channel_at(streaked, size, 32, 24, 0) > 0,
+                 "angle 0 smears the dot along x");
+  COMP_CHECK_MSG(row_identical(streaked, dot, size, 2),
+                 "rows far from the dot are byte-identical");
+  COMP_CHECK_MSG(channel_at(streaked, size, 24, 32, 0) == 0,
+                 "a horizontal streak does not move the dot along y");
+
+  /* 90 度：条纹转到竖直方向（方向的正负对称，故两种朝向都一样）。 */
+  Document vertical(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id vertical_id = add_layer_with(&vertical, dot, comp_rect{0, 0, size, size});
+  settings.motion_blur.angle = 90.0;
+  COMP_CHECK(filter_apply(&vertical, vertical_id, settings, 1.0, &code, &changed, nullptr,
+                          &error));
+  const std::vector<uint8_t> upright = pixels_of(vertical, vertical_id);
+  COMP_CHECK_MSG(channel_at(upright, size, 24, 32, 0) > 0, "angle 90 smears the dot along y");
+  COMP_CHECK_MSG(channel_at(upright, size, 32, 24, 0) == 0,
+                 "a vertical streak does not move the dot along x");
+
+  /* scale 缩放条纹长度：0.5 时 16 px 的条纹缩到 8 px，够不到 x = 32。 */
+  Document preview(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id preview_id = add_layer_with(&preview, dot, comp_rect{0, 0, size, size});
+  settings.motion_blur.angle = 0.0;
+  COMP_CHECK(filter_apply(&preview, preview_id, settings, 0.5, &code, &changed, nullptr, &error));
+  const std::vector<uint8_t> half = pixels_of(preview, preview_id);
+  COMP_CHECK_MSG(channel_at(half, size, 32, 24, 0) == 0,
+                 "scale 0.5 halves the streak length");
+  COMP_CHECK_MSG(channel_at(half, size, 28, 24, 0) > 0, "the halved streak is still visible");
+
+  horizontal.undo();
+  COMP_CHECK_MSG(pixels_of(horizontal, horizontal_id) == dot, "one undo restores the source");
+}
+
 /* ================================================== 3. 选区 / 深度 / 拒绝 */
 
 COMP_TEST(filters_clip_to_the_document_selection_in_document_coordinates) {
@@ -1029,5 +1147,49 @@ COMP_TEST(filters_abi_maps_the_p1_operator_fields) {
                                0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
   grain.grain.size = 0.4;
   COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &grain, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+COMP_TEST(filters_abi_maps_the_motion_blur_fields) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 32, 32, 72.0f, "sRGB");
+  const comp_layer_id id =
+      add_layer_with(&document, dot_on_opaque_black(32, 32), comp_rect{0, 0, 32, 32});
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  int32_t changed = 0;
+
+  /* Angle / Distance 两个字段都要过 ABI；负角度（顺时针）也是合法值。 */
+  comp_filter_desc motion{};
+  motion.kind = COMP_FILTER_MOTION_BLUR;
+  motion.motion_blur.angle = -30.0;
+  motion.motion_blur.distance = 12.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &motion, 1.0, &changed, note,
+                                   sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the motion blur desc");
+  COMP_CHECK_MSG(changed == 1, "the motion blur reports out_changed = 1");
+  COMP_CHECK_MSG(std::string(note).find("Motion Blur applied") != std::string::npos,
+                 "the note names the motion blur");
+  COMP_CHECK_MSG(std::string(note).find("equivalent standard deviation") != std::string::npos,
+                 "the note keeps the CIMotionBlur caveat");
+
+  /* 零初始化 desc + kind 7 = distance 0 = 恒等（不碰像素、不开事务）。 */
+  comp_filter_desc identity{};
+  identity.kind = COMP_FILTER_MOTION_BLUR;
+  identity.motion_blur.angle = 45.0; /* 只有角度不为 0 仍是恒等：距离才是判据 */
+  changed = -1;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &identity, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "distance 0 is the identity regardless of the angle");
+  COMP_CHECK_MSG(changed == 0, "the identity motion blur reports out_changed = 0");
+
+  /* 越界量程在 ABI 边界被拒。 */
+  motion.motion_blur.angle = 90.5;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &motion, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  motion.motion_blur.angle = 0.0;
+  motion.motion_blur.distance = 0.5;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &motion, 1.0, &changed, nullptr,
                                0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }

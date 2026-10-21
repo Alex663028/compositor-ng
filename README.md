@@ -1663,6 +1663,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Shape（S10 新增，非上游 `.c` 内核） | `COMP_TOOL_SHAPE` | `shape_raster::shape_rasterize`（矩形 / 椭圆 / 三次贝塞尔路径的填充 + 胶囊距离描边 + 圆角矩形 + 窗口化覆盖率，4 行超采样 AA）；路径基元来自 S10 抽出的 `path_raster`（与选区共用，行为中立） | 贝塞尔路径只有 ABI 通路（外壳 `U` 只能拖出矩形/椭圆/直线；钢笔仍用于提交选区） |
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段）/ `COMP_FILTER_ADD_NOISE` | `noise_add_at`（origin 锚定） | — |
+| Motion Blur（P1 新增，本仓内核） | `COMP_FILTER_MOTION_BLUR` | `engine/domain/filters.cpp` 的 `motion_blur_pixels`（盒式线积分：长度 = `distance * scale`，预乘双线性、边缘夹取、最多 257 采样） | 无独立内核函数（上游是 Core Image `CIMotionBlur`） |
 | Levels | `comp_layer_histogram`（只读查询） | `levels_histogram`（**预乘先反预乘再取亮度**） | — |
 | Heal | `COMP_TOOL_HEAL` | `spot_heal`、`heal_membrane`（内部派发）、**`heal_coverage_bounds`**（`comp_tool_coverage_bounds` 只读查询） | — |
 | Deep | `COMP_TOOL_DEEP` | `dither_quantize16`、**deep round trip**（内含 `deep_split`/`deep_merge`）、**16 位 `cube_apply`**、`extract_alpha`/`restore_alpha`、**`hdr_normalize`/`hdr_restore`**（C2：HDR 图层上的 deep round trip，§6.1.16）、**`hdr_exposure`/`extract_alpha_hdr`/`restore_alpha_hdr`**（C5：half 调整与剪贴栈 coverage，§6.1.19）、**`deep_take_painted`/`deep_take_painted_hdr`**（落笔族在 RGBA16 / RGBA16F 上保留深像素，§6.1.21） | — |
@@ -4227,6 +4228,39 @@ monochromatic 三通道相等；Grain 同 seed 复现 / 换 seed 不同；三者
 壳自检 **245 项不变**（SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
 **6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/filters.md` §1 / §3.5–3.7 /
 §5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，`docs/manual-test.md` M9 追加 5–8 条。
+
+### 6.46 P1 滤镜库扩容（收尾）：Motion Blur（2026-10-21，Claude）
+
+**立项口径。** 上游 `FilterKind` 里最后一个**完全没有产品通路**的算子。前七个的像素
+内核在本仓早已就位，Motion Blur 没有对应内核（上游是 Core Image `CIMotionBlur`），
+本批按它的可观察口径补一份盒式线积分，并接上同一条 Filter 入口。
+
+**零新增导出。** `comp_filter_kind` 尾部追加 `COMP_FILTER_MOTION_BLUR = 7`；
+`comp_filter_desc` 尾部追加 `motion_blur { angle, distance }`。既有枚举值、偏移与导出
+一个不动，PE 导出仍 **138**。
+
+**口径。** `angle` -90..90（水平 0，逆时针为正，屏幕 y 向下故内核取 `dy = -sin`）；
+`distance` 0 = 恒等，否则 1..2000（图层像素，预览再乘 `scale`），`(0, 1)` 显式拒绝。
+恒等判据**只看 distance**：角度取任何合法值都不开事务。采样在预乘像素上做双线性平均
+（alpha 一起平均，条纹向外扩散），越界坐标夹到图层边缘（等效上游
+`extending(...past: canvasSides)`），每像素最多 257 个采样点。
+
+**为什么不声称与 CI 逐位一致。** 上游把 `distance / sqrt(12)` 传给 `CIMotionBlur` 的
+radius——即让 CI 的分布与长度为 `distance` 的均匀条纹同方差。本仓直接对长度
+`distance` 做盒式平均：方向与长度两条可观察口径一致，形状不同，note 写明
+`CIMotionBlur's radius is the equivalent standard deviation`。
+
+**外壳。** `FilterId` 追加 7（`Count` 移到 8），`filter_table()` 追加一行
+（Angle / Distance 两行），菜单与面板仍从同一张表生成；`build_filter_desc` 追加
+唯一映射分支；`main.cpp` 补一条 `static_assert` 锁死枚举数值。
+
+**验证。** 领域 / ABI 层 18 例（新增 2 例）：`angle = 0` 只沿 x 拉出条纹
+（远端行逐字节不动、不沿 y 移动），`angle = 90` 转竖直，`scale = 0.5` 把条纹长度
+减半，一步撤销逐字节还原；越界闸（angle ±90.5、distance 0.5 / 2000.5）；ABI 字段
+搬运与 note caveat。单测 580 → **582 例 / 0 失败**；PE 导出 **138 不变**；壳自检
+**245 项不变**（SHA256 仍 `26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos`
+**6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/filters.md` §1 / §3.8 /
+§5 / §6 / §7 / §8，`docs/shell-parity.md` §5.3，`docs/manual-test.md` M9 追加第 9 条。
 
 
 

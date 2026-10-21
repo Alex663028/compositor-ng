@@ -3,13 +3,14 @@
  * filters.h — Filter 菜单的领域层（P1 滤镜批次）。
  *
  * 背景：Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
- * Add Noise / Grain 在上游是 FilterSettings + PixelFilter.run 的一条通路
- * （Filters.swift:63、:312-356）。这七个算子的像素内核在本仓早已就位
- * （AdjustPixels.h 的 adjust_colored_vignette / adjust_tonal_contrast /
+ * Add Noise / Grain / Motion Blur 在上游是 FilterSettings + PixelFilter.run 的
+ * 一条通路（Filters.swift:63、:312-356）。这八个算子里，前七个的像素内核在本仓
+ * 早已就位（AdjustPixels.h 的 adjust_colored_vignette / adjust_tonal_contrast /
  * adjust_grain、LensPixels.h 的 lens_distort、NoisePixels.h 的 noise_add_at、
- * adjustment_eval.h 的 blur_rgba8_copy），缺的是**产品入口**：参数契约、
- * 与图层几何的装配、一步撤销、与选区的混合。本文件把那条通路收口成一个
- * 领域入口。
+ * adjustment_eval.h 的 blur_rgba8_copy），Motion Blur 没有对应内核，由本文件
+ * 按上游 `CIMotionBlur` 的可观察口径补一份盒式线积分；缺的都是**产品入口**：
+ * 参数契约、与图层几何的装配、一步撤销、与选区的混合。本文件把那条通路
+ * 收口成一个领域入口。
  *
  * 与工具层（tool_ops.h）的分工：
  *   - 工具层按「笔迹 / coverage」工作，一次调用通常落一笔；
@@ -159,6 +160,24 @@ struct GrainSettings {
   uint32_t seed = 0;
 };
 
+/*
+ * Motion Blur（上游 FilterSettings.angle / distance，CIMotionBlur）。
+ *
+ * `angle` -90..90 是方向角（Photoshop 口径：水平为 0，逆时针为正）；
+ * `distance` 1..2000 是条纹长度（图层像素，预览再乘 scale）；**0 = 恒等**。
+ * (0, 1) 与越界值显式拒绝，不静默夹到端点。
+ *
+ * 上游把 `distance / sqrt(12)` 传给 `CIMotionBlur` 的 radius——即让 Core Image
+ * 的（近似）分布与长度为 distance 的均匀条纹同方差。本仓直接做**盒式线积分**，
+ * 条纹长度就是 distance：方向与长度两条可观察口径一致，形状不声称逐像素等同。
+ * 采样在预乘像素上做双线性平均（alpha 一起平均，条纹会向外扩散），坐标夹到
+ * 图层边界（等效上游 `extending(...past canvasSides)` 的边缘延展）。
+ */
+struct MotionBlurSettings {
+  double angle = 0.0;
+  double distance = 0.0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -168,6 +187,7 @@ enum FilterKind {
   kFilterGaussianBlur = 4,
   kFilterAddNoise = 5,
   kFilterGrain = 6,
+  kFilterMotionBlur = 7,
 };
 
 /*
@@ -183,6 +203,7 @@ struct FilterSettings {
   GaussianBlurSettings gaussian_blur;
   AddNoiseSettings add_noise;
   GrainSettings grain;
+  MotionBlurSettings motion_blur;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

@@ -10,6 +10,7 @@
  *   Gaussian Blur   adjustment_eval.h blur_rgba8_copy（与 kind 7 调整层同一实现）
  *   Add Noise       NoisePixels.h   noise_add_at
  *   Grain           AdjustPixels.h  adjust_grain（与 kind 5 调整层同一内核）
+ *   Motion Blur     本文件（上游是 Core Image CIMotionBlur，见 motion_blur_pixels）
  *
  * 本文件只做「校验 -> 装配 -> 调用 -> 选区混合 -> 事务」，不重新定义内核语义。
  */
@@ -128,6 +129,17 @@ bool grain_valid(const GrainSettings& s, std::string* error) {
   if (!in_range(s.size, 0.5, 20.0)) return set_error(error, "grain size out of 0.5..20");
   if (!in_range(s.roughness, 0.0, 100.0)) {
     return set_error(error, "grain roughness out of 0..100");
+  }
+  return true;
+}
+
+bool motion_blur_valid(const MotionBlurSettings& s, std::string* error) {
+  if (!in_range(s.angle, -90.0, 90.0)) {
+    return set_error(error, "motion blur angle out of -90..90");
+  }
+  /* 0 = 恒等；>0 时按上游量程 1..2000。中间那段 (0, 1) 显式拒绝。 */
+  if (s.distance != 0.0 && !in_range(s.distance, 1.0, 2000.0)) {
+    return set_error(error, "motion blur distance must be 0 or in 1..2000");
   }
   return true;
 }
@@ -303,6 +315,85 @@ comp_result grain_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
   return COMP_OK;
 }
 
+/*
+ * Motion Blur：沿 angle 方向的**盒式线积分**（distance = 条纹全长，图层像素，
+ * 预览再乘 scale）。上游把 `distance / sqrt(12)` 传给 CIMotionBlur 的 radius，
+ * 让 Core Image 的分布与长度 distance 的均匀条纹同方差；本仓直接对长度
+ * distance 做平均，方向与长度两条可观察口径一致，形状是盒式而不是 CI 的近似
+ * 高斯，note 如实注明。
+ *
+ * 采样在**预乘**像素上做双线性平均（含 alpha：条纹会向外扩散，与上游不保留
+ * 透明的 motionBlur 一致）；越界坐标夹到边缘（等效上游
+ * `extending(...past: canvasSides)` 的边缘延展）。每像素最多 257 个采样点，
+ * 更长的条纹按步长重采样。
+ */
+comp_result motion_blur_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                               const MotionBlurSettings& s, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const double length = s.distance * scale;
+  if (!(length >= 0.5)) return COMP_OK; /* 亚像素条纹：不改动像素 */
+  const double radians = s.angle * 3.14159265358979323846 / 180.0;
+  /* 屏幕坐标 y 向下：Photoshop 的逆时针正角在这里 dy 取负。 */
+  const double dx = std::cos(radians);
+  const double dy = -std::sin(radians);
+
+  int taps = static_cast<int>(std::ceil(length)) + 1;
+  if (taps < 2) taps = 2;
+  if (taps > 257) taps = 257;
+  const double first = -length / 2.0;
+  const double step = length / static_cast<double>(taps - 1);
+
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+
+  const double last_x = static_cast<double>(width - 1);
+  const double last_y = static_cast<double>(height - 1);
+  auto fetch = [&](double x, double y, double out[4]) {
+    x = std::min(std::max(x, 0.0), last_x);
+    y = std::min(std::max(y, 0.0), last_y);
+    const int32_t x0 = static_cast<int32_t>(x);
+    const int32_t y0 = static_cast<int32_t>(y);
+    const int32_t x1 = x0 < width - 1 ? x0 + 1 : x0;
+    const int32_t y1 = y0 < height - 1 ? y0 + 1 : y0;
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+    const uint8_t* row0 = source.data() + static_cast<size_t>(y0) * row_bytes;
+    const uint8_t* row1 = source.data() + static_cast<size_t>(y1) * row_bytes;
+    const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p10 = row0 + static_cast<size_t>(x1) * 4u;
+    const uint8_t* p01 = row1 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p11 = row1 + static_cast<size_t>(x1) * 4u;
+    for (int c = 0; c < 4; ++c) {
+      const double top = p00[c] + (p10[c] - p00[c]) * fx;
+      const double bottom = p01[c] + (p11[c] - p01[c]) * fx;
+      out[c] = top + (bottom - top) * fy;
+    }
+  };
+
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      double sum[4] = {0.0, 0.0, 0.0, 0.0};
+      for (int t = 0; t < taps; ++t) {
+        const double offset = first + step * static_cast<double>(t);
+        double sample[4];
+        fetch(static_cast<double>(x) + dx * offset, static_cast<double>(y) + dy * offset, sample);
+        for (int c = 0; c < 4; ++c) sum[c] += sample[c];
+      }
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 4; ++c) {
+        long value = std::lround(sum[c] / static_cast<double>(taps));
+        pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y) {
@@ -322,6 +413,8 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return add_noise_pixels(rgba, width, height, stride, settings.add_noise, origin_x, origin_y);
     case kFilterGrain:
       return grain_pixels(rgba, width, height, stride, settings.grain, scale);
+    case kFilterMotionBlur:
+      return motion_blur_pixels(rgba, width, height, stride, settings.motion_blur, scale);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -347,6 +440,7 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterGaussianBlur: return gaussian_blur_valid(settings.gaussian_blur, error);
     case kFilterAddNoise: return add_noise_valid(settings.add_noise, error);
     case kFilterGrain: return grain_valid(settings.grain, error);
+    case kFilterMotionBlur: return motion_blur_valid(settings.motion_blur, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -363,6 +457,7 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterGaussianBlur: return settings.gaussian_blur.radius == 0.0;
     case kFilterAddNoise: return settings.add_noise.amount == 0.0;
     case kFilterGrain: return settings.grain.amount == 0.0;
+    case kFilterMotionBlur: return settings.motion_blur.distance == 0.0;
   }
   return true;
 }
@@ -376,6 +471,7 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterGaussianBlur: return "Gaussian Blur";
     case kFilterAddNoise: return "Add Noise";
     case kFilterGrain: return "Grain";
+    case kFilterMotionBlur: return "Motion Blur";
   }
   return "filter";
 }
@@ -504,6 +600,10 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     }
     if (settings.kind == kFilterGaussianBlur) {
       *note += " via the shared three-pass box approximation of a Gaussian (sigma = radius * scale)";
+    }
+    if (settings.kind == kFilterMotionBlur) {
+      *note += " as a box streak over distance * scale (CIMotionBlur's radius is the equivalent "
+               "standard deviation, so the shape is not pixel-identical)";
     }
     if (clip) *note += ", clipped to the document selection";
   }

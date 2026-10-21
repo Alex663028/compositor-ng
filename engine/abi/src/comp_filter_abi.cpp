@@ -71,6 +71,9 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.grain.size = desc.grain.size;
   settings.grain.roughness = desc.grain.roughness;
   settings.grain.seed = desc.grain.seed;
+
+  settings.motion_blur.angle = desc.motion_blur.angle;
+  settings.motion_blur.distance = desc.motion_blur.distance;
   return settings;
 }
 

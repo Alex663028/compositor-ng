@@ -623,7 +623,7 @@ inline int step_swatch(int index, int direction) {
 /* ------------------------------------------------------------ 滤镜面板 */
 
 /*
- * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..6，尾部追加）；
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..7，尾部追加）；
  * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
  */
 enum class FilterId : int {
@@ -634,6 +634,7 @@ enum class FilterId : int {
   GaussianBlur = 4,
   AddNoise = 5,
   Grain = 6,
+  MotionBlur = 7,
   Count
 };
 
@@ -724,6 +725,15 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"Size", 0.5, 20.0, 0.5, 1.5},
         {"Roughness", 0.0, 100.0, 1.0, 50.0},
         {"Seed", 0.0, 4294967295.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::MotionBlur,
+       "Motion Blur",
+       2,
+       {{"Angle", -90.0, 90.0, 1.0, 0.0},
+        {"Distance", 0.0, 2000.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0}}},
   };

@@ -2,9 +2,9 @@
 /*
  * comp_filter.h — Filter 菜单的 C ABI（P1 滤镜批次）。
  *
- * 语义唯一真源见 `domain/filters.h` 的文件头：七个算子（Vignette / Tonal
- * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain）的像素
- * 口径、选区混合与能力边界都写在那里。
+ * 语义唯一真源见 `domain/filters.h` 的文件头：八个算子（Vignette / Tonal
+ * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain /
+ * Motion Blur）的像素口径、选区混合与能力边界都写在那里。
  *
  * 本头文件只暴露一件事：一次「整层」滤镜调用。
  *
@@ -42,7 +42,8 @@ typedef enum comp_filter_kind {
   COMP_FILTER_LENS_CORRECTION = 3,
   COMP_FILTER_GAUSSIAN_BLUR   = 4,
   COMP_FILTER_ADD_NOISE       = 5,
-  COMP_FILTER_GRAIN           = 6
+  COMP_FILTER_GRAIN           = 6,
+  COMP_FILTER_MOTION_BLUR     = 7
 } comp_filter_kind;
 
 /*
@@ -127,6 +128,16 @@ typedef struct comp_filter_grain {
 } comp_filter_grain;
 
 /*
+ * Motion Blur（上游 FilterSettings.angle / distance，CIMotionBlur）。
+ *   angle     -90..90（度；水平为 0，逆时针为正，Photoshop 口径）
+ *   distance  0 = 恒等；否则 1..2000（条纹长度，图层像素；预览再乘 scale）
+ */
+typedef struct comp_filter_motion_blur {
+  double angle;
+  double distance;
+} comp_filter_motion_blur;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
  */
@@ -139,13 +150,15 @@ typedef struct comp_filter_desc {
   comp_filter_gaussian_blur    gaussian_blur;
   comp_filter_add_noise        add_noise;
   comp_filter_grain            grain;
+  comp_filter_motion_blur      motion_blur;
 } comp_filter_desc;
 
 /*
  * 对目标图层跑一次滤镜。成功返回 COMP_OK。
  *
- * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：只影响高斯半径（Tonal
- * Contrast / Bloom），让降采样预览看起来与全尺寸一致。
+ * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响高斯半径（Tonal
+ * Contrast / Bloom / Gaussian Blur 的 radius、Motion Blur 的 distance），
+ * 让降采样预览看起来与全尺寸一致。
  *
  * 错误码：
  *   参数越界 / 非有限 / desc 为 NULL -> COMP_ERR_INVALID_ARGUMENT
@@ -154,8 +167,8 @@ typedef struct comp_filter_desc {
  *   分配失败                         -> COMP_ERR_OUT_OF_MEMORY
  *
  * note 可为 NULL；非 NULL 时写入 UTF-8 非致命说明（16 位降位、选区裁切、
- * Bloom / Gaussian Blur 的近似口径），两段式：note_capacity 为 0 时只回报所需
- * 长度，out_note_size 写入含 '\0' 的长度。out_changed 可为 NULL。
+ * Bloom / Gaussian Blur / Motion Blur 的近似口径），两段式：note_capacity 为 0
+ * 时只回报所需长度，out_note_size 写入含 '\0' 的长度。out_changed 可为 NULL。
  */
 COMP_API comp_result comp_filter_apply(comp_document document, comp_layer_id target,
                                        const comp_filter_desc* desc, double scale,

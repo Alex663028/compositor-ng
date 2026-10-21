@@ -2939,6 +2939,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::AddNoise) == COMP_FILTER_ADD_N
               "FilterId::AddNoise must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::Grain) == COMP_FILTER_GRAIN,
               "FilterId::Grain must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::MotionBlur) == COMP_FILTER_MOTION_BLUR,
+              "FilterId::MotionBlur must match comp_filter_kind");
 
 std::wstring param_status_text(const comp_ui::FilterPanel& panel) {
   const comp_ui::FilterParamSpec* spec = panel.param_at(panel.focused);
@@ -3074,6 +3076,10 @@ void build_filter_desc(const comp_ui::FilterPanel& panel, comp_filter_desc* out)
       desc.grain.size = panel.value(1);
       desc.grain.roughness = panel.value(2);
       desc.grain.seed = static_cast<uint32_t>(std::llround(panel.value(3)));
+      break;
+    case comp_ui::FilterId::MotionBlur:
+      desc.motion_blur.angle = panel.value(0);
+      desc.motion_blur.distance = panel.value(1);
       break;
     default:
       break;

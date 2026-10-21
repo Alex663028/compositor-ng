@@ -9,6 +9,8 @@
 上游把 Filter 菜单收在 `FilterSettings` + `PixelFilter.run` 一条通路上
 （`Filters.swift:63`、`:312-356`）。本仓的七个像素内核早已就位，缺的是**产品入口**：
 参数契约、与图层几何的装配、一步撤销、与选区的混合。`comp_filter_apply` 就是那条入口。
+Motion Blur 在上游走 Core Image 的 `CIMotionBlur`，本仓没有对应内核，由本层按
+其可观察口径补一份盒式线积分（见 §3.8、§5）。
 
 | 滤镜 | 内核 | 上游来源 |
 |------|------|---------|
@@ -19,6 +21,7 @@
 | Gaussian Blur | `blur_rgba8_copy`（与 blur 工具、Tonal 的 detail 同一实现） | `radius` / `preserveTransparency` |
 | Add Noise | `noise_add_at`（`imaging/NoisePixels.h`） | `amount` / `gaussian` / `monochromatic` / `seed` |
 | Grain | `adjust_grain`（与 Grain 调整层同一内核） | `grain` / `GrainSettings` |
+| Motion Blur | 本文件 `motion_blur_pixels`（盒式线积分，见 §5） | `angle` / `distance`（Core Image `CIMotionBlur`） |
 
 与工具层（[`docs/tool-ops.md`](tool-ops.md)）的分工：
 
@@ -27,7 +30,7 @@
 
 ## 2. 通用契约
 
-- **零初始化 = 恒等**：各子结构的 `amount` / `distortion` 缺省为 0，此时
+- **零初始化 = 恒等**：各子结构的 `amount` / `distortion` / `distance` 缺省为 0，此时
   不动像素、不开事务、`out_changed = 0`，note 写明 `settings are the identity`。
   ABI 不替宿主决定「面板缺省值」——宿主需要上游默认值时自己填（见 §3 各表）。
 - **参数闸在开事务之前**：越界 / 非有限参数返回 `COMP_ERR_INVALID_ARGUMENT`，
@@ -150,6 +153,22 @@ alpha。因此 alpha 通道逐字节不变，轮廓不向外扩散，透明邻�
 （origin 0，`unitsPerPixel = 1 / scale`），与上游
 `grain.apply(job.image, unitsPerPixel: 1 / job.scale, seed: job.seed)` 一致。
 
+### 3.8 Motion Blur（`COMP_FILTER_MOTION_BLUR`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `angle` | -90..90 | 0 | 方向角（度；水平为 0，逆时针为正，Photoshop 口径） |
+| `distance` | 0 = 恒等；否则 1..2000 | 0 | 条纹长度（图层像素；预览再乘 `scale`） |
+
+- **恒等判据只看 `distance`**：`distance = 0` 时不碰像素、不开事务，
+  `angle` 取任何合法值都一样。
+- `(0, 1)` 显式拒绝，不静默夹到 1（与 Gaussian Blur 的 `(0, 0.1)` 同规矩）。
+- 采样在**预乘**像素上沿条纹做双线性平均，alpha 一起平均（条纹会向外扩散，
+  与上游不保留透明的 motionBlur 一致）；越界坐标夹到图层边缘（等效上游
+  `extending(...past: canvasSides)`）。
+- 每像素最多 257 个采样点；更长的条纹按步长重采样（仍覆盖整条长度）。
+- 角度只决定方向，条纹以像素为中心左右对称（上游 `CIMotionBlur` 亦无偏移参数）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -182,8 +201,13 @@ note 写明 `document selection is empty`。
    `applyingGaussianBlur(sigma:)`；本仓用共享的三遍盒式模糊
    （`blur_rgba8_copy`），`sigma = radius * scale`。保证「半径越大越糊、
    alpha 处理按 `preserveTransparency`」这两条可观察口径，不声称逐位一致。
-6. **新三例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain 都跑在
-   8 位工作副本上（见 §6），HDR 拒绝。
+6. **Motion Blur 是盒式条纹，不是 CI 的高斯近似**。上游把
+   `distance / sqrt(12)` 作为 `CIMotionBlur` 的 radius（让 CI 的分布与长度为
+   `distance` 的均匀条纹同方差）；本仓直接对长度 `distance` 做盒式平均。
+   方向与长度两条可观察口径一致，形状不声称逐像素等同，note 写明
+   `CIMotionBlur's radius is the equivalent standard deviation`。
+7. **新四例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur
+   都跑在 8 位工作副本上（见 §6），HDR 拒绝。
 
 ## 6. 16 位与 HDR
 
@@ -197,11 +221,11 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（16 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（18 例，ABI + 域层混合视角）钉住：
 
-- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增三个 kind 的零初始化）；
-- 越界参数在事务之前拒绝（13 组，含 NaN scale；覆盖 blur radius、noise amount、
-  grain size / roughness 的边界内外）；
+- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增四个 kind 的零初始化）；
+- 越界参数在事务之前拒绝（17 组，含 NaN scale；覆盖 blur radius、noise amount、
+  grain size / roughness、motion blur angle / distance 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -216,7 +240,9 @@ note 写明 `document selection is empty`。
 - Add Noise 同 seed 逐字节复现、换 seed 不同、**按文档坐标锚定**（缩进图层与
   全幅图层在重叠处一致）、monochromatic 三通道相等；
 - Grain 同 seed 复现、换 seed 不同、一步撤销；
-- ABI 正确搬运三个新 kind 的字段（含布尔），越界值在 ABI 边界同样被拒。
+- Motion Blur 在 `angle = 0` 时只沿 x 拉出条纹（远端行逐字节不动、不沿 y 移动），
+  `angle = 90` 时转为竖直；`scale = 0.5` 把条纹长度减半；一步撤销；
+- ABI 正确搬运四个新 kind 的字段（含布尔），越界值在 ABI 边界同样被拒。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -235,6 +261,7 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 | Gaussian Blur 0..1 | `gaussian_blur.radius/preserve_transparency` | 0 / 0 |
 | Add Noise 0..3 | `add_noise.amount/gaussian/monochromatic/seed` | 0 / 0 / 0 / 0 |
 | Grain 0..3 | `grain.amount/size/roughness/seed` | 0 / 1.5 / 50 / 0 |
+| Motion Blur 0..1 | `motion_blur.angle/distance` | 0 / 0 |
 
 - **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
   值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。
