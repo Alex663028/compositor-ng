@@ -2047,6 +2047,14 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
     set_status(shell, L"无图层");
     return;
   }
+  /*
+   * 组图层：filter_graph 只烘焙成员、组节点不读自己的 transform，写进去是静默无操作。
+   * 这里如实拒绝（与 Alt 拖动的措辞一致），否则方向键会「看起来动了、画面没动」。
+   */
+  if (row->is_group != 0) {
+    set_status(shell, L"图层位置：组图层不参与 transform 合成，暂不支持整组移动");
+    return;
+  }
   comp_rect transform{};
   float rotation = 0.0f;
   if (comp_layer_get_transform(shell.document, row->id, &transform, &rotation) != COMP_OK) {
@@ -2061,7 +2069,7 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
   }
   shell.needs_render = true;
   wchar_t buffer[128];
-  wsprintfW(buffer, L"图层位置：(%d, %d) 方向键", transform.x, transform.y);
+  wsprintfW(buffer, L"图层位置：(%d, %d)（方向键微调）", transform.x, transform.y);
   refresh_history_status(shell, buffer);
 }
 
@@ -9119,7 +9127,7 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   } else if (id == comp_ui::ToolId::Move) {
     wsprintfW(buffer,
               L"工具：Move（V）· 无选区 = 拖整层、Alt+拖动 = 复制一份再移动；"
-              L"有选区 = 搬选区像素（Alt = 复制）");
+              L"有选区 = 搬选区像素（Alt = 复制）；方向键微调 1 px（Shift 1 / Ctrl 10）");
   } else if (id == comp_ui::ToolId::Zoom) {
     wsprintfW(buffer,
               L"工具：Zoom（点击放大 1.2 倍 / 拖框放大到该区域；Alt+点击缩小；"
@@ -10622,7 +10630,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         panel_rotate_layer(shell, key == VK_RIGHT);
         break;
       }
-      if (!ctrl && !shift) break; /* 无修饰：保持既有行为，交给下面的 OEM 分支之外无动作 */
+      if (!ctrl && !shift) {
+        /*
+         * Move 工具下无修饰方向键 = 微调 1 px（上游 V 的语义）。其它工具保持既有行为
+         * ——左右方向无动作、上下方向选图层——否则会把「换图层」这条基本操作抢走。
+         */
+        if (shell.tool == comp_ui::ToolId::Move && shell.document != nullptr) {
+          panel_move_layer(shell, key == VK_LEFT ? -1 : 1, 0);
+        }
+        break;
+      }
       const int step = comp_ui::layer_transform_move_step(ctrl);
       panel_move_layer(shell, key == VK_LEFT ? -step : step, 0);
       break;
@@ -10637,6 +10654,12 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       if (ctrl && shift) {
         run_shell_command(window, shell,
                           key == VK_UP ? kCmdLayerBringForward : kCmdLayerSendBackward);
+        break;
+      }
+      /* Move 工具 + 无修饰 = 微调 1 px；与左右方向同一口径，见上。 */
+      if (!shift && !ctrl && shell.tool == comp_ui::ToolId::Move &&
+          shell.document != nullptr) {
+        panel_move_layer(shell, 0, key == VK_UP ? -1 : 1);
         break;
       }
       /* 无修饰仍是选图层；Shift/Ctrl 才平移（避免与既有 ↑↓ 选图层抢键）。 */
