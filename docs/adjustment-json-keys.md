@@ -26,8 +26,8 @@
 | kind | 名称（上游 rawValue） | 面板可逐参数编辑 |
 |------|----------------------|------------------|
 | 0 | `Hue/Saturation` | 是 |
-| 1 | `Levels` | 否（需专用色阶编辑器） |
-| 2 | `Curves` | 否（需专用曲线编辑器） |
+| 1 | `Levels` | 是（通道条 + 20 个滑杆参数，§3.1） |
+| 2 | `Curves` | 专用控制点编辑器（不走参数表，§3.2 + §5 曲线 ABI） |
 | 3 | `Exposure` | 是 |
 | 4 | `Gradient Map` | 是 |
 | 5 | `Grain` | 是 |
@@ -55,15 +55,37 @@
 | `lightness` | number | -100 … 100 | 0 |
 | `colorize` | bool | — | false |
 
-### kind 1 — Levels（`levels` 对象，浅层校验）
+### kind 1 — Levels（`levels` 对象）
 
-`levels.channel`（`"RGB"` / `"Red"` / `"Green"` / `"Blue"`）与
-`levels.ranges`（4 个 `{ black, gamma, white, outputBlack, outputWhite }`，默认 `0, 1, 255, 0, 255`）。
-结构复杂，面板不编辑；ABI 层只要求 `levels` 是对象。
+`levels.channel`（`"RGB"` / `"Red"` / `"Green"` / `"Blue"`）只决定面板高亮哪个通道条，
+求值恒为「RGB 用 `ranges[0]`，R/G/B 各用 `ranges[1..3]`」（同上游 `Levels.swift`）。
+`levels.ranges` 是**定长 4 项**数组，每项 `{ black, gamma, white, outputBlack, outputWhite }`；
+数组下标有语义，所以参数表里的路径带数字段（`levels.ranges.1.black` 等），ABI 按数组下标解析。
 
-### kind 2 — Curves（`curves` 对象，浅层校验）
+| 路径（`ranges.<i>.` 后同列，i = 0…3） | 标签前缀 | 类型 | 范围 | 默认 |
+|------|------|------|------|------|
+| `black` | `RGB` / `R` / `G` / `B` `Black` | number | 0 … 254 | 0 |
+| `gamma` | `… Gamma` | number | 0.1 … 9.99 | 1 |
+| `white` | `… White` | number | 1 … 255 | 255 |
+| `outputBlack` | `… OutLo` | number | 0 … 255 | 0 |
+| `outputWhite` | `… OutHi` | number | 0 … 255 | 255 |
 
-面板不编辑；ABI 层只要求 `curves` 是对象。
+`white` 与 `black` 的相对顺序不靠校验兜底，由求值侧 `normalize()` 保证（同上游）。
+面板渲染顺序 = 上表顺序（通道分页：`levels.channel` 决定当前页，20 个参数全量可滚）。
+
+### kind 2 — Curves（`curves` 对象）
+
+```json
+{ "curves": { "channels": [ [ {"x": 0, "y": 0}, {"x": 128, "y": 190}, {"x": 255, "y": 255} ],
+                           [], [], [] ] } }
+```
+
+- `channels` 是 4 项数组，下标 0 = RGB 合成，1..3 = R/G/B；**空数组 = 恒等曲线**（不是错误）。
+- 每通道 2..32 个点，`x` 严格递增、首点 `x = 0`、末点 `x = 255`、`x`/`y` 都在 0..255。
+- 点同时接受对象形式 `{"x":N,"y":N}` 与紧凑形式 `[x, y]`（上游两种都出现过）。
+- 曲线求值是形状保持的三次 Hermite（Fritsch–Carlson），见 `engine/compositing/adjustment_eval.cpp`。
+
+面板不通过参数表编辑（`param_count` = 0），而是调 §5 的 4 个曲线纯函数读写 `channels`。
 
 ### kind 3 — Exposure
 
@@ -156,10 +178,12 @@
 
 1. `kind` 必须 < 12；
 2. `settings` 必须是 JSON **对象**（空串按 `{}` 处理）；
-3. 顶层键必须在白名单内（= §3 各路径的根段 + 允许但不可编辑的 `hsvSettings` / `levels` / `curves`）——
+3. 顶层键必须在白名单内（= §3 各路径的根段，加上 kind 0 允许的包裹层 `hsvSettings`）——
    多余键直接拒绝，避免打错键名却静默无效；
 4. §3 列出的数值/布尔叶子若存在，必须类型正确且在范围内；
-5. `levels` / `curves` 只做「是对象」的浅层校验。
+5. `levels` 必须是对象、`ranges` 必须是定长 4 项数组；`curves` 必须是对象，并做
+   §3.2 的**结构**校验（通道数、点数、x 递增、端点锁死、值域）——变长控制点表达不了
+   在静态参数表里，所以这部分校验在 `curves_settings.cpp`。
 
 失败返回 `COMP_ERR_INVALID_ARGUMENT`，错误文本经 `comp_engine_last_error` 可取。
 **读取路径不校验**：`.comp` 载入时对 `engineAdjustments` 原样保真，不因参数越界而拒绝工程文件。
@@ -170,15 +194,33 @@
 |------|------|
 | `comp_layer_add_adjustment(doc, id, kind, settings_json)` | 追加调整（校验后写入，构成一个撤销步） |
 | `comp_layer_update_adjustment(doc, id, settings_json)` | 替换该图层**首个**调整的 settings（kind 沿用） |
+| `comp_layer_update_adjustment_at(doc, id, index, kind, settings_json)` | 替换第 `index` 个调整；面板改曲线时用它（**写入 = 一个撤销步**） |
 | `comp_layer_adjustment_validate(kind, settings_json)` | 只校验不写入 |
 | `comp_layer_adjustment_kind_name(kind, &name)` | 取规范名称 |
 | `comp_layer_adjustment_param_count(kind, &count)` | 可编辑参数个数（面板据此决定是否渲染控件） |
 | `comp_layer_adjustment_param_at(kind, i, &param)` | 取参数元数据（路径/标签/类型/范围/默认） |
 | `comp_layer_adjustment_count(doc, id, &count)` | 图层上调整数量（面板列出既有调整） |
 | `comp_layer_adjustment_at(doc, id, i, &kind, buf, cap, &size)` | 读取第 i 个调整（两段式字符串） |
+| `comp_layer_curves_channel_count(&count)` | 通道数（恒 4：0 = RGB，1..3 = R/G/B） |
+| `comp_layer_curves_point_count(settings, channel, &count)` | 该通道控制点数（缺省/非法 = 0，即恒等） |
+| `comp_layer_curves_point_at(settings, channel, i, &x, &y)` | 读第 i 个控制点（越界 `COMP_ERR_NOT_FOUND`） |
+| `comp_layer_curves_set_points(settings, channel, pts, n, buf, cap, &size)` | 改写该通道点列，返回新 settings（两段式；纯函数，**不开事务、不写文档**） |
+
+**曲线的撤销从哪来**：上面 4 个曲线接口都是纯函数（只在 settings JSON 字符串上操作）。
+面板「按下 → 拖动 → 松手」的把戏是：`comp_txn_begin` 一次，拖动过程中反复
+`comp_layer_curves_set_points` + `comp_layer_update_adjustment_at` 做实时预览，松手时
+`comp_txn_commit` —— 于是整段拖动只占**一个**撤销步；拖动没改动像素则 `comp_txn_abort`，
+不留空步（`tests/test_adjustment.cpp` 的 `curves_*` 用例守着这两条）。
+点列落盘后逐点不变（`curves_points_survive_comp_round_trip` 用 `.comp` 往返证明）。
 
 ## 6. 已知未覆盖
 
-- **Levels / Curves 无面板编辑**：需要专用编辑器（色阶直方图、曲线控制点），当前仅保真存取并做浅层校验。
+- **曲线只有 RGB/R/G/B 四通道**：上游的「单独编辑某通道同时看合成结果」已覆盖，
+  但预设（如强对比 S 曲线库）、直方图背景、曲线求值以外的插值策略（单调三次 vs
+  Catmull-Rom 可选）都没有——求值固定为 Fritsch–Carlson 形状保持 Hermite。
+- **色阶通道条只是面板分页**：点通道条只改外壳当前页（`ShellState.adj_channel`），
+  **不写回** settings 里的 `levels.channel`；求值始终把 `ranges[0]` 用在合成通道、
+  `ranges[1..3]` 各管一个色彩通道（与上游 `Levels.swift` 一致）。所以「只调红通道」
+  的正确做法是改 `ranges.1.*`，而不是先点红通道再改第一页。
 - **无删除调整接口**：暂未提供 `comp_layer_remove_adjustment`，面板不提供删除按钮。
 - **上游对象型键不覆盖**：上游自有的 adjustment 表现形式不在本轮改写范围（见 README §6.3）。

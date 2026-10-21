@@ -430,6 +430,15 @@ void JsonValue::push(JsonValue value) {
   array_.push_back(std::move(value));
 }
 
+void JsonValue::set_index(size_t index, JsonValue value) {
+  if (type_ != Type::Array) {
+    type_ = Type::Array;
+    array_.clear();
+  }
+  if (array_.size() <= index) array_.resize(index + 1);
+  array_[index] = std::move(value);
+}
+
 std::string json_dump(const JsonValue& value, int indent) {
   std::string out;
   dump_into(value, indent, 0, &out);

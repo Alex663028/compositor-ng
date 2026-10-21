@@ -238,6 +238,31 @@ struct ShellState {
   int32_t adj_param = 0;                 /* 聚焦的可编辑参数序号 */
   std::vector<std::string> adj_values;   /* 与参数表对齐的 ASCII 编辑值 */
   std::wstring adj_input;                /* 键入缓冲；非空 = 输入态 */
+  /*
+   * P0-3 滑杆拖动：按下即进拖动态并开显式事务（只有选中既有调整时才开），拖动
+   * 途中每次写回都落在同一事务里，松手提交 = 一步撤销；Esc / 失焦则 abort 回滚。
+   * adj_drag_track 是按下瞬间的滑道矩形——拖动途中不重算几何，面板不会在指针
+   * 下「跑掉」。adj_scroll 是长参数表（色阶 20 行）滚掉的行数。
+   */
+  int32_t adj_drag_param = -1;
+  comp_ui::Rect adj_drag_track{};
+  comp_txn adj_drag_txn = nullptr;
+  bool adj_drag_dirty = false;
+  int32_t adj_scroll = 0;
+  /*
+   * P0-3 色阶按通道分页（RGB / R / G / B，每页 5 行）与曲线编辑器状态。
+   * curve_xy 是**当前通道**的控制点（x,y 交替、已按 x 升序），与 settings 里的
+   * curves.channels[channel] 同步；空表示该通道没有点（= 恒等曲线）。
+   * 拖动走显式事务：按下开、每次移动写、松手提交，一次拖动 = 一步撤销。
+   */
+  int32_t adj_channel = 0;
+  int32_t curve_channel = 0;
+  std::vector<double> curve_xy;
+  int32_t curve_focus_point = -1;
+  int32_t curve_drag_point = -1;
+  comp_ui::Rect curve_drag_plot; /* 拖动期间冻结的绘图区（指针 -> 值换算用） */
+  comp_txn curve_drag_txn = nullptr;
+  bool curve_drag_dirty = false;
   /* 画布视图与工具状态：几何/变换全部来自 ui_core.h，壳内不重复实现。 */
   comp_ui::CanvasView view;
   comp_ui::ToolId tool = comp_ui::ToolId::Select;
@@ -474,6 +499,12 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 
 /* 调整面板在下方定义；refresh_layers 需要它同步选中图层的调整列表。 */
 void refresh_adjustments(ShellState& shell);
+
+/* 曲线控制点缓存跟随「选中调整 + 当前通道」，refresh_adjustments 末尾统一重读。 */
+void refresh_curve_points(ShellState& shell);
+
+/* 通道名（RGB / R / G / B）：色阶通道条与曲线通道条共用，绘制在面板段之前。 */
+const wchar_t* curve_channel_name(int32_t channel);
 
 /* S22：直方图数据同源于下方定义；refresh_layers 在换层/变更后统一刷新它。 */
 void refresh_histogram(ShellState& shell);
@@ -2448,6 +2479,20 @@ const char* adjustment_kind_name(uint32_t kind) {
   return name;
 }
 
+/*
+ * 色阶 = 4 通道 × 5 参（参数表顺序 `levels.ranges.N.field` 由引擎钉住，
+ * tests/test_adjustment.cpp 有逐项断言）。面板按通道分页，一次只显示 5 行；
+ * 其它 kind 不分页（整表显示）。这两个常量只描述「怎么分页」，不复制任何键名。
+ */
+constexpr int32_t kLevelsChannelCount = 4;
+constexpr int32_t kLevelsFieldsPerChannel = 5;
+constexpr int32_t kCurveChannels = 4;
+
+bool adjust_paged_kind(uint32_t kind) { return kind == COMP_ADJUSTMENT_LEVELS; }
+int32_t adjust_channel_count(uint32_t kind) {
+  return adjust_paged_kind(kind) ? kLevelsChannelCount : 1;
+}
+
 /* 重建编辑值：以缺省值为底；若选中了既有调整，则按 settings 回填（引擎侧解析 JSON）。 */
 void reset_adjustment_values(ShellState& shell) {
   shell.adj_values.clear();
@@ -2495,6 +2540,20 @@ void reset_adjustment_values(ShellState& shell) {
     }
     shell.adj_values.push_back(text);
   }
+
+  /*
+   * 分页视图的入口状态：通道号只夹取、不重置——拖动结束会走 refresh -> 这里，
+   * 若在这里把通道清 0，用户拖 B 通道的滑杆松手就会被弹回 RGB。焦点落在当前
+   * 通道首行，避免高亮停在不显示的行上。
+   */
+  const int32_t channels = adjust_channel_count(static_cast<uint32_t>(shell.adj_kind));
+  if (shell.adj_channel < 0) shell.adj_channel = 0;
+  if (shell.adj_channel >= channels) shell.adj_channel = channels - 1;
+  shell.adj_param =
+      adjust_paged_kind(static_cast<uint32_t>(shell.adj_kind))
+          ? shell.adj_channel * kLevelsFieldsPerChannel
+          : 0;
+  if (shell.adj_param >= static_cast<int32_t>(shell.adj_values.size())) shell.adj_param = 0;
 }
 
 /* 读取选中图层的调整列表（只读，不开事务），并把 kind 与编辑值同步过来。 */
@@ -2506,6 +2565,7 @@ void refresh_adjustments(ShellState& shell) {
   if (id == 0) {
     shell.selected_adjustment = -1;
     reset_adjustment_values(shell);
+    refresh_curve_points(shell);
     return;
   }
   size_t count = 0;
@@ -2529,6 +2589,7 @@ void refresh_adjustments(ShellState& shell) {
     shell.adj_kind = static_cast<int32_t>(shell.adj_kinds[static_cast<size_t>(shell.selected_adjustment)]);
   }
   reset_adjustment_values(shell);
+  refresh_curve_points(shell);
 }
 
 void panel_cycle_kind(ShellState& shell, int32_t delta) {
@@ -2539,6 +2600,7 @@ void panel_cycle_kind(ShellState& shell, int32_t delta) {
   shell.adj_kind = kind;
   shell.selected_adjustment = -1; /* 换类型即进入「新增」态 */
   reset_adjustment_values(shell);
+  refresh_curve_points(shell);
   wchar_t buffer[160];
   wsprintfW(buffer, L"调整类型 %d/%d：%s", shell.adj_kind + 1, total,
             widen_ascii(adjustment_kind_name(static_cast<uint32_t>(kind))).c_str());
@@ -2557,11 +2619,15 @@ void panel_select_adjustment(ShellState& shell, int32_t delta) {
   shell.selected_adjustment = next;
   shell.adj_kind = static_cast<int32_t>(shell.adj_kinds[static_cast<size_t>(next)]);
   reset_adjustment_values(shell);
+  refresh_curve_points(shell);
   wchar_t buffer[160];
   wsprintfW(buffer, L"已选中调整 #%d：%s", next + 1,
             widen_ascii(adjustment_kind_name(static_cast<uint32_t>(shell.adj_kind))).c_str());
   set_status(shell, buffer);
 }
+
+/* 定义在后面（要用 client_layout），先声明给「切参数时自动滚动」用。 */
+void adjust_scroll_to_focus(ShellState& shell);
 
 void panel_move_param(ShellState& shell, int32_t delta) {
   const int32_t count = static_cast<int32_t>(shell.adj_values.size());
@@ -2569,9 +2635,15 @@ void panel_move_param(ShellState& shell, int32_t delta) {
     set_status(shell, L"当前调整没有可编辑参数");
     return;
   }
+  /* 分页视图（色阶）里 Tab 只在当前通道的 5 行内绕，不会串到别的通道。 */
+  const bool paged = adjust_paged_kind(static_cast<uint32_t>(shell.adj_kind));
+  const int32_t first = paged ? shell.adj_channel * kLevelsFieldsPerChannel : 0;
+  int32_t last = paged ? first + kLevelsFieldsPerChannel - 1 : count - 1;
+  if (last >= count) last = count - 1;
+  if (last < first) last = first;
   int32_t next = shell.adj_param + delta;
-  if (next < 0) next = 0;
-  if (next >= count) next = count - 1;
+  if (next < first) next = first;
+  if (next > last) next = last;
   shell.adj_param = next;
   comp_adjustment_param param{};
   if (comp_layer_adjustment_param_at(static_cast<uint32_t>(shell.adj_kind), static_cast<size_t>(next),
@@ -2584,6 +2656,33 @@ void panel_move_param(ShellState& shell, int32_t delta) {
             widen_ascii(shell.adj_values[static_cast<size_t>(next)].c_str()).c_str());
   set_status(shell, buffer);
   shell.adj_input.clear();
+  /* 色阶 20 行、小窗口只显示 12 行，切参数后必须把焦点行滚进可视区。 */
+  adjust_scroll_to_focus(shell);
+}
+
+/* 面板当前显示的行数，以及「相对行 -> 参数表下标」的基址。分页视图下两者不再
+ * 相等：色阶 20 项按通道切成 4 页，每页 5 行。绘制/命中/滚动全用这两个函数。 */
+int32_t adjust_shown_count(const ShellState& shell) {
+  const int32_t total = static_cast<int32_t>(shell.adj_values.size());
+  if (!adjust_paged_kind(static_cast<uint32_t>(shell.adj_kind))) return total;
+  const int32_t base = shell.adj_channel * kLevelsFieldsPerChannel;
+  if (base >= total) return 0;
+  const int32_t rest = total - base;
+  return rest < kLevelsFieldsPerChannel ? rest : kLevelsFieldsPerChannel;
+}
+
+int32_t adjust_param_base(const ShellState& shell) {
+  return adjust_paged_kind(static_cast<uint32_t>(shell.adj_kind))
+             ? shell.adj_channel * kLevelsFieldsPerChannel
+             : 0;
+}
+
+/* 键盘/滑杆共用的步长：宽量程一律 1（色阶 0..255、±100 的明暗这类「整数量」），
+ * 窄量程取百分之一（gamma、曝光这类必须留小数的）。 */
+double adjust_param_step(const comp_adjustment_param& param) {
+  const double span = param.max_value - param.min_value;
+  if (!(span > 0.0)) return 0.0;
+  return span >= 50.0 ? 1.0 : span / 100.0;
 }
 
 void panel_step_value(ShellState& shell, int32_t direction) {
@@ -2599,13 +2698,11 @@ void panel_step_value(ShellState& shell, int32_t direction) {
   if (param.type == COMP_PARAM_BOOL) {
     shell.adj_values[index] = shell.adj_values[index] == "1" ? "0" : "1";
   } else {
-    double value = std::atof(shell.adj_values[index].c_str());
-    double step = (param.max_value - param.min_value) / 100.0;
-    if (step <= 0.0) step = 1.0;
-    value += static_cast<double>(direction) * step;
-    if (value < param.min_value) value = param.min_value;
-    if (value > param.max_value) value = param.max_value;
-    shell.adj_values[index] = number_text(value);
+    const double value = std::atof(shell.adj_values[index].c_str()) +
+                         static_cast<double>(direction) * adjust_param_step(param);
+    /* 与滑杆同一套归整：键盘调出来的值不许是 40.000000000000004。 */
+    shell.adj_values[index] =
+        number_text(comp_ui::adjust_snap_value(value, param.min_value, param.max_value));
   }
   shell.adj_input.clear();
   wchar_t buffer[220];
@@ -2722,6 +2819,7 @@ void panel_apply_adjustment(ShellState& shell, bool add) {
   } else if (add) {
     reset_adjustment_values(shell);
   }
+  if (add) refresh_curve_points(shell);
 
   wchar_t buffer[180];
   wsprintfW(buffer, L"%s：%s",
@@ -5314,6 +5412,115 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   TextOutW(dc, panel_rect.x + 10, panel_rect.bottom() - 26, hint2, lstrlenW(hint2));
 }
 
+/* 通道条（色阶 / 曲线共用）：激活通道填蓝，其余深灰。 */
+void draw_channel_chip(HDC dc, const comp_ui::Rect& rect, const wchar_t* name, bool active) {
+  RECT box{rect.x, rect.y, rect.right(), rect.bottom()};
+  HBRUSH brush = CreateSolidBrush(active ? RGB(66, 106, 176) : RGB(38, 42, 52));
+  FillRect(dc, &box, brush);
+  DeleteObject(brush);
+  SetTextColor(dc, active ? RGB(255, 255, 255) : RGB(168, 174, 190));
+  SIZE extent{};
+  GetTextExtentPoint32W(dc, name, lstrlenW(name), &extent);
+  TextOutW(dc, rect.x + (rect.w - extent.cx) / 2, rect.y + 1, name, lstrlenW(name));
+}
+
+/*
+ * 曲线编辑器（P0-3）：通道条 + 正方形绘图区 + 折线 + 控制点。
+ * 折线用 ui_core::curve_eval 采样，与引擎 Curve::apply 同一套 Hermite 公式——
+ * 画出来的线和真实像素映射一致，否则用户会照着一条错的线调。
+ */
+void draw_curve_editor(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  for (int32_t c = 0; c < kCurveChannels; ++c) {
+    draw_channel_chip(dc, comp_ui::curve_channel_chip_rect(panel_rect, c, kCurveChannels),
+                      curve_channel_name(c), c == shell.curve_channel);
+  }
+  const comp_ui::Rect plot = comp_ui::adjust_curve_plot_rect(panel_rect);
+  if (plot.empty()) return;
+
+  RECT box{plot.x, plot.y, plot.right(), plot.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(14, 16, 20));
+  FillRect(dc, &box, background);
+  DeleteObject(background);
+
+  /* 四分网格 + 恒等参考线（虚线），值是 0..255 的线性刻度。 */
+  HPEN grid = CreatePen(PS_SOLID, 1, RGB(42, 46, 56));
+  HGDIOBJ old_pen = SelectObject(dc, grid);
+  for (int i = 1; i < 4; ++i) {
+    const int gx = plot.x + plot.w * i / 4;
+    MoveToEx(dc, gx, plot.y, nullptr);
+    LineTo(dc, gx, plot.bottom());
+    const int gy = plot.y + plot.h * i / 4;
+    MoveToEx(dc, plot.x, gy, nullptr);
+    LineTo(dc, plot.right(), gy);
+  }
+  SelectObject(dc, old_pen);
+  DeleteObject(grid);
+  HPEN diagonal = CreatePen(PS_DOT, 1, RGB(74, 78, 90));
+  old_pen = SelectObject(dc, diagonal);
+  MoveToEx(dc, plot.x, plot.bottom() - 1, nullptr);
+  LineTo(dc, plot.right() - 1, plot.y);
+  SelectObject(dc, old_pen);
+  DeleteObject(diagonal);
+
+  /* 空通道按恒等画：用户看到的是「这条调整目前什么都不改」。 */
+  static const double kIdentity[] = {0.0, 0.0, 255.0, 255.0};
+  const int32_t count = static_cast<int32_t>(shell.curve_xy.size() / 2);
+  const double* points = count >= 2 ? shell.curve_xy.data() : kIdentity;
+  const int drawn = count >= 2 ? static_cast<int>(count) : 2;
+
+  HPEN curve_pen = CreatePen(PS_SOLID, 2, RGB(120, 200, 255));
+  old_pen = SelectObject(dc, curve_pen);
+  const auto y_for = [&](double value) {
+    return static_cast<int>(std::lround(comp_ui::curve_plot_value_to_y(plot, value)));
+  };
+  MoveToEx(dc, static_cast<int>(std::lround(comp_ui::curve_plot_value_to_x(plot, 0.0))),
+           y_for(comp_ui::curve_eval(points, drawn, 0.0)), nullptr);
+  for (int px = 1; px < plot.w; ++px) {
+    const double value_x = comp_ui::curve_plot_x_to_value(plot, plot.x + px);
+    LineTo(dc, plot.x + px, y_for(comp_ui::curve_eval(points, drawn, value_x)));
+  }
+  SelectObject(dc, old_pen);
+  DeleteObject(curve_pen);
+
+  /* 控制点：端点画空心（x 锁死），内部点实心；焦点/拖动中描黄边。 */
+  for (int32_t i = 0; i < drawn; ++i) {
+    const double px = comp_ui::curve_plot_value_to_x(plot, points[2 * i]);
+    const double py = comp_ui::curve_plot_value_to_y(plot, points[2 * i + 1]);
+    const int cx = static_cast<int>(std::lround(px));
+    const int cy = static_cast<int>(std::lround(py));
+    const bool endpoint = i == 0 || i == drawn - 1;
+    const bool hot = i == shell.curve_focus_point || i == shell.curve_drag_point;
+    RECT dot{cx - 3, cy - 3, cx + 4, cy + 4};
+    HBRUSH fill = CreateSolidBrush(hot ? RGB(255, 226, 140)
+                                       : (count >= 2 && endpoint ? RGB(150, 156, 172)
+                                                                 : RGB(226, 232, 244)));
+    FillRect(dc, &dot, fill);
+    DeleteObject(fill);
+  }
+
+  wchar_t line[220];
+  SetTextColor(dc, RGB(150, 154, 166));
+  if (shell.curve_focus_point >= 0 && count >= 2 &&
+      shell.curve_focus_point < static_cast<int32_t>(shell.curve_xy.size() / 2)) {
+    /* wsprintfW 只认整数宽度，%f 会把参数当 int 取、指针读飞（在 user32 里 AV）。 */
+    const std::wstring point_x =
+        widen_ascii(number_text(shell.curve_xy[static_cast<size_t>(2 * shell.curve_focus_point)])
+                        .c_str());
+    const std::wstring point_y =
+        widen_ascii(number_text(shell.curve_xy[static_cast<size_t>(2 * shell.curve_focus_point + 1)])
+                        .c_str());
+    wsprintfW(line, L"%s · 点 %d/%d = (%s, %s)", curve_channel_name(shell.curve_channel),
+              shell.curve_focus_point + 1, static_cast<int>(count), point_x.c_str(),
+              point_y.c_str());
+  } else {
+    wsprintfW(line, L"%s · %d 个控制点%s", curve_channel_name(shell.curve_channel),
+              static_cast<int>(count), count < 2 ? L"（恒等）" : L"");
+  }
+  TextOutW(dc, plot.x, plot.bottom() + 4, line, lstrlenW(line));
+  const wchar_t* help = L"点击加点 · 拖动改点 · Delete 删点";
+  TextOutW(dc, plot.x, plot.bottom() + 20, help, lstrlenW(help));
+}
+
 /* 调整面板：控件完全由 ABI 元数据生成（外壳不复制键名表、不解析 JSON）。 */
 void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
   const int left = panel_rect.x;
@@ -5338,75 +5545,143 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   TextOutW(dc, left + 10, y, line, lstrlenW(line));
   y += kAdjustRowHeight;
 
-  size_t param_count = 0;
-  comp_layer_adjustment_param_count(static_cast<uint32_t>(shell.adj_kind), &param_count);
-  if (param_count == 0) {
+  /* 色阶通道条：标题行右侧，四个通道各一页（参数行几何因此不用变）。 */
+  const bool paged = adjust_paged_kind(static_cast<uint32_t>(shell.adj_kind));
+  if (paged) {
+    for (int32_t c = 0; c < kLevelsChannelCount; ++c) {
+      draw_channel_chip(dc, comp_ui::adjust_channel_chip_rect(panel_rect, c, kLevelsChannelCount),
+                        curve_channel_name(c), c == shell.adj_channel);
+    }
+  }
+
+  /* 面板显示的行数（分页视图下参数总数 != 显示行数）与「相对行 -> 参数下标」的基址。 */
+  const int shown_total = adjust_shown_count(shell);
+  const int base = adjust_param_base(shell);
+  const int scroll = comp_ui::adjust_param_clamp_scroll(panel_rect, shown_total, shell.adj_scroll);
+  const int visible = comp_ui::adjust_param_visible_rows(panel_rect);
+  if (shell.adj_kind == COMP_ADJUSTMENT_CURVES) {
+    /* 曲线没有标量参数：参数表位置让给绘图区。 */
+    draw_curve_editor(dc, shell, panel_rect);
+  } else if (shown_total == 0) {
     SetTextColor(dc, RGB(200, 170, 120));
     const wchar_t* note = L"（该类型无可面板编辑参数）";
     TextOutW(dc, left + 10, y, note, lstrlenW(note));
-    y += kAdjustRowHeight;
   } else {
-    for (size_t i = 0; i < param_count; ++i) {
+    /*
+     * P0-3：每个参数 = 上 18 px「标签 + 数值」+ 下 16 px 滑道。行几何来自
+     * ui_core::adjust_param_row_rect，命中测试用的是同一个函数——绘制与命中同源。
+     * 超出可视区的行不画；滚动量在这里夹一次，长表（色阶 20 行）不会画到提示区。
+     */
+    for (int row = scroll; row < shown_total && row < scroll + visible; ++row) {
+      const int index = base + row; /* 相对行 -> 参数表绝对下标 */
       comp_adjustment_param param{};
-      if (comp_layer_adjustment_param_at(static_cast<uint32_t>(shell.adj_kind), i, &param) != COMP_OK) {
+      if (comp_layer_adjustment_param_at(static_cast<uint32_t>(shell.adj_kind),
+                                         static_cast<size_t>(index), &param) != COMP_OK) {
         break;
       }
-      const bool focused = static_cast<int32_t>(i) == shell.adj_param;
+      const comp_ui::Rect row_rect = comp_ui::adjust_param_row_rect(panel_rect, row, scroll);
+      const bool focused = index == shell.adj_param;
       if (focused) {
-        RECT highlight{left + 4, y - 2, panel_rect.right() - 6, y + kAdjustRowHeight - 4};
+        RECT highlight{row_rect.x + 4, row_rect.y - 1, row_rect.right() - 6,
+                       row_rect.bottom() - 1};
         HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
         FillRect(dc, &highlight, brush);
         DeleteObject(brush);
       }
-      SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
-      const std::string value =
-          i < shell.adj_values.size() ? shell.adj_values[i] : std::string("?");
-      if (param.type == COMP_PARAM_BOOL) {
-        wsprintfW(line, L"%s = %s", widen_ascii(param.label).c_str(),
-                  value == "1" ? L"true" : L"false");
+      const std::string value = static_cast<size_t>(index) < shell.adj_values.size()
+                                    ? shell.adj_values[static_cast<size_t>(index)]
+                                    : std::string("?");
+      std::wstring shown;
+      if (focused && !shell.adj_input.empty()) {
+        shown = L"输入中：";
+        shown += shell.adj_input;
+      } else if (param.type == COMP_PARAM_BOOL) {
+        shown = value == "1" ? L"true" : L"false";
       } else {
-        wsprintfW(line, L"%s = %s", widen_ascii(param.label).c_str(),
-                  widen_ascii(value.c_str()).c_str());
+        shown = widen_ascii(value.c_str());
       }
-      TextOutW(dc, left + 12, y, line, lstrlenW(line));
-      y += kAdjustRowHeight;
+      const std::wstring label = widen_ascii(param.label != nullptr ? param.label : "");
+      SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+      TextOutW(dc, row_rect.x + 12, row_rect.y + 1, label.c_str(), lstrlenW(label.c_str()));
+      /* 数值右对齐：滑道两端和数字对齐，拖动时眼睛不用在行里找。 */
+      SIZE extent{};
+      GetTextExtentPoint32W(dc, shown.c_str(), lstrlenW(shown.c_str()), &extent);
+      TextOutW(dc, row_rect.right() - 12 - extent.cx, row_rect.y + 1, shown.c_str(),
+               lstrlenW(shown.c_str()));
+      if (param.type == COMP_PARAM_BOOL) continue;
+
+      const comp_ui::Rect track = comp_ui::adjust_slider_track_rect(row_rect);
+      const int mid = track.y + track.h / 2;
+      HBRUSH groove = CreateSolidBrush(RGB(44, 48, 58));
+      RECT groove_rect{track.x, mid - 2, track.right(), mid + 2};
+      FillRect(dc, &groove_rect, groove);
+      DeleteObject(groove);
+
+      const double number = std::atof(value.c_str());
+      const int knob_x = static_cast<int>(std::lround(comp_ui::adjust_slider_knob_x(
+          track, number, param.min_value, param.max_value)));
+      if (knob_x > track.x) {
+        HBRUSH filled = CreateSolidBrush(RGB(78, 126, 208));
+        RECT fill_rect{track.x, mid - 2, knob_x, mid + 2};
+        FillRect(dc, &fill_rect, filled);
+        DeleteObject(filled);
+      }
+      HBRUSH knob = CreateSolidBrush(focused ? RGB(255, 240, 190) : RGB(214, 220, 232));
+      RECT knob_rect{knob_x - 3, track.y + 2, knob_x + 4, track.bottom() - 2};
+      FillRect(dc, &knob_rect, knob);
+      DeleteObject(knob);
+    }
+    /* 长表/分页滚动位置：只在小窗口 / 每页放不下 5 行时出现。 */
+    if (comp_ui::adjust_param_max_scroll(panel_rect, shown_total) > 0) {
+      const int last_row = scroll + visible < shown_total ? scroll + visible : shown_total;
+      wsprintfW(line, L"%d-%d / %d", scroll + 1, last_row, shown_total);
+      SetTextColor(dc, RGB(150, 154, 166));
+      SIZE extent{};
+      GetTextExtentPoint32W(dc, line, lstrlenW(line), &extent);
+      TextOutW(dc, panel_rect.right() - 12 - extent.cx, panel_rect.y + 30, line,
+               lstrlenW(line));
     }
   }
 
-  y += 8;
+  /*
+   * 底部固定区（高度 = kAdjustPanelFooter）：上「已有调整」列表、下快捷键提示。
+   * 固定而不是跟着参数表流下来——参数表会滚，提示不该跟着滚出窗口。
+   */
+  const int footer_top = height - comp_ui::kAdjustPanelFooter;
+  int footer_y = footer_top + 2;
   SetTextColor(dc, RGB(180, 184, 196));
   wsprintfW(line, L"该图层已有调整：%u", static_cast<unsigned>(shell.adj_settings.size()));
-  TextOutW(dc, left + 10, y, line, lstrlenW(line));
-  y += kAdjustRowHeight;
-  for (size_t i = 0; i < shell.adj_settings.size() && y < height - 120; ++i) {
+  TextOutW(dc, left + 10, footer_y, line, lstrlenW(line));
+  footer_y += 18;
+  for (size_t i = 0; i < shell.adj_settings.size() && i < 3; ++i) {
     const bool selected = static_cast<int32_t>(i) == shell.selected_adjustment;
     SetTextColor(dc, selected ? RGB(255, 226, 140) : RGB(196, 198, 208));
     wsprintfW(line, L"%s %u: %s", selected ? L">" : L" ", static_cast<unsigned>(i + 1),
               widen_ascii(adjustment_kind_name(shell.adj_kinds[i])).c_str());
-    TextOutW(dc, left + 12, y, line, lstrlenW(line));
-    y += kAdjustRowHeight;
-  }
-
-  if (!shell.adj_input.empty()) {
-    SetTextColor(dc, RGB(255, 240, 160));
-    const std::string typed(shell.adj_input.begin(), shell.adj_input.end());
-    wsprintfW(line, L"输入中：%s", widen_ascii(typed.c_str()).c_str());
-    TextOutW(dc, left + 10, height - 108, line, lstrlenW(line));
+    TextOutW(dc, left + 12, footer_y, line, lstrlenW(line));
+    footer_y += 18;
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
-  const wchar_t* hints[] = {
-      L"Ctrl+Shift+K/J 切换类型",
-      L", / . 选择已有调整",
-      L"Tab 切参数 · - / = 调值",
-      L"数字键输入 · 回车提交",
-      L"Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用",
-      L"Ctrl+Shift+D 删除选中调整",
-      L"调整只作用于下方 · 挂在新图层上",
+  const wchar_t* curve_hints[] = {
+      L"Ctrl+Shift+K/J 切换类型 · , / . 选调整",
+      L"通道条：RGB / R / G / B（点控制点切换）",
+      L"点击空白加点 · 拖动改点 · Delete 删点",
+      L"Ctrl+Shift+A 新增曲线 · Ctrl+Shift+U 应用",
+      L"Ctrl+Shift+D 删除选中调整 · Esc 取消拖动",
   };
-  int hint_y = height - 128;
-  for (const wchar_t* hint : hints) {
-    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+  const wchar_t* slider_hints[] = {
+      L"Ctrl+Shift+K/J 切换类型 · , / . 选调整",
+      L"Tab 切参数 · 拖动滑杆实时预览",
+      L"数字键输入 · 回车提交 · - / = 调值",
+      L"色阶：顶部 RGB/R/G/B 切通道页",
+      L"Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除",
+  };
+  const wchar_t* const* hints =
+      shell.adj_kind == COMP_ADJUSTMENT_CURVES ? curve_hints : slider_hints;
+  int hint_y = height - 96;
+  for (int i = 0; i < 5; ++i) {
+    TextOutW(dc, left + 10, hint_y, hints[i], lstrlenW(hints[i]));
     hint_y += 18;
   }
 }
@@ -6445,6 +6720,390 @@ void commit_color_input(ShellState& shell) {
   set_status(shell, buffer);
 }
 
+/* ------------------------------------------------------ 调整滑杆（P0-3） */
+
+/*
+ * 一步撤销的关键在事务边界：按下开显式事务，拖动途中每次写回都落在它里面，
+ * 松手才 commit。不开事务时引擎的 ImplicitTxn 会把每次写都自提交——拖一次
+ * 滑杆能产生几十步撤销，正是 P0-3 要修的东西。
+ * 新增态（selected_adjustment < 0）没有可写的对象：拖动只改编辑缓冲，仍由
+ * Ctrl+Shift+U 落盘，这样「先调参数、满意了再加」不会被写进历史。
+ */
+bool adjust_row_param(const ShellState& shell, int32_t row, comp_adjustment_param* out) {
+  if (row < 0 || out == nullptr) return false;
+  return comp_layer_adjustment_param_at(static_cast<uint32_t>(shell.adj_kind),
+                                        static_cast<size_t>(row), out) == COMP_OK;
+}
+
+/* 编辑缓冲 -> 选中的那条调整。只在拖动持有事务时写；失败保持静默（拖动中不刷屏）。 */
+bool adjust_write_live(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0 || shell.selected_adjustment < 0) return false;
+  if (shell.adj_drag_txn == nullptr) return false;
+  std::string json;
+  if (!build_settings_json(shell, &json)) return false;
+  if (comp_layer_update_adjustment_at(shell.document, id,
+                                      static_cast<size_t>(shell.selected_adjustment),
+                                      static_cast<uint32_t>(shell.adj_kind),
+                                      json.c_str()) != COMP_OK) {
+    return false;
+  }
+  shell.needs_render = true;
+  return true;
+}
+
+/* 把指针 x 换算成值写进编辑缓冲；值没变就不写文档（少一次快照，也少一次重绘）。 */
+void adjust_drag_value(ShellState& shell, double x) {
+  if (shell.adj_drag_param < 0) return;
+  comp_adjustment_param param{};
+  if (!adjust_row_param(shell, shell.adj_drag_param, &param)) return;
+  if (param.type == COMP_PARAM_BOOL) return;
+  const size_t index = static_cast<size_t>(shell.adj_drag_param);
+  if (index >= shell.adj_values.size()) return;
+
+  const double raw =
+      comp_ui::adjust_slider_value(shell.adj_drag_track, x, param.min_value, param.max_value);
+  const double value = comp_ui::adjust_snap_value(raw, param.min_value, param.max_value);
+  const std::string text = number_text(value);
+  if (shell.adj_values[index] == text) return;
+  shell.adj_values[index] = text;
+  shell.adj_input.clear();
+  if (adjust_write_live(shell)) shell.adj_drag_dirty = true;
+  shell.needs_render = true;
+
+  wchar_t buffer[220];
+  wsprintfW(buffer, L"%s = %s（%s）",
+            widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+            widen_ascii(text.c_str()).c_str(),
+            shell.adj_drag_txn != nullptr ? L"实时预览，松手算一步撤销"
+                                          : L"预览值，Ctrl+Shift+U 应用");
+  set_status(shell, buffer);
+}
+
+void adjust_begin_drag(ShellState& shell, const comp_ui::Rect& panel, int32_t row, double x) {
+  comp_adjustment_param param{};
+  if (!adjust_row_param(shell, row, &param)) return;
+  if (param.type == COMP_PARAM_BOOL) return; /* 布尔没有滑道，点击即切换 */
+
+  if (shell.selected_adjustment >= 0) {
+    if (shell.document == nullptr) return;
+    if (comp_txn_begin(shell.document, "Adjust Parameter", &shell.adj_drag_txn) != COMP_OK) {
+      shell.adj_drag_txn = nullptr;
+      set_status(shell, L"调整滑杆：无法开启事务（未改动）");
+      return;
+    }
+  } else {
+    shell.adj_drag_txn = nullptr;
+  }
+  shell.adj_param = row;
+  shell.adj_input.clear();
+  shell.adj_drag_param = row;
+  shell.adj_drag_dirty = false;
+  /* 几何在按下瞬间冻结：拖动途中面板重排也不会让滑道在指针下跑掉。
+   * 行几何用「相对行」（分页视图里绝对下标要减掉通道基址）。 */
+  shell.adj_drag_track = comp_ui::adjust_slider_track_rect(comp_ui::adjust_param_row_rect(
+      panel, row - adjust_param_base(shell), shell.adj_scroll));
+  adjust_drag_value(shell, x);
+}
+
+/* commit=false 用于 Esc / 失焦：事务 abort 会回滚到按下前的快照。 */
+void adjust_drag_finish(ShellState& shell, bool commit) {
+  if (shell.adj_drag_param < 0) return;
+  const int32_t focused = shell.adj_param;
+  comp_adjustment_param param{};
+  const bool has_param = adjust_row_param(shell, focused, &param);
+  const comp_txn txn = shell.adj_drag_txn;
+  const bool dirty = shell.adj_drag_dirty;
+  /* 先清状态再 ReleaseCapture：捕获变更会重入 WM_CAPTURECHANGED。 */
+  shell.adj_drag_param = -1;
+  shell.adj_drag_txn = nullptr;
+  shell.adj_drag_dirty = false;
+  ReleaseCapture();
+
+  bool committed = false;
+  if (txn != nullptr) {
+    if (commit && dirty) {
+      committed = comp_txn_commit(txn) == COMP_OK;
+    } else {
+      /* 没有实际写入的空事务不该占一步撤销：直接回滚。 */
+      comp_txn_abort(txn);
+    }
+  }
+  shell.needs_render = true;
+  refresh_adjustments(shell);
+  if (focused >= 0 && focused < static_cast<int32_t>(shell.adj_values.size())) {
+    shell.adj_param = focused;
+  }
+
+  wchar_t buffer[220];
+  if (committed) {
+    wsprintfW(buffer, L"已应用 %s = %s（一步撤销）",
+              widen_ascii(has_param && param.label != nullptr ? param.label : "").c_str(),
+              widen_ascii(shell.adj_param < static_cast<int32_t>(shell.adj_values.size())
+                              ? shell.adj_values[static_cast<size_t>(shell.adj_param)].c_str()
+                              : "")
+                  .c_str());
+    refresh_history_status(shell, buffer);
+  } else if (txn != nullptr && !dirty) {
+    wsprintfW(buffer, L"调整未改动（未产生撤销步）");
+    refresh_history_status(shell, buffer);
+  } else if (txn != nullptr) {
+    refresh_history_status(shell, L"已回滚调整拖动");
+  } else {
+    set_status(shell, L"调整预览值：Ctrl+Shift+U 应用（新增模式不写历史）");
+  }
+}
+
+/* Tab 切参数后把焦点行滚进可视区（小窗口 / 长参数表时必需）。 */
+void adjust_scroll_to_focus(ShellState& shell) {
+  Layout layout{};
+  if (!client_layout(shell, &layout) || layout.adjust_panel.w <= 0) return;
+  shell.adj_scroll = comp_ui::adjust_param_ensure_visible(
+      layout.adjust_panel, adjust_shown_count(shell), shell.adj_param - adjust_param_base(shell),
+      shell.adj_scroll);
+}
+
+/* ------------------------------------------------ 曲线编辑器（P0-3） */
+
+/*
+ * 控制点的真相在引擎里（settings JSON）。外壳只缓存一份「当前通道的点列」用于
+ * 绘制/命中；任何写入都走 comp_layer_curves_set_points 拼 JSON，再由
+ * comp_layer_update_adjustment_at 落盘 —— 撤销步由后者产生，曲线接口本身是
+ * 纯函数（见 comp_layer.h 的契约）。拖动期间用显式事务把多次写入折成一步。
+ */
+const std::string* selected_adjustment_settings(const ShellState& shell) {
+  if (shell.selected_adjustment < 0 ||
+      shell.selected_adjustment >= static_cast<int32_t>(shell.adj_settings.size())) {
+    return nullptr;
+  }
+  return &shell.adj_settings[static_cast<size_t>(shell.selected_adjustment)];
+}
+
+/* 曲线编辑只在「已选中的 Curves 调整」上可用：新增态没有可写对象。 */
+bool curve_editable(const ShellState& shell) {
+  return shell.adj_kind == COMP_ADJUSTMENT_CURVES && selected_adjustment_settings(shell) != nullptr;
+}
+
+const wchar_t* curve_channel_name(int32_t channel) {
+  switch (channel) {
+    case 1: return L"R";
+    case 2: return L"G";
+    case 3: return L"B";
+    default: return L"RGB";
+  }
+}
+
+/* 从 settings 重读当前通道的点列；空通道（`{"curves":{}}`）留在空态，由编辑器
+ * 在第一次加点时补上恒等端点。 */
+void refresh_curve_points(ShellState& shell) {
+  shell.curve_xy.clear();
+  shell.curve_focus_point = -1;
+  const std::string* settings = selected_adjustment_settings(shell);
+  if (settings == nullptr || shell.adj_kind != COMP_ADJUSTMENT_CURVES) return;
+  const uint32_t channel = static_cast<uint32_t>(shell.curve_channel);
+  size_t count = 0;
+  if (comp_layer_curves_point_count(settings->c_str(), channel, &count) != COMP_OK) return;
+  if (count > 32) count = 32;
+  for (size_t i = 0; i < count; ++i) {
+    double x = 0.0;
+    double y = 0.0;
+    if (comp_layer_curves_point_at(settings->c_str(), channel, i, &x, &y) != COMP_OK) break;
+    shell.curve_xy.push_back(x);
+    shell.curve_xy.push_back(y);
+  }
+}
+
+/* 点列 -> settings -> 文档。两遍调用（先问容量再写），与 ABI 契约一致。 */
+bool curve_write_points(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  const std::string* settings = selected_adjustment_settings(shell);
+  if (shell.document == nullptr || id == 0 || settings == nullptr) return false;
+  const size_t count = shell.curve_xy.size() / 2;
+  if (count < 2) return false;
+  const uint32_t channel = static_cast<uint32_t>(shell.curve_channel);
+  size_t need = 0;
+  if (comp_layer_curves_set_points(settings->c_str(), channel, shell.curve_xy.data(), count, nullptr,
+                                   0, &need) != COMP_OK) {
+    return false;
+  }
+  std::string json(need + 1, '\0');
+  if (comp_layer_curves_set_points(settings->c_str(), channel, shell.curve_xy.data(), count,
+                                   &json[0], json.size(), &need) != COMP_OK) {
+    return false;
+  }
+  json.resize(need);
+  if (comp_layer_update_adjustment_at(shell.document, id,
+                                      static_cast<size_t>(shell.selected_adjustment),
+                                      COMP_ADJUSTMENT_CURVES, json.c_str()) != COMP_OK) {
+    return false;
+  }
+  shell.needs_render = true;
+  return true;
+}
+
+void curve_drag_to(ShellState& shell, const comp_ui::Rect& plot, double x, double y) {
+  const int32_t index = shell.curve_drag_point;
+  if (index < 0) return;
+  const int32_t count = static_cast<int32_t>(shell.curve_xy.size() / 2);
+  if (index >= count) return;
+
+  double value_x = std::floor(comp_ui::curve_plot_x_to_value(plot, x) + 0.5);
+  double value_y = std::floor(comp_ui::curve_plot_y_to_value(plot, y) + 0.5);
+  if (index == 0) {
+    value_x = 0.0; /* 端点锁 x：曲线定义域必须覆盖 0..255 */
+  } else if (index == count - 1) {
+    value_x = 255.0;
+  } else {
+    /* 内部点保持严格递增（比较用整数 x，所以最小间隔就是 1）。 */
+    const double lo = shell.curve_xy[static_cast<size_t>(2 * (index - 1))] + 1.0;
+    const double hi = shell.curve_xy[static_cast<size_t>(2 * (index + 1))] - 1.0;
+    if (value_x < lo) value_x = lo;
+    if (value_x > hi) value_x = hi;
+  }
+  if (value_y < 0.0) value_y = 0.0;
+  if (value_y > 255.0) value_y = 255.0;
+  const size_t slot = static_cast<size_t>(2 * index);
+  if (shell.curve_xy[slot] == value_x && shell.curve_xy[slot + 1] == value_y) return;
+  shell.curve_xy[slot] = value_x;
+  shell.curve_xy[slot + 1] = value_y;
+
+  if (curve_write_points(shell)) shell.curve_drag_dirty = true;
+  shell.needs_render = true;
+  wchar_t buffer[200];
+  /* 同上：wsprintfW 不支持 %f，先转文本再 %s。 */
+  const std::wstring text_x = widen_ascii(number_text(value_x).c_str());
+  const std::wstring text_y = widen_ascii(number_text(value_y).c_str());
+  wsprintfW(buffer, L"曲线 %s 点 %d/%d = (%s, %s) %s", curve_channel_name(shell.curve_channel),
+            index + 1, count, text_x.c_str(), text_y.c_str(),
+            shell.curve_drag_txn != nullptr ? L"（实时预览，松手算一步撤销）" : L"（未写入）");
+  set_status(shell, buffer);
+}
+
+/* 按住控制点开事务 + 冻结绘图区几何（与滑杆同一套理由）。 */
+void curve_begin_drag(ShellState& shell, const comp_ui::Rect& plot, int32_t point, double x,
+                      double y) {
+  if (!curve_editable(shell)) {
+    set_status(shell, L"曲线：先 Ctrl+Shift+A 新增一条 Curves（恒等），再从空白处加点");
+    return;
+  }
+  if (shell.document == nullptr) return;
+  if (comp_txn_begin(shell.document, "Adjust Curve", &shell.curve_drag_txn) != COMP_OK) {
+    shell.curve_drag_txn = nullptr;
+    set_status(shell, L"曲线：无法开启事务（未改动）");
+    return;
+  }
+  shell.curve_drag_point = point;
+  shell.curve_focus_point = point;
+  shell.curve_drag_dirty = false;
+  shell.curve_drag_plot = plot;
+  curve_drag_to(shell, plot, x, y);
+}
+
+void curve_drag_finish(ShellState& shell, bool commit) {
+  if (shell.curve_drag_point < 0) return;
+  const int32_t focused = shell.curve_focus_point;
+  const comp_txn txn = shell.curve_drag_txn;
+  const bool dirty = shell.curve_drag_dirty;
+  shell.curve_drag_point = -1;
+  shell.curve_drag_txn = nullptr;
+  shell.curve_drag_dirty = false;
+  ReleaseCapture();
+
+  bool committed = false;
+  if (txn != nullptr) {
+    if (commit && dirty) {
+      committed = comp_txn_commit(txn) == COMP_OK;
+    } else {
+      comp_txn_abort(txn);
+    }
+  }
+  shell.needs_render = true;
+  refresh_adjustments(shell); /* 重读 settings，点列以引擎为准 */
+  shell.curve_focus_point = focused;
+
+  wchar_t buffer[200];
+  if (committed) {
+    wsprintfW(buffer, L"已应用曲线 %s（一步撤销）", curve_channel_name(shell.curve_channel));
+    refresh_history_status(shell, buffer);
+  } else if (txn != nullptr && !dirty) {
+    refresh_history_status(shell, L"曲线未改动（未产生撤销步）");
+  } else if (txn != nullptr) {
+    refresh_history_status(shell, L"已回滚曲线拖动");
+  } else {
+    set_status(shell, L"曲线未写入（无事务）");
+  }
+}
+
+/* 空白处点击 = 插入一个控制点，并立刻进入拖动（一次按下就能定位）。 */
+void curve_add_point(ShellState& shell, const comp_ui::Rect& plot, double x, double y) {
+  if (!curve_editable(shell)) {
+    set_status(shell, L"曲线：先 Ctrl+Shift+A 新增一条 Curves（恒等），再从空白处加点");
+    return;
+  }
+  if (shell.curve_xy.empty()) {
+    shell.curve_xy = {0.0, 0.0, 255.0, 255.0}; /* 空通道从恒等基线开始 */
+  }
+  const int32_t count = static_cast<int32_t>(shell.curve_xy.size() / 2);
+  if (count >= 32) {
+    set_status(shell, L"曲线控制点已满（上限 32）");
+    return;
+  }
+  const double value_x = comp_ui::curve_insert_x(
+      shell.curve_xy.data(), static_cast<int>(count), comp_ui::curve_plot_x_to_value(plot, x));
+  if (std::isnan(value_x)) {
+    set_status(shell, L"这里插不进新点（与相邻点的 x 距离不足 1）");
+    return;
+  }
+  double value_y = std::floor(comp_ui::curve_plot_y_to_value(plot, y) + 0.5);
+  if (value_y < 0.0) value_y = 0.0;
+  if (value_y > 255.0) value_y = 255.0;
+  int32_t index = 0;
+  while (index < count && shell.curve_xy[static_cast<size_t>(2 * index)] < value_x) ++index;
+  shell.curve_xy.insert(shell.curve_xy.begin() + 2 * index, {value_x, value_y});
+  curve_begin_drag(shell, plot, index, x, y);
+}
+
+/* 删点：端点（x=0 / x=255）锁死，删掉它们曲线都没定义域了。 */
+void curve_delete_point(ShellState& shell, int32_t index) {
+  if (!curve_editable(shell)) return;
+  const int32_t count = static_cast<int32_t>(shell.curve_xy.size() / 2);
+  if (index < 0 || index >= count) {
+    set_status(shell, L"曲线：没有可删除的控制点（先在曲线上点一下选中）");
+    return;
+  }
+  if (index == 0 || index == count - 1) {
+    set_status(shell, L"曲线端点不能删除（x = 0 / x = 255 固定）");
+    return;
+  }
+  shell.curve_xy.erase(shell.curve_xy.begin() + 2 * index,
+                       shell.curve_xy.begin() + 2 * index + 2);
+  shell.curve_focus_point = -1;
+  const bool ok = curve_write_points(shell); /* 隐式事务 = 一步撤销 */
+  refresh_adjustments(shell);
+  refresh_history_status(shell, ok ? L"已删除曲线控制点（一步撤销）" : L"删除曲线控制点失败");
+}
+
+void curve_set_channel(ShellState& shell, int32_t channel) {
+  if (channel < 0 || channel >= kCurveChannels) return;
+  shell.curve_channel = channel;
+  refresh_curve_points(shell);
+  wchar_t buffer[120];
+  wsprintfW(buffer, L"曲线通道：%s", curve_channel_name(channel));
+  set_status(shell, buffer);
+}
+
+/* 色阶：切通道页。焦点落到该通道首行，输入缓冲清掉（不在别的通道上提交数字）。 */
+void adjust_set_channel(ShellState& shell, int32_t channel) {
+  if (channel < 0 || channel >= kLevelsChannelCount) return;
+  shell.adj_channel = channel;
+  shell.adj_param = adjust_param_base(shell);
+  shell.adj_input.clear();
+  shell.adj_scroll = 0;
+  wchar_t buffer[120];
+  wsprintfW(buffer, L"色阶通道：%s", curve_channel_name(channel));
+  set_status(shell, buffer);
+}
+
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
   /*
    * P0-1：图层名 / 不透明度键入态是最高的模态。字符本体由 WM_CHAR 送进来
@@ -6718,6 +7377,28 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       return;
     }
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* P0-3：拖动中的滑杆/曲线点按 Esc = 取消这次拖动（事务回滚，不留撤销步）。 */
+  if (shell.curve_drag_point >= 0 && key == VK_ESCAPE) {
+    curve_drag_finish(shell, false);
+    InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
+  if (shell.adj_drag_param >= 0 && key == VK_ESCAPE) {
+    adjust_drag_finish(shell, false);
+    InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
+  /*
+   * P0-3：曲线页按 Delete = 删除焦点控制点。必须在图层删除命令之前判——
+   * 那边 Delete 是「删图层」，正在调曲线时按到会整层消失。
+   */
+  if (key == VK_DELETE && shell.adj_kind == COMP_ADJUSTMENT_CURVES &&
+      shell.curve_focus_point >= 0) {
+    curve_delete_point(shell, shell.curve_focus_point);
+    InvalidateRect(window, nullptr, FALSE);
+    return;
   }
 
   /* 调整面板输入态优先：Esc 取消输入（不关窗）、退格删字符、回车提交、数字/./- 进缓冲。 */
@@ -7410,6 +8091,100 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (!shell->effect_open && !shell->filter_open && !type_panel_visible(*shell) &&
+              layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * P0-3 调整面板：上半行 = 聚焦，下半行（滑道）= 聚焦 + 开始拖动。
+             * 行/滑道几何全部来自 ui_core::adjust_param_row_rect /
+             * adjust_slider_track_rect，与 draw_adjust_panel 同源。
+             * 分页视图（色阶）里几何用「相对行」（row - base），数据用绝对下标。
+             */
+            const int32_t shown_total = adjust_shown_count(*shell);
+            const int32_t base = adjust_param_base(*shell);
+            const int32_t scroll = comp_ui::adjust_param_clamp_scroll(
+                layout.adjust_panel, shown_total, shell->adj_scroll);
+            shell->adj_scroll = scroll;
+
+            /* 色阶通道条：先于参数行命中（它在标题行，行命中吃不到这里）。 */
+            if (adjust_paged_kind(static_cast<uint32_t>(shell->adj_kind))) {
+              const int32_t chip = comp_ui::adjust_channel_chip_at(
+                  layout.adjust_panel, kLevelsChannelCount, mouse_x, mouse_y);
+              if (chip >= 0) {
+                adjust_set_channel(*shell, chip);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+              }
+            }
+
+            /* 曲线：通道条 -> 绘图区（命中控制点 = 拖动，空白 = 加点后拖动）。 */
+            if (shell->adj_kind == COMP_ADJUSTMENT_CURVES) {
+              const int32_t chip = comp_ui::curve_channel_chip_at(
+                  layout.adjust_panel, kCurveChannels, mouse_x, mouse_y);
+              if (chip >= 0) {
+                curve_set_channel(*shell, chip);
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+              }
+              const comp_ui::Rect plot = comp_ui::adjust_curve_plot_rect(layout.adjust_panel);
+              if (!plot.empty() && plot.contains(mouse_x, mouse_y)) {
+                const int32_t count = static_cast<int32_t>(shell->curve_xy.size() / 2);
+                const int32_t hit =
+                    count >= 2 ? comp_ui::curve_point_hit(
+                                     plot, shell->curve_xy.data(), static_cast<int>(count),
+                                     mouse_x, mouse_y, 7.0)
+                               : -1;
+                if (hit >= 0) {
+                  curve_begin_drag(*shell, plot, hit, mouse_x, mouse_y);
+                  if (shell->curve_drag_point >= 0) SetCapture(window);
+                } else {
+                  curve_add_point(*shell, plot, mouse_x, mouse_y);
+                  if (shell->curve_drag_point >= 0) SetCapture(window);
+                }
+                InvalidateRect(window, nullptr, FALSE);
+                return 0;
+              }
+            }
+
+            const int row = comp_ui::adjust_param_row_at(layout.adjust_panel, shown_total,
+                                                         scroll, mouse_x, mouse_y);
+            if (row >= 0) {
+              const int32_t index = base + row;
+              shell->adj_param = index;
+              shell->adj_input.clear();
+              if (comp_ui::adjust_row_track_hit(layout.adjust_panel, row, scroll, mouse_x,
+                                                mouse_y)) {
+                comp_adjustment_param param{};
+                if (comp_layer_adjustment_param_at(static_cast<uint32_t>(shell->adj_kind),
+                                                   static_cast<size_t>(index),
+                                                   &param) == COMP_OK) {
+                  if (param.type == COMP_PARAM_BOOL) {
+                    /* 布尔参数没有滑道：点一下就是切换。 */
+                    panel_step_value(*shell, 1);
+                  } else {
+                    adjust_begin_drag(*shell, layout.adjust_panel, index, mouse_x);
+                    SetCapture(window);
+                  }
+                }
+              } else {
+                wchar_t buffer[220];
+                comp_adjustment_param param{};
+                if (comp_layer_adjustment_param_at(static_cast<uint32_t>(shell->adj_kind),
+                                                   static_cast<size_t>(index),
+                                                   &param) == COMP_OK) {
+                  wsprintfW(buffer, L"%s = %s（范围 [%s, %s]；拖动滑杆实时预览）",
+                            widen_ascii(param.label != nullptr ? param.label : "").c_str(),
+                            widen_ascii(shell->adj_values[static_cast<size_t>(index)].c_str())
+                                .c_str(),
+                            widen_ascii(number_text(param.min_value).c_str()).c_str(),
+                            widen_ascii(number_text(param.max_value).c_str()).c_str());
+                  set_status(*shell, buffer);
+                }
+              }
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           if (layout.canvas.contains(mouse_x, mouse_y)) {
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
@@ -7493,6 +8268,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      /* P0-3 曲线松手：提交事务 = 一次拖动只占一步撤销。 */
+      if (shell != nullptr && shell->curve_drag_point >= 0) {
+        curve_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /* P0-3 滑杆松手：提交事务 = 一次拖动只占一步撤销。 */
+      if (shell != nullptr && shell->adj_drag_param >= 0) {
+        adjust_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       /*
        * S24 直方图框选收尾：位移 < 4px 视为单击（不缩放）；否则把拖出的亮度区间
        * 设为新的可视窗口。夹取/排序全在 ui_core，这里只递交两个屏幕 x。
@@ -7606,6 +8393,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         shell->layer_drag_pending = false;
         shell->layer_drag_active = false;
         shell->histogram_drag = false;
+        /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
+        curve_drag_finish(*shell, false);
+        adjust_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         move_cancel(*shell);
@@ -7624,6 +8414,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         shell->layer_drag_pending = false;
         shell->layer_drag_active = false;
         shell->histogram_drag = false;
+        /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
+        curve_drag_finish(*shell, false);
+        adjust_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         move_cancel(*shell);
@@ -7639,6 +8432,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
+          /* P0-3 曲线拖动优先：几何用按下时冻结的绘图区，写入落在同一个事务里。 */
+          if (shell->curve_drag_point >= 0) {
+            curve_drag_to(*shell, shell->curve_drag_plot, static_cast<double>(mouse_x),
+                          static_cast<double>(mouse_y));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          /* P0-3 滑杆拖动优先：持有鼠标捕获，写入落在按下时开的同一个事务里。 */
+          if (shell->adj_drag_param >= 0) {
+            adjust_drag_value(*shell, static_cast<double>(mouse_x));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           /*
            * S24：图层拖行（超过 4px 阈值才进入 active）与直方图框选优先于工具状态机。
            * 两者都持有鼠标捕获，必须在这里更新，否则松手时目标行停在按下那一行。
@@ -7848,6 +8654,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             panel_histogram_zoom(*shell, delta > 0 ? 1.0 / 1.25 : 1.25, focus);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !shell->effect_open && !shell->filter_open &&
+                   !type_panel_visible(*shell) &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /*
+           * P0-3：调整参数表滚动（色阶每页 5 行 / 小窗口），一格 3 行，夹取在 ui_core。
+           * 曲线页没有参数表：滚轮不吞掉，交给下面的默认处理（不做事也不报错）。
+           */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int count = adjust_shown_count(*shell);
+            const int next = shell->adj_scroll + (delta > 0 ? -3 : 3);
+            shell->adj_scroll =
+                comp_ui::adjust_param_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
           }
         }
         return 0;

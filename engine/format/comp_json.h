@@ -56,6 +56,8 @@ class JsonValue {
 
   void set(std::string key, JsonValue value);
   void push(JsonValue value);
+  /* 数组下标赋值：非数组先转数组，缺位补 null（保持值语义，不影响既有元素）。 */
+  void set_index(size_t index, JsonValue value);
 
  private:
   Type type_;

@@ -16,6 +16,7 @@
 #include "compositing/blend.h"
 #include "core/comp_geometry.h"
 #include "domain/adjustment_table.h"
+#include "domain/curves_settings.h"
 #include "domain/effect_table.h"
 #include "domain/tool_ops.h"
 
@@ -1560,6 +1561,72 @@ comp_result comp_layer_effect_build_settings(uint32_t effect, const char* const*
     const size_t copy = json.size() < capacity - 1 ? json.size() : capacity - 1;
     std::memcpy(settings_json_utf8, json.data(), copy);
     settings_json_utf8[copy] = '\0';
+  }
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+/* ------------------------------------------- 曲线控制点（P0-3 尾部追加） */
+
+comp_result comp_layer_curves_channel_count(size_t* out_count) {
+  COMP_ABI_TRY(nullptr)
+  if (out_count == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+  *out_count = compositor::kCurveChannelCount;
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_curves_point_count(const char* settings_json_utf8, uint32_t channel,
+                                          size_t* out_count) {
+  COMP_ABI_TRY(nullptr)
+  if (channel >= compositor::kCurveChannelCount || out_count == nullptr) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  const std::string settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
+  *out_count = compositor::curves_read_points(settings, channel).size();
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_curves_point_at(const char* settings_json_utf8, uint32_t channel,
+                                       size_t index, double* out_x, double* out_y) {
+  COMP_ABI_TRY(nullptr)
+  if (channel >= compositor::kCurveChannelCount) return COMP_ERR_INVALID_ARGUMENT;
+  const std::string settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
+  const std::vector<std::pair<double, double>> points =
+      compositor::curves_read_points(settings, channel);
+  if (index >= points.size()) return COMP_ERR_NOT_FOUND;
+  if (out_x != nullptr) *out_x = points[index].first;
+  if (out_y != nullptr) *out_y = points[index].second;
+  return COMP_OK;
+  COMP_ABI_CATCH(nullptr)
+}
+
+comp_result comp_layer_curves_set_points(const char* settings_json_utf8, uint32_t channel,
+                                         const double* points_xy, size_t point_count,
+                                         char* out_json_utf8, size_t capacity, size_t* out_size) {
+  COMP_ABI_TRY(nullptr)
+  if (channel >= compositor::kCurveChannelCount) return COMP_ERR_INVALID_ARGUMENT;
+  if (points_xy == nullptr && point_count != 0) return COMP_ERR_INVALID_ARGUMENT;
+
+  std::vector<std::pair<double, double>> points;
+  points.reserve(point_count);
+  for (size_t i = 0; i < point_count; ++i) {
+    points.emplace_back(points_xy[2 * i], points_xy[2 * i + 1]);
+  }
+
+  const std::string settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
+  std::string json;
+  std::string error;
+  if (!compositor::curves_set_points(settings, channel, points, &json, &error)) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_size != nullptr) *out_size = json.size();
+  /* 与 adjustment_build_settings 同口径：容量按「含 NUL」计，不够则截断并补 NUL。 */
+  if (out_json_utf8 != nullptr && capacity > 0) {
+    const size_t copy = json.size() < capacity - 1 ? json.size() : capacity - 1;
+    std::memcpy(out_json_utf8, json.data(), copy);
+    out_json_utf8[copy] = '\0';
   }
   return COMP_OK;
   COMP_ABI_CATCH(nullptr)

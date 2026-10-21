@@ -24,6 +24,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 图层增删改查 | 图层面板（增/删/复制/改名/建组/多选/拖行重排/拖进拖出组/显隐/不透明度/混合/变换/蒙版/剪贴/隔离/采样/效果） | （未接 UI） | `comp_layer_*` | **已达成**（P0-1，见 §5.12）：`add`/`remove`/`duplicate`/`get_name`/`set_name`/`move`/`reorder`/`set_blend`/`set_transform`/`set_mask`/`set_clipping_source`/`set_isolated`/`set_sampling`/`set_flip`/`set_effect`/`merge_down` 均有壳侧调用点；鸿蒙壳仍无面板 |
 | 调整图层参数编辑 | 调整面板 | （未接 UI） | 调整 ABI 全套 | 已达成（鸿蒙无面板） |
 | 调整控件元数据 | `refresh_adjustments` | 预留 | `comp_layer_adjustment_param_at` 等 | 已达成 |
+| 调整滑杆 + 曲线/色阶编辑器（P0-3） | 调整面板：拖动滑杆实时预览；曲线加点/拖点/删点；色阶 20 参数分页 | （未接 UI） | `comp_layer_update_adjustment_at` + `comp_layer_curves_*` | **已达成**（P0-3，见 §5.14）：一次拖动 = **一个**撤销步，空拖动不产生撤销步 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
@@ -484,4 +485,69 @@ InnerGlow），键名就是 `effect_eval.cpp` 的扁平 JSON 键。`effect_read_
 ② 颜色是 `red`/`green`/`blue` 三个 0..1 数字，无取色器/HSL；③ 只编辑当前选中图层，
 多选批量加效果未做；④ 参数表与 `effect_eval.cpp` 是两份手写常量，靠像素对拍守而不是编译期
 联动——新增参数必须两处同改；⑤ 手感/跨 DPI 待 ALEX 目视（`docs/manual-test.md` M17）。
+
+### 5.14 调整滑杆 + 曲线/色阶编辑器（P0-3，2026-10-21）
+
+P0-3 之前调整面板只能「`Tab` 换行 + `=` 步进 + 数字键入」，没有滑杆也没有拖动预览；
+Levels 的 20 个量压根没有面板参数（`param_count = 0`），Curves 整条曲线没有编辑入口。
+本轮补三件事：**滑杆拖动**、**一步撤销**、**曲线控制点编辑**。
+
+**1. ABI 纯尾部追加 4 个导出（131 → 135）。** 既有枚举/签名一个不动（表见
+`docs/adjustment-json-keys.md` §5）：
+
+| 导出 | 语义 |
+|------|------|
+| `comp_layer_curves_channel_count` | 通道数（恒 4：0 = RGB，1..3 = R/G/B） |
+| `comp_layer_curves_point_count` | 读某通道点数；缺失/非法 = 0（语义即恒等） |
+| `comp_layer_curves_point_at` | 读第 i 个点；与上面共用同一份「排序 + 同 x 去重」结果，不会漂移 |
+| `comp_layer_curves_set_points` | 改写某通道点列，返回新 settings（两段式；**纯函数**：不开事务、不写文档） |
+
+**2. 单一事实源。** Levels 补齐 20 个参数（`levels.ranges.0..3` × black/gamma/white/
+outputBlack/outputWhite），量程逐条抄上游 `LevelRange.normalized`（black 0..254、
+white 1..255、gamma 0.1..9.99、输出 0..255），落在 `adjustment_table.cpp`；
+白与黑的相对顺序不校验，由求值侧 `normalize()` 兜（同上游）。曲线点列的结构约束
+（4 通道、2..32 点、x 严格递增、首末点 x 锁 0/255、值域 0..255）静态参数表表达不了，
+落在 `engine/domain/curves_settings.cpp`，由 `adjustment_validate_settings` 调用。
+
+**3. 一步撤销。** 拖动途中每次写回都是 `comp_layer_update_adjustment_at`，
+不开事务时引擎的 `ImplicitTxn` 会给每次写各记一步——拖一次滑杆能产生几十步撤销，
+正是 P0-3 要修的东西。现在的边界是：
+
+- 按下开**显式事务**（`comp_txn_begin`），拖动期间所有写回都折在它里面；
+- 松手 `comp_txn_commit` → 整段拖动**只占一步**；
+- 拖动没有任何实际写入（值没变）→ `comp_txn_abort`，**不留空撤销步**；
+- `Esc` / `WM_CAPTURECHANGED`（失焦、被别处抢捕获）→ abort 回滚到按下前快照；
+- 新增态（`selected_adjustment < 0`，还没有可写对象）拖动只改编辑缓冲、不写文档，
+  仍由 `Ctrl+Shift+U` 落盘——「先调好再加」不该进历史。
+
+**4. 几何/命中共用一份纯函数。** 滑道矩形、滑道命中、x→值、值吸附、曲线绘图区、
+曲线通道条、点命中、插入点选址（`curve_insert_x`）、值↔像素换算全在
+`ui_core.h`，绘制与命中**调同一批函数**（而不是各写一套常量），单测直接盯这些函数；
+`visual_check.py` 侧把同一套几何再镜像一遍，断言「绘图区是参数区里的正方形」这类性质，
+不抄魔法像素。
+
+**5. 曲线编辑器交互。** 通道条四页（RGB/R/G/B，点条即换页）；在绘图区空白处按下 =
+插入控制点并立刻进入拖动（一次按下就能定位），按在已有点上 = 拖该点；`Delete` 删焦点点，
+两端点锁死不可删（删了定义域就不完整）。x 保持严格递增（内部点夹在左右邻点 ±1 内），
+x/y 取整后写回引擎；点列真相在引擎 settings 里，壳只缓存当前通道用于绘制/命中，
+每次写完 `refresh_adjustments` 以引擎为准回读。
+
+**6. 这次真崩过一次（教训）。** 第一次用鼠标拖曲线点时外壳 `0xc0000005` 崩在 `USER32.dll`
+（`fault offset 0x401c3`）——根因是新写的两处状态栏文字用了
+`wsprintfW(L"… (%.0f, %.0f) …")`：**`wsprintfW` 不支持浮点转换**，它按整数宽度取变参，
+`double` 被当成指针读飞。修法是把数值先过 `number_text()`（`snprintf`）再以 `%s` 拼进去，
+与壳里其它面板同口径。自动化场景 `curve_levels` 现在覆盖这条路径（键盘路径**永远**测不出来：
+`scene_adjustment` 全是键盘，`%.0f` 那两行只有拖动/绘制焦点点时才执行）。
+
+**7. 验证。** `tests/test_adjustment.cpp`：通道点数/读点/写点/非法拒绝/两段式容量，
+外加 `curves_points_survive_comp_round_trip`（`.comp` 存盘再载入后 settings **逐字节**相同、
+四个通道逐点相同）；`scripts/visual_check.py` 新增场景 `curve_levels` 6 项：
+绘图区几何、抬中间调后画布变亮、画布直方图中位数右移、一次 `Ctrl+Z` 回到修改前、
+色阶黑场拖到 40 压暗、再一次 `Ctrl+Z` 回到色阶前。全套 16 场景 74 项零失败。
+
+**8. 边界。** ① 曲线没有预设库、没有直方图底图、没有贝塞尔手柄（求值固定 Fritsch–Carlson
+形状保持三次 Hermite）；② 色阶通道条只切面板分页，**不写回** `levels.channel`，求值恒按
+`ranges[0]` 管合成、`ranges[1..3]` 各管一个色彩通道；③ 布尔参数没有滑道（点一下即切换）；
+④ 滑杆值吸附到整数是「量程 ≥ 50」时的统一规则，没有按住 `Shift` 的精细模式；
+⑤ 手感/跨 DPI/连续拖动是否跟手仍待 ALEX 目视（`docs/manual-test.md` M18）。
 

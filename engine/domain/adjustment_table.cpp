@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "domain/curves_settings.h"
 #include "format/comp_json.h"
 
 namespace compositor {
@@ -34,7 +35,37 @@ const AdjustmentParam kHsvParams[] = {
     {"colorize", "Colorize", kAdjustmentParamBool, 0.0, 1.0, 0.0},
 };
 
-/* 1 Levels：通道与四个 LevelRange 走专用编辑器，面板不提供逐参数编辑。 */
+/* 1 Levels：四个通道（RGB 合成 + 红/绿/蓝）各 5 个 LevelRange 字段。
+ *
+ * `ranges` 是数组，json_path 因此带数字段（`levels.ranges.1.black`）。数字段按数组下标
+ * 解析（见 locate_leaf / set_path），数组下标语义与上游 `LevelsSettings.ranges` 一致。
+ * 量程取自上游 `LevelRange.normalized`：black 0..254、white 1..255、gamma 0.1..9.99、
+ * 输出两端 0..255。white 与 black 的相对顺序由引擎求值侧 normalize() 保证（同上游）。
+ */
+const AdjustmentParam kLevelsParams[] = {
+    {"levels.ranges.0.black", "RGB Black", kAdjustmentParamNumber, 0.0, 254.0, 0.0},
+    {"levels.ranges.0.gamma", "RGB Gamma", kAdjustmentParamNumber, 0.1, 9.99, 1.0},
+    {"levels.ranges.0.white", "RGB White", kAdjustmentParamNumber, 1.0, 255.0, 255.0},
+    {"levels.ranges.0.outputBlack", "RGB OutLo", kAdjustmentParamNumber, 0.0, 255.0, 0.0},
+    {"levels.ranges.0.outputWhite", "RGB OutHi", kAdjustmentParamNumber, 0.0, 255.0, 255.0},
+    {"levels.ranges.1.black", "R Black", kAdjustmentParamNumber, 0.0, 254.0, 0.0},
+    {"levels.ranges.1.gamma", "R Gamma", kAdjustmentParamNumber, 0.1, 9.99, 1.0},
+    {"levels.ranges.1.white", "R White", kAdjustmentParamNumber, 1.0, 255.0, 255.0},
+    {"levels.ranges.1.outputBlack", "R OutLo", kAdjustmentParamNumber, 0.0, 255.0, 0.0},
+    {"levels.ranges.1.outputWhite", "R OutHi", kAdjustmentParamNumber, 0.0, 255.0, 255.0},
+    {"levels.ranges.2.black", "G Black", kAdjustmentParamNumber, 0.0, 254.0, 0.0},
+    {"levels.ranges.2.gamma", "G Gamma", kAdjustmentParamNumber, 0.1, 9.99, 1.0},
+    {"levels.ranges.2.white", "G White", kAdjustmentParamNumber, 1.0, 255.0, 255.0},
+    {"levels.ranges.2.outputBlack", "G OutLo", kAdjustmentParamNumber, 0.0, 255.0, 0.0},
+    {"levels.ranges.2.outputWhite", "G OutHi", kAdjustmentParamNumber, 0.0, 255.0, 255.0},
+    {"levels.ranges.3.black", "B Black", kAdjustmentParamNumber, 0.0, 254.0, 0.0},
+    {"levels.ranges.3.gamma", "B Gamma", kAdjustmentParamNumber, 0.1, 9.99, 1.0},
+    {"levels.ranges.3.white", "B White", kAdjustmentParamNumber, 1.0, 255.0, 255.0},
+    {"levels.ranges.3.outputBlack", "B OutLo", kAdjustmentParamNumber, 0.0, 255.0, 0.0},
+    {"levels.ranges.3.outputWhite", "B OutHi", kAdjustmentParamNumber, 0.0, 255.0, 255.0},
+};
+
+/* 无面板参数的 kind（Invert）共用空表。 */
 const AdjustmentParam kNoParams[] = {};
 
 /* 3 Exposure */
@@ -113,8 +144,9 @@ const AdjustmentParam kColorBalanceParams[] = {
 const AdjustmentKindInfo kKinds[kAdjustmentKindCount] = {
     {0, "Hue/Saturation", "Hue, saturation and lightness shifts", kHsvParams,
      COMP_ARRAY_LEN(kHsvParams), true, "hsvSettings"},
-    {1, "Levels", "Levels need the dedicated levels editor", kNoParams, 0, false, "levels"},
-    {2, "Curves", "Curves need the dedicated curve editor", kNoParams, 0, false, "curves"},
+    {1, "Levels", "Input and output levels per channel", kLevelsParams,
+     COMP_ARRAY_LEN(kLevelsParams), true, kNoRoots},
+    {2, "Curves", "Tone curve control points per channel", kNoParams, 0, false, "curves"},
     {3, "Exposure", "Exposure, offset and gamma", kExposureParams,
      COMP_ARRAY_LEN(kExposureParams), true, kNoRoots},
     {4, "Gradient Map", "Map shadows and highlights to colors", kGradientMapParams,
@@ -157,7 +189,19 @@ bool root_allowed(const AdjustmentKindInfo& info, const std::string& key) {
   return false;
 }
 
-/* 按点分路径定位叶子；中间段缺失视为「未提供」（合法），中间段存在但非对象视为错误。 */
+/* 纯数字段 = 数组下标（Levels 的 ranges.0 / Curves 的 channels.0）。 */
+bool segment_index(const std::string& text, size_t* out) {
+  if (text.empty() || text.size() > 6) return false;
+  size_t value = 0;
+  for (const char c : text) {
+    if (c < '0' || c > '9') return false;
+    value = value * 10 + static_cast<size_t>(c - '0');
+  }
+  *out = value;
+  return true;
+}
+
+/* 按点分路径定位叶子；中间段缺失视为「未提供」（合法），中间段存在但类型不符视为错误。 */
 const JsonValue* locate_leaf(const JsonValue& root, const char* path, bool* malformed) {
   const JsonValue* current = &root;
   const char* cursor = path;
@@ -165,14 +209,24 @@ const JsonValue* locate_leaf(const JsonValue& root, const char* path, bool* malf
     const char* dot = std::strchr(cursor, '.');
     const size_t length = dot != nullptr ? static_cast<size_t>(dot - cursor) : std::strlen(cursor);
     const std::string key(cursor, length);
-    if (!current->is_object()) {
-      *malformed = true;
-      return nullptr;
+    size_t slot = 0;
+    if (segment_index(key, &slot)) {
+      if (!current->is_array()) {
+        *malformed = true;
+        return nullptr;
+      }
+      if (slot >= current->as_array().size()) return nullptr;
+      current = &current->as_array()[slot];
+    } else {
+      if (!current->is_object()) {
+        *malformed = true;
+        return nullptr;
+      }
+      const JsonValue* next = current->find(key);
+      if (next == nullptr) return nullptr;
+      current = next;
     }
-    const JsonValue* next = current->find(key);
-    if (next == nullptr) return nullptr;
-    if (dot == nullptr) return next;
-    current = next;
+    if (dot == nullptr) return current;
     cursor = dot + 1;
   }
 }
@@ -203,11 +257,25 @@ std::vector<std::string> split_path(const char* path) {
 }
 
 /*
- * 在（可能是新建的）对象树里按段路径放置叶子。JsonValue 只有 const find，故用重建式赋值。
- * 已存在的中间对象会被保留并继续向下合并，而非整棵替换。
+ * 在（可能是新建的）对象/数组树里按段路径放置叶子。JsonValue 只有 const find，故用重建式赋值。
+ * 已存在的中间对象/数组会被保留并继续向下合并，而非整棵替换；数字段按数组下标处理，
+ * 缺位补 null（Levels 的 ranges 由此从空树长成 4 元素数组）。
  */
 JsonValue set_path(const JsonValue& node, const std::vector<std::string>& segments, size_t index,
                    JsonValue value) {
+  size_t slot = 0;
+  if (segment_index(segments[index], &slot)) {
+    JsonValue result = node.is_array() ? node : JsonValue::array({});
+    if (index + 1 == segments.size()) {
+      result.set_index(slot, std::move(value));
+      return result;
+    }
+    const JsonValue* child =
+        (node.is_array() && slot < node.as_array().size()) ? &node.as_array()[slot] : nullptr;
+    const JsonValue next = child != nullptr ? *child : JsonValue();
+    result.set_index(slot, set_path(next, segments, index + 1, std::move(value)));
+    return result;
+  }
   JsonValue result = node.is_object() ? node : JsonValue::object({});
   if (index + 1 == segments.size()) {
     result.set(segments[index], std::move(value));
@@ -291,6 +359,9 @@ bool adjustment_validate_settings(uint32_t kind, const std::string& settings_jso
       start = space + 1;
     }
   }
+
+  /* Curves 的控制点数组表达不进静态参数表，交给专用校验。 */
+  if (kind == 2u && !curves_validate_settings(text, error)) return false;
 
   for (size_t i = 0; i < info->param_count; ++i) {
     const AdjustmentParam& param = info->params[i];

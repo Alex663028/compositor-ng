@@ -638,3 +638,114 @@ COMP_TEST(adjustment_eval_blend_mode_preserves_below_alpha) {
   }
   COMP_CHECK_MSG(multiplied != normal_mode, "sanity: the colors must differ somewhere");
 }
+
+/* ------------------------------------------------------- P0-3：Curves 求值精确性 */
+
+/*
+ * 恒等曲线必须逐字节不变。
+ *
+ * 这条用例直接钉住此前的标度缺陷：求值侧把 0..255 的输入除以 255 后拿去做
+ * 0..255 的控制点插值，恒等曲线 (0,0)-(255,255) 于是把每个像素压到接近 0
+ * ——画面全黑。断言「逐字节不变」对任何标度错误都是致命的。
+ */
+COMP_TEST(curves_eval_identity_is_byte_exact) {
+  Fixture fx;
+  const std::vector<uint8_t> plain = render_gradient(fx.doc);
+  add_adjustment(fx.doc, 2, R"({"curves":{"channels":[[{"x":0,"y":0},{"x":255,"y":255}]]}})");
+  COMP_CHECK_MSG(flatten(fx.doc) == plain,
+                 "identity curve must be a byte-exact no-op (0..255 control point scale)");
+}
+
+/* 两端点翻转的曲线 = 逐通道取反（两点 Hermite 退化成分段线性）。 */
+COMP_TEST(curves_eval_invert_curve_is_exact_complement) {
+  Fixture fx;
+  const std::vector<uint8_t> plain = render_gradient(fx.doc);
+  add_adjustment(fx.doc, 2, R"({"curves":{"channels":[[{"x":0,"y":255},{"x":255,"y":0}]]}})");
+  const std::vector<uint8_t> adjusted = flatten(fx.doc);
+  for (size_t i = 0; i < plain.size(); i += 4) {
+    for (int c = 0; c < 3; ++c) {
+      COMP_CHECK_MSG(adjusted[i + c] == 255 - plain[i + c],
+                     "two-point inverted curve must be an exact complement");
+    }
+    COMP_CHECK(adjusted[i + 3] == plain[i + 3]);
+  }
+}
+
+/* 控制点必须被精确命中：抬中间调的曲线在 x=64 处输出 y=128。 */
+COMP_TEST(curves_eval_hits_control_points_exactly) {
+  Fixture fx;
+  const std::vector<uint8_t> plain = render_gradient(fx.doc);
+  add_adjustment(fx.doc, 2,
+                 R"({"curves":{"channels":[[{"x":0,"y":0},{"x":64,"y":128},{"x":255,"y":255}]]}})");
+  const std::vector<uint8_t> adjusted = flatten(fx.doc);
+
+  /* 渐变里红通道 = x*16：x=0 -> 0，x=4 -> 64，x=7 -> 112。 */
+  for (int32_t y = 0; y < kH; ++y) {
+    const size_t px0 = (static_cast<size_t>(y) * kW + 0) * 4;
+    const size_t px4 = (static_cast<size_t>(y) * kW + 4) * 4;
+    COMP_CHECK_MSG(plain[px4] == 64, "sanity: gradient red at x=4 is the control point x");
+    COMP_CHECK_MSG(adjusted[px0] == 0, "curve at x=0 must output y=0");
+    COMP_CHECK_MSG(adjusted[px4] == 128, "curve must hit the control point (64 -> 128) exactly");
+    /* 中间调被抬起而非压低（标度/方向任一错都会失败）。 */
+    COMP_CHECK_MSG(adjusted[px4] > plain[px4], "midtone lift must brighten");
+    /* channels[0] 是 RGB 合成曲线，对三条通道同时生效：绿通道取到 64 时同样落到 128。 */
+    const size_t px4_green = (static_cast<size_t>(4) * kW + 0) * 4;
+    COMP_CHECK_MSG(plain[px4_green + 1] == 64,
+                   "sanity: gradient green at y=4 is the control point x");
+    COMP_CHECK_MSG(adjusted[px4_green + 1] == 128,
+                   "the RGB composite curve must apply to every channel, green included");
+  }
+}
+
+/*
+ * 通道曲线先于 RGB 合成曲线（上游 `value(value(x, channel), 0)`）。
+ *
+ * 判据：红通道取反后过「白点减半」的 RGB 曲线 ⇒ 结果 = (255-v)*128/255；
+ * 若实现拿通道曲线**替换**了 RGB 曲线，红通道会是 255-v，差一倍。
+ */
+COMP_TEST(curves_eval_channel_curve_composes_with_rgb_curve) {
+  Fixture fx;
+  const std::vector<uint8_t> plain = render_gradient(fx.doc);
+  add_adjustment(fx.doc, 2,
+                 R"({"curves":{"channels":[[{"x":0,"y":0},{"x":255,"y":128}],)"
+                 R"([{"x":0,"y":255},{"x":255,"y":0}]]}})");
+  const std::vector<uint8_t> adjusted = flatten(fx.doc);
+
+  for (size_t i = 0; i < plain.size(); i += 4) {
+    const double red = (255.0 - plain[i]) * 128.0 / 255.0;
+    COMP_CHECK_MSG(adjusted[i] == static_cast<uint8_t>(std::lround(red)),
+                   "red = RGB curve(channel curve(v))");
+    const double green = plain[i + 1] * 128.0 / 255.0;
+    COMP_CHECK_MSG(adjusted[i + 1] == static_cast<uint8_t>(std::lround(green)),
+                   "unset channel goes straight through the RGB curve");
+    const double blue = plain[i + 2] * 128.0 / 255.0;
+    COMP_CHECK_MSG(adjusted[i + 2] == static_cast<uint8_t>(std::lround(blue)),
+                   "unset channel goes straight through the RGB curve");
+  }
+}
+
+/* Levels 黑点拉到 40 ⇒ 40 以下的输入全部压成黑（上游 LevelsFilter 公式）。 */
+COMP_TEST(levels_eval_black_point_crushes_shadows) {
+  Fixture fx;
+  const std::vector<uint8_t> plain = render_gradient(fx.doc);
+  add_adjustment(fx.doc, 1,
+                 R"({"levels":{"ranges":[{)"
+                 R"("black":40,"white":255,"gamma":1,"outputBlack":0,"outputWhite":255}]}})");
+  const std::vector<uint8_t> adjusted = flatten(fx.doc);
+
+  for (size_t i = 0; i < plain.size(); i += 4) {
+    for (int c = 0; c < 3; ++c) {
+      const double normalized = std::min(1.0, std::max(0.0, (plain[i + c] - 40.0) / 215.0));
+      const int expected = static_cast<int>(std::lround(normalized * 255.0));
+      COMP_CHECK_MSG(adjusted[i + c] == expected, "levels black point must match upstream formula");
+    }
+    COMP_CHECK(adjusted[i + 3] == plain[i + 3]);
+  }
+  /* 阴影被压黑的直观判据：红通道 x<=2（0/16/32）在输出里必须为 0。 */
+  for (int32_t y = 0; y < kH; ++y) {
+    for (int32_t x = 0; x <= 2; ++x) {
+      const size_t px = (static_cast<size_t>(y) * kW + x) * 4;
+      COMP_CHECK_MSG(adjusted[px] == 0, "levels black=40 must crush values below 40");
+    }
+  }
+}

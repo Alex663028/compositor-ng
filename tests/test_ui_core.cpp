@@ -2191,3 +2191,228 @@ COMP_TEST(ui_core_histogram_view_clamp_zoom_and_mapping) {
   COMP_CHECK(comp_ui::histogram_view_is_full(
       comp_ui::histogram_window_from_drag(plot, full, -1000.0, 1000.0)));
 }
+
+/*
+ * 调整参数面板（P0-3）：行 / 滑道 / 滚动 / 值映射。
+ *
+ * 这里钉的是「画出来的地方就是能点的地方」——滑杆的命中区、滑道的像素位置、
+ * 拖动时的 x -> 值映射三者必须同源，否则会出现拖了半格没反应、或者松手后
+ * 数值跳一下的老问题。滚动只保证：能滚到的行都完整落在可视区，滚不到的行
+ * 命中返回 -1（而不是顺手改掉别人的参数）。
+ */
+COMP_TEST(ui_core_adjust_param_rows_and_slider_mapping) {
+  const comp_ui::Rect panel{1000, 100, 330, 648};
+  COMP_CHECK(comp_ui::kAdjustParamRowHeight == 34);
+  COMP_CHECK(comp_ui::kAdjustParamRowsTop == 50);
+
+  /* 1. 行几何：行首与 draw_adjust_panel 的标题 + 类型行对齐，行高含标签带与滑道。 */
+  const comp_ui::Rect first = comp_ui::adjust_param_row_rect(panel, 0);
+  COMP_CHECK(first.x == panel.x && first.w == panel.w && first.h == comp_ui::kAdjustParamRowHeight);
+  COMP_CHECK(first.y == panel.y + comp_ui::kAdjustParamRowsTop);
+  COMP_CHECK(comp_ui::adjust_param_row_rect(panel, 3).y ==
+             first.y + 3 * comp_ui::kAdjustParamRowHeight);
+  /* 滚动只平移，不改行尺寸。 */
+  const comp_ui::Rect scrolled = comp_ui::adjust_param_row_rect(panel, 3, 2);
+  COMP_CHECK(scrolled.y == comp_ui::adjust_param_row_rect(panel, 1).y);
+  COMP_CHECK(scrolled.h == first.h && scrolled.w == first.w);
+
+  /* 2. 可视行数 / 滚动上限：720 高的窗口（体区 648）放得下十余行，色阶 20 行要能滚。 */
+  COMP_CHECK(comp_ui::adjust_param_visible_rows(panel) ==
+             (panel.h - comp_ui::kAdjustParamRowsTop - comp_ui::kAdjustPanelFooter) /
+                 comp_ui::kAdjustParamRowHeight);
+  COMP_CHECK(comp_ui::adjust_param_max_scroll(panel, 5) == 0);
+  COMP_CHECK(comp_ui::adjust_param_max_scroll(panel, 20) ==
+             20 - comp_ui::adjust_param_visible_rows(panel));
+  COMP_CHECK(comp_ui::adjust_param_clamp_scroll(panel, 20, -7) == 0);
+  COMP_CHECK(comp_ui::adjust_param_clamp_scroll(panel, 20, 999) ==
+             comp_ui::adjust_param_max_scroll(panel, 20));
+  COMP_CHECK(comp_ui::adjust_param_clamp_scroll(panel, 5, 3) == 0);
+
+  const int visible = comp_ui::adjust_param_visible_rows(panel);
+  COMP_CHECK(visible > 0);
+
+  /* Tab 切参数时「刚好滚够」：已经在窗口内就不动，越界只滚最小距离。 */
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 20, 4, 2) == 2);
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 20, visible - 1, 0) == 0);
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 20, visible, 0) == 1);
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 20, 19, 0) == 19 - visible + 1);
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 20, 2, 5) == 2);
+  COMP_CHECK(comp_ui::adjust_param_ensure_visible(panel, 5, 9, 0) == 0);
+
+  /* 滚到底时最后一行仍然完整落在可视区内，不压到底部「已有调整」列表。 */
+  const comp_ui::Rect last = comp_ui::adjust_param_row_rect(
+      panel, 19, comp_ui::adjust_param_clamp_scroll(panel, 20, 999));
+  COMP_CHECK(last.bottom() <= panel.bottom() - comp_ui::kAdjustPanelFooter);
+
+  /* 3. 命中：行首 / 行中 / 行尾命中同一行；标题区、可视区外、行数外返回 -1。 */
+  for (int row = 0; row < 3; ++row) {
+    const comp_ui::Rect rect = comp_ui::adjust_param_row_rect(panel, row, 0);
+    const double x = static_cast<double>(rect.x + 4);
+    COMP_CHECK(comp_ui::adjust_param_row_at(panel, 5, 0, x, static_cast<double>(rect.y)) == row);
+    COMP_CHECK(comp_ui::adjust_param_row_at(panel, 5, 0, x,
+                                            static_cast<double>(rect.bottom()) - 1.0) == row);
+  }
+  COMP_CHECK(comp_ui::adjust_param_row_at(panel, 5, 0, static_cast<double>(first.x + 4),
+                                          static_cast<double>(panel.y + 10)) == -1);
+  COMP_CHECK(comp_ui::adjust_param_row_at(panel, 5, 0, static_cast<double>(panel.right() + 4),
+                                          static_cast<double>(first.y)) == -1);
+  COMP_CHECK(comp_ui::adjust_param_row_at(panel, 0, 0, static_cast<double>(first.x + 4),
+                                          static_cast<double>(first.y)) == -1);
+  /* 滚过 2 行后，屏幕第一行是绝对第 2 行；绝对第 0/1 行已不可点。 */
+  COMP_CHECK(comp_ui::adjust_param_row_at(panel, 20, 2, static_cast<double>(first.x + 4),
+                                          static_cast<double>(first.y)) == 2);
+  /* 可视区以下（底部提示区）不是参数行。 */
+  COMP_CHECK(comp_ui::adjust_param_row_at(panel, 20, 0, static_cast<double>(first.x + 4),
+                                          static_cast<double>(panel.bottom()) - 4.0) == -1);
+
+  /* 4. 滑道：只占行下半段，上沿留出聚焦/键入带；标签带点击不算拖滑杆。 */
+  const comp_ui::Rect track = comp_ui::adjust_slider_track_rect(first);
+  COMP_CHECK(track.x > first.x && track.right() < first.right());
+  COMP_CHECK(track.y == first.y + comp_ui::kAdjustRowLabelBand);
+  COMP_CHECK(track.bottom() <= first.bottom());
+  COMP_CHECK(!comp_ui::adjust_row_track_hit(panel, 0, 0, static_cast<double>(track.x + 4),
+                                            static_cast<double>(first.y + 4)));
+  COMP_CHECK(comp_ui::adjust_row_track_hit(panel, 0, 0, static_cast<double>(track.x + 4),
+                                           static_cast<double>(track.y + track.h / 2.0)));
+
+  /* 5. x -> 值：两端严格对齐滑道左右，拖出滑道取端值，NaN 不产生脏值。 */
+  COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, track.x, 0.0, 255.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, track.right(), 0.0, 255.0), 255.0));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, track.x - 500.0, 0.0, 255.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, track.right() + 500.0, 0.0, 255.0),
+                        255.0));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_fraction(track, std::nan("")), 0.0));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, std::nan(""), -100.0, 100.0), -100.0));
+
+  /* 值 -> 像素 -> 值往返：滑块画在哪，拖到那就是哪个值。 */
+  const double samples[] = {0.0, 40.0, 127.5, 200.0, 255.0};
+  for (double value : samples) {
+    const double x = comp_ui::adjust_slider_knob_x(track, value, 0.0, 255.0);
+    COMP_CHECK(near_value(comp_ui::adjust_slider_value(track, x, 0.0, 255.0), value));
+  }
+  COMP_CHECK(near_value(comp_ui::adjust_slider_knob_x(track, -1e9, 0.0, 255.0), track.x));
+  COMP_CHECK(near_value(comp_ui::adjust_slider_knob_x(track, 1e9, 0.0, 255.0), track.right()));
+
+  /* 6. 归整：宽量程（色阶 0..255）取整，窄量程（gamma 0.1..9.99）留两位小数。 */
+  COMP_CHECK(comp_ui::adjust_snap_value(127.6, 0.0, 255.0) == 128.0);
+  COMP_CHECK(comp_ui::adjust_snap_value(39.4, 0.0, 255.0) == 39.0);
+  COMP_CHECK(comp_ui::adjust_snap_value(-3.6, -100.0, 100.0) == -4.0);
+  COMP_CHECK(comp_ui::adjust_snap_value(1.234, 0.1, 9.99) == 1.23);
+  COMP_CHECK(comp_ui::adjust_snap_value(0.004, -20.0, 20.0) == 0.0);
+  COMP_CHECK(comp_ui::adjust_snap_value(1e9, 0.0, 255.0) == 255.0);
+  COMP_CHECK(comp_ui::adjust_snap_value(std::nan(""), 0.0, 255.0) == 0.0);
+}
+
+/*
+ * 色阶通道条 + 曲线编辑器（P0-3）。
+ *
+ * 这里钉三件事：
+ *   1. 通道条右对齐在类型行上，不压参数行；四个格子按 RGB/R/G/B 从左到右排，
+ *      互不重叠且完整落在面板里（点得到的前提是画得下）。
+ *   2. 曲线绘图区是正方形，屏幕 <-> 值双向映射一致（y 翻转）；控制点命中取最近
+ *      且在半径内的点，空白处不加点的情况返回 -1。
+ *   3. 折线求值与引擎同口径：恒等曲线不动、单调点上不过冲、端点夹住。
+ */
+COMP_TEST(ui_core_adjust_channel_chips_and_curve_editor) {
+  const comp_ui::Rect panel{1000, 100, 330, 648};
+
+  /* 1. 通道条：4 个格子，右对齐，不进入参数行区域。 */
+  const int channels = 4;
+  comp_ui::Rect previous{};
+  for (int c = 0; c < channels; ++c) {
+    const comp_ui::Rect chip = comp_ui::adjust_channel_chip_rect(panel, c, channels);
+    COMP_CHECK(chip.w == comp_ui::kAdjustChannelChipWidth);
+    COMP_CHECK(chip.h == comp_ui::kAdjustChannelChipHeight);
+    COMP_CHECK(chip.x > panel.x && chip.right() <= panel.right() - 10);
+    COMP_CHECK(chip.bottom() <= panel.y + comp_ui::kAdjustParamRowsTop);
+    if (c > 0) COMP_CHECK(chip.x > previous.right());
+    previous = chip;
+    COMP_CHECK(comp_ui::adjust_channel_chip_at(panel, channels,
+                                               chip.x + chip.w / 2.0,
+                                               chip.y + chip.h / 2.0) == c);
+  }
+  COMP_CHECK(comp_ui::adjust_channel_chip_at(panel, channels, panel.x + 4.0,
+                                             panel.y + 30.0) == -1);
+  COMP_CHECK(comp_ui::adjust_channel_chip_at(panel, channels, panel.right() - 4.0,
+                                             panel.y + 30.0) == -1);
+  /* 通道格子不吞参数行：第一行起始 y 在通道条之下。 */
+  const comp_ui::Rect first = comp_ui::adjust_param_row_rect(panel, 0);
+  COMP_CHECK(comp_ui::adjust_channel_chip_rect(panel, 0, channels).bottom() <= first.y);
+
+  /* 2. 曲线通道条 + 绘图区。 */
+  const comp_ui::Rect plot = comp_ui::adjust_curve_plot_rect(panel);
+  COMP_CHECK(!plot.empty());
+  COMP_CHECK(plot.w == plot.h);
+  COMP_CHECK(plot.x >= panel.x && plot.right() <= panel.right());
+  COMP_CHECK(plot.bottom() <= panel.bottom() - comp_ui::kAdjustPanelFooter);
+  COMP_CHECK(plot.y >= panel.y + comp_ui::kAdjustParamRowsTop + comp_ui::kCurveChannelBarHeight);
+  for (int c = 0; c < channels; ++c) {
+    const comp_ui::Rect chip = comp_ui::curve_channel_chip_rect(panel, c, channels);
+    COMP_CHECK(chip.bottom() <= plot.y);
+    COMP_CHECK(comp_ui::curve_channel_chip_at(panel, channels, chip.x + chip.w / 2.0,
+                                              chip.y + chip.h / 2.0) == c);
+  }
+  /* 小面板放不下正方形时返回空矩形，绘制端据此跳过（不画半个编辑器）。 */
+  COMP_CHECK(comp_ui::adjust_curve_plot_rect(comp_ui::Rect{0, 0, 200, 120}).empty());
+
+  /* 3. 值 <-> 屏幕：0 在左下、255 在右上，往返一致。 */
+  COMP_CHECK(near_value(comp_ui::curve_plot_value_to_x(plot, 0.0),
+                        static_cast<double>(plot.x)));
+  COMP_CHECK(near_value(comp_ui::curve_plot_value_to_x(plot, 255.0),
+                        static_cast<double>(plot.right() - 1)));
+  COMP_CHECK(near_value(comp_ui::curve_plot_value_to_y(plot, 0.0),
+                        static_cast<double>(plot.bottom() - 1)));
+  COMP_CHECK(near_value(comp_ui::curve_plot_value_to_y(plot, 255.0),
+                        static_cast<double>(plot.y)));
+  const double sample_values[] = {0.0, 40.0, 128.0, 200.0, 255.0};
+  for (double value : sample_values) {
+    COMP_CHECK(near_value(
+        comp_ui::curve_plot_x_to_value(plot, comp_ui::curve_plot_value_to_x(plot, value)), value));
+    COMP_CHECK(near_value(
+        comp_ui::curve_plot_y_to_value(plot, comp_ui::curve_plot_value_to_y(plot, value)), value));
+  }
+  COMP_CHECK(near_value(comp_ui::curve_plot_x_to_value(plot, plot.x - 500.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::curve_plot_x_to_value(plot, plot.right() + 500.0), 255.0));
+
+  /* 4. 控制点命中：取半径内最近的点；点外返回 -1。 */
+  const double xy[] = {0.0, 0.0, 128.0, 160.0, 255.0, 255.0};
+  const double mid_x = comp_ui::curve_plot_value_to_x(plot, 128.0);
+  const double mid_y = comp_ui::curve_plot_value_to_y(plot, 160.0);
+  COMP_CHECK(comp_ui::curve_point_hit(plot, xy, 3, mid_x + 2.0, mid_y - 2.0, 6.0) == 1);
+  COMP_CHECK(comp_ui::curve_point_hit(plot, xy, 3, mid_x + 40.0, mid_y, 6.0) == -1);
+  COMP_CHECK(comp_ui::curve_point_hit(plot, xy, 0, mid_x, mid_y, 6.0) == -1);
+  /* 两个点重叠半径内取更近的那个。 */
+  COMP_CHECK(comp_ui::curve_point_hit(plot, xy, 3, mid_x, mid_y + 3.0, 6.0) == 1);
+
+  /* 5. 加点：只能落在相邻两点之间且两侧留 1 个单位。 */
+  const double wide[] = {0.0, 0.0, 128.0, 128.0, 255.0, 255.0};
+  COMP_CHECK(near_value(comp_ui::curve_insert_x(wide, 3, 64.2), 64.0));
+  COMP_CHECK(near_value(comp_ui::curve_insert_x(wide, 3, 126.6), 127.0));
+  COMP_CHECK(std::isnan(comp_ui::curve_insert_x(wide, 3, 128.0)));
+  COMP_CHECK(std::isnan(comp_ui::curve_insert_x(wide, 3, 255.0)));
+  COMP_CHECK(std::isnan(comp_ui::curve_insert_x(wide, 3, -4.0)));
+  const double tight[] = {0.0, 0.0, 1.0, 1.0, 255.0, 255.0};
+  COMP_CHECK(std::isnan(comp_ui::curve_insert_x(tight, 3, 0.4)));
+  COMP_CHECK(near_value(comp_ui::curve_insert_x(tight, 3, 100.0), 100.0));
+
+  /* 6. 折线求值：恒等、端点夹住、单调点上不过冲。 */
+  const double identity[] = {0.0, 0.0, 255.0, 255.0};
+  for (double value : sample_values) {
+    COMP_CHECK(near_value(comp_ui::curve_eval(identity, 2, value), value));
+  }
+  const double lift[] = {0.0, 0.0, 128.0, 180.0, 255.0, 255.0};
+  COMP_CHECK(near_value(comp_ui::curve_eval(lift, 3, 128.0), 180.0));
+  COMP_CHECK(near_value(comp_ui::curve_eval(lift, 3, 0.0), 0.0));
+  COMP_CHECK(near_value(comp_ui::curve_eval(lift, 3, 255.0), 255.0));
+  /* 保形：中间调上提后整段单调不减；中段不冲过 180，末段不冲过 255。 */
+  double previous_y = -1.0;
+  for (int x = 0; x <= 255; ++x) {
+    const double y = comp_ui::curve_eval(lift, 3, static_cast<double>(x));
+    COMP_CHECK(y >= previous_y - 1e-9);
+    COMP_CHECK(y >= -1e-9 && y <= 255.0 + 1e-9);
+    if (x <= 128) COMP_CHECK(y <= 180.0 + 1e-9);
+    previous_y = y;
+  }
+  /* 少于两点 = 恒等（引擎按容错读，面板也照此画）。 */
+  COMP_CHECK(near_value(comp_ui::curve_eval(identity, 1, 77.0), 77.0));
+}

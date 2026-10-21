@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace comp_ui {
 
@@ -2212,6 +2213,120 @@ inline double step_effect_param(double current, int direction, double min_value,
                             min_value, max_value);
 }
 
+/* ------------------------------------------------ 调整参数面板（P0-3） */
+
+/*
+ * 参数行 = 上 18 px「标签 + 数值」（点击聚焦 / 数字键键入）+ 下 16 px 滑杆。
+ * 单行 20 px 放不下一个能用鼠标拖的滑道，这是 GDI 里还能拖得动的下限。
+ * 行首偏移 = 标题（8 + 22）+ 类型行（20），与 draw_adjust_panel 的排版一致；
+ * 绘制与命中都走下面这组函数，避免「看得见点不中」。
+ */
+inline constexpr int kAdjustParamRowHeight = 34;
+inline constexpr int kAdjustParamRowsTop = 50;
+inline constexpr int kAdjustRowLabelBand = 18;
+/* 底部留给「已有调整」列表与快捷键提示的高度（列表头 + 3 行 + 5 行提示）。 */
+inline constexpr int kAdjustPanelFooter = 180;
+
+inline int adjust_param_visible_rows(const Rect& panel) {
+  const int space = panel.h - kAdjustParamRowsTop - kAdjustPanelFooter;
+  if (space <= 0) return 0;
+  return space / kAdjustParamRowHeight;
+}
+
+inline int adjust_param_max_scroll(const Rect& panel, int param_count) {
+  const int visible = adjust_param_visible_rows(panel);
+  if (visible <= 0 || param_count <= visible) return 0;
+  return param_count - visible;
+}
+
+inline int adjust_param_clamp_scroll(const Rect& panel, int param_count, int scroll) {
+  if (scroll < 0) scroll = 0;
+  const int max_scroll = adjust_param_max_scroll(panel, param_count);
+  return scroll > max_scroll ? max_scroll : scroll;
+}
+
+/* 让 row 落进可视区（Tab 切参数时用）：只滚到刚好够，不做居中。 */
+inline int adjust_param_ensure_visible(const Rect& panel, int param_count, int row,
+                                       int scroll) {
+  const int visible = adjust_param_visible_rows(panel);
+  int next = scroll;
+  if (visible > 0 && row >= 0) {
+    if (row < next) next = row;
+    if (row >= next + visible) next = row - visible + 1;
+  }
+  return adjust_param_clamp_scroll(panel, param_count, next);
+}
+
+/* row 是参数表里的绝对下标；scroll 是已经滚掉的行数。 */
+inline Rect adjust_param_row_rect(const Rect& panel, int row, int scroll = 0) {
+  return Rect{panel.x, panel.y + kAdjustParamRowsTop + (row - scroll) * kAdjustParamRowHeight,
+              panel.w, kAdjustParamRowHeight};
+}
+
+/* 命中：返回绝对行号；落在滚动窗口外 / 行数之外返回 -1。 */
+inline int adjust_param_row_at(const Rect& panel, int param_count, int scroll, double x,
+                               double y) {
+  if (param_count <= 0 || !panel.contains(x, y)) return -1;
+  const int visible = adjust_param_visible_rows(panel);
+  if (visible <= 0) return -1;
+  const double local = y - static_cast<double>(panel.y + kAdjustParamRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kAdjustParamRowHeight)));
+  if (row < 0 || row >= visible) return -1;
+  const int absolute = row + scroll;
+  return absolute < param_count ? absolute : -1;
+}
+
+inline Rect adjust_slider_track_rect(const Rect& row) {
+  return Rect{row.x + 10, row.y + kAdjustRowLabelBand, row.w - 20,
+              row.h - kAdjustRowLabelBand - 2};
+}
+
+/* 滑杆只占行的下半段：上半段仍是「聚焦 / 键入」区域，拖动不会误锁焦点。 */
+inline bool adjust_row_track_hit(const Rect& panel, int row, int scroll, double x, double y) {
+  const Rect rect = adjust_param_row_rect(panel, row, scroll);
+  return adjust_slider_track_rect(rect).contains(x, y);
+}
+
+/* x -> 0..1，含 NaN / 越界夹取（拖出滑道即取端值，PS 同款）。 */
+inline double adjust_slider_fraction(const Rect& track, double x) {
+  if (track.w <= 0) return 0.0;
+  const double t = (x - static_cast<double>(track.x)) / static_cast<double>(track.w);
+  if (!(t == t)) return 0.0; /* NaN */
+  return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+}
+
+inline double adjust_value_fraction(double value, double min_value, double max_value) {
+  if (!(max_value > min_value) || !(value == value)) return 0.0;
+  const double t = (value - min_value) / (max_value - min_value);
+  return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+}
+
+inline double adjust_slider_value(const Rect& track, double x, double min_value,
+                                  double max_value) {
+  const double t = adjust_slider_fraction(track, x);
+  return clamp_effect_param(min_value + (max_value - min_value) * t, min_value, max_value);
+}
+
+/*
+ * 落文本前的归整：量程 >= 50 的表项（色阶 0..255、明暗/饱和 -100..100）都是
+ * 「整数量」，而量程小的（±20 的曝光、0.1..9.99 的 gamma）必须留小数。
+ * 阈值按当前参数表定，与 effect_param_step 的「跨度 <= 1」同一思路：
+ * 表里出现新的量程类别时，补字段比在这里加特例更诚实。
+ */
+inline double adjust_snap_value(double value, double min_value, double max_value) {
+  const double clamped = clamp_effect_param(value, min_value, max_value);
+  const double scale = (max_value - min_value) >= 50.0 ? 1.0 : 100.0;
+  return std::round(clamped * scale) / scale;
+}
+
+/* 数值在滑道上的像素位置（画滑块用；与 x -> 值严格互逆）。 */
+inline double adjust_slider_knob_x(const Rect& track, double value, double min_value,
+                                   double max_value) {
+  const double t = adjust_value_fraction(value, min_value, max_value);
+  return static_cast<double>(track.x) + t * static_cast<double>(track.w);
+}
+
 /* ------------------------------------------------------- 拖行重排（S24） */
 
 enum class DragTarget {
@@ -2422,6 +2537,181 @@ inline HistogramView histogram_window_from_drag(const Rect& plot, const Histogra
   if (a < 0.0) a = 0.0;
   if (b > kHistogramMaxBin) b = kHistogramMaxBin;
   return clamp_histogram_view(a, b);
+}
+
+/* ------------------------------------- 调整面板：色阶通道条 / 曲线编辑器（P0-3） */
+
+/*
+ * 色阶 = 4 通道 × 5 参（`levels.ranges.N.*`，顺序由引擎表钉住）。面板按通道分页，
+ * 通道条右对齐排在**标题行**（与「调整（Adjustment）」同高），不占参数行高度——
+ * 参数行几何因此不用为色阶单独开一套，滚动/命中仍走 adjust_param_*。
+ */
+inline constexpr int kAdjustChannelChipWidth = 34;
+inline constexpr int kAdjustChannelChipHeight = 18;
+inline constexpr int kAdjustChannelChipGap = 4;
+
+inline Rect adjust_channel_chip_rect(const Rect& panel, int channel, int channel_count) {
+  if (channel_count < 1) channel_count = 1;
+  if (channel < 0) channel = 0;
+  if (channel >= channel_count) channel = channel_count - 1;
+  const int total =
+      channel_count * kAdjustChannelChipWidth + (channel_count - 1) * kAdjustChannelChipGap;
+  const int x0 = panel.right() - 10 - total;
+  return Rect{x0 + channel * (kAdjustChannelChipWidth + kAdjustChannelChipGap), panel.y + 6,
+              kAdjustChannelChipWidth, kAdjustChannelChipHeight};
+}
+
+inline int adjust_channel_chip_at(const Rect& panel, int channel_count, double x, double y) {
+  for (int c = 0; c < channel_count; ++c) {
+    if (adjust_channel_chip_rect(panel, c, channel_count).contains(x, y)) return c;
+  }
+  return -1;
+}
+
+/*
+ * 曲线编辑器：顶部一排通道条（RGB / R / G / B），下面是正方形绘图区。
+ * 坐标系与引擎同口径：控制点是 0..255 的 (x, y)，y 向上为大——屏幕 y 要翻转。
+ * 屏幕 <-> 值的换算只此一份，绘制折线、画控制点、命中、拖动全部复用它。
+ */
+inline constexpr int kCurveChannelBarHeight = 22;
+inline constexpr int kCurveChannelChipWidth = 42;
+inline constexpr int kCurveMinPlotSide = 48;
+
+inline Rect curve_channel_chip_rect(const Rect& panel, int channel, int channel_count) {
+  if (channel_count < 1) channel_count = 1;
+  if (channel < 0) channel = 0;
+  if (channel >= channel_count) channel = channel_count - 1;
+  const int total =
+      channel_count * kCurveChannelChipWidth + (channel_count - 1) * kAdjustChannelChipGap;
+  const int x0 = panel.x + (panel.w - total) / 2;
+  return Rect{x0 + channel * (kCurveChannelChipWidth + kAdjustChannelChipGap),
+              panel.y + kAdjustParamRowsTop, kCurveChannelChipWidth, kAdjustChannelChipHeight};
+}
+
+inline int curve_channel_chip_at(const Rect& panel, int channel_count, double x, double y) {
+  for (int c = 0; c < channel_count; ++c) {
+    if (curve_channel_chip_rect(panel, c, channel_count).contains(x, y)) return c;
+  }
+  return -1;
+}
+
+/* 绘图区：通道条以下的可用区里取最大的正方形，水平居中；放不下就返回空矩形。 */
+inline Rect adjust_curve_plot_rect(const Rect& panel) {
+  const int top = panel.y + kAdjustParamRowsTop + kCurveChannelBarHeight;
+  const int avail_w = panel.w - 24;
+  const int avail_h = panel.bottom() - kAdjustPanelFooter - top - 8;
+  if (avail_w < kCurveMinPlotSide || avail_h < kCurveMinPlotSide) return Rect{};
+  const int side = avail_w < avail_h ? avail_w : avail_h;
+  return Rect{panel.x + (panel.w - side) / 2, top, side, side};
+}
+
+inline double curve_plot_value_to_x(const Rect& plot, double value) {
+  if (!(plot.w > 1.0)) return plot.x;
+  if (value < 0.0) value = 0.0;
+  if (value > 255.0) value = 255.0;
+  return plot.x + (value / 255.0) * (plot.w - 1.0);
+}
+
+inline double curve_plot_value_to_y(const Rect& plot, double value) {
+  if (!(plot.h > 1.0)) return plot.y;
+  if (value < 0.0) value = 0.0;
+  if (value > 255.0) value = 255.0;
+  return plot.y + (1.0 - value / 255.0) * (plot.h - 1.0);
+}
+
+inline double curve_plot_x_to_value(const Rect& plot, double x) {
+  if (!(plot.w > 1.0)) return 0.0;
+  double t = (x - plot.x) / (plot.w - 1.0);
+  if (t < 0.0) t = 0.0;
+  if (t > 1.0) t = 1.0;
+  return t * 255.0;
+}
+
+inline double curve_plot_y_to_value(const Rect& plot, double y) {
+  if (!(plot.h > 1.0)) return 0.0;
+  double t = 1.0 - (y - plot.y) / (plot.h - 1.0);
+  if (t < 0.0) t = 0.0;
+  if (t > 1.0) t = 1.0;
+  return t * 255.0;
+}
+
+/* 控制点命中：返回半径内最近的点，没有则 -1。points_xy 是 (x, y) 交替存放。 */
+inline int curve_point_hit(const Rect& plot, const double* points_xy, int count, double x,
+                           double y, double radius) {
+  if (points_xy == nullptr || radius <= 0.0) return -1;
+  int best = -1;
+  double best_d2 = radius * radius;
+  for (int i = 0; i < count; ++i) {
+    const double dx = curve_plot_value_to_x(plot, points_xy[2 * i]) - x;
+    const double dy = curve_plot_value_to_y(plot, points_xy[2 * i + 1]) - y;
+    const double d2 = dx * dx + dy * dy;
+    if (d2 <= best_d2) {
+      best_d2 = d2;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/*
+ * 空白处加点：取最近的整数 x，必须严格落在相邻两点之间且两侧各留 1 个单位
+ * （引擎要求 x 严格递增）。没有空位返回 NaN，调用方据此不加点。
+ */
+inline double curve_insert_x(const double* points_xy, int count, double value_x) {
+  if (points_xy == nullptr || count < 2) return std::numeric_limits<double>::quiet_NaN();
+  const double target = std::floor(value_x + 0.5);
+  for (int i = 0; i + 1 < count; ++i) {
+    const double left = points_xy[2 * i];
+    const double right = points_xy[2 * i + 2];
+    if (target > left && target < right) {
+      if (target - left < 1.0 || right - target < 1.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      return target;
+    }
+  }
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+/*
+ * 曲线求值（**只用于面板画折线**）：保形三次 Hermite / Fritsch–Carlson 斜率，
+ * 与 engine/compositing/adjustment_eval.cpp 的 `Curve::apply` 同口径。面板画出来的
+ * 形状必须等于画布上实际的亮度映射，否则用户拖的是 A、看到的是 B。
+ */
+inline double curve_eval(const double* points_xy, int count, double x) {
+  if (points_xy == nullptr || count < 2) return x;
+  if (count > 32) count = 32;
+  if (x <= points_xy[0]) return points_xy[1];
+  if (x >= points_xy[2 * count - 2]) return points_xy[2 * count - 1];
+
+  double slopes[32];
+  for (int i = 0; i + 1 < count; ++i) {
+    const double span = points_xy[2 * i + 2] - points_xy[2 * i];
+    slopes[i] = span > 1e-9 ? (points_xy[2 * i + 3] - points_xy[2 * i + 1]) / span : 0.0;
+  }
+  /* 端点用邻段斜率；中间点取调和平均，异号或为零则取 0（保形，不过冲）。 */
+  auto slope_at = [&](int j) {
+    if (j <= 0) return slopes[0];
+    if (j >= count - 1) return slopes[count - 2];
+    if (slopes[j - 1] * slopes[j] <= 0.0) return 0.0;
+    return 2.0 / (1.0 / slopes[j - 1] + 1.0 / slopes[j]);
+  };
+
+  int i = 0;
+  while (i + 2 < count && x > points_xy[2 * i + 2]) ++i;
+  const double x0 = points_xy[2 * i];
+  const double y0 = points_xy[2 * i + 1];
+  const double x1 = points_xy[2 * i + 2];
+  const double y1 = points_xy[2 * i + 3];
+  const double h = x1 - x0;
+  const double t = h > 1e-9 ? (x - x0) / h : 0.0;
+  const double t2 = t * t;
+  const double t3 = t2 * t;
+  double y = (2.0 * t3 - 3.0 * t2 + 1.0) * y0 + (t3 - 2.0 * t2 + t) * h * slope_at(i) +
+             (-2.0 * t3 + 3.0 * t2) * y1 + (t3 - t2) * h * slope_at(i + 1);
+  if (y < 0.0) y = 0.0;
+  if (y > 255.0) y = 255.0;
+  return y;
 }
 
 }  // namespace comp_ui

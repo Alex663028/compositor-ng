@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **470 用例 0 失败**；Windows 外壳实机自检 **164 项全 OK**（与仓内基线逐字节一致）。
+  全量 **553 用例 0 失败**；Windows 外壳实机自检 **219 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -3856,4 +3856,63 @@ PE 导出 **131**；`run_regression.py --require-ohos` **6/6 PASS**；壳自检 
 新增参数必须同时改 `effect_eval.cpp` 的 `read_*`——漂移由像素对拍用例守，不是编译期联动；
 ⑤ 面板手感/跨 DPI 仍待 ALEX 目视（`docs/manual-test.md` M17）；⑥ `scripts/visual_check.py`
 的工作区改动按约定仍未提交。
+
+### 6.39 P0-3 调整滑杆 + 曲线/色阶编辑器（2026-10-21，Claude）
+
+**缺口。** 调整面板只能「`Tab` 换行 + `=` 步进 + 数字键入」，没有滑杆、没有拖动预览；
+更要命的是三类调整根本改不了：**Levels 的 20 个量在参数表里是 0 项**（`param_count = 0`，
+面板连一行都不显示），**Curves 整条曲线没有编辑入口**（只能读、只能保真存取）。
+验收标准：数字参数能拖、拖的时候画面实时变、**一次拖动只占一步撤销**；
+曲线能加点/拖点/删点且落盘后点列不变；Levels 黑场拖到 40 暗部被压死。
+
+**ABI（纯尾部追加，131 → 135）。** `comp_layer_curves_channel_count` /
+`_point_count` / `_point_at` / `_set_points`；既有枚举、结构体、签名一个不动。
+后三个共用同一份「按 x 排序 + 同 x 去重」结果，两个读入口不会漂移；`set_points` 是
+**纯函数**（只在 settings JSON 字符串上操作），既不碰文档也不开事务——撤销步由
+`comp_layer_update_adjustment_at`（P0-2 前已存在）产生。
+
+**单一事实源。** Levels 补齐 20 个参数（`levels.ranges.0..3` × black/gamma/white/
+outputBlack/outputWhite），量程逐条抄上游 `LevelRange.normalized`（black 0..254、
+white 1..255、gamma 0.1..9.99、输出 0..255），落在 `adjustment_table.cpp` 的同一张表里；
+白/黑相对顺序不校验，由求值侧 `normalize()` 兜（同上游）。曲线点列的结构约束表达不了在
+静态参数表里（4 通道、2..32 点、x 严格递增、首末点 x 锁 0/255、值域 0..255），新增
+`engine/domain/curves_settings.{h,cpp}`，由 `adjustment_validate_settings` 调用；
+`.comp` 里的对象形式 `{"x":N,"y":N}` 与紧凑形式 `[x,y]` 都接受。
+
+**一步撤销（本轮的核心理由）。** 拖动途中每次写回都是 `comp_layer_update_adjustment_at`，
+不开事务时引擎的 `ImplicitTxn` 会给**每次写各记一步**——拖一次滑杆能产生几十步撤销，
+`Ctrl+Z` 看起来像「撤销一次没反应」。现在的边界：按下开显式事务 → 拖动期间的写全折在
+里面 → 松手 `comp_txn_commit`，整段拖动只占**一步**；值没变（没有任何实际写入）→
+`comp_txn_abort`，**不留空撤销步**；`Esc` 或 `WM_CAPTURECHANGED`/`WM_KILLFOCUS`
+（失焦、菜单抢捕获）→ abort 回滚到按下前快照；新增态（`selected_adjustment < 0`，还没有
+可写对象）拖动只改编辑缓冲、不写文档，仍由 `Ctrl+Shift+U` 落盘——「先调好再加」不该进历史。
+
+**壳侧交互。** 参数行的滑道按下即可左右拖（几何在按下瞬间冻结，拖动途中的重排不会让滑道
+在指针下跑掉）；曲线编辑器是「绘图区正方形 + RGB/R/G/B 四页通道条」：空白处按下 = 插入
+控制点并立刻进入拖动（一次按下就能定位），按在已有点上 = 拖该点，`Delete` 删焦点点，
+两端点锁死（删了定义域就不完整），内部点 x 夹在左右邻点 ±1 内保持严格递增。点列真相在
+引擎 settings 里，壳只缓存当前通道用于绘制/命中，每次写完都 `refresh_adjustments` 以引擎为准
+回读。滑道矩形、滑道命中、x→值、值吸附、曲线绘图区、通道条、点命中、插入点选址全部是
+`ui_core.h` 的纯函数，绘制与命中**调同一批函数**，`tests/test_ui_core.cpp` 直接盯这些函数。
+
+**一次真崩（教训）。** 第一次用鼠标拖曲线点，外壳 `0xc0000005` 崩在 `USER32.dll`
+（`fault offset 0x401c3`）。根因是新写的两处状态栏/页脚文字用了
+`wsprintfW(L"… (%.0f, %.0f) …")`——**`wsprintfW` 不支持浮点转换**，它按整数宽度取变参，
+`double` 被当成指针读飞。改为先 `number_text()`（`snprintf`）再 `%s` 拼入，与壳里其它面板
+同口径。自动化此前完全测不到这条路径：`scene_adjustment` 全是键盘，那两行只有「拖动中/绘制
+焦点点」时才执行——所以本轮同时补了鼠标驱动的 `curve_levels` 场景。
+
+**验证。** 全量 **553 例 / 0 失败**（P0-2 的 535 + 曲线 ABI/校验 17 例 + `.comp` 点列往返 1 例）；
+PE 导出 **135**；`run_regression.py --require-ohos` **6/6 PASS**（壳自检 219 项 SHA256
+`e277a4c4…` 与基线逐字节一致，鸿蒙 aarch64 交叉编译 95 目标 0 失败）；
+`visual_check.py` **16 场景 74 项 / 0 失败**（新增 `curve_levels` 6 项：
+绘图区几何、抬中间调画布变亮、画布直方图中位数右移、一次 `Ctrl+Z` 回原、色阶黑场 40 压暗、
+再一次 `Ctrl+Z` 回原；截图 `report/assets/s15/60_*.png`–`66_*.png`）。
+
+**边界。** ① 曲线没有预设库、没有直方图底图、没有贝塞尔手柄（求值固定为 Fritsch–Carlson
+形状保持三次 Hermite）；② 色阶通道条只切面板分页（`ShellState.adj_channel`），**不写回**
+`levels.channel`，求值恒按 `ranges[0]` 管合成、`ranges[1..3]` 各管一个色彩通道；
+③ 布尔参数没有滑道（点一下即切换）；④ 滑杆吸附到整数是「量程 ≥ 50」的统一规则，
+没有按住 `Shift` 的精细模式；⑤ 手感/跨 DPI/连续拖动是否跟手仍待 ALEX 目视
+（`docs/manual-test.md` M18）；⑥ `scripts/visual_check.py` 的工作区改动按约定仍未提交。
 

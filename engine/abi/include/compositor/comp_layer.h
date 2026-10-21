@@ -338,7 +338,7 @@ typedef struct comp_adjustment_param {
 /* kind 的规范名称（= 上游 rawValue）；kind 非法时返回 COMP_ERR_INVALID_ARGUMENT。 */
 COMP_API comp_result comp_layer_adjustment_kind_name(uint32_t kind, const char** out_name);
 
-/* 该 kind 可编辑参数数量（0 表示无逐参数面板，如 Invert / Levels / Curves）。 */
+/* 该 kind 可编辑参数数量（0 表示无逐参数面板，如 Invert / Curves）。 */
 COMP_API comp_result comp_layer_adjustment_param_count(uint32_t kind, size_t* out_count);
 
 /* 取第 index 个参数的元数据（index 越界返回 COMP_ERR_INVALID_ARGUMENT）。 */
@@ -1043,6 +1043,61 @@ COMP_API comp_result comp_layer_effect_build_settings(uint32_t effect,
                                                       char* settings_json_utf8,
                                                       size_t capacity,
                                                       size_t* out_size);
+
+/* ------------------------------------------- 曲线控制点（P0-3 尾部追加） */
+
+/*
+ * Curves 的控制点读写（settings 里的 `curves.channels`，与上游 Curves.swift 同口径）。
+ *
+ * 通道下标有语义：0 = RGB 合成，1/2/3 = R/G/B（与 `comp_adjustment_kind` 的
+ * COMP_ADJUSTMENT_CURVES 配合使用）。每通道 2..32 个点，x 严格递增、首点 x = 0、
+ * 末点 x = 255，x/y 都在 0..255；求值是保形三次 Hermite，通道曲线先于 RGB 合成曲线。
+ *
+ * 这组入口与 `comp_layer_adjustment_*` 一样是**纯函数**：只在 settings JSON 上操作，
+ * 不碰文档、不开事务、不进撤销栈——面板把返回的 JSON 交给
+ * `comp_layer_update_adjustment_at` 才产生撤销步（配合显式事务即可做到「一次拖动一步」）。
+ */
+#define COMP_CURVE_CHANNEL_COUNT 4
+
+/* 通道数（上下文无关，恒为 COMP_CURVE_CHANNEL_COUNT）；out_count 为 NULL -> INVALID_ARGUMENT。 */
+COMP_API comp_result comp_layer_curves_channel_count(size_t* out_count);
+
+/*
+ * 某通道当前控制点数量（按 x 升序、同 x 去重后的条数）。
+ * settings 非法、通道缺失或数组为空 -> 0（语义即恒等曲线），仍返回 COMP_OK；
+ * channel 越界或 out_count 为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_layer_curves_point_count(const char* settings_json_utf8,
+                                                   uint32_t channel,
+                                                   size_t* out_count);
+
+/*
+ * 读第 index 个控制点；index 越界 -> COMP_ERR_NOT_FOUND（调用方回落到恒等）。
+ * 与 point_count 用同一份排序去重结果，两个入口不会漂移。
+ */
+COMP_API comp_result comp_layer_curves_point_at(const char* settings_json_utf8,
+                                                uint32_t channel,
+                                                size_t index,
+                                                double* out_x,
+                                                double* out_y);
+
+/*
+ * 写某通道控制点，保留 settings 里其余键（其他通道、`curves.channel` 等）：
+ *   - `points_xy` 是 `point_count` 个 (x, y) 对（共 2*point_count 个 double），
+ *     顺序任意，引擎排序后校验；
+ *   - `point_count == 0` 表示复位成恒等曲线 (0,0)-(255,255)，`points_xy` 可为 NULL；
+ *   - 点数不在 2..32、x 重复、首点 x != 0、末点 x != 255、x/y 越界或非有限 ->
+ *     COMP_ERR_INVALID_ARGUMENT（不写半成品）；
+ *   - 两段式：capacity 为 0 时只回报长度（正文长度写 out_size，不含 NUL），
+ *     容量不够则截断并补 NUL（与 adjustment_build_settings 同口径）。
+ */
+COMP_API comp_result comp_layer_curves_set_points(const char* settings_json_utf8,
+                                                  uint32_t channel,
+                                                  const double* points_xy,
+                                                  size_t point_count,
+                                                  char* out_json_utf8,
+                                                  size_t capacity,
+                                                  size_t* out_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

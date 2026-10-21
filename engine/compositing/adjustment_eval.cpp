@@ -319,29 +319,53 @@ bool apply_levels(uint8_t* buf, size_t count, const Settings& s) {
 
 /*
  * kind 2 — Curves。
- * 逐通道控制点 + 单条 RGB 合成曲线；用单调分段线性插值建 256 项查找表。
- * 上游 CurvePoint 是 (x, y) 且允许非单调，本实现按折线逐段线性走，
- * 与上游 `LayerAdjustment.curves` 的求值口径一致（控制点之间线性）。
+ *
+ * 逐字对齐上游 `Curves.swift`：
+ *   - 控制点是 0..255 标度的 (x, y)，x 严格递增，首点 x = 0、末点 x = 255；
+ *   - 段间用**保形三次 Hermite**（Fritsch–Carlson 调和平均斜率），不是线性插值：
+ *     线性插值在控制点处出现折角，与上游渲染对不上；
+ *   - 颜色通道先过自己的曲线，再过 RGB 合成曲线（上游 `value(value(x, ch), 0)`）。
+ * 少于 2 个点按恒等处理（上游 isValid 会拒收，这里按容错读）。
  */
 struct Curve {
   std::vector<std::pair<double, double>> points; /* 已按 x 升序 */
   bool empty() const { return points.size() < 2; }
 
-  double apply(double v) const {
-    if (empty()) return v;
-    if (v <= points.front().first) return points.front().second;
-    if (v >= points.back().first) return points.back().second;
-    for (size_t i = 1; i < points.size(); ++i) {
-      const auto& a = points[i - 1];
-      const auto& b = points[i];
-      if (v <= b.first) {
-        const double span = b.first - a.first;
-        if (span <= 1e-9) return b.second;
-        const double t = (v - a.first) / span;
-        return a.second + t * (b.second - a.second);
-      }
+  double apply(double x) const {
+    if (empty()) return x;
+    const size_t count = points.size();
+    if (x <= points.front().first) return points.front().second;
+    if (x >= points.back().first) return points.back().second;
+
+    /* 相邻点斜率（上游 `d`）。同 x 的重复点已在 read_curve 里去掉。 */
+    std::vector<double> slopes(count - 1);
+    for (size_t i = 0; i + 1 < count; ++i) {
+      const double span = points[i + 1].first - points[i].first;
+      slopes[i] = span > 1e-9 ? (points[i + 1].second - points[i].second) / span : 0.0;
     }
-    return points.back().second;
+    /* 端点用邻段斜率；中间点用调和平均，异号或零则取 0（保形，不过冲）。 */
+    auto slope_at = [&](size_t j) {
+      if (j == 0) return slopes.front();
+      if (j + 1 == count) return slopes.back();
+      if (slopes[j - 1] * slopes[j] <= 0.0) return 0.0;
+      return 2.0 / (1.0 / slopes[j - 1] + 1.0 / slopes[j]);
+    };
+
+    size_t i = 0;
+    for (size_t k = 0; k + 1 < count; ++k) {
+      if (points[k].first <= x) i = k;
+    }
+    const double h = points[i + 1].first - points[i].first;
+    if (h <= 1e-9) return points[i + 1].second;
+    double t = (x - points[i].first) / h;
+    t = std::clamp(t, 0.0, 1.0);
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    const double y = (2.0 * t3 - 3.0 * t2 + 1.0) * points[i].second +
+                     (t3 - 2.0 * t2 + t) * h * slope_at(i) +
+                     (-2.0 * t3 + 3.0 * t2) * points[i + 1].second +
+                     (t3 - t2) * h * slope_at(i + 1);
+    return std::clamp(y, 0.0, 255.0);
   }
 };
 
@@ -370,6 +394,11 @@ Curve read_curve(const JsonValue* channels, int index) {
     curve.points.emplace_back(pair[0].as_number(0.0), pair[1].as_number(0.0));
   }
   std::sort(curve.points.begin(), curve.points.end());
+  /* 同 x 的重复点会让分段 Hermite 除零；上游 isValid 本就要求严格递增，这里只做容错去重。 */
+  curve.points.erase(std::unique(curve.points.begin(), curve.points.end(),
+                                 [](const std::pair<double, double>& a,
+                                    const std::pair<double, double>& b) { return a.first == b.first; }),
+                     curve.points.end());
   return curve;
 }
 
@@ -388,10 +417,12 @@ bool apply_curves(uint8_t* buf, size_t count, const Settings& s) {
   for (int c = 0; c < 3; ++c) {
     const Curve& own = (c == 0) ? red : (c == 1) ? green : blue;
     for (int i = 0; i < 256; ++i) {
-      const double v = i / 255.0;
-      /* 上游：单通道曲线覆盖 RGB 合成曲线（ch0 始终先过）。 */
-      const double mapped = own.empty() ? rgb.apply(v) : own.apply(v);
-      tables[c * 256 + i] = static_cast<float>(std::clamp(mapped, 0.0, 1.0));
+      /* 控制点是 0..255 标度（上游 CurvePoint），表项再归一到 0..1 交给 levels_apply。 */
+      double v = static_cast<double>(i);
+      /* 上游 `Curves.apply`：先过本通道曲线，再过 RGB 合成曲线（ch0）。 */
+      if (!own.empty()) v = own.apply(v);
+      if (!rgb.empty()) v = rgb.apply(v);
+      tables[c * 256 + i] = static_cast<float>(std::clamp(v / 255.0, 0.0, 1.0));
     }
   }
   levels_apply(buf, count, tables.data());
