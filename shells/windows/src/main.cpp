@@ -6976,8 +6976,9 @@ bool layer_handle_begin(HWND window, ShellState& shell, int x, int y, const Layo
     wsprintfW(buffer, L"旋转图层：拖动旋钮，Shift = %d° 吸附（松开算一步撤销），当前 %d°",
               comp_ui::kLayerTransformRotateStep, static_cast<int>(std::lround(rotation)));
   } else {
-    wsprintfW(buffer, L"缩放图层：拖动手柄改变尺寸（松开算一步撤销），当前 %d×%d", rect.w,
-              rect.h);
+    wsprintfW(buffer,
+              L"缩放图层：拖动手柄改变尺寸，Shift = 拖角等比（松开算一步撤销），当前 %d×%d",
+              rect.w, rect.h);
   }
   set_status(shell, buffer);
   return true;
@@ -6993,6 +6994,7 @@ void layer_handle_extend(ShellState& shell, int x, int y, const Layout& layout) 
 
   comp_rect target = shell.layer_handle_current;
   float rotation = shell.layer_handle_current_rotation;
+  bool uniform_scale = false;
   if (shell.layer_handle_kind == comp_ui::kTransformHandleRotate) {
     const double delta = comp_ui::transform_rotate_delta(base, shell.layer_handle_press, doc);
     double next = static_cast<double>(shell.layer_handle_base_rotation) + delta;
@@ -7007,10 +7009,12 @@ void layer_handle_extend(ShellState& shell, int x, int y, const Layout& layout) 
     rotation = static_cast<float>(next);
     target = shell.layer_handle_base; /* 旋转只改角度，矩形不动 */
   } else {
+    /* S43：Shift = 拖角等比缩放（比例锁在按下时的 base 上，见 transform_scale_rect）。 */
+    uniform_scale = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     const comp_ui::Rect scaled =
         comp_ui::transform_scale_rect(base, shell.layer_handle_base_rotation,
                                       shell.layer_handle_kind, doc,
-                                      comp_ui::kTransformHandleMinSize);
+                                      comp_ui::kTransformHandleMinSize, uniform_scale);
     target = to_abi_rect(scaled);
     if (same_rect(target, shell.layer_handle_current)) return;
     rotation = shell.layer_handle_base_rotation;
@@ -7029,8 +7033,8 @@ void layer_handle_extend(ShellState& shell, int x, int y, const Layout& layout) 
   if (shell.layer_handle_kind == comp_ui::kTransformHandleRotate) {
     wsprintfW(buffer, L"旋转图层：%d°", static_cast<int>(std::lround(rotation)));
   } else {
-    wsprintfW(buffer, L"缩放图层：%d×%d（位置 (%d, %d)）", target.w, target.h, target.x,
-              target.y);
+    wsprintfW(buffer, L"缩放图层：%d×%d（位置 (%d, %d)）%s", target.w, target.h, target.x,
+              target.y, uniform_scale ? L" 等比" : L"");
   }
   set_status(shell, buffer);
 }

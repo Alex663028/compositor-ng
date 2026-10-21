@@ -3311,3 +3311,42 @@ COMP_TEST(ui_core_transform_handles_track_rotation_and_anchor) {
   /* 中心与实际手柄中心一致（旋钮角度以它为原点）。 */
   COMP_CHECK(same_point(center, Point{300, 300}));
 }
+
+/*
+ * S43：Shift 拖角 = 等比缩放。比例锁在按下时的 base 上（不是上一帧的中间结果），
+ * 对角锚点语义与自由缩放完全一致；边手柄忽略 Shift（没有中心锚点这条路径）。
+ */
+COMP_TEST(ui_core_transform_uniform_scale_locks_aspect) {
+  const Rect base{100, 200, 400, 200}; /* 2:1 */
+  /* 1. 左上角：宽度 450/400=1.125、高度 250/200=1.25，主方向是高度，取 1.25。 */
+  const Rect top_left = comp_ui::transform_scale_rect(base, 0.0, 0, Point{50, 150}, 1, true);
+  COMP_CHECK(top_left.x == 0 && top_left.y == 150 && top_left.w == 500 && top_left.h == 250);
+  COMP_CHECK(top_left.right() == 500 && top_left.bottom() == 400); /* 右下角不动 */
+  /* 2. 同一指针下自由缩放两个方向各走各的，比例被破坏——这正是要修的行为。 */
+  const Rect free = comp_ui::transform_scale_rect(base, 0.0, 0, Point{50, 150}, 1);
+  COMP_CHECK(free.w == 450 && free.h == 250);
+  /* 3. 右下角：钉住左上角，1.5 倍。 */
+  const Rect bottom_right =
+      comp_ui::transform_scale_rect(base, 0.0, 4, Point{600, 500}, 1, true);
+  COMP_CHECK(bottom_right.x == 100 && bottom_right.y == 200 && bottom_right.w == 600 &&
+             bottom_right.h == 300);
+  /* 4. 边手柄忽略 Shift：结果必须与自由缩放逐字段相同。 */
+  const Rect edge_free = comp_ui::transform_scale_rect(base, 0.0, 3, Point{600, 300}, 1);
+  const Rect edge_shift =
+      comp_ui::transform_scale_rect(base, 0.0, 3, Point{600, 300}, 1, true);
+  COMP_CHECK(edge_shift.x == edge_free.x && edge_shift.y == edge_free.y &&
+             edge_shift.w == edge_free.w && edge_shift.h == edge_free.h);
+  /* 5. 拖到 0 也不破坏比例：两边都压到下限之上（8 高 -> 16 宽）。 */
+  const Rect minimal =
+      comp_ui::transform_scale_rect(base, 0.0, 4, Point{100, 200}, 8, true);
+  COMP_CHECK(minimal.w == 16 && minimal.h == 8);
+  /* 6. 旋转 90°：比例仍锁住，局部左上角（锚点）在文档里的位置不动。 */
+  const Rect rotated = comp_ui::transform_scale_rect(base, 90.0, 4, Point{300, 600}, 1, true);
+  COMP_CHECK(rotated.w == 500 && rotated.h == 250);
+  const Point anchor_before = comp_ui::rotate_doc_point(
+      Point{100, 200}, comp_ui::rect_center_point(base), 90.0);
+  const Point anchor_after = comp_ui::rotate_doc_point(
+      Point{static_cast<double>(rotated.x), static_cast<double>(rotated.y)},
+      comp_ui::rect_center_point(rotated), 90.0);
+  COMP_CHECK(same_point(anchor_after, anchor_before, 1.5));
+}

@@ -2513,9 +2513,16 @@ inline bool transform_knob_at(const Rect& rect, double rotation, Point doc, doub
  *
  * 每帧都从按下时的 base 重新求，不在上一帧结果上叠加：来回拖动不会因取整漂移。
  * handle 非法 / rect 为空 / 角度非有限时原样返回。
+ *
+ * uniform = Shift 等比（S43）：只对**角**手柄生效（0/2/4/6）。先按自由拖拽算出
+ * 两个方向各自想要的新尺寸，取较大的缩放倍率（主方向决定），再由 base 的宽高比
+ * 反推另一方向，所以比例永远是按下那一刻的比例，而且松手再拖也不会逐帧漂。
+ * 对角锚点与旋转补偿沿用同一套：等比只改两个尺寸，不改锚点语义。
+ * 边手柄忽略 uniform——PS 里 Shift+边手柄是「以中心等比」，本壳没有中心锚点
+ * 这条路径，静默按自由缩放处理比偷偷换个锚点更好解释。
  */
 inline Rect transform_scale_rect(const Rect& base, double rotation, int handle, Point pointer,
-                                 int min_size) {
+                                 int min_size, bool uniform = false) {
   if (base.empty() || !std::isfinite(rotation)) return base;
   if (handle < 0 || handle >= kTransformHandleCount) return base;
   const int minimum = min_size < 1 ? 1 : min_size;
@@ -2536,20 +2543,59 @@ inline Rect transform_scale_rect(const Rect& base, double rotation, int handle, 
     case 6: left = local.x; bottom = local.y; break;
     default: left = local.x; break;
   }
-  if (right - left < static_cast<double>(minimum)) {
-    const bool moves_left = handle == 0 || handle == 6 || handle == 7;
-    if (moves_left) {
-      left = right - static_cast<double>(minimum);
-    } else {
-      right = left + static_cast<double>(minimum);
+  const double base_w = static_cast<double>(base.w);
+  const double base_h = static_cast<double>(base.h);
+  const bool corner = (handle % 2) == 0;
+  if (uniform && corner && base_w > 0.0 && base_h > 0.0) {
+    /*
+     * 自由拖拽给出的 (right-left, bottom-top) 就是指针要求的两个新尺寸；
+     * 取相对变化更大的那个方向定倍率，另一方向按 base 比例跟随。
+     * 倍率下限同时满足两个方向的最小尺寸，否则「宽够 1px、高只有 0.2px」。
+     */
+    const double want_w = right - left;
+    const double want_h = bottom - top;
+    double scale = want_w / base_w;
+    if (want_h / base_h > scale) scale = want_h / base_h;
+    const double floor_w = static_cast<double>(minimum) / base_w;
+    const double floor_h = static_cast<double>(minimum) / base_h;
+    if (scale < floor_w) scale = floor_w;
+    if (scale < floor_h) scale = floor_h;
+    const double width = base_w * scale;
+    const double height = base_h * scale;
+    switch (handle) {
+      case 0: /* 拖左上：右/下边是 base 的，钉住右下角 */
+        left = right - width;
+        top = bottom - height;
+        break;
+      case 2: /* 拖右上：钉住左下角 */
+        right = left + width;
+        top = bottom - height;
+        break;
+      case 4: /* 拖右下：钉住左上角 */
+        right = left + width;
+        bottom = top + height;
+        break;
+      default: /* 6：拖左下，钉住右上角 */
+        left = right - width;
+        bottom = top + height;
+        break;
     }
-  }
-  if (bottom - top < static_cast<double>(minimum)) {
-    const bool moves_top = handle == 0 || handle == 1 || handle == 2;
-    if (moves_top) {
-      top = bottom - static_cast<double>(minimum);
-    } else {
-      bottom = top + static_cast<double>(minimum);
+  } else {
+    if (right - left < static_cast<double>(minimum)) {
+      const bool moves_left = handle == 0 || handle == 6 || handle == 7;
+      if (moves_left) {
+        left = right - static_cast<double>(minimum);
+      } else {
+        right = left + static_cast<double>(minimum);
+      }
+    }
+    if (bottom - top < static_cast<double>(minimum)) {
+      const bool moves_top = handle == 0 || handle == 1 || handle == 2;
+      if (moves_top) {
+        top = bottom - static_cast<double>(minimum);
+      } else {
+        bottom = top + static_cast<double>(minimum);
+      }
     }
   }
 
