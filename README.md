@@ -1643,6 +1643,11 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
   `stroke_width` 只在描边开启时校验（纯填充形状不需要宿主为不用的字段编数值）；
   形状与图层完全不相交时**成功但留不下撤销步**。细节见
   [`docs/tool-ops.md`](docs/tool-ops.md) §4.11。
+- **Dodge / Burn / Sponge（P1 追加，kind 16/17/18）**：三种色调工具共用一个
+  `comp_tool_tone{mode, strength}`，是**落笔族**（RGBA16 / RGBA16F 上笔尖之外保深像素）；
+  在直通色空间运算、alpha 不变、全透明像素跳过；选区覆盖率在文档分辨率乘进笔迹，
+  选区外逐字节不动。运算结果逐字节不变（海绵加色碰到灰度、减淡碰到纯白）时整步
+  `txn_abort`，不留空撤销步。细节见 [`docs/tool-ops.md`](docs/tool-ops.md) §4.13。
 
 ### 6.6 内核接线现状（2026-10-18 更新）
 
@@ -1654,6 +1659,7 @@ AdjustPixels 与上游的 diff 只剩「去 GCD」与 include。
 | Dither | `COMP_TOOL_DITHER` | `dither_apply`、`scanlines`、`chunky`（后两者分别接 `dither_glow` 与 `dither_dots`） | — |
 | Lens | `COMP_TOOL_LENS` / `COMP_FILTER_LENS_CORRECTION` | `lens_distort`（工具收 `|k| <= 1`，滤镜收 `-100..100` 再换算 `k`） | — |
 | Blur | `COMP_TOOL_BLUR` / Tonal Contrast、Bloom 的 detail 模糊 | `blur_rgba8_copy`（三趟滑动窗口盒式近似，与 Gaussian Blur 调整层同一实现） | — |
+| Dodge / Burn / Sponge（P1 新增，域层算子） | `COMP_TOOL_DODGE` / `COMP_TOOL_BURN` / `COMP_TOOL_SPONGE` | `engine/domain/tool_ops.cpp` 的色调分支（直通色空间混合 + Range 权重，alpha 不变；选区在文档分辨率裁剪） | 无独立内核函数（上游同为工具层逻辑） |
 | Shape（S10 新增，非上游 `.c` 内核） | `COMP_TOOL_SHAPE` | `shape_raster::shape_rasterize`（矩形 / 椭圆 / 三次贝塞尔路径的填充 + 胶囊距离描边 + 圆角矩形 + 窗口化覆盖率，4 行超采样 AA）；路径基元来自 S10 抽出的 `path_raster`（与选区共用，行为中立） | 贝塞尔路径只有 ABI 通路（外壳 `U` 只能拖出矩形/椭圆/直线；钢笔仍用于提交选区） |
 | Brush | `COMP_TOOL_STROKE` | 解析式圆头笔 + **`noise_add_at` 颗粒**（噪声钉在文档坐标；`seed` 参与计算） | `brush_alpha_bounds` 一族（剪贴栈已改走 `extract/restore_alpha`） |
 | Noise | `COMP_TOOL_STROKE`（经 brush 字段） | `noise_add_at`（origin 锚定） | — |
@@ -4070,6 +4076,62 @@ PE 导出 **138**；壳自检 **245 项不变**（面板不进自检脚本，基
 ② 标签是写入方给的（壳里是英文操作名），面板不改写成中文；③ 历史被预算裁掉后
 列表跟着收缩，不额外提示「更早的记录已丢弃」（状态栏字节数仍在）；④ 粒度是一步，
 笔迹仍是每笔一步，没有上游的「合成笔迹」分组；⑤ 回跳手感与高亮跟手度待 ALEX 目视（M22）。
+
+### 6.43 P1 减淡 / 加深 / 海绵：色调工具进入产品通路（2026-10-21，Claude）
+
+**立项口径。** 路线图 P1「减淡 / 加深 / 海绵」：三种工具能改像素且受选区约束，
+撤销一步。此前工具表里没有这一族，引擎也没有任何色调算子；上游的
+`RetouchTools.swift` 同样是工具层逻辑（没有对应 `.c` 内核），所以这一项是**域层新增**，
+不是把已有内核接出来。
+
+**ABI 纯尾部追加（138 不变）。** `comp_tool_op` 追加 `COMP_TOOL_DODGE = 16` /
+`_BURN = 17` / `_SPONGE = 18`，`comp_tool_op_desc` 尾部追加
+`comp_tool_tone tone { int32_t mode; float strength; }`。既有枚举值、既有字段布局、
+既有导出一个不动；**没有新增导出**（仍 138），宿主照旧只认 `comp_tool_apply`。
+
+**为什么共用一个 `strength`。** 上游 Dodge/Burn 叫 Exposure、Sponge 叫 Flow，
+都是「这一笔有多强」的单一标量；拆成两个字段只会让宿主在切工具时搬一个恒为 0 的值。
+`mode` 复用同一条：Dodge/Burn 是 Range（0 = 中间调 / 1 = 阴影 / 2 = 高光），
+Sponge 是方向（0 = 去色 / 1 = 加色），越界一律 `INVALID_ARGUMENT`，不静默夹取。
+
+**像素口径。** 图层是预乘 RGBA8：先按 `alpha` 反预乘到直通色、运算、再用**原 alpha**
+重新预乘量化——`alpha` 一个字节都不改，`alpha == 0` 的像素跳过（没有颜色可提亮/去色）。
+Range 权重按 Rec.601 亮度算，再走 smoothstep（线性边界在中间调/高光交界会出台阶）；
+直通色在 `[0,1]` 夹取后再乘回 alpha，避免反预乘的舍入把 255 顶出界。
+
+**选区与图层边界。** 与渐变 / 形状 / 文字同一条规矩：在**文档分辨率**取
+`selection_effective_coverage()`，按 `effective_bounds()` 的原点把图层像素映射到画布，
+覆盖率为 0 或画布外的像素**逐字节不动**；笔尖与图层完全不相交时整步 `txn_abort`。
+
+**空撤销防线（本项自查修掉的缺陷）。** 第一版无条件写像素并记 `changed = true`，
+于是「海绵加色碰到纯灰」「减淡碰到纯白」会留下**像素逐字节相同的空撤销步**。
+现在每个通道**量化后与旧值比较**，只有真的有字节变化才写、才置 `changed`；
+全笔逐字节不变时 `txn_abort` + `COMP_OK` + note
+`tone stroke changed no pixel (arithmetically a no-op)`。同理，`strength == 0`
+在参数闸就被拒绝（与渐变 opacity 0 同口径），不会靠「算出来没变」兜底。
+
+**16 位 / HDR。** 三种色调算子属于**落笔族**（`is_stroke_family`），与画笔 / 橡皮擦 /
+仿制 / 涂抹 / 液化 / 模糊共用 `DeepPaintCopy` + `deep_take_painted(_hdr)`：
+只有真正被改动的像素拿到深值，笔尖之外保住 16 位 / half，不是先降 8 位再补。
+
+**外壳（`O`）。** 新增 `ToolId::Tone`（插在 Retouch 之后）与 8 档状态机：
+`Dodge/Midtones → Dodge/Shadows → Dodge/Highlights → Burn/Midtones → Burn/Shadows →
+Burn/Highlights → Sponge/Desaturate → Sponge/Saturate`，重复按 `O` 循环，从别的工具
+切进来回到第一档。算子与 `mode` 由 `tone_state_tool()` / `tone_state_mode()` 从
+**同一张状态表**换算，壳内不存第二份，状态栏文案不可能与实际下发的参数不一致。
+`Alt+[` / `Alt+]` 调强度（0.01..1.0，10% 一步）。笔迹走与画笔相同的折线采集
+（`StrokeKind::Tone`），松手一次 `comp_tool_apply`，`ReleaseCapture` 之前先把折点搬走
+（S15 那个 `WM_CAPTURECHANGED` 缺陷的同一条防线）。
+
+**验证。** 领域层新增 4 例（Dodge/Burn 方向 + 撤销逐字节、Sponge 去色 + 纯灰 no-op
+不记步、参数闸先于事务、RGBA16 笔尖外保深）；ABI 层新增 3 例（枚举值冻结、经
+`comp_tool_apply` 的提亮/压暗与一步撤销、左半选区裁剪 + 非法 mode/strength 不留步）；
+UI 层新增 1 例（8 档映射、越界归位、文案、强度钳位与步进）。单测 560 → **568 例 /
+0 失败**；PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍
+`26b3e910e3b9ccb7…`）；`run_regression.py --require-ohos` **6/6 通过**；
+`build_windows_shell.py` 零警告。文档：`docs/tool-ops.md` §4.13、
+`docs/shell-parity.md` §5.19 + 矩阵一行，`docs/manual-test.md` 新增 **M23**
+（M1 的工具顺序改为 19 个）。
 
 
 

@@ -1407,6 +1407,10 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   }
   params.type.opacity = desc->type.opacity;
 
+  /* P1 尾部追加：减淡 / 加深 / 海绵只多两个标量，笔迹与几何复用上面的字段。 */
+  params.tone.mode = desc->tone.mode;
+  params.tone.strength = desc->tone.strength;
+
   comp_result code = COMP_ERR_INTERNAL;
   std::string error;
   std::string note_text;

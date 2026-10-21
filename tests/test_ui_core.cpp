@@ -243,7 +243,7 @@ COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
 COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
   size_t count = 0;
   comp_ui::tool_table(&count);
-  COMP_CHECK(count == 18);
+  COMP_CHECK(count == 19);
   COMP_CHECK(static_cast<int>(ToolId::Count) == static_cast<int>(count));
 
   /* 逐条对齐上游 KeyboardShortcuts.swift 的工具默认键。 */
@@ -258,6 +258,7 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
                   {'u', ToolId::Shape},      {'i', ToolId::Eyedropper},
                   {'m', ToolId::Marquee},    {'w', ToolId::Wand},
                   {'l', ToolId::Lasso},      {'r', ToolId::Retouch},
+                  {'o', ToolId::Tone},
                   {'c', ToolId::Crop},       {'p', ToolId::Pen}};
   COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == count);
   for (const auto& entry : expected) {
@@ -681,6 +682,7 @@ COMP_TEST(ui_core_brush_tip_and_retouch_strength_are_bounded) {
   /* 只有吃笔刷直径的工具画笔尖。 */
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Brush));
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Retouch));
+  COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Tone));
   COMP_CHECK(comp_ui::tool_has_brush_tip(comp_ui::ToolId::Clone));
   COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Marquee));
   COMP_CHECK(!comp_ui::tool_has_brush_tip(comp_ui::ToolId::Hand));
@@ -699,6 +701,56 @@ COMP_TEST(ui_core_brush_tip_and_retouch_strength_are_bounded) {
   COMP_CHECK(near_value(strength, comp_ui::kMaxRetouchStrength));
   for (int i = 0; i < 100; ++i) strength = comp_ui::step_retouch_strength(strength, -1);
   COMP_CHECK(near_value(strength, comp_ui::kMinRetouchStrength));
+}
+
+COMP_TEST(ui_core_tone_states_map_to_abi_operators_and_modes) {
+  /* O 键循环：Dodge 中间调 -> 阴影 -> 高光 -> Burn 三档 -> Sponge 两档 -> 回到起点。 */
+  COMP_CHECK(comp_ui::kToneStateCount == 8);
+  COMP_CHECK(comp_ui::next_tone_state(comp_ui::kToneDodgeMidtone) == comp_ui::kToneDodgeShadow);
+  COMP_CHECK(comp_ui::next_tone_state(comp_ui::kToneBurnHighlight) ==
+             comp_ui::kToneSpongeDesaturate);
+  COMP_CHECK(comp_ui::next_tone_state(comp_ui::kToneSpongeSaturate) ==
+             comp_ui::kToneDodgeMidtone);
+  /* 越界不读表外内存：一律回到起点。 */
+  COMP_CHECK(comp_ui::next_tone_state(-1) == comp_ui::kToneDodgeMidtone);
+  COMP_CHECK(comp_ui::next_tone_state(99) == comp_ui::kToneDodgeMidtone);
+
+  /* 状态 -> (算子, mode)：状态栏文案与实际下发的参数必须同源。 */
+  COMP_CHECK(comp_ui::tone_state_tool(comp_ui::kToneDodgeMidtone) == comp_ui::kToneToolDodge);
+  COMP_CHECK(comp_ui::tone_state_tool(comp_ui::kToneDodgeHighlight) == comp_ui::kToneToolDodge);
+  COMP_CHECK(comp_ui::tone_state_tool(comp_ui::kToneBurnShadow) == comp_ui::kToneToolBurn);
+  COMP_CHECK(comp_ui::tone_state_tool(comp_ui::kToneSpongeSaturate) == comp_ui::kToneToolSponge);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneDodgeMidtone) == 0);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneDodgeShadow) == 1);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneDodgeHighlight) == 2);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneBurnMidtone) == 0);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneBurnHighlight) == 2);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneSpongeDesaturate) == 0);
+  COMP_CHECK(comp_ui::tone_state_mode(comp_ui::kToneSpongeSaturate) == 1);
+
+  /* 文案逐条冻结：状态栏、笔迹提示、撤销步标签都用它。 */
+  COMP_CHECK(std::string(comp_ui::tone_state_name(comp_ui::kToneDodgeMidtone)) ==
+             "Dodge / Midtones");
+  COMP_CHECK(std::string(comp_ui::tone_state_name(comp_ui::kToneBurnShadow)) == "Burn / Shadows");
+  COMP_CHECK(std::string(comp_ui::tone_state_name(comp_ui::kToneSpongeDesaturate)) ==
+             "Sponge / Desaturate");
+  COMP_CHECK(std::string(comp_ui::tone_state_name(-1)) == "?");
+  COMP_CHECK(std::string(comp_ui::tone_state_name(8)) == "?");
+
+  /* 强度：0 / 负数 / NaN 回落到 1%（引擎闸会拒绝 0），上限 100%，步进 0.1。 */
+  COMP_CHECK(near_value(comp_ui::clamp_tone_strength(0.0), comp_ui::kMinToneStrength));
+  COMP_CHECK(near_value(comp_ui::clamp_tone_strength(-1.0), comp_ui::kMinToneStrength));
+  COMP_CHECK(near_value(comp_ui::clamp_tone_strength(std::nan("")), comp_ui::kMinToneStrength));
+  COMP_CHECK(near_value(comp_ui::clamp_tone_strength(5.0), comp_ui::kMaxToneStrength));
+  COMP_CHECK(near_value(comp_ui::step_tone_strength(0.5, 1), 0.6));
+  COMP_CHECK(near_value(comp_ui::step_tone_strength(0.5, -1), 0.4));
+  COMP_CHECK(near_value(comp_ui::step_tone_strength(0.5, 0), 0.5));
+
+  double strength = comp_ui::kMinToneStrength;
+  for (int i = 0; i < 100; ++i) strength = comp_ui::step_tone_strength(strength, 1);
+  COMP_CHECK(near_value(strength, comp_ui::kMaxToneStrength));
+  for (int i = 0; i < 100; ++i) strength = comp_ui::step_tone_strength(strength, -1);
+  COMP_CHECK(near_value(strength, comp_ui::kMinToneStrength));
 }
 
 COMP_TEST(ui_core_brush_steps_are_geometric_and_bounded) {
@@ -733,6 +785,7 @@ COMP_TEST(ui_core_tool_shortcut_e_toggles_brush_and_eraser) {
   /* 其余键位仍按 tool_table 走，未命中返回 Count。 */
   COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Eraser, 'b') == ToolId::Brush);
   COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'r') == ToolId::Retouch);
+  COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'o') == ToolId::Tone);
   COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, 'x') == ToolId::Count);
   COMP_CHECK(comp_ui::tool_shortcut_target(ToolId::Brush, '1') == ToolId::Count);
 }

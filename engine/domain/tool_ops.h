@@ -216,6 +216,37 @@ struct BlurParams {
   float radius = 10.0f;
 };
 
+/* ============================================================== 色调（P1） */
+
+/*
+ * 减淡 / 加深 / 海绵参数（上游工具箱的 Dodge / Burn / Sponge）。
+ *
+ * 三者共用「笔迹 coverage 决定强度」的通路（与模糊同款：折线 + 直径/硬度/
+ * 压力/flow），差别只在逐像素的色调运算：
+ *   - Dodge：直通色朝白提亮 `c' = c + (1-c)·w`；
+ *   - Burn：朝黑压暗 `c' = c·(1-w)`；
+ *   - Sponge：围绕亮度缩放色度，`c' = luma + (c-luma)·(1-w)`（去色）或
+ *     `·(1+w)`（加色）。
+ *
+ * `mode` 的取值范围随算子不同（数值与 ABI `comp_tool_tone.mode` 一一对应）：
+ *   - Dodge / Burn：0 = 中间调、1 = 阴影、2 = 高光（对齐 Photoshop 的 Range，
+ *     缺省 0 = 中间调，也是上游工具栏的默认档）。范围权重按反预乘后的亮度取
+ *     `1-|2l-1|` / `(0.5-l)/0.5` / `(l-0.5)/0.5`，再过一遍 smoothstep：线性
+ *     边界会在中间调与高光交界留下可见台阶。
+ *   - Sponge：0 = 去色（Saturate 的反面）、1 = 加色。
+ *
+ * `strength` 0..1 是本笔总量：Dodge/Burn 的口径是上游 Exposure，Sponge 是
+ * Flow；再乘进笔迹 coverage 与选区覆盖率。0 被参数闸拒绝 —— 恒等操作不该
+ * 记一步空撤销。
+ *
+ * 全透明像素（alpha = 0）跳过：没有颜色可提亮/压暗。alpha 本身不变 —— 三种
+ * 工具都只改颜色，与上游一致。
+ */
+struct ToneParams {
+  int32_t mode = 0;
+  float strength = 0.5f;
+};
+
 /* ============================================================== 渐变 */
 
 /* 渐变类型（数值与 ABI `comp_tool_gradient.type` 一一对应）。 */
@@ -499,6 +530,9 @@ enum ToolOpKind {
   kToolOpGradient = 13,   /* 渐变 -> 按两个端点铺一片渐变（S9 尾部追加） */
   kToolOpShape = 14,      /* 形状 -> 矩形/椭圆/直线/贝塞尔路径的填充与描边（S10 尾部追加） */
   kToolOpType = 15,       /* 文字 -> 位图 ASCII 字体排版成像素（S11 尾部追加） */
+  kToolOpDodge = 16,      /* 减淡 -> 按笔迹提亮（P1 尾部追加） */
+  kToolOpBurn = 17,       /* 加深 -> 按笔迹压暗（P1 尾部追加） */
+  kToolOpSponge = 18,     /* 海绵 -> 按笔迹去色/加色（P1 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */
@@ -565,6 +599,9 @@ struct ToolOpParams {
    * 精度，如实记入 note。
    */
   ToolOpKind inner = kToolOpNone;
+
+  /* Dodge / Burn / Sponge 用（笔迹折线复用 points，几何复用 brush，见 ToneParams）。 */
+  ToneParams tone;
 };
 
 /* ============================================================== 执行 */
@@ -604,6 +641,10 @@ struct ToolOpParams {
  *                     同样按选区覆盖率遮罩；与图层不相交时不产生撤销步。
  *   - kToolOpType     把 ASCII 文本按自带 5×7 位图字体排版成覆盖率后按颜色合成，
  *                     同样按选区覆盖率遮罩；与图层不相交时不产生撤销步。
+ *   - kToolOpDodge/kToolOpBurn/kToolOpSponge 按笔迹 coverage × 强度（× 选区
+ *                     覆盖率）改直通色：提亮 / 压暗 / 去色加色。alpha 不变、
+ *                     全透明像素不动、选区外逐字节不动；没有任何像素真的改变
+ *                     （笔尖落在图层外、恒等运算）时不产生撤销步。
  */
 bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& params,
                  comp_result* out_code, std::string* error, std::string* note);

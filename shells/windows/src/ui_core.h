@@ -274,6 +274,7 @@ enum class ToolId : int {
   Heal,
   Clone,
   Retouch, /* 上游 "Blur / Smudge / Liquify"，同一个 R 键循环 */
+  Tone,    /* 上游 "Dodge / Burn / Sponge"，同一个 O 键循环 */
   Gradient,
   Shape,
   Type,
@@ -303,6 +304,7 @@ inline const ToolInfo* tool_table(size_t* out_count) {
       {ToolId::Heal, "Spot Healing", 'j'},
       {ToolId::Clone, "Clone Stamp", 's'},
       {ToolId::Retouch, "Blur/Smudge/Liquify", 'r'},
+      {ToolId::Tone, "Dodge/Burn/Sponge", 'o'},
       {ToolId::Gradient, "Gradient", 'g'},
       {ToolId::Shape, "Shape", 'u'},
       {ToolId::Type, "Type", 't'},
@@ -343,8 +345,8 @@ inline const ToolInfo* tool_info(ToolId id) {
 
 /*
  * 哪些工具需要画「笔尖轮廓」。Brush / Eraser / Spot Healing / Clone Stamp 与
- * Retouch 族（Blur / Smudge / Liquify）都吃 `brush_size`，画同一个圆；
- * 选区类工具不吃笔刷直径，不画（避免误导）。
+ * Retouch 族（Blur / Smudge / Liquify）、Tone 族（Dodge / Burn / Sponge）都吃
+ * `brush_size`，画同一个圆；选区类工具不吃笔刷直径，不画（避免误导）。
  */
 inline bool tool_has_brush_tip(ToolId id) {
   switch (id) {
@@ -353,6 +355,7 @@ inline bool tool_has_brush_tip(ToolId id) {
     case ToolId::Heal:
     case ToolId::Clone:
     case ToolId::Retouch:
+    case ToolId::Tone:
       return true;
     default:
       return false;
@@ -395,6 +398,7 @@ inline ToolId tool_shortcut_target(ToolId current, char key) {
 enum class StrokeKind : int {
   None = 0,
   Retouch, /* COMP_TOOL_BLUR / SMUDGE / LIQUIFY */
+  Tone,    /* COMP_TOOL_DODGE / BURN / SPONGE */
   Paint    /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
 };
 
@@ -859,6 +863,88 @@ inline double step_blur_radius(double current, int direction) {
   const double base = clamp_blur_radius(current);
   if (direction > 0) return clamp_blur_radius(base * 1.2);
   if (direction < 0) return clamp_blur_radius(base / 1.2);
+  return base;
+}
+
+/* ------------------------------------------------------------ 色调工具（Dodge / Burn / Sponge） */
+
+/*
+ * 上游工具箱把减淡 / 加深 / 海绵收在同一个 O 键上循环（对齐 Photoshop 的
+ * Dodge 默认键 O）。本仓用一个工具 + 8 个状态：
+ *
+ *   状态 0..2 = Dodge（中间调 / 阴影 / 高光）
+ *   状态 3..5 = Burn （中间调 / 阴影 / 高光）
+ *   状态 6..7 = Sponge（去色 / 加色）
+ *
+ * 状态是壳侧唯一的真值：ABI 侧的 (算子, mode) 由 tone_state_tool() /
+ * tone_state_mode() 换算，壳内不另存一份，避免「状态栏说阴影、实际按中间调算」。
+ */
+inline constexpr int kToneStateCount = 8;
+inline constexpr int kToneDodgeMidtone = 0;
+inline constexpr int kToneDodgeShadow = 1;
+inline constexpr int kToneDodgeHighlight = 2;
+inline constexpr int kToneBurnMidtone = 3;
+inline constexpr int kToneBurnShadow = 4;
+inline constexpr int kToneBurnHighlight = 5;
+inline constexpr int kToneSpongeDesaturate = 6;
+inline constexpr int kToneSpongeSaturate = 7;
+
+/* 算子：0 = 减淡、1 = 加深、2 = 海绵（壳侧编号，不是 ABI 枚举值）。 */
+inline constexpr int kToneToolDodge = 0;
+inline constexpr int kToneToolBurn = 1;
+inline constexpr int kToneToolSponge = 2;
+
+/* 状态 -> 算子。越界按 Dodge 处理（与 next_* 的「不越界读表」同口径）。 */
+inline int tone_state_tool(int state) {
+  if (state < kToneBurnMidtone) return kToneToolDodge;
+  if (state < kToneSpongeDesaturate) return kToneToolBurn;
+  return kToneToolSponge;
+}
+
+/*
+ * 状态 -> ABI `comp_tool_tone.mode`：Dodge/Burn 0 = 中间调、1 = 阴影、2 = 高光；
+ * Sponge 0 = 去色、1 = 加色。状态里的三档与这里的 mode 同序，减掉各段起点即可。
+ */
+inline int tone_state_mode(int state) {
+  if (state < 0 || state >= kToneStateCount) return 0;
+  if (state < kToneBurnMidtone) return state;
+  if (state < kToneSpongeDesaturate) return state - kToneBurnMidtone;
+  return state - kToneSpongeDesaturate;
+}
+
+inline const char* tone_state_name(int state) {
+  switch (state) {
+    case kToneDodgeMidtone: return "Dodge / Midtones";
+    case kToneDodgeShadow: return "Dodge / Shadows";
+    case kToneDodgeHighlight: return "Dodge / Highlights";
+    case kToneBurnMidtone: return "Burn / Midtones";
+    case kToneBurnShadow: return "Burn / Shadows";
+    case kToneBurnHighlight: return "Burn / Highlights";
+    case kToneSpongeDesaturate: return "Sponge / Desaturate";
+    case kToneSpongeSaturate: return "Sponge / Saturate";
+    default: return "?";
+  }
+}
+
+/* 重复按 O：Dodge 中间调 -> ... -> Sponge 加色 -> 回到 Dodge 中间调。 */
+inline int next_tone_state(int state) {
+  if (state < 0 || state >= kToneStateCount - 1) return kToneDodgeMidtone;
+  return state + 1;
+}
+
+/* 强度口径对齐 comp_tool_tone.strength（0..1，0 被引擎的闸拒绝）。 */
+inline constexpr double kMinToneStrength = 0.01;
+inline constexpr double kMaxToneStrength = 1.0;
+
+inline double clamp_tone_strength(double value) {
+  if (!(value > 0.0)) return kMinToneStrength; /* NaN / 0 / 负数回落到下限 */
+  return std::min(std::max(value, kMinToneStrength), kMaxToneStrength);
+}
+
+inline double step_tone_strength(double current, int direction) {
+  const double base = clamp_tone_strength(current);
+  if (direction > 0) return clamp_tone_strength(base + 0.1);
+  if (direction < 0) return clamp_tone_strength(base - 0.1);
   return base;
 }
 

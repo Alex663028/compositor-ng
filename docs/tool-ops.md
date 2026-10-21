@@ -309,6 +309,37 @@ coverage 把样本盖回当前像素。
   面板只写 `ShellState` 的参数字段，提交仍是同一次 `comp_tool_apply(COMP_TOOL_TYPE)`，
   **算子语义与 ABI 不变**。
 
+### 4.13 减淡 / 加深 / 海绵（`COMP_TOOL_DODGE` / `COMP_TOOL_BURN` / `COMP_TOOL_SPONGE`，P1 尾部追加）
+
+上游 `Document/RetouchTools.swift` 的 Dodge / Burn / Sponge 三件套共用一个 `comp_tool_tone`
+（`mode` + `strength`），落笔几何复用 `stroke_points` / `brush`，与 Blur 同一条折线通路。
+三种算子都是**落笔族**（`is_stroke_family`），因此在 RGBA16 / RGBA16F 图层上保持深像素。
+
+- **先反预乘再算，再按原 alpha 重新预乘**：图层像素是预乘 RGBA8，色调运算在直通色空间做；
+  `alpha` 一个字节都不改，`alpha == 0` 的像素跳过（没有可提亮/去色的颜色）。
+- `mode`：Dodge / Burn 为 `0 = 中间调 / 1 = 阴影 / 2 = 高光`。Range 权重按亮度取：
+  中间调 `1 - |2·luma - 1|`（0.5 处最高），阴影 `(0.5 - luma) / 0.5`（0 处最高），
+  高光 `(luma - 0.5) / 0.5`（1 处最高），再过 smoothstep——线性边界在中间调与高光
+  交界会留下可见台阶。Sponge 为 `0 = 去色 / 1 = 加色`，没有 Range 档。
+  越界 → `COMP_ERR_INVALID_ARGUMENT`（不是静默夹取）。
+- `strength` 必须满足 `0 < strength <= 1`（0 / 负数 / NaN / Inf 一律拒绝），按
+  `coverage × strength` 混合原色与目标色：
+  - Dodge：目标色 = 提亮（向白色靠）；
+  - Burn：目标色 = 压暗（向黑色靠）；
+  - Sponge 去色：目标色 = 同亮度的灰（`0.299/0.587/0.114` 的 Rec.601 亮度）；
+  - Sponge 加色：把偏离灰的中性程度放大。
+- **选区裁剪与其它笔迹族同口径**：在文档分辨率取 `selection_effective_coverage()`，
+  再乘进每个像素的笔迹覆盖率；选区外（或画布外）逐字节不变。
+- **成功 no-op 不落撤销步**：笔尖完全落在图层外、或运算结果逐字节不变（例如海绵
+  「加色」碰到灰度像素、减淡碰到纯白）时，整步 `txn_abort`，返回 `COMP_OK` 并写 note。
+  这一点对三种算子都成立，且靠**逐字节比较**而不是靠参数判断。
+- 计算量程：单次调用 `1..kMaxStrokePoints` 个折点，`diameter` / `hardness` / `pressure` /
+  `flow` 与画笔同口径；三种算子不读 `blur.radius`、`gradient.*` 等其它子结构。
+- 外壳（P1，`O`）：同一个 `O` 键在 8 档里循环
+  （Dodge 中间调/阴影/高光 → Burn 中间调/阴影/高光 → Sponge 去色/加色），
+  `Alt+[ / ]` 调强度（0.01..1.0，10% 一步）。状态栏文案与下发的 `(kind, mode)`
+  由同一张状态表换算，壳内不另存第二份。
+
 ## 5. 可重复性
 
 `dither_apply` 的误差扩散与 `patch_fill` 的 PatchMatch 都是随机化/顺序敏感的。

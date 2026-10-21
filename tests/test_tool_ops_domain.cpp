@@ -1330,6 +1330,249 @@ COMP_TEST(tool_ops_domain_blur_keeps_sixteen_bit_depth_outside_the_stroke) {
   COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
 }
 
+/* ============================================ [F] 色调：减淡 / 加深 / 海绵（P1 追加） */
+
+namespace {
+
+/* 纯色不透明图层（预乘下 rgb 就是直通色，便于直接判方向）。 */
+std::vector<uint8_t> flat_pixels(int32_t width, int32_t height, uint8_t r, uint8_t g, uint8_t b,
+                                 uint8_t a) {
+  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+  for (size_t i = 0; i < static_cast<size_t>(width) * static_cast<size_t>(height); ++i) {
+    pixels[i * 4 + 0] = r;
+    pixels[i * 4 + 1] = g;
+    pixels[i * 4 + 2] = b;
+    pixels[i * 4 + 3] = a;
+  }
+  return pixels;
+}
+
+ToolOpParams tone_params(ToolOpKind kind, int32_t mode, float strength, const float* points,
+                         int32_t point_count) {
+  ToolOpParams params;
+  params.kind = kind;
+  params.points = points;
+  params.point_count = point_count;
+  params.brush.diameter = 7.0f;
+  params.brush.hardness = 1.0f;
+  params.brush.pressure = 1.0f;
+  params.brush.flow = 1.0f;
+  params.tone.mode = mode;
+  params.tone.strength = strength;
+  return params;
+}
+
+}  // namespace
+
+/*
+ * [F1] 减淡朝白、加深朝黑，都只落在笔尖下且不动 alpha。
+ *
+ * 判定：中灰 (128) 在强度 0.5 的减淡下变亮、加深下变暗；alpha 恒 255；笔尖外
+ * 逐字节不动；一步撤销回到落笔前。
+ */
+COMP_TEST(tool_ops_domain_tone_dodge_and_burn_move_toward_white_and_black) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  const std::vector<uint8_t> gray = flat_pixels(16, 16, 128, 128, 128, 255);
+  layer->pixels.resize(16, 16, COMP_PIXEL_RGBA8);
+  std::memcpy(layer->pixels.writable_pixels().data(), gray.data(), gray.size());
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  COMP_CHECK(before == gray);
+
+  const auto at = [](int32_t x, int32_t y) -> size_t {
+    return (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * 4u;
+  };
+  const float center[2] = {8.0f, 8.0f}; /* 单点 = 圆形笔尖 */
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+
+  ToolOpParams dodge = tone_params(kToolOpDodge, 0, 0.5f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, dodge, &code, &error, nullptr),
+                 "a dodge stroke is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+  const std::vector<uint8_t> lightened = pixels_of(document, id);
+  COMP_CHECK_MSG(lightened[at(8, 8)] > before[at(8, 8)],
+                 "dodge moves the midtone toward white");
+  COMP_CHECK_MSG(lightened[at(8, 8) + 3] == 255, "dodge never changes alpha");
+  COMP_CHECK_MSG(lightened[at(0, 0)] == before[at(0, 0)],
+                 "pixels outside the brush tip are byte-identical");
+
+  COMP_CHECK_MSG(document.history().undo_depth() == 1, "one dodge stroke is one undo step");
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the midtone byte for byte");
+
+  ToolOpParams burn = tone_params(kToolOpBurn, 0, 0.5f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, burn, &code, &error, nullptr),
+                 "a burn stroke is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+  const std::vector<uint8_t> darkened = pixels_of(document, id);
+  COMP_CHECK_MSG(darkened[at(8, 8)] < before[at(8, 8)],
+                 "burn moves the midtone toward black");
+  COMP_CHECK_MSG(darkened[at(8, 8) + 3] == 255, "burn never changes alpha");
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the burn byte for byte");
+}
+
+/*
+ * [F2] 海绵：去色把色度收掉，加色把色度放大；灰度像素上加色是恒等运算 ——
+ * 成功但**不记撤销步**（不能留下一笔什么都没改的撤销）。
+ */
+COMP_TEST(tool_ops_domain_tone_sponge_desaturates_and_noops_on_gray) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  const std::vector<uint8_t> red = flat_pixels(16, 16, 255, 0, 0, 255);
+  layer->pixels.resize(16, 16, COMP_PIXEL_RGBA8);
+  std::memcpy(layer->pixels.writable_pixels().data(), red.data(), red.size());
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  const auto at = [](int32_t x, int32_t y) -> size_t {
+    return (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * 4u;
+  };
+  const float center[2] = {8.0f, 8.0f};
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+
+  ToolOpParams desaturate = tone_params(kToolOpSponge, 0, 1.0f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, desaturate, &code, &error, nullptr),
+                 "a sponge stroke is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+  const std::vector<uint8_t> dull = pixels_of(document, id);
+  COMP_CHECK_MSG(dull[at(8, 8)] < 255, "desaturating red loses red");
+  COMP_CHECK_MSG(dull[at(8, 8) + 1] == dull[at(8, 8)] && dull[at(8, 8) + 2] == dull[at(8, 8)],
+                 "a fully desaturated pixel is neutral gray");
+  COMP_CHECK_MSG(dull[at(8, 8) + 3] == 255, "sponge never changes alpha");
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the red byte for byte");
+
+  /* 灰度 × 加色：色度本来就是 0，乘 (1+w) 还是 0 —— 逐字节不变 = 空操作。 */
+  const std::vector<uint8_t> gray = flat_pixels(16, 16, 128, 128, 128, 255);
+  Layer* restored = document.find(id);
+  COMP_CHECK(restored != nullptr);
+  std::memcpy(restored->pixels.writable_pixels().data(), gray.data(), gray.size());
+  const size_t undo_before = document.history().undo_depth();
+  std::string note;
+  ToolOpParams saturate = tone_params(kToolOpSponge, 1, 0.5f, center, 1);
+  COMP_CHECK_MSG(run_tool_op(&document, id, saturate, &code, &error, &note),
+                 "a no-op sponge stroke still succeeds: " + error);
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(note.find("changed no pixel") != std::string::npos,
+                 "the note says the tone stroke changed nothing: " + note);
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before,
+                 "a stroke that changes no byte records no undo step");
+  COMP_CHECK_MSG(pixels_of(document, id) == gray, "the no-op stroke leaves pixels byte-identical");
+}
+
+/* [F3] mode / strength / points 的闸都在开事务之前拒绝。 */
+COMP_TEST(tool_ops_domain_tone_rejects_bad_mode_and_strength_before_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_pixel_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = document.history().undo_depth();
+
+  const float points[4] = {2.0f, 2.0f, 5.0f, 2.0f};
+  comp_result code = COMP_OK;
+  std::string error;
+
+  {
+    ToolOpParams params = tone_params(kToolOpDodge, 3, 0.5f, points, 2);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "dodge mode 3 is rejected (only 0/1/2 exist)");
+    COMP_CHECK_MSG(code == COMP_ERR_INVALID_ARGUMENT, "an out-of-range dodge mode is an arg error");
+  }
+  {
+    ToolOpParams params = tone_params(kToolOpSponge, 2, 0.5f, points, 2);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "sponge mode 2 is rejected (only 0 = desaturate / 1 = saturate)");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = tone_params(kToolOpBurn, 1, 0.0f, points, 2);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "strength 0 is rejected instead of recording an empty undo step");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params =
+        tone_params(kToolOpBurn, 1, std::numeric_limits<float>::quiet_NaN(), points, 2);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a NaN strength is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+  {
+    ToolOpParams params = tone_params(kToolOpDodge, 0, 0.5f, nullptr, 2);
+    COMP_CHECK_MSG(!run_tool_op(&document, id, params, &code, &error, nullptr),
+                   "a null point array is rejected");
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  }
+
+  COMP_CHECK_MSG(!document.txn_active(), "the gate runs before txn_begin: no txn left open");
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before,
+                 "rejected tone strokes add no undo step");
+  COMP_CHECK_MSG(pixels_of(document, id) == before,
+                 "rejected tone strokes leave pixels byte-identical");
+
+  /* 合法值通过同一道闸，并恰好记一步。 */
+  ToolOpParams good = tone_params(kToolOpDodge, 0, 0.5f, points, 2);
+  COMP_CHECK_MSG(run_tool_op(&document, id, good, &code, &error, nullptr),
+                 "a legal tone stroke runs: " + error);
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(document.history().undo_depth() == undo_before + 1,
+                 "a tone stroke is exactly one undo step");
+}
+
+/* [F4] 16 位图层：色调工具按落笔族往返，笔尖外保持深精度。 */
+COMP_TEST(tool_ops_domain_tone_keeps_sixteen_bit_depth_outside_the_stroke) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 8, 8, 72.0f, "sRGB");
+  const comp_layer_id id = add_wide_layer(document);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+
+  const float points[4] = {2.0f, 2.0f, 3.0f, 2.0f};
+  ToolOpParams params = tone_params(kToolOpDodge, 0, 0.5f, points, 2);
+  params.brush.diameter = 3.0f;
+  comp_result code = COMP_ERR_INTERNAL;
+  std::string error;
+  COMP_CHECK_MSG(run_tool_op(&document, id, params, &code, &error, nullptr),
+                 "a tone stroke on a 16-bit layer is a real product path: " + error);
+  COMP_CHECK(code == COMP_OK);
+
+  const Layer* layer = document.find(id);
+  COMP_CHECK(layer != nullptr);
+  COMP_CHECK_MSG(layer->pixels.format == COMP_PIXEL_RGBA16,
+                 "tone joins the stroke family and keeps the layer at 16 bits");
+
+  const uint16_t* now = reinterpret_cast<const uint16_t*>(layer->pixels.pixel_data().data());
+  const uint16_t* old = reinterpret_cast<const uint16_t*>(before.data());
+  const size_t count = 8u * 8u;
+  size_t changed = 0;
+  bool only_eight_bit_values = true;
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t* p = now + i * 4u;
+    const uint16_t* b = old + i * 4u;
+    if (p[0] == b[0] && p[1] == b[1] && p[2] == b[2] && p[3] == b[3]) continue;
+    ++changed;
+    for (int c = 0; c < 4; ++c) {
+      if (p[c] % 257u != 0u || p[c] / 257u > 255u) only_eight_bit_values = false;
+    }
+  }
+  COMP_CHECK_MSG(changed > 0, "the tone stroke actually changed something");
+  COMP_CHECK_MSG(changed < count, "pixels outside the stroke keep their 16-bit precision");
+  COMP_CHECK_MSG(only_eight_bit_values,
+                 "a painted pixel takes the 8-bit value * 257 (deep_take_painted)");
+
+  document.undo();
+  COMP_CHECK_MSG(document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                 "undo restores the 16-bit asset");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "undo restores the deep pixels byte for byte");
+}
+
 /* ============================================================== 文字（S11） */
 
 namespace {

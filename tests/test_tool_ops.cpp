@@ -757,6 +757,133 @@ COMP_TEST(tool_ops_blur_rejects_a_zero_radius_before_opening_the_transaction) {
   COMP_CHECK_MSG(undo_ok > undo_before, "the legal radius goes through and records history");
 }
 
+/* ================================================== 5b. P1：减淡 / 加深 / 海绵 */
+
+COMP_TEST(tool_ops_tone_is_reachable_through_the_abi_and_undoes_in_one_step) {
+  /* 枚举值本身是 ABI：宿主按数字编译，不能漂移。 */
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_DODGE) == 16, "COMP_TOOL_DODGE stays at 16");
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_BURN) == 17, "COMP_TOOL_BURN stays at 17");
+  COMP_CHECK_MSG(static_cast<int>(COMP_TOOL_SPONGE) == 18, "COMP_TOOL_SPONGE stays at 18");
+
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(128, 128, 128);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[4] = {4.0f, 8.0f, 12.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_DODGE);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 2;
+  desc.brush.diameter = 7.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.tone.mode = 0; /* 中间调 */
+  desc.tone.strength = 0.5f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  COMP_CHECK_MSG(comp_tool_apply(fx.doc, fx.layer, &desc, nullptr, 0, nullptr) == COMP_OK,
+                 "dodge reaches the engine through comp_tool_apply");
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(after, 8, 8) > red_at(before, 8, 8),
+                 "dodge lightens the pixels under the stroke");
+  COMP_CHECK_MSG(alpha_at(after, 8, 8) == 255, "dodge never punches holes in alpha");
+  COMP_CHECK_MSG(red_at(after, 1, 14) == red_at(before, 1, 14),
+                 "pixels far from the stroke are untouched");
+
+  /* 同一份 desc 换成加深：方向必须相反。 */
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the dodge byte for byte");
+  desc.kind = COMP_TOOL_BURN;
+  COMP_CHECK(comp_tool_apply(fx.doc, fx.layer, &desc, nullptr, 0, nullptr) == COMP_OK);
+  const std::vector<uint8_t> burned = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(burned, 8, 8) < red_at(before, 8, 8),
+                 "burn darkens the same pixels the dodge lightened");
+
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after > undo_before, "each tone stroke adds undo history");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "undo restores the burn byte for byte");
+}
+
+COMP_TEST(tool_ops_tone_respects_the_selection) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(100, 100, 100);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  const float rect[4] = {0.0f, 0.0f, 8.0f, 16.0f};
+  int32_t changed = 0;
+  COMP_CHECK(comp_selection_apply_shape(fx.doc, COMP_SELECTION_RECT, rect, 2,
+                                        COMP_SELECTION_REPLACE, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed != 0, "the left-half selection really was created");
+
+  /* 折线横跨选区边界（x = 4..12，直径 7），只有左半应当被压暗。 */
+  float points[4] = {4.0f, 8.0f, 12.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_BURN);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 2;
+  desc.brush.diameter = 7.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.tone.mode = 0;
+  desc.tone.strength = 0.6f;
+  COMP_CHECK(comp_tool_apply(fx.doc, fx.layer, &desc, nullptr, 0, nullptr) == COMP_OK);
+
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(red_at(after, 5, 8) < red_at(before, 5, 8),
+                 "inside the selection the burn really darkens");
+  COMP_CHECK_MSG(red_at(after, 11, 8) == red_at(before, 11, 8),
+                 "outside the selection the layer is byte-identical");
+  COMP_CHECK_MSG(alpha_at(after, 11, 8) == 255, "outside the selection alpha is untouched");
+
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "one undo restores the masked tone stroke");
+}
+
+COMP_TEST(tool_ops_tone_rejects_bad_mode_and_strength_before_opening_the_transaction) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = plain_pixels(128, 128, 128);
+  set_pixels(fx.doc, fx.layer, pixels);
+  const std::vector<uint8_t> before = flatten(fx.doc);
+
+  float points[2] = {8.0f, 8.0f};
+  comp_tool_op_desc desc = base(COMP_TOOL_SPONGE);
+  desc.stroke_points = points;
+  desc.stroke_point_count = 1;
+  desc.brush.diameter = 5.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.tone.mode = 2; /* 海绵只有 0 = 去色 / 1 = 加色 */
+  desc.tone.strength = 0.5f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_before, nullptr) == COMP_OK);
+
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT,
+                 "sponge mode 2 is an argument error");
+  size_t undo_rejected = 0;
+  COMP_CHECK(comp_document_history_stats(fx.doc, &undo_rejected, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_rejected == undo_before, "the rejected tone leaves no undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the rejected tone leaves the render untouched");
+
+  /* strength 0 同口径：恒等操作不记空撤销。 */
+  desc.tone.mode = 1;
+  desc.tone.strength = 0.0f;
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(flatten(fx.doc) == before);
+
+  /* 合法值通过同一道闸。 */
+  desc.tone.strength = 0.5f;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, desc) == COMP_OK,
+                 "the legal sponge goes through");
+}
+
 /* ================================================== 6. S5：橡皮擦模式 */
 
 COMP_TEST(tool_ops_eraser_subtracts_coverage_instead_of_painting) {

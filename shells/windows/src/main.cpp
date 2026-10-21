@@ -161,7 +161,7 @@ constexpr UINT kCmdSelectLoadPixels = 1049;
 constexpr UINT kCmdSelectColorRange = 1050;
 constexpr UINT kCmdSelectPaths = 1051; /* P0-4 可选：路径面板（Ctrl+Shift+P） */
 constexpr UINT kCmdHistoryPanel = 1052; /* P1：历史记录面板（Ctrl+Alt+H） */
-constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1116 */
+constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
 constexpr UINT kCmdFilterReset = 1211;
@@ -280,6 +280,12 @@ struct ShellState {
   int retouch_mode = comp_ui::kRetouchBlur;
   double blur_radius = 8.0;
   double retouch_strength = 0.5; /* Smudge / Liquify 的 warp.strength */
+  /*
+   * Tone 工具（O 循环）：8 个状态 = Dodge/Burn 各三档 + Sponge 两档。
+   * 算子与 mode 都由 comp_ui::tone_state_tool/mode 换算，壳内不另存一份。
+   */
+  int tone_state = comp_ui::kToneDodgeMidtone;
+  double tone_strength = 0.5; /* comp_tool_tone.strength（Exposure / Flow） */
   /* 滤镜面板：状态（种类/焦点/值）全在 ui_core.h，壳只做绘制与 ABI 搬运。 */
   comp_ui::FilterPanel filter;
   bool filter_open = false;
@@ -340,9 +346,10 @@ struct ShellState {
   int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
   std::wstring color_input;  /* Shift+X 的十六进制键入；非空 = 输入态 */
   /*
-   * 进行中的画布笔迹（文档像素折线）。Retouch 族（Blur / Smudge / Liquify）与
-   * 画笔/橡皮擦共用同一条折线通路与去抖规则，stroke_kind 记住松开时装配哪种算子；
-   * stroke_erase 在落笔时冻结——拖拽中途按 E 不改变这一笔的合成方向。
+   * 进行中的画布笔迹（文档像素折线）。Retouch 族（Blur / Smudge / Liquify）、
+   * Tone 族（Dodge / Burn / Sponge）与画笔/橡皮擦共用同一条折线通路与去抖规则，
+   * stroke_kind 记住松开时装配哪种算子；stroke_erase 在落笔时冻结——拖拽中途
+   * 按 E 不改变这一笔的合成方向。
    */
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
@@ -4989,6 +4996,80 @@ void retouch_stroke_end(HWND window, ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------------------------ 色调笔迹（减淡 / 加深 / 海绵） */
+
+/* Dodge / Burn / Sponge 共用同一条「鼠标折线 -> comp_tool_apply」通路。 */
+bool tone_stroke_available(const ShellState& shell) {
+  return shell.document != nullptr && shell.tool == comp_ui::ToolId::Tone;
+}
+
+void tone_stroke_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!tone_stroke_available(shell)) return;
+  if (!stroke_begin(shell, x, y, layout, comp_ui::StrokeKind::Tone)) return;
+  SetCapture(window);
+  wchar_t buffer[160];
+  wsprintfW(buffer, L"%s 笔迹…（松开鼠标应用，强度 %d%%）",
+            widen_ascii(comp_ui::tone_state_name(shell.tone_state)).c_str(),
+            static_cast<int>(shell.tone_strength * 100.0 + 0.5));
+  set_status(shell, buffer);
+}
+
+void tone_stroke_end(HWND window, ShellState& shell) {
+  if (shell.stroke_kind != comp_ui::StrokeKind::Tone) return;
+  shell.stroke_kind = comp_ui::StrokeKind::None;
+
+  /* 同 retouch_stroke_end：折线必须先搬走，ReleaseCapture 会同步触发取消。 */
+  std::vector<float> points;
+  points.swap(shell.stroke_points);
+  ReleaseCapture();
+  if (points.empty()) return;
+
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.document == nullptr || id == 0) {
+    set_status(shell, L"减淡/加深/海绵：请先选择一个图层");
+    return;
+  }
+
+  comp_tool_op_desc desc{};
+  switch (comp_ui::tone_state_tool(shell.tone_state)) {
+    case comp_ui::kToneToolDodge: desc.kind = COMP_TOOL_DODGE; break;
+    case comp_ui::kToneToolBurn: desc.kind = COMP_TOOL_BURN; break;
+    default: desc.kind = COMP_TOOL_SPONGE; break;
+  }
+  desc.tone.mode = comp_ui::tone_state_mode(shell.tone_state);
+  desc.tone.strength = static_cast<float>(shell.tone_strength);
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  desc.brush.flow = 1.0f;
+  desc.brush.seed = 0; /* 三种算子都不用随机数；固定值保证同参数同结果 */
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.document, id, &desc, note, sizeof(note), &note_size);
+  shell.needs_render = true;
+
+  const char* state_name = comp_ui::tone_state_name(shell.tone_state);
+  wchar_t buffer[384];
+  if (result != COMP_OK) {
+    wsprintfW(buffer, L"%s 失败", widen_ascii(state_name).c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  if (note[0] != '\0' && note_size > 1) {
+    wsprintfW(buffer, L"%s：已应用 %d 个折点｜%s", widen_ascii(state_name).c_str(),
+              desc.stroke_point_count, widen_ascii(note).c_str());
+  } else {
+    wsprintfW(buffer, L"%s：已应用 %d 个折点（强度 %d%%）",
+              widen_ascii(state_name).c_str(), desc.stroke_point_count,
+              static_cast<int>(shell.tone_strength * 100.0 + 0.5));
+  }
+  refresh_history_status(shell, buffer);
+}
+
 /* ------------------------------------------------------------ 画笔 / 橡皮擦 */
 
 /*
@@ -5934,9 +6015,13 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     DrawTextW(dc, letter, 1, &button, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   }
 
-  /* 右侧读数：缩放、笔刷，Retouch 工具再带上子模式与当前参数。 */
+  /* 右侧读数：缩放、笔刷，Retouch / Tone 工具再带上子模式与当前参数。 */
   wchar_t extra[96] = L"";
-  if (shell.tool == comp_ui::ToolId::Retouch) {
+  if (shell.tool == comp_ui::ToolId::Tone) {
+    wsprintfW(extra, L"   %s / 强度 %d%%",
+              widen_ascii(comp_ui::tone_state_name(shell.tone_state)).c_str(),
+              static_cast<int>(shell.tone_strength * 100.0 + 0.5));
+  } else if (shell.tool == comp_ui::ToolId::Retouch) {
     if (shell.retouch_mode == comp_ui::kRetouchBlur) {
       wsprintfW(extra, L"   %s / 半径 %d px",
                 widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str(),
@@ -5972,11 +6057,16 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
     /* R 键在同一工具内循环：状态栏必须显示当前子模式，否则用户不知道自己拿的是哪个。 */
     wsprintfW(tool_name, L"Retouch / %s",
               widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  } else if (shell.tool == comp_ui::ToolId::Tone) {
+    /* O 键同理：8 档共用同一个键，状态栏不写清楚就等于没切。 */
+    wsprintfW(tool_name, L"%s", widen_ascii(comp_ui::tone_state_name(shell.tone_state)).c_str());
   } else {
     wsprintfW(tool_name, L"%s", info != nullptr ? widen_ascii(info->name).c_str() : L"?");
   }
   wchar_t extra[64] = L"";
-  if (shell.tool == comp_ui::ToolId::Retouch) {
+  if (shell.tool == comp_ui::ToolId::Tone) {
+    wsprintfW(extra, L" · 强度 %d%%", static_cast<int>(shell.tone_strength * 100.0 + 0.5));
+  } else if (shell.tool == comp_ui::ToolId::Retouch) {
     if (shell.retouch_mode == comp_ui::kRetouchBlur) {
       wsprintfW(extra, L" · 半径 %d px", static_cast<int>(shell.blur_radius + 0.5));
     } else {
@@ -7606,6 +7696,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
   if (id == comp_ui::ToolId::Retouch) {
     wsprintfW(buffer, L"工具：Retouch / %s（再按 R 循环）",
               widen_ascii(comp_ui::retouch_mode_name(shell.retouch_mode)).c_str());
+  } else if (id == comp_ui::ToolId::Tone) {
+    wsprintfW(buffer, L"工具：%s（再按 O 循环；Alt+[ / ] 调强度，当前 %d%%）",
+              widen_ascii(comp_ui::tone_state_name(shell.tone_state)).c_str(),
+              static_cast<int>(shell.tone_strength * 100.0 + 0.5));
   } else if (id == comp_ui::ToolId::Marquee) {
     wsprintfW(buffer, L"工具：Marquee / %s（M 切矩形/椭圆，Shift 加选 / Alt 减选）",
               widen_ascii(comp_ui::marquee_shape_name(shell.marquee_shape)).c_str());
@@ -7663,6 +7757,17 @@ void set_retouch_mode(ShellState& shell, int mode) {
               widen_ascii(comp_ui::retouch_mode_name(mode)).c_str(),
               static_cast<int>(shell.retouch_strength * 100.0 + 0.5));
   }
+  set_status(shell, buffer);
+}
+
+/* O 键循环 8 档（Dodge/Burn 各三档 + Sponge 两档）；都走 comp_tool_apply。 */
+void set_tone_state(ShellState& shell, int state) {
+  shell.tone_state = state;
+  shell.tool = comp_ui::ToolId::Tone;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"工具：%s（再按 O 循环；Alt+[ / ] 调强度，当前 %d%%）",
+            widen_ascii(comp_ui::tone_state_name(state)).c_str(),
+            static_cast<int>(shell.tone_strength * 100.0 + 0.5));
   set_status(shell, buffer);
 }
 
@@ -9090,6 +9195,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           set_retouch_mode(shell, shell.tool == comp_ui::ToolId::Retouch
                                       ? comp_ui::next_retouch_mode(shell.retouch_mode)
                                       : comp_ui::kRetouchBlur);
+        } else if (id == comp_ui::ToolId::Tone) {
+          /* 重复按 O 在 8 档里循环；从别的工具切进来一律回到 Dodge 中间调。 */
+          set_tone_state(shell, shell.tool == comp_ui::ToolId::Tone
+                                    ? comp_ui::next_tone_state(shell.tone_state)
+                                    : comp_ui::kToneDodgeMidtone);
         } else if (id != comp_ui::ToolId::Count) {
           set_tool(shell, id);
         }
@@ -9510,6 +9620,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               shape_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (type_available(*shell)) {
               type_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (tone_stroke_available(*shell)) {
+              tone_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (retouch_stroke_available(*shell)) {
               retouch_stroke_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (paint_stroke_available(*shell)) {
@@ -9690,6 +9802,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr && shell->eyedropper_drag) {
         shell->eyedropper_drag = false;
         ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->stroke_kind == comp_ui::StrokeKind::Tone) {
+        tone_stroke_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -9888,7 +10005,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       /*
-       * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化模式调强度。
+       * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化与减淡/加深/海绵调强度。
        * 普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，因此放到 Alt 组合，
        * 且必须在这里吞掉，否则 DefWindowProc 会响铃。
        */
@@ -9925,6 +10042,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               comp_ui::step_shape_stroke_width(shell->shape_stroke_width, direction);
           wsprintfW(buffer, L"形状描边宽度 %d px（直线描边用）",
                     static_cast<int>(shell->shape_stroke_width + 0.5));
+        } else if (shell->tool == comp_ui::ToolId::Tone) {
+          /* P1：Alt+[ / ] 调减淡/加深/海绵的强度（Exposure / Flow 口径，10% 一步）。 */
+          shell->tone_strength = comp_ui::step_tone_strength(shell->tone_strength, direction);
+          wsprintfW(buffer, L"%s强度 %d%%",
+                    widen_ascii(comp_ui::tone_state_name(shell->tone_state)).c_str(),
+                    static_cast<int>(shell->tone_strength * 100.0 + 0.5));
         } else if (shell->tool == comp_ui::ToolId::Retouch &&
                    shell->retouch_mode != comp_ui::kRetouchBlur) {
           shell->retouch_strength =

@@ -32,6 +32,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
+| 减淡 / 加深 / 海绵（P1） | `O` 循环 8 档，画布折线 → 一次 `COMP_TOOL_DODGE` / `_BURN` / `_SPONGE` | （未接 UI） | `comp_tool_apply` | **已达成**（§5.19）：`Alt+[ / ]` 调强度，受选区约束 |
 | 渐变工具（S9） | 画布拖拽两端点 → 一次 `COMP_TOOL_GRADIENT` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；线性/径向、Shift 反向） |
 | 形状工具（S10） | 画布拖拽对角点/两端点 → 一次 `COMP_TOOL_SHAPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；矩形/椭圆/直线，Shift 正方、Alt 从中心） |
 | 文字工具（S11） | 点击落插入点 + 键入 ASCII → 一次 `COMP_TOOL_TYPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；内置 5×7 点阵，ASCII-only） |
@@ -41,7 +42,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | PSD 只读导入 | 可用 | 可用 | `comp_io_import` | 已达成（stb） |
 | 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读；**HWND 直呈已落地（S16，`caps().window_present`）** | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_present` / `comp_render_flatten` | **部分达成**：Windows 的设备侧离屏（S13）与交换链直呈（S16）都已落地；鸿蒙设备侧交换链未落地，窗口表面如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
-| 工具条 / 画布导航 | 17 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
+| 工具条 / 画布导航 | 19 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
 `COMP_ERR_UNSUPPORTED`**，不伪造成功。Windows 侧已在 S16 补上 D3D12 交换链直呈
@@ -130,7 +131,7 @@ compositor-ng 是「同引擎、两壳」结构：
 
 `A` Select · `V` Move/Transform · `M` Marquee · `L` Lasso · `W` Magic Wand · `C` Crop ·
 `I` Eyedropper · `B` Brush · `E` Eraser · `J` Spot Healing · `S` Clone Stamp ·
-`R` Blur/Smudge/Liquify · `G` Gradient · `U` Shape · `T` Type · `H` Hand · `Z` Zoom
+`R` Blur/Smudge/Liquify · `O` Dodge/Burn/Sponge · `G` Gradient · `U` Shape · `T` Type · `H` Hand · `Z` Zoom
 
 - 大写字母与小写等价（`WM_KEYDOWN` 不区分大小写）；
 - 未占用键显式返回 `ToolId::Count`，**不静默回落到第一个工具**；
@@ -794,4 +795,47 @@ Alt 组合才落在 `WM_SYSKEYDOWN`）。面板占用右栏 `layout.adjust_panel
 ② 标签是写入方给的（壳里是英文操作名），面板不改写成中文；③ 历史被预算裁掉后
 列表随之收缩，不提示「更早的记录已丢弃」（状态栏的字节数仍在）；
 ④ 快照粒度是「一步」，笔迹仍然是每笔一步，没有上游的「合成笔迹」分组。
+
+### 5.19 减淡 / 加深 / 海绵（P1，2026-10-21）
+
+路线图 P1「减淡 / 加深 / 海绵」的验收口径是「三种工具能改像素且受选区约束，撤销一步」。
+上游 `RetouchTools.swift` 是工具层逻辑、没有 `.c` 内核，所以这一项在**域层新增算子**
+（`tool_ops.cpp` 的色调分支），再在 ABI 尾部追加三个 kind。
+
+**1. 一个工具、八个状态。** `O` 键进 Tone 工具，重复按在
+`Dodge/Midtones → Dodge/Shadows → Dodge/Highlights → Burn/Midtones → Burn/Shadows →
+Burn/Highlights → Sponge/Desaturate → Sponge/Saturate` 里循环（第 8 档再按回到第 1 档）；
+从别的工具切进来一律落在 `Dodge/Midtones`。状态是壳侧**唯一真值**：
+ABI 的 `(kind, mode)` 由 `tone_state_tool()` / `tone_state_mode()` 从同一张表换算，
+壳内不另存一份，因此不会出现「状态栏说阴影、实际按中间调算」。
+
+**2. 参数增量最小。** ABI 只加 `comp_tool_tone { mode; strength; }` 与三个枚举值
+（16/17/18，纯尾部追加，导出数仍 138）。笔迹几何完全复用 `stroke_points` / `brush`，
+与 Blur 同一条折线通路；`Alt+[` / `Alt+]` 调强度（0.01..1.0，10% 一步，`clamp` 兜住
+0 / 负数 / NaN），`Shift+O` 图层不透明度、`Ctrl+O` 打开、`[` `]` 笔刷都不受影响。
+
+**3. 落笔族。** 三种算子走 `StrokeKind::Tone`，与画笔同一条 `StrokeShape` 覆盖率与
+「不叠加」口径；`is_stroke_family` 因此扩到这三种 kind——RGBA16 / RGBA16F 上只有
+真正被改动的像素拿深值，笔尖之外保持原深度（与 Photoshop 一致）。
+
+**4. 空撤销防线。** 三种运算都可能算出「逐字节不变」：海绵加色碰到纯灰、
+减淡碰到纯白。实现逐通道**量化后与旧值比较**，没有字节变化就不写、全笔都没变化时
+`txn_abort` 并返回 `COMP_OK`，状态栏显示引擎 note
+`tone stroke changed no pixel (arithmetically a no-op)`——`Ctrl+Z` 撤的是上一笔，
+不会撤出一步空操作。`strength == 0` 更早：在参数闸就以 `INVALID_ARGUMENT` 拒绝。
+
+**5. 选区约束。** 与渐变 / 形状 / 文字同口径：在文档分辨率取
+`selection_effective_coverage()` 并乘进笔迹覆盖率，画布外与覆盖率为 0 的像素
+逐字节不动；外层坐标用 `effective_bounds()` 的原点映射。一条横跨选区边界的笔迹
+只有选区内一侧变化。
+
+**6. 入口与工具表。** `ToolId::Tone` 插在 `Retouch` 之后（工具栏第 14 个按钮，
+`tool_table` 仍是工具条 / Tools 菜单 / 快捷键的唯一来源，索引全部由表生成）；
+工具条与状态栏都显示当前档名与强度。M1 的工具顺序因此变为
+`A V M L P W C I B E J S R O G U T H Z`（19 个）。
+
+**7. 验证。** 领域层 4 例、ABI 层 3 例、UI 层 1 例，单测 560 → **568 例 / 0 失败**；
+PE 导出 **138 不变**；壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M23**。
 

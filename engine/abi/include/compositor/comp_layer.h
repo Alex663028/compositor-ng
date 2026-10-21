@@ -517,7 +517,17 @@ typedef enum comp_tool_op {
    * 直接排版成覆盖率；字体是**引擎自带的 5×7 位图 ASCII 字体**，UTF-8/CJK
    * 明确不支持（参数闸拒绝，不静默画方框）。见 `comp_tool_type`。
    */
-  COMP_TOOL_TYPE = 15
+  COMP_TOOL_TYPE = 15,
+  /*
+   * P1 尾部追加：减淡 / 加深 / 海绵（上游工具箱的 Dodge / Burn / Sponge）。
+   * 三者都吃 `stroke_points` 折线与 `brush` 几何（与模糊同款：coverage 决定
+   * 强度），差别只在逐像素的色调运算；参数见 `comp_tool_tone`。
+   * 语义：Dodge 提亮、Burn 压暗、Sponge 去色/加色；alpha 不变、全透明像素
+   * 不动、选区外逐字节不动。
+   */
+  COMP_TOOL_DODGE = 16,
+  COMP_TOOL_BURN = 17,
+  COMP_TOOL_SPONGE = 18
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */
@@ -787,6 +797,29 @@ typedef struct comp_tool_type {
   float opacity;            /* 0..1，再乘进逐像素覆盖率 */
 } comp_tool_type;
 
+/* ============================================================== 色调（P1） */
+
+/*
+ * 减淡 / 加深 / 海绵参数（语义见 domain/tool_ops.h 的 `ToneParams`）。
+ *
+ * 三者共用 `stroke_points` 折线与 `brush` 的直径/硬度/pressure/flow（与模糊
+ * 同一条笔迹通路），本结构只承载「哪一种色调运算、多强」：
+ *
+ * `mode` 的取值范围随算子不同：
+ *   - COMP_TOOL_DODGE / COMP_TOOL_BURN：0 = 中间调（缺省，对齐上游工具栏）、
+ *     1 = 阴影、2 = 高光。范围权重按亮度取 1-|2l-1| / (0.5-l)/0.5 / (l-0.5)/0.5，
+ *     再过 smoothstep（线性边界会在中间调与高光交界留下可见台阶）。
+ *   - COMP_TOOL_SPONGE：0 = 去色、1 = 加色。
+ *
+ * `strength` 0..1 是本笔总量（Dodge/Burn 是上游 Exposure，Sponge 是 Flow），
+ * 再乘进 coverage 与选区有效覆盖率。参数闸拒绝 <= 0（恒等操作不记空撤销）；
+ * alpha 保持不变，全透明像素（alpha 0）跳过。
+ */
+typedef struct comp_tool_tone {
+  int32_t mode;
+  float   strength;
+} comp_tool_tone;
+
 /*
  * 一次工具操作。零初始化即可调用（各子结构缺省即「什么都不改」）。
  * `stroke.points` 为文档像素坐标折线（x, y 成对，共 point_count*2 个 float）。
@@ -840,6 +873,12 @@ typedef struct comp_tool_op_desc {
    * 语义见 comp_tool_type。它不读 `stroke_points`，也不读 `shape`。
    */
   comp_tool_type   type;
+  /*
+   * P1 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   * COMP_TOOL_DODGE / _BURN / _SPONGE 读取：模式与强度，语义见 comp_tool_tone；
+   * 笔迹折线与笔刷几何仍走 `stroke_points` 与 `brush`。
+   */
+  comp_tool_tone   tone;
 } comp_tool_op_desc;
 
 /*

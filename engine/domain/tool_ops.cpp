@@ -95,6 +95,9 @@ std::string label(uint32_t kind) {
     case kToolOpGradient: return "gradient";
     case kToolOpShape: return "shape";
     case kToolOpType: return "type";
+    case kToolOpDodge: return "dodge";
+    case kToolOpBurn: return "burn";
+    case kToolOpSponge: return "sponge";
     default: return "none";
   }
 }
@@ -354,7 +357,8 @@ bool use_rgba8_working_copy(Layer* layer) {
 }
 
 /*
- * 落笔族（stroke / clone / smudge / liquify / blur）在 16 位与 HDR 上的往返。
+ * 落笔族（stroke / clone / smudge / liquify / blur / dodge / burn / sponge）在
+ * 16 位与 HDR 上的往返。
  *
  * 上游 BrushStroke.swift:1097 `sixteenBit()` 的口径，不是「全 16 位落笔」：
  *   1. 把图层的**原始** 16 位像素当宽缓冲 `wide`（工具全程不碰它）；
@@ -375,7 +379,14 @@ bool is_stroke_family(uint32_t kind) {
          kind == static_cast<uint32_t>(kToolOpSmudge) ||
          kind == static_cast<uint32_t>(kToolOpLiquify) ||
          /* 模糊只改笔尖盖到的像素，笔尖之外保住深像素——与落笔族同一口径。 */
-         kind == static_cast<uint32_t>(kToolOpBlur);
+         kind == static_cast<uint32_t>(kToolOpBlur) ||
+         /*
+          * 减淡/加深/海绵同样只改笔尖盖到的像素（上游 Photoshop 的 16 位图层
+          * 上这三种工具不降位），因此按落笔族往返，笔尖之外保住深像素。
+          */
+         kind == static_cast<uint32_t>(kToolOpDodge) ||
+         kind == static_cast<uint32_t>(kToolOpBurn) ||
+         kind == static_cast<uint32_t>(kToolOpSponge);
 }
 
 struct DeepPaintCopy {
@@ -778,6 +789,41 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
         if (!std::isfinite(params.points[i]) ||
             std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
           return bad_arg("blur point is not finite or out of range");
+        }
+      }
+      break;
+    }
+
+    case kToolOpDodge:
+    case kToolOpBurn:
+    case kToolOpSponge: {
+      if (params.point_count <= 0 || params.point_count > kMaxStrokePoints) {
+        return bad_arg("tone stroke needs 1..65536 points");
+      }
+      if (params.points == nullptr) return bad_arg("tone points are null");
+      if (!std::isfinite(params.brush.diameter) || params.brush.diameter <= 0.0f ||
+          params.brush.diameter > kMaxBrushDiameter) {
+        return bad_arg("tone brush diameter out of range");
+      }
+      if (!finite01(params.brush.hardness)) return bad_arg("brush hardness out of 0..1");
+      if (!finite01(params.brush.pressure)) return bad_arg("brush pressure out of 0..1");
+      if (!finite01(params.brush.flow)) return bad_arg("brush flow out of 0..1");
+      /* strength 0 = 逐字节不动：与渐变 opacity 0 同口径，拒绝而不是记一步空撤销。 */
+      if (!std::isfinite(params.tone.strength) || params.tone.strength <= 0.0f ||
+          params.tone.strength > 1.0f) {
+        return bad_arg("tone strength must be within 0..1 and non-zero");
+      }
+      const bool sponge = params.kind == kToolOpSponge;
+      const int32_t max_mode = sponge ? 1 : 2;
+      if (params.tone.mode < 0 || params.tone.mode > max_mode) {
+        return bad_arg(sponge ? "sponge mode must be 0 (desaturate) or 1 (saturate)"
+                              : "dodge/burn mode must be 0 (midtones), 1 (shadows) or 2 "
+                                "(highlights)");
+      }
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i]) ||
+            std::fabs(static_cast<double>(params.points[i])) > kMaxToolCoordinate) {
+          return bad_arg("tone point is not finite or out of range");
         }
       }
       break;
@@ -1293,6 +1339,141 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
                        target_layer->pixels.stride(), target_layer->pixels.width,
                        target_layer->pixels.height, blurred, local.data(), params.point_count,
                        params.brush);
+      break;
+    }
+
+    case kToolOpDodge:
+    case kToolOpBurn:
+    case kToolOpSponge: {
+      /*
+       * 减淡 / 加深 / 海绵：与模糊同一条「笔迹 coverage 决定改多少」通路，改的是
+       * **色调**。图层像素是预乘 RGBA8，这里先反预乘回直通色再算、最后乘回
+       * alpha：直接在预乘值上提亮/压暗会让半透明边缘（低 alpha）的改动被 alpha
+       * 压低，笔迹边缘出现一圈「没动」的硬边。
+       *
+       * 选区口径与渐变/形状/文字完全一致：有效 coverage 是文档分辨率，图层像素
+       * 按 effective_bounds 原点平移到文档坐标后取样，画布外视为选区之外。
+       */
+      const bool masked = document->selection().active;
+      std::vector<uint8_t> selection_coverage;
+      const int32_t canvas_width = document->state().width;
+      const int32_t canvas_height = document->state().height;
+      if (masked) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+        if (selection_coverage.size() != static_cast<size_t>(canvas_width) *
+                                            static_cast<size_t>(canvas_height)) {
+          ok = bad_state("active selection has no coverage at the document resolution");
+          break;
+        }
+      }
+
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        local[i] = params.points[i] - ((i & 1) ? b.y : b.x);
+      }
+      const StrokeShape shape(local.data(), params.point_count, params.brush.diameter,
+                              params.brush.hardness, params.brush.pressure * params.brush.flow);
+      int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (shape.empty() ||
+          !shape.bounds(target_layer->pixels.width, target_layer->pixels.height, &x0, &y0, &x1,
+                        &y1)) {
+        noop = true;
+        if (note != nullptr) {
+          *note += "tone stroke does not intersect the layer (no pixels changed); ";
+        }
+        break;
+      }
+
+      bool changed = false;
+      const double strength = static_cast<double>(params.tone.strength);
+      const int32_t mode = params.tone.mode;
+      uint8_t* pixels = target_layer->pixels.writable_pixels().data();
+      const size_t stride = target_layer->pixels.stride();
+      for (int32_t y = y0; y <= y1; ++y) {
+        uint8_t* row = pixels + static_cast<size_t>(y) * stride;
+        for (int32_t x = x0; x <= x1; ++x) {
+          const float cov =
+              shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+          if (cov <= 0.0f) continue;
+          double weight = static_cast<double>(cov) * strength;
+          if (masked) {
+            const int32_t canvas_x = b.x + x;
+            const int32_t canvas_y = b.y + y;
+            if (canvas_x < 0 || canvas_y < 0 || canvas_x >= canvas_width ||
+                canvas_y >= canvas_height) {
+              continue; /* 画布外 = 选区之外：逐字节不动 */
+            }
+            weight *= static_cast<double>(
+                          selection_coverage[static_cast<size_t>(canvas_y) *
+                                                 static_cast<size_t>(canvas_width) +
+                                             static_cast<size_t>(canvas_x)]) /
+                      255.0;
+          }
+          if (weight <= 0.0) continue;
+
+          uint8_t* px = row + static_cast<size_t>(x) * 4u;
+          if (px[3] == 0) continue; /* 全透明像素没有颜色可提亮/压暗 */
+          double straight[3];
+          for (int c = 0; c < 3; ++c) {
+            straight[c] = std::min(static_cast<double>(px[c]) / static_cast<double>(px[3]), 1.0);
+          }
+          const double luma = 0.299 * straight[0] + 0.587 * straight[1] + 0.114 * straight[2];
+
+          /*
+           * Range 权重只对 Dodge/Burn 生效（海绵没有 Range 档）：中间调以 0.5
+           * 为峰、阴影以 0 为峰、高光以 1 为峰，再过 smoothstep —— 线性边界
+           * 在中间调与高光交界会留下可见台阶。
+           */
+          if (params.kind != kToolOpSponge) {
+            double range = 1.0 - std::fabs(2.0 * luma - 1.0);
+            if (mode == 1) {
+              range = (0.5 - luma) / 0.5;
+            } else if (mode == 2) {
+              range = (luma - 0.5) / 0.5;
+            }
+            range = std::min(std::max(range, 0.0), 1.0);
+            weight *= range * range * (3.0 - 2.0 * range);
+            if (weight <= 0.0) continue;
+          }
+
+          if (params.kind == kToolOpSponge) {
+            /* 去色把色度乘 (1-w)，加色乘 (1+w)（超出色域按 clamp 收回）。 */
+            const double factor = mode == 0 ? 1.0 - weight : 1.0 + weight;
+            for (int c = 0; c < 3; ++c) straight[c] = luma + (straight[c] - luma) * factor;
+          } else if (params.kind == kToolOpDodge) {
+            for (int c = 0; c < 3; ++c) straight[c] += (1.0 - straight[c]) * weight;
+          } else {
+            for (int c = 0; c < 3; ++c) straight[c] *= 1.0 - weight;
+          }
+          /*
+           * 逐字节比较后再写：海绵对灰度像素「加色」、减淡撞到纯白这类数学上
+           * 不动的像素不写，也不记撤销步——否则会留下一笔「什么都没改」的撤销。
+           */
+          bool pixel_changed = false;
+          for (int c = 0; c < 3; ++c) {
+            const double value =
+                std::min(std::max(straight[c], 0.0), 1.0) * static_cast<double>(px[3]);
+            const uint8_t quantized = static_cast<uint8_t>(std::lround(value));
+            if (quantized != px[c]) {
+              px[c] = quantized;
+              pixel_changed = true;
+            }
+          }
+          /* alpha 不变：三种工具都只改颜色（上游同款）。 */
+          if (pixel_changed) changed = true;
+        }
+      }
+      if (!changed) {
+        noop = true;
+        if (note != nullptr) {
+          *note += "tone stroke changed no pixel (arithmetically a no-op); ";
+        }
+        break;
+      }
+      if (masked && note != nullptr) {
+        *note += "tone is masked by the active selection (coverage 0 pixels are unchanged); ";
+      }
       break;
     }
 
@@ -1905,8 +2086,9 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   }
   if (noop) {
     /*
-     * 成功但一个像素都没改（目前只有「形状与图层不相交」会走到这里）：
-     * 事务整步撤回，撤销栈不增长，dirty 也不置位——宿主不该看到一步空撤销。
+     * 成功但一个像素都没改（形状/文字与图层不相交、色调笔迹算下来逐字节
+     * 不变）：事务整步撤回，撤销栈不增长，dirty 也不置位——宿主不该看到一步
+     * 空撤销。
      * 若外层持有事务（owns_txn 为假），这里什么都不做，外层自行决定。
      */
     if (deep_paint.active()) target_layer->pixels = std::move(deep_paint.deep);
