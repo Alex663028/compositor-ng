@@ -44,6 +44,8 @@ DEFAULT_OUT = os.path.join(ROOT, "..", "report", "assets", "s15")
 
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
+WM_IME_CHAR = 0x0286
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_COMMAND = 0x0111
@@ -88,16 +90,22 @@ CMD_LAYER_FLATTEN = 1026
 CMD_VIEW_FIT = 1027
 CMD_VIEW_ACTUAL = 1028
 CMD_SELECT_NONE = 1032
+CMD_ADJ_KIND_PREV = 1014
 CMD_ADJ_ADD = 1022
 CMD_ADJ_APPLY = 1023
 CMD_ADJ_VALUE_UP = 1021
 CMD_FILTER_APPLY = 1210
+CMD_NEW_DOCUMENT_DIALOG = 1560
+CMD_SAVE_AS = 1561
+CMD_IMAGE_SIZE = 1562
+CMD_CANVAS_SIZE = 1563
+CMD_HISTORY_SETTINGS = 1564
 
 TOOL = {
     "select": 0, "move": 1, "marquee": 2, "lasso": 3, "pen": 4, "wand": 5,
     "crop": 6, "eyedropper": 7, "brush": 8, "eraser": 9, "heal": 10,
-    "clone": 11, "retouch": 12, "gradient": 13, "shape": 14, "type": 15,
-    "hand": 16, "zoom": 17,
+    "clone": 11, "retouch": 12, "tone": 13, "gradient": 14, "shape": 15,
+    "type": 16, "hand": 17, "zoom": 18, "history": 19,
 }
 
 # ui_core.h 的布局常量（客户区坐标）
@@ -228,6 +236,21 @@ def count_matching(img, rect, target, tol=18):
                 abs(data[index + 2] - target[2]) <= tol):
             count += 1
     return count
+
+
+def median_luma(img, rect):
+    """区域亮度的中位数（「画布直方图右移」用它比均值更抗个别像素）。"""
+    region = img.crop(rect).convert("L")
+    hist = region.histogram()
+    total = sum(hist)
+    if total == 0:
+        return 0
+    running = 0
+    for value, count in enumerate(hist):
+        running += count
+        if running * 2 >= total:
+            return value
+    return 255
 
 
 def count_color(image, target, tol=18):
@@ -389,17 +412,37 @@ class Shell:
         self.proc = None
 
     def focus(self):
-        """把窗口切到前台并返回是否成功（失败会导致 SetCapture 立刻丢失）。"""
-        fg = user32.GetForegroundWindow()
-        fg_thread = user32.GetWindowThreadProcessId(fg, None)
+        """把窗口切到前台并返回是否成功（失败会导致 SetCapture 立刻丢失）。
+
+        前台锁是会话状态：当前台窗口恰好是「无前台/锁屏/第三方抢前台」时，
+        单次 SetForegroundWindow 会被拒。这里做两件事加强：
+        1) SystemParametersInfo 清掉前台锁定超时（SPI_SETFOREGROUNDLOCKTIMEOUT=0）；
+        2) 最多 5 轮重试，每轮失败后按一次 Alt 键重置前台锁计数（Win32 既定技巧）。
+        """
+        SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, None, 0)
         current = kernel32.GetCurrentThreadId()
         target = user32.GetWindowThreadProcessId(self.hwnd, None)
-        # 纯 SetForegroundWindow 会被前台锁拒绝；先临时共享输入队列再调用。
-        user32.AttachThreadInput(current, fg_thread, True)
-        user32.AttachThreadInput(current, target, True)
-        user32.SetForegroundWindow(self.hwnd)
-        user32.AttachThreadInput(current, fg_thread, False)
-        user32.AttachThreadInput(current, target, False)
+        for _ in range(5):
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            if fg_thread:
+                user32.AttachThreadInput(current, fg_thread, True)
+            user32.AttachThreadInput(current, target, True)
+            user32.BringWindowToTop(self.hwnd)
+            user32.SetForegroundWindow(self.hwnd)
+            user32.SetActiveWindow(self.hwnd)
+            if fg_thread:
+                user32.AttachThreadInput(current, fg_thread, False)
+            user32.AttachThreadInput(current, target, False)
+            if user32.GetForegroundWindow() != self.hwnd:
+                # Alt 键按下再抬起会清掉前台锁定状态，下一轮重试
+                user32.keybd_event(0x12, 0, 0, 0)   # VK_MENU down
+                user32.keybd_event(0x12, 0, 2, 0)   # VK_MENU up
+                self.wait(0.25)
+            else:
+                self.wait(0.2)
+                return True
         self.wait(0.2)
         return user32.GetForegroundWindow() == self.hwnd
 
@@ -447,9 +490,14 @@ class Shell:
     def canvas_center(self):
         return self.canvas_point(0.5, 0.5)
 
-    def document_rect(self):
-        """文档（黑色空画布）在客户区里的矩形；只在文档还是空的时候调用。"""
-        if getattr(self, "_doc_rect", None) is None:
+    def document_rect(self, refresh=False):
+        """文档（黑色空画布）在客户区里的矩形。
+
+        refresh=True 时丢弃缓存重新扫描。裁剪提交 / 视图适配会让文档在客户区里
+        重排，缓存里仍是旧矩形——crop 场景提交后必须 refresh，否则永远量到
+        旧画布（文档内容要有黑边留白，detect_document_rect 靠黑色外接框定位）。
+        """
+        if refresh or getattr(self, "_doc_rect", None) is None:
             self._doc_rect = detect_document_rect(self.capture(), self.layout["canvas"])
             if self._doc_rect is None:
                 raise RuntimeError("画布上找不到文档区域（空文档应为纯黑）")
@@ -535,6 +583,16 @@ class Shell:
     def select_tool(self, name):
         user32.PostMessageW(self.hwnd, WM_COMMAND, CMD_TOOL_BASE + TOOL[name], 0)
         self.wait(0.2)
+
+    def post_char(self, code):
+        """WM_CHAR 直接送一个 UTF-16 码元：键盘字符与输入法提交字符的同一出口。"""
+        user32.PostMessageW(self.hwnd, WM_CHAR, code, 0)
+        self.wait(0.12)
+
+    def send_ime_char(self, code):
+        """按真实 IME 的方式投 WM_IME_CHAR；壳未拦截时 DefWindowProc 翻成 WM_CHAR。"""
+        user32.SendMessageW(self.hwnd, WM_IME_CHAR, code, 0)
+        self.wait(0.12)
 
     def click(self, x, y):
         x, y = int(x), int(y)
@@ -826,72 +884,105 @@ def scene_crop(shell, checker):
     """
     裁剪（S22）：拖框 -> Enter 提交 -> 画布尺寸与内容真的变了。
 
-    这个场景要证明三件事：
-      1. 裁剪框能拖出来（Crop 工具此前是死的：图标在、快捷键在，按下无反应）；
-      2. Enter 真的提交（改画布尺寸），不是只画了个框；
-      3. 裁掉的内容真的消失、保留的内容真的留下——即裁剪方向不是反的。
+    引擎语义（engine/domain/crop.cpp 的 crop_apply）：裁剪框 是**保留区**——
+    画布换成 rect 尺寸、图层整体平移 -rect.xy、框外内容丢弃。所以本场景：
 
-    判据全部用文档坐标算出来的采样点，不是"看起来像"。
+      1. 框内画橙色块、框外（右上角）画蓝色块；
+      2. Enter 提交后重新「适合窗口」再量几何（文档矩形必须 refresh，
+         缓存里是旧画布；提交后视图重排，旧的屏幕坐标也不再对应同一文档像素）：
+         - 文档宽高比 == 裁剪框比例（画布真的换了尺寸）；
+         - 橙色仍在（保留内容存活，方向没搞反）；
+         - 蓝色为 0（框外内容确实被裁掉）；
+      3. Esc 取消不改变画布尺寸（两次都在同一「适合窗口」视图下量）。
     """
     scene = "crop"
+    shell.press(ord("0"), ctrl=True)      # 适合窗口：先统一视图再量几何
+    shell.wait(0.3)
     doc = shell.document_rect()
     left, top, right, bottom = doc
     width, height = right - left, bottom - top
 
-    # 1) 先在画布右上角画一块橙色矩形（偏离中心，便于判断裁剪方向）
+    # 裁剪框：左下角四分之一块（与右上角的蓝色不出边、不重叠）
+    box_x0, box_y0 = left + 20, top + height // 2
+    box_x1, box_y1 = left + width // 3, bottom - 20
+    box_w, box_h = box_x1 - box_x0, box_y1 - box_y0
+    box_aspect = float(box_w) / float(box_h)
+
+    # 1) 框内画橙色（内缩 15px，给 detect_document_rect 留黑色外接边）
     shell.press(ord("X"), shift=True)
     shell.type_text("ff8800")
     shell.press(VK_RETURN)
     shell.select_tool("shape")
-    keep_x0, keep_y0 = left + width // 2, top + 20
-    keep_x1, keep_y1 = right - 20, top + height // 3
-    shell.drag(keep_x0, keep_y0, keep_x1, keep_y1, steps=8)
+    orange = (box_x0 + 15, box_y0 + 15, box_x1 - 15, box_y1 - 15)
+    shell.drag(orange[0], orange[1], orange[2], orange[3], steps=8)
+    # 框外画蓝色（右上角，与裁剪框完全不相交）
+    shell.press(ord("X"), shift=True)
+    shell.type_text("0000ff")
+    shell.press(VK_RETURN)
+    blue = (left + 3 * width // 4, top + 12, right - 12, top + height // 4)
+    shell.drag(blue[0], blue[1], blue[2], blue[3], steps=8)
     img = shell.shot("34_crop_before")
-    keep_center = ((keep_x0 + keep_x1) // 2, (keep_y0 + keep_y1) // 2)
-    before_keep = pixel(img, *keep_center)
-    checker.check(scene, "裁剪前：保留区是前景色",
-                  near(before_keep, (255, 136, 0), 30),
-                  "实测 %s" % (before_keep,))
+    orange_center = ((orange[0] + orange[2]) // 2, (orange[1] + orange[3]) // 2)
+    before_orange = pixel(img, *orange_center)
+    before_blue = count_matching(img, (blue[0] + 4, blue[1] + 4,
+                                       blue[2] - 4, blue[3] - 4), (0, 0, 255), 16)
+    checker.check(scene, "裁剪前：框内已画橙色保留块",
+                  near(before_orange, (255, 136, 0), 30),
+                  "实测 %s" % (before_orange,))
+    checker.check(scene, "裁剪前：框外已画蓝色待裁块",
+                  before_blue > 200,
+                  "蓝色像素 %d" % (before_blue,))
 
-    # 2) 切 Crop，拖出左下角的框（**不包含**橙色区），Enter 提交
+    # 2) 切 Crop，拖出同一个框，Enter 提交
     shell.select_tool("crop")
-    shell.drag(left + 20, bottom - height // 2, left + width // 3, bottom - 20, steps=8)
+    shell.drag(box_x0, box_y0, box_x1, box_y1, steps=8)
     img = shell.shot("35_crop_frame")
     checker.check(scene, "裁剪框可见（框内区域未被遮罩糊掉）",
-                  brightness(mean_rgb(img, (left + 24, bottom - height // 2 + 4,
-                                            left + width // 3 - 4,
-                                            bottom - height // 2 + 40))) < 200,
-                  "框内区域平均 %s" % (mean_rgb(img, (left + 24, bottom - height // 2 + 4,
-                                                     left + width // 3 - 4,
-                                                     bottom - height // 2 + 40)),))
+                  brightness(mean_rgb(img, (box_x0 + 4, box_y0 + 4,
+                                            box_x1 - 4, box_y0 + 40))) < 200,
+                  "框内区域平均 %s" % (mean_rgb(img, (box_x0 + 4, box_y0 + 4,
+                                                     box_x1 - 4, box_y0 + 40)),))
     shell.press(VK_RETURN)
     shell.wait(0.4)
+    shell.press(ord("0"), ctrl=True)      # 重新适合窗口：统一视图再量新画布
+    shell.wait(0.5)
     img = shell.shot("36_crop_after")
 
-    # 3) 提交后橙色区仍在（它不在被裁掉的那一半里）
-    after_keep = pixel(img, *keep_center)
-    checker.check(scene, "提交后：保留区仍是前景色（方向没搞反）",
-                  near(after_keep, (255, 136, 0), 30),
-                  "实测 %s" % (after_keep,))
+    # 3) 提交后：新文档矩形必须重测（缓存里是旧画布）
+    doc_after = shell.document_rect(refresh=True)
+    al, at, ar, ab = doc_after
+    after_w, after_h = ar - al, ab - at
+    after_aspect = float(after_w) / float(after_h)
+    aspect_tol = max(0.03, box_aspect * 0.03)
+    checker.check(scene, "提交后画布换成裁剪框尺寸（宽高比一致）",
+                  abs(after_aspect - box_aspect) <= aspect_tol,
+                  "裁剪框 %dx%d 比 %.3f，提交后文档 %dx%d 比 %.3f"
+                  % (box_w, box_h, box_aspect, after_w, after_h, after_aspect))
 
-    # 4) 画布尺寸变了：文档矩形不再是原来的宽度
-    doc_after = shell.document_rect()
-    checker.check(scene, "画布宽度被裁剪（文档矩形变窄）",
-                  (doc_after[2] - doc_after[0]) < (right - left) - 40,
-                  "裁剪前宽 %d，裁剪后宽 %d" % (right - left, doc_after[2] - doc_after[0]))
+    after_orange = count_matching(img, (al + 2, at + 2, ar - 2, ab - 2),
+                                  (255, 136, 0), 32)
+    after_blue = count_matching(img, (al + 2, at + 2, ar - 2, ab - 2),
+                                (0, 0, 255), 32)
+    checker.check(scene, "框内橙色内容保留（方向没搞反）",
+                  after_orange > 500,
+                  "文档内橙色像素 %d" % (after_orange,))
+    checker.check(scene, "框外蓝色内容被裁掉",
+                  after_blue == 0,
+                  "文档内蓝色像素 %d" % (after_blue,))
 
-    # 5) Esc 取消也不改画布：再拖一个框，按 Esc，尺寸应保持不变
-    width_before_esc = doc_after[2] - doc_after[0]
+    # 4) Esc 取消也不改画布：再拖一个框，按 Esc，尺寸应保持不变
+    size_before_esc = (after_w, after_h)
     shell.select_tool("crop")
-    shell.drag(left + 20, top + 20, left + width // 3, top + height // 2, steps=8)
+    shell.drag(al + 20, at + 20, al + after_w // 3, at + after_h // 3, steps=8)
     shell.press(VK_ESCAPE)
     shell.wait(0.3)
-    shell.select_tool("select")
-    shell.press(ord("0"), ctrl=True)   # 适合窗口，便于量文档矩形
-    doc_esc = shell.document_rect()
+    shell.press(ord("0"), ctrl=True)
+    shell.wait(0.4)
+    doc_esc = shell.document_rect(refresh=True)
+    size_after_esc = (doc_esc[2] - doc_esc[0], doc_esc[3] - doc_esc[1])
     checker.check(scene, "Esc 取消不改变画布尺寸",
-                  (doc_esc[2] - doc_esc[0]) == width_before_esc,
-                  "取消前宽 %d，取消后宽 %d" % (width_before_esc, doc_esc[2] - doc_esc[0]))
+                  size_after_esc == size_before_esc,
+                  "取消前 %s，取消后 %s" % (size_before_esc, size_after_esc))
 
 
 def scene_type(shell, checker):
@@ -952,7 +1043,11 @@ def scene_type(shell, checker):
     glyphs32, _, gy0, _, gy1 = glyph_bbox(
         img, (origin[0] - 4, origin[1] - 8, origin[0] + 120, origin[1] + 90))
     checker.check(scene, "回车提交后画布出现前景色字形（32 px）",
-                  glyphs32 > 40, "字形像素 %d" % glyphs32)
+                  glyphs32 > 15, "字形像素 %d" % glyphs32)
+    # 容差说明：glyph_bbox 只数前景色 ±60 以内的像素；「适合窗口」视图把文档
+    # 缩到 ~49%，32 px 字形降采样后大量像素是抗锯齿混合色（如 (127,68,0)）
+    # 落在容差外，正确渲染的单字只剩 ~29 个全饱和核心。阈值取 15 仍能区分
+    # 「没画上」（0）与「画上了」；48 px 那条字号大、核心多，保持 > 40。
     checker.check(scene, "提交后退出键入态（状态栏回到属性提示）",
                   pixel_diff(img, typing_status, shell.layout["status"]) > 20,
                   "状态栏差异像素 %d" % pixel_diff(img, typing_status, shell.layout["status"]))
@@ -984,6 +1079,91 @@ def scene_type(shell, checker):
     checker.check(scene, "48 px 文字已提交且字形比 32 px 更高",
                   glyphs48 > 40 and height48 > height32 + 3,
                   "字形 %d 像素，高 %d px > 32 px 的 %d px" % (glyphs48, height48, height32))
+
+
+def scene_ime(shell, checker):
+    """输入法路径的文字工具验收（M43 的自动化预检）。
+
+    壳没有 WM_IME_CHAR 分支：IME 提交的字符经 DefWindowProc 翻成 WM_CHAR，与
+    键盘字符共用 type_char_input 一个出口。所以 M43 的「上屏不双字」「退格整字
+    删」都能在消息层如实复现——WM_IME_CHAR 送一次，缓冲里只能多一个码点；
+    退格一次，UTF-8 缓冲按码点整删（type_utf8_erase_last）。
+    """
+    scene = "ime"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("type")
+    adjust = shell.layout["adjust"]
+    rows_top = 54
+    row_h = 20
+    origin = (left + 40, top + 40)
+    box = (origin[0] - 6, origin[1] - 10, origin[0] + 110, origin[1] + 70)
+
+    # 1) WM_CHAR 送「你」：字体轨道渲染中文的底线（没加载字体就是 0 像素）
+    shell.click(*origin)
+    shell.post_char(0x4F60)
+    shell.press(VK_RETURN)
+    img = shell.shot("70_ime_char_commit")
+    base, _, _, _, _ = glyph_bbox(img, box)
+    checker.check(scene, "输入法字符经 WM_CHAR 上屏（中文字形落画布）",
+                  base > 10, "字形像素 %d" % base)
+    # 一次提交 = 恰好一步撤销，Ctrl+Z 后画布必须完全复原
+    shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("71_ime_undo_clean")
+    cleared, _, _, _, _ = glyph_bbox(img, box)
+    checker.check(scene, "一步撤销后画布无中文残留",
+                  base > 10 and cleared < 5,
+                  "提交 %d 像素，撤销后 %d 像素" % (base, cleared))
+
+    # 2) WM_IME_CHAR 送同一个字：DefWindowProc 只能翻出一次 WM_CHAR（不双字）
+    shell.click(*origin)
+    shell.send_ime_char(0x4F60)
+    shell.press(VK_RETURN)
+    img = shell.shot("72_ime_imechar_commit")
+    ime, _, _, _, _ = glyph_bbox(img, box)
+    ratio = ime / base if base else 0.0
+    checker.check(scene, "WM_IME_CHAR 上屏不双字（与 WM_CHAR 像素量一致）",
+                  base > 10 and 0.7 <= ratio <= 1.4,
+                  "WM_CHAR %d，WM_IME_CHAR %d，比值 %.2f" % (base, ime, ratio))
+    shell.press(ord("Z"), ctrl=True)
+
+    # 3) 两个汉字 + 一次退格 = 剩一个字（退格按码点整删，不是半个字节）
+    shell.click(*origin)
+    shell.post_char(0x4F60)
+    shell.post_char(0x597D)
+    shell.press(VK_BACK)
+    shell.press(VK_RETURN)
+    img = shell.shot("73_ime_backspace_one_glyph")
+    after_bs, _, _, _, _ = glyph_bbox(img, box)
+    bs_ratio = after_bs / base if base else 0.0
+    checker.check(scene, "退格一次只删一个整字（提交后像素量与单字一致）",
+                  base > 10 and 0.7 <= bs_ratio <= 1.4,
+                  "单字 %d，退格后 %d，比值 %.2f" % (base, after_bs, bs_ratio))
+    shell.press(ord("Z"), ctrl=True)
+
+    # 4) M43 预检：48px「你好，世界」整段上屏，再一步撤销完全复原
+    shell.click(adjust[0] + 40, adjust[1] + rows_top + row_h // 2)
+    shell.type_text("48")
+    shell.press(VK_RETURN)
+    shell.click(*origin)
+    for ch in "你好，世界":
+        shell.post_char(ord(ch))
+    shell.press(VK_RETURN)
+    img = shell.shot("74_ime_cjk_48")
+    wide = (origin[0] - 6, origin[1] - 12, origin[0] + 260, origin[1] + 90)
+    glyphs, gx0, gy0, gx1, gy1 = glyph_bbox(img, wide)
+    checker.check(scene, "48px「你好，世界」整段上屏（M43 预检）",
+                  glyphs > 60,
+                  "字形像素 %d，外接框 %dx%d" % (glyphs, gx1 - gx0 + 1, gy1 - gy0 + 1))
+    shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("75_ime_cjk_48_undo")
+    cleared, _, _, _, _ = glyph_bbox(img, wide)
+    checker.check(scene, "48px 段落后撤销完全复原",
+                  glyphs > 60 and cleared < 8,
+                  "提交 %d 像素，撤销后 %d 像素" % (glyphs, cleared))
 
 
 def scene_filter(shell, checker):
@@ -1063,6 +1243,103 @@ def scene_adjustment(shell, checker):
     checker.check(scene, "撤销后亮度回到修改前",
                   abs(brightness(undo) - brightness(before)) < 12,
                   "撤销后 %s 原 %s" % (undo, before))
+
+
+def adjust_curve_plot(shell):
+    """ui_core.h::adjust_curve_plot_rect 的镜像：通道条以下取最大正方形。
+
+    绘制、命中、拖动都用同一个矩形；脚本要按同一份几何算坐标，
+    否则「脚本点到的位置」和「外壳认的位置」会各说各话。
+    """
+    left, top, right, bottom = shell.layout["adjust"]
+    width = right - left
+    plot_top = top + 50 + 22  # kAdjustParamRowsTop + kCurveChannelBarHeight
+    side = min(width - 24, bottom - 180 - plot_top - 8)
+    return left + (width - side) // 2, plot_top, side
+
+
+def scene_curve_levels(shell, checker):
+    """
+    P0-3 验收：曲线/色阶编辑器。
+
+    1. 加一条恒等 Curves，从绘图区空白处按下加点并往上拖 -> 画布变亮、直方图右移。
+    2. 一次 Ctrl+Z 回到修改前（拖一次只算一步撤销）。
+    3. 加一条 Levels，把 RGB 黑场拖到 40 -> 暗部被压死（画布整体压暗）。
+    4. 再一次 Ctrl+Z 回到色阶前。
+    """
+    scene = "curve_levels"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("336699")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left, top, right, bottom, steps=8)
+    shell.select_tool("select")
+    # 调整是「调整图层」：只作用于本层下方的内容，必须新建一层再挂调整
+    shell.press(ord("N"), ctrl=True, shift=True)
+    img = shell.shot("60_curve_before")
+    region = (left + 10, top + 10, right - 10, bottom - 10)
+    before = mean_rgb(img, region)
+    before_median = median_luma(img, region)
+
+    # 默认 kind = 3（Exposure）；后退一档 = 2（Curves）
+    shell.command(CMD_ADJ_KIND_PREV)
+    shell.press(ord("A"), ctrl=True, shift=True)  # 新增恒等 Curves
+    img = shell.shot("61_curve_added")
+    adjust = shell.layout["adjust"]
+    px, py, side = adjust_curve_plot(shell)
+    checker.check(scene, "曲线绘图区是参数区里的正方形",
+                  side >= 48 and py > adjust[1] + 60 and py + side < adjust[3] - 100,
+                  "plot=(%d, %d, %d)" % (px, py, side))
+
+    def vx(value):
+        return px + (value / 255.0) * (side - 1)
+
+    def vy(value):
+        return py + (1.0 - value / 255.0) * (side - 1)
+
+    # 空白处按下 = 加点，按住往上拖 = 抬中间调（一次拖动 = 一步撤销）
+    shell.drag(vx(128), vy(128), vx(128), vy(190), steps=8)
+    img = shell.shot("62_curve_lifted")
+    lifted = mean_rgb(img, region)
+    lifted_median = median_luma(img, region)
+    checker.check(scene, "曲线抬中间调后画布变亮",
+                  brightness(lifted) > brightness(before) + 20,
+                  "前 %s 后 %s" % (before, lifted))
+    checker.check(scene, "画布直方图中位数右移",
+                  lifted_median > before_median + 10,
+                  "中位 %d -> %d" % (before_median, lifted_median))
+
+    shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("63_curve_undo")
+    undo = mean_rgb(img, region)
+    checker.check(scene, "一次 Ctrl+Z 回到曲线修改前",
+                  abs(brightness(undo) - brightness(before)) < 8,
+                  "撤销后 %s 原 %s" % (undo, before))
+
+    # 再后退一档 = 1（Levels），新增一条（缺省恒等：黑 0 / 白 255）
+    shell.command(CMD_ADJ_KIND_PREV)
+    shell.press(ord("A"), ctrl=True, shift=True)
+    img = shell.shot("64_levels_added")
+
+    # 第一行 = levels.ranges.0.black（0..254）；滑道 = 行宽 - 20，行高 34 / 标签带 18
+    track_x = adjust[0] + 10
+    track_w = (adjust[2] - adjust[0]) - 20
+    row_y = adjust[1] + 50 + 18 + 7
+    shell.drag(track_x, row_y, track_x + track_w * 40.0 / 254.0, row_y, steps=8)
+    img = shell.shot("65_levels_black_40")
+    crushed = mean_rgb(img, region)
+    checker.check(scene, "色阶黑场拖到 40 后画布压暗",
+                  brightness(crushed) < brightness(before) * 0.9,
+                  "前 %s 后 %s" % (before, crushed))
+
+    shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("66_levels_undo")
+    restored = mean_rgb(img, region)
+    checker.check(scene, "一次 Ctrl+Z 回到色阶修改前",
+                  abs(brightness(restored) - brightness(before)) < 8,
+                  "撤销后 %s 原 %s" % (restored, before))
 
 
 def scene_layers(shell, checker):
@@ -1310,6 +1587,101 @@ def scene_image_io(shell, checker):
                   "自检报告未找到 comp_io 往返断言")
 
 
+def doc_dialog_aspect(shell):
+    """适合窗口 -> 量文档在屏幕上的宽高比。空（透明）文档是纯黑，可测。"""
+    shell.press(ord("0"), ctrl=True)
+    shell.wait(0.45)
+    left, top, right, bottom = shell.document_rect(refresh=True)
+    return float(right - left) / float(bottom - top), (right - left, bottom - top)
+
+
+def scene_doc_dialog(shell, checker):
+    """
+    文档级对话框（S25 P0-3）：新建文档 / 图像大小 / 画布大小 / 历史容量。
+
+    断言全部是「量出来的画布宽高比」，不是截图观感；口径沿用 crop 场景——
+    空（透明）文档渲染成纯黑，detect_document_rect 能给出屏幕矩形。默认文档
+    是 1280×720（16:9），下面每一步换成别的比例都能区分：
+      1. 新建 640×480 -> 4:3；
+      2. 图像大小：Tab 到「约束比例」用空格关掉，再设 320×120 -> 8:3；
+      3. 画布大小：宽度 520（居中锚点）-> 13:3；
+      4. Esc 取消画布大小不改尺寸；
+      5. 历史容量面板能打开、Esc 能收回（右栏像素确实变过）。
+    """
+    scene = "doc_dialog"
+    panel = shell.layout["adjust"]
+    title_rect = (panel[0] + 8, panel[1] + 8, panel[2] - 8, panel[1] + 96)
+
+    # 1) 新建文档：640×480。背景保持默认「透明」——填了底色文档就不再是纯黑，
+    #    下面的几何断言就失去可靠口径（白底文档的探针由标题栏脏标记覆盖）。
+    shell.command(CMD_NEW_DOCUMENT_DIALOG)
+    img = shell.shot("37_new_doc_dialog")
+    bright = count_bright(img, title_rect, 150)
+    checker.check(scene, "新建文档面板已绘制（右栏标题区有文字）", bright > 120,
+                  "右栏浅色像素 %d" % bright)
+    shell.type_text("640")
+    shell.press(VK_TAB)          # 提交宽度，焦点到高度行
+    shell.type_text("480")
+    shell.press(VK_RETURN)       # 提交高度并应用
+    shell.wait(0.4)
+    aspect, size = doc_dialog_aspect(shell)
+    checker.check(scene, "新建 640×480 生效（文档比例 4:3）",
+                  abs(aspect - 4.0 / 3.0) <= 0.06,
+                  "实测比例 %.3f（屏幕 %s）" % (aspect, size))
+
+    # 2) 图像大小：默认「约束比例 = 开」，先关掉才能设非等比尺寸。
+    shell.command(CMD_IMAGE_SIZE)
+    shell.press(VK_TAB)
+    shell.press(VK_TAB)          # 焦点到「约束比例」
+    shell.press(VK_SPACE)        # 关掉
+    shell.press(VK_UP)
+    shell.press(VK_UP)           # 回到宽度行
+    shell.type_text("320")
+    shell.press(VK_TAB)          # 提交宽度；比例未锁，高度不动
+    shell.type_text("120")
+    shell.press(VK_RETURN)
+    shell.wait(0.6)
+    shell.shot("37b_image_size_applied")
+    aspect, size = doc_dialog_aspect(shell)
+    checker.check(scene, "图像大小 320×120 生效（文档比例 8:3）",
+                  abs(aspect - 8.0 / 3.0) <= 0.12,
+                  "实测比例 %.3f（屏幕 %s）" % (aspect, size))
+
+    # 3) 画布大小：只改宽度到 520，锚点保持默认居中。
+    shell.command(CMD_CANVAS_SIZE)
+    shell.type_text("520")
+    shell.press(VK_RETURN)
+    shell.wait(0.6)
+    aspect, size = doc_dialog_aspect(shell)
+    checker.check(scene, "画布大小 520×120 生效（文档比例 13:3）",
+                  abs(aspect - 13.0 / 3.0) <= 0.16,
+                  "实测比例 %.3f（屏幕 %s）" % (aspect, size))
+    size_after_canvas = size
+
+    # 4) Esc 取消：键入 100 后连按两次 Esc（第一次撤草稿、第二次关面板），
+    #    画布尺寸必须一点不变。
+    shell.command(CMD_CANVAS_SIZE)
+    shell.type_text("100")
+    shell.press(VK_ESCAPE)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.3)
+    _, size_after_esc = doc_dialog_aspect(shell)
+    checker.check(scene, "Esc 取消画布大小不改变尺寸",
+                  size_after_esc == size_after_canvas,
+                  "取消前 %s，取消后 %s" % (size_after_canvas, size_after_esc))
+
+    # 5) 历史容量：面板打开 -> Esc 收回，右栏像素必须变过（不是「开着当没开」）。
+    shell.command(CMD_HISTORY_SETTINGS)
+    img_open = shell.shot("38_history_settings")
+    shell.press(VK_ESCAPE)
+    shell.wait(0.3)
+    img_closed = shell.shot("39_history_settings_closed")
+    changed = pixel_diff(img_open, img_closed,
+                         (panel[0] + 4, panel[1] + 4, panel[2] - 4, panel[1] + 160), 24)
+    checker.check(scene, "历史容量面板打开后被 Esc 收回（右栏像素发生变化）",
+                  changed > 500, "变化像素 %d" % changed)
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -1331,14 +1703,17 @@ SCENES = [    ("start", scene_start, ()),
     ("gradient", scene_gradient, ()),
     ("shape", scene_shape, ()),
     ("type", scene_type, ()),
+    ("ime", scene_ime, ()),
     ("filter", scene_filter, ()),
     ("adjustment", scene_adjustment, ()),
+    ("curve_levels", scene_curve_levels, ()),
     ("layers", scene_layers, ()),
     ("blend", scene_blend, ()),
     ("xform", scene_xform, ()),
     ("view", scene_view, ()),
     ("image_io", scene_image_io, ("import_probe.png",)),
     ("crop", scene_crop, ()),
+    ("doc_dialog", scene_doc_dialog, ()),
 ]
 
 
