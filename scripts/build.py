@@ -59,6 +59,38 @@ for _vendor in ("zlib", "libpng", "stb"):
     if os.path.isdir(_vendor_path):
         INCLUDE_DIRS.append(_vendor_path)
 
+# FreeType（P5-0）。裁剪版目录结构与上游一致，包含根是 <root>/include 而不是 <root>，
+# 所以不能走上面那条 vendor 规则。
+FREETYPE_ROOT = os.path.join(ENGINE, "third_party", "freetype")
+FREETYPE_INCLUDE = os.path.join(FREETYPE_ROOT, "include")
+
+# **只编译聚合翻译单元。** 每个模块目录里除聚合文件外的 .c 都被聚合文件 #include
+# （如 src/truetype/truetype.c 包含 ttobjs.c），若 glob 再单独编译它们就会重复定义。
+# 因此 collect_sources() 把 third_party/freetype 从 engine/**/*.c 的 glob 里排除，
+# 再追加下面这张显式清单。CMake 与 build_ohos.sh 必须保持同一份清单；
+# 详见 engine/third_party/freetype/VENDOR-NOTES.md。
+FREETYPE_SOURCES = [
+    "src/base/ftsystem.c",
+    "src/base/ftinit.c",
+    "src/base/ftdebug.c",
+    "src/base/ftbase.c",
+    "src/base/ftbbox.c",
+    "src/base/ftglyph.c",
+    "src/base/ftbitmap.c",
+    # TrueType GX/可变字体默认开启，sfnt 会调用 FT_Set_Named_Instance。
+    "src/base/ftmm.c",
+    "src/sfnt/sfnt.c",
+    "src/truetype/truetype.c",
+    "src/cff/cff.c",
+    "src/psaux/psaux.c",
+    "src/pshinter/pshinter.c",
+    "src/psnames/psnames.c",
+    "src/smooth/smooth.c",
+]
+
+if os.path.isdir(FREETYPE_INCLUDE):
+    INCLUDE_DIRS.append(FREETYPE_INCLUDE)
+
 # C 侧必须带 -fblocks：engine/imaging/*.c 沿用原 macOS 工程的 clang block 语法（^）
 # 作为区间回调；非 Apple 平台的 BlocksRuntime 由 engine/core/comp_blocks_rt.c 提供。
 # -std=gnu11 而非 c11：内核用到 M_PI 等 GNU/BSD 扩展宏（严格 ANSI 模式下不可见）。
@@ -95,8 +127,18 @@ def resolve_toolchain(driver: str) -> tuple[list[str], list[str], list[str]]:
     return zig_prefix() + ["cc"], zig_prefix() + ["c++"], zig_prefix() + ["c++"]
 
 
+def _is_freetype_source(path: str) -> bool:
+    root = os.path.normcase(os.path.abspath(FREETYPE_ROOT)) + os.sep
+    return os.path.normcase(os.path.abspath(path)).startswith(root)
+
+
 def collect_sources() -> tuple[list[str], list[str], list[str]]:
-    c_sources = sorted(glob.glob(os.path.join(ENGINE, "**", "*.c"), recursive=True))
+    c_sources = [path for path in
+                 sorted(glob.glob(os.path.join(ENGINE, "**", "*.c"), recursive=True))
+                 if not _is_freetype_source(path)]
+    if os.path.isdir(FREETYPE_ROOT):
+        c_sources.extend(os.path.join(FREETYPE_ROOT, name) for name in FREETYPE_SOURCES)
+        c_sources.sort()
     cxx_sources = sorted(glob.glob(os.path.join(ENGINE, "**", "*.cpp"), recursive=True))
     test_sources = sorted(glob.glob(os.path.join(TESTS, "*.cpp")))
     return c_sources, cxx_sources, test_sources
@@ -192,11 +234,16 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
 
     for source in c_sources:
         obj = obj_path(source, driver, shared, gpu)
+        # FreeType 的 fterrors.h 在未定义 FT2_BUILD_LIBRARY 时会 #undef FT_ERR_PREFIX，
+        # 于是库内部 FT_ERR(x) 拼不出 FT_Err_ 前缀（上游 autotools 正是靠这个宏编库）。
+        extra = ["-DFT2_BUILD_LIBRARY"] if _is_freetype_source(source) else []
         if msvc:
             cmd = cc + ["/nologo", "/c", "/O2", "/utf-8", "/TC", source, f"/Fo{obj}"] + \
                   [f"/I{path}" for path in INCLUDE_DIRS] + msvc_defines
+            if extra:
+                cmd.append("/DFT2_BUILD_LIBRARY")
         else:
-            cmd = cc + ["-c", source, "-o", obj] + C_FLAGS + includes_c + defines
+            cmd = cc + ["-c", source, "-o", obj] + C_FLAGS + includes_c + defines + extra
         run(cmd)
         objects.append(obj)
 

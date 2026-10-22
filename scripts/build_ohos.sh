@@ -75,6 +75,18 @@ DEFINES=""
 # 应把 third_party 加入下面的包含路径并确认 zlib/libpng 能过 OHOS 交叉编译后一并开启。
 CPPFLAGS="-I$ROOT/engine -I$ROOT/engine/abi/include -I$ROOT/engine/abi/src"
 
+# FreeType（P5-0）：与 build.py / CMakeLists.txt 同一份「聚合翻译单元」清单。
+# 目录中的其余 .c 被聚合文件 #include，不能再单独编译；下面的 find 必须排除整棵树。
+# 裁剪说明见 engine/third_party/freetype/VENDOR-NOTES.md。
+FT_ROOT="engine/third_party/freetype"
+FT_SOURCES="src/base/ftsystem.c src/base/ftinit.c src/base/ftdebug.c \
+src/base/ftbase.c src/base/ftbbox.c src/base/ftglyph.c src/base/ftbitmap.c src/base/ftmm.c \
+src/sfnt/sfnt.c src/truetype/truetype.c src/cff/cff.c src/psaux/psaux.c \
+src/pshinter/pshinter.c src/psnames/psnames.c src/smooth/smooth.c"
+if [ -d "$ROOT/$FT_ROOT/include" ]; then
+  CPPFLAGS="$CPPFLAGS -I$ROOT/$FT_ROOT/include"
+fi
+
 echo "[ohos] target=$TARGET"
 echo "[ohos] sysroot=$SYSROOT"
 echo "[ohos] out=$OUT"
@@ -83,7 +95,7 @@ ok=0
 fail=0
 failed_list=""
 
-for src in $(cd "$ROOT" && find engine -name "*.c" | sort); do
+for src in $(cd "$ROOT" && find engine -name "*.c" ! -path "$FT_ROOT/*" | sort); do
   obj="$OUT/$(echo "$src" | tr '/' '_').o"
   if "$CC" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=gnu11 -O2 -fblocks $DEFINES \
         -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
@@ -92,6 +104,20 @@ for src in $(cd "$ROOT" && find engine -name "*.c" | sort); do
     fail=$((fail + 1)); failed_list="$failed_list $src"
   fi
 done
+
+if [ -d "$ROOT/$FT_ROOT" ]; then
+  for ft in $FT_SOURCES; do
+    src="$FT_ROOT/$ft"
+    obj="$OUT/$(echo "$src" | tr '/' '_').o"
+    # -DFT2_BUILD_LIBRARY：fterrors.h 在没有它时会 #undef FT_ERR_PREFIX（上游编库口径）。
+    if "$CC" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=gnu11 -O2 -fblocks \
+          -DFT2_BUILD_LIBRARY $DEFINES -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
+      ok=$((ok + 1))
+    else
+      fail=$((fail + 1)); failed_list="$failed_list $src"
+    fi
+  done
+fi
 
 for src in $(cd "$ROOT" && find engine -name "*.cpp" | sort); do
   obj="$OUT/$(echo "$src" | tr '/' '_').o"

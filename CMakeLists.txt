@@ -60,7 +60,27 @@ if(APPLE)
   list(FILTER COMP_ENGINE_C EXCLUDE REGEX "comp_blocks_rt\\.c$")
 endif()
 
-add_library(compositor_engine STATIC ${COMP_ENGINE_CXX} ${COMP_ENGINE_C})
+# FreeType（P5-0）：裁剪版只编译 14 个聚合翻译单元。glob 必须排除
+# third_party/freetype —— 模块目录里其余 .c 已被聚合文件 #include（如 truetype.c
+# 包含 ttobjs.c），再单独编译就是重复符号。清单与 scripts/build.py 的
+# FREETYPE_SOURCES、build_ohos.sh 是同一份，改一处必须同步三处。
+# 详见 engine/third_party/freetype/VENDOR-NOTES.md。
+set(COMP_FREETYPE_ROOT "${COMP_ENGINE_ROOT}/third_party/freetype")
+set(COMP_FREETYPE_SOURCES "")
+if(IS_DIRECTORY "${COMP_FREETYPE_ROOT}")
+  list(FILTER COMP_ENGINE_C EXCLUDE REGEX "third_party/freetype/")
+  foreach(_ft_src
+      src/base/ftsystem.c src/base/ftinit.c src/base/ftdebug.c
+      src/base/ftbase.c src/base/ftbbox.c src/base/ftglyph.c src/base/ftbitmap.c
+      src/base/ftmm.c
+      src/sfnt/sfnt.c src/truetype/truetype.c
+      src/cff/cff.c src/psaux/psaux.c src/pshinter/pshinter.c
+      src/psnames/psnames.c src/smooth/smooth.c)
+    list(APPEND COMP_FREETYPE_SOURCES "${COMP_FREETYPE_ROOT}/${_ft_src}")
+  endforeach()
+endif()
+
+add_library(compositor_engine STATIC ${COMP_ENGINE_CXX} ${COMP_ENGINE_C} ${COMP_FREETYPE_SOURCES})
 
 target_include_directories(compositor_engine
   PUBLIC
@@ -79,7 +99,24 @@ foreach(_vendor zlib libpng stb)
     list(APPEND COMP_VENDOR_INCLUDE_DIRS "${COMP_ENGINE_ROOT}/third_party/${_vendor}")
   endif()
 endforeach()
+# FreeType 的包含根是 <root>/include（上游 INSTALL.ANY 口径），不是 <root>。
+if(IS_DIRECTORY "${COMP_FREETYPE_ROOT}/include")
+  list(APPEND COMP_VENDOR_INCLUDE_DIRS "${COMP_FREETYPE_ROOT}/include")
+endif()
 target_include_directories(compositor_engine PRIVATE ${COMP_VENDOR_INCLUDE_DIRS})
+
+# 第三方源码不参与本仓的 -Wall -Wextra 基线：告警只应来自我们自己的代码，
+# 否则「零新增告警」会被上游的写法淹没。build.py 的 C 编译本来不开 -Wall。
+if(COMP_FREETYPE_SOURCES)
+  if(MSVC)
+    set_source_files_properties(${COMP_FREETYPE_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
+  else()
+    set_source_files_properties(${COMP_FREETYPE_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+  endif()
+  # 上游编库必须的宏：fterrors.h 在未定义它时会 #undef FT_ERR_PREFIX。
+  set_source_files_properties(${COMP_FREETYPE_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "FT2_BUILD_LIBRARY")
+endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(compositor_engine PUBLIC Threads::Threads)
