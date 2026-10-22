@@ -18,11 +18,16 @@
 #include "engine.h"
 
 namespace compositor {
+
+class FontFace;
+
 namespace abi {
 
 /* 句柄 <-> 内部类型转换。 */
 Engine* as_engine(comp_engine handle);
 Document* as_document(comp_document handle);
+/* 字体句柄（P5-1）：与 Engine/Document 同一套 magic 校验。 */
+FontFace* as_font(comp_font handle);
 
 /* 校验句柄；失败返回 COMP_ERR_INVALID_ARGUMENT。 */
 comp_result guard_document(comp_document handle, Document** out_document, Engine** out_engine);

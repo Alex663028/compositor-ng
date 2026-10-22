@@ -15,6 +15,7 @@ namespace compositor {
 
 constexpr uint32_t kEngineMagic = 0x454E4749u;   /* "ENGI" */
 constexpr uint32_t kDocumentMagic = 0x444F4355u; /* "DOCU" */
+constexpr uint32_t kFontMagic = 0x464F4E54u;     /* "FONT"（P5-1 字体句柄） */
 constexpr uint32_t kHandlePoisoned = 0xDEADBEEFu;
 
 }  // namespace compositor

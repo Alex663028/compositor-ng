@@ -69,6 +69,8 @@ enum {
 typedef struct comp_engine_handle*   comp_engine;
 typedef struct comp_document_handle* comp_document;
 typedef struct comp_txn_handle*      comp_txn;
+/* 字体句柄（P5-1）：独立于引擎存在，由 comp_font_load_* 创建、comp_font_release 释放。 */
+typedef struct comp_font_handle*     comp_font;
 
 /* 图层标识：0 表示无效。取值稳定，写入 .comp 后不得复用。 */
 typedef uint64_t comp_layer_id;
