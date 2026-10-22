@@ -1749,6 +1749,76 @@ def scene_camera_raw(shell, checker):
                   "曝光后 %s 原 %s" % (darker, before))
 
 
+def scene_clipboard(shell, checker):
+    """
+    P0-4 剪贴板：拷贝 -> 清除 -> 贴入选区 -> 撤销 -> 普通粘贴。
+
+    为什么先铺满一块橙色再清除：清除后画布回到黑（空图层），之后任何橙色都只能
+    来自剪贴板，「往返内容一致」才被截图证实，而不是靠状态栏文字。贴入选区单独
+    验一次落点与蒙版：橙色只出现在选区里，右半必须还是黑。
+    """
+    scene = "clipboard"
+    left, top, right, bottom = shell.document_rect()
+    mid_x = (left + right) // 2
+    mid_y = (top + bottom) // 2
+
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left + 20, top + 20, right - 20, bottom - 20, steps=10)
+    img = shell.shot("80_clipboard_source")
+    checker.check(scene, "前置：画布铺满橙色矩形",
+                  near(pixel(img, mid_x, mid_y), (255, 136, 0), 40),
+                  "实测 %s" % (pixel(img, mid_x, mid_y),))
+
+    # 无选区时 Ctrl+C 拷整层，Backspace 清空整层
+    shell.press(ord("C"), ctrl=True)
+    shell.press(VK_BACK)
+    shell.wait(0.2)
+    img = shell.shot("81_clipboard_cleared")
+    checker.check(scene, "Backspace 清除后画布回到黑（图层已清空）",
+                  near(pixel(img, mid_x, mid_y), (0, 0, 0), 10),
+                  "实测 %s" % (pixel(img, mid_x, mid_y),))
+
+    # 选左半区，Ctrl+Alt+V 贴入：只在选区内出现橙色
+    shell.select_tool("marquee")
+    shell.drag(left + 20, top + 20, mid_x - 20, bottom - 20, steps=10)
+    shell.press(ord("V"), ctrl=True, alt=True)
+    shell.wait(0.3)
+    img = shell.shot("82_clipboard_paste_into")
+    inside = pixel(img, mid_x - 40, mid_y)
+    outside = pixel(img, mid_x + 60, mid_y)
+    checker.check(scene, "贴入选区：选区内橙色、选区外仍是黑",
+                  near(inside, (255, 136, 0), 40) and near(outside, (0, 0, 0), 10),
+                  "内 %s 外 %s" % (inside, outside))
+
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.2)
+    img = shell.shot("83_clipboard_undo_into")
+    checker.check(scene, "Ctrl+Z 一步撤销贴入（整幅回到黑）",
+                  near(pixel(img, mid_x - 40, mid_y), (0, 0, 0), 10),
+                  "实测 %s" % (pixel(img, mid_x - 40, mid_y),))
+
+    # 取消选区后 Ctrl+V：按剪贴板记下的落点铺回去（左右都应是橙色）
+    shell.press(ord("D"), ctrl=True)
+    shell.press(ord("V"), ctrl=True)
+    shell.wait(0.3)
+    img = shell.shot("84_clipboard_paste")
+    left_px = pixel(img, mid_x - 40, mid_y)
+    right_px = pixel(img, mid_x + 60, mid_y)
+    checker.check(scene, "Ctrl+V 粘贴回原落点（左右两半都是橙）",
+                  near(left_px, (255, 136, 0), 40) and near(right_px, (255, 136, 0), 40),
+                  "左 %s 右 %s" % (left_px, right_px))
+
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.2)
+    img = shell.shot("85_clipboard_undo_paste")
+    checker.check(scene, "Ctrl+Z 一步撤销粘贴（画布回到黑）",
+                  near(pixel(img, mid_x, mid_y), (0, 0, 0), 10),
+                  "实测 %s" % (pixel(img, mid_x, mid_y),))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -1782,6 +1852,7 @@ SCENES = [    ("start", scene_start, ()),
     ("crop", scene_crop, ()),
     ("doc_dialog", scene_doc_dialog, ()),
     ("camera_raw", scene_camera_raw, ()),
+    ("clipboard", scene_clipboard, ()),
 ]
 
 

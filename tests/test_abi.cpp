@@ -1546,6 +1546,191 @@ COMP_TEST(abi_layer_get_mask_reports_presence_and_size) {
 }
 
 /*
+ * comp_layer_get_pixels（P0-4，ABI 尾部追加 145 -> 146）的读侧契约。
+ *
+ * 为什么需要它：剪贴板复制/剪切、删除选区内像素都要先**看到**图层当前像素，
+ * 再做「读—改—写」。`comp_render_layer_thumbnail` 看起来能读，但那条路输出的是
+ * 画布坐标下的单层合成（transform/蒙版/效果/透明度全部烘进去），拿它回写等于
+ * 把这些东西烤死进像素。本入口读的是图层**原始资产**，与之严格分工。
+ *
+ * 这里钉四件事：逐字节往返、步长/出参校验、空图层与组不是错误、只读不置脏；
+ * 16 位与 HDR 的降位口径由 deep_to_rgba8 / hdr_to_rgba8 的既有测试覆盖，
+ * 本处只钉「out_format 回报原始格式」——宿主靠它决定能不能无损写回。
+ */
+COMP_TEST(abi_layer_get_pixels_reads_raw_layer_asset) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  COMP_CHECK_MSG(engine != nullptr, "engine");
+  if (engine == nullptr) return;
+
+  comp_document_desc doc_desc{};
+  doc_desc.width = 8;
+  doc_desc.height = 8;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &document) == COMP_OK);
+
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "pixels-probe";
+  layer_desc.transform = comp_rect{1, 2, 5, 3};
+  comp_layer_id layer = 0;
+  COMP_CHECK(comp_layer_add(document, &layer_desc, &layer) == COMP_OK);
+  COMP_CHECK(layer != 0);
+
+  /* 预乘、半透明、各像素不同的 5x3 资产：纯色会让「行序/步长读错」看起来也对。 */
+  std::vector<uint8_t> source(static_cast<size_t>(5) * 3u * 4u);
+  for (size_t i = 0; i < source.size(); i += 4) {
+    const uint8_t alpha = static_cast<uint8_t>(40u + (i / 4u) * 9u);
+    source[i + 3] = alpha;
+    source[i + 0] = static_cast<uint8_t>(alpha / 2u);
+    source[i + 1] = static_cast<uint8_t>(alpha / 3u);
+    source[i + 2] = static_cast<uint8_t>(alpha / 4u);
+  }
+  comp_image image{};
+  image.width = 5;
+  image.height = 3;
+  image.format = COMP_PIXEL_RGBA8;
+  image.stride = 5u * 4u;
+  image.pixels = source.data();
+  COMP_CHECK(comp_layer_set_pixels(document, layer, &image) == COMP_OK);
+
+  /* 1. 逐字节回读：尺寸是**图层像素矩形**（5x3），不是画布（8x8）。 */
+  std::vector<uint8_t> read_back(source.size(), 0xEEu);
+  int32_t width = -1;
+  int32_t height = -1;
+  comp_pixel_format format = COMP_PIXEL_RGBA16F;
+  COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u, &width, &height,
+                                   &format) == COMP_OK);
+  COMP_CHECK(width == 5 && height == 3);
+  COMP_CHECK(format == COMP_PIXEL_RGBA8);
+  COMP_CHECK_MSG(read_back == source, "get_pixels must return the layer asset byte-identically");
+
+  /* 2. 读—改—写闭环：把读到的缓冲原样写回，再读一次必须仍逐字节相等。
+         （宿主剪贴板剪切正是这条路径；读侧多一个字节、写侧就会偏一行。） */
+  {
+    comp_image same{};
+    same.width = width;
+    same.height = height;
+    same.format = COMP_PIXEL_RGBA8;
+    same.stride = 5u * 4u;
+    same.pixels = read_back.data();
+    COMP_CHECK(comp_layer_set_pixels(document, layer, &same) == COMP_OK);
+    std::vector<uint8_t> again(source.size(), 0);
+    COMP_CHECK(comp_layer_get_pixels(document, layer, again.data(), 5u * 4u, &width, &height,
+                                     &format) == COMP_OK);
+    COMP_CHECK(again == source);
+  }
+
+  /* 3. 查询模式：pixels == nullptr（或 stride == 0）只回尺寸/格式，不写缓冲。
+        宿主必须先问尺寸再分配——按画布尺寸分配、图层更大时会越界写。 */
+  width = -1;
+  height = -1;
+  format = COMP_PIXEL_RGBA16F;
+  COMP_CHECK(comp_layer_get_pixels(document, layer, nullptr, 0, &width, &height, &format) ==
+             COMP_OK);
+  COMP_CHECK(width == 5 && height == 3);
+  COMP_CHECK(format == COMP_PIXEL_RGBA8);
+
+  /* 4. 步长不足整行必须拒绝（引擎不替调用方猜 stride，与 flatten 同一把尺子）。 */
+  COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u - 1u, &width,
+                                   &height, &format) == COMP_ERR_INVALID_ARGUMENT);
+  /* 出参必填：缺一个都先拒，不能写坏调用方栈。 */
+  COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u, nullptr, &height,
+                                   &format) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u, &width, nullptr,
+                                   &format) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u, &width, &height,
+                                   nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_get_pixels(document, 0xdeadbeef, read_back.data(), 5u * 4u, &width,
+                                   &height, &format) == COMP_ERR_NOT_FOUND);
+
+  /* 5. 新建像素层铺满画布（全透明）：报画布尺寸，不是 0；组没有像素资产：报 0x0。
+        两者都是合法状态，不是错误。 */
+  comp_layer_desc fresh_desc{};
+  fresh_desc.name = "fresh";
+  fresh_desc.transform = comp_rect{0, 0, 8, 8};
+  comp_layer_id fresh_layer = 0;
+  COMP_CHECK(comp_layer_add(document, &fresh_desc, &fresh_layer) == COMP_OK);
+  width = 7;
+  height = 7;
+  COMP_CHECK(comp_layer_get_pixels(document, fresh_layer, nullptr, 0, &width, &height, &format) ==
+             COMP_OK);
+  COMP_CHECK(width == 8 && height == 8);
+  COMP_CHECK(format == COMP_PIXEL_RGBA8);
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "group";
+  group_desc.is_group = 1;
+  comp_layer_id group = 0;
+  COMP_CHECK(comp_layer_add(document, &group_desc, &group) == COMP_OK);
+  width = 7;
+  height = 7;
+  COMP_CHECK(comp_layer_get_pixels(document, group, nullptr, 0, &width, &height, &format) ==
+             COMP_OK);
+  COMP_CHECK(width == 0 && height == 0);
+
+  /*
+   * 5. 只读：复制/剪切会反复调用读取，不能把文档从干净改成脏。
+   *    先写像素（如实置脏）→ 存盘清脏 → 反复读 → 脏标记必须仍是干净。
+   */
+  {
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "compositor_get_pixels_clean.comp").string();
+    COMP_CHECK(comp_document_save(document, path.c_str()) == COMP_OK);
+    int32_t dirty = 1;
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "saving must clear the dirty flag");
+    for (int32_t i = 0; i < 4; ++i) {
+      COMP_CHECK(comp_layer_get_pixels(document, layer, read_back.data(), 5u * 4u, &width, &height,
+                                       &format) == COMP_OK);
+    }
+    COMP_CHECK(comp_document_is_dirty(document, &dirty) == COMP_OK);
+    COMP_CHECK_MSG(dirty == 0, "read-only pixel query must not dirty the document");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+
+  /* 6. 16 位资产：默认输出 8 位工作副本，但 out_format 必须回报 RGBA16——
+        宿主据此拒绝把 8 位副本写回 16 位图层（否则静默降位）。 */
+  {
+    comp_document_desc wide_desc{};
+    wide_desc.width = 4;
+    wide_desc.height = 4;
+    comp_document wide_doc = nullptr;
+    COMP_CHECK(comp_document_create(engine, &wide_desc, &wide_doc) == COMP_OK);
+    const comp_layer_id wide_layer = background_layer(wide_doc);
+    std::vector<uint16_t> wide(4u * 4u * 4u, 0);
+    for (size_t i = 0; i < wide.size(); i += 4) {
+      wide[i + 3] = 0x8000;
+      wide[i + 0] = 0x4000;
+    }
+    comp_image wide_image{};
+    wide_image.width = 4;
+    wide_image.height = 4;
+    wide_image.format = COMP_PIXEL_RGBA16;
+    wide_image.stride = 4u * 8u;
+    wide_image.pixels = wide.data();
+    COMP_CHECK(comp_layer_set_pixels(wide_doc, wide_layer, &wide_image) == COMP_OK);
+
+    std::vector<uint8_t> wide_read(4u * 4u * 4u, 0);
+    int32_t wide_width = 0;
+    int32_t wide_height = 0;
+    comp_pixel_format wide_format = COMP_PIXEL_RGBA8;
+    COMP_CHECK(comp_layer_get_pixels(wide_doc, wide_layer, wide_read.data(), 4u * 4u, &wide_width,
+                                     &wide_height, &wide_format) == COMP_OK);
+    COMP_CHECK(wide_width == 4 && wide_height == 4);
+    COMP_CHECK_MSG(wide_format == COMP_PIXEL_RGBA16,
+                   "out_format must report the stored format, not the working copy's");
+    COMP_CHECK_MSG(wide_read[3] >= 120 && wide_read[3] <= 136,
+                   "16-bit working copy is the dithered 8-bit view (alpha 0x8000 ~= 128)");
+    comp_document_destroy(wide_doc);
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/*
  * comp_layer_get_group_info（S22，ABI 尾部追加 113 -> 114 -> 115）。
  *
  * 钉三件事：根级图层的树关系全零；显式建组后 is_group/parent 如实回读；

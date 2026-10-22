@@ -1665,4 +1665,67 @@ comp_result comp_layer_curves_set_points(const char* settings_json_utf8, uint32_
   COMP_ABI_CATCH(nullptr)
 }
 
+comp_result comp_layer_get_pixels(comp_document document, comp_layer_id id, void* pixels,
+                                 size_t stride, int32_t* out_width, int32_t* out_height,
+                                 comp_pixel_format* out_format) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_width == nullptr || out_height == nullptr || out_format == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "out_width / out_height / out_format is null");
+  }
+  *out_width = 0;
+  *out_height = 0;
+  *out_format = COMP_PIXEL_RGBA8;
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /* 组与从未有像素的层是合法状态：如实回报 0x0，而不是伪装成错误。 */
+  if (layer->is_group || layer->pixels.empty()) {
+    return compositor::abi::ok(engine);
+  }
+  const compositor::ImageBuffer& src = layer->pixels;
+  /* 先回报尺寸/原始格式：查询模式（pixels == nullptr 或 stride == 0）到此为止，
+     宿主据此分配缓冲。写回格式是 8 位工作副本，但来源格式必须如实回报。 */
+  *out_format = src.format;
+  *out_width = src.width;
+  *out_height = src.height;
+  if (pixels == nullptr || stride == 0) {
+    return compositor::abi::ok(engine);
+  }
+  const size_t row_bytes = static_cast<size_t>(src.width) * 4u;
+  if (stride < row_bytes) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "stride is smaller than one row of RGBA8 pixels");
+  }
+
+  uint8_t* base = static_cast<uint8_t*>(pixels);
+  if (src.format == COMP_PIXEL_RGBA8) {
+    for (int32_t y = 0; y < src.height; ++y) {
+      std::memcpy(base + static_cast<size_t>(y) * stride, src.row(y), row_bytes);
+    }
+  } else {
+    /* 与合成/缩略图/工具层同一份 8 位工作副本：16 位整数与 HDR half 各有自己的
+       降位口径（见 domain/layer.h），这里只做搬运，不另造一套。 */
+    compositor::ImageBuffer rgba;
+    const bool made = src.format == COMP_PIXEL_RGBA16F
+                          ? compositor::hdr_to_rgba8(src, &rgba)
+                          : compositor::deep_to_rgba8(src, &rgba);
+    if (!made) {
+      return compositor::abi::fail(engine, COMP_ERR_INTERNAL,
+                                   "8-bit working copy conversion failed");
+    }
+    for (int32_t y = 0; y < rgba.height; ++y) {
+      std::memcpy(base + static_cast<size_t>(y) * stride, rgba.row(y), row_bytes);
+    }
+  }
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 } /* extern "C" */

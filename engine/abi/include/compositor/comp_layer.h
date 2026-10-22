@@ -1203,6 +1203,46 @@ COMP_API comp_result comp_layer_curves_set_points(const char* settings_json_utf8
                                                   size_t capacity,
                                                   size_t* out_size);
 
+/* ------------------------------------------- 像素回读（P0-4 尾部追加） */
+
+/*
+ * 读取图层像素的 **8 位工作副本**（预乘 RGBA8、4 字节/像素、行优先、自上而下，
+ * 尺寸为该图层像素矩形，**不是**画布尺寸；画布落点由 comp_layer_get_transform
+ * 给出）。这是 `comp_layer_set_pixels` 的读侧对偶，补它是为了让宿主能做
+ * 「读—改—写」：剪贴板复制/剪切、删除选区内像素都要求先看到图层当前内容。
+ *
+ * 与 `comp_render_layer_thumbnail` 的分工：那个返回**画布坐标下看到的单层合成**
+ * （transform、蒙版、效果、透明度全部烘进去，用于缩略图）；本入口返回**图层
+ * 原始资产**，不做任何合成。需要「用户看到的那一层」用前者，需要「把像素改掉
+ * 再写回」用本入口。
+ *
+ * 16 位 / HDR 图层先走既有的 8 位工作副本（`deep_to_rgba8` / `hdr_to_rgba8`，
+ * 与合成、缩略图、工具层同一份口径），`out_format` 仍回报**原始**格式：宿主
+ * 据此判断能否无损写回——RGBA16 / RGBA16F 经 `comp_layer_set_pixels` 回写会
+ * 降为 8 位（见该函数契约），宁可拒绝也不要静默降位。
+ *
+ * 契约：
+ *   - **两段式**：`pixels == nullptr`（或 `stride == 0`）是查询模式，只写
+ *     `out_width / out_height / out_format` 并返回 COMP_OK——宿主必须先问尺寸
+ *     再分配，否则「按画布尺寸分配、图层其实更大」会越界写；
+ *   - 给了缓冲时 `stride` 必须 >= width * 4（不足 -> COMP_ERR_INVALID_ARGUMENT，
+ *     不写半行）；缓冲至少 `height * stride` 字节，由调用方保证；
+ *   - 空图层（组、或没有像素资产的层）写 `out_width = out_height = 0` 并返回
+ *     COMP_OK —— 「没有像素」是合法状态，不是错误。注意新建的**像素层**默认
+ *     铺满画布（全透明），所以它报的是画布尺寸而不是 0；
+ *   - 图层不存在 -> COMP_ERR_NOT_FOUND；
+ *   - **只读**：不开事务、不进撤销栈、不改内容修订号（不影响合成缓存）。
+ *
+ * ABI 尾部追加：前序函数与结构体布局不变（145 -> 146）。
+ */
+COMP_API comp_result comp_layer_get_pixels(comp_document document,
+                                           comp_layer_id id,
+                                           void* pixels,
+                                           size_t stride,
+                                           int32_t* out_width,
+                                           int32_t* out_height,
+                                           comp_pixel_format* out_format);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
