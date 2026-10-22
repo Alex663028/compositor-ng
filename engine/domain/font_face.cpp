@@ -1,6 +1,8 @@
 // AI生成
 #include "font_face.h"
 
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <new>
@@ -318,6 +320,57 @@ void FontFace::read_metrics() {
 
   /* U+4F60「你」有字形 = 能排中文的最低门槛（不做完整覆盖统计，见头文件）。 */
   info->has_cjk = FT_Get_Char_Index(face, 0x4F60) != 0;
+}
+
+bool FontFace::render_glyph(uint32_t codepoint, double pixel_size, FontGlyph* out) {
+  if (out == nullptr) return false;
+  *out = FontGlyph{};
+  if (!is_alive() || !std::isfinite(pixel_size) || pixel_size < 1.0 || pixel_size > 4096.0) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  FT_Face face = static_cast<FT_Face>(face_);
+  /* 26.6 定点：小数字号（如 48.5 px）不被截断，字形随字号线性缩放。 */
+  const FT_F26Dot6 size_26_6 = static_cast<FT_F26Dot6>(std::lround(pixel_size * 64.0));
+  if (FT_Set_Char_Size(face, 0, size_26_6, 72, 72) != 0) return false;
+
+  const FT_UInt index = FT_Get_Char_Index(face, codepoint);
+  if (index == 0) {
+    /* 缺字：不画 .notdef（那是字体的方框，不是用户的字），按最大步进留白。 */
+    out->missing = true;
+    const long fallback = (face->size != nullptr) ? face->size->metrics.max_advance : 0;
+    out->advance = fallback > 0 ? static_cast<double>(fallback) / 64.0 : pixel_size * 0.5;
+    return true;
+  }
+
+  if (FT_Load_Glyph(face, index, FT_LOAD_NO_HINTING | FT_LOAD_RENDER) != 0) return false;
+  const FT_GlyphSlot slot = face->glyph;
+  if (slot == nullptr) return false;
+  out->advance = static_cast<double>(slot->advance.x) / 64.0;
+
+  const FT_Bitmap& bitmap = slot->bitmap;
+  if (bitmap.width == 0 || bitmap.rows == 0) return true; /* 空格等无墨字形 */
+  if (bitmap.pixel_mode != FT_PIXEL_MODE_GRAY || bitmap.buffer == nullptr) return false;
+
+  out->width = static_cast<int32_t>(bitmap.width);
+  out->height = static_cast<int32_t>(bitmap.rows);
+  out->bearing_x = slot->bitmap_left;
+  out->bearing_y = slot->bitmap_top;
+  out->bitmap.resize(static_cast<size_t>(out->width) * static_cast<size_t>(out->height));
+
+  /*
+   * FreeType 的 pitch 是「加多少字节到指针上就往下走一行」，可为负（自下而上
+   * 存的行）。负 pitch 时 buffer 指向最后一行，故按行号从尾往前走。
+   */
+  const ptrdiff_t pitch = static_cast<ptrdiff_t>(bitmap.pitch);
+  for (int32_t row = 0; row < out->height; ++row) {
+    const int32_t source_row = pitch >= 0 ? row : (out->height - 1 - row);
+    const uint8_t* source = bitmap.buffer + static_cast<ptrdiff_t>(source_row) * pitch;
+    std::memcpy(out->bitmap.data() + static_cast<size_t>(row) * static_cast<size_t>(out->width),
+                source, static_cast<size_t>(out->width));
+  }
+  return true;
 }
 
 }  // namespace compositor

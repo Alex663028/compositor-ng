@@ -75,8 +75,11 @@ COMP_API comp_result comp_font_load_memory(const void* data, size_t size, int32_
                                            comp_font* out_font);
 
 /*
- * 释放句柄；NULL 与已失效句柄都是安全的空操作（不重复释放，也不解引用可疑指针）。
- * 同一句柄只能释放一次；释放后再传给其它字体函数一律返回 INVALID_ARGUMENT/NULL。
+ * 释放句柄；NULL 是安全的空操作。
+ *
+ * 句柄一经释放即**不可再用**（与 comp_engine / comp_document 同一套约定）：
+ * 释放后句柄指向的对象已经被 delete，再传给任何字体函数（包括第二次 release）
+ * 都是宿主错误，契约外行为——不要在释放后保留或复用句柄。
  */
 COMP_API void comp_font_release(comp_font font);
 

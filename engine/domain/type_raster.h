@@ -8,18 +8,28 @@
 
 namespace compositor {
 
+class FontFace; /* 字体轨道用（P5-2），见 domain/font_face.h。 */
+
 /*
  * 文字工具（S11）的位图字体与栅格化内核：文本 + 样式 -> 覆盖率。
  *
- * 与上游 TypeTool 的关系（只复刻语义，不搬 Swift 代码）：
- *   - 上游把文字交给 CoreText 排版成字形轮廓再栅格化；本仓零依赖、不链接任何
- *     字体引擎，因此**自带一张 5×7 的 ASCII 位图字体**：95 个可打印字符
- *     （0x20..0x7E），每字符 5 列 × 7 行，列优先、bit0 = 最上一行；
- *   - 排列口径按「行」走：'\\n' 换行，其它字符水平排；字形步进 = 6 列
- *     （5 列字形 + 1 列字间空隙）× 缩放 + 字距，行距 = font_size × line_height。
+ * 双轨（P5 起）：
+ *   - **旧轨道**（`type_measure_text` / `type_rasterize`）：本仓自带的 5×7 位图
+ *     ASCII 字体，零依赖，95 个可打印字符；语义与 P5 之前逐字节一致。
+ *   - **字体轨道**（`*_with_font`，P5-2）：宿主通过 `comp_font_*` 加载一份
+ *     TrueType/OpenType 字体（见 domain/font_face.h），按**字号 = em 高**排版，
+ *     支持 UTF-8/CJK。两轨不互调：没加载字体时永远走旧轨道，宿主不会因为
+ *     本批改动看到任何像素差异。
  *
- * 明确不支持（如实拒绝，不静默替换成别的字形）：
- *   - UTF-8 / CJK：本字体只有 ASCII，把「你好」画成方框或问号都是在撒谎；
+ * 与上游 TypeTool 的关系（只复刻语义，不搬 Swift 代码）：上游把文字交给
+ * CoreText 排版成字形轮廓再栅格化；旧轨道**自带一张 5×7 的 ASCII 位图字体**：
+ * 95 个可打印字符（0x20..0x7E），每字符 5 列 × 7 行，列优先、bit0 = 最上一行；
+ * 排列口径按「行」走：'\\n' 换行，其它字符水平排；字形步进 = 6 列
+ * （5 列字形 + 1 列字间空隙）× 缩放 + 字距，行距 = font_size × line_height。
+ *
+ * 旧轨道明确不支持（如实拒绝，不静默替换成别的字形）：
+ *   - UTF-8 / CJK：本字体只有 ASCII，把「你好」画成方框或问号都是在撒谎
+ *     （字体轨道支持，但必须由宿主显式加载字体）；
  *   - 换行符以外的控制字符（含 Tab）：位图字体没有制表位语义；
  *   - 字体族 / 粗体 / 斜体 / 对齐 / 旋转 / 字距微调：本批不做，宿主拿到的是
  *     「左对齐、无变换」的一行行文字。
@@ -57,9 +67,11 @@ struct TypeRasterStyle {
 struct TypeMeasure {
   int32_t line_count = 0;  /* 行数（至少 1） */
   int64_t glyph_count = 0; /* 字形总数（空格算字形，'\n' 不算） */
-  double advance = 0.0;    /* 单字形步进（文档像素） */
+  double advance = 0.0;    /* 单字形步进（文档像素）；字体轨道为 0（逐字形步进不同） */
   double width = 0.0;      /* 最长行的步进宽度 */
   double height = 0.0;     /* font_size + (line_count-1) * 行步进 */
+  /* 字体轨道专用：该字体里没有字形的字符数（它们不占像素，只占步进）。 */
+  int64_t missing_glyphs = 0;
 };
 
 enum class TypeRasterStatus {
@@ -68,6 +80,7 @@ enum class TypeRasterStatus {
   kTooLong = 2,   /* 字符数超过 kMaxTypeCharacters */
   kBadStyle = 3,  /* 字号/行距/字距越界或非有限 */
   kEmpty = 4,     /* 文本框与图层不相交：成功但没有任何像素要改 */
+  kFontError = 5, /* 字体栅格化失败（句柄失效 / FreeType 报错）：宿主态错误，不是参数错误 */
 };
 
 struct TypeRasterReport {
@@ -122,6 +135,45 @@ TypeRasterReport type_measure_text(const char* text, size_t size, const TypeRast
 TypeRasterReport type_rasterize(const char* text, size_t size, const TypeRasterStyle& style,
                                 double origin_x, double origin_y, int32_t layer_x, int32_t layer_y,
                                 int32_t layer_width, int32_t layer_height, TypeCoverage* out);
+
+/* ============================================================== 字体轨道（P5-2） */
+
+/*
+ * 用宿主加载的字体（domain/font_face.h）排版并量文本。
+ *
+ * 口径与旧轨道的差异（都是语义差异，不是遗漏）：
+ *   - `font` 必须非空；为空报 kFontError（**不**静默回落到 5×7——那会让宿主
+ *     以为字体被用上了）。字体不可缩放 / 场馆度量全 0 同样是 kFontError；
+ *   - 文本是 UTF-8：'\n' 断行，非法序列、过长编码、代理对与 Tab 等控制字符
+ *     按 kBadText 拒绝（不做「尽力解码」）；
+ *   - `style.font_size` 是 **em 高**（旧轨道是 5×7 单元高）。行步进 =
+ *     font_size × line_height；首行基线 = 文本框顶 + ascender × font_size；
+ *     文本框高 = (ascender - descender) × font_size + (行数-1) × 行步进；
+ *   - 文本框宽 = 各字形步进之和 + 字形之间的字距（行尾不加字距）；
+ *     `measure.advance` 为 0（字体轨道没有单一「字形步进」）；
+ *   - 字体里没有字形的码位计入 `measure.missing_glyphs`，它们只占步进、不画
+ *     .notdef 方框（缺字如实回报，不假装画上了）。
+ */
+TypeRasterReport type_measure_text_with_font(const char* text, size_t size,
+                                             const TypeRasterStyle& style, FontFace* font,
+                                             TypeMeasure* out);
+
+/*
+ * 字体轨道的栅格化。几何口径（origin、图层局部坐标、kEmpty 语义）与
+ * type_rasterize 完全一致；像素口径：
+ *   - FT_LOAD_NO_HINTING + 灰度 coverage（不做网格拟合，任意字号形状一致）；
+ *   - 字形原点取整到整数像素（不做亚像素插值，已知取舍）；
+ *   - `antialias` 非 0 时用 FreeType 灰度值；0 时 >= 128 记 255（硬边）；
+ *   - 字形重叠取最大覆盖率，不叠加（与旧轨道「不叠亮度」同口径）；
+ *   - `out_missing_glyphs`（可为 nullptr）写入缺字个数，供 note 如实回报。
+ * 返回 kFontError 时 out 已清空（句柄失效 / FreeType 失败，属于宿主态错误）。
+ */
+TypeRasterReport type_rasterize_with_font(const char* text, size_t size,
+                                          const TypeRasterStyle& style, FontFace* font,
+                                          double origin_x, double origin_y, int32_t layer_x,
+                                          int32_t layer_y, int32_t layer_width,
+                                          int32_t layer_height, TypeCoverage* out,
+                                          int64_t* out_missing_glyphs);
 
 }  // namespace compositor
 

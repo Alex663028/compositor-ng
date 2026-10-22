@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include "domain/font_face.h"
+
 namespace compositor {
 namespace {
 
@@ -271,6 +273,191 @@ bool clip_window(double origin_x, double origin_y, double width, double height, 
   return *x1 > *x0 && *y1 > *y0;
 }
 
+/* ---------- 字体轨道（P5-2）：FreeType 字形排版 ---------- */
+
+/* 排版结果：码位顺序 + 每行起止下标（line_begin 多一个尾哨兵）+ 字体度量。 */
+struct FontLayout {
+  std::vector<uint32_t> codepoints;
+  std::vector<size_t> line_begin;
+  TypeMeasure measure;
+  double ascender = 0.0;     /* 文档像素（已乘 em 高） */
+  double line_pitch = 0.0;   /* ascender - descender，文档像素 */
+  double line_advance = 0.0; /* font_size × line_height */
+  double letter_spacing = 0.0;
+};
+
+/*
+ * 严格 UTF-8 解码：拒绝过长编码、代理对、> U+10FFFF 与孤立续字节。
+ * '\n' 保留（排版按它断行），其余 C0/C1 控制字符拒绝——字体没有制表位语义，
+ * 静默跳过会让宿主以为字符被排上了。
+ */
+bool decode_utf8(const char* text, size_t size, std::vector<uint32_t>* out, const char** error) {
+  size_t i = 0;
+  while (i < size) {
+    const unsigned char lead = static_cast<unsigned char>(text[i]);
+    uint32_t codepoint = 0;
+    size_t extra = 0;
+    uint32_t minimum = 0;
+    if (lead < 0x80) {
+      codepoint = lead;
+    } else if ((lead & 0xE0) == 0xC0) {
+      codepoint = lead & 0x1Fu;
+      extra = 1;
+      minimum = 0x80u;
+    } else if ((lead & 0xF0) == 0xE0) {
+      codepoint = lead & 0x0Fu;
+      extra = 2;
+      minimum = 0x800u;
+    } else if ((lead & 0xF8) == 0xF0) {
+      codepoint = lead & 0x07u;
+      extra = 3;
+      minimum = 0x10000u;
+    } else {
+      *error = "type text is not valid UTF-8 (bad lead byte)";
+      return false;
+    }
+    for (size_t k = 1; k <= extra; ++k) {
+      if (i + k >= size) {
+        *error = "type text is not valid UTF-8 (truncated sequence)";
+        return false;
+      }
+      const unsigned char continuation = static_cast<unsigned char>(text[i + k]);
+      if ((continuation & 0xC0) != 0x80) {
+        *error = "type text is not valid UTF-8 (bad continuation byte)";
+        return false;
+      }
+      codepoint = (codepoint << 6) | static_cast<uint32_t>(continuation & 0x3F);
+    }
+    if (extra > 0 && (codepoint < minimum || codepoint > 0x10FFFF ||
+                      (codepoint >= 0xD800 && codepoint <= 0xDFFF))) {
+      *error = "type text is not valid UTF-8 (overlong or out-of-range sequence)";
+      return false;
+    }
+    if (codepoint != '\n' && (codepoint < 0x20 || codepoint == 0x7F)) {
+      *error = "type text contains a control character (only '\\n' is supported)";
+      return false;
+    }
+    out->push_back(codepoint);
+    i += extra + 1;
+  }
+  return true;
+}
+
+/* 字体轨道的样式闸：量程与旧轨道一致，但步进要逐字形才知道（见 build_font_layout）。 */
+bool validate_font_style(const TypeRasterStyle& style, const char** error) {
+  if (!finite_range(style.font_size, kMinTypeFontSize, kMaxTypeFontSize)) {
+    *error = "type font size must be within 6..2048 document px";
+    return false;
+  }
+  if (!finite_range(style.line_height, kMinTypeLineHeight, kMaxTypeLineHeight)) {
+    *error = "type line height must be within 1..8 (lines may not overlap)";
+    return false;
+  }
+  if (!std::isfinite(style.letter_spacing) ||
+      std::fabs(style.letter_spacing) > kMaxTypeLetterSpacing) {
+    *error = "type letter spacing is not finite or out of range";
+    return false;
+  }
+  return true;
+}
+
+TypeRasterReport build_font_layout(const char* text, size_t size, const TypeRasterStyle& style,
+                                   FontFace* font, FontLayout* out) {
+  if (font == nullptr) {
+    return make_report(TypeRasterStatus::kFontError, "type font handle is null");
+  }
+  if (size > kMaxTypeCharacters) {
+    return make_report(TypeRasterStatus::kTooLong, "type text exceeds 65536 characters");
+  }
+  if (text == nullptr) {
+    return make_report(TypeRasterStatus::kBadText, "type text pointer is null");
+  }
+  const char* error = "";
+  if (!validate_font_style(style, &error)) {
+    return make_report(TypeRasterStatus::kBadStyle, error);
+  }
+
+  out->codepoints.clear();
+  out->line_begin.clear();
+  if (!decode_utf8(text, size, &out->codepoints, &error)) {
+    return make_report(TypeRasterStatus::kBadText, error);
+  }
+
+  const FontMetricsInfo& metrics = font->metrics();
+  if (!metrics.scalable || metrics.units_per_em == 0) {
+    return make_report(TypeRasterStatus::kFontError, "the loaded font is not scalable");
+  }
+  out->ascender = metrics.ascender * style.font_size;
+  const double descender = metrics.descender * style.font_size;
+  out->line_pitch = out->ascender - descender;
+  if (!(out->line_pitch > 0.0)) {
+    return make_report(TypeRasterStatus::kFontError, "the loaded font has no usable vertical metrics");
+  }
+  out->line_advance = style.font_size * style.line_height;
+  out->letter_spacing = style.letter_spacing;
+
+  out->line_begin.push_back(0);
+  for (size_t i = 0; i < out->codepoints.size(); ++i) {
+    if (out->codepoints[i] == '\n') out->line_begin.push_back(i + 1);
+  }
+  /*
+   * 行尾哨兵：每行都靠 [begin, end) 取码位，end 来自下一行的起点。没有这个尾哨兵，
+   * 最后一行永远落不进循环（单行文本会量出 line_count = 0、宽度 0，且一个字都不画）。
+   * 文本以 '\n' 结尾时尾哨兵等于码位数，产生一个合法的空尾行——与常见文本编辑器
+   * 的口径一致。
+   */
+  out->line_begin.push_back(out->codepoints.size());
+  size_t glyphs = 0;
+  for (uint32_t codepoint : out->codepoints) {
+    if (codepoint != '\n') ++glyphs;
+  }
+  if (glyphs == 0) {
+    return make_report(TypeRasterStatus::kBadText, "type text has no printable glyphs");
+  }
+
+  /*
+   * 逐字形量宽度：字体里每个码位的步进都不同，不能像 5×7 那样用一个常数。
+   * 这里顺带数缺字并把「字距把步进压成 0」「字形栅格化失败」在度量阶段就查出来，
+   * 保证「量」与「画」用的是同一次排版结果。
+   */
+  int64_t missing = 0;
+  double widest = 0.0;
+  for (size_t line = 0; line + 1 < out->line_begin.size(); ++line) {
+    const size_t begin = out->line_begin[line];
+    const size_t end = out->line_begin[line + 1];
+    bool first = true;
+    double line_width = 0.0;
+    for (size_t i = begin; i < end; ++i) {
+      const uint32_t codepoint = out->codepoints[i];
+      if (codepoint == '\n') continue;
+      FontGlyph glyph;
+      if (!font->render_glyph(codepoint, style.font_size, &glyph)) {
+        return make_report(TypeRasterStatus::kFontError,
+                           "the loaded font failed to rasterize a glyph");
+      }
+      if (glyph.missing) ++missing;
+      const double step = glyph.advance + (first ? 0.0 : out->letter_spacing);
+      if (!(step >= kMinTypeAdvance)) {
+        return make_report(TypeRasterStatus::kBadStyle,
+                          "type letter spacing makes the glyph advance smaller than 0.5 document px");
+      }
+      if (!first) line_width += out->letter_spacing;
+      line_width += glyph.advance;
+      first = false;
+    }
+    widest = std::max(widest, line_width);
+  }
+
+  out->measure.line_count = static_cast<int32_t>(out->line_begin.size() - 1);
+  out->measure.glyph_count = static_cast<int64_t>(glyphs);
+  out->measure.advance = 0.0;
+  out->measure.width = widest;
+  out->measure.height =
+      out->line_pitch + static_cast<double>(out->measure.line_count - 1) * out->line_advance;
+  out->measure.missing_glyphs = missing;
+  return make_report(TypeRasterStatus::kOk, "");
+}
+
 void rasterize_antialiased(const TypeLayout& layout, double origin_x, double origin_y,
                            int64_t win_x0, int64_t win_y0, int64_t win_x1, int64_t win_y1,
                            TypeCoverage* out) {
@@ -443,6 +630,113 @@ TypeRasterReport type_rasterize(const char* text, size_t size, const TypeRasterS
   } else {
     rasterize_hard_edged(layout, origin_x, origin_y, win_x0, win_y0, win_x1, win_y1, out);
   }
+  return make_report(TypeRasterStatus::kOk, "");
+}
+
+TypeRasterReport type_measure_text_with_font(const char* text, size_t size,
+                                             const TypeRasterStyle& style, FontFace* font,
+                                             TypeMeasure* out) {
+  FontLayout layout;
+  const TypeRasterReport report = build_font_layout(text, size, style, font, &layout);
+  if (out != nullptr) {
+    *out = report.status == TypeRasterStatus::kOk ? layout.measure : TypeMeasure{};
+  }
+  return report;
+}
+
+TypeRasterReport type_rasterize_with_font(const char* text, size_t size,
+                                          const TypeRasterStyle& style, FontFace* font,
+                                          double origin_x, double origin_y, int32_t layer_x,
+                                          int32_t layer_y, int32_t layer_width,
+                                          int32_t layer_height, TypeCoverage* out,
+                                          int64_t* out_missing_glyphs) {
+  if (out_missing_glyphs != nullptr) *out_missing_glyphs = 0;
+  if (out == nullptr) {
+    return make_report(TypeRasterStatus::kBadStyle, "type coverage output is null");
+  }
+  *out = TypeCoverage{};
+
+  FontLayout layout;
+  const TypeRasterReport report = build_font_layout(text, size, style, font, &layout);
+  if (report.status != TypeRasterStatus::kOk) return report;
+  if (!std::isfinite(origin_x) || !std::isfinite(origin_y)) {
+    return make_report(TypeRasterStatus::kBadStyle, "type origin is not finite");
+  }
+
+  /*
+   * 字形会越过「步进箱」：斜体、负左侧距、重音都可能伸出字体盒。窗口四周各放
+   * 一 em 余量再裁到图层，既不会漏画，也不会在正常字体上多占太多像素。
+   */
+  const double margin = style.font_size;
+  int64_t win_x0 = 0;
+  int64_t win_y0 = 0;
+  int64_t win_x1 = 0;
+  int64_t win_y1 = 0;
+  if (!clip_window(origin_x - margin, origin_y - margin, layout.measure.width + 2.0 * margin,
+                   layout.measure.height + 2.0 * margin, layer_x, layer_y, layer_width,
+                   layer_height, &win_x0, &win_y0, &win_x1, &win_y1)) {
+    return make_report(TypeRasterStatus::kEmpty, "type box does not intersect the layer");
+  }
+  out->x = static_cast<int32_t>(win_x0 - layer_x);
+  out->y = static_cast<int32_t>(win_y0 - layer_y);
+  out->w = static_cast<int32_t>(win_x1 - win_x0);
+  out->h = static_cast<int32_t>(win_y1 - win_y0);
+  out->coverage.assign(static_cast<size_t>(out->w) * static_cast<size_t>(out->h), 0);
+
+  const bool antialias = style.antialias;
+  int64_t missing = 0;
+  for (size_t line = 0; line + 1 < layout.line_begin.size(); ++line) {
+    const size_t begin = layout.line_begin[line];
+    const size_t end = layout.line_begin[line + 1];
+    /* 首行基线 = 文本框顶 + ascender；ascender 已按字号换算成文档像素。 */
+    const double baseline =
+        origin_y + layout.ascender + static_cast<double>(line) * layout.line_advance;
+    double pen_x = origin_x;
+    bool first = true;
+    for (size_t i = begin; i < end; ++i) {
+      const uint32_t codepoint = layout.codepoints[i];
+      if (codepoint == '\n') continue;
+      FontGlyph glyph;
+      if (!font->render_glyph(codepoint, style.font_size, &glyph)) {
+        *out = TypeCoverage{};
+        return make_report(TypeRasterStatus::kFontError,
+                           "the loaded font failed to rasterize a glyph");
+      }
+      if (!first) pen_x += layout.letter_spacing;
+      if (glyph.missing) ++missing;
+
+      if (!glyph.empty()) {
+        /*
+         * 位图是 FreeType 已栅格化好的像素网格；这里把字形原点取整落到整数像素
+         * （不做亚像素插值）。字距/原点的小数部分因此会带来最多半像素的横向
+         * 抖动，这是本批已知取舍，不为它引入二次重采样。
+         */
+        const int64_t glyph_x = std::llround(pen_x + static_cast<double>(glyph.bearing_x));
+        const int64_t glyph_y = std::llround(baseline - static_cast<double>(glyph.bearing_y));
+        for (int32_t row = 0; row < glyph.height; ++row) {
+          const int64_t pixel_y = glyph_y + row;
+          if (pixel_y < win_y0 || pixel_y >= win_y1) continue;
+          uint8_t* target = out->coverage.data() +
+                            static_cast<size_t>(pixel_y - win_y0) * static_cast<size_t>(out->w);
+          for (int32_t column = 0; column < glyph.width; ++column) {
+            const int64_t pixel_x = glyph_x + column;
+            if (pixel_x < win_x0 || pixel_x >= win_x1) continue;
+            uint8_t value =
+                glyph.bitmap[static_cast<size_t>(row) * static_cast<size_t>(glyph.width) +
+                             static_cast<size_t>(column)];
+            if (!antialias) value = value >= 128 ? 255 : 0;
+            if (value == 0) continue;
+            uint8_t& slot = target[pixel_x - win_x0];
+            if (value > slot) slot = value; /* 字形重叠取最大值，不叠亮度 */
+          }
+        }
+      }
+      pen_x += glyph.advance;
+      first = false;
+    }
+  }
+
+  if (out_missing_glyphs != nullptr) *out_missing_glyphs = missing;
   return make_report(TypeRasterStatus::kOk, "");
 }
 

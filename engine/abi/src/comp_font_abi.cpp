@@ -89,7 +89,12 @@ COMP_API comp_result comp_font_load_memory(const void* data, size_t size, int32_
 
 COMP_API void comp_font_release(comp_font font) {
   FontFace* face = as_font(font);
-  if (face == nullptr) return; /* NULL / 已失效句柄：安全空操作，不解引用。 */
+  if (face == nullptr) return; /* NULL：安全空操作。 */
+  /*
+   * 注意：已释放的句柄是**宿主错误**，不是「安全空操作」——as_font 要读对象里的
+   * magic，而对象已经被 delete，读它就是未定义行为。这与 comp_engine_destroy /
+   * comp_document_destroy 同一套约定：句柄一经释放即不可再用，重复释放在契约外。
+   */
   delete face;
 }
 

@@ -754,9 +754,10 @@ typedef struct comp_tool_shape {
  * 文字样式（语义见 domain/tool_ops.h 的 `TypeStyle`）。
  *
  * `font_size` 是**单元高**（文档像素）：引擎的自带位图字体是 5 列 × 7 行，
- * 缩放 = font_size / 7。`line_height` 是行距倍数（>= 1，上限 8）；`letter_spacing`
- * 是附加字距（文档像素，可负，但「6×缩放 + 字距」必须 >= 0.5）。
- * `antialias` 非 0 = 逐像素精确面积覆盖率；0 = 像素中心一票（硬边）。
+ * 缩放 = font_size / 7。传入字体句柄（`type_font`）后 `font_size` 换成 **em 高**。
+ * `line_height` 是行距倍数（>= 1，上限 8）；`letter_spacing`
+ * 是附加字距（文档像素，可负，但字形步进必须 >= 0.5）。
+ * `antialias` 非 0 = 抗锯齿；0 = 像素中心一票 / 灰度阈值 128（硬边）。
  */
 typedef struct comp_type_style {
   double font_size;      /* 单元高，文档像素；6..2048 */
@@ -771,24 +772,29 @@ typedef struct comp_type_style {
  * 只做左对齐 + 字号/行距/字距）。
  *
  * 文本：
- *   - `text` 是 UTF-8 缓冲区，但**只接受 0x20..0x7E 与 '\n'**；其它字节（含
+ *   - 默认（`comp_tool_op_desc::type_font` 为 NULL）走内置 5×7 位图字体：
+ *     `text` 是 UTF-8 缓冲区，但**只接受 0x20..0x7E 与 '\n'**；其它字节（含
  *     UTF-8 多字节 = CJK、Tab 等控制字符）被参数闸以 COMP_ERR_INVALID_ARGUMENT
- *     拒绝。本仓零依赖、不链接字体引擎，没有 CJK 字形就不假装有；
- *   - `text_length` 是字节数（ASCII 下等于字符数），上限 65536；
+ *     拒绝——没有 CJK 字形就不假装有；
+ *   - 传入字体句柄后走字体轨道：`text` 按 UTF-8 解码（UTF-8 非法序列、Tab 等
+ *     控制字符仍拒绝），CJK 可用；缺字只占步进、不画方框，note 回报缺字个数；
+ *   - `text_length` 是字节数，上限 65536；
  *   - `origin_x/origin_y` 是文本框**左上角**（文档像素，可带小数）。
  *
- * 排版：单字形步进 = 6×缩放 + letter_spacing；行步进 = font_size × line_height；
- * 文本框宽 = 最长行的步进宽度，高 = font_size + (行数-1)×行步进。全部坐标是
- * **文档像素**，引擎减掉图层 `effective_bounds()` 原点后落图层局部像素。
+ * 排版：默认轨道的单字形步进 = 6×缩放 + letter_spacing，`style.font_size` 是
+ * 5×7 单元高；字体轨道的字形步进来自字体本身（`style.font_size` 是 **em 高**）。
+ * 两条轨道的行步进都是 font_size × line_height；文本框宽 = 最长行的步进宽度。
  *
  * 颜色是**直通 sRGB + alpha（非预乘）**，铺到图层时按 coverage/255 × color.a/255
  * × opacity 走预乘 source-over；选区活跃时再乘选区有效 coverage（覆盖率 0 的
  * 像素逐字节不动）。
  *
  * 参数闸（COMP_ERR_INVALID_ARGUMENT，且不留半成品/不进撤销栈）：文本为空、
- * 只含换行、含非可打印 ASCII、超过 65536 字符、字号/行距/字距越界或非有限、
- * 字距把步进压到 0.5 px 以下、原点 NaN/Inf 或绝对值 > 1e6、颜色 alpha 为 0、
- * opacity 不在 0..1 或为 0。
+ * 只含换行、默认轨道含非可打印 ASCII（字体轨道：UTF-8 非法或含控制字符）、
+ * 超过 65536 字符、字号/行距/字距越界或非有限、字距把步进压到 0.5 px 以下、
+ * 原点 NaN/Inf 或绝对值 > 1e6、颜色 alpha 为 0、opacity 不在 0..1 或为 0。
+ * 传入的字体句柄非 NULL 但通不过 magic 校验 -> COMP_ERR_STATE（不回落成「没传字体」；
+ * 已释放的句柄不可再用，见 comp_font_release）。
  *
  * 与图层完全不相交时：成功、**无像素改动且不产生撤销步**，note 如实说明。
  * 16 位图层经 8 位工作副本穿过；RGBA16F 拒绝（COMP_ERR_STATE）。
@@ -796,7 +802,7 @@ typedef struct comp_type_style {
 typedef struct comp_tool_type {
   double origin_x;          /* 文本框左上角，文档像素 */
   double origin_y;
-  const char* text;         /* 仅 0x20..0x7E 与 '\n'；UTF-8 多字节被拒绝 */
+  const char* text;         /* 默认轨道仅 0x20..0x7E 与 '\n'；字体轨道为 UTF-8 */
   int32_t text_length;      /* 字节数；1..65536 */
   comp_type_style style;
   uint8_t color[4];         /* 直通 sRGB + alpha（0..255） */
@@ -925,6 +931,19 @@ typedef struct comp_tool_op_desc {
    * 变成一次明确的拒绝，而不是未定义行为。
    */
   size_t           heal_coverage_rows;
+  /*
+   * P5-2 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   *
+   * 仅 COMP_TOOL_TYPE 读取：可选字体句柄（comp_font_load_file / _load_memory 创建）。
+   *   - NULL = 旧行为：内置 5×7 位图 ASCII 字体，文本只接受 0x20..0x7E 与 '\n'，
+   *     `style.font_size` 是单元高；像素结果与 P5 之前逐字节一致；
+   *   - 非 NULL = 用该字体排版：文本是 UTF-8（CJK 可用），`style.font_size` 变成
+   *     **em 高**，行高与字距语义不变；字体里没有字形的字符只占步进、不绘制，
+   *     note 会如实回报个数；句柄失效 -> COMP_ERR_STATE。
+   *
+   * 句柄只在本调用期间被读取，引擎不接管它的生命周期（仍由宿主 comp_font_release）。
+   */
+  comp_font        type_font;
 } comp_tool_op_desc;
 
 /*

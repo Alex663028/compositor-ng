@@ -1420,6 +1420,18 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
   }
   params.type.opacity = desc->type.opacity;
 
+  /*
+   * P5-2 尾部追加：可选字体句柄。NULL = 旧轨道（5×7 位图，行为逐字节不变）；
+   * 非 NULL 时必须是仍有效的 comp_font——失效/重复释放的句柄属于宿主态错误
+   * （COMP_ERR_STATE），不能当成「没传字体」静默回落。引擎只在本次调用内读取
+   * 该句柄，不接管生命周期。
+   */
+  params.type.font = compositor::abi::as_font(desc->type_font);
+  if (desc->type_font != nullptr && params.type.font == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "type font handle is invalid or already released");
+  }
+
   /* P1 尾部追加：减淡 / 加深 / 海绵只多两个标量，笔迹与几何复用上面的字段。 */
   params.tone.mode = desc->tone.mode;
   params.tone.strength = desc->tone.strength;

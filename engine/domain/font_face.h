@@ -67,6 +67,11 @@ struct FontGlyph {
   int32_t bearing_x = 0; /* 位图左上角相对「笔位 + 基线」的偏移，像素 */
   int32_t bearing_y = 0; /* 向上为正（FreeType 口径） */
   double advance = 0.0;  /* 笔位前进，像素 */
+  /*
+   * 该字体里没有这个码位（FreeType 字形 0 = .notdef）。此时位图为空，
+   * advance 取字体最大步进，宿主据此如实回报「缺字」而不是画一个方框。
+   */
+  bool missing = false;
   std::vector<uint8_t> bitmap;
 
   bool empty() const { return width <= 0 || height <= 0 || bitmap.empty(); }
@@ -96,6 +101,19 @@ class FontFace {
   const std::string& style_name() const noexcept { return style_name_; }
   /* 无 PostScript 名时为空串。 */
   const std::string& postscript_name() const noexcept { return postscript_name_; }
+
+  /*
+   * 按像素字号（em 高，可带小数）栅格化一个码位（P5-2）。
+   *
+   * 口径：FT_Set_Char_Size 用 26.6 定点（保留小数字号）+ FT_LOAD_NO_HINTING
+   * （不做网格拟合，任意字号下字形形状一致）+ FT_LOAD_RENDER（灰度 coverage，
+   * 与合成路径的单通道覆盖率同款）。字体里没有该码位时 out->missing = true、
+   * 位图为空、advance 取字体最大步进（如实回报缺字，不画 .notdef 方框）。
+   *
+   * 返回 false = 句柄/参数无效或 FreeType 失败（不是「缺字」）；此时 out 已清空。
+   * 内部持锁：同一个 FT_Face 不能被并发访问（见类注释）。
+   */
+  bool render_glyph(uint32_t codepoint, double pixel_size, FontGlyph* out);
 
   /* 内部：P5-2 的栅格化入口需要 face。非本模块代码不要直接调用。 */
   void* native_face() noexcept { return face_; }

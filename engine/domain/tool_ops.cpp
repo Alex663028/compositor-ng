@@ -1005,9 +1005,10 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
         return bad_arg("type has no visible color (the color is fully transparent)");
       }
       /*
-       * 文本与排版量程统一交给内核校验：字号/行距/字距的上限、ASCII 白名单、
-       * 字符数上限与「字距把步进压成 0」都在 type_measure_text 里，域层不再
-       * 各写一份阈值（两份阈值迟早漂移，是本仓反复踩过的坑）。
+       * 文本与排版量程统一交给内核校验：字号/行距/字距的上限、字符白名单（旧轨道
+       * ASCII / 字体轨道 UTF-8）、字符数上限与「字距把步进压成 0」都在内核里，
+       * 域层不再各写一份阈值（两份阈值迟早漂移，是本仓反复踩过的坑）。
+       * 传入字体句柄后走字体轨道；句柄失效/字体不可用属于宿主态错误，不是参数错。
        */
       TypeRasterStyle style;
       style.font_size = type.style.font_size;
@@ -1016,7 +1017,14 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       style.antialias = type.style.antialias != 0;
       TypeMeasure measure;
       const TypeRasterReport report =
-          type_measure_text(type.text, static_cast<size_t>(type.text_length), style, &measure);
+          type.font != nullptr
+              ? type_measure_text_with_font(type.text, static_cast<size_t>(type.text_length),
+                                            style, type.font, &measure)
+              : type_measure_text(type.text, static_cast<size_t>(type.text_length), style,
+                                  &measure);
+      if (report.status == TypeRasterStatus::kFontError) {
+        return bad_state(report.message);
+      }
       if (report.status != TypeRasterStatus::kOk) {
         return bad_arg(report.message);
       }
@@ -1904,15 +1912,29 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       style.antialias = type.style.antialias != 0;
 
       TypeCoverage raster;
+      int64_t missing_glyphs = 0;
       const TypeRasterReport report =
-          type_rasterize(type.text, static_cast<size_t>(type.text_length), style, type.origin_x,
-                         type.origin_y, bounds.x, bounds.y, target_layer->pixels.width,
-                         target_layer->pixels.height, &raster);
+          type.font != nullptr
+              ? type_rasterize_with_font(type.text, static_cast<size_t>(type.text_length), style,
+                                         type.font, type.origin_x, type.origin_y, bounds.x,
+                                         bounds.y, target_layer->pixels.width,
+                                         target_layer->pixels.height, &raster, &missing_glyphs)
+              : type_rasterize(type.text, static_cast<size_t>(type.text_length), style,
+                               type.origin_x, type.origin_y, bounds.x, bounds.y,
+                               target_layer->pixels.width, target_layer->pixels.height, &raster);
       if (report.status == TypeRasterStatus::kBadText ||
           report.status == TypeRasterStatus::kTooLong ||
           report.status == TypeRasterStatus::kBadStyle) {
         ok = bad_arg(report.message);
         break;
+      }
+      if (report.status == TypeRasterStatus::kFontError) {
+        ok = bad_state(report.message);
+        break;
+      }
+      if (missing_glyphs > 0 && note != nullptr) {
+        *note += "type has " + std::to_string(missing_glyphs) +
+                 " character(s) without a glyph in the loaded font (they were not drawn); ";
       }
       if (report.status == TypeRasterStatus::kEmpty) {
         /* 文本框完全落在图层之外：成功但无像素要改，不记撤销步（与形状同口径）。 */
