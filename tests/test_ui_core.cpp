@@ -3941,6 +3941,39 @@ COMP_TEST(ui_core_camera_raw_rows) {
   COMP_CHECK(comp_ui::camera_raw_settings_json(values, -3) == "{}");
 }
 
+COMP_TEST(ui_core_close_prompt_rows) {
+  using comp_ui::DocDialogKind;
+  using comp_ui::DocRowKind;
+
+  /*
+   * 关闭提示（P0-3）也走同一套行模型：只有一行「动作」，三档循环。
+   * 这里钉住的是壳的另一半约定——行值直接就是 kCloseAction*，面板显示、
+   * 状态栏与执行分支读的是同一份数（显示「保存」却执行「丢弃」是最坏的失败）。
+   */
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::ClosePrompt) == 1);
+  const comp_ui::DocRowSpec action = comp_ui::doc_dialog_row(DocDialogKind::ClosePrompt, 0);
+  COMP_CHECK(action.kind == DocRowKind::Choice && action.choice_count == 3);
+  COMP_CHECK(action.min == comp_ui::kCloseActionSave);
+  COMP_CHECK(action.max == comp_ui::kCloseActionCancel);
+  /* 缺省动作是「保存」：回车落在安全侧，误触不会丢像素。 */
+  COMP_CHECK(comp_ui::kCloseActionSave == 0);
+  COMP_CHECK(comp_ui::kCloseActionDiscard == 1);
+  COMP_CHECK(comp_ui::kCloseActionCancel == 2);
+  COMP_CHECK(std::string(comp_ui::doc_close_action_name(comp_ui::kCloseActionSave)) != "");
+  COMP_CHECK(std::string(comp_ui::doc_close_action_name(comp_ui::kCloseActionDiscard)) !=
+             comp_ui::doc_close_action_name(comp_ui::kCloseActionSave));
+  COMP_CHECK(std::string(comp_ui::doc_close_action_name(comp_ui::kCloseActionCancel)) != "");
+  /* 越界动作名不返回 nullptr（绘制侧直接 TextOut 它）。 */
+  COMP_CHECK(comp_ui::doc_close_action_name(99) != nullptr);
+  /* 标题/提示必须非空：面板靠它们告诉用户「这不是普通对话框」。 */
+  COMP_CHECK(std::string(comp_ui::doc_dialog_title(DocDialogKind::ClosePrompt)) != "");
+  COMP_CHECK(std::string(comp_ui::doc_dialog_hint(DocDialogKind::ClosePrompt)) != "");
+  /* 越界行仍然是安全默认值，不越界读。 */
+  const comp_ui::DocRowSpec out_of_range =
+      comp_ui::doc_dialog_row(DocDialogKind::ClosePrompt, 3);
+  COMP_CHECK(out_of_range.label != nullptr && out_of_range.label[0] == '\0');
+}
+
 COMP_TEST(ui_core_doc_dialog_anchor) {
   /* 1. 四角钉住不动、四边只动一个轴、居中两轴各动一半——这是画布大小的全部语义。 */
   const int dw = 100;

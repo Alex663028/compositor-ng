@@ -2089,6 +2089,89 @@ max(canvas_w, canvas_h))` 取画布尺寸单层合成（"所见即所拷"），
 `comp_crop_apply` 一步撤销。自检 257 项与 SHA **未变**（`crop` 只有视觉探针覆盖）；
 `visual_check.py` 97 条 / 20 场景 / **0 失败**，`crop` 场景 7 条连续复跑稳定。
 
+### 5.48 关闭 / 退出前的未保存提示：面板内三选一（P0-3，2026-10-22）
+
+**旧行为**：`WM_CLOSE` 无条件 `DestroyWindow`，脏文档直接丢。**新行为**：先问
+`comp_document_is_dirty`，脏则打开右栏的 `DocDialogKind::ClosePrompt` 面板，不脏才销毁。
+零 ABI 新增（导出数仍 **146**）。
+
+#### 为什么不用 `MessageBox`
+
+自动化收尾 `shell.stop()` 是「post `WM_CLOSE` → 等 1.2 s → 超时补一个键 → 等 3 s → kill」。
+系统模态弹窗有三处致命：阻塞式，会把每次目视跑拖成超时；不吃 `PostMessageW` 到主窗口的
+键（进不了模态消息循环），脚本没法回答；截不到图，探针无从断言。所以提示必须画在我们
+自己的面板里——走既有的 `draw_doc_dialog` / `doc_dialog_*` 一套，`present()` 每帧刷。
+
+#### 行模型
+
+`ui_core.h` 只追加一个枚举值 `DocDialogKind::ClosePrompt`，其余全是常量与纯函数：
+
+| 项 | 值 |
+|----|----|
+| `doc_dialog_row_count(ClosePrompt)` | `1`（唯一一行「动作」） |
+| `doc_dialog_row(ClosePrompt, 0)` | `DocRowSpec{"动作", DocRowKind::Choice, 0, 2, 1, 3}` |
+| 动作档位 | `kCloseActionSave = 0` / `kCloseActionDiscard = 1` / `kCloseActionCancel = 2` |
+| 默认值 | `0` = 保存并关闭（所以「回车」= 安全动作） |
+| 文案 | `doc_close_action_name()`：保存并关闭 / 不保存，直接关闭 / 取消（留在文档） |
+| 标题 | 「关闭文档（Close）」，副标题「文档有未保存的修改 · 关闭前请选择」 |
+| 提示行 | `doc_dialog_hint` = 「不保存 = 这次修改连同撤销栈一起丢弃」 |
+
+提示行**不写键位**：`draw_doc_dialog` 底部本来就有三行固定键位提示，重复一遍在截图里很明显
+（第一版就是这么翻车的）。固定键行对 `ClosePrompt` 分支换文案：
+
+```
+S 保存并关闭 · D 不保存
+回车执行当前动作
+Esc 取消（留在文档）
+```
+
+其它对话框的这三行一字未动（像素级不变）。
+
+#### 键盘
+
+- `S` → 置 `Save` 后立刻 `doc_dialog_apply`；`D` → 置 `Discard` 后立刻 apply；`Esc` → 取消。
+- 这两个字母只在 `ClosePrompt` 下特判，位置在模态块的 `switch (key)` **之前**。其它文档对话
+  框继续吞掉字母，工具快捷键（C=裁剪、V=移动、B=画笔…）不会从提示底下穿过去。
+- 原有的 Tab/↑↓ 切行、←/→/±/Space 步进、数字直输、回车应用全部照旧。
+
+#### 「不关窗，除非真存下去了」
+
+```
+Save 且 document_path 非空 → save_document(path)
+                           失败 → 关面板，窗口留着，状态栏「保存失败，窗口未关闭」
+Save 且无路径             → save_document_dialog()（另存为）
+                           回来后重查 comp_document_is_dirty
+                           仍脏 / 路径为空 → 关面板，窗口留着，「未保存（另存为已取消），窗口未关闭」
+Discard                   → 直接 DestroyWindow（不落盘）
+Cancel                    → 只 doc_dialog_close，文档与撤销栈都不动
+```
+
+无路径分支必须**复查 dirty** 而不是只看对话框返回值：`comp_document_save` 成功时内部走
+`mark_dirty(false)`（`comp_engine_abi.cpp:240`），所以「存完之后还脏吗」是可靠的落盘判据。
+（`文件 > 退出` 是 `PostMessageW(window, WM_CLOSE, 0, 0)`，共用同一条路径。）
+
+提示已经开着时再来一个 `WM_CLOSE`（再点一次关闭键）当作**取消**：不销毁窗口，也不重置
+用户已经选好的档位。
+
+#### 测试侧
+
+- `shells/windows/src/ui_core.h` 的常量与行规格由新单测 `ui_core_close_prompt_rows` 覆盖
+  （行数/档位数/`min == Save && max == Cancel`/三档名字互不相同/越界动作名与越界行兜底）。
+- `visual_check.py` 的 `stop()` 学会在脏文档上补一个 `D`：先 post `WM_CLOSE`，1.2 s 内没退
+  就发 `D`，再等 3 s 才 kill。这样所有**脏文档收尾**的场景不再白等超时（此前只是硬等）。
+- 新场景 `close_prompt` 5 条：脏文档 post `WM_CLOSE` 后进程仍存活 → 右栏标题区变化 > 300
+  像素（实测 8046）→ `Esc` 后仍存活 → 取消后画布 `pixel_diff == 0` → 按 `D` 后 3 秒内退出。
+  取文档矩形**必须在涂色之前**：`detect_document_rect` 依赖空文档纯黑，涂成橙色就认不出边框了。
+
+#### 已知边界
+
+- `文件 > 新建` / `文件 > 打开` 仍直接销毁旧文档、不提示（本批未动）。
+- 窗口过窄时右栏宽度塌成 0，提示只剩键盘路径可用。
+- 崩溃恢复、最近文件仍未做；多文档按 BACKLOG 原文仍是【架构】。
+
+`visual_check.py` **102 条 / 21 场景 / 0 失败**；单测 **627 例 / 0 失败**；
+壳自检 257 项 failures=0、SHA `377DE660D48AC933…` 与基线逐字节一致。
+
 
 
 

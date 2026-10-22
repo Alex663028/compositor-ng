@@ -444,6 +444,8 @@ struct ShellState {
   int doc_dialog_anchor = 4; /* 居中 */
   int doc_dialog_steps = 0;
   int doc_dialog_budget_mb = 0;
+  /* 关闭提示的当前选择（0 保存 / 1 不保存 / 2 取消），行值与枚举同源。 */
+  int doc_dialog_close_action = comp_ui::kCloseActionSave;
   /* 打开时的原始尺寸：约束比例与百分比都以它为基准，连续微调不累积取整误差。 */
   int doc_dialog_base_width = kDefaultWidth;
   int doc_dialog_base_height = kDefaultHeight;
@@ -9319,6 +9321,9 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
     case comp_ui::DocDialogKind::CameraRaw:
       if (row < 0 || row >= comp_ui::kCameraRawRowCount) return 0;
       return shell.camera_raw_values[row];
+    case comp_ui::DocDialogKind::ClosePrompt:
+      if (row != 0) return 0;
+      return shell.doc_dialog_close_action;
     default:
       return 0;
   }
@@ -9411,6 +9416,12 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         shell.camera_raw_values[row] = clamped;
       }
       break;
+    case comp_ui::DocDialogKind::ClosePrompt:
+      if (row != 0) break;
+      if (value < comp_ui::kCloseActionSave) value = comp_ui::kCloseActionSave;
+      if (value > comp_ui::kCloseActionCancel) value = comp_ui::kCloseActionCancel;
+      shell.doc_dialog_close_action = value;
+      break;
     default:
       break;
   }
@@ -9427,6 +9438,9 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
     case comp_ui::DocRowKind::Choice:
       if (shell.doc_dialog == comp_ui::DocDialogKind::NewDocument) {
         return widen_utf8(comp_ui::doc_new_background_name(value));
+      }
+      if (shell.doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
+        return widen_utf8(comp_ui::doc_close_action_name(value));
       }
       return widen_utf8(comp_ui::doc_anchor_name(value));
     case comp_ui::DocRowKind::Number:
@@ -9485,7 +9499,9 @@ void doc_dialog_close(ShellState& shell, const wchar_t* status) {
 
 void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   if (kind == comp_ui::DocDialogKind::None) return;
-  if (kind != comp_ui::DocDialogKind::NewDocument && shell.document == nullptr) {
+  /* 新建不依赖当前文档；关闭提示的成立条件由 WM_CLOSE 那边先查（脏标记仍读引擎）。 */
+  if (kind != comp_ui::DocDialogKind::NewDocument &&
+      kind != comp_ui::DocDialogKind::ClosePrompt && shell.document == nullptr) {
     set_status(shell, L"文档：还没有打开任何文档");
     return;
   }
@@ -9558,10 +9574,19 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
         shell.camera_raw_values[row] = 0;
       }
       break;
+    case comp_ui::DocDialogKind::ClosePrompt:
+      /* 缺省落在「保存」：回车是安全动作，误触不会丢像素。 */
+      shell.doc_dialog_close_action = comp_ui::kCloseActionSave;
+      break;
     default:
       break;
   }
   wchar_t buffer[192];
+  if (kind == comp_ui::DocDialogKind::ClosePrompt) {
+    /* 这个面板没有数值可填：状态栏直接给三个动作的键，不照抄通用提示。 */
+    set_status(shell, L"关闭文档：S 保存并关闭 · D 不保存 · Esc 取消");
+    return;
+  }
   wsprintfW(buffer, L"%s：Tab 切行 · 回车应用 · Esc 取消",
             widen_utf8(comp_ui::doc_dialog_title(kind)).c_str());
   set_status(shell, buffer);
@@ -9669,11 +9694,47 @@ void sync_document_buffers(ShellState& shell) {
 }
 
 void doc_dialog_apply(HWND window, ShellState& shell) {
-  (void)window;
   const comp_ui::DocDialogKind kind = shell.doc_dialog;
   if (kind == comp_ui::DocDialogKind::None) return;
   /* 键入态下直接回车 = 先落值再应用，少按一次键（与滤镜面板同一约定）。 */
   if (!shell.doc_dialog_input.empty()) doc_dialog_commit_input(shell);
+
+  /*
+   * 关闭提示（P0-3）：动作作用在**窗口**上而不是文档内容上，所以排在所有
+   * 文档级分支之前。三条路径的共同底线是「没保存成功就不关窗」——宁可让用户
+   * 再选一次，也不能出现「以为存了其实丢了」。
+   */
+  if (kind == comp_ui::DocDialogKind::ClosePrompt) {
+    const int action = shell.doc_dialog_close_action;
+    if (action == comp_ui::kCloseActionCancel) {
+      doc_dialog_close(shell, L"已取消关闭（文档未改动）");
+      return;
+    }
+    if (action == comp_ui::kCloseActionSave) {
+      if (!shell.document_path.empty()) {
+        if (!save_document(shell, shell.document_path.c_str())) {
+          doc_dialog_close(shell, L"保存失败，窗口未关闭");
+          return;
+        }
+      } else {
+        /*
+         * 没有磁盘来源 = 走另存为。用户取消系统对话框时脏标记仍在，据此判断
+         * 「真的存下去了」而不是只看函数有没有被调用过。
+         */
+        save_document_dialog(window, shell);
+        int32_t dirty = 0;
+        if (shell.document == nullptr || shell.document_path.empty() ||
+            comp_document_is_dirty(shell.document, &dirty) != COMP_OK || dirty != 0) {
+          doc_dialog_close(shell, L"未保存（另存为已取消），窗口未关闭");
+          return;
+        }
+      }
+    }
+    /* 保存成功或「不保存」：关窗即退出（WM_DESTROY 里 PostQuitMessage）。 */
+    doc_dialog_close(shell, nullptr);
+    DestroyWindow(window);
+    return;
+  }
 
   if (kind == comp_ui::DocDialogKind::NewDocument) {
     const int width = shell.doc_dialog_width;
@@ -11420,10 +11481,15 @@ void draw_doc_dialog(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
   int hint_y = bottom - 86;
   TextOutW(dc, left + 10, hint_y, hint.c_str(), static_cast<int>(hint.size()));
   hint_y += 18;
+  /*
+   * 固定键位提示分两套：关闭提示没有数值可填，照抄「数字键输入 · - / = 步进」
+   * 会误导用户去按键；其它对话框的三行保持原样（像素与文字都不变）。
+   */
+  const bool close_prompt = shell.doc_dialog == comp_ui::DocDialogKind::ClosePrompt;
   const wchar_t* keys[] = {
-      L"Tab / Shift+Tab 切行 · 方向键切行",
-      L"- / = 步进 · 数字键直接输入",
-      L"回车应用 · Esc 取消",
+      close_prompt ? L"S 保存并关闭 · D 不保存" : L"Tab / Shift+Tab 切行 · 方向键切行",
+      close_prompt ? L"回车执行当前动作" : L"- / = 步进 · 数字键直接输入",
+      close_prompt ? L"Esc 取消（留在文档）" : L"回车应用 · Esc 取消",
   };
   for (const wchar_t* key : keys) {
     TextOutW(dc, left + 10, hint_y, key, lstrlenW(key));
@@ -14061,6 +14127,25 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       }
       return; /* 输入态下屏蔽其它快捷键，避免误触发 */
     }
+    /*
+     * 关闭提示的字母快捷键（P0-3）：S = 保存并关闭、D = 不保存直接关闭。
+     * 只给 ClosePrompt 开这个口子——其它对话框必须继续吞掉字母键，否则工具
+     * 快捷键会从面板底下把当前工具换掉。
+     */
+    if (shell.doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
+      if (key == 'S' || key == 'D') {
+        /*
+         * 文字工具还开着时（键入态在下面才处理），TranslateMessage 随后还会送一个
+         * 同名字符：不吞掉它，按 S 保存却取消另存为的话，那个 'S' 会被插进待提交
+         * 的文字里——用户刚说「保存」，文档反而被改了。
+         */
+        shell.type_skip_char = true;
+        doc_dialog_set_row_value(
+            shell, 0, key == 'S' ? comp_ui::kCloseActionSave : comp_ui::kCloseActionDiscard);
+        doc_dialog_apply(window, shell);
+        return;
+      }
+    }
     switch (key) {
       case VK_ESCAPE:
         doc_dialog_close(shell, L"已取消");
@@ -16526,7 +16611,25 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_CLOSE:
       /* 关窗也收口：微调事务里的位移已经生效，不 commit 就丢掉那一步的撤销能力。 */
-      if (shell != nullptr) nudge_flush(*shell);
+      if (shell != nullptr) {
+        nudge_flush(*shell);
+        /*
+         * P0-3：脏文档先问「保存 / 不保存 / 取消」。用右栏面板而不是 MessageBox——
+         * 自动化 stop() 是「post WM_CLOSE 后等几秒」，阻塞式弹窗只能等到超时，
+         * 面板则能用按键回答（S / D / Esc，见 handle_key）。
+         */
+        if (shell->doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
+          /* 提示已经开着：再点一次关闭等同「取消」，不销毁，也不重置用户的选择。 */
+          return 0;
+        }
+        int32_t dirty = 0;
+        if (shell->document != nullptr &&
+            comp_document_is_dirty(shell->document, &dirty) == COMP_OK && dirty != 0) {
+          doc_dialog_begin(*shell, comp_ui::DocDialogKind::ClosePrompt);
+          InvalidateRect(window, nullptr, FALSE);
+          return 0;
+        }
+      }
       DestroyWindow(window);
       return 0;
     case WM_DESTROY:

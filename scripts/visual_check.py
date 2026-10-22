@@ -405,9 +405,17 @@ class Shell:
             user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
         if self.proc:
             try:
-                self.proc.wait(timeout=5)
+                self.proc.wait(timeout=1.2)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                # 脏文档会先弹右栏的「关闭提示」（P0-3），按 D = 不保存直接关闭。
+                # 干净文档在 1.2 秒内就已经退出，不会走到这里；真的连 D 都不理
+                # （面板都没起来）才 kill，不让超时把整轮目视拖垮。
+                if self.hwnd:
+                    self.press(ord("D"))
+                try:
+                    self.proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
         self.hwnd = None
         self.proc = None
 
@@ -1819,6 +1827,75 @@ def scene_clipboard(shell, checker):
                   "实测 %s" % (pixel(img, mid_x, mid_y),))
 
 
+def scene_close_prompt(shell, checker):
+    """
+    P0-3 关闭提示：脏文档关窗时必须出现右栏三选一（不是 MessageBox）。
+
+    为什么要截屏而不是读状态栏：这条功能的失败方式就是「弹了个阻塞对话框」或
+    「干脆什么也没问就退出了」。所以先量进程活没活，再量右栏像素有没有变
+    （面板真的画出来），最后量画布像素一点没动（取消 = 不改文档）。
+
+    断言：
+      1. 脏文档 post WM_CLOSE 后进程仍存活（没有静默丢弃，也没有把消息循环卡死）；
+      2. 右栏标题区像素变化（关闭提示真的画在面板里，而不是无提示）；
+      3. Esc 取消后进程仍存活、画布像素逐像素不变；
+      4. 再次 WM_CLOSE 后按 D（不保存），进程在 3 秒内退出。
+    """
+    scene = "close_prompt"
+    # 先量文档矩形：空文档是纯黑，detect_document_rect 可靠；填了颜色之后再量
+    # 就失去黑色外接框这个口径，所以顺序不能反。
+    left, top, right, bottom = shell.document_rect()
+    canvas = shell.layout["canvas"]
+
+    # 脏文档：形状工具铺一块橙色（图层像素变了，引擎的 dirty 才会置位）。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left + 30, top + 30, right - 30, bottom - 30, steps=8)
+    shell.wait(0.3)
+    before = shell.shot("45_close_prompt_before")
+
+    panel = shell.layout["adjust"]
+    title_rect = (panel[0] + 4, panel[1] + 4, panel[2] - 4, panel[1] + 120)
+
+    user32.PostMessageW(shell.hwnd, WM_CLOSE, 0, 0)
+    shell.wait(0.6)
+    alive_after_close = shell.proc.poll() is None
+    img = shell.shot("46_close_prompt_panel")
+    checker.check(scene, "脏文档关窗后进程仍存活（没有静默丢弃）", alive_after_close,
+                  "proc.poll=%s" % (shell.proc.poll(),))
+    changed = pixel_diff(img, before, title_rect, 24)
+    checker.check(scene, "关闭提示已绘制在右栏（标题区像素变化）", changed > 300,
+                  "变化像素 %d" % changed)
+
+    # Esc = 取消：窗口活着、画布一个像素都不许变。
+    shell.press(VK_ESCAPE)
+    shell.wait(0.4)
+    img_cancel = shell.shot("47_close_prompt_cancelled")
+    checker.check(scene, "Esc 取消后进程仍存活", shell.proc.poll() is None,
+                  "proc.poll=%s" % (shell.proc.poll(),))
+    canvas_changed = pixel_diff(img_cancel, before, canvas, 24)
+    checker.check(scene, "取消关闭不改画布像素", canvas_changed == 0,
+                  "画布变化像素 %d" % canvas_changed)
+
+    # 再关一次：D = 不保存，进程必须在 3 秒内退出（面板确认真的执行了）。
+    user32.PostMessageW(shell.hwnd, WM_CLOSE, 0, 0)
+    shell.wait(0.6)
+    prompt_again = shell.proc.poll() is None
+    if prompt_again:
+        shell.press(ord("D"))
+    exited = True
+    try:
+        shell.proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        exited = False
+    checker.check(scene, "按 D 不保存后进程退出（3 秒内）", exited,
+                  "proc.poll=%s" % (shell.proc.poll(),))
+    if exited:
+        shell.hwnd = None  # 窗口已销毁，stop() 不必再 post WM_CLOSE
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -1853,6 +1930,7 @@ SCENES = [    ("start", scene_start, ()),
     ("doc_dialog", scene_doc_dialog, ()),
     ("camera_raw", scene_camera_raw, ()),
     ("clipboard", scene_clipboard, ()),
+    ("close_prompt", scene_close_prompt, ()),
 ]
 
 

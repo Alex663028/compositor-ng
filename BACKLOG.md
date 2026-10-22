@@ -12,6 +12,8 @@
 > **同日第三批**：P0-4 剪贴板（复制 / 合并拷贝 / 剪切 / 粘贴 / 贴入选区 / 清除），
 > **唯一一处 ABI 尾部追加**（`comp_layer_get_pixels`，145 → **146**，仅用于把图层原始像素读出来做
 > 逐字节拷贝），视觉探针 91 → **97 条**（只追加 `clipboard` 场景）。
+> **同日第四批**：P0-3 关闭 / 退出前的未保存提示（**面板内**三选一，零 ABI 新增），
+> 视觉探针 97 → **102 条**（只追加 `close_prompt` 场景）。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -99,8 +101,20 @@
   - **标题栏脏标记**：`update_window_title` 每次 `present()` 读 `comp_document_is_dirty`
     （不是壳自己维护的副本），标题形如 `Compositor (Windows shell) - CPU - 未命名 *`；
     文本先与缓存比较，不变化就不 `SetWindowTextW`（避免每帧刷标题）。
-  - **关闭/退出提示仍未做**：刻意不用 `MessageBox`——自动化 `stop()` 是「post WM_CLOSE 后等 5 秒」，
-    阻塞式弹窗会让每次目视跑成超时；要做就得是**面板内**的三选一，属于独立一批。
+  - **关闭/退出提示（第四批已落地，2026-10-22）**：`WM_CLOSE` 先 `comp_document_is_dirty`，
+    脏则打开右栏的 `DocDialogKind::ClosePrompt` 面板（**不用 MessageBox**——自动化 `stop()` 是
+    「post WM_CLOSE 后等 5 秒」，阻塞式系统弹窗会把每次目视跑拖成超时，也没法用键盘脚本回答）。
+    - 行模型只一行「动作」，三档 = 保存并关闭 / 不保存直接关闭 / 取消（`ui_core.h`
+      `kCloseActionSave|Discard|Cancel`，默认停**保存**，回车即安全动作）。
+    - 键位：`S` 保存并关闭、`D` 不保存、`Esc` 取消；Tab/↑↓ 切档、←/→ 步进、回车执行仍照旧。
+    - 「不关窗除非真存下去」：有路径走 `save_document` 的返回值；无路径先弹「另存为」，
+      回来后**再查一次 dirty**（`comp_document_save` 成功内部会 `mark_dirty(false)`），
+      仍脏或路径为空就只关面板、窗口留着，状态栏报「未保存（另存为已取消），窗口未关闭」。
+    - 取消路径不改文档、不动撤销栈；提示开着时再点一次关闭键等于取消，不重置用户选的那一档。
+    - 与既有对话框共享渲染/键盘栈（`draw_doc_dialog`），只给 `ClosePrompt` 换固定键行文案；
+      其它文档对话框的关键字仍被吞掉，工具快捷键不会从提示底下穿过去。
+  - **仍有边界**：`文件 > 新建` / `文件 > 打开` 依然直接销毁旧文档、不提示（同一批没动，
+    属于多文档上下文问题，按原文仍是【架构】）；窗口很窄时右栏宽度塌成 0，提示只剩键盘路径。
   - 最近文件、多文档未做（多文档按原文仍是【架构】）。
 
 
@@ -167,7 +181,11 @@
 - **验收**：位深切换后 8 位像素逐字节不变；灰度转换有明确色度学口径与往返测试；非 sRGB 文档在 `.comp` 里有可识别的 profile 字段（追加）。
 
 ### P0-10 界面可用性基线：选项栏 / 光标预览 / HiDPI
-- **现状**：无工具选项栏——代码注释里作者自己写明「本壳没有选项栏」（`main.cpp:6824`、`:13263`）；画笔无尺寸/圆形光标预览（全文件未用 `IDC_CROSS`，只有箭头与手柄缩放光标）；`shells/windows` **没有 manifest、源码无 `SetProcessDpi*`**，高 DPI 屏由系统位图拉伸；面板不能浮动/合并（`docs/shell-parity.md` §5.11）。
+- **现状**：无工具选项栏——代码注释里作者自己写明「本壳没有选项栏」（`main.cpp:6824`、`:13263`）——参数只能从右栏面板或菜单改；
+  ~~画笔无尺寸/圆形光标预览~~ **已过时**：笔尖轮廓早就有了（`main.cpp:12663-12682`，
+  `comp_ui::tool_has_brush_tip` + `brush_tip_radius(brush_size, zoom)`，黑白双描边椭圆，随缩放变化），
+  这一项只剩「十字/隐藏光标模式」没做；`shells/windows` **没有 manifest、源码无 `SetProcessDpi*`**，
+  高 DPI 屏由系统位图拉伸；面板不能浮动/合并（`docs/shell-parity.md` §5.11）。
 - **PS 行为**：选项栏、笔刷大小光标、HiDPI 原生渲染、可停靠/浮动面板。
 - **性质**：【壳层】S（选项栏/光标）+ S（DPI awareness）+【架构】L（面板停靠系统）。
 - **验收**：200% 缩放下 1px 线条仍为 1 设备像素；触摸笔刷尺寸可见且不遮挡落点；窗口 resize 后布局不重叠。
@@ -292,8 +310,8 @@
 
 ## 8. 顺带记录的文档漂移（不属于功能缺口，但会误导排期）
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **145** 个（本次唯一化统计）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **91 条 / 19 场景**（2026-10-22 追加 `doc_dialog`、`camera_raw` 后；原 80 条含 IME 6/6）。
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **146** 个（尾部追加 `comp_layer_get_pixels` 之后）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **102 条 / 21 场景**（2026-10-22 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
 - §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
 
@@ -320,6 +338,6 @@
 | 组强制 Normal | `engine/format/comp_file.cpp:285` |
 | `.comp` 不存选区/路径/参考线 | `engine/format/comp_file.cpp:382-473` |
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
-| Camera Raw 无壳入口 | ABI 3 个导出；`shells/windows/src/*` 内 `camera` 0 命中；`docs/camera-raw.md:13-18` |
+| Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
-| 壳自检/视觉探针基线 | Hermes 2026-10-22 终验：257 项 failures=0、SHA256 `377de660…`；视觉探针 **91/91**（Claude 2026-10-22 追加 `doc_dialog`、`camera_raw` 后全量复核，257 项 SHA 未变） |
+| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-22 四批改动后逐字节复核未变）；视觉探针 **102/102 / 21 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`） |

@@ -5501,6 +5501,45 @@ FreeType）。
 一步撤销。自检 257 项与 SHA `377DE660D48AC933…` **未变**；`visual_check.py` 97 条 /
 20 场景 / **0 失败**，`crop` 场景 7 条连续复跑稳定。
 
+### 6.81 关闭 / 退出的未保存提示：右栏面板内三选一，不用 MessageBox（P0-3，2026-10-22，Claude）
+
+`WM_CLOSE` 此前是无条件 `DestroyWindow`：改了半天点右上角叉，修改连同撤销栈一起消失。
+本批把提示做成**面板内**的三选一，零 ABI 新增（仍 **146** 导出、既有签名一个没动）。
+
+- **为什么不是 `MessageBox`**：自动化 `stop()` 的收尾是「post WM_CLOSE 后等 1.2 秒，
+  超时再补一次按键，最后 kill」。阻塞式系统弹窗会把每次目视跑拖成超时，而且它不吃我们
+  注入的键盘脚本（`PostMessageW` 到主窗口的键不会进系统模态循环）。面板内提示则完全走
+  现有的 `DocDialogKind` 渲染/键盘栈：`draw_doc_dialog` 会画、`present()` 会刷、
+  截图探针量得到。
+- **复用行模型，只加一个枚举值**：`DocDialogKind::ClosePrompt` 的 `doc_dialog_row_count()`
+  是 1，唯一一行「动作」是 `DocRowKind::Choice`、`choice_count = 3`，取值
+  `kCloseActionSave(0) / Discard(1) / Cancel(2)`（`ui_core.h`，纯头文件常量，单测可测）。
+  默认停 **0 = 保存并关闭**，所以「回车」永远是安全动作；Tab/↑↓ 切行、←/→ 步进照旧。
+- **键位 `S` / `D`**：键盘模型里 `S` 保存并关闭、`D` 不保存直接关闭、`Esc` 取消。
+  两个字母键只在 `ClosePrompt` 下打开——其它文档对话框继续吞掉字母，工具快捷键
+  （C=裁剪、V=移动、B=画笔…）不会从提示底下穿过去。
+- **「不关窗，除非真存下去了」**：有路径 → `save_document()` 的返回值说了算；无路径 →
+  先弹 `save_document_dialog()`（另存为），回来后**再查一次** `comp_document_is_dirty`
+  （`comp_document_save` 成功时内部 `mark_dirty(false)`，所以这次复查就是"到底存没存"的
+  判据）。仍脏或路径为空只关面板、窗口留着，状态栏写「未保存（另存为已取消），窗口未关闭」；
+  磁盘写失败同理「保存失败，窗口未关闭」。
+- **取消真的不改东西**：`Esc` / 档位选「取消」只 `doc_dialog_close`，不碰文档也不动撤销栈；
+  提示开着时再点一次关闭键当作取消（不销毁窗口，也不重置用户已选的那一档）。
+- **共享渲染，键行改文案**：`draw_doc_dialog` 的三行固定键位提示对 `ClosePrompt` 换成
+  「S 保存并关闭 · D 不保存 / 回车执行当前动作 / Esc 取消（留在文档）」；`doc_dialog_hint`
+  写的是不重复的警示语「不保存 = 这次修改连同撤销栈一起丢弃」。其它对话框的像素一字未动。
+- **边界（如实记）**：`文件 > 新建` / `文件 > 打开` 仍然直接销毁旧文档、不提示（同一批没动，
+  本质是多文档上下文问题）；窗口太窄时右栏宽度塌成 0，提示只剩键盘路径可用。
+
+**验证。** 单测 **627 例 / 0 失败**（新增 `ui_core_close_prompt_rows`：行数/档位数/
+`min == Save && max == Cancel`/三档名字非空且互不相同/越界动作名与越界行都安全兜底）；
+`run_regression.py --require-ohos` **6/6**；壳自检 **257 项 failures=0、
+SHA256 `377DE660D48AC933…` 与基线逐字节一致**；`build_windows_shell.py` 零警告；
+`check_tool_table.py` PASS（20 个工具）；`visual_check.py` **102 条 / 21 场景 / 0 失败**——
+新增 `close_prompt` 场景 5 条：脏文档 post WM_CLOSE 后进程仍活着、右栏标题区变化 8046 像素、
+`Esc` 后仍活着、取消不改画布（`pixel_diff == 0`）、按 `D` 后 3 秒内退出。
+同时 `stop()` 学会在脏文档上补一个 `D`（其它场景不再为这个提示白等超时）。
+
 
 
 

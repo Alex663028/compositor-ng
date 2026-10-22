@@ -4379,6 +4379,9 @@ inline double curve_eval(const double* points_xy, int count, double x) {
  *   - 图像大小：comp_document_resize_image（整篇重采样）；
  *   - 画布大小：comp_txn_begin + comp_layer_set_transform + comp_document_set_size；
  *   - 历史容量：comp_document_set_history_limit / set_history_budget。
+ *
+ * 关闭提示（ClosePrompt，P0-3）也吃这套行模型，但它只有一行「动作」，没有数值：
+ * 目的不是填参数，而是**把模态确认放进右栏面板**，让自动化能按 D 回答。
  */
 enum class DocDialogKind {
   None = 0,
@@ -4392,7 +4395,16 @@ enum class DocDialogKind {
    * 值本身不回读（ABI 没有 settings getter，且滤镜是破坏性的），每次打开都从
    * 上游缺省值起算；这是如实反映引擎契约，不是取巧。
    */
-  CameraRaw
+  CameraRaw,
+  /*
+   * P0-3：关闭 / 退出前的未保存提示。行模型里只有一个「动作」枚举行，
+   * 三档 = 保存并关闭 / 不保存直接关闭 / 取消。
+   *
+   * **刻意不用 MessageBox**：自动化 `stop()` 是「post WM_CLOSE 后等一会儿，
+   * 没退就补一个键」，系统模态弹窗既不吃注入的键、又会把每次目视跑拖成超时。
+   * 放进右栏面板后它和别的文档级对话框共用同一套键位与命中，脚本按 D 即可。
+   */
+  ClosePrompt
 };
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
@@ -4422,6 +4434,23 @@ inline constexpr int kDocHistoryBudgetMaxMb = 16384;
  */
 inline constexpr int kCameraRawRowCount = 12;
 inline constexpr int kCameraRawExposureMax = 500;
+
+/*
+ * 关闭提示的三个动作。行值直接就是这三个常量：面板显示、状态栏、执行分支读同
+ * 一份数，不会出现「显示保存、实际丢弃」。缺省 = 保存（与 PS 的默认按钮同侧）。
+ */
+inline constexpr int kCloseActionSave = 0;
+inline constexpr int kCloseActionDiscard = 1;
+inline constexpr int kCloseActionCancel = 2;
+
+inline const char* doc_close_action_name(int action) {
+  switch (action) {
+    case kCloseActionSave: return "保存并关闭";
+    case kCloseActionDiscard: return "不保存，直接关闭";
+    case kCloseActionCancel: return "取消（留在文档）";
+    default: return "?";
+  }
+}
 
 inline int clamp_doc_size(int value) {
   if (value < kDocSizeMin) return kDocSizeMin;
@@ -4459,6 +4488,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "历史记录容量（History）";
     case DocDialogKind::CameraRaw:
       return "Camera Raw 滤镜（Camera Raw Filter）";
+    case DocDialogKind::ClosePrompt:
+      return "关闭文档（Close）";
     default:
       return "";
   }
@@ -4476,6 +4507,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "0 = 引擎默认（200 步 / 512 MiB）";
     case DocDialogKind::CameraRaw:
       return "对选中图层整层写入（Basic 组；一步撤销）";
+    case DocDialogKind::ClosePrompt:
+      return "文档有未保存的修改 · 关闭前请选择";
     default:
       return "";
   }
@@ -4493,6 +4526,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "Tab 切行 · 0 = 默认 · 回车应用";
     case DocDialogKind::CameraRaw:
       return "Tab 切行 · 负值用 - 开头 · 回车应用";
+    case DocDialogKind::ClosePrompt:
+      return "不保存 = 这次修改连同撤销栈一起丢弃";
     default:
       return "";
   }
@@ -4510,6 +4545,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
       return 2; /* 步数上限 / 内存上限 */
     case DocDialogKind::CameraRaw:
       return kCameraRawRowCount;
+    case DocDialogKind::ClosePrompt:
+      return 1; /* 动作 */
     default:
       return 0;
   }
@@ -4572,6 +4609,11 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
         case 10: return DocRowSpec{"饱和度", DocRowKind::Number, -100, 100, 5, 0};
         case 11: return DocRowSpec{"去雾", DocRowKind::Number, -100, 100, 5, 0};
         default: break;
+      }
+      break;
+    case DocDialogKind::ClosePrompt:
+      if (row == 0) {
+        return DocRowSpec{"动作", DocRowKind::Choice, 0, 2, 1, 3};
       }
       break;
     default:
