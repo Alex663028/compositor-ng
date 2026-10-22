@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include <compositor/comp_camera_raw.h>
 #include <compositor/comp_canvas.h>
 #include <compositor/comp_command.h>
 #include <compositor/comp_core.h>
@@ -187,6 +188,12 @@ constexpr UINT kCmdSaveAs = 1561;            /* 文件 > 另存为…（Ctrl+Alt
 constexpr UINT kCmdImageSize = 1562;         /* 图像 > 图像大小…（Ctrl+Alt+I） */
 constexpr UINT kCmdCanvasSize = 1563;        /* 图像 > 画布大小…（Ctrl+Alt+C） */
 constexpr UINT kCmdHistorySettings = 1564;   /* 编辑 > 历史记录容量… */
+/*
+ * P1-5 Camera Raw：引擎侧的三个导出（表加载 / 是否已加载 / 应用）自 §6.36
+ * 就在，外壳 0 处调用——763 张实测表与整条管线用户完全拿不到。这条入口
+ * 只是把已有能力接到菜单上，不新增 ABI。
+ */
+constexpr UINT kCmdCameraRaw = 1565; /* 滤镜 > Camera Raw 滤镜…（Ctrl+Alt+R） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -434,6 +441,17 @@ struct ShellState {
   int new_doc_height = kDefaultHeight;
   int new_doc_dpi = 72;
   int new_doc_background = 1;
+  /*
+   * P1-5 Camera Raw（帧内值，不跨文档保存）。ABI 没有 settings 回读口，滤镜又是
+   * 破坏性的（直接写整层像素），所以这里**不是**文档状态的第二份拷贝：它是本次
+   * 面板草稿，回车写进像素后即失效。每次打开都归零 = 从上游缺省值起算。
+   */
+  int camera_raw_values[comp_ui::kCameraRawRowCount] = {};
+  /*
+   * 763 张实测表只在启动时加载一次（引擎级共享只读资源）。为 false 时面板照样
+   * 能打开看量程，但回车会如实报「表未加载」——不静默降级成另一套观感。
+   */
+  bool camera_raw_tables_loaded = false;
   /*
    * 标题栏的「文件 + 脏标记」来源。读盘时引擎没有 dpi getter，document_dpi 只记
    * 新建时写入的值，0 = 未知（标题里省略，不瞎猜 72）。
@@ -6192,6 +6210,63 @@ bool load_shell_font(ShellState& shell) {
   return true;
 }
 
+/* ------------------------------------------------------- Camera Raw 实测表（P1-5） */
+
+/*
+ * 表是引擎级共享的只读资源（CRT4 = 10 字节头 + zlib 流，763 张 17³ 实测网格，
+ * 随仓 1.78 MB），一次加载、所有文档复用。缺文件不算启动失败：滤镜菜单照常
+ * 出现，打开面板时才如实报「色彩表未加载」，总比整个壳起不来强。
+ */
+const wchar_t* kCameraRawTableFileName = L"camera_raw_tables.bin";
+
+bool read_whole_file(const std::wstring& path, std::vector<uint8_t>* out) {
+  if (out == nullptr) return false;
+  out->clear();
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"rb") != 0 || file == nullptr) return false;
+  bool ok = false;
+  if (std::fseek(file, 0, SEEK_END) == 0) {
+    const long size = std::ftell(file);
+    if (size > 0 && std::fseek(file, 0, SEEK_SET) == 0) {
+      out->resize(static_cast<size_t>(size));
+      ok = std::fread(out->data(), 1, out->size(), file) == out->size();
+    }
+  }
+  std::fclose(file);
+  if (!ok) out->clear();
+  return ok;
+}
+
+bool load_shell_camera_raw_tables(ShellState& shell) {
+  shell.camera_raw_tables_loaded = false;
+  if (shell.engine == nullptr) return false;
+  /* 表是引擎级共享资源：同一进程里只解码一次，重复调用不重读 1.78 MB。 */
+  int32_t already = 0;
+  if (comp_engine_camera_raw_tables_loaded(shell.engine, &already) == COMP_OK && already != 0) {
+    shell.camera_raw_tables_loaded = true;
+    return true;
+  }
+  std::vector<std::wstring> candidates;
+  const std::wstring exe_dir = exe_directory();
+  if (!exe_dir.empty()) {
+    candidates.push_back(exe_dir + L"\\resources\\" + kCameraRawTableFileName);
+    candidates.push_back(exe_dir + L"\\..\\resources\\" + kCameraRawTableFileName);
+  }
+  candidates.push_back(std::wstring(L"resources\\") + kCameraRawTableFileName);
+
+  for (const std::wstring& wide : candidates) {
+    std::vector<uint8_t> data;
+    if (!read_whole_file(wide, &data)) continue;
+    /* 坏表不覆盖引擎里已有的表（ABI 契约）：继续试下一个候选。 */
+    if (comp_engine_load_camera_raw_tables(shell.engine, data.data(), data.size()) != COMP_OK) {
+      continue;
+    }
+    shell.camera_raw_tables_loaded = true;
+    return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------------------ 文字属性面板（S14） */
 
 /*
@@ -8495,6 +8570,9 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
         case 1: return shell.doc_dialog_budget_mb;
         default: return 0;
       }
+    case comp_ui::DocDialogKind::CameraRaw:
+      if (row < 0 || row >= comp_ui::kCameraRawRowCount) return 0;
+      return shell.camera_raw_values[row];
     default:
       return 0;
   }
@@ -8576,6 +8654,17 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         default: break;
       }
       break;
+    case comp_ui::DocDialogKind::CameraRaw:
+      if (row < 0 || row >= comp_ui::kCameraRawRowCount) break;
+      /* 夹取区间取自行规格本身：量程改了这里不用跟着改，引擎侧不会收到越界值。 */
+      {
+        const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc_dialog, row);
+        int clamped = value;
+        if (clamped < spec.min) clamped = spec.min;
+        if (clamped > spec.max) clamped = spec.max;
+        shell.camera_raw_values[row] = clamped;
+      }
+      break;
     default:
       break;
   }
@@ -8622,6 +8711,21 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
         wsprintfW(buffer, L"%d MiB", value);
       }
       return buffer;
+    case comp_ui::DocDialogKind::CameraRaw: {
+      /*
+       * wsprintfW（user32）**不支持浮点格式**——P0-3 的曲线面板曾因此在 %f 上崩。
+       * 曝光按整数拆成「元/角分」两段拼，既避开 %f，也保证显示与写进 JSON 的
+       * 数值同源（都是同一个 0.01 EV 整数）。
+       */
+      if (comp_ui::camera_raw_row_is_exposure(row)) {
+        const int magnitude = value < 0 ? -value : value;
+        wsprintfW(buffer, L"%s%d.%02d EV", value < 0 ? L"-" : L"+", magnitude / 100,
+                  magnitude % 100);
+      } else {
+        wsprintfW(buffer, value > 0 ? L"+%d" : L"%d", value);
+      }
+      return buffer;
+    }
     default:
       return L"";
   }
@@ -8638,6 +8742,21 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   if (kind != comp_ui::DocDialogKind::NewDocument && shell.document == nullptr) {
     set_status(shell, L"文档：还没有打开任何文档");
     return;
+  }
+  /*
+   * Camera Raw 是**图层级**的破坏性操作，入口条件比文档级对话框多两条：
+   * 必须有目标图层，且引擎手里得有实测表（否则 comp_camera_raw_apply 只会回
+   * COMP_ERR_STATE）。两者都在打开前查清，用户不会白填一轮参数才被拒。
+   */
+  if (kind == comp_ui::DocDialogKind::CameraRaw) {
+    if (selected_layer_id(shell) == 0) {
+      set_status(shell, L"Camera Raw：请先在图层面板选中一个图层");
+      return;
+    }
+    if (!shell.camera_raw_tables_loaded) {
+      set_status(shell, L"Camera Raw：色彩表未加载（缺 resources/camera_raw_tables.bin）");
+      return;
+    }
   }
   /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围互斥）。 */
   if (shell.color_range_open) color_range_cancel(shell);
@@ -8682,6 +8801,16 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       /* ABI 没有 limit/budget 的 getter：0 = 引擎默认，回显如实写 0。 */
       shell.doc_dialog_steps = 0;
       shell.doc_dialog_budget_mb = 0;
+      break;
+    case comp_ui::DocDialogKind::CameraRaw:
+      /*
+       * ABI 同样没有「读回某图层当前 Camera Raw 参数」的 getter 级入口（设置是
+       * 破坏性写进像素的，不留在图层上）。面板因此是**草稿**：每次打开归零，
+       * 副标题已如实写明「对选中图层整层写入」。
+       */
+      for (int row = 0; row < comp_ui::kCameraRawRowCount; ++row) {
+        shell.camera_raw_values[row] = 0;
+      }
       break;
     default:
       break;
@@ -8735,6 +8864,11 @@ void doc_dialog_begin_input(ShellState& shell, wchar_t character) {
   const comp_ui::DocRowSpec spec =
       comp_ui::doc_dialog_row(shell.doc_dialog, shell.doc_dialog_focus);
   if (spec.kind != comp_ui::DocRowKind::Number) return;
+  /*
+   * 负号（Camera Raw 的大部分行）：只许出现在**负值区间**的行的**行首**。
+   * 其它位置直接忽略——若把 '-' 当噪声跳过，"-5" 会静默变成 +5，那是最坏的失败方式。
+   */
+  if (character == L'-' && (spec.min >= 0 || !shell.doc_dialog_input.empty())) return;
   /* 30000 / 16384 / 10000 都是五位；六位只可能是误按，留着没意义。 */
   if (shell.doc_dialog_input.size() >= 5) return;
   shell.doc_dialog_input.push_back(character);
@@ -8747,10 +8881,18 @@ void doc_dialog_commit_input(ShellState& shell) {
   if (shell.doc_dialog_input.empty()) return;
   const int row = shell.doc_dialog_focus;
   const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc_dialog, row);
+  bool negative = false;
+  size_t digits_from = 0;
+  if (shell.doc_dialog_input[0] == L'-') {
+    negative = true;
+    digits_from = 1;
+  }
   int value = 0;
-  for (const wchar_t character : shell.doc_dialog_input) {
+  for (size_t index = digits_from; index < shell.doc_dialog_input.size(); ++index) {
+    const wchar_t character = shell.doc_dialog_input[index];
     if (character >= L'0' && character <= L'9') value = value * 10 + (character - L'0');
   }
+  if (negative) value = -value;
   shell.doc_dialog_input.clear();
   if (spec.kind != comp_ui::DocRowKind::Number) return;
   /* 键入值按行的合法区间夹取（0 在历史两项里是合法值「引擎默认」）。 */
@@ -8926,6 +9068,50 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
     doc_dialog_close(shell, nullptr);
     wchar_t buffer[192];
     wsprintfW(buffer, L"历史容量：%d 步 / %d MiB", steps, shell.doc_dialog_budget_mb);
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  if (kind == comp_ui::DocDialogKind::CameraRaw) {
+    const comp_layer_id target = selected_layer_id(shell);
+    if (target == 0) {
+      doc_dialog_close(shell, L"Camera Raw：目标图层已不存在");
+      return;
+    }
+    /*
+     * 只把**非零**行写进 JSON：0 就是上游缺省值，省掉它们让「设置等于默认」
+     * 干干净净地变成 "{}"——引擎据此回 changed=0、不开事务（见 comp_camera_raw.h
+     * 的恒等契约）。键名与缺省判定都在 ui_core.h 里单测过，引擎对未知键是硬拒绝。
+     */
+    const std::string settings = comp_ui::camera_raw_settings_json(
+        shell.camera_raw_values, comp_ui::kCameraRawRowCount);
+    int32_t changed = 0;
+    char note[256] = {0};
+    size_t note_size = 0;
+    const comp_result result = comp_camera_raw_apply(
+        shell.document, target, settings.c_str(), 1.0, /*seed=*/0u, &changed, note, sizeof(note),
+        &note_size);
+    if (result != COMP_OK) {
+      /* 面板留着，用户改的参数不丢；last_error 由 set_status 附带。 */
+      set_status(shell, L"Camera Raw：应用失败（图层未改动）");
+      return;
+    }
+    if (changed == 0) {
+      set_status(shell, settings == "{}" ? L"Camera Raw：设置等于默认值，像素未改动（未产生撤销步）"
+                                         : L"Camera Raw：像素未改动（未产生撤销步）");
+      return;
+    }
+    shell.needs_render = true;
+    refresh_layers(shell);
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[384];
+    if (note[0] != '\0') {
+      note[sizeof(note) - 1] = '\0';
+      wsprintfW(buffer, L"Camera Raw：已应用到选中图层（%s）",
+                widen_utf8(note).c_str());
+    } else {
+      wsprintfW(buffer, L"Camera Raw：已应用到选中图层");
+    }
     refresh_history_status(shell, buffer);
     return;
   }
@@ -9146,6 +9332,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     /* ---- 编辑 > 历史记录容量… ---- */
     case kCmdHistorySettings:
       doc_dialog_begin(shell, comp_ui::DocDialogKind::HistoryLimit);
+      break;
+    /* ---- 滤镜 > Camera Raw 滤镜… ---- */
+    case kCmdCameraRaw:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::CameraRaw);
       break;
     case kCmdOpenImage:
       open_image_dialog(window, shell);
@@ -13096,6 +13286,10 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         default:
           break;
       }
+      if (key == VK_OEM_MINUS || key == VK_SUBTRACT) {
+        doc_dialog_begin_input(shell, L'-');
+        return;
+      }
       if (key >= '0' && key <= '9') {
         doc_dialog_begin_input(shell, static_cast<wchar_t>(key));
         return;
@@ -13119,9 +13313,24 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         doc_dialog_focus_row(shell, 1);
         return;
       case VK_LEFT:
-      case VK_OEM_MINUS:
         doc_dialog_step(shell, -1);
         return;
+      case VK_OEM_MINUS:
+      case VK_SUBTRACT: {
+        /*
+         * 允许负值的行（Camera Raw）：'-' 起输入，而不是步进 -1——否则负值只能
+         * 靠长按左箭头从 0 数下去。这些行仍可用 LEFT 步进，减号键被借用不算
+         * 丢能力；其它对话框 min >= 0，行为保持原样。
+         */
+        const comp_ui::DocRowSpec spec =
+            comp_ui::doc_dialog_row(shell.doc_dialog, shell.doc_dialog_focus);
+        if (spec.kind == comp_ui::DocRowKind::Number && spec.min < 0) {
+          doc_dialog_begin_input(shell, L'-');
+          return;
+        }
+        doc_dialog_step(shell, -1);
+        return;
+      }
       case VK_RIGHT:
       case VK_OEM_PLUS:
         doc_dialog_step(shell, 1);
@@ -15315,9 +15524,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       /*
-       * Ctrl+Alt+N / S / I / C：新建文档… / 另存为… / 图像大小… / 画布大小…
-       * 放在 Alt 组合里是因为 Ctrl+N、Ctrl+S、Ctrl+I 各自已被占用（即时新建 /
-       * 保存 / 反相），不带 Alt 就会改掉既有手感；Ctrl+Shift+S 也已被导出占用。
+       * Ctrl+Alt+N / S / I / C / R：新建文档… / 另存为… / 图像大小… / 画布大小… /
+       * Camera Raw…
+       * 放在 Alt 组合里是因为 Ctrl+N、Ctrl+S、Ctrl+I、Ctrl+R（旋转 90°）各自
+       * 已被占用，不带 Alt 就会改掉既有手感；Ctrl+Shift+S 也已被导出占用。
        */
       if (shell != nullptr) {
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -15328,6 +15538,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             case 'S': command = kCmdSaveAs; break;
             case 'I': command = kCmdImageSize; break;
             case 'C': command = kCmdCanvasSize; break;
+            case 'R': command = kCmdCameraRaw; break;
             default: break;
           }
           if (command != 0) {
@@ -15768,6 +15979,9 @@ HMENU build_menu() {
 
   /* 滤镜菜单与面板参数表共用 ui_core.h 的 filter_table（量程与 comp_filter.h 对齐）。 */
   HMENU filter_menu = CreatePopupMenu();
+  /* P1-5：Camera Raw 是图层级破坏性滤镜，位置与 PS 一致放在滤镜菜单最上面。 */
+  AppendMenuW(filter_menu, MF_STRING, kCmdCameraRaw, L"Camera Raw 滤镜…(&C)\tCtrl+Alt+R");
+  AppendMenuW(filter_menu, MF_SEPARATOR, 0, nullptr);
   for (int i = 0; i < comp_ui::filter_count(); ++i) {
     const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(i);
     if (spec == nullptr) continue;
@@ -18401,6 +18615,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   if (shell.backend != COMP_BACKEND_CPU) {
     set_status(shell, L"引擎后端已启用硬件加速");
   }
+  /* P1-5：镜头校正的 763 张实测表在启动时加载（缺文件不阻断启动，见函数注释）。 */
+  load_shell_camera_raw_tables(shell);
 
   const wchar_t* class_name = L"CompositorShellWindow";
   WNDCLASSEXW window_class{};

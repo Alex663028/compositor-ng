@@ -1682,6 +1682,73 @@ def scene_doc_dialog(shell, checker):
                   changed > 500, "变化像素 %d" % changed)
 
 
+def scene_camera_raw(shell, checker):
+    """
+    P1-5 Camera Raw 滤镜入口：面板 -> 曝光真写进像素 -> 一步撤销 -> 负号键入。
+
+    为什么用中性灰做底：曝光是线性光乘 2^EV，灰色在中段，+1 EV 与 -1 EV 都会
+    明显朝两个方向分开（约 128 -> 176 / 92），不会像黑白两端那样撞上限或钳到 0。
+    断言量的是灰块中心一块区域的平均色，不是整屏截图观感：
+      1. 画一个 #808080 矩形，确认底子确实是中性灰；
+      2. Ctrl+Alt+R 打开面板（右栏像素必须变过，证明真开了）；
+      3. 曝光行键入 100（= +1.00 EV）回车 -> 灰块变亮；
+      4. Ctrl+Z -> 回到曝光前的平均色（一步撤销，不是两次）；
+      5. 重开面板键入 -100 -> 灰块变暗（负号能起输入，没有被当成步进 -1）。
+    """
+    scene = "camera_raw"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("808080")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    x0, y0 = left + 30, top + 30
+    x1, y1 = right - 30, bottom - 30
+    shell.drag(x0, y0, x1, y1, steps=10)
+    img = shell.shot("40_camera_raw_before")
+    region = ((x0 + x1) // 2 - 20, (y0 + y1) // 2 - 20,
+              (x0 + x1) // 2 + 20, (y0 + y1) // 2 + 20)
+    before = mean_rgb(img, region)
+    checker.check(scene, "前置：画布上有中性灰图层",
+                  90 < brightness(before) < 160, "灰块平均 %s" % (before,))
+
+    panel = shell.layout["adjust"]
+    panel_title = (panel[0] + 4, panel[1] + 4, panel[2] - 4, panel[1] + 120)
+    before_panel = shell.capture()
+    shell.press(ord("R"), ctrl=True, alt=True)
+    img_open = shell.shot("41_camera_raw_panel")
+    changed = pixel_diff(img_open, before_panel, panel_title, 24)
+    checker.check(scene, "Ctrl+Alt+R 打开 Camera Raw 面板（右栏像素变化）",
+                  changed > 300, "变化像素 %d" % changed)
+
+    shell.type_text("100")       # 曝光 +1.00 EV
+    shell.press(VK_RETURN)
+    shell.wait(0.6)
+    img = shell.shot("42_camera_raw_exposure_up")
+    brighter = mean_rgb(img, region)
+    checker.check(scene, "曝光 +1.00 EV 后灰块变亮",
+                  brightness(brighter) > brightness(before) + 20,
+                  "曝光后 %s 原 %s" % (brighter, before))
+
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.5)
+    img = shell.shot("43_camera_raw_undo")
+    undone = mean_rgb(img, region)
+    checker.check(scene, "一步撤销回到曝光前的像素",
+                  abs(brightness(undone) - brightness(before)) <= 3,
+                  "撤销后 %s 原 %s" % (undone, before))
+
+    shell.press(ord("R"), ctrl=True, alt=True)
+    shell.type_text("-100")      # 负号起输入 -> 曝光 -1.00 EV
+    shell.press(VK_RETURN)
+    shell.wait(0.6)
+    img = shell.shot("44_camera_raw_exposure_down")
+    darker = mean_rgb(img, region)
+    checker.check(scene, "负号键入生效：曝光 -1.00 EV 使灰块变暗",
+                  brightness(darker) < brightness(before) - 15,
+                  "曝光后 %s 原 %s" % (darker, before))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -1714,6 +1781,7 @@ SCENES = [    ("start", scene_start, ()),
     ("image_io", scene_image_io, ("import_probe.png",)),
     ("crop", scene_crop, ()),
     ("doc_dialog", scene_doc_dialog, ()),
+    ("camera_raw", scene_camera_raw, ()),
 ]
 
 

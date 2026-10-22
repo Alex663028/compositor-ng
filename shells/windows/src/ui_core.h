@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 
@@ -4379,7 +4380,20 @@ inline double curve_eval(const double* points_xy, int count, double x) {
  *   - 画布大小：comp_txn_begin + comp_layer_set_transform + comp_document_set_size；
  *   - 历史容量：comp_document_set_history_limit / set_history_budget。
  */
-enum class DocDialogKind { None = 0, NewDocument, ImageSize, CanvasSize, HistoryLimit };
+enum class DocDialogKind {
+  None = 0,
+  NewDocument,
+  ImageSize,
+  CanvasSize,
+  HistoryLimit,
+  /*
+   * P1-5：Camera Raw 面板复用同一套行模型与键盘/命中通路，但它是**图层级**
+   * 而非文档级的——回车把整层像素按设置跑一遍相机管线（一步撤销），Esc 不改。
+   * 值本身不回读（ABI 没有 settings getter，且滤镜是破坏性的），每次打开都从
+   * 上游缺省值起算；这是如实反映引擎契约，不是取巧。
+   */
+  CameraRaw
+};
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
 
@@ -4402,6 +4416,12 @@ inline constexpr int kDocDpiMax = 2400;
 inline constexpr int kDocHistoryStepsMax = 2000;
 /* 历史内存预算：0 = 引擎默认 512 MiB；界面上按 MiB 显示，上限 16 GiB。 */
 inline constexpr int kDocHistoryBudgetMaxMb = 16384;
+/*
+ * Camera Raw 面板的行数（Basic 组十二项）。曝光用 0.01 EV 的整数近似，
+ * -500..500 对应 docs/camera-raw.md §3.1 的 -5..5 档。
+ */
+inline constexpr int kCameraRawRowCount = 12;
+inline constexpr int kCameraRawExposureMax = 500;
 
 inline int clamp_doc_size(int value) {
   if (value < kDocSizeMin) return kDocSizeMin;
@@ -4437,6 +4457,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "画布大小（Canvas Size）";
     case DocDialogKind::HistoryLimit:
       return "历史记录容量（History）";
+    case DocDialogKind::CameraRaw:
+      return "Camera Raw 滤镜（Camera Raw Filter）";
     default:
       return "";
   }
@@ -4452,6 +4474,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "改画布并按锚点平移内容；裁剪不可恢复";
     case DocDialogKind::HistoryLimit:
       return "0 = 引擎默认（200 步 / 512 MiB）";
+    case DocDialogKind::CameraRaw:
+      return "对选中图层整层写入（Basic 组；一步撤销）";
     default:
       return "";
   }
@@ -4467,6 +4491,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "Tab 切行 · ←/→ 循环锚点 · 回车应用";
     case DocDialogKind::HistoryLimit:
       return "Tab 切行 · 0 = 默认 · 回车应用";
+    case DocDialogKind::CameraRaw:
+      return "Tab 切行 · 负值用 - 开头 · 回车应用";
     default:
       return "";
   }
@@ -4482,6 +4508,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
       return 3; /* 宽 / 高 / 锚点 */
     case DocDialogKind::HistoryLimit:
       return 2; /* 步数上限 / 内存上限 */
+    case DocDialogKind::CameraRaw:
+      return kCameraRawRowCount;
     default:
       return 0;
   }
@@ -4522,6 +4550,27 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
         case 1:
           return DocRowSpec{"内存上限 (MiB)", DocRowKind::Number, 0,
                             kDocHistoryBudgetMaxMb, 64, 0};
+        default: break;
+      }
+      break;
+    case DocDialogKind::CameraRaw:
+      switch (row) {
+        /* 曝光以 0.01 EV 为整数单位（-500..500 即 -5.00..+5.00），面板只收整数，
+         * 写 JSON 时才除以 100——与 docs/camera-raw.md §3.1 的量程逐项对齐。 */
+        case 0:
+          return DocRowSpec{"曝光 (0.01 EV)", DocRowKind::Number, -kCameraRawExposureMax,
+                            kCameraRawExposureMax, 5, 0};
+        case 1: return DocRowSpec{"色温", DocRowKind::Number, -100, 100, 5, 0};
+        case 2: return DocRowSpec{"色调", DocRowKind::Number, -100, 100, 5, 0};
+        case 3: return DocRowSpec{"对比", DocRowKind::Number, -100, 100, 5, 0};
+        case 4: return DocRowSpec{"高光", DocRowKind::Number, -100, 100, 5, 0};
+        case 5: return DocRowSpec{"阴影", DocRowKind::Number, -100, 100, 5, 0};
+        case 6: return DocRowSpec{"白色", DocRowKind::Number, -100, 100, 5, 0};
+        case 7: return DocRowSpec{"黑色", DocRowKind::Number, -100, 100, 5, 0};
+        case 8: return DocRowSpec{"清晰度", DocRowKind::Number, -100, 100, 5, 0};
+        case 9: return DocRowSpec{"鲜艳度", DocRowKind::Number, -100, 100, 5, 0};
+        case 10: return DocRowSpec{"饱和度", DocRowKind::Number, -100, 100, 5, 0};
+        case 11: return DocRowSpec{"去雾", DocRowKind::Number, -100, 100, 5, 0};
         default: break;
       }
       break;
@@ -4616,6 +4665,65 @@ inline int doc_dialog_row_at(const Rect& panel, int row_count, double x, double 
   const int row = static_cast<int>(std::floor(local / static_cast<double>(kDocDialogRowHeight)));
   if (row < 0 || row >= row_count) return -1;
   return row;
+}
+
+/*
+ * Camera Raw 行的 JSON 键：与 `docs/camera-raw.md` §3.1 的字段名逐字一致。
+ * 拼错一个键引擎就整条拒绝（COMP_ERR_INVALID_ARGUMENT，未知键不忽略），
+ * 所以键表放在 UI 核里由单元测试钉住，而不是散落在壳的拼串代码里。
+ */
+inline const char* camera_raw_row_key(int row) {
+  switch (row) {
+    case 0: return "exposure";
+    case 1: return "temperature";
+    case 2: return "tint";
+    case 3: return "contrast";
+    case 4: return "highlights";
+    case 5: return "shadows";
+    case 6: return "whites";
+    case 7: return "blacks";
+    case 8: return "clarity";
+    case 9: return "vibrance";
+    case 10: return "saturation";
+    case 11: return "dehaze";
+    default: return nullptr;
+  }
+}
+
+/* 曝光行在 JSON 里是小数：面板整数单位是 0.01 EV，写出去要除以 100。 */
+inline bool camera_raw_row_is_exposure(int row) { return row == 0; }
+
+/*
+ * 面板值 -> 设置 JSON。**只写非零字段**：零就是上游缺省，写不写等价；
+ * 少写几个键既缩短字符串，也让「恒等设置」自然得到 "{}"（引擎据此
+ * 不开事务、不动像素，out_changed = 0）。
+ *
+ * 数值格式刻意固定两位小数（曝光）与十进制整数（其余），由单元测试逐字钉住
+ * ——JSON 是跨语言边界，格式漂移比逻辑漂移更难在运行时发现。
+ */
+inline std::string camera_raw_settings_json(const int* values, int count) {
+  std::string json = "{";
+  bool first = true;
+  for (int row = 0; row < count && row < kCameraRawRowCount; ++row) {
+    if (values == nullptr || values[row] == 0) continue;
+    const char* key = camera_raw_row_key(row);
+    if (key == nullptr) continue;
+    char number[32];
+    if (camera_raw_row_is_exposure(row)) {
+      std::snprintf(number, sizeof(number), "%.2f",
+                    static_cast<double>(values[row]) / 100.0);
+    } else {
+      std::snprintf(number, sizeof(number), "%d", values[row]);
+    }
+    if (!first) json += ',';
+    first = false;
+    json += '"';
+    json += key;
+    json += "\":";
+    json += number;
+  }
+  json += '}';
+  return json;
 }
 
 }  // namespace comp_ui

@@ -3872,6 +3872,75 @@ COMP_TEST(ui_core_doc_dialog_rows) {
   COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 0, panel.x + 10.0, first_y) == -1);
 }
 
+/*
+ * P1-5 Camera Raw 面板：行序 + JSON 生成。
+ *
+ * JSON 键名必须是**引擎认识的 camelCase**（未知键是 COMP_ERR_INVALID_ARGUMENT，
+ * 不是忽略），所以这里把 12 个键逐字钉死；数值只写非零行、曝光除以 100 写成
+ * 带两位小数的 EV，是全零 → "{}"（恒等设置、不产生撤销步）的前提。
+ */
+COMP_TEST(ui_core_camera_raw_rows) {
+  using comp_ui::DocDialogKind;
+  using comp_ui::DocRowKind;
+
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::CameraRaw) ==
+             comp_ui::kCameraRawRowCount);
+  COMP_CHECK(comp_ui::kCameraRawRowCount == 12);
+
+  /* 行 0 是曝光（0.01 EV 整数单位），其余 11 行都是 ±100 的整数档。 */
+  const comp_ui::DocRowSpec exposure = comp_ui::doc_dialog_row(DocDialogKind::CameraRaw, 0);
+  COMP_CHECK(exposure.kind == DocRowKind::Number);
+  COMP_CHECK(exposure.min == -comp_ui::kCameraRawExposureMax);
+  COMP_CHECK(exposure.max == comp_ui::kCameraRawExposureMax);
+  COMP_CHECK(comp_ui::camera_raw_row_is_exposure(0));
+  for (int row = 1; row < comp_ui::kCameraRawRowCount; ++row) {
+    const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(DocDialogKind::CameraRaw, row);
+    COMP_CHECK(spec.kind == DocRowKind::Number);
+    COMP_CHECK(spec.min == -100 && spec.max == 100);
+    COMP_CHECK(!comp_ui::camera_raw_row_is_exposure(row));
+  }
+
+  /* 键名与行号一一对应，且互不重复（重复会写出两份同名键）。 */
+  COMP_CHECK(std::string(comp_ui::camera_raw_row_key(0)) == "exposure");
+  COMP_CHECK(std::string(comp_ui::camera_raw_row_key(1)) == "temperature");
+  COMP_CHECK(std::string(comp_ui::camera_raw_row_key(11)) == "dehaze");
+  COMP_CHECK(comp_ui::camera_raw_row_key(12) == nullptr);
+  COMP_CHECK(comp_ui::camera_raw_row_key(-1) == nullptr);
+  for (int row = 0; row < comp_ui::kCameraRawRowCount; ++row) {
+    for (int other = row + 1; other < comp_ui::kCameraRawRowCount; ++other) {
+      COMP_CHECK(std::string(comp_ui::camera_raw_row_key(row)) !=
+                 std::string(comp_ui::camera_raw_row_key(other)));
+    }
+  }
+
+  /* 全零 = 恒等设置：必须是空对象，而不是 12 个 "key":0。 */
+  int values[comp_ui::kCameraRawRowCount] = {};
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, comp_ui::kCameraRawRowCount) == "{}");
+
+  /* 曝光 35 = +0.35 EV；小数点在 JSON 里必须是 '.'，且只有两位。 */
+  values[0] = 35;
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, comp_ui::kCameraRawRowCount) ==
+             "{\"exposure\":0.35}");
+  values[0] = -125;
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, comp_ui::kCameraRawRowCount) ==
+             "{\"exposure\":-1.25}");
+  values[0] = 0;
+
+  /* 非零行按行序输出；零行被跳过（0 就是上游缺省值，写出来只会白跑一遍管线）。 */
+  values[1] = -40;
+  values[7] = 12;
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, comp_ui::kCameraRawRowCount) ==
+             "{\"temperature\":-40,\"blacks\":12}");
+
+  /* 行数上限由 count 与 kCameraRawRowCount 中较小者决定：多传不越界，少传截断。 */
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, 1) == "{}");
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, 64) ==
+             "{\"temperature\":-40,\"blacks\":12}");
+  COMP_CHECK(comp_ui::camera_raw_settings_json(nullptr, comp_ui::kCameraRawRowCount) == "{}");
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, 0) == "{}");
+  COMP_CHECK(comp_ui::camera_raw_settings_json(values, -3) == "{}");
+}
+
 COMP_TEST(ui_core_doc_dialog_anchor) {
   /* 1. 四角钉住不动、四边只动一个轴、居中两轴各动一半——这是画布大小的全部语义。 */
   const int dw = 100;

@@ -40,6 +40,10 @@ comp_result comp_engine_camera_raw_tables_loaded(comp_engine engine, int32_t* ou
 推荐宿主在创建引擎后、首次应用 Camera Raw 前调用一次；路径由宿主决定
 （仓库内是 `resources/camera_raw_tables.bin`）。
 
+Windows 壳在**启动时**（引擎创建之后、建窗之前）读一次，查找顺序与字体相同：
+`exe/resources/` → `exe/../resources/`（开发态 `build/` 与仓根并列）→ 当前工作目录。
+缺文件不算启动失败：滤镜菜单照常出现，打开面板时才报「色彩表未加载」。
+
 ### CRT4 容器
 
 ```
@@ -236,7 +240,11 @@ note 会写明实际通路：恒等 / 单次查找（folded）/ 逐像素曲线�
 - **无 RAW 解码**：本接口处理的是已解码的图层像素；相机原始格式的读取属编解码层。
 - **无 GPU 通路**：CPU 内核；`camera_raw_lookup_is_valid` / `repair_lookup` 已随
   AdjustPixels 移植，但 F4 不走 Metal。
-- **无 UI**：面板、曲线编辑器、颜色轮属外壳职责。
+- **外壳 UI 只有 Basic 组**：Windows 壳的 `滤镜 > Camera Raw 滤镜…`（`Ctrl+Alt+R`）
+  给 12 行整数参数（曝光 ±500 = ±5.00 EV，其余 ±100），**写选中图层整层**、一次
+  一步撤销；曲线编辑器、颜色轮、细节/光学/颗粒/几何组仍无 UI（ABI 全部支持，
+  缺的是入口）。面板每次打开都是零草稿——ABI 没有「读回图层当前参数」的 getter，
+  设置是破坏性写进像素的，不留在图层上。
 
 ## 7. 测试
 
@@ -245,3 +253,7 @@ note 会写明实际通路：恒等 / 单次查找（folded）/ 逐像素曲线�
 缺表、缺图层、folded / per-pixel 两条通路的 note、note 两段式拷贝、颗粒 seed
 确定性、细节与光学改像素、16 位落 8 位、透明像素保持、曲线求值器边界。
 `tests/test_camera_raw_align.cpp`（8 例）另钉住上游 1.5.3 的四个 AdjustPixels 函数。
+
+外壳通路：`tests/test_ui_core.cpp` 的 `ui_core_camera_raw_rows` 钉住 12 行规格与 JSON
+（键名、非零才写、曝光两位小数、全零 = `{}`）；`scripts/visual_check.py` 的
+`camera_raw` 场景 5 条量真实像素（面板打开、+1 EV 变亮、一步撤销、-1 EV 变暗）。
