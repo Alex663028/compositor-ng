@@ -220,6 +220,16 @@ COMP_TEST(ui_core_layout_never_overlaps_at_any_size) {
                      "canvas/toolbar overlap");
       COMP_CHECK_MSG(!rects_overlap(layout.canvas, layout.status),
                      "canvas/status overlap");
+      COMP_CHECK_MSG(!rects_overlap(layout.canvas, layout.options),
+                     "canvas/options overlap");
+      COMP_CHECK_MSG(!rects_overlap(layout.options, layout.status),
+                     "options/status overlap");
+      /* 选项栏要么整条存在（贴工具栏下沿、满宽），要么整条收起（h == 0）。 */
+      COMP_CHECK_MSG(layout.options.h == 0 ||
+                         (layout.options.h == Layout::kOptionsHeight &&
+                          layout.options.y == layout.toolbar.bottom() &&
+                          layout.options.w == width),
+                     "options bar must be either absent or full width under the toolbar");
 
       /* 三块横向拼接后必须正好铺满客户区。 */
       COMP_CHECK_MSG(layout.layer_panel.w + layout.canvas.w + layout.adjust_panel.w == width,
@@ -242,8 +252,20 @@ COMP_TEST(ui_core_layout_never_overlaps_at_any_size) {
   const Layout wide = comp_ui::compute_layout(1280, 720);
   COMP_CHECK(wide.canvas.w == 1280 - Layout::kLayerPanelWidth - Layout::kAdjustPanelWidth);
   COMP_CHECK(wide.status.h == Layout::kStatusHeight);
-  COMP_CHECK(wide.canvas.y == Layout::kToolbarHeight);
+  COMP_CHECK(wide.options.h == Layout::kOptionsHeight);
+  COMP_CHECK(wide.options.y == Layout::kToolbarHeight);
+  COMP_CHECK(wide.canvas.y == Layout::kToolbarHeight + Layout::kOptionsHeight);
   COMP_CHECK(wide.canvas.bottom() == 720 - Layout::kStatusHeight);
+
+  /* §5.49：矮窗口先收起选项栏，画布回收这 32px；阈值两侧各验一次。 */
+  const int shown_at =
+      Layout::kToolbarHeight + Layout::kOptionsHeight + Layout::kMinBodyHeight +
+      Layout::kStatusHeight;
+  COMP_CHECK(comp_ui::compute_layout(1280, shown_at).options.h == Layout::kOptionsHeight);
+  const Layout short_window = comp_ui::compute_layout(1280, shown_at - 1);
+  COMP_CHECK(short_window.options.h == 0);
+  COMP_CHECK(short_window.canvas.y == Layout::kToolbarHeight);
+  COMP_CHECK(short_window.canvas.bottom() == shown_at - 1 - Layout::kStatusHeight);
 }
 
 COMP_TEST(ui_core_layout_respects_panel_width_prefs) {
@@ -290,6 +312,105 @@ COMP_TEST(ui_core_layout_respects_panel_width_prefs) {
   COMP_CHECK(wide.layer_panel.w == 400);
   COMP_CHECK(wide.canvas.x == 400);
   COMP_CHECK(wide.canvas.w == standard.canvas.w - (400 - Layout::kLayerPanelWidth));
+}
+
+COMP_TEST(ui_core_tool_options_bar) {
+  /* 行集合是纯函数：绘制与命中共用 tool_option_count / tool_option，不能两处各写一张表。 */
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Brush) == 2);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Clone) == 4);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Heal) == 3);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Wand) == 2);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Marquee) == 1);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Gradient) == 1);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Shape) == 2);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Hand) == 0);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Move) == 0);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Type) == 0); /* 文字参数在右栏 */
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Hand, 0).id == comp_ui::ToolOptionId::None);
+
+  const comp_ui::ToolOptionSpec size = comp_ui::tool_option(comp_ui::ToolId::Brush, 0);
+  COMP_CHECK(size.id == comp_ui::ToolOptionId::BrushSize);
+  COMP_CHECK(size.kind == comp_ui::ToolOptionKind::Stepper);
+  COMP_CHECK(size.min == static_cast<int>(comp_ui::kMinBrushSize));
+  COMP_CHECK(size.max == static_cast<int>(comp_ui::kMaxBrushSize));
+
+  const comp_ui::ToolId with_options[] = {
+      comp_ui::ToolId::Brush,   comp_ui::ToolId::Eraser, comp_ui::ToolId::Heal,
+      comp_ui::ToolId::Clone,   comp_ui::ToolId::Retouch, comp_ui::ToolId::Tone,
+      comp_ui::ToolId::Marquee, comp_ui::ToolId::Lasso,  comp_ui::ToolId::Wand,
+      comp_ui::ToolId::Gradient, comp_ui::ToolId::Shape, comp_ui::ToolId::HistoryBrush};
+  for (comp_ui::ToolId tool : with_options) {
+    const int count = comp_ui::tool_option_count(tool);
+    COMP_CHECK_MSG(count > 0, "tool with options must expose at least one row");
+    for (int i = 0; i < count; ++i) {
+      const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(tool, i);
+      COMP_CHECK_MSG(spec.id != comp_ui::ToolOptionId::None, "row must name an option id");
+      COMP_CHECK_MSG(spec.label != nullptr && spec.label[0] != '\0', "row must have a label");
+      COMP_CHECK_MSG(spec.min <= spec.max, "row range must be ordered");
+      if (spec.kind == comp_ui::ToolOptionKind::Choice) {
+        COMP_CHECK_MSG(spec.choice_count == spec.max - spec.min + 1,
+                       "choice row must span its enum range");
+        COMP_CHECK_MSG(spec.choice_count >= 2, "choice row needs at least two choices");
+      } else {
+        COMP_CHECK_MSG(spec.step >= 1, "stepper row must advance");
+      }
+      /* 同一工具下不重复同一参数（重复行 = 两行互相打架）。 */
+      for (int j = 0; j < i; ++j) {
+        COMP_CHECK_MSG(comp_ui::tool_option(tool, j).id != spec.id, "duplicate option row");
+      }
+    }
+    COMP_CHECK(comp_ui::tool_option(tool, count).id == comp_ui::ToolOptionId::None);
+  }
+
+  /* 几何：组从左往右排、放不下整组不画；控件盒在标签右侧。 */
+  const comp_ui::Rect bar{0, 46, 1280, comp_ui::Layout::kOptionsHeight};
+  const comp_ui::Rect group0 = comp_ui::option_group_rect(bar, 0);
+  const comp_ui::Rect group1 = comp_ui::option_group_rect(bar, 1);
+  COMP_CHECK(group0.x == comp_ui::kOptionLeftPad);
+  COMP_CHECK(group0.w == comp_ui::kOptionGroupWidth);
+  COMP_CHECK(group1.x == group0.right() + comp_ui::kOptionGroupGap);
+  COMP_CHECK(comp_ui::option_group_rect(bar, -1).empty());
+  COMP_CHECK(comp_ui::option_group_rect(comp_ui::Rect{}, 0).empty());
+  const comp_ui::Rect narrow{0, 46, 300, comp_ui::Layout::kOptionsHeight};
+  COMP_CHECK(!comp_ui::option_group_rect(narrow, 0).empty());
+  COMP_CHECK(comp_ui::option_group_rect(narrow, 1).empty()); /* 170..320 越界 */
+
+  const comp_ui::Rect control = comp_ui::option_control_rect(group0);
+  COMP_CHECK(control.x == group0.x + comp_ui::kOptionLabelWidth);
+  COMP_CHECK(control.w == comp_ui::kOptionArrowWidth * 2 + comp_ui::kOptionValueWidth);
+  COMP_CHECK(control.h <= group0.h);
+  COMP_CHECK(control.y >= group0.y && control.bottom() <= group0.bottom());
+  COMP_CHECK(comp_ui::option_control_rect(comp_ui::Rect{}).empty());
+
+  /* 命中：Stepper 只有两侧箭头响应，数值区点了不动参数；Choice 整块响应。 */
+  int delta = 99;
+  const double mid_y = static_cast<double>(control.y + control.h / 2);
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.x + 4.0, mid_y, &delta) == 0);
+  COMP_CHECK(delta == -1);
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.right() - 4.0, mid_y,
+                                 &delta) == 0);
+  COMP_CHECK(delta == 1);
+  delta = 99;
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.x + control.w * 0.5, mid_y,
+                                 &delta) == -1);
+  COMP_CHECK(delta == 0);
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, group0.right() + 4.0, mid_y, &delta) ==
+             -1);
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Hand, control.x + 4.0, mid_y, &delta) == -1);
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.x + 4.0, 20.0, &delta) == -1);
+  delta = 0;
+  COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Shape, control.x + 4.0, mid_y, &delta) == 0);
+  COMP_CHECK(delta == 1); /* 形状是 Choice：整块点都是下一档 */
+  COMP_CHECK(comp_ui::option_hit(comp_ui::Rect{}, comp_ui::ToolId::Brush, 100.0, 60.0, &delta) ==
+             -1);
+
+  /* Choice 绕环：向后到底回 0，向前到 0 回尾；非法档位回落到 0。 */
+  COMP_CHECK(comp_ui::option_cycle_choice(2, 3, 1) == 0);
+  COMP_CHECK(comp_ui::option_cycle_choice(0, 3, -1) == 2);
+  COMP_CHECK(comp_ui::option_cycle_choice(1, 3, 1) == 2);
+  COMP_CHECK(comp_ui::option_cycle_choice(1, 3, 0) == 1);
+  COMP_CHECK(comp_ui::option_cycle_choice(9, 3, 1) == 1);
+  COMP_CHECK(comp_ui::option_cycle_choice(1, 0, 1) == 0);
 }
 
 COMP_TEST(ui_core_panel_width_clamp_and_drag) {

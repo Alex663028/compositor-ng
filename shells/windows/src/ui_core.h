@@ -186,6 +186,17 @@ struct CanvasView {
  */
 struct Layout {
   static constexpr int kToolbarHeight = 46;
+  /*
+   * §5.49 工具选项栏（P0-10）：工具条下的一条参数横栏。参数只有「当前工具」这一维，
+   * 所以它放在工具条正下方而不是右栏——改画笔大小不该先切面板。
+   */
+  static constexpr int kOptionsHeight = 32;
+  /*
+   * 选项栏的收起阈值：窗口还得给「面板/画布主体」留够这么多高度才显示选项栏。
+   * 不留阈值的话，矮窗口里选项栏会先于面板被挤扁——面板至少还能滚，32px 的
+   * 一条横栏挤扁后连一行字都放不下，只会把画布往下推。
+   */
+  static constexpr int kMinBodyHeight = 96;
   static constexpr int kStatusHeight = 26;
   static constexpr int kLayerPanelWidth = 248;
   static constexpr int kAdjustPanelWidth = 330;
@@ -225,6 +236,7 @@ struct Layout {
   static constexpr int kHistogramPlotHeight = 40;
 
   Rect toolbar{};
+  Rect options{}; /* §5.49 工具选项栏；高度不够时为空矩形 */
   Rect layer_panel{};
   Rect adjust_panel{};
   Rect canvas{};
@@ -290,8 +302,17 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
 
   const int toolbar_h = std::min(height, Layout::kToolbarHeight);
   const int status_h = std::min(height - toolbar_h, Layout::kStatusHeight);
-  const int body_top = toolbar_h;
-  const int body_h = height - toolbar_h - status_h;
+  /*
+   * §5.49：选项栏只在「工具栏 + 选项栏 + 主体下限 + 状态栏」都放得下时占位。
+   * 收起时高度直接记 0 并返回空矩形，命中测试因此自动失效（与分界线同一口径），
+   * 画布回收这 32px，不会留一条空白带。
+   */
+  const int remainder_h = height - toolbar_h - status_h;
+  const int options_h = remainder_h >= Layout::kOptionsHeight + Layout::kMinBodyHeight
+                            ? Layout::kOptionsHeight
+                            : 0;
+  const int body_top = toolbar_h + options_h;
+  const int body_h = remainder_h - options_h;
 
   /*
    * §5.43：收起态只把「想要的宽度」换成 24px 竖条，**收起口径不变**——仍按
@@ -315,6 +336,7 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
 
   Layout out;
   out.toolbar = Rect{0, 0, width, toolbar_h};
+  out.options = Rect{0, toolbar_h, width, options_h};
   out.layer_panel = Rect{0, body_top, layer_w, body_h};
   out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
   out.canvas = Rect{layer_w, body_top, width - layer_w - adjust_w, body_h};
@@ -2169,6 +2191,217 @@ inline int step_selection_grow(int radius, int direction) {
   const int next = current + (direction > 0 ? step : -step);
   return next < kMinSelectionGrow ? kMinSelectionGrow : (next > kMaxSelectionGrow ? kMaxSelectionGrow : next);
 }
+
+/* ------------------------------------------------------------ 工具选项栏（P0-10） */
+
+/*
+ * 选项栏只表达**当前工具**的参数，因此这里是一张「工具 -> 行」的静态映射，
+ * 而不是可停靠的通用面板：
+ *
+ *   - 行集合必须是纯函数（tool_option_count / tool_option），绘制与命中都从它
+ *     取数——两边各写一份表是「点中的行和画出来的行不是同一行」的来源。
+ *   - 不重复右栏已有的入口：文字（字号/行距）仍在右栏，缩放的显示比例仍在
+ *     工具条右侧；这里只放「改了要立刻看见画布变化」的手感参数。
+ *   - 行数少的工具（0–4 行）刻意不做换行/滚动：一行放不下就整组不画，点击
+ *     自然落到空处（命中测试先看命中矩形，空矩形永不命中）。
+ */
+enum class ToolOptionId : int {
+  None = 0,
+  BrushSize,
+  BrushHardness, /* 0..100 整数百分比；引擎侧是 0..1 的 double，由外壳换算 */
+  WandTolerance,
+  SelectionFeather,
+  GradientType,
+  ShapeKind,
+  ShapeStrokeWidth,
+  CloneSample, /* 0 = 当前图层，1 = 整篇合成 */
+  CloneAligned,
+  HealMode
+};
+
+enum class ToolOptionKind : int {
+  Stepper = 0, /* 左箭头 / 值 / 右箭头 */
+  Choice = 1   /* 值本身就是按钮，点一下切下一档 */
+};
+
+struct ToolOptionSpec {
+  ToolOptionId id = ToolOptionId::None;
+  const char* label = "";
+  ToolOptionKind kind = ToolOptionKind::Stepper;
+  int min = 0;
+  int max = 0;
+  int step = 1;
+  int choice_count = 0; /* 仅 Choice 有意义 */
+};
+
+/* 一行放几组、每组多宽：整数像素写死，绘制与命中共用同一组常量。 */
+inline constexpr int kOptionLeftPad = 12;
+inline constexpr int kOptionGroupWidth = 150;
+inline constexpr int kOptionGroupGap = 8;
+inline constexpr int kOptionLabelWidth = 56;
+inline constexpr int kOptionArrowWidth = 18;
+inline constexpr int kOptionValueWidth = 54;
+inline constexpr int kOptionControlHeight = 22;
+
+inline ToolOptionSpec tool_option(ToolId tool, int index) {
+  const ToolOptionSpec size{ToolOptionId::BrushSize, "大小", ToolOptionKind::Stepper,
+                            static_cast<int>(kMinBrushSize), static_cast<int>(kMaxBrushSize), 1, 0};
+  const ToolOptionSpec hardness{ToolOptionId::BrushHardness, "硬度", ToolOptionKind::Stepper, 0,
+                                100, 10, 0};
+  switch (tool) {
+    case ToolId::Brush:
+    case ToolId::Eraser:
+    case ToolId::Retouch:
+    case ToolId::Tone:
+    case ToolId::HistoryBrush:
+      if (index == 0) return size;
+      if (index == 1) return hardness;
+      break;
+    case ToolId::Heal:
+      if (index == 0) return size;
+      if (index == 1) return hardness;
+      if (index == 2) {
+        return ToolOptionSpec{ToolOptionId::HealMode, "模式", ToolOptionKind::Choice, 0,
+                              kHealModeCount - 1, 1, kHealModeCount};
+      }
+      break;
+    case ToolId::Clone:
+      if (index == 0) return size;
+      if (index == 1) return hardness;
+      if (index == 2) {
+        return ToolOptionSpec{ToolOptionId::CloneSample, "取样", ToolOptionKind::Choice, 0, 1, 1, 2};
+      }
+      if (index == 3) {
+        return ToolOptionSpec{ToolOptionId::CloneAligned, "对齐", ToolOptionKind::Choice, 0, 1, 1, 2};
+      }
+      break;
+    case ToolId::Marquee:
+    case ToolId::Lasso:
+      if (index == 0) {
+        return ToolOptionSpec{ToolOptionId::SelectionFeather, "羽化", ToolOptionKind::Stepper,
+                              kMinSelectionFeather, kMaxSelectionFeather, 1, 0};
+      }
+      break;
+    case ToolId::Wand:
+      if (index == 0) {
+        return ToolOptionSpec{ToolOptionId::WandTolerance, "容差", ToolOptionKind::Stepper,
+                              kMinWandTolerance, kMaxWandTolerance, 1, 0};
+      }
+      if (index == 1) {
+        return ToolOptionSpec{ToolOptionId::SelectionFeather, "羽化", ToolOptionKind::Stepper,
+                              kMinSelectionFeather, kMaxSelectionFeather, 1, 0};
+      }
+      break;
+    case ToolId::Gradient:
+      if (index == 0) {
+        return ToolOptionSpec{ToolOptionId::GradientType, "类型", ToolOptionKind::Choice, 0,
+                              kGradientTypeCount - 1, 1, kGradientTypeCount};
+      }
+      break;
+    case ToolId::Shape:
+      if (index == 0) {
+        return ToolOptionSpec{ToolOptionId::ShapeKind, "形状", ToolOptionKind::Choice, 0,
+                              kShellShapeKindCount - 1, 1, kShellShapeKindCount};
+      }
+      if (index == 1) {
+        return ToolOptionSpec{ToolOptionId::ShapeStrokeWidth, "线宽", ToolOptionKind::Stepper, 1,
+                              50, 1, 0};
+      }
+      break;
+    default:
+      break;
+  }
+  return ToolOptionSpec{};
+}
+
+inline int tool_option_count(ToolId tool) {
+  switch (tool) {
+    case ToolId::Brush:
+    case ToolId::Eraser:
+    case ToolId::Retouch:
+    case ToolId::Tone:
+    case ToolId::HistoryBrush:
+      return 2;
+    case ToolId::Heal:
+      return 3;
+    case ToolId::Clone:
+      return 4;
+    case ToolId::Marquee:
+    case ToolId::Lasso:
+      return 1;
+    case ToolId::Wand:
+      return 2;
+    case ToolId::Gradient:
+      return 1;
+    case ToolId::Shape:
+      return 2; /* 形状 + 线宽 */
+    default:
+      return 0;
+  }
+}
+
+/*
+ * 组矩形：从左往右排，**放不下就整组不画**（返回空矩形）。不做半宽裁切——
+ * 半截的「大小 +」比没有更糟：用户会点在只剩 20px 的箭头上，以为在调参数。
+ */
+inline Rect option_group_rect(const Rect& bar, int index) {
+  if (bar.empty() || index < 0) return Rect{};
+  const int x = bar.x + kOptionLeftPad + index * (kOptionGroupWidth + kOptionGroupGap);
+  if (x + kOptionGroupWidth > bar.right()) return Rect{};
+  return Rect{x, bar.y, kOptionGroupWidth, bar.h};
+}
+
+/* 控件盒：标签右侧的「− 值 +」，垂直居中于整条高度（上下各留 5px 手感边距）。 */
+inline Rect option_control_rect(const Rect& group) {
+  if (group.empty()) return Rect{};
+  const int height = std::min(kOptionControlHeight, group.h - 10);
+  if (height <= 0) return Rect{};
+  return Rect{group.x + kOptionLabelWidth, group.y + (group.h - height) / 2,
+              kOptionArrowWidth * 2 + kOptionValueWidth, height};
+}
+
+/*
+ * 命中：返回组下标（无命中 -1），*delta 给方向（-1 / +1 / 0）。
+ *   - Stepper：只有左右两个箭头响应；点在数值上不动参数（PS 里数值区是文本输入，
+ *     本仓的数值编辑在右栏，横栏里误触改参数比「点了没反应」更糟）。
+ *   - Choice：整块响应，一律 direction = +1（循环到下一档）。
+ */
+inline int option_hit(const Rect& bar, ToolId tool, double x, double y, int* delta) {
+  if (delta != nullptr) *delta = 0;
+  const int count = tool_option_count(tool);
+  for (int i = 0; i < count; ++i) {
+    const Rect group = option_group_rect(bar, i);
+    if (group.empty()) break; /* 后面的组更放不下 */
+    const Rect control = option_control_rect(group);
+    if (!control.contains(x, y)) continue;
+    const ToolOptionSpec spec = tool_option(tool, i);
+    if (spec.kind == ToolOptionKind::Choice) {
+      if (delta != nullptr) *delta = 1;
+      return i;
+    }
+    if (x < static_cast<double>(control.x + kOptionArrowWidth)) {
+      if (delta != nullptr) *delta = -1;
+      return i;
+    }
+    if (x >= static_cast<double>(control.right() - kOptionArrowWidth)) {
+      if (delta != nullptr) *delta = 1;
+      return i;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+/* Choice 值的循环：direction > 0 向后、< 0 向前，绕环走（与右栏选择行同一手感）。 */
+inline int option_cycle_choice(int current, int choice_count, int direction) {
+  if (choice_count <= 0) return 0;
+  int value = current;
+  if (value < 0 || value >= choice_count) value = 0;
+  if (direction > 0) return (value + 1) % choice_count;
+  if (direction < 0) return (value + choice_count - 1) % choice_count;
+  return value;
+}
+
 
 /*
  * 把工具 coverage 与选区蒙版逐像素相乘（255 = 全保留，0 = 全丢弃）。

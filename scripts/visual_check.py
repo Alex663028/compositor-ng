@@ -114,6 +114,16 @@ STATUS_H = 26
 LAYER_W = 248
 ADJUST_W = 330
 MIN_CANVAS_W = 180
+# §5.49 工具选项栏：高度 + 收起阈值（与 Layout::kOptionsHeight / kMinBodyHeight 同值）。
+OPTIONS_H = 32
+MIN_BODY_H = 96
+OPTION_LEFT_PAD = 12
+OPTION_GROUP_W = 150
+OPTION_GROUP_GAP = 8
+OPTION_LABEL_W = 56
+OPTION_ARROW_W = 18
+OPTION_VALUE_W = 54
+OPTION_CONTROL_H = 22
 
 # ui_core.h 的配色（断言用真值）
 COL_TOOLBAR_BG = (44, 46, 52)
@@ -122,6 +132,8 @@ COL_TOOL_SELECTED = (70, 104, 168)
 COL_LAYER_BG = (24, 26, 30)
 COL_ADJ_BG = (22, 24, 28)
 COL_STATUS_BG = (26, 28, 32)
+COL_OPTIONS_BG = (38, 40, 46)
+COL_OPTION_CTRL = (58, 60, 68)
 COL_HIGHLIGHT = (56, 76, 120)
 COL_APP_BG = (32, 32, 36)
 
@@ -470,17 +482,44 @@ class Shell:
         w, h = self.client_w, self.client_h
         toolbar_h = min(h, TOOLBAR_H)
         status_h = min(h - toolbar_h, STATUS_H)
-        body_top = toolbar_h
-        body_h = h - toolbar_h - status_h
+        # §5.49 选项栏：与 ui_core compute_layout 同一阈值，收起时高度为 0。
+        remainder = h - toolbar_h - status_h
+        options_h = OPTIONS_H if remainder >= OPTIONS_H + MIN_BODY_H else 0
+        body_top = toolbar_h + options_h
+        body_h = remainder - options_h
         layer_w = LAYER_W if w >= LAYER_W + MIN_CANVAS_W else 0
         adjust_w = ADJUST_W if w - layer_w >= ADJUST_W + MIN_CANVAS_W else 0
         return {
             "toolbar": (0, 0, w, toolbar_h),
+            "options": (0, toolbar_h, w, toolbar_h + options_h),
             "layer": (0, body_top, layer_w, body_top + body_h),
             "adjust": (w - adjust_w, body_top, w, body_top + body_h),
             "canvas": (layer_w, body_top, w - adjust_w, body_top + body_h),
             "status": (0, body_top + body_h, w, body_top + body_h + status_h),
         }
+
+    def option_group_rect(self, index):
+        """选项栏第 index 组的矩形（与 ui_core option_group_rect 同算式）。"""
+        left, top, right, bottom = self.layout["options"]
+        if bottom - top <= 0:
+            return None
+        x = left + OPTION_LEFT_PAD + index * (OPTION_GROUP_W + OPTION_GROUP_GAP)
+        if x + OPTION_GROUP_W > right:
+            return None
+        return (x, top, x + OPTION_GROUP_W, bottom)
+
+    def option_control_rect(self, index):
+        """选项栏第 index 组的「- 值 +」控件盒。"""
+        group = self.option_group_rect(index)
+        if group is None:
+            return None
+        left, top, right, bottom = group
+        height = min(OPTION_CONTROL_H, bottom - top - 10)
+        if height <= 0:
+            return None
+        y = top + (bottom - top - height) // 2
+        return (left + OPTION_LABEL_W, y, left + OPTION_LABEL_W + OPTION_ARROW_W * 2 +
+                OPTION_VALUE_W, y + height)
 
     def tool_button_center(self, index):
         size = 32
@@ -1896,6 +1935,112 @@ def scene_close_prompt(shell, checker):
         shell.hwnd = None  # 窗口已销毁，stop() 不必再 post WM_CLOSE
 
 
+def scene_options_bar(shell, checker):
+    """
+    P0-10 工具选项栏：横栏存在、点击归横栏、改的值真的进了画布。
+
+    这条功能的失败方式有三种，所以每条都单独量：
+      1. 横栏没画出来 / 画到画布上（布局破了）；
+      2. 点击穿透到画布（横栏在命中顺序里排在画布之后）——用「点 + 之后画布
+         像素逐字节不变」证明；
+      3. 值只改了显示没进状态（横栏与右栏各存一份副本）——用同一个落点画一笔，
+         大画笔的橙色像素数必须明显多于小画笔。
+
+    断言：
+      1. 选项栏占 32px、底色与工具条不同；
+      2. 画笔工具有「大小 / 硬度」两组，控件盒底色正确、标签有字形；
+      3. 连点 4 次「+」后值文本变化，且画布一个像素都没变（点击被横栏吃掉）；
+      4. 同一落点画点：放大后的橙色像素数 > 2 倍初始值；
+      5. 形状工具第一组是 Choice，点击后值文本变化、画布仍不变。
+    """
+    scene = "options_bar"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    bar = shell.layout["options"]
+    checker.check(scene, "选项栏在工具栏下方占 32px", bar[3] - bar[1] == OPTIONS_H,
+                  "options=%s 客户区高=%d" % (bar, shell.client_h))
+
+    # 先换前景色（Shift+X 十六进制键入），否则黑笔在空文档上看不见。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("brush")
+    img = shell.shot("48_options_bar_brush")
+
+    checker.check(scene, "选项栏底色", near(pixel(img, bar[0] + 2, bar[1] + 2), COL_OPTIONS_BG, 8),
+                  "实测 %s" % (pixel(img, bar[0] + 2, bar[1] + 2),))
+    group0 = shell.option_group_rect(0)
+    group1 = shell.option_group_rect(1)
+    checker.check(scene, "画笔有两组选项（大小 / 硬度）", group1 is not None,
+                  "group1=%s" % (group1,))
+    control0 = shell.option_control_rect(0)
+    checker.check(scene, "第一组控件盒可见",
+                  control0 is not None and
+                  near(pixel(img, control0[0] + 2, control0[1] + 2), COL_OPTION_CTRL, 10),
+                  "control=%s 实测 %s" % (control0,
+                                        pixel(img, control0[0] + 2, control0[1] + 2)))
+    labels = count_bright(img, (group0[0], group0[1] + 6, group0[0] + OPTION_LABEL_W - 6,
+                               group0[3] - 6), 110)
+    checker.check(scene, "选项标签有字形", labels > 10, "浅色像素 %d" % labels)
+
+    # 初始画笔：画一个小点，记橙色像素数。
+    shell.drag(cx - 2, cy, cx + 2, cy, steps=3)
+    shell.wait(0.2)
+    img_small = shell.shot("49_options_bar_small_dot")
+    box = (cx - 70, cy - 70, cx + 70, cy + 70)
+    small = count_matching(img_small, box, (255, 136, 0), 60)
+    checker.check(scene, "小画笔在落点留下橙色像素", small > 0, "橙色像素 %d" % small)
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.2)
+    after_undo = shell.shot("50_options_bar_undo")
+    checker.check(scene, "Ctrl+Z 后落点清空",
+                  count_matching(after_undo, box, (255, 136, 0), 60) == 0,
+                  "残留 %d" % count_matching(after_undo, box, (255, 136, 0), 60))
+
+    # 连点 4 次「+」：值文本必须变；画布必须一个像素都不变（点击归横栏）。
+    plus = (control0[2] - OPTION_ARROW_W // 2, (control0[1] + control0[3]) // 2)
+    for _ in range(4):
+        shell.click(plus[0], plus[1])
+        shell.wait(0.05)
+    shell.wait(0.2)
+    img_big = shell.shot("51_options_bar_bigger")
+    value_diff = pixel_diff(img_big, after_undo, control0, 24)
+    checker.check(scene, "点 + 后大小数值变化", value_diff > 20, "值区变化像素 %d" % value_diff)
+    canvas = shell.layout["canvas"]
+    penetration = pixel_diff(img_big, after_undo, canvas, 24)
+    checker.check(scene, "选项栏点击不穿透到画布", penetration == 0,
+                  "画布变化像素 %d" % penetration)
+
+    # 同一落点再画一次：更大的笔尖覆盖的橙色像素必须明显更多。
+    shell.drag(cx - 2, cy, cx + 2, cy, steps=3)
+    shell.wait(0.2)
+    img_wide = shell.shot("52_options_bar_wide_dot")
+    wide = count_matching(img_wide, box, (255, 136, 0), 60)
+    checker.check(scene, "放大后的笔迹覆盖更多像素", wide > small * 2,
+                  "小 %d → 大 %d" % (small, wide))
+
+    # Choice 组：形状工具第一组是「形状」，点一下整块都算下一档。
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.2)
+    shell.select_tool("shape")
+    img_shape = shell.shot("53_options_bar_shape")
+    shape_control = shell.option_control_rect(0)
+    checker.check(scene, "形状工具有选项组", shape_control is not None,
+                  "control=%s" % (shape_control,))
+    if shape_control is not None:
+        shell.click((shape_control[0] + shape_control[2]) // 2,
+                    (shape_control[1] + shape_control[3]) // 2)
+        shell.wait(0.3)
+        img_choice = shell.shot("54_options_bar_choice")
+        choice_diff = pixel_diff(img_choice, img_shape, shape_control, 24)
+        checker.check(scene, "点 Choice 值切换下一档", choice_diff > 20,
+                      "值区变化像素 %d" % choice_diff)
+        checker.check(scene, "Choice 点击不穿透到画布",
+                      pixel_diff(img_choice, img_shape, canvas, 24) == 0,
+                      "画布变化像素 %d" % pixel_diff(img_choice, img_shape, canvas, 24))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -1931,6 +2076,7 @@ SCENES = [    ("start", scene_start, ()),
     ("camera_raw", scene_camera_raw, ()),
     ("clipboard", scene_clipboard, ()),
     ("close_prompt", scene_close_prompt, ()),
+    ("options_bar", scene_options_bar, ()),
 ]
 
 

@@ -2172,6 +2172,97 @@ Cancel                    → 只 doc_dialog_close，文档与撤销栈都不动
 `visual_check.py` **102 条 / 21 场景 / 0 失败**；单测 **627 例 / 0 失败**；
 壳自检 257 项 failures=0、SHA `377DE660D48AC933…` 与基线逐字节一致。
 
+### 5.49 工具选项栏：工具参数从右栏搬到工具条下（P0-10，2026-10-22）
+
+**旧行为**：画笔大小、硬度、魔棒容差这些参数只能在右栏面板里改，工具条下空白一片——
+和 Photoshop 的位置直觉相反，且右栏窄到塌陷时就没得改。**新行为**：工具条正下方多一条
+32 px 的选项栏，按当前工具列出 Stepper（`- 值 +`）/ Choice（循环档位）两类控件。
+零 ABI 新增（导出数仍 **146**），全部状态复用既有 `ShellState` 字段。
+
+#### 布局：真的参与排版，不是浮层
+
+浮层会让点击穿透到画布，所以选项栏是**布局的一部分**（`ui_core.h`）：
+
+| 项 | 值 |
+|----|----|
+| `Layout::kOptionsHeight` | `32` |
+| `Layout::kMinBodyHeight` | `96`（画布+面板的最低高度） |
+| `options` 矩形 | `{0, toolbar_h, width, options_h}` |
+| `body_top` | `toolbar_h + options_h` |
+| `body_h` | `remainder_h - options_h` |
+| 出现条件 | `remainder_h >= kOptionsHeight + kMinBodyHeight` |
+
+窗口矮到只剩不到 96 px 主体时选项栏高度取 0、整块不画、画布把那 32 px 收回去——
+宁可少一个控件，也不让画布被压没。宽窗口（1264 px）实测：`options = (0, 46, 1264, 78)`
+即 y 46..78，`canvas.y == kToolbarHeight + kOptionsHeight`。
+
+#### 行模型（纯函数，全部可单测）
+
+`ToolOptionId` 只列有意义的参数：`BrushSize`、`BrushHardness`、`WandTolerance`、
+`SelectionFeather`、`GradientType`、`ShapeKind`、`ShapeStrokeWidth`、`CloneSample`、
+`CloneAligned`、`HealMode`。`ToolOptionKind` 两档：`Stepper = 0`（`min/max/step`）、
+`Choice = 1`（`choice_count`，`max == min + count - 1`）。
+
+| 工具 | 行 |
+|------|----|
+| 画笔 / 橡皮 / 修饰 / 加深减淡 / 历史画笔 | 大小 1..500、硬度 0..100 step 10 |
+| 修复 | 大小、硬度、模式（Choice 3） |
+| 仿制图章 | 大小、取样（Choice 2）、对齐（Choice 2） |
+| 选框 / 套索 | 羽化 0..250 |
+| 魔棒 | 容差 0..255、羽化 0..250 |
+| 渐变 | 类型（Choice `kGradientTypeCount`） |
+| 形状 | 形状（Choice `kShellShapeKindCount`）、线宽 1..50 |
+| 文字 / 抓手 / 移动 / 裁剪 / 钢笔 / 缩放 / 吸管 / 选择 | 0 行（画一行「该工具没有选项栏参数」） |
+
+#### 几何与命中
+
+固定像素组宽，不做流式换行：`kOptionLeftPad = 12`、`kOptionGroupWidth = 150`、
+`kOptionGroupGap = 8`、`kOptionLabelWidth = 56`、`kOptionArrowWidth = 18`、
+`kOptionValueWidth = 54`、`kOptionControlHeight = 22`。`option_group_rect` 在组宽越界时
+返回空矩形（窄窗口只显示能放下的前几组），`option_control_rect` 与
+`option_hit` 共用同一份几何——画出来的框就是能点的框。
+
+- Stepper **只有左右两条 18 px 箭头带响应**，中间数值带 `return -1`（避免「点值等于点 +」
+  这种手感歧义）。实测 `control.x + 4` → `-1`、`control.right - 4` → `+1`。
+- Choice 整个控件都可点，方向恒为 `+1`（`option_cycle_choice` 前向循环，无箭头）。
+- `option_hit` 对 0 行工具与越界 y 一律 `-1`；y 判据是 control 矩形，不是整条 bar。
+
+#### 接线
+
+`option_value_text()` 渲染值（`%d px` / `%d%%` / `合并·图层` / `开·关` / `%.1f px`），
+`apply_tool_option()` 把 delta 写回**同一批** `ShellState` 字段（`step_brush_size`、
+`step_brush_hardness`、`step_wand_tolerance`、`step_selection_feather`、
+`step_shape_stroke_width`，Choice 走 `option_cycle_choice`），所以选项栏和右栏永远是同一个
+数值，不存在两套真相。命中顺序在 `WM_LBUTTONDOWN` 里是：工具条按钮 → **选项栏** →
+§5.43 面板开关 → 画布。点完只在状态栏回一行「标签：值」并 `InvalidateRect`。
+
+#### 测试侧
+
+- 新单测 `ui_core_tool_options_bar`：逐工具行数（画笔 2 / 仿制 4 / 修复 3 / 魔棒 2 /
+  选框 1 / 渐变 1 / 形状 2 / 抓手·移动·文字 0）、规格合法性（标签非空、`min <= max`、
+  Choice 的 `choice_count == max-min+1` 且 ≥2、无重复 id、越界索引兜底 `None`）、
+  几何（首组 x == 12、组宽/间距、负索引与空 bar → 空矩形、300 px 窄 bar 第二组为空）、
+  命中带与循环（`(2,3,1)→0`、`(0,3,-1)→2`、`(9,3,1)→1`、`(1,0,1)→0`）。
+- `ui_core_layout_never_overlaps_at_any_size` 增加选项栏不重叠断言，并断言
+  「要么 h == 0，要么 h == 32 且 y == toolbar.bottom 且满宽」。
+- `visual_check.py` 的 `Shell.layout` 镜像了上面所有常量与新矩形（**不同步就是所有下游场景
+  默默量错矩形**，这一节最容易踩的坑）；新场景 `options_bar` 13 条：
+  条高 32、条底色、画笔两组、控件底色、标签字形、小圆点橙色像素 > 0、Ctrl+Z 清空后
+  画同一点橙色像素 122 → 418（证明参数真的落到引擎）、四次点 `+` 只改值不改画布
+  （`pixel_diff == 0`）、同点重绘宽 > 2×窄、形状 Choice 点击值像素变化 326 且画布 0。
+
+#### 已知边界（本批未做）
+
+- **没有数字直输**：Stepper 只能点箭头/±，值域靠 clamp，不能键入精确值。
+- **DPI 未做**：高 DPI 下 32 px 与 22 px 控件仍是物理像素，会被系统缩放模糊；整套
+  UI 缩放是独立一批（要改全局度量），本批不半做。
+- 窄窗口只显示放得下的前几组，不换行、不横向滚动。
+- 浮动面板（P0-10 的另一半）仍未做。
+
+`visual_check.py` **115 条 / 22 场景 / 0 失败**；单测 **628 例 / 0 失败**；
+`check_tool_table.py` PASS（20 工具）；`run_regression.py --require-ohos` 6/6；
+壳自检 257 项 failures=0、SHA `377DE660D48AC933…` 与基线逐字节一致。
+
 
 
 

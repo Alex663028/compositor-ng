@@ -10774,6 +10774,141 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
   DrawTextW(dc, info_text, -1, &info_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 }
 
+/* 选项栏的值文本：整数百分比与枚举名各走一条，绘制与状态反馈共用。 */
+std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptionSpec& spec) {
+  wchar_t buffer[48];
+  switch (spec.id) {
+    case comp_ui::ToolOptionId::BrushSize:
+      wsprintfW(buffer, L"%d px", static_cast<int>(shell.brush_size + 0.5));
+      return buffer;
+    case comp_ui::ToolOptionId::BrushHardness:
+      wsprintfW(buffer, L"%d%%", static_cast<int>(shell.brush_hardness * 100.0 + 0.5));
+      return buffer;
+    case comp_ui::ToolOptionId::WandTolerance:
+      wsprintfW(buffer, L"%d", shell.wand_tolerance);
+      return buffer;
+    case comp_ui::ToolOptionId::SelectionFeather:
+      wsprintfW(buffer, L"%d px", shell.selection_feather);
+      return buffer;
+    case comp_ui::ToolOptionId::GradientType:
+      return widen_ascii(comp_ui::gradient_type_name(shell.gradient_type));
+    case comp_ui::ToolOptionId::ShapeKind:
+      return widen_ascii(comp_ui::shape_kind_name(shell.shape_kind));
+    case comp_ui::ToolOptionId::ShapeStrokeWidth:
+      wsprintfW(buffer, L"%.1f px", shell.shape_stroke_width);
+      return buffer;
+    case comp_ui::ToolOptionId::CloneSample:
+      return shell.clone_sample_all ? L"合并" : L"图层";
+    case comp_ui::ToolOptionId::CloneAligned:
+      return shell.clone_aligned ? L"开" : L"关";
+    case comp_ui::ToolOptionId::HealMode:
+      return widen_ascii(comp_ui::heal_mode_name(shell.heal_mode));
+    default:
+      return L"";
+  }
+}
+
+/*
+ * 点击选项栏：改的是**同一个** ShellState 字段，画笔下一笔就生效，不需要
+ * 任何「应用」按钮。返回 false 表示这一下不是选项栏吃掉的（调用方继续派发）。
+ *
+ * 边界夹取全部复用 ui_core 的 clamp/step：横栏与右栏/快捷键改的是同一个值，
+ * 两处各写一份夹取迟早会分叉（例如横栏能拖到 600px 而快捷键卡在 500px）。
+ */
+bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
+  switch (id) {
+    case comp_ui::ToolOptionId::BrushSize:
+      shell.brush_size = comp_ui::step_brush_size(shell.brush_size, delta);
+      break;
+    case comp_ui::ToolOptionId::BrushHardness:
+      shell.brush_hardness = comp_ui::step_brush_hardness(shell.brush_hardness, delta);
+      break;
+    case comp_ui::ToolOptionId::WandTolerance:
+      shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, delta);
+      break;
+    case comp_ui::ToolOptionId::SelectionFeather:
+      shell.selection_feather = comp_ui::step_selection_feather(shell.selection_feather, delta);
+      break;
+    case comp_ui::ToolOptionId::GradientType:
+      shell.gradient_type =
+          comp_ui::option_cycle_choice(shell.gradient_type, comp_ui::kGradientTypeCount, delta);
+      break;
+    case comp_ui::ToolOptionId::ShapeKind:
+      shell.shape_kind =
+          comp_ui::option_cycle_choice(shell.shape_kind, comp_ui::kShellShapeKindCount, delta);
+      break;
+    case comp_ui::ToolOptionId::ShapeStrokeWidth:
+      shell.shape_stroke_width = comp_ui::step_shape_stroke_width(shell.shape_stroke_width, delta);
+      break;
+    case comp_ui::ToolOptionId::CloneSample:
+      shell.clone_sample_all = !shell.clone_sample_all;
+      break;
+    case comp_ui::ToolOptionId::CloneAligned:
+      shell.clone_aligned = !shell.clone_aligned;
+      break;
+    case comp_ui::ToolOptionId::HealMode:
+      shell.heal_mode = comp_ui::option_cycle_choice(shell.heal_mode, comp_ui::kHealModeCount, delta);
+      break;
+    default:
+      return false;
+  }
+  return true;
+}
+
+/*
+ * §5.49 工具选项栏：一条横栏，左边是当前工具的参数组。
+ * 几何全部来自 ui_core 的 option_group_rect / option_control_rect，绘制与命中
+ * 用同一份矩形——横栏只有 32px 高，差 1px 就会点错组（与面板分界线同一教训）。
+ */
+void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
+  RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(38, 40, 46));
+  FillRect(dc, &background_rect, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  const int count = comp_ui::tool_option_count(shell.tool);
+  if (count == 0) {
+    RECT hint{bar.x + comp_ui::kOptionLeftPad, bar.y, bar.right() - 12, bar.bottom()};
+    SetTextColor(dc, RGB(118, 122, 134));
+    DrawTextW(dc, L"该工具没有选项栏参数", -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    return;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    const comp_ui::Rect group = comp_ui::option_group_rect(bar, i);
+    if (group.empty()) break; /* 后面的组只会更放不下 */
+    const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(shell.tool, i);
+
+    RECT label{group.x, group.y, group.x + comp_ui::kOptionLabelWidth - 6, group.bottom()};
+    SetTextColor(dc, RGB(170, 174, 186));
+    DrawTextW(dc, widen_ascii(spec.label).c_str(), -1, &label,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    const comp_ui::Rect control = comp_ui::option_control_rect(group);
+    if (control.empty()) continue;
+    RECT box{control.x, control.y, control.right(), control.bottom()};
+    HBRUSH fill = CreateSolidBrush(RGB(58, 60, 68));
+    FillRect(dc, &box, fill);
+    DeleteObject(fill);
+
+    RECT value{control.x, control.y, control.right(), control.bottom()};
+    SetTextColor(dc, RGB(228, 230, 236));
+    DrawTextW(dc, option_value_text(shell, spec).c_str(), -1, &value,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (spec.kind == comp_ui::ToolOptionKind::Stepper) {
+      /* Stepper 的箭头画在值两侧：命中测试按同样两条 18px 带子判断。 */
+      RECT left{control.x, control.y, control.x + comp_ui::kOptionArrowWidth, control.bottom()};
+      RECT right{control.right() - comp_ui::kOptionArrowWidth, control.y, control.right(),
+                 control.bottom()};
+      SetTextColor(dc, RGB(196, 200, 210));
+      DrawTextW(dc, L"-", -1, &left, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      DrawTextW(dc, L"+", -1, &right, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+  }
+}
+
 /* 状态栏：工具 / 缩放 / 历史，加上壳层最近一条反馈。 */
 void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
   RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
@@ -12924,6 +13059,10 @@ void present(HWND window, ShellState& shell) {
   draw_canvas_overlays(memory_dc, shell, layout);
 
   draw_toolbar(memory_dc, shell, layout.toolbar);
+  /* §5.49：选项栏高度为 0 时整块跳过（矮窗口），画布已经回收了这条高度。 */
+  if (layout.options.h > 0) {
+    draw_tool_options(memory_dc, shell, layout.options);
+  }
   /*
    * §5.43：收起态只剩 24px 竖条，面板内容一列都排不下——整块不画，交给
    * draw_panel_toggles 画竖条。两者互斥，竖条上不会漏出半截图层行。
@@ -15317,6 +15456,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             if (info != nullptr) set_tool(*shell, info->id);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          /*
+           * §5.49 选项栏：排在工具按钮之后、面板开关之前。它在两者之间的一条
+           * 独立横栏，命中后必须吃掉这次点击——否则会继续落到画布上落下第一笔。
+           */
+          if (layout.options.h > 0) {
+            int delta = 0;
+            const int option =
+                comp_ui::option_hit(layout.options, shell->tool, mouse_x, mouse_y, &delta);
+            if (option >= 0) {
+              const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(shell->tool, option);
+              if (apply_tool_option(*shell, spec.id, delta)) {
+                wchar_t line[128];
+                wsprintfW(line, L"%s：%s", widen_ascii(spec.label).c_str(),
+                          option_value_text(*shell, spec).c_str());
+                shell->status = line;
+              }
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
           }
           /*
            * §5.43 收起/展开按钮：先于分界线与面板行。展开态它与分界线留 3px

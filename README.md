@@ -5540,6 +5540,55 @@ SHA256 `377DE660D48AC933…` 与基线逐字节一致**；`build_windows_shell.p
 `Esc` 后仍活着、取消不改画布（`pixel_diff == 0`）、按 `D` 后 3 秒内退出。
 同时 `stop()` 学会在脏文档上补一个 `D`（其它场景不再为这个提示白等超时）。
 
+### 6.82 工具选项栏：工具参数从右栏搬到工具条下（P0-10，2026-10-22，Claude）
+
+改画笔大小此前只有两条路：`[` / `]` 快捷键，或切到右栏面板再找滑杆。本批补上
+Photoshop 的**工具选项栏**——工具条正下方一条 32px 横栏，只放「当前工具」的参数，
+改完立刻生效。零 ABI 新增（仍 **146** 导出），引擎一行未动。
+
+- **布局是新增的一层，不是浮层**：`Layout` 增加 `kOptionsHeight = 32` 与
+  `kMinBodyHeight = 96`，`compute_layout` 里 `body_top = toolbar_h + options_h`。
+  横栏**整块参与布局**：显示时画布/两侧面板整体下移 32px，收起时高度记 0、画布
+  回收这 32px，不存在「一条悬空带子盖在画布上」。矮窗口（主体不足 96px）先收选项栏，
+  再挤压面板——挤扁的 32px 横栏连一行字都放不下，只会白白推走画布。
+- **行集合是纯函数**：`ui_core.h` 新段 `ToolOptionId / ToolOptionKind / ToolOptionSpec`
+  + `tool_option_count(ToolId)` / `tool_option(ToolId, index)`。绘制与命中都从这两个
+  函数取数，不存在「画出来的行和点中的行不是同一行」。行集合按工具：
+  画笔/橡皮/修补画笔/减淡加深/历史画笔 → 大小、硬度；污点修复 → + 模式；
+  仿制图章 → + 取样（图层/合并）、对齐；选框/套索 → 羽化；魔棒 → 容差、羽化；
+  渐变 → 类型；形状 → 形状、线宽。文字工具**刻意不给**：字号/行距在右栏已有完整面板，
+  横栏再放一份就是两份真源。
+- **几何与命中同一份常量**：`option_group_rect` / `option_control_rect` 按「左内边距 12、
+  组宽 150、组距 8、标签 56、箭头各 18、值 54」排；放不下就**整组不画**（返回空矩形），
+  不做半宽裁切——只剩 20px 的「+」比没有更糟。`option_hit` 只认两侧 18px 箭头，
+  数值区点了不改参数（PS 里数值区是文本输入，本仓的数值编辑在右栏）。
+  `Choice` 整块响应、点一下循环到下一档（`option_cycle_choice`，首尾绕环）。
+- **改的是同一个 `ShellState` 字段**：`apply_tool_option` 直接写 `brush_size` /
+  `brush_hardness` / `wand_tolerance` / `selection_feather` / `gradient_type` /
+  `shape_kind` / `shape_stroke_width` / `clone_sample_all` / `clone_aligned` / `heal_mode`，
+  夹取全部复用 ui_core 已有的 `step_*` 函数（横栏与快捷键不会分叉出两套边界）。
+- **命中顺序**：`WM_LBUTTONDOWN` 里排在「工具按钮」之后、「面板开关/分界线/画布」之前。
+  横栏命中即 `return 0`，否则同一次按下会继续落到画布上落下第一笔。
+- **边界（如实记）**：横栏数值只能步进、不能键入（数值输入仍走右栏/快捷键）；
+  `Retouch` / `Tone` 的子模式与强度已经有工具条右侧读数与快捷键，未搬进横栏；
+  高 DPI 仍未做（`SetProcessDpiAware*`、manifest 都不在，本批没有半做——那是一整套
+  UI 缩放改造，留作独立批次）；横栏宽度不足时只显示能放下的前几组（不滚动）。
+
+**验证。** 单测 **628 例 / 0 失败**（新增 `ui_core_tool_options_bar`：各工具行数、
+行 id/标签/区间/Choice 跨度/同工具不重复行、组控件矩形与放不下时整组消失、
+Stepper 两侧箭头与数值区不同响应、空矩形不命中、Choice 绕环；布局测试补了
+选项栏「要么整条满宽显示、要么高度 0」与高度阈值两侧的边界）；
+`run_regression.py --require-ohos` **6/6**；壳自检 **257 项 failures=0、
+SHA256 `377DE660D48AC933…` 与基线逐字节一致**（`kToolbarHeight/kOptionsHeight` 只出现在
+`ui_core.h`，自检不覆盖布局）；`build_windows_shell.py` 零警告；`check_tool_table.py`
+PASS（20 个工具）；`visual_check.py` **115 条 / 22 场景 / 0 失败**——新增 `options_bar`
+场景 13 条：横栏 32px 且底色为 (38,40,46)、画笔有两组、控件盒底色正确、标签有字形、
+小笔尖落点有橙色像素且 `Ctrl+Z` 清零、连点 4 次「+」后值区变化 **58** 像素而画布
+**0** 像素变化（点击确实被横栏吃掉）、同一落点橙色像素 **122 → 418**（参数真的进了
+画布）、形状工具的 Choice 组点击后值区变化 **326** 像素且画布不变。
+`visual_check.py` 的布局镜像同步加了 `options` 与 `option_group_rect/option_control_rect`，
+既有 21 个场景在画布下移 32px 后仍全绿。
+
 
 
 
