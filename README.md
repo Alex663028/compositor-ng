@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **560 用例 0 失败**；Windows 外壳实机自检 **245 项全 OK**（与仓内基线逐字节一致）。
+  全量 **619 用例 0 失败**；Windows 外壳实机自检 **257 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -2746,8 +2746,9 @@ S10 之后「Type / Shape / Gradient」只剩 Type。与 Shape 不同，Type 没
 **4. 语义与边界。** 合成是预乘 source-over，权重 = 覆盖率 × `opacity` × `color.a`；
 活跃选区按 `selection_effective_coverage` 逐像素乘入，覆盖率为 0 的像素逐字节不动
 （画布外 = 选区之外）；8 位工作副本，RGBA16 经 `merge_deep_paint` 合回，RGBA16F 直接
-`COMP_ERR_STATE`（与 Dither / Lens / Gradient / Shape 同口径）。与上游三处显式差异：
-① 没有系统字体 / 字体选择 / CJK / 富文本（粗体、斜体、对齐、旋转、文字描边都没有）；
+`COMP_ERR_STATE`（与 Dither / Lens / Gradient / Shape 同口径）。与上游三处显式差异
+（S11 当时）：① 没有系统字体 / 字体选择 / CJK / 富文本（粗体、斜体、对齐、旋转、文字描边
+都没有）——**P5-3 起字体轨道与 CJK 已接上，见 `docs/shell-parity.md` §5.45**；
 ② 文字是**一次性像素**，不是可再编辑的文本对象，提交后不能回改内容（撤销只能整步回滚）；
 ③ 上游画完新建图层，本仓写进当前图层（与所有工具算子同一条规矩）。
 
@@ -2755,7 +2756,8 @@ S10 之后「Type / Shape / Gradient」只剩 Type。与 Shape 不同，Type 没
 `kDefaultTypeLineHeight = 1.25`、字号 6..2048（`×/÷1.25` 步进）、行距 1..8、字距量程
 由「步距 ≥ 0.5 px」反推（`type_letter_spacing_min(font_size) = 0.5 - 6 × font_size / 7`，
 负字距合法）、`type_block_metrics`（与内核 `build_layout` 同公式，状态栏与预览共用）、
-US 布局的 `type_ascii_from_vk`（字母/数字 + 常用标点，Shift 读修饰键）、`type_caret_height`。
+`type_caret_height`。S11 当时的 `type_ascii_from_vk`（US 布局 VK→ASCII）已在 P5-3 删除：
+字符改由 `WM_CHAR`/输入法进入，见 `docs/shell-parity.md` §5.45。
 手势：`T` 选工具 → 画布点击落插入点 → 直接键入 ASCII → `Enter` 提交一次
 `comp_tool_apply(COMP_TOOL_TYPE)`；`Shift+Enter` 换行、`Backspace` 删字符、
 `Esc` / 切工具 / 失焦取消（只丢预览，不产生撤销步）；`[ / ]` 调字号、`Shift+[ / ]`

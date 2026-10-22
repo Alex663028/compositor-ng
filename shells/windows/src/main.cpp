@@ -39,6 +39,7 @@
 #include <compositor/comp_engine.h>
 #include <compositor/comp_eyedropper.h>
 #include <compositor/comp_filter.h>
+#include <compositor/comp_font.h>
 #include <compositor/comp_io.h>
 #include <compositor/comp_layer.h>
 #include <compositor/comp_render.h>
@@ -640,18 +641,36 @@ struct ShellState {
   double shape_stroke_width = comp_ui::kDefaultShapeStrokeWidth;
   double shape_corner_radius = comp_ui::kDefaultShapeCornerRadius;
   /*
-   * 文字工具（S11）：T 切工具；在画布上点一下落插入点，随后直接键入 ASCII，
+   * 文字工具（S11 + P5）：T 切工具；在画布上点一下落插入点，随后直接键入，
    * 回车提交一次 comp_tool_apply(COMP_TOOL_TYPE)，Esc / 失焦 / 切工具取消
-   * （只丢预览，不产生撤销步）。字体是引擎内的 5×7 点阵，没有系统字体，
-   * 因此只支持 ASCII；CJK 由引擎参数闸如实拒绝（不画方框顶替）。
+   * （只丢预览，不产生撤销步）。
+   *
+   * 文本走 UTF-8：字符从 WM_CHAR（含输入法）进来，一个汉字就是 3 字节，
+   * 退格按码点整段删（ui_core::type_utf8_erase_last）。默认轨道是引擎内的
+   * 5×7 点阵（只收 ASCII）；启动时加载了随仓子集字体就多一条字体轨道，
+   * font_size 变成 em 高，中文按字形真实步进排版。没有加载成功就只用点阵，
+   * 不静默换成系统字体（同一份文档在不同机器上会排出不同结果）。
    */
   bool type_active = false; /* 已落插入点，正在键入/等待提交 */
   comp_ui::Point type_origin{}; /* 插入点（文档像素，文本框左上角） */
-  std::string type_text;        /* ASCII 键入缓冲，'\n' = 换行（Shift+Enter） */
+  std::string type_text;        /* UTF-8 键入缓冲，'\n' = 换行（Shift+Enter） */
   double type_font_size = comp_ui::kDefaultTypeFontSize;
   double type_line_height = comp_ui::kDefaultTypeLineHeight;
   double type_letter_spacing = 0.0;
-  /* 文字属性面板（S14）：三行（字号/行距/字距）；type_input 非空 = 数值键入态。 */
+  /* 字体轨道（P5-3）：句柄归 ShellState 所有，退出时释放一次。 */
+  comp_font type_font = nullptr;
+  bool type_use_font = false; /* 面板第 4 行的开关；没加载成功时永远为 false */
+  double type_font_ascender = 0.0;  /* em 比例，来自 comp_font_metrics */
+  double type_font_descender = 0.0; /* em 比例，通常为负 */
+  std::wstring type_font_label;     /* 面板显示名（"Noto Sans SC Subset" / 未加载） */
+  /*
+   * WM_CHAR 一个消息只送一个 UTF-16 码元：BMP 外字符（emoji 等）成对到达。
+   * 高位先存着，等低位拼成码点再写进缓冲；落点/提交/取消都丢弃残留高位。
+   */
+  wchar_t type_pending_high = 0;
+  /* 该按键已被 [ / ] 快捷键吃掉，随之而来的 WM_CHAR 要跳过（否则会多插一个括号）。 */
+  bool type_skip_char = false;
+  /* 文字属性面板（S14）：四行（字号/行距/字距/字体）；type_input 非空 = 数值键入态。 */
   int type_panel_focused = comp_ui::kTypePanelFontSizeRow;
   std::wstring type_input;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
@@ -5829,38 +5848,103 @@ bool type_available(const ShellState& shell) {
   return shell.document != nullptr && shell.tool == comp_ui::ToolId::Type;
 }
 
+/* 字体轨道开关的实际取值：句柄没加载成功就只能是 5×7（不静默借系统字体）。 */
+bool type_font_track(const ShellState& shell) {
+  return shell.type_use_font && shell.type_font != nullptr;
+}
+
+/*
+ * 预览度量：两条轨道量纲不同（点阵是格子、字体是 em），调用点不应该各写一次
+ * 分支——状态栏、面板数字、虚线框三处必须给出同一组值。
+ */
+comp_ui::TypeBlockMetrics type_metrics(const ShellState& shell) {
+  if (type_font_track(shell)) {
+    return comp_ui::type_block_metrics_font(
+        shell.type_font_size, shell.type_line_height, shell.type_letter_spacing,
+        shell.type_text.c_str(), shell.type_font_ascender, shell.type_font_descender);
+  }
+  return comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
+                                     shell.type_letter_spacing, shell.type_text.c_str());
+}
+
 void type_cancel(ShellState& shell) {
   shell.type_active = false;
   shell.type_text.clear();
+  shell.type_pending_high = 0;
+  shell.type_skip_char = false;
+}
+
+/*
+ * 一个 UTF-16 码元进入缓冲（WM_CHAR / 输入法提交的共同出口）。
+ *
+ * 控制字符（回车、退格、Esc、Tab）由 WM_KEYDOWN 处理，这里一律挡掉——否则
+ * 回车会被写成 0x0D，引擎如实报 kBadText，用户看到的是「打字把文本框弄坏了」。
+ * 代理对的两半分别到达：先存高位，低位拼成完整码点再写（孤立的一半直接丢弃）。
+ * 返回是否真的写入了字符（调用方据此决定要不要刷状态栏）。
+ */
+bool type_char_input(ShellState& shell, wchar_t unit) {
+  if (shell.type_skip_char) {
+    shell.type_skip_char = false;
+    return false;
+  }
+  uint32_t codepoint = 0;
+  const uint32_t value = static_cast<uint32_t>(unit);
+  if (value >= 0xD800u && value <= 0xDBFFu) { /* 高代理：等低位 */
+    shell.type_pending_high = unit;
+    return false;
+  }
+  if (value >= 0xDC00u && value <= 0xDFFFu) { /* 低代理：必须配上一个高位 */
+    if (shell.type_pending_high == 0) return false;
+    const uint32_t high = static_cast<uint32_t>(shell.type_pending_high) - 0xD800u;
+    const uint32_t low = value - 0xDC00u;
+    shell.type_pending_high = 0;
+    codepoint = 0x10000u + (high << 10) + low;
+  } else {
+    shell.type_pending_high = 0; /* 高代理后面不是低位：丢弃那一半 */
+    codepoint = value;
+  }
+  if (codepoint < 0x20u || codepoint == 0x7Fu || codepoint > 0x10FFFFu) return false;
+  comp_ui::type_utf8_append(shell.type_text, codepoint);
+  return true;
 }
 
 /* 状态栏：空缓冲时给快捷键提示，有内容时给行数/文本框尺寸/排版值。 */
 void type_refresh_status(ShellState& shell) {
-  const comp_ui::TypeBlockMetrics metrics =
-      comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
-                                  shell.type_letter_spacing, shell.type_text.c_str());
+  const comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
   const int size_px = static_cast<int>(shell.type_font_size + 0.5);
   const int line_pct = static_cast<int>(shell.type_line_height * 100.0 + 0.5);
   const int spacing_px = static_cast<int>(std::lround(shell.type_letter_spacing));
   const int width_px = static_cast<int>(std::lround(metrics.width));
   const int height_px = static_cast<int>(std::lround(metrics.height));
+  const wchar_t* track = type_font_track(shell)
+                             ? shell.type_font_label.c_str()
+                             : L"5×7 点阵";
   wchar_t buffer[384];
   if (shell.type_text.empty()) {
     wsprintfW(buffer,
-              L"文字：插入点 (%d, %d)｜字号 %d px，行距 %d%%，字距 %d px｜"
-              L"键入 ASCII，Shift+Enter 换行，回车提交，Esc 取消；"
+              L"文字：插入点 (%d, %d)｜字体 %s，字号 %d px（%s），行距 %d%%，字距 %d px｜"
+              L"直接键入（中文用输入法），Shift+Enter 换行，回车提交，Esc 取消；"
               L"[ / ] 字号，Shift+[ / ] 字距，Alt+[ / ] 行距",
               static_cast<int>(std::floor(shell.type_origin.x)),
-              static_cast<int>(std::floor(shell.type_origin.y)), size_px, line_pct, spacing_px);
+              static_cast<int>(std::floor(shell.type_origin.y)), track, size_px,
+              type_font_track(shell) ? L"em 高" : L"点阵格高", line_pct, spacing_px);
   } else {
     /* 状态栏是单行：把换行显示成 '|'，不把控制字符塞进窗口标题。 */
     std::string display;
     display.reserve(shell.type_text.size());
     for (char ch : shell.type_text) display.push_back(ch == '\n' ? '|' : ch);
-    wsprintfW(buffer, L"文字：%s｜%d 行 %d×%d px，字号 %d，行距 %d%%，字距 %d｜"
-                      L"回车提交，Esc 取消",
-              widen_ascii(display.c_str()).c_str(), metrics.line_count, width_px, height_px,
-              size_px, line_pct, spacing_px);
+    /* 字体轨道的宽度是估计值：数字前面加「≈」，不让估计值冒充引擎结果。 */
+    if (type_font_track(shell)) {
+      wsprintfW(buffer, L"文字：%s｜%d 行 ≈%d×%d px，字体 %s（em %d），行距 %d%%，字距 %d｜"
+                        L"回车提交，Esc 取消",
+                widen_utf8(display).c_str(), metrics.line_count, width_px, height_px,
+                track, size_px, line_pct, spacing_px);
+    } else {
+      wsprintfW(buffer, L"文字：%s｜%d 行 %d×%d px，字号 %d，行距 %d%%，字距 %d｜"
+                        L"回车提交，Esc 取消",
+                widen_utf8(display).c_str(), metrics.line_count, width_px, height_px,
+                size_px, line_pct, spacing_px);
+    }
   }
   set_status(shell, buffer);
 }
@@ -5876,6 +5960,8 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
   shell.type_origin = shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
   shell.type_active = true;
   shell.type_text.clear();
+  shell.type_pending_high = 0;
+  shell.type_skip_char = false;
   /* 落插入点即离开属性面板的数值键入态，否则数字键会被面板缓冲吃掉。 */
   shell.type_input.clear();
   /*
@@ -5916,6 +6002,12 @@ void type_commit(ShellState& shell) {
   desc.type.style.line_height = shell.type_line_height;
   desc.type.style.letter_spacing = shell.type_letter_spacing;
   desc.type.style.antialias = 1;
+  /*
+   * type_font 是 comp_tool_op_desc 的**尾字段**：非 NULL 时引擎走字体轨道，
+   * NULL 时沿用 5×7 点阵。开关关掉就传 NULL（而不是「传了句柄但让引擎忽略」），
+   * 两条轨道在 ABI 上只有这一个分叉。
+   */
+  desc.type_font = type_font_track(shell) ? shell.type_font : nullptr;
   desc.type.color[0] = shell.foreground.r;
   desc.type.color[1] = shell.foreground.g;
   desc.type.color[2] = shell.foreground.b;
@@ -5929,12 +6021,11 @@ void type_commit(ShellState& shell) {
   shell.needs_render = true;
 
   /* 无论成功与否都退出键入态：成功已提交，失败也没有可保留的预览语义。 */
-  const int lines = comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
-                                                shell.type_letter_spacing,
-                                                shell.type_text.c_str())
-                        .line_count;
+  const int lines = type_metrics(shell).line_count;
   shell.type_active = false;
   shell.type_text.clear();
+  shell.type_pending_high = 0;
+  shell.type_skip_char = false;
 
   wchar_t buffer[384];
   if (result != COMP_OK) {
@@ -5976,12 +6067,90 @@ void type_step_param(ShellState& shell, int direction, bool spacing) {
   }
 }
 
+/* ------------------------------------------------------------ 字体轨道（P5-3） */
+
+/*
+ * 随仓子集字体的固定文件名（字符集与 SHA256 记在 resources/fonts/README.md）。
+ * 外壳**只**加载这一份：系统字体随机器漂移（同一份文档在两台机器上会排出不同
+ * 结果），字体授权也不该由外壳去猜。加载失败就如实留在 5×7 轨道。
+ */
+const wchar_t* kShellFontFileName = L"NotoSansSC-Regular-Subset.ttf";
+
+std::wstring exe_directory() {
+  wchar_t path[MAX_PATH] = L"";
+  const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) return std::wstring();
+  std::wstring full(path, length);
+  const size_t slash = full.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return std::wstring();
+  return full.substr(0, slash);
+}
+
+/*
+ * 候选顺序：exe 同级 resources/、exe 上一级（开发态 build/ 与仓根并列）、
+ * 当前工作目录。命中第一个可用字体就停；三处都没有返回 nullptr。
+ *
+ * 可用性检查不只看「能打开」：位图字体（units_per_em = 0）、没有 CJK 字形的
+ * 字体都不能承担文字工具，宁可继续用点阵，也不要让用户在面板上选到一个
+ * 一打字就满屏缺字的字体。自检与窗口启动共用这一条加载路径。
+ */
+comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metrics) {
+  std::vector<std::wstring> candidates;
+  const std::wstring exe_dir = exe_directory();
+  if (!exe_dir.empty()) {
+    candidates.push_back(exe_dir + L"\\resources\\fonts\\" + kShellFontFileName);
+    candidates.push_back(exe_dir + L"\\..\\resources\\fonts\\" + kShellFontFileName);
+  }
+  candidates.push_back(std::wstring(L"resources\\fonts\\") + kShellFontFileName);
+
+  for (const std::wstring& wide : candidates) {
+    char utf8[MAX_PATH * 3] = {0};
+    if (WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr) <=
+        0) {
+      continue;
+    }
+    comp_font font = nullptr;
+    if (comp_font_load_file(utf8, 0, &font) != COMP_OK || font == nullptr) continue;
+    comp_font_metrics metrics{};
+    const bool usable = comp_font_get_metrics(font, &metrics) == COMP_OK &&
+                        metrics.scalable != 0 && metrics.units_per_em > 0 &&
+                        metrics.has_cjk != 0;
+    if (!usable) {
+      comp_font_release(font);
+      continue;
+    }
+    if (out_metrics != nullptr) *out_metrics = metrics;
+    if (out_label != nullptr) {
+      const char* family = comp_font_name(font, COMP_FONT_NAME_FAMILY);
+      *out_label = (family != nullptr && family[0] != '\0') ? widen_utf8(std::string(family))
+                                                            : std::wstring(L"字体轨道");
+    }
+    return font;
+  }
+  return nullptr;
+}
+
+bool load_shell_font(ShellState& shell) {
+  comp_font_metrics metrics{};
+  std::wstring label;
+  comp_font font = load_shipped_font(&label, &metrics);
+  if (font == nullptr) return false;
+  shell.type_font = font;
+  shell.type_font_ascender = metrics.ascender;
+  shell.type_font_descender = metrics.descender;
+  shell.type_font_label = label;
+  /* 默认就走字体轨道：P0-5 的验收是「中文能打、能排、能提交」，多一步切换只是障碍。 */
+  shell.type_use_font = true;
+  return true;
+}
+
 /* ------------------------------------------------------------ 文字属性面板（S14） */
 
 /*
- * 三行属性面板（字号 / 行距 / 字距）。值仍写回 ShellState 的 type_* 字段，
- * 面板只是第二条操作通路：引擎参数、状态栏、文本框预览都读同一组值。
- * 行几何、夹取、步进全部来自 ui_core.h，绘制与命中不会漂移。
+ * 四行属性面板（字号 / 行距 / 字距 / 字体）。前三行的值写回 ShellState 的
+ * type_* 字段，第四行切换轨道；面板只是第二条操作通路：引擎参数、状态栏、
+ * 文本框预览都读同一组值。行几何、夹取、步进全部来自 ui_core.h，绘制与命中
+ * 不会漂移。
  */
 bool type_panel_visible(const ShellState& shell) {
   return shell.tool == comp_ui::ToolId::Type && !shell.filter_open;
@@ -5997,11 +6166,15 @@ double type_panel_value(const ShellState& shell, int row) {
 }
 
 std::wstring type_panel_value_text(const ShellState& shell, int row) {
-  wchar_t buffer[48];
+  wchar_t buffer[96];
   if (row == comp_ui::kTypePanelLineHeightRow) {
     wsprintfW(buffer, L"%d%%", static_cast<int>(shell.type_line_height * 100.0 + 0.5));
   } else if (row == comp_ui::kTypePanelFontSizeRow) {
     wsprintfW(buffer, L"%d px", static_cast<int>(shell.type_font_size + 0.5));
+  } else if (row == comp_ui::kTypePanelFontRow) {
+    /* 字体行显示的是「当前会用到哪个字体」，不是字号——字号量纲对它没有意义。 */
+    wsprintfW(buffer, L"%s", type_font_track(shell) ? shell.type_font_label.c_str()
+                                                    : L"5×7 点阵");
   } else {
     wsprintfW(buffer, L"%d px", static_cast<int>(std::lround(shell.type_letter_spacing)));
   }
@@ -6053,8 +6226,34 @@ void type_panel_focus(ShellState& shell, int delta) {
   type_panel_status(shell, L"文字属性 ");
 }
 
+/*
+ * 字体行切换：字体轨道 <-> 5×7 点阵。两条轨道的 font_size 量纲不同（em / 格子），
+ * 切换时**不改数值**——用户调好的 48 px 在字体轨道是 48 px 的 em，回到点阵就是
+ * 48 px 的格子；硬换算只会制造一个没人要的 5.2。状态栏说清楚当前量纲即可。
+ */
+void type_panel_toggle_font(ShellState& shell) {
+  if (shell.type_font == nullptr) {
+    set_status(shell, L"字体：没有加载随仓字体，只能用 5×7 点阵（ASCII）");
+    return;
+  }
+  shell.type_use_font = !shell.type_use_font;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"字体 = %s（%s）",
+            shell.type_use_font ? shell.type_font_label.c_str() : L"5×7 点阵",
+            shell.type_use_font ? L"UTF-8/CJK，字号按 em 高" : L"仅 ASCII，字号按格子高");
+  if (shell.type_active) {
+    type_refresh_status(shell);
+  } else {
+    set_status(shell, buffer);
+  }
+}
+
 void type_panel_step(ShellState& shell, int direction) {
   const int row = shell.type_panel_focused;
+  if (comp_ui::type_panel_row_is_toggle(row)) {
+    type_panel_toggle_font(shell);
+    return;
+  }
   const double before = type_panel_value(shell, row);
   const double next = comp_ui::type_panel_step_value(row, before, shell.type_font_size, direction);
   type_panel_set(shell, row, next);
@@ -10041,16 +10240,20 @@ void draw_type_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
     TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
   }
 
-  /* 文本框度量与引擎 build_layout 同一公式（ui_core::type_block_metrics）。 */
-  const comp_ui::TypeBlockMetrics metrics =
-      comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
-                                  shell.type_letter_spacing, shell.type_text.c_str());
+  /* 文本框度量：点阵轨道与引擎 build_layout 同公式，字体轨道是 em 估计值。 */
+  const comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
   SetTextColor(dc, RGB(170, 174, 186));
   y = comp_ui::type_param_row_rect(panel_rect, comp_ui::kTypePanelRowCount - 1).bottom() + 8;
-  wsprintfW(line, L"文本框 %d×%d px｜%d 行｜步距 %d px",
-            static_cast<int>(std::lround(metrics.width)),
-            static_cast<int>(std::lround(metrics.height)), metrics.line_count,
-            static_cast<int>(std::lround(metrics.advance)));
+  if (type_font_track(shell)) {
+    wsprintfW(line, L"文本框 ≈%d×%d px｜%d 行｜em 高（宽度是估计值）",
+              static_cast<int>(std::lround(metrics.width)),
+              static_cast<int>(std::lround(metrics.height)), metrics.line_count);
+  } else {
+    wsprintfW(line, L"文本框 %d×%d px｜%d 行｜步距 %d px",
+              static_cast<int>(std::lround(metrics.width)),
+              static_cast<int>(std::lround(metrics.height)), metrics.line_count,
+              static_cast<int>(std::lround(metrics.advance)));
+  }
   TextOutW(dc, left + 10, y, line, lstrlenW(line));
 
   if (!shell.type_input.empty()) {
@@ -10545,15 +10748,14 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
   }
 
   /*
-   * 文字预览（S11）：插入点光标 + 未来文本框（白实线 + 黑虚线双描边）。
-   * 只给位置与尺寸，不预演字形：外壳没有系统字体（字体是引擎内的 5×7 点阵），
-   * 画一套 GDI 字只会与落笔结果不一致；像素在回车时由引擎一次写出（与渐变/
-   * 形状预览同口径）。度量来自 ui_core，与内核 build_layout 同公式。
+   * 文字预览（S11/P5）：插入点光标 + 未来文本框（白实线 + 黑虚线双描边）。
+   * 只给位置与尺寸，不预演字形：点阵轨道没有可借的 GDI 字体，字体轨道也不该
+   * 用 GDI 字体冒充引擎结果（同一段文字会排出两种字形）。像素在回车时由引擎
+   * 一次写出（与渐变/形状预览同口径）。点阵轨道的度量与内核 build_layout 同公式；
+   * 字体轨道是 em 估计值，框线只是提示，宽度在面板/状态栏都标了「≈」。
    */
   if (shell.type_active) {
-    const comp_ui::TypeBlockMetrics metrics =
-        comp_ui::type_block_metrics(shell.type_font_size, shell.type_line_height,
-                                    shell.type_letter_spacing, shell.type_text.c_str());
+    const comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
     const comp_ui::Point origin = shell.view.doc_to_screen(
         shell.type_origin.x, shell.type_origin.y, layout.canvas, shell.width, shell.height);
     const comp_ui::Point corner = shell.view.doc_to_screen(
@@ -12629,6 +12831,7 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     if (key == VK_RETURN) {
       if (shift) {
         shell.type_text.push_back('\n');
+        shell.type_pending_high = 0; /* 换行把没拼完的代理对隔断了 */
         type_refresh_status(shell);
       } else {
         type_commit(shell);
@@ -12636,20 +12839,23 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       return;
     }
     if (key == VK_BACK) {
-      if (!shell.type_text.empty()) shell.type_text.pop_back();
+      /* 按码点删：UTF-8 下一个汉字 3 字节，按字节删会留下半个码点（引擎会拒收）。 */
+      comp_ui::type_utf8_erase_last(shell.type_text);
+      shell.type_pending_high = 0;
       type_refresh_status(shell);
       return;
     }
     if (key == VK_OEM_4 || key == VK_OEM_6) {
       type_step_param(shell, key == VK_OEM_4 ? -1 : 1, shift);
+      /* 这一键已经是快捷键，TranslateMessage 随后还会送一个 '[' / ']'：吃掉它。 */
+      shell.type_skip_char = true;
       return;
     }
     if (!ctrl) {
-      const char typed = comp_ui::type_ascii_from_vk(static_cast<int>(key), shift);
-      if (typed != 0) {
-        shell.type_text.push_back(typed);
-        type_refresh_status(shell);
-      }
+      /*
+       * 字符本体一律走 WM_CHAR（输入法、键盘布局、AltGr 的共同出口）。这里不再
+       * 自己按 VK 查表：两条路同时插字符会让每个按键都打两遍。
+       */
       return; /* 键入态下屏蔽其它快捷键，避免误触发 */
     }
   }
@@ -12672,7 +12878,7 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       default:
         break;
     }
-    if (key >= '0' && key <= '9') {
+    if (key >= '0' && key <= '9' && !comp_ui::type_panel_row_is_toggle(shell.type_panel_focused)) {
       type_panel_begin_input(shell, static_cast<wchar_t>(key));
       return;
     }
@@ -13218,6 +13424,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_CHAR:
       if (shell != nullptr && shell->layer_input != LayerInput::None) {
         panel_layer_input_char(*shell, static_cast<wchar_t>(wparam));
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
+       * 文字工具（P5-3）同一个出口：WM_CHAR / WM_IME_CHAR 送来的码元进 UTF-8
+       * 缓冲。落点后键盘是模态的，字符不再兼作工具快捷键（快捷键在 KEYDOWN
+       * 里已经处理过的会置 type_skip_char，这里跳过它对应的那个字符）。
+       */
+      if (shell != nullptr && shell->type_active) {
+        if (type_char_input(*shell, static_cast<wchar_t>(wparam))) {
+          type_refresh_status(*shell);
+        }
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -15990,16 +16208,19 @@ int run_selftest(const wchar_t* out_path) {
    * 文字属性面板（S14）：行表、步进与命中几何都来自 ui_core.h，
    * 与 draw_type_panel / WM_LBUTTONDOWN 共用同一份常量。
    */
-  verify(comp_ui::kTypePanelRowCount == 3 &&
+  verify(comp_ui::kTypePanelRowCount == 4 &&
              std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontSizeRow)) ==
                  "Font Size" &&
              std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLineHeightRow)) ==
                  "Line Height" &&
              std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLetterSpacingRow)) ==
                  "Letter Spacing" &&
+             std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontRow)) == "Typeface" &&
+             comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelFontRow) &&
+             !comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelFontSizeRow) &&
              comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLineHeightRow) &&
              !comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelFontSizeRow),
-         "ui_core type panel row table (3 rows, line height is a percentage)");
+         "ui_core type panel row table (4 rows, font row is a toggle)");
 
   verify(std::fabs(comp_ui::step_type_line_height(1.25, 1) - 1.30) < 1e-9 &&
              std::fabs(comp_ui::step_type_line_height(1.25, -1) - 1.20) < 1e-9 &&
@@ -16019,10 +16240,104 @@ int run_selftest(const wchar_t* out_path) {
   verify(comp_ui::type_param_row_at(type_panel_rect, 1010.0, 101.0) == 0 &&
              comp_ui::type_param_row_at(type_panel_rect, 1010.0, 121.0) == 1 &&
              comp_ui::type_param_row_at(type_panel_rect, 1010.0, 141.0) == 2 &&
-             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 161.0) == -1 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 161.0) == 3 &&
+             comp_ui::type_param_row_at(type_panel_rect, 1010.0, 181.0) == -1 &&
              comp_ui::type_param_row_at(type_panel_rect, 1010.0, 99.0) == -1 &&
              comp_ui::type_param_row_at(type_panel_rect, 500.0, 121.0) == -1,
          "ui_core type panel rows hit-test with the drawn geometry");
+
+  /*
+   * UTF-8 编辑（P5-3）：退格必须按码点整段删。按字节删在「你好」上会留下
+   * E4 BD 这样的半截码点，引擎如实报 kBadText——用户看到的是退格把整段文字弄没了。
+   */
+  {
+    std::string utf8_buffer;
+    comp_ui::type_utf8_append(utf8_buffer, 0x4F60u);  /* 你（3 字节） */
+    comp_ui::type_utf8_append(utf8_buffer, 0x1F600u); /* 表情（4 字节） */
+    comp_ui::type_utf8_append(utf8_buffer, 'A');      /* ASCII（1 字节） */
+    const size_t utf8_total = utf8_buffer.size();
+    const bool ascii_erased =
+        utf8_total == 8 && comp_ui::type_utf8_erase_last(utf8_buffer) == 1 && utf8_buffer.size() == 7;
+    const bool wide_erased = comp_ui::type_utf8_erase_last(utf8_buffer) == 4 &&
+                             utf8_buffer.size() == 3 &&
+                             comp_ui::type_utf8_erase_last(utf8_buffer) == 3 && utf8_buffer.empty();
+    verify(ascii_erased && wide_erased,
+           "ui_core type_utf8_erase_last() deletes one whole codepoint per press");
+    uint32_t decoded = 0;
+    verify(comp_ui::type_utf8_next("\xE4\xBD\xA0", &decoded) == 3 && decoded == 0x4F60u,
+           "ui_core type_utf8_next() decodes a 3-byte CJK codepoint");
+    verify(comp_ui::type_utf8_next("\xE4\xBD", &decoded) == 0 &&
+               comp_ui::type_utf8_next("\n", &decoded) == 0,
+           "ui_core type_utf8_next() rejects truncated codepoints and control characters");
+  }
+
+  /*
+   * 字体轨道（P5-3）：随仓子集字体能加载、能排中文、缺字如实回报，
+   * 并且一次提交只占一步撤销。加载路径与窗口启动共用 load_shipped_font。
+   */
+  comp_font_metrics font_metrics{};
+  std::wstring font_label;
+  comp_font shipped_font = load_shipped_font(&font_label, &font_metrics);
+  verify(shipped_font != nullptr && font_metrics.scalable != 0 && font_metrics.has_cjk != 0 &&
+             font_metrics.units_per_em > 0,
+         "the shipped subset font loads (scalable, has CJK)");
+  if (shipped_font != nullptr) {
+    /* 预览度量：两个 CJK 码点约 2 em 宽，高 = (ascender - descender) * em。 */
+    const comp_ui::TypeBlockMetrics font_preview = comp_ui::type_block_metrics_font(
+        40.0, 1.25, 0.0, "\xE4\xBD\xA0\xE5\xA5\xBD", font_metrics.ascender,
+        font_metrics.descender);
+    verify(font_preview.line_count == 1 && font_preview.max_line_glyphs == 2 &&
+               std::fabs(font_preview.width - 80.0) < 1.0 &&
+               std::fabs(font_preview.height -
+                         (font_metrics.ascender - font_metrics.descender) * 40.0) < 1e-6 &&
+               font_preview.advance == 0.0,
+           "ui_core font-track preview measures CJK in em units (estimate)");
+
+    std::vector<uint8_t> font_before(stride * static_cast<size_t>(height), 0);
+    comp_render_flatten(document, font_before.data(), COMP_PIXEL_RGBA8, stride);
+    size_t font_undo_before = 0;
+    comp_document_history_stats(document, &font_undo_before, &type_redo);
+
+    comp_tool_op_desc font_desc = type_desc;
+    font_desc.type.text = "\xE4\xBD\xA0\xE5\xA5\xBD"; /* 你好 */
+    font_desc.type.text_length = 6;
+    font_desc.type.style.font_size = 32.0; /* 字体轨道：em 高，不是格子高 */
+    font_desc.type_font = shipped_font;
+    const bool font_ok =
+        comp_tool_apply(document, layer, &font_desc, tool_note, sizeof(tool_note),
+                        &tool_note_size) == COMP_OK;
+    verify(font_ok, "comp_tool_apply(COMP_TOOL_TYPE CJK through the font track)");
+    std::vector<uint8_t> font_after(stride * static_cast<size_t>(height), 0);
+    comp_render_flatten(document, font_after.data(), COMP_PIXEL_RGBA8, stride);
+    size_t font_ink = 0;
+    for (size_t i = 3; i < font_after.size(); i += 4) {
+      if (font_after[i] != 0) ++font_ink;
+    }
+    verify(font_ok && font_ink > 100, "the font track paints CJK coverage");
+    verify(font_ok && comp_document_undo(document) == COMP_OK,
+           "comp_document_undo(font track CJK step)");
+    std::vector<uint8_t> font_restored(stride * static_cast<size_t>(height), 0);
+    comp_render_flatten(document, font_restored.data(), COMP_PIXEL_RGBA8, stride);
+    verify(font_ok && font_restored == font_before,
+           "font-track undo restores pixels byte-for-byte");
+
+    /* 缺字（U+0378 未分配）：提交成功、note 如实说明、不画 .notdef 方框。 */
+    comp_tool_op_desc missing_desc = font_desc;
+    missing_desc.type.text = "\xE4\xBD\xA0\xCD\xB8"; /* 你 + U+0378 */
+    missing_desc.type.text_length = 5;
+    const bool missing_ok =
+        comp_tool_apply(document, layer, &missing_desc, tool_note, sizeof(tool_note),
+                        &tool_note_size) == COMP_OK;
+    verify(missing_ok && std::strstr(tool_note, "without a glyph") != nullptr,
+           "a codepoint without a glyph is reported in the note");
+    verify(missing_ok && comp_document_undo(document) == COMP_OK,
+           "comp_document_undo(font track missing-glyph step)");
+    size_t font_undo_after = 0;
+    comp_document_history_stats(document, &font_undo_after, &type_redo);
+    verify(font_undo_after == font_undo_before,
+           "the font-track steps leave the undo stack where it started");
+    comp_font_release(shipped_font);
+  }
 
   /*
    * 合成缓存（MERGED，S12）：外壳每次 WM_PAINT 都走 comp_render_flatten，
@@ -17285,6 +17600,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   g_shell = &shell;
   shell.window = window; /* 视图命令需要客户区矩形，必须早于首次绘制设置 */
   create_document(shell);
+  /*
+   * P5-3：随仓字体在这里一次性加载（字体句柄独立于引擎，不需要文档）。
+   * 失败不算错误：文字工具继续用 5×7 点阵，状态栏如实说明原因。
+   */
+  if (load_shell_font(shell)) {
+    wchar_t font_status[192];
+    wsprintfW(font_status, L"文字：已加载字体 %s（可键入中文，字号按 em 高）",
+              shell.type_font_label.c_str());
+    set_status(shell, font_status);
+  } else {
+    set_status(shell, L"文字：未找到随仓字体（resources/fonts），文字工具只用 5×7 点阵（ASCII）");
+  }
   {
     /* 标题上也标出实际后端：不打开状态栏也能一眼判断走的是 GPU 还是 CPU。 */
     wchar_t title[96];
@@ -17330,6 +17657,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
 
   g_shell = nullptr;
   if (shell.document != nullptr) comp_document_destroy(shell.document);
+  /* 字体句柄独立于引擎：引擎销毁不会带走它，必须显式释放（与 comp_font.h 一致）。 */
+  if (shell.type_font != nullptr) comp_font_release(shell.type_font);
   comp_engine_destroy(shell.engine);
   return 0;
 }

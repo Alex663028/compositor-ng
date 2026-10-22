@@ -1914,34 +1914,71 @@ COMP_TEST(ui_core_type_metrics_and_ascii_key_mapping_match_the_kernel) {
   COMP_CHECK(near_value(metrics.height, 14.0));
 
   /*
-   * WM_KEYDOWN -> ASCII：US 布局映射；控制键/功能键返回 0（外壳据此把键让给
-   * 工具快捷键而不是塞进文本）。
+   * 字体轨道的文本是 UTF-8，字符只从 WM_CHAR/输入法进来（外壳不再自己把
+   * VK 翻成 ASCII——那会吞掉输入法，也和 WM_CHAR 重复插一遍）。
+   * 一个码点 1..4 字节，退格必须整段删：按字节删会留下半个码点，引擎如实
+   * 拒收成 kBadText。
    */
-  COMP_CHECK(comp_ui::type_ascii_from_vk('A', false) == 'a');
-  COMP_CHECK(comp_ui::type_ascii_from_vk('A', true) == 'A');
-  COMP_CHECK(comp_ui::type_ascii_from_vk('Z', false) == 'z');
-  COMP_CHECK(comp_ui::type_ascii_from_vk('0', false) == '0');
-  COMP_CHECK(comp_ui::type_ascii_from_vk('9', true) == '(');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x20, false) == ' ');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x20, true) == ' ');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBA, false) == ';');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBA, true) == ':');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBB, true) == '+');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBC, true) == '<');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBD, true) == '_');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBE, false) == '.');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xBF, true) == '?');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xC0, true) == '~');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDB, true) == '{');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDC, true) == '|');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDD, true) == '}');
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0xDE, true) == '"');
-  /* 回车/退格/Tab/方向键/F 键都不是可键入字符。 */
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x0D, false) == 0);
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x08, false) == 0);
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x09, false) == 0);
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x25, false) == 0);
-  COMP_CHECK(comp_ui::type_ascii_from_vk(0x70, false) == 0);
+  {
+    std::string buffer;
+    comp_ui::type_utf8_append(buffer, 'A');
+    comp_ui::type_utf8_append(buffer, 0x4F60u);  /* 你：3 字节 */
+    comp_ui::type_utf8_append(buffer, 0x1F600u); /* 😀：4 字节（代理对在壳里拼好） */
+    COMP_CHECK(buffer.size() == 1 + 3 + 4);
+
+    uint32_t cp = 0;
+    COMP_CHECK(comp_ui::type_utf8_next(buffer.c_str(), &cp) == 1 && cp == 'A');
+    COMP_CHECK(comp_ui::type_utf8_next(buffer.c_str() + 1, &cp) == 3 && cp == 0x4F60u);
+    COMP_CHECK(comp_ui::type_utf8_next(buffer.c_str() + 4, &cp) == 4 && cp == 0x1F600u);
+
+    COMP_CHECK(comp_ui::type_utf8_erase_last(buffer) == 4 && buffer.size() == 4);
+    COMP_CHECK(comp_ui::type_utf8_erase_last(buffer) == 3 && buffer.size() == 1);
+    COMP_CHECK(comp_ui::type_utf8_erase_last(buffer) == 1 && buffer.empty());
+    COMP_CHECK(comp_ui::type_utf8_erase_last(buffer) == 0);
+  }
+
+  /* 拒绝：截断、孤立续字节、控制字符（含 Tab）、代理区、越界码点。 */
+  {
+    uint32_t cp = 0;
+    COMP_CHECK(comp_ui::type_utf8_next("\xE4\xBD", &cp) == 0);
+    COMP_CHECK(comp_ui::type_utf8_next("\xA0", &cp) == 0);
+    COMP_CHECK(comp_ui::type_utf8_next("\n", &cp) == 0);
+    COMP_CHECK(comp_ui::type_utf8_next("\x09", &cp) == 0);
+    COMP_CHECK(comp_ui::type_utf8_next("\xED\xA0\x80", &cp) == 0); /* U+D800 代理 */
+    COMP_CHECK(comp_ui::type_utf8_next("\xF4\x90\x80\x80", &cp) == 0); /* > U+10FFFF */
+    COMP_CHECK(comp_ui::type_utf8_next(nullptr, &cp) == 0);
+    /* 半个码点不动：宁可原样留着让引擎拒收，也不猜该丢哪个字节。 */
+    std::string broken(1, static_cast<char>(0x80));
+    COMP_CHECK(comp_ui::type_utf8_erase_last(broken) == 0 && broken.size() == 1);
+  }
+
+  /*
+   * 字体轨道的预览度量：font_size 是 em 高，ascender/descender 是 em 比例。
+   * 外壳没有只量的 ABI（不为此加导出），步进只能是估计值：CJK/全角 ≈1 em，
+   * 其余 ≈0.55 em；advance 归 0 表示「不知道」，免得把估计值当引擎真值。
+   */
+  comp_ui::TypeBlockMetrics font_metrics =
+      comp_ui::type_block_metrics_font(40.0, 1.25, 0.0, "\xE4\xBD\xA0\xE5\xA5\xBD", 0.8, -0.2);
+  COMP_CHECK(near_value(font_metrics.width, 80.0));
+  COMP_CHECK(near_value(font_metrics.height, 40.0));
+  COMP_CHECK(font_metrics.line_count == 1);
+  COMP_CHECK(font_metrics.max_line_glyphs == 2);
+  COMP_CHECK(near_value(font_metrics.advance, 0.0));
+
+  /* 行步进 = font_size × line_height；字距只加在码点之间，不进行尾。 */
+  font_metrics = comp_ui::type_block_metrics_font(40.0, 1.5, 2.0, "AB\nA", 0.8, -0.2);
+  COMP_CHECK(near_value(font_metrics.width, 2.0 * 0.55 * 40.0 + 2.0));
+  COMP_CHECK(near_value(font_metrics.height, 40.0 + 40.0 * 1.5));
+  COMP_CHECK(font_metrics.line_count == 2);
+  COMP_CHECK(font_metrics.last_line_glyphs == 1);
+
+  /* 空文本 / nullptr：宽 0、高一个 em（插入点光标只画竖线）。 */
+  font_metrics = comp_ui::type_block_metrics_font(40.0, 1.25, 0.0, "", 0.8, -0.2);
+  COMP_CHECK(near_value(font_metrics.width, 0.0));
+  COMP_CHECK(near_value(font_metrics.height, 40.0));
+  font_metrics = comp_ui::type_block_metrics_font(40.0, 1.25, 0.0, nullptr, 0.8, -0.2);
+  COMP_CHECK(near_value(font_metrics.width, 0.0));
+  COMP_CHECK(font_metrics.line_count == 1);
 
   /* 插入点光标：文档字号 × 缩放，至少 1 px。 */
   COMP_CHECK(near_value(comp_ui::type_caret_height(32.0, 0.5), 16.0));
@@ -1961,18 +1998,25 @@ COMP_TEST(ui_core_type_metrics_and_ascii_key_mapping_match_the_kernel) {
  * 因此这里钉住的是「面板显示的值 = 引擎接受的值」这条口径。
  */
 COMP_TEST(ui_core_type_panel_rows_steps_and_hit_testing) {
-  COMP_CHECK(comp_ui::kTypePanelRowCount == 3);
+  COMP_CHECK(comp_ui::kTypePanelRowCount == 4);
   COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontSizeRow)) ==
              "Font Size");
   COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLineHeightRow)) ==
              "Line Height");
   COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelLetterSpacingRow)) ==
              "Letter Spacing");
+  /* 字体行是开关不是数值：值文本由外壳填（字体名 / 「5×7 点阵」）。 */
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(comp_ui::kTypePanelFontRow)) == "Typeface");
+  COMP_CHECK(comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelFontRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelFontSizeRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelLineHeightRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_toggle(comp_ui::kTypePanelLetterSpacingRow));
   COMP_CHECK(std::string(comp_ui::type_panel_row_label(-1)).empty());
-  COMP_CHECK(std::string(comp_ui::type_panel_row_label(3)).empty());
+  COMP_CHECK(std::string(comp_ui::type_panel_row_label(4)).empty());
   COMP_CHECK(comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLineHeightRow));
   COMP_CHECK(!comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelFontSizeRow));
   COMP_CHECK(!comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelLetterSpacingRow));
+  COMP_CHECK(!comp_ui::type_panel_row_is_percent(comp_ui::kTypePanelFontRow));
 
   /* 行距 5% 一步，夹在 1.0..8.0（面板与 Alt+[ / ] 共用）。 */
   COMP_CHECK(near_value(comp_ui::step_type_line_height(1.25, 1), 1.30));
@@ -2014,7 +2058,8 @@ COMP_TEST(ui_core_type_panel_rows_steps_and_hit_testing) {
   COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 101.0) == 0);
   COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 121.0) == 1);
   COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 141.0) == 2);
-  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 161.0) == -1); /* 第四行不存在 */
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 161.0) == comp_ui::kTypePanelFontRow);
+  COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 181.0) == -1); /* 第五行不存在 */
   COMP_CHECK(comp_ui::type_param_row_at(panel, 1010.0, 99.0) == -1);  /* 标题区 */
   COMP_CHECK(comp_ui::type_param_row_at(panel, 500.0, 121.0) == -1);  /* 面板外 */
   COMP_CHECK(comp_ui::type_param_row_at(panel, 1330.0, 121.0) == -1); /* 右边界开区间 */

@@ -278,8 +278,8 @@ Shift 并集 / Alt 差集 / 否则替换。每次写入是一个撤销步；`und
   0.5 - 6 × font_size / 7`（负字距合法，但不能把字形挤到重叠）；
   `clamp_type_letter_spacing` / `step_type_letter_spacing` 都带 `font_size` 参数，
   字号变小后字距会被重新夹取；
-- 键入映射：`type_ascii_from_vk(vk, shift)` 只覆盖 **US 布局**的字母、数字与常用标点
-  （字母区 + `0x30..0x39` + `OEM_*`）；未识别键返回 0，不猜其它布局；
+- 键入映射：**S11 当时**用 `type_ascii_from_vk(vk, shift)` 覆盖 **US 布局**的字母、
+  数字与常用标点；P5-3 起该函数已删除，字符只从 `WM_CHAR`/输入法进来（见 §5.45）；
 - 手势：`T` 选工具 → 画布点击落插入点 → 直接键入 ASCII → `Enter` 提交一次
   `comp_tool_apply(COMP_TOOL_TYPE)`；`Shift+Enter` 换行、`Backspace` 删字符、
   `Esc` / 切工具 / 失焦取消（只丢预览、不产生撤销步）；`[ / ]` 调字号、
@@ -289,9 +289,9 @@ Shift 并集 / Alt 差集 / 否则替换。每次写入是一个撤销步；`und
 - 画布预览只画插入点光标 + 文本框（白实线 + 黑虚线双描边），**不预演字形**：
   外壳没有系统字体（字体是引擎内的点阵），用 GDI 画一套只会与落笔结果不一致；
   像素在 `Enter` 时由引擎一次写出（与渐变/形状「拖完一次提交」同口径）；
-- 与上游的差异：ASCII-only（无 CJK / 字体选择 / 粗斜体 / 对齐 / 旋转）、
-  文字是**一次性像素**而不是可编辑文本对象、画进当前图层而不是新建图层
-  （见 `docs/tool-ops.md` §4.12）。
+- 与上游的差异（**S11 当时**）：ASCII-only（无 CJK / 字体选择 / 粗斜体 / 对齐 /
+  旋转），文字是**一次性像素**而不是可编辑文本对象，画进当前图层而不是新建图层
+  （见 `docs/tool-ops.md` §4.12）。CJK 与字体选择由 P5-3 补上（见 §5.45）。
 
 **事实边界。** 与 §5.6 相同：交互路径**未经真人键盘/鼠标实测**；ABI、`ui_core`
 数学层与 `--selftest` 驱动序列有覆盖，「打出来的字好不好看、光标位置对不对」仍需开窗目视。
@@ -1958,6 +1958,67 @@ PE 导出 **138 → 140**（尾部追加 `comp_selection_get_base_bounds` /
 （基线 SHA256 仍 `26b3e910e3b9ccb7…`——本轮没有动任何既有自检路径）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M42**。
+
+### 5.45 文字接入字体轨道：中文输入与码点编辑（P5-3，2026-10-22）
+
+P0-5 验收「你好，世界」@48 px 的外壳半边。引擎的字体轨道在 P5-2 已通
+（`comp_tool_apply` 读 `comp_tool_op_desc.type_font`），这一步把它接到 Windows 壳：
+启动加载随仓字体、面板第四行切轨道、键入只走 `WM_CHAR`（输入法才进得来）、
+退格按码点删。**ABI 零新增**，仍是 145 个导出。
+
+**1. 字体从哪来。** `resources/fonts/NotoSansSC-Regular-Subset.ttf`（仓内子集字体）。
+`load_shipped_font` 依次探 `<exe>/resources/fonts`、`<exe>/../resources/fonts`
+（开发构建的 `build/` 就在仓根下一层）、`<cwd>/resources/fonts`——构建脚本不拷贝字体，
+所以三处都探；可用性闸门是 `scalable && units_per_em > 0 && has_cjk`，
+**位图字体与纯拉丁字体一律不选**：宁可退回 5×7，也不挂一个排不出中文的字体上去。
+`comp_font_metrics` 的 `ascender` / `descender`（em 比例）存进 `ShellState`，
+退出时 `comp_font_release`。找不到字体不是错误：状态栏如实说「未找到随仓字体」，
+文字工具只用点阵。
+
+**2. 两条轨道，一个开关。** 面板第四行 `Typeface` 是**开关行**
+（`type_panel_row_is_toggle`）：值文本由外壳填（字体 family 名 / `5×7 点阵`），
+`- / =` 切换，数字键不进入输入态（这一行没有数值量纲）。开轨道时
+`comp_tool_op_desc.type_font` 填句柄，`font_size` 的含义同时从「格子高」变成
+**em 高**——同一组面板数字两种量纲，状态栏明写「em 高」；关轨道时字段是 NULL，
+5×7 轨道逐字节不变（P5-2 的 22 条逐字节断言仍全绿）。
+
+**3. 键入只认 `WM_CHAR`，`type_ascii_from_vk` 已删除。** 两条理由：VK→ASCII
+映射天生看不见输入法（中文永远打不进去），而且它与 `TranslateMessage` 派发的
+`WM_CHAR` 会**各插一遍**，开输入法时打进双字。现在字符的唯一来源是 `WM_CHAR`
+（`TranslateMessage` 与 IME 的共同出口）：代理对
+（`0x10000 + (high - 0xD800) × 0x400 + (low - 0xDC00)`）在 `type_char_input`
+里拼好，孤立半个代理丢弃；`< 0x20`、`0x7F`、越界码点挡掉。`type_skip_char`
+吞掉 `[ / ]` 快捷键之后必然跟来的那个 `WM_CHAR`——不吞的话按一次 `[` 会同时
+改字号**和**打出一个 `[`。
+
+**4. 编辑按码点。** `Backspace` 走 `type_utf8_erase_last`：先找首字节、再按首字节
+声明的长度整段删。按字节删会把缓冲停在半个汉字上，引擎如实拒收成 `kBadText`，
+用户看到的是「退格把整段字弄没了」。缓冲不是完整 UTF-8 时函数返回 0 且**不动**：
+宁可原样留着让引擎拒收，也不猜该丢哪个字节——缓冲只由本文件的追加函数写入，
+出现半截只可能是本文件自己的 bug，那时不能悄悄「修好」。
+
+**5. 预览仍是估计值。** 外壳没有「只度量不落墨」的 ABI 入口，也不为此加导出：
+`type_block_metrics_font` 按 em 比例估宽——CJK/全角 1 em、其余 0.55 em
+（Noto Sans SC 的拉丁平均量级，±5%）；高 = `(ascender - descender) × em +
+(行数 - 1) × em × line_height`；`advance` 归 0 表示「不存在单一逐字步进」。
+界面数字一律带 `≈`，状态栏写「宽度是估计值」，不把估计当引擎真值。
+画布上仍只画插入点光标 + 虚线文本框，**不预演字形**：GDI 画一套与 FreeType
+落出来的不是一回事，假预览比没有预览更糟。
+
+**6. 验证。** 单测 **619 例 / 0 失败**（同数换内容：删掉 22 条 `type_ascii_from_vk`
+断言，换成 UTF-8 追加/退格/解码与字体轨道度量共 30 条）；壳自检 **245 → 257 项**，
+新增 12 项（字体可加载且 scalable/has_cjk、UTF-8 三个助手、四行面板表与开关、
+字体轨道度量、CJK 走 ABI 落墨覆盖 > 100 像素、一步撤销逐字节还原、缺字 U+0378
+如实写进 note、撤销深度回到起点）。基线 `compositor_shell_selftest.txt` 重新生成
+（SHA256 `377DE660D48AC933…`）；`run_regression.py --require-ohos` **6/6**；
+`build_windows_shell.py` 零警告。
+
+**7. 边界。** ① 没有富文本（粗/斜/字重/对齐/旋转），也没有字体选择对话框——
+只有「随仓字体 ↔ 5×7 点阵」两档；② 两轨的 `font_size` 量纲不同（em vs 格子高），
+切换时数字不换算，状态栏载明；③ 输入法候选窗不跟随插入点（没链 `imm32`：
+`ImmSetCompositionWindow` 要实时取插入点坐标），候选框停在默认位置；
+④ 键入路径**未经真人键盘/输入法实测**，目视项见 `docs/manual-test.md` **M43**。
+
 
 
 

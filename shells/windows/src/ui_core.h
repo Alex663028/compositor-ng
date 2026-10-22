@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 
 namespace comp_ui {
 
@@ -1543,8 +1544,10 @@ inline double shape_effective_corner_radius(double radius, const ShapeDragBox& b
 /* ------------------------------------------------------------ 文字工具（S11） */
 
 /*
- * 文字工具只产出 **ASCII**：本仓自带 5×7 点阵字体，锚定「零依赖、可交叉编译」，
- * 没有系统字体可借；UTF-8/CJK 由引擎参数闸如实拒绝（不画方框顶替）。
+ * 文字工具有两条轨道（P5）：
+ *   - 默认 5×7 点阵：锚定「零依赖、可交叉编译」，只收 0x20..0x7E 与 '\n'；
+ *   - 字体轨道：宿主传入已加载的 comp_font，font_size 变成 **em 高**，文本是
+ *     UTF-8（CJK 由输入法直接送进来）。没有字体就老老实实走点阵，不猜系统字体。
  *
  * 这里的三组量程必须与 `engine/domain/type_raster.h` 的 TypeRasterStyle 逐项一致
  * （字号 6..2048、行距 1..8、字距 ±4096，且步进宽度 >= 0.5 px）：
@@ -1653,39 +1656,173 @@ inline TypeBlockMetrics type_block_metrics(double font_size, double line_height,
 }
 
 /*
- * WM_KEYDOWN 的虚拟键码 -> 可键入 ASCII（0 = 该键不是文字输入）。
+ * UTF-8 缓冲的逐码点编辑（P5-3）。
  *
- * 布局口径是 **US 键盘**：Win32 的 WM_KEYDOWN 给的是虚拟键码，不含字符本身；
- * 外壳不调用 ToUnicode（那会随输入法/键盘布局漂移，且中文输入法会产出
- * UTF-8，而字体只支持 ASCII），因此这里显式列出能产出的字符集。Shift 只
- * 影响同一键位上的第二个字符（与 US 布局一致）。
+ * 字体轨道的文本来自 WM_CHAR（含输入法），一个汉字是 3 字节；退格如果按字节删，
+ * 留下的是半个码点，引擎会如实报 kBadText——用户看到的是「退格把整段文字弄没了」。
+ * 所以编辑一律按码点：先认出首字节长度，再整段删除/追加。
  *
- * 常量用数值写死以保持 ui_core.h 不 include <windows.h>：
- * 0x20=Space、0x30..0x39=0..9、0x41..0x5A=A..Z、0xBA..=OEM 标点（US 布局）。
+ * 这里不做「容错解码」：缓冲只由本文件的追加函数写入，出现非完整 UTF-8 只可能是
+ * 本文件自己的 bug，那时返回 0 并保持原样，比猜一个字符更诚实。
  */
-inline char type_ascii_from_vk(int vk, bool shift) {
-  if (vk == 0x20) return ' '; /* VK_SPACE */
-  if (vk >= '0' && vk <= '9') {
-    static const char kShiftedDigits[] = ")!@#$%^&*(";
-    return shift ? kShiftedDigits[vk - '0'] : static_cast<char>(vk);
+
+/* UTF-8 首字节 -> 该码点字节数；续字节 / 非法首字节返回 0。 */
+inline int type_utf8_lead_bytes(unsigned char lead) {
+  if (lead < 0x80) return 1;
+  if (lead >= 0xC2 && lead <= 0xDF) return 2;
+  if (lead >= 0xE0 && lead <= 0xEF) return 3;
+  if (lead >= 0xF0 && lead <= 0xF4) return 4;
+  return 0;
+}
+
+/* 追加一个码点。调用方保证 cp 不是代理、且 >= 0x20（控制字符在入口就挡掉了）。 */
+inline void type_utf8_append(std::string& out, uint32_t cp) {
+  if (cp < 0x80) {
+    out.push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp < 0x10000u) {
+    out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+  } else if (cp <= 0x10FFFFu) {
+    out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+    out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
   }
-  if (vk >= 'A' && vk <= 'Z') {
-    return shift ? static_cast<char>(vk) : static_cast<char>(vk - 'A' + 'a');
+}
+
+/* 删掉最后一个码点，返回删掉的字节数；缓冲不是完整 UTF-8 时返回 0 且不动。 */
+inline size_t type_utf8_erase_last(std::string& text) {
+  if (text.empty()) return 0;
+  size_t start = text.size() - 1;
+  size_t continuation = 0;
+  while (start > 0 && continuation < 3 &&
+         (static_cast<unsigned char>(text[start]) & 0xC0u) == 0x80u) {
+    --start;
+    ++continuation;
   }
-  switch (vk) {
-    case 0xBA: return shift ? ':' : ';';  /* VK_OEM_1 */
-    case 0xBB: return shift ? '+' : '=';  /* VK_OEM_PLUS */
-    case 0xBC: return shift ? '<' : ',';  /* VK_OEM_COMMA */
-    case 0xBD: return shift ? '_' : '-';  /* VK_OEM_MINUS */
-    case 0xBE: return shift ? '>' : '.';  /* VK_OEM_PERIOD */
-    case 0xBF: return shift ? '?' : '/';  /* VK_OEM_2 */
-    case 0xC0: return shift ? '~' : '`';  /* VK_OEM_3 */
-    case 0xDB: return shift ? '{' : '[';  /* VK_OEM_4 */
-    case 0xDC: return shift ? '|' : '\\'; /* VK_OEM_5 */
-    case 0xDD: return shift ? '}' : ']';  /* VK_OEM_6 */
-    case 0xDE: return shift ? '"' : '\''; /* VK_OEM_7 */
-    default: return 0;                    /* 控制键 / 功能键：不是文字输入 */
+  const int bytes = type_utf8_lead_bytes(static_cast<unsigned char>(text[start]));
+  if (bytes <= 0 || static_cast<size_t>(bytes) != text.size() - start) return 0;
+  text.erase(start);
+  return static_cast<size_t>(bytes);
+}
+
+/*
+ * 取下一个码点，返回消耗的字节数（0 = 文本结束或不是完整/合法 UTF-8）。
+ * 只在预览度量里用；判定口径与引擎的 decode_utf8 一致（拒绝过长编码、代理对、
+ * > U+10FFFF、孤立续字节），这样「预览能排、引擎拒收」不会出现。
+ */
+inline int type_utf8_next(const char* text, uint32_t* out_codepoint) {
+  if (text == nullptr || out_codepoint == nullptr) return 0;
+  const unsigned char lead = static_cast<unsigned char>(text[0]);
+  const int bytes = type_utf8_lead_bytes(lead);
+  if (bytes <= 0) return 0;
+  for (int i = 1; i < bytes; ++i) {
+    if ((static_cast<unsigned char>(text[i]) & 0xC0u) != 0x80u) return 0;
   }
+  uint32_t cp = 0;
+  if (bytes == 1) {
+    cp = lead;
+  } else if (bytes == 2) {
+    cp = (static_cast<uint32_t>(lead & 0x1Fu) << 6) |
+         static_cast<uint32_t>(text[1] & 0x3F);
+  } else if (bytes == 3) {
+    cp = (static_cast<uint32_t>(lead & 0x0Fu) << 12) |
+         (static_cast<uint32_t>(text[1] & 0x3F) << 6) |
+         static_cast<uint32_t>(text[2] & 0x3F);
+  } else {
+    cp = (static_cast<uint32_t>(lead & 0x07u) << 18) |
+         (static_cast<uint32_t>(text[1] & 0x3F) << 12) |
+         (static_cast<uint32_t>(text[2] & 0x3F) << 6) |
+         static_cast<uint32_t>(text[3] & 0x3F);
+  }
+  if (cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) return 0;
+  if (cp < 0x20u) return 0; /* 控制字符（含 Tab）：引擎拒收，预览也不认 */
+  *out_codepoint = cp;
+  return bytes;
+}
+
+/*
+ * 字体轨道的预览宽度估计（em 比例）。外壳没有「只度量不落墨」的 ABI 入口，
+ * 而每个字形的真实步进又依赖字体本身，所以预览框只能估：
+ *   - 全角（CJK / 假名 / 谚文 / 全角标点）按 1 em（CJK 字体的实际步进就是 1 em）；
+ *   - 其余（拉丁、希腊、符号）按 0.55 em（Noto Sans SC 的拉丁平均步进量级）。
+ * 偏差在 ±5% 量级，只影响虚线预览框与状态栏的「≈」数字；像素永远以引擎为准。
+ */
+inline bool type_font_codepoint_is_wide(uint32_t cp) {
+  return (cp >= 0x1100u && cp <= 0x115Fu) ||   /* 谚文字母 */
+         (cp >= 0x2E80u && cp <= 0x9FFFu) ||   /* CJK 部首..统一表意文字 */
+         (cp >= 0xAC00u && cp <= 0xD7A3u) ||   /* 谚文音节 */
+         (cp >= 0xF900u && cp <= 0xFAFFu) ||   /* CJK 兼容表意文字 */
+         (cp >= 0xFE30u && cp <= 0xFE4Fu) ||   /* CJK 兼容形式 */
+         (cp >= 0xFF00u && cp <= 0xFF60u) ||   /* 全角 ASCII / 全角标点 */
+         (cp >= 0xFFE0u && cp <= 0xFFE6u) ||   /* 全角符号 */
+         (cp >= 0x20000u && cp <= 0x3FFFDdu);  /* 扩展 B 及以后 */
+}
+
+inline double type_font_estimate_advance_em(uint32_t cp) {
+  return type_font_codepoint_is_wide(cp) ? 1.0 : 0.55;
+}
+
+/*
+ * 字体轨道的文本框度量（镜像 build_font_layout 的**结构**，宽度是估计值）：
+ *   - font_size 是 em 高（与 5×7 轨道的「格子高」不是同一个量纲）；
+ *   - 行高 = (ascender - descender) * font_size（字号 48、Noto 约 0.65 时≈ 65 px）；
+ *   - 多行行距 = font_size * line_height；
+ *   - 字距只加在「非首字形」之间，与引擎一致。
+ * ascender_em / descender_em 来自 comp_font_metrics（em 比例，descender 通常为负）。
+ */
+inline TypeBlockMetrics type_block_metrics_font(double font_size, double line_height,
+                                                double letter_spacing, const char* text,
+                                                double ascender_em, double descender_em) {
+  TypeBlockMetrics out{};
+  out.line_count = 1; /* 空文本也是「一行空行」，与内核 build_layout 同口径 */
+  const double size = clamp_type_font_size(font_size);
+  const double spacing = clamp_type_letter_spacing(letter_spacing, size);
+  const double lh = clamp_type_line_height(line_height);
+  const double ascender = (ascender_em > 0.0) ? ascender_em : 0.8;
+  const double descender = (descender_em < 0.0) ? descender_em : -0.2;
+
+  double widest = 0.0;
+  double line_width = 0.0;
+  int codepoints = 0;
+  if (text != nullptr) {
+    const char* cursor = text;
+    uint32_t cp = 0;
+    for (;;) {
+      const int bytes = type_utf8_next(cursor, &cp);
+      if (bytes <= 0) {
+        /* '\n' 让 type_utf8_next 返回 0（控制字符），这里单独认一下换行。 */
+        if (*cursor == '\n') {
+          if (line_width > widest) widest = line_width;
+          line_width = 0.0;
+          if (codepoints > out.max_line_glyphs) out.max_line_glyphs = codepoints;
+          out.last_line_glyphs = codepoints;
+          codepoints = 0;
+          ++out.line_count;
+          ++cursor;
+          continue;
+        }
+        break;
+      }
+      const double advance = type_font_estimate_advance_em(cp) * size;
+      line_width += advance + (codepoints > 0 ? spacing : 0.0);
+      ++codepoints;
+      cursor += bytes;
+    }
+  }
+  out.last_line_glyphs = codepoints;
+  if (codepoints > out.max_line_glyphs) out.max_line_glyphs = codepoints;
+  if (line_width > widest) widest = line_width;
+  /* max_line_glyphs 在字体轨道按码点数统计（一个码点一个字形，缺字只占步进）。 */
+  out.width = widest;
+  out.advance = 0.0; /* 字体轨道没有单一「步距」：每个字形自己的 advance */
+  out.height = (ascender - descender) * size +
+               static_cast<double>(out.line_count - 1) * size * lh;
+  return out;
 }
 
 /* 插入点光标在屏幕上的高度（文档字号 × 缩放，至少 1 px 可见）。 */
@@ -1698,14 +1835,17 @@ inline double type_caret_height(double font_size, double zoom) {
 /* ------------------------------------------------------------ 文字属性面板（S14） */
 
 /*
- * 文字属性面板只有三行：字号 / 行距 / 字距。值本身仍存在 ShellState（与键入态
- * 共用），这里只负责「行号 <-> 量纲」的映射、夹取与步进，保证面板、快捷键、
- * 引擎三处用的是同一套量程（与 engine 的 TypeRasterStyle 一致）。
+ * 文字属性面板四行：字号 / 行距 / 字距 / 字体。
+ *
+ * 前三维是数值行（面板、快捷键、引擎三处同一套量程）；第 4 行是**开关**行
+ * （5×7 点阵 <-> 已加载字体），没有数值量纲，- / = 在两种字体之间切换。
+ * 行号只追加不改：既有三行的几何与命中顺序保持不变（追加型 ABI 的同一条规矩）。
  */
-inline constexpr int kTypePanelRowCount = 3;
+inline constexpr int kTypePanelRowCount = 4;
 inline constexpr int kTypePanelFontSizeRow = 0;
 inline constexpr int kTypePanelLineHeightRow = 1;
 inline constexpr int kTypePanelLetterSpacingRow = 2;
+inline constexpr int kTypePanelFontRow = 3;
 
 /* 行距是倍率（1.0..8.0，界面显示为百分比）；面板一次步进 5%。 */
 inline constexpr double kTypeLineHeightStep = 0.05;
@@ -1715,12 +1855,16 @@ inline const char* type_panel_row_label(int row) {
     case kTypePanelFontSizeRow: return "Font Size";
     case kTypePanelLineHeightRow: return "Line Height";
     case kTypePanelLetterSpacingRow: return "Letter Spacing";
+    case kTypePanelFontRow: return "Typeface";
     default: return "";
   }
 }
 
 /* 行距按百分比显示，字号/字距按像素显示。 */
 inline bool type_panel_row_is_percent(int row) { return row == kTypePanelLineHeightRow; }
+
+/* 字体行是开关（数值量纲无意义）：数字键不进入输入态，- / = 直接切换。 */
+inline bool type_panel_row_is_toggle(int row) { return row == kTypePanelFontRow; }
 
 /* 按行夹取；字距的下限依赖当前字号，所以 font_size 必须一起传。 */
 inline double type_panel_clamp_value(int row, double value, double font_size) {

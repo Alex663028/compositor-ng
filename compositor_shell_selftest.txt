@@ -156,10 +156,22 @@
 [OK] text entirely outside the layer succeeds as a no-op
 [OK] an off-canvas text box leaves no empty undo step
 [OK] an off-canvas text box leaves the render byte-identical
-[OK] ui_core type panel row table (3 rows, line height is a percentage)
+[OK] ui_core type panel row table (4 rows, font row is a toggle)
 [OK] ui_core type line-height steps 5% and clamps to 1..8
 [OK] ui_core type panel steps use each row's own units
 [OK] ui_core type panel rows hit-test with the drawn geometry
+[OK] ui_core type_utf8_erase_last() deletes one whole codepoint per press
+[OK] ui_core type_utf8_next() decodes a 3-byte CJK codepoint
+[OK] ui_core type_utf8_next() rejects truncated codepoints and control characters
+[OK] the shipped subset font loads (scalable, has CJK)
+[OK] ui_core font-track preview measures CJK in em units (estimate)
+[OK] comp_tool_apply(COMP_TOOL_TYPE CJK through the font track)
+[OK] the font track paints CJK coverage
+[OK] comp_document_undo(font track CJK step)
+[OK] font-track undo restores pixels byte-for-byte
+[OK] a codepoint without a glyph is reported in the note
+[OK] comp_document_undo(font track missing-glyph step)
+[OK] the font-track steps leave the undo stack where it started
 [OK] two consecutive renders are byte-identical (MERGED cache hit)
 [OK] comp_tool_apply(COMP_TOOL_TYPE "A") for the MERGED cache check
 [OK] an edit invalidates the MERGED cache (the next frame shows the new pixels)
