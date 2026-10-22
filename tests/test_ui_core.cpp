@@ -367,6 +367,103 @@ COMP_TEST(ui_core_panel_splitter_hit_test) {
   COMP_CHECK(comp_ui::panel_splitter_at(narrow, narrow.canvas.x, mid_y) == 0);
 }
 
+/*
+ * §5.43 面板整块收起（§5.11「面板缩放 / 停靠」的另一半）：
+ *   1. 收起态走同一套「三块铺满」算式，画布恰好让出 (偏好宽度 - 24) 的差额；
+ *   2. 收起条上没有分界线——否则「点条展开」会被最右 5px 的「拖宽」吃掉；
+ *   3. 展开态按钮落在标题行内，既不吃图层行，也不与分界线/色阶通道格重叠；
+ *   4. 窄窗回落口径不变：按「想要的宽度（收起 = 24px）+ 画布下限」判断。
+ */
+COMP_TEST(ui_core_collapsed_panels_layout) {
+  const double mid_y = comp_ui::compute_layout(1280, 720).canvas.y + 100.0;
+
+  /* 1 + 2：左侧整块收起。 */
+  comp_ui::LayoutPrefs folded_prefs;
+  folded_prefs.layer_panel_collapsed = true;
+  const Layout folded = comp_ui::compute_layout(1280, 720, folded_prefs);
+  COMP_CHECK(folded.layer_panel.w == Layout::kCollapsedPanelWidth);
+  COMP_CHECK(folded.layer_collapsed);
+  COMP_CHECK(!folded.adjust_collapsed);
+  COMP_CHECK(folded.layer_panel.w + folded.canvas.w + folded.adjust_panel.w == 1280);
+  COMP_CHECK(folded.canvas.w ==
+             comp_ui::compute_layout(1280, 720).canvas.w +
+                 (Layout::kLayerPanelWidth - Layout::kCollapsedPanelWidth));
+  COMP_CHECK(folded.layer_splitter.empty());
+  COMP_CHECK(comp_ui::panel_splitter_at(folded, folded.layer_panel.right() - 1.0, mid_y) == 0);
+  /* 整条竖条都是展开按钮：不要求用户去瞄 18px 的小方块。 */
+  COMP_CHECK(folded.layer_toggle.x == folded.layer_panel.x);
+  COMP_CHECK(folded.layer_toggle.y == folded.layer_panel.y);
+  COMP_CHECK(folded.layer_toggle.w == folded.layer_panel.w);
+  COMP_CHECK(folded.layer_toggle.h == folded.layer_panel.h);
+  COMP_CHECK(comp_ui::panel_toggle_at(folded, folded.layer_panel.x + 1.0,
+                                      folded.layer_panel.y + 1.0) == 1);
+  COMP_CHECK(comp_ui::panel_toggle_at(folded, folded.layer_panel.right() - 2.0,
+                                      folded.layer_panel.bottom() - 2.0) == 1);
+
+  /* 右侧同样：收起后不吃画布像素，分界线消失。 */
+  comp_ui::LayoutPrefs folded_right;
+  folded_right.adjust_panel_collapsed = true;
+  const Layout right = comp_ui::compute_layout(1280, 720, folded_right);
+  COMP_CHECK(right.adjust_panel.w == Layout::kCollapsedPanelWidth);
+  COMP_CHECK(right.adjust_collapsed);
+  COMP_CHECK(right.adjust_splitter.empty());
+  COMP_CHECK(right.adjust_toggle.x == right.adjust_panel.x);
+  COMP_CHECK(right.adjust_toggle.w == right.adjust_panel.w);
+  COMP_CHECK(comp_ui::panel_toggle_at(right, right.adjust_panel.x + 2.0,
+                                      right.adjust_panel.y + 40.0) == 2);
+
+  /* 3：展开态按钮几何。 */
+  const Layout open_layout = comp_ui::compute_layout(1280, 720);
+  COMP_CHECK(open_layout.layer_toggle.w == Layout::kPanelToggleSize);
+  COMP_CHECK(open_layout.layer_toggle.h == Layout::kPanelToggleSize);
+  COMP_CHECK(open_layout.layer_toggle.x >= open_layout.layer_panel.x);
+  /* 与分界线留出间隔：否则「收起」与「拖宽」命中区重叠，先命中的那条通吃。 */
+  COMP_CHECK(!rects_overlap(open_layout.layer_toggle, open_layout.layer_splitter));
+  COMP_CHECK(!rects_overlap(open_layout.adjust_toggle, open_layout.adjust_splitter));
+  /* 不侵入图层行：标题行高 30，按钮底边必须还在标题行内。 */
+  COMP_CHECK(open_layout.layer_toggle.bottom() <=
+             open_layout.layer_panel.y + comp_ui::kLayerHeaderHeight);
+  COMP_CHECK(comp_ui::panel_toggle_at(open_layout, open_layout.layer_toggle.x + 1.0,
+                                      open_layout.layer_toggle.y + 1.0) == 1);
+  COMP_CHECK(comp_ui::panel_toggle_at(open_layout, open_layout.layer_panel.x + 3.0, mid_y) == 0);
+  COMP_CHECK(comp_ui::panel_toggle_at(open_layout, open_layout.adjust_toggle.x + 1.0,
+                                      open_layout.adjust_toggle.y + 1.0) == 2);
+  /* 色阶通道格必须让开按钮：被盖住的那一页就再也点不到了。 */
+  for (int c = 0; c < 4; ++c) {
+    const Rect chip = comp_ui::adjust_channel_chip_rect(open_layout.adjust_panel, c, 4);
+    COMP_CHECK(!rects_overlap(chip, open_layout.adjust_toggle));
+  }
+
+  /* 4：窄窗回落——按收起后的 24px 判断，面板与画布都不出现负宽高。 */
+  const int widths[] = {0, 24, 203, 204, 205, 227, 228, 229, 400};
+  for (int width : widths) {
+    comp_ui::LayoutPrefs both;
+    both.layer_panel_collapsed = true;
+    both.adjust_panel_collapsed = true;
+    const Layout layout = comp_ui::compute_layout(width, 720, both);
+    COMP_CHECK_MSG(layout.layer_panel.w + layout.canvas.w + layout.adjust_panel.w == width,
+                   "collapsed layout must tile the full width");
+    COMP_CHECK_MSG(layout.canvas.w >= 0, "collapsed canvas must never go negative");
+    COMP_CHECK_MSG(layout.layer_panel.w == 0 ||
+                       layout.layer_panel.w == Layout::kCollapsedPanelWidth,
+                   "collapsed layer strip is either shown at 24 px or fully absent");
+    COMP_CHECK_MSG(layout.adjust_panel.w == 0 ||
+                       layout.adjust_panel.w == Layout::kCollapsedPanelWidth,
+                   "collapsed adjust strip is either shown at 24 px or fully absent");
+    /* 面板未显示时按钮必须一起消失，否则会在画布上留一个看不见的命中区。 */
+    if (layout.layer_panel.w == 0) COMP_CHECK(layout.layer_toggle.empty());
+    if (layout.adjust_panel.w == 0) COMP_CHECK(layout.adjust_toggle.empty());
+  }
+  /* 204 = 24 + 180：图层面板刚好放得下；右侧条只剩 180px 画布，放不下。 */
+  comp_ui::LayoutPrefs both;
+  both.layer_panel_collapsed = true;
+  both.adjust_panel_collapsed = true;
+  const Layout tight = comp_ui::compute_layout(204, 720, both);
+  COMP_CHECK(tight.layer_panel.w == Layout::kCollapsedPanelWidth);
+  COMP_CHECK(tight.adjust_panel.w == 0);
+  COMP_CHECK(tight.canvas.w == Layout::kMinCanvasWidth);
+}
+
 COMP_TEST(ui_core_layer_in_subtree) {
   /*
    * 1 是根级，2 是 1 的子层，3 是 2 的子层，4 是另一个根级（1 的兄弟），

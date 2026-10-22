@@ -201,6 +201,20 @@ struct Layout {
    */
   static constexpr int kPanelSplitterWidth = 5;
   /*
+   * §5.43 面板整块收起（停靠最小版）：收起后只剩一条 24px 的竖条，点一下展开。
+   * 收起条比任何面板下限都窄，但**仍占布局宽度**——它必须和展开态走同一套
+   * 「三块横向铺满」的算式，否则收起/展开时画布宽度会跳 24px，而 pan 补偿
+   * 是按画布中心算的，中心与宽度同时变会让画面看起来「闪一下」。
+   */
+  static constexpr int kCollapsedPanelWidth = 24;
+  /*
+   * 展开态的收起按钮：落在面板标题行右端（18×18），离右边缘 8px——分界线占
+   * 最右 5px，两者留 3px 间隔，命中区永不重叠（重叠时「拖宽」会吃掉「收起」）。
+   */
+  static constexpr int kPanelToggleSize = 18;
+  static constexpr int kPanelToggleRightMargin = 8;
+  static constexpr int kPanelToggleTop = 6;
+  /*
    * S22 直方图面板：叠在图层面板顶部（不新增一栏，否则 248px 的图层栏会被
    * 压到无法读层名）。高度是排版密度，不参与命中测试——它纯展示、不可点。
    */
@@ -217,12 +231,26 @@ struct Layout {
   /* 面板分界线命中带（§6.60）：面板收起时为空矩形，命中测试因此自动失效。 */
   Rect layer_splitter{};
   Rect adjust_splitter{};
+  /*
+   * §5.43 收起/展开按钮。展开态 = 标题行右端的小方块；整块收起时 = 整条竖条
+   * （点条上任意位置都展开，不必去瞄 18px 的小方块）。面板未显示时为空矩形。
+   */
+  Rect layer_toggle{};
+  Rect adjust_toggle{};
+  bool layer_collapsed = false;
+  bool adjust_collapsed = false;
 };
 
 /* 面板宽度偏好（§6.60）：用户拖到哪儿就记到哪儿，跨窗口尺寸沿用。 */
 struct LayoutPrefs {
   int layer_panel_width = Layout::kLayerPanelWidth;
   int adjust_panel_width = Layout::kAdjustPanelWidth;
+  /*
+   * §5.43：整块收起。收起不改偏好宽度——展开回来必须是用户拖出来的宽度，
+   * 而不是缺省值（宽度偏好是会话状态，收起只是它的一个显示开关）。
+   */
+  bool layer_panel_collapsed = false;
+  bool adjust_panel_collapsed = false;
 };
 
 /* 宽度是整数像素，不存在 NaN 输入，夹取只需一次 min/max。 */
@@ -247,6 +275,13 @@ inline int adjust_panel_width_from_drag(int base_width, double dx) {
   return clamp_adjust_panel_width(base_width - static_cast<int>(std::lround(dx)));
 }
 
+/* 展开态切换按钮的几何：标题行右端，与分界线留 3px（见 Layout 注释）。 */
+inline Rect panel_toggle_rect(const Rect& panel) {
+  return Rect{panel.right() - Layout::kPanelToggleRightMargin - Layout::kPanelToggleSize,
+              panel.y + Layout::kPanelToggleTop, Layout::kPanelToggleSize,
+              Layout::kPanelToggleSize};
+}
+
 inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   if (width < 0) width = 0;
   if (height < 0) height = 0;
@@ -256,14 +291,24 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   const int body_top = toolbar_h;
   const int body_h = height - toolbar_h - status_h;
 
+  /*
+   * §5.43：收起态只把「想要的宽度」换成 24px 竖条，**收起口径不变**——仍按
+   * 「想要的宽度 + 画布下限」判断放不放得下，放不下就整块不给。这样窄窗不会
+   * 出现「一条 24px 的竖条把画布挤到 179px」的破例。
+   */
+  const int layer_wanted = prefs.layer_panel_collapsed
+                               ? Layout::kCollapsedPanelWidth
+                               : clamp_layer_panel_width(prefs.layer_panel_width);
   int layer_w = 0;
-  if (width >= clamp_layer_panel_width(prefs.layer_panel_width) + Layout::kMinCanvasWidth) {
-    layer_w = clamp_layer_panel_width(prefs.layer_panel_width);
+  if (width >= layer_wanted + Layout::kMinCanvasWidth) {
+    layer_w = layer_wanted;
   }
+  const int adjust_wanted = prefs.adjust_panel_collapsed
+                                ? Layout::kCollapsedPanelWidth
+                                : clamp_adjust_panel_width(prefs.adjust_panel_width);
   int adjust_w = 0;
-  if (width - layer_w >=
-      clamp_adjust_panel_width(prefs.adjust_panel_width) + Layout::kMinCanvasWidth) {
-    adjust_w = clamp_adjust_panel_width(prefs.adjust_panel_width);
+  if (width - layer_w >= adjust_wanted + Layout::kMinCanvasWidth) {
+    adjust_w = adjust_wanted;
   }
 
   Layout out;
@@ -272,12 +317,25 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
   out.canvas = Rect{layer_w, body_top, width - layer_w - adjust_w, body_h};
   out.status = Rect{0, body_top + body_h, width, status_h};
-  if (layer_w > 0) {
+  out.layer_collapsed = layer_w > 0 && prefs.layer_panel_collapsed;
+  out.adjust_collapsed = adjust_w > 0 && prefs.adjust_panel_collapsed;
+  /*
+   * 收起条不提供拖宽：它只有 24px，拖动命中带（最右 5px）几乎占满整条，用户
+   * 想在哪儿点「展开」都会变成「拉宽」。展开后分界线立刻恢复。
+   */
+  if (layer_w > 0 && !out.layer_collapsed) {
     out.layer_splitter = Rect{layer_w - Layout::kPanelSplitterWidth, body_top,
                               Layout::kPanelSplitterWidth, body_h};
   }
-  if (adjust_w > 0) {
+  if (adjust_w > 0 && !out.adjust_collapsed) {
     out.adjust_splitter = Rect{width - adjust_w, body_top, Layout::kPanelSplitterWidth, body_h};
+  }
+  if (layer_w > 0) {
+    out.layer_toggle = out.layer_collapsed ? out.layer_panel : panel_toggle_rect(out.layer_panel);
+  }
+  if (adjust_w > 0) {
+    out.adjust_toggle =
+        out.adjust_collapsed ? out.adjust_panel : panel_toggle_rect(out.adjust_panel);
   }
   return out;
 }
@@ -290,6 +348,13 @@ inline Layout compute_layout(int width, int height) {
 inline int panel_splitter_at(const Layout& layout, double x, double y) {
   if (layout.layer_splitter.contains(x, y)) return 1;
   if (layout.adjust_splitter.contains(x, y)) return 2;
+  return 0;
+}
+
+/* 收起/展开命中：0 = 未命中，1 = 图层面板，2 = 调整面板（§5.43）。 */
+inline int panel_toggle_at(const Layout& layout, double x, double y) {
+  if (layout.layer_toggle.contains(x, y)) return 1;
+  if (layout.adjust_toggle.contains(x, y)) return 2;
   return 0;
 }
 
@@ -3858,7 +3923,13 @@ inline Rect adjust_channel_chip_rect(const Rect& panel, int channel, int channel
   if (channel >= channel_count) channel = channel_count - 1;
   const int total =
       channel_count * kAdjustChannelChipWidth + (channel_count - 1) * kAdjustChannelChipGap;
-  const int x0 = panel.right() - 10 - total;
+  /*
+   * §5.43：标题行右端让给整块收起按钮（18px + 8px 边距），通道条整体左移同样的
+   * 宽度。不左移的话按钮会盖住最后一个通道格（"B"），而通道格是能点的——被盖住
+   * 的那一页就再也切不过去了。
+   */
+  const int x0 = panel.right() - 10 - Layout::kPanelToggleSize -
+                 Layout::kPanelToggleRightMargin - total;
   return Rect{x0 + channel * (kAdjustChannelChipWidth + kAdjustChannelChipGap), panel.y + 6,
               kAdjustChannelChipWidth, kAdjustChannelChipHeight};
 }

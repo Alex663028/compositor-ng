@@ -121,6 +121,9 @@ constexpr UINT kCmdLayerDuplicate = 1531;   /* Ctrl+J：复制选中图层 */
 constexpr UINT kCmdLayerRename = 1532;      /* F2：重命名（键入态） */
 constexpr UINT kCmdLayerNewGroup = 1533;    /* Ctrl+G：新建组（选区非空时收纳进组） */
 constexpr UINT kCmdLayerOpacitySet = 1534;  /* 精确不透明度（键入态） */
+/* §5.43 面板整块收起（停靠最小版）：F7 = 图层面板、F8 = 调整面板（PS 同键位）。 */
+constexpr UINT kCmdPanelLayers = 1535;
+constexpr UINT kCmdPanelAdjust = 1536;
 /* 与 Document::kMaxLayerNameBytes 同一个上限（comp_layer.h 的 set_name 约定）。 */
 constexpr size_t kLayerNameCapacity = 1024;
 constexpr UINT kCmdLayerMoveLeft = 1036;  /* S21：图层平移（Shift=微调、Ctrl=粗调） */
@@ -554,6 +557,14 @@ struct ShellState {
   int panel_resize_start_x = 0;
   /* 悬停高亮：只用于把分界线画亮一点，不影响命中。 */
   int panel_splitter_hover = 0;
+  /*
+   * §5.43 面板整块收起（停靠最小版）。和宽度一样是**会话偏好**，不进撤销栈；
+   * 收起不改 `*_panel_width`，展开回来仍是用户拖出来的宽度。
+   */
+  bool layer_panel_collapsed = false;
+  bool adjust_panel_collapsed = false;
+  /* 收起/展开按钮的悬停档位（1 = 图层面板，2 = 调整面板，0 = 无）。 */
+  int panel_toggle_hover = 0;
   /* 吸管拖拽（S6）：按住拖动时连续取样；只读，不产生撤销步。 */
   bool eyedropper_drag = false;
   /*
@@ -2447,6 +2458,9 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_checked_recursive(menu, kCmdLayerToggleClipping, checks.clipping);
   menu_set_checked_recursive(menu, kCmdLayerToggleIsolated, checks.isolated);
   menu_set_checked_recursive(menu, kCmdHistogramToggle, checks.histogram);
+  /* §5.43：勾选 = 已收起（竖条态），与画出来的形态一致。 */
+  menu_set_checked_recursive(menu, kCmdPanelLayers, shell.layer_panel_collapsed);
+  menu_set_checked_recursive(menu, kCmdPanelAdjust, shell.adjust_panel_collapsed);
   if (checks.sampling >= 0) {
     menu_radio_check_recursive(menu, kCmdSamplingBase,
                                kCmdSamplingBase + static_cast<UINT>(comp_ui::kSamplingCount) - 1,
@@ -8132,6 +8146,9 @@ void view_actual(ShellState& shell);
 void view_zoom_step(ShellState& shell, double factor);
 
 /* 菜单与快捷键共用同一入口，保证两条路径行为不分叉。 */
+/* §5.43 面板整块收起：定义在 client_layout 之后（要用前后布局做 pan 补偿）。 */
+void panel_toggle_collapsed(ShellState& shell, int target);
+
 void run_shell_command(HWND window, ShellState& shell, UINT id) {
   /*
    * 任何命令之前先给连续微调收口：撤销/重做/新建/打开都要求「没有活动事务」，
@@ -8326,6 +8343,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdHistogramToggle:
       panel_toggle_histogram(shell);
+      break;
+    /* ---- §5.43 面板整块收起（停靠最小版）：菜单 / F7 / F8 / 点标题行按钮同一入口 ---- */
+    case kCmdPanelLayers:
+      panel_toggle_collapsed(shell, 1);
+      break;
+    case kCmdPanelAdjust:
+      panel_toggle_collapsed(shell, 2);
       break;
     /* ---- S24：镜像、效果开关、直方图区间复位 ---- */
     case kCmdLayerFlipHorizontal:
@@ -10585,6 +10609,83 @@ void draw_panel_dividers(HDC dc, const ShellState& shell, const Layout& layout) 
   }
 }
 
+/*
+ * §5.43 收起/展开按钮。几何全部来自 Layout（panel_toggle_at 命中用的是同一块
+ * 矩形），这里只画两种形态：
+ *   - 展开态：标题行右端 18×18 小方块，三角指向「收进去」的一侧；
+ *   - 收起态：整条 24px 竖条，竖排两字 + 指向「展开出来」的三角。
+ * 收起条整条可点，因此悬停高亮也铺整条：点哪儿亮哪儿，不必去瞄 18px 的小方块。
+ */
+void draw_toggle_chevron(HDC dc, int cx, int cy, int half, bool point_left, COLORREF color) {
+  POINT points[3];
+  if (point_left) {
+    points[0] = POINT{cx - half, cy};
+    points[1] = POINT{cx + half, cy - half};
+    points[2] = POINT{cx + half, cy + half};
+  } else {
+    points[0] = POINT{cx + half, cy};
+    points[1] = POINT{cx - half, cy - half};
+    points[2] = POINT{cx - half, cy + half};
+  }
+  HBRUSH brush = CreateSolidBrush(color);
+  HGDIOBJ old = SelectObject(dc, brush);
+  Polygon(dc, points, 3);
+  SelectObject(dc, old);
+  DeleteObject(brush);
+}
+
+void draw_panel_toggle(HDC dc, const comp_ui::Rect& box, bool collapsed, bool hot,
+                       bool panel_on_left, const wchar_t* row0, const wchar_t* row1) {
+  if (box.w <= 0 || box.h <= 0) return;
+  RECT rect{box.x, box.y, box.right(), box.bottom()};
+  HBRUSH fill = CreateSolidBrush(collapsed ? (hot ? RGB(44, 50, 62) : RGB(30, 33, 40))
+                                          : (hot ? RGB(52, 62, 80) : RGB(38, 42, 52)));
+  FillRect(dc, &rect, fill);
+  DeleteObject(fill);
+
+  SetBkMode(dc, TRANSPARENT);
+  if (!collapsed) {
+    FrameRect(dc, &rect, reinterpret_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    /* 展开态的三角朝外：左栏收起 = 往左推，右栏收起 = 往右推。 */
+    draw_toggle_chevron(dc, box.x + box.w / 2, box.y + box.h / 2, 4, panel_on_left,
+                        hot ? RGB(255, 255, 255) : RGB(190, 196, 210));
+    return;
+  }
+
+  /* 收起条与画布交界描一条暗线：两边都接近黑色时，不描就看不出边界。 */
+  RECT edge{panel_on_left ? box.right() - 1 : box.x, box.y,
+            panel_on_left ? box.right() : box.x + 1, box.bottom()};
+  HBRUSH line = CreateSolidBrush(RGB(16, 18, 22));
+  FillRect(dc, &edge, line);
+  DeleteObject(line);
+
+  SetTextColor(dc, hot ? RGB(232, 238, 250) : RGB(168, 174, 188));
+  SIZE extent{};
+  GetTextExtentPoint32W(dc, row0, lstrlenW(row0), &extent);
+  TextOutW(dc, box.x + (box.w - extent.cx) / 2, box.y + 8, row0, lstrlenW(row0));
+  GetTextExtentPoint32W(dc, row1, lstrlenW(row1), &extent);
+  TextOutW(dc, box.x + (box.w - extent.cx) / 2, box.y + 26, row1, lstrlenW(row1));
+
+  /* 三角朝画布：左栏展开 = 往右拉出来，右栏展开 = 往左拉出来。 */
+  int cy = box.y + 52;
+  if (cy > box.bottom() - 10) cy = box.bottom() - 10;
+  if (cy > box.y + 44) {
+    draw_toggle_chevron(dc, box.x + box.w / 2, cy, 4, !panel_on_left,
+                        hot ? RGB(232, 238, 250) : RGB(150, 158, 176));
+  }
+}
+
+void draw_panel_toggles(HDC dc, const ShellState& shell, const Layout& layout) {
+  if (layout.layer_toggle.w > 0) {
+    draw_panel_toggle(dc, layout.layer_toggle, layout.layer_collapsed,
+                      shell.panel_toggle_hover == 1, true, L"图", L"层");
+  }
+  if (layout.adjust_toggle.w > 0) {
+    draw_panel_toggle(dc, layout.adjust_toggle, layout.adjust_collapsed,
+                      shell.panel_toggle_hover == 2, false, L"调", L"整");
+  }
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -10677,8 +10778,14 @@ void present(HWND window, ShellState& shell) {
   draw_canvas_overlays(memory_dc, shell, layout);
 
   draw_toolbar(memory_dc, shell, layout.toolbar);
-  if (layout.layer_panel.w > 0) draw_layer_panel(memory_dc, shell, layout.layer_panel);
-  if (layout.adjust_panel.w > 0) {
+  /*
+   * §5.43：收起态只剩 24px 竖条，面板内容一列都排不下——整块不画，交给
+   * draw_panel_toggles 画竖条。两者互斥，竖条上不会漏出半截图层行。
+   */
+  if (layout.layer_panel.w > 0 && !layout.layer_collapsed) {
+    draw_layer_panel(memory_dc, shell, layout.layer_panel);
+  }
+  if (layout.adjust_panel.w > 0 && !layout.adjust_collapsed) {
     if (path_panel_visible(shell)) {
       draw_path_panel(memory_dc, shell, layout.adjust_panel);
     } else if (history_panel_visible(shell)) {
@@ -10698,6 +10805,7 @@ void present(HWND window, ShellState& shell) {
     }
   }
   /* 分界线最后画：盖在面板底色之上，1px 线才不会被面板自己的填充吃掉。 */
+  draw_panel_toggles(memory_dc, shell, layout);
   draw_panel_dividers(memory_dc, shell, layout);
   draw_status_bar(memory_dc, shell, layout.status);
 
@@ -10885,6 +10993,8 @@ bool client_layout(const ShellState& shell, Layout* out) {
   comp_ui::LayoutPrefs prefs;
   prefs.layer_panel_width = shell.layer_panel_width;
   prefs.adjust_panel_width = shell.adjust_panel_width;
+  prefs.layer_panel_collapsed = shell.layer_panel_collapsed;
+  prefs.adjust_panel_collapsed = shell.adjust_panel_collapsed;
   *out = comp_ui::compute_layout(client.right - client.left, client.bottom - client.top, prefs);
   return true;
 }
@@ -11006,6 +11116,50 @@ void panel_resize_reset(ShellState& shell, int target) {
   }
   set_status(shell, target == 1 ? L"图层面板宽度已复位为 248 px"
                                 : L"右侧面板宽度已复位为 330 px");
+}
+
+/*
+ * §5.43 面板整块收起（停靠最小版）。target 1 = 图层面板、2 = 调整面板。
+ *
+ * 与 §6.60 拖宽同一套口径：只改会话偏好（不进撤销栈），并且把画布中心的位移
+ * 补偿进 pan——收起/展开会让画布宽 224px、中心横移 112px，不补偿的话用户按 F7
+ * 收面板，正在看的图像会跟着跳一下，像「视图被重置了」。
+ *
+ * 宽度偏好**不**跟着收起变：展开回来仍是用户拖出来的宽度（宽度是会话状态，
+ * 收起只是它的一个显示开关）。
+ */
+void panel_toggle_collapsed(ShellState& shell, int target) {
+  if (target != 1 && target != 2) return;
+  Layout before{};
+  if (!client_layout(shell, &before)) return;
+
+  if (target == 1) {
+    shell.layer_panel_collapsed = !shell.layer_panel_collapsed;
+  } else {
+    shell.adjust_panel_collapsed = !shell.adjust_panel_collapsed;
+  }
+
+  Layout after{};
+  bool shown = true;
+  if (client_layout(shell, &after)) {
+    const comp_ui::Point was = comp_ui::CanvasView::canvas_center(before.canvas);
+    const comp_ui::Point now = comp_ui::CanvasView::canvas_center(after.canvas);
+    shell.view.pan_by(was.x - now.x, was.y - now.y);
+    shown = target == 1 ? after.layer_panel.w > 0 : after.adjust_panel.w > 0;
+  }
+
+  const bool collapsed =
+      target == 1 ? shell.layer_panel_collapsed : shell.adjust_panel_collapsed;
+  const wchar_t* hint = L"";
+  if (!shown) {
+    hint = L"（当前窗口放不下，放宽窗口后生效）";
+  } else if (collapsed) {
+    hint = target == 1 ? L"（F7 或点竖条展开）" : L"（F8 或点竖条展开）";
+  }
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s：%s%s", target == 1 ? L"图层面板" : L"调整面板",
+            collapsed ? L"已收起" : L"已展开", hint);
+  set_status(shell, buffer);
 }
 
 void view_fit(ShellState& shell) {
@@ -12759,6 +12913,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           return 0;
         }
         /*
+         * §5.43 F7 / F8：面板整块收起（与 PS 同键位）。同样走 run_shell_command，
+         * 菜单、快捷键、点按钮三条入口不分叉。
+         */
+        if (wparam == VK_F7) {
+          run_shell_command(window, *shell, kCmdPanelLayers);
+          return 0;
+        }
+        if (wparam == VK_F8) {
+          run_shell_command(window, *shell, kCmdPanelAdjust);
+          return 0;
+        }
+        /*
          * §6.60 Esc 取消面板拖动：回到按下前的宽度（与滑杆/曲线拖动同一手感）。
          * 必须先回滚再 ReleaseCapture——释放捕获会重入 cancel，那时目标已清空即为空操作。
          */
@@ -12828,6 +12994,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (button >= 0) {
             const comp_ui::ToolInfo* info = comp_ui::tool_info_at(button);
             if (info != nullptr) set_tool(*shell, info->id);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          /*
+           * §5.43 收起/展开按钮：先于分界线与面板行。展开态它与分界线留 3px
+           * 间隔（互不重叠），收起态整条 24px 都是按钮——顺序必须在这里，否则
+           * 点竖条会先落到「面板行」/滑杆上。
+           */
+          const int toggle = comp_ui::panel_toggle_at(layout, mouse_x, mouse_y);
+          if (toggle != 0) {
+            panel_toggle_collapsed(*shell, toggle);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
@@ -13285,6 +13462,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
          * 也必须先于直方图/路径/图层行：分界线窄带压在这些控件之上。
          */
         if (client_layout(*shell, &layout)) {
+          /*
+           * §5.43 双击收起/展开按钮 = 与单击同义（第二击不吞掉：收起后整条都是
+           * 按钮，双击就是「收起再展开」，与连点两次完全一致）。
+           */
+          const int toggle = comp_ui::panel_toggle_at(layout, mouse_x, mouse_y);
+          if (toggle != 0) {
+            panel_toggle_collapsed(*shell, toggle);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           const int splitter = comp_ui::panel_splitter_at(layout, mouse_x, mouse_y);
           if (splitter != 0) {
             panel_resize_reset(*shell, splitter);
@@ -13598,6 +13785,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_SETCURSOR:
       /*
+       * §5.43 收起/展开按钮：手形。先于分界线判定——两者几何不重叠（留 3px），
+       * 但收起条压在画布边的光标逻辑之上，顺序固定后不会出现「竖条上显示箭头」。
+       */
+      if (shell != nullptr && LOWORD(lparam) == HTCLIENT && shell->panel_toggle_hover != 0) {
+        HCURSOR cursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_HAND));
+        if (cursor != nullptr) {
+          SetCursor(cursor);
+          return TRUE;
+        }
+      }
+      /*
        * §6.60 面板分界线：左右箭头。悬停档位由 WM_MOUSEMOVE 维护；拖动中用 target
        * 判定——此时指针可能已拖出分界线甚至拖出窗口，但形状必须一直保持到松手。
        */
@@ -13646,6 +13844,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           const int hover = comp_ui::panel_splitter_at(layout, mouse_x, mouse_y);
           if (hover != shell->panel_splitter_hover) {
             shell->panel_splitter_hover = hover;
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          /* §5.43 收起/展开按钮同样要悬停高亮：18px 的小方块没有高亮没人会去点。 */
+          const int toggle_hover = comp_ui::panel_toggle_at(layout, mouse_x, mouse_y);
+          if (toggle_hover != shell->panel_toggle_hover) {
+            shell->panel_toggle_hover = toggle_hover;
             InvalidateRect(window, nullptr, FALSE);
           }
           /* P0-3 曲线拖动优先：几何用按下时冻结的绘图区，写入落在同一个事务里。 */
@@ -13732,8 +13936,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
          * WM_MOUSELEAVE 是一次性的，收到后要重新 Track 才能再收到。
          * 分界线悬停同样要 Track：否则指针从面板直接移出窗口，高亮会一直留着。
          */
-        const bool want_track =
-            comp_ui::tool_has_brush_tip(shell->tool) || shell->panel_splitter_hover != 0;
+        const bool want_track = comp_ui::tool_has_brush_tip(shell->tool) ||
+                                shell->panel_splitter_hover != 0 ||
+                                shell->panel_toggle_hover != 0;
         if (want_track) {
           if (comp_ui::tool_has_brush_tip(shell->tool)) {
             shell->cursor_x = mouse_x;
@@ -13761,6 +13966,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         shell->tracking_leave = false;
         /* §6.60 指针离开窗口：分界线高亮必须一起熄灭，否则会留一条亮边。 */
         shell->panel_splitter_hover = 0;
+        /* §5.43 收起按钮同理。 */
+        shell->panel_toggle_hover = 0;
         InvalidateRect(window, nullptr, FALSE);
       }
       break;
@@ -13909,7 +14116,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           }
         } else if (client_layout(*shell, &layout) && layout.layer_panel.w > 0 &&
-                   shell->histogram_open &&
+                   !layout.layer_collapsed && shell->histogram_open &&
                    comp_ui::histogram_plot_rect(layout.layer_panel)
                        .contains(cursor.x, cursor.y)) {
           /*
@@ -13929,7 +14136,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
-                   history_panel_visible(*shell) &&
+                   !layout.adjust_collapsed && history_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
           /* 历史记录面板滚轮翻列表：一格 3 行，夹取在 ui_core。 */
           const int delta = static_cast<short>(HIWORD(wparam));
@@ -13941,7 +14148,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           }
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
-                   !shell->effect_open && !shell->filter_open &&
+                   !layout.adjust_collapsed && !shell->effect_open && !shell->filter_open &&
                    !type_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
           /*
@@ -14182,6 +14389,13 @@ HMENU build_menu() {
    */
   AppendMenuW(view_menu, MF_STRING, kCmdHistogramToggle, L"亮度直方图(&H)\tF6");
   AppendMenuW(view_menu, MF_STRING, kCmdHistogramReset, L"直方图区间复位(&R)\t双击图内");
+  /*
+   * §5.43 面板整块收起：F7 / F8 与 PS 同键位（Layers / Adjustments）。勾选态 =
+   * 已收起，菜单里一眼能看出哪块现在是竖条。
+   */
+  AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(view_menu, MF_STRING, kCmdPanelLayers, L"图层面板收起/展开(&L)\tF7");
+  AppendMenuW(view_menu, MF_STRING, kCmdPanelAdjust, L"调整面板收起/展开(&J)\tF8");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view_menu), L"视图(&V)");
 
   /* 工具菜单与工具条、快捷键共用同一张表（tool_table），不另抄一份键位。 */
