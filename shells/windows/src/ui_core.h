@@ -4365,6 +4365,259 @@ inline double curve_eval(const double* points_xy, int count, double x) {
   return y;
 }
 
+/* ------------------------------------------------- 文档级对话框（P0 接线） */
+
+/*
+ * 新建 / 图像大小 / 画布大小 / 历史容量四个对话框共用一套行模型：数值行、
+ * 枚举行、开关行。行几何、夹取、锚点与百分比换算都放在这里，壳只负责取值
+ * 和调用既有 ABI——「面板上显示的数字」与「真正写进文档的数字」必须同源，
+ * 否则一旦两边各写一份夹取，用户就会看到 30000 却得到 16384。
+ *
+ * 这四个对话框全都**不新增 ABI**：
+ *   - 新建：comp_document_desc 的 width/height/dpi/color_space；
+ *   - 图像大小：comp_document_resize_image（整篇重采样）；
+ *   - 画布大小：comp_txn_begin + comp_layer_set_transform + comp_document_set_size；
+ *   - 历史容量：comp_document_set_history_limit / set_history_budget。
+ */
+enum class DocDialogKind { None = 0, NewDocument, ImageSize, CanvasSize, HistoryLimit };
+
+enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
+
+struct DocRowSpec {
+  const char* label;
+  DocRowKind kind;
+  int min;
+  int max;
+  int step;         /* ← / → 与 - / = 的单步步长（数值行） */
+  int choice_count; /* 枚举行档位数；数值/开关行为 0 */
+};
+
+/* 画布尺寸的合法区间，与 comp_document_desc 的注释（1..30000）同口径。 */
+inline constexpr int kDocSizeMin = 1;
+inline constexpr int kDocSizeMax = 30000;
+/* dpi：0 表示引擎默认 72；对话框里给 1..2400 的可选区间。 */
+inline constexpr int kDocDpiMin = 1;
+inline constexpr int kDocDpiMax = 2400;
+/* 历史步数：0 = 引擎默认 200，上限给到 2000（快照式撤销，再高内存吃不住）。 */
+inline constexpr int kDocHistoryStepsMax = 2000;
+/* 历史内存预算：0 = 引擎默认 512 MiB；界面上按 MiB 显示，上限 16 GiB。 */
+inline constexpr int kDocHistoryBudgetMaxMb = 16384;
+
+inline int clamp_doc_size(int value) {
+  if (value < kDocSizeMin) return kDocSizeMin;
+  if (value > kDocSizeMax) return kDocSizeMax;
+  return value;
+}
+
+inline int clamp_doc_dpi(int value) {
+  if (value < kDocDpiMin) return kDocDpiMin;
+  if (value > kDocDpiMax) return kDocDpiMax;
+  return value;
+}
+
+inline int clamp_history_steps(int value) {
+  if (value < 0) return 0;
+  if (value > kDocHistoryStepsMax) return kDocHistoryStepsMax;
+  return value;
+}
+
+inline int clamp_history_budget_mb(int value) {
+  if (value < 0) return 0;
+  if (value > kDocHistoryBudgetMaxMb) return kDocHistoryBudgetMaxMb;
+  return value;
+}
+
+inline const char* doc_dialog_title(DocDialogKind kind) {
+  switch (kind) {
+    case DocDialogKind::NewDocument:
+      return "新建文档（New Document）";
+    case DocDialogKind::ImageSize:
+      return "图像大小（Image Size）";
+    case DocDialogKind::CanvasSize:
+      return "画布大小（Canvas Size）";
+    case DocDialogKind::HistoryLimit:
+      return "历史记录容量（History）";
+    default:
+      return "";
+  }
+}
+
+inline const char* doc_dialog_subtitle(DocDialogKind kind) {
+  switch (kind) {
+    case DocDialogKind::NewDocument:
+      return "画布尺寸 / 分辨率 / 背景";
+    case DocDialogKind::ImageSize:
+      return "整篇重采样；选区会被丢弃";
+    case DocDialogKind::CanvasSize:
+      return "改画布并按锚点平移内容；裁剪不可恢复";
+    case DocDialogKind::HistoryLimit:
+      return "0 = 引擎默认（200 步 / 512 MiB）";
+    default:
+      return "";
+  }
+}
+
+inline const char* doc_dialog_hint(DocDialogKind kind) {
+  switch (kind) {
+    case DocDialogKind::NewDocument:
+      return "Tab 切行 · 数字键输入 · 回车应用";
+    case DocDialogKind::ImageSize:
+      return "Tab 切行 · 空格关约束 · 回车应用";
+    case DocDialogKind::CanvasSize:
+      return "Tab 切行 · ←/→ 循环锚点 · 回车应用";
+    case DocDialogKind::HistoryLimit:
+      return "Tab 切行 · 0 = 默认 · 回车应用";
+    default:
+      return "";
+  }
+}
+
+inline int doc_dialog_row_count(DocDialogKind kind) {
+  switch (kind) {
+    case DocDialogKind::NewDocument:
+      return 4; /* 宽 / 高 / 分辨率 / 背景 */
+    case DocDialogKind::ImageSize:
+      return 4; /* 宽 / 高 / 约束比例 / 百分比 */
+    case DocDialogKind::CanvasSize:
+      return 3; /* 宽 / 高 / 锚点 */
+    case DocDialogKind::HistoryLimit:
+      return 2; /* 步数上限 / 内存上限 */
+    default:
+      return 0;
+  }
+}
+
+inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
+  switch (kind) {
+    case DocDialogKind::NewDocument:
+      switch (row) {
+        case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 2: return DocRowSpec{"分辨率 (dpi)", DocRowKind::Number, kDocDpiMin, kDocDpiMax, 1, 0};
+        case 3: return DocRowSpec{"背景", DocRowKind::Choice, 0, 2, 1, 3};
+        default: break;
+      }
+      break;
+    case DocDialogKind::ImageSize:
+      switch (row) {
+        case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 2: return DocRowSpec{"约束比例", DocRowKind::Toggle, 0, 1, 1, 0};
+        case 3: return DocRowSpec{"百分比 (%)", DocRowKind::Number, 1, 10000, 5, 0};
+        default: break;
+      }
+      break;
+    case DocDialogKind::CanvasSize:
+      switch (row) {
+        case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
+        case 2: return DocRowSpec{"锚点", DocRowKind::Choice, 0, 8, 1, 9};
+        default: break;
+      }
+      break;
+    case DocDialogKind::HistoryLimit:
+      switch (row) {
+        case 0:
+          return DocRowSpec{"步数上限", DocRowKind::Number, 0, kDocHistoryStepsMax, 10, 0};
+        case 1:
+          return DocRowSpec{"内存上限 (MiB)", DocRowKind::Number, 0,
+                            kDocHistoryBudgetMaxMb, 64, 0};
+        default: break;
+      }
+      break;
+    default:
+      break;
+  }
+  return DocRowSpec{"", DocRowKind::Number, 0, 0, 1, 0};
+}
+
+inline const char* doc_new_background_name(int choice) {
+  switch (choice) {
+    case 0: return "白色";
+    case 1: return "透明";
+    case 2: return "前景色";
+    default: return "?";
+  }
+}
+
+/* 锚点按 3×3 行优先编号：0=左上 … 4=居中 … 8=右下。 */
+inline const char* doc_anchor_name(int anchor) {
+  static const char* names[9] = {"左上", "上中", "右上", "左中", "居中",
+                                 "右中", "左下", "下中", "右下"};
+  if (anchor < 0 || anchor > 8) return "?";
+  return names[anchor];
+}
+
+/* 锚点 -> 内容位移。列号 = anchor % 3，行号 = anchor / 3，取 0 / 半个 / 一个增量。 */
+inline int doc_anchor_offset(int delta, int index) {
+  if (index <= 0) return 0;
+  if (index >= 2) return delta;
+  return delta >= 0 ? delta / 2 : -((-delta) / 2);
+}
+
+inline int doc_anchor_dx(int anchor, int delta_width) {
+  if (anchor < 0 || anchor > 8) anchor = 4;
+  return doc_anchor_offset(delta_width, anchor % 3);
+}
+
+inline int doc_anchor_dy(int anchor, int delta_height) {
+  if (anchor < 0 || anchor > 8) anchor = 4;
+  return doc_anchor_offset(delta_height, anchor / 3);
+}
+
+/* 百分比 -> 尺寸：四舍五入后夹取，和面板上显示的数字一致。 */
+inline int doc_size_from_percent(int base, int percent) {
+  if (base <= 0) return kDocSizeMin;
+  if (percent <= 0) percent = 1;
+  const double scaled = static_cast<double>(base) * static_cast<double>(percent) / 100.0;
+  return clamp_doc_size(static_cast<int>(std::lround(scaled)));
+}
+
+/* 尺寸 -> 百分比（仅用于面板回显；不写回字段，避免来回取整漂移）。 */
+inline int doc_percent_from_size(int base, int value) {
+  if (base <= 0) return 100;
+  const double percent = static_cast<double>(value) * 100.0 / static_cast<double>(base);
+  if (percent < 1.0) return 1;
+  if (percent > 10000.0) return 10000;
+  return static_cast<int>(std::lround(percent));
+}
+
+/*
+ * 约束比例联动：改宽按原比例推高，改高按原比例推宽。两个方向都从**原始尺寸**
+ * 取比例，而不是从上一帧的结果——否则连续微调会一路累积取整误差。
+ */
+inline int doc_locked_height(int original_width, int original_height, int width) {
+  if (original_width <= 0) return original_height;
+  const double height = static_cast<double>(width) * static_cast<double>(original_height) /
+                        static_cast<double>(original_width);
+  return clamp_doc_size(static_cast<int>(std::lround(height)));
+}
+
+inline int doc_locked_width(int original_width, int original_height, int height) {
+  if (original_height <= 0) return original_width;
+  const double width = static_cast<double>(height) * static_cast<double>(original_width) /
+                       static_cast<double>(original_height);
+  return clamp_doc_size(static_cast<int>(std::lround(width)));
+}
+
+/* 行几何：绘制与命中同源（与 trim_row_rect 同一套约定）。 */
+inline constexpr int kDocDialogRowHeight = 22;
+inline constexpr int kDocDialogRowsTop = 56;
+
+inline Rect doc_dialog_row_rect(const Rect& panel, int row) {
+  return Rect{panel.x, panel.y + kDocDialogRowsTop + row * kDocDialogRowHeight, panel.w,
+              kDocDialogRowHeight};
+}
+
+inline int doc_dialog_row_at(const Rect& panel, int row_count, double x, double y) {
+  if (row_count <= 0 || !panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kDocDialogRowsTop);
+  if (local < 0.0) return -1;
+  const int row = static_cast<int>(std::floor(local / static_cast<double>(kDocDialogRowHeight)));
+  if (row < 0 || row >= row_count) return -1;
+  return row;
+}
+
 }  // namespace comp_ui
 
 #endif /* COMPOSITOR_SHELL_UI_CORE_H */

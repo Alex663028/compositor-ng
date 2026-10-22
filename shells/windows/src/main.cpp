@@ -176,6 +176,17 @@ constexpr UINT kCmdImageRotateCCW = 1054; /* 画布逆时针 90° */
 constexpr UINT kCmdImageRotate180 = 1055; /* 画布 180° */
 constexpr UINT kCmdImageTrim = 1056;      /* 修边（模态面板，回车应用） */
 constexpr UINT kCmdImageInvert = 1057;    /* 图层反相（Ctrl+I） */
+/*
+ * P0 文档级对话框（1560 段，空号段，不挤占工具/滤镜/混合模式的连续 id）。
+ * 四条入口此前壳里根本没有：新建只有固定的 1280×720、没有分辨率与背景，
+ * 图像大小 / 画布大小完全没有，历史容量只能靠改 .comp。全走既有 ABI，
+ * 不新增导出（ABI 仍为 145）。
+ */
+constexpr UINT kCmdNewDocumentDialog = 1560; /* 文件 > 新建文档…（Ctrl+Alt+N） */
+constexpr UINT kCmdSaveAs = 1561;            /* 文件 > 另存为…（Ctrl+Alt+S） */
+constexpr UINT kCmdImageSize = 1562;         /* 图像 > 图像大小…（Ctrl+Alt+I） */
+constexpr UINT kCmdCanvasSize = 1563;        /* 图像 > 画布大小…（Ctrl+Alt+C） */
+constexpr UINT kCmdHistorySettings = 1564;   /* 编辑 > 历史记录容量… */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -393,6 +404,43 @@ struct ShellState {
   comp_ui::TrimPanel trim;
   bool trim_open = false;
   std::wstring trim_input; /* 容差键入缓冲；非空 = 输入态 */
+  /*
+   * P0 文档级对话框：新建 / 图像大小 / 画布大小 / 历史容量。
+   *
+   * 与修边/滤镜同一条模态规矩：占右侧调整栏、Esc 取消、回车应用、其余快捷键让路。
+   * 所有数值都是 int：引擎的 desc / set_size / resize_image 收的就是整数像素，
+   * 壳里不引入浮点中间态，面板显示的数字与写进文档的数字同源（夹取在 ui_core.h，
+   * 与单元测试钉在一起）。四种对话框都不新增 ABI 导出。
+   *
+   * new_doc_* 是「上次新建设置」：新建对话框打开时从这里取初值、应用成功后再写回，
+   * 与上游 Remember Last Used Settings 同效；它不与 doc_dialog_* 共用字段，否则
+   * 打开一次图像大小就会把记住的新建尺寸覆盖掉。
+   */
+  comp_ui::DocDialogKind doc_dialog = comp_ui::DocDialogKind::None;
+  int doc_dialog_focus = 0;
+  int doc_dialog_width = kDefaultWidth;
+  int doc_dialog_height = kDefaultHeight;
+  int doc_dialog_dpi = 72;
+  int doc_dialog_background = 1; /* 0 白 / 1 透明 / 2 前景色；缺省透明 = Ctrl+N 旧行为 */
+  int doc_dialog_lock_aspect = 1;
+  int doc_dialog_anchor = 4; /* 居中 */
+  int doc_dialog_steps = 0;
+  int doc_dialog_budget_mb = 0;
+  /* 打开时的原始尺寸：约束比例与百分比都以它为基准，连续微调不累积取整误差。 */
+  int doc_dialog_base_width = kDefaultWidth;
+  int doc_dialog_base_height = kDefaultHeight;
+  std::wstring doc_dialog_input;
+  int new_doc_width = kDefaultWidth;
+  int new_doc_height = kDefaultHeight;
+  int new_doc_dpi = 72;
+  int new_doc_background = 1;
+  /*
+   * 标题栏的「文件 + 脏标记」来源。读盘时引擎没有 dpi getter，document_dpi 只记
+   * 新建时写入的值，0 = 未知（标题里省略，不瞎猜 72）。
+   */
+  std::string document_path;
+  int document_dpi = 0;
+  std::wstring window_title_cache;
   /*
    * S22 直方图（comp_layer_histogram 的壳侧唯一调用点）。
    *
@@ -8150,10 +8198,40 @@ void forget_color_range(ShellState& shell) {
   shell.history_scroll = 0;
 }
 
-bool create_document(ShellState& shell) {
+/*
+ * 新文档的背景填充。引擎建文档时给的是**透明**背景层
+ * （ensure_background_layer -> clear_transparent），所以「白底 / 前景色底」必须
+ * 自己写一遍像素。写入走 comp_layer_set_pixels（与画笔同一条 ABI），因此会进
+ * 历史：新建带底色的文档一开始就是脏文档——它确实还没存过盘，标题上的 * 是实话。
+ */
+bool fill_document_background(ShellState& shell, int background) {
+  if (background == 1 || shell.document == nullptr) return true; /* 透明 = 引擎缺省 */
+  if (shell.width <= 0 || shell.height <= 0 || shell.layers.empty()) return false;
+  const uint8_t r = background == 2 ? shell.foreground.r : 255;
+  const uint8_t g = background == 2 ? shell.foreground.g : 255;
+  const uint8_t b = background == 2 ? shell.foreground.b : 255;
+  /* 预乘 RGBA8，alpha = 255 时预乘与直写相同。 */
+  std::vector<uint8_t> pixels(static_cast<size_t>(shell.width) * shell.height * 4, 255);
+  for (size_t i = 0; i < pixels.size(); i += 4) {
+    pixels[i] = r;
+    pixels[i + 1] = g;
+    pixels[i + 2] = b;
+    pixels[i + 3] = 255;
+  }
+  comp_image image{};
+  image.width = shell.width;
+  image.height = shell.height;
+  image.format = COMP_PIXEL_RGBA8;
+  image.stride = static_cast<size_t>(shell.width) * 4;
+  image.pixels = pixels.data();
+  return comp_layer_set_pixels(shell.document, shell.layers.front().id, &image) == COMP_OK;
+}
+
+bool create_document_with(ShellState& shell, int width, int height, int dpi, int background) {
   comp_document_desc desc{};
-  desc.width = kDefaultWidth;
-  desc.height = kDefaultHeight;
+  desc.width = comp_ui::clamp_doc_size(width);
+  desc.height = comp_ui::clamp_doc_size(height);
+  desc.dpi = static_cast<float>(comp_ui::clamp_doc_dpi(dpi));
   desc.color_space = "sRGB";
 
   comp_document document = nullptr;
@@ -8165,6 +8243,9 @@ bool create_document(ShellState& shell) {
   forget_color_range(shell);
   if (shell.document != nullptr) comp_document_destroy(shell.document);
   shell.document = document;
+  /* 新文档没有磁盘来源；dpi 记下来给标题栏用（引擎不提供回读口）。 */
+  shell.document_path.clear();
+  shell.document_dpi = static_cast<int>(desc.dpi);
 
   comp_size size{};
   if (comp_document_size(shell.document, &size) == COMP_OK) {
@@ -8197,8 +8278,18 @@ bool create_document(ShellState& shell) {
   pen_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
+  if (!fill_document_background(shell, background)) {
+    set_status(shell, L"新建文档成功，但背景填充失败（画布保持透明）");
+    return true;
+  }
+  shell.needs_render = true;
   refresh_history_status(shell, L"已新建文档");
   return true;
+}
+
+/* 旧入口（Ctrl+N / 启动 / 新建菜单）：行为与历史完全一致，透明背景 + 默认尺寸。 */
+bool create_document(ShellState& shell) {
+  return create_document_with(shell, kDefaultWidth, kDefaultHeight, 72, 1);
 }
 
 bool load_document(ShellState& shell, const char* path_utf8) {
@@ -8239,6 +8330,9 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   pen_cancel(shell);
   refresh_layers(shell);
   refresh_selection(shell);
+  /* 标题栏的文件名只在 .comp 上有意义：从位图打开的是「未命名文档」。 */
+  shell.document_path.assign(path_utf8);
+  shell.document_dpi = 0; /* 读盘没有 dpi 回读口：标题里省略，不瞎猜 72 */
   refresh_history_status(shell, L"已打开 .comp");
   return true;
 }
@@ -8246,6 +8340,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
 bool save_document(ShellState& shell, const char* path_utf8) {
   if (shell.document == nullptr) return false;
   const bool ok = comp_document_save(shell.document, path_utf8) == COMP_OK;
+  if (ok) shell.document_path.assign(path_utf8);
   set_status(shell, ok ? L"已保存 .comp" : L"保存 .comp 失败");
   return ok;
 }
@@ -8328,6 +8423,11 @@ void open_document_dialog(HWND window, ShellState& shell) {
 void save_document_dialog(HWND window, ShellState& shell) {
   if (shell.document == nullptr) return;
   wchar_t buffer[MAX_PATH] = L"";
+  /* 已保存过的文档把当前路径填进去：另存为/首次保存都少敲一遍目录。 */
+  if (!shell.document_path.empty()) {
+    MultiByteToWideChar(CP_UTF8, 0, shell.document_path.c_str(), -1, buffer, MAX_PATH);
+    buffer[MAX_PATH - 1] = L'\0';
+  }
   OPENFILENAMEW dialog{};
   dialog.lStructSize = sizeof(dialog);
   dialog.hwndOwner = window;
@@ -8339,6 +8439,496 @@ void save_document_dialog(HWND window, ShellState& shell) {
   char utf8[MAX_PATH * 3] = {0};
   WideCharToMultiByte(CP_UTF8, 0, buffer, -1, utf8, sizeof(utf8), nullptr, nullptr);
   save_document(shell, utf8);
+}
+
+/*
+ * Ctrl+S：有磁盘来源就直接写回（与上游 Save 一致），没有才弹另存为。
+ * 这样「保存」不打断手头工作，而「另存为」仍是一个显式入口。
+ */
+void save_document_quick(HWND window, ShellState& shell) {
+  if (shell.document == nullptr) return;
+  if (!shell.document_path.empty()) {
+    save_document(shell, shell.document_path.c_str());
+    return;
+  }
+  save_document_dialog(window, shell);
+}
+
+/* ------------------------------------------------- 文档级对话框（P0 接线） */
+
+/*
+ * 行 -> 值 / 值 -> 行：唯一映射点。行序必须与 ui_core::doc_dialog_row 完全相同
+ * （单元测试 ui_core_doc_dialog_rows 钉住行数与行序）。所有写入都经
+ * doc_dialog_set_row_value，夹取一次、联动一次，绘制与状态栏读的是同一份值。
+ */
+int doc_dialog_row_value(const ShellState& shell, int row) {
+  switch (shell.doc_dialog) {
+    case comp_ui::DocDialogKind::NewDocument:
+      switch (row) {
+        case 0: return shell.doc_dialog_width;
+        case 1: return shell.doc_dialog_height;
+        case 2: return shell.doc_dialog_dpi;
+        case 3: return shell.doc_dialog_background;
+        default: return 0;
+      }
+    case comp_ui::DocDialogKind::ImageSize:
+      switch (row) {
+        case 0: return shell.doc_dialog_width;
+        case 1: return shell.doc_dialog_height;
+        case 2: return shell.doc_dialog_lock_aspect;
+        /* 百分比不另存一份：始终由「当前宽 / 基准宽」现算，来回切换不会漂移。 */
+        case 3:
+          return comp_ui::doc_percent_from_size(shell.doc_dialog_base_width,
+                                                shell.doc_dialog_width);
+        default: return 0;
+      }
+    case comp_ui::DocDialogKind::CanvasSize:
+      switch (row) {
+        case 0: return shell.doc_dialog_width;
+        case 1: return shell.doc_dialog_height;
+        case 2: return shell.doc_dialog_anchor;
+        default: return 0;
+      }
+    case comp_ui::DocDialogKind::HistoryLimit:
+      switch (row) {
+        case 0: return shell.doc_dialog_steps;
+        case 1: return shell.doc_dialog_budget_mb;
+        default: return 0;
+      }
+    default:
+      return 0;
+  }
+}
+
+void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
+  switch (shell.doc_dialog) {
+    case comp_ui::DocDialogKind::NewDocument:
+      switch (row) {
+        case 0: shell.doc_dialog_width = comp_ui::clamp_doc_size(value); break;
+        case 1: shell.doc_dialog_height = comp_ui::clamp_doc_size(value); break;
+        case 2: shell.doc_dialog_dpi = comp_ui::clamp_doc_dpi(value); break;
+        case 3: shell.doc_dialog_background = value < 0 ? 0 : (value > 2 ? 2 : value); break;
+        default: break;
+      }
+      break;
+    case comp_ui::DocDialogKind::ImageSize:
+      switch (row) {
+        case 0:
+          shell.doc_dialog_width = comp_ui::clamp_doc_size(value);
+          if (shell.doc_dialog_lock_aspect != 0) {
+            shell.doc_dialog_height = comp_ui::doc_locked_height(
+                shell.doc_dialog_base_width, shell.doc_dialog_base_height,
+                shell.doc_dialog_width);
+          }
+          break;
+        case 1:
+          shell.doc_dialog_height = comp_ui::clamp_doc_size(value);
+          if (shell.doc_dialog_lock_aspect != 0) {
+            shell.doc_dialog_width = comp_ui::doc_locked_width(
+                shell.doc_dialog_base_width, shell.doc_dialog_base_height,
+                shell.doc_dialog_height);
+          }
+          break;
+        case 2:
+          shell.doc_dialog_lock_aspect = value != 0 ? 1 : 0;
+          /* 刚打开约束就立刻对齐到原始比例，不等到用户再动一次尺寸。 */
+          if (shell.doc_dialog_lock_aspect != 0) {
+            shell.doc_dialog_height = comp_ui::doc_locked_height(
+                shell.doc_dialog_base_width, shell.doc_dialog_base_height,
+                shell.doc_dialog_width);
+          }
+          break;
+        case 3: {
+          int percent = value;
+          if (percent < 1) percent = 1;
+          if (percent > 10000) percent = 10000;
+          shell.doc_dialog_width = comp_ui::doc_size_from_percent(
+              shell.doc_dialog_base_width, percent);
+          shell.doc_dialog_height = comp_ui::doc_size_from_percent(
+              shell.doc_dialog_base_height, percent);
+          if (shell.doc_dialog_lock_aspect != 0) {
+            shell.doc_dialog_height = comp_ui::doc_locked_height(
+                shell.doc_dialog_base_width, shell.doc_dialog_base_height,
+                shell.doc_dialog_width);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      break;
+    case comp_ui::DocDialogKind::CanvasSize:
+      switch (row) {
+        case 0: shell.doc_dialog_width = comp_ui::clamp_doc_size(value); break;
+        case 1: shell.doc_dialog_height = comp_ui::clamp_doc_size(value); break;
+        case 2:
+          if (value < 0) value = 0;
+          if (value > 8) value = 8;
+          shell.doc_dialog_anchor = value;
+          break;
+        default: break;
+      }
+      break;
+    case comp_ui::DocDialogKind::HistoryLimit:
+      switch (row) {
+        case 0: shell.doc_dialog_steps = comp_ui::clamp_history_steps(value); break;
+        case 1: shell.doc_dialog_budget_mb = comp_ui::clamp_history_budget_mb(value); break;
+        default: break;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+/* 行值的显示文本：绘制与状态栏共用，避免「面板 72 dpi、状态栏 72 px」两套说法。 */
+std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
+  const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc_dialog, row);
+  const int value = doc_dialog_row_value(shell, row);
+  wchar_t buffer[64];
+  switch (spec.kind) {
+    case comp_ui::DocRowKind::Toggle:
+      return value != 0 ? L"开" : L"关";
+    case comp_ui::DocRowKind::Choice:
+      if (shell.doc_dialog == comp_ui::DocDialogKind::NewDocument) {
+        return widen_utf8(comp_ui::doc_new_background_name(value));
+      }
+      return widen_utf8(comp_ui::doc_anchor_name(value));
+    case comp_ui::DocRowKind::Number:
+      break;
+  }
+  switch (shell.doc_dialog) {
+    case comp_ui::DocDialogKind::NewDocument:
+      if (row == 2) {
+        wsprintfW(buffer, L"%d dpi", value);
+        return buffer;
+      }
+      wsprintfW(buffer, L"%d px", value);
+      return buffer;
+    case comp_ui::DocDialogKind::ImageSize:
+      if (row == 3) {
+        wsprintfW(buffer, L"%d %%", value);
+        return buffer;
+      }
+      wsprintfW(buffer, L"%d px", value);
+      return buffer;
+    case comp_ui::DocDialogKind::CanvasSize:
+      wsprintfW(buffer, L"%d px", value);
+      return buffer;
+    case comp_ui::DocDialogKind::HistoryLimit:
+      if (row == 0) {
+        wsprintfW(buffer, L"%d 步", value);
+      } else {
+        wsprintfW(buffer, L"%d MiB", value);
+      }
+      return buffer;
+    default:
+      return L"";
+  }
+}
+
+void doc_dialog_close(ShellState& shell, const wchar_t* status) {
+  shell.doc_dialog = comp_ui::DocDialogKind::None;
+  shell.doc_dialog_input.clear();
+  if (status != nullptr) set_status(shell, status);
+}
+
+void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
+  if (kind == comp_ui::DocDialogKind::None) return;
+  if (kind != comp_ui::DocDialogKind::NewDocument && shell.document == nullptr) {
+    set_status(shell, L"文档：还没有打开任何文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围互斥）。 */
+  if (shell.color_range_open) color_range_cancel(shell);
+  shell.filter_open = false;
+  shell.filter_input.clear();
+  filter_preview_forget(shell);
+  shell.effect_open = false;
+  shell.effect_input.clear();
+  shell.path_open = false;
+  shell.history_open = false;
+  shell.trim_open = false;
+  shell.trim_input.clear();
+
+  shell.doc_dialog = kind;
+  shell.doc_dialog_focus = 0;
+  shell.doc_dialog_input.clear();
+  shell.doc_dialog_lock_aspect = 1;
+  shell.doc_dialog_anchor = 4;
+  switch (kind) {
+    case comp_ui::DocDialogKind::NewDocument:
+      /* 记住上次的新建设置（与上游 Remember Last Used Settings 同效）。 */
+      shell.doc_dialog_width = shell.new_doc_width;
+      shell.doc_dialog_height = shell.new_doc_height;
+      shell.doc_dialog_dpi = shell.new_doc_dpi;
+      shell.doc_dialog_background = shell.new_doc_background;
+      shell.doc_dialog_base_width = shell.new_doc_width;
+      shell.doc_dialog_base_height = shell.new_doc_height;
+      break;
+    case comp_ui::DocDialogKind::ImageSize:
+      shell.doc_dialog_base_width = shell.width;
+      shell.doc_dialog_base_height = shell.height;
+      shell.doc_dialog_width = shell.width;
+      shell.doc_dialog_height = shell.height;
+      break;
+    case comp_ui::DocDialogKind::CanvasSize:
+      shell.doc_dialog_base_width = shell.width;
+      shell.doc_dialog_base_height = shell.height;
+      shell.doc_dialog_width = shell.width;
+      shell.doc_dialog_height = shell.height;
+      break;
+    case comp_ui::DocDialogKind::HistoryLimit:
+      /* ABI 没有 limit/budget 的 getter：0 = 引擎默认，回显如实写 0。 */
+      shell.doc_dialog_steps = 0;
+      shell.doc_dialog_budget_mb = 0;
+      break;
+    default:
+      break;
+  }
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s：Tab 切行 · 回车应用 · Esc 取消",
+            widen_utf8(comp_ui::doc_dialog_title(kind)).c_str());
+  set_status(shell, buffer);
+}
+
+void doc_dialog_focus_row(ShellState& shell, int delta) {
+  if (shell.doc_dialog == comp_ui::DocDialogKind::None) return;
+  shell.doc_dialog_input.clear();
+  const int count = comp_ui::doc_dialog_row_count(shell.doc_dialog);
+  if (count <= 0) return;
+  shell.doc_dialog_focus =
+      ((shell.doc_dialog_focus + delta) % count + count) % count;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s %d/%d：%s", widen_utf8(comp_ui::doc_dialog_title(shell.doc_dialog)).c_str(),
+            shell.doc_dialog_focus + 1, count,
+            widen_utf8(comp_ui::doc_dialog_row(shell.doc_dialog, shell.doc_dialog_focus).label)
+                .c_str());
+  set_status(shell, buffer);
+}
+
+void doc_dialog_step(ShellState& shell, int direction) {
+  if (shell.doc_dialog == comp_ui::DocDialogKind::None) return;
+  const int row = shell.doc_dialog_focus;
+  const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc_dialog, row);
+  const int current = doc_dialog_row_value(shell, row);
+  int next = current;
+  if (spec.kind == comp_ui::DocRowKind::Number) {
+    const long long raw = static_cast<long long>(current) +
+                          static_cast<long long>(spec.step) * direction;
+    next = raw < spec.min ? spec.min : (raw > spec.max ? spec.max : static_cast<int>(raw));
+  } else if (spec.kind == comp_ui::DocRowKind::Toggle) {
+    next = current != 0 ? 0 : 1;
+  } else {
+    const int choices = spec.choice_count > 0 ? spec.choice_count : 1;
+    next = ((current + direction) % choices + choices) % choices;
+  }
+  doc_dialog_set_row_value(shell, row, next);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s = %s", widen_utf8(spec.label).c_str(),
+            doc_dialog_value_text(shell, row).c_str());
+  set_status(shell, buffer);
+}
+
+void doc_dialog_begin_input(ShellState& shell, wchar_t character) {
+  if (shell.doc_dialog == comp_ui::DocDialogKind::None) return;
+  const comp_ui::DocRowSpec spec =
+      comp_ui::doc_dialog_row(shell.doc_dialog, shell.doc_dialog_focus);
+  if (spec.kind != comp_ui::DocRowKind::Number) return;
+  /* 30000 / 16384 / 10000 都是五位；六位只可能是误按，留着没意义。 */
+  if (shell.doc_dialog_input.size() >= 5) return;
+  shell.doc_dialog_input.push_back(character);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"输入中：%s", shell.doc_dialog_input.c_str());
+  set_status(shell, buffer);
+}
+
+void doc_dialog_commit_input(ShellState& shell) {
+  if (shell.doc_dialog_input.empty()) return;
+  const int row = shell.doc_dialog_focus;
+  const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc_dialog, row);
+  int value = 0;
+  for (const wchar_t character : shell.doc_dialog_input) {
+    if (character >= L'0' && character <= L'9') value = value * 10 + (character - L'0');
+  }
+  shell.doc_dialog_input.clear();
+  if (spec.kind != comp_ui::DocRowKind::Number) return;
+  /* 键入值按行的合法区间夹取（0 在历史两项里是合法值「引擎默认」）。 */
+  if (value < spec.min) value = spec.min;
+  if (value > spec.max) value = spec.max;
+  doc_dialog_set_row_value(shell, row, value);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"%s = %s", widen_utf8(spec.label).c_str(),
+            doc_dialog_value_text(shell, row).c_str());
+  set_status(shell, buffer);
+}
+
+/*
+ * 尺寸变化后的缓冲同步：rgba/framebuffer 是**按旧尺寸**分配的，render_canvas 直接
+ * 按 shell.width/height 写进去。这里只在长度变化时重分配（等于旧尺寸的旋转/修边
+ * 不受影响），不引入额外的每帧开销。
+ */
+void sync_document_buffers(ShellState& shell) {
+  comp_size size{};
+  if (shell.document != nullptr && comp_document_size(shell.document, &size) == COMP_OK) {
+    shell.width = size.width;
+    shell.height = size.height;
+  }
+  const size_t pixel_count =
+      static_cast<size_t>(shell.width) * static_cast<size_t>(shell.height);
+  if (shell.rgba.size() != pixel_count * 4) shell.rgba.assign(pixel_count * 4, 0);
+  if (shell.framebuffer.size() != pixel_count) shell.framebuffer.assign(pixel_count, 0);
+}
+
+void doc_dialog_apply(HWND window, ShellState& shell) {
+  (void)window;
+  const comp_ui::DocDialogKind kind = shell.doc_dialog;
+  if (kind == comp_ui::DocDialogKind::None) return;
+  /* 键入态下直接回车 = 先落值再应用，少按一次键（与滤镜面板同一约定）。 */
+  if (!shell.doc_dialog_input.empty()) doc_dialog_commit_input(shell);
+
+  if (kind == comp_ui::DocDialogKind::NewDocument) {
+    const int width = shell.doc_dialog_width;
+    const int height = shell.doc_dialog_height;
+    const int dpi = shell.doc_dialog_dpi;
+    const int background = shell.doc_dialog_background;
+    /* 先记设置再建：建失败也保留用户刚填的参数。 */
+    shell.new_doc_width = width;
+    shell.new_doc_height = height;
+    shell.new_doc_dpi = dpi;
+    shell.new_doc_background = background;
+    if (!create_document_with(shell, width, height, dpi, background)) {
+      doc_dialog_close(shell, L"新建文档失败（未改动当前文档）");
+      return;
+    }
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"已新建 %d×%d @%d dpi（背景：%s）", width, height, dpi,
+              widen_utf8(comp_ui::doc_new_background_name(background)).c_str());
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  if (shell.document == nullptr) {
+    doc_dialog_close(shell, L"文档：还没有打开任何文档");
+    return;
+  }
+
+  if (kind == comp_ui::DocDialogKind::ImageSize) {
+    const int width = shell.doc_dialog_width;
+    const int height = shell.doc_dialog_height;
+    if (width == shell.width && height == shell.height) {
+      set_status(shell, L"图像大小：尺寸未变（未产生撤销步）");
+      return;
+    }
+    comp_size size{};
+    size.width = width;
+    size.height = height;
+    const comp_result result = comp_document_resize_image(shell.document, size);
+    if (result != COMP_OK) {
+      set_status(shell, L"图像大小：重采样失败（文档未改动）");
+      return;
+    }
+    sync_document_buffers(shell);
+    finish_canvas_command(shell);
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"已重采样为 %d×%d（选区已丢弃）", width, height);
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  if (kind == comp_ui::DocDialogKind::CanvasSize) {
+    const int width = shell.doc_dialog_width;
+    const int height = shell.doc_dialog_height;
+    const int delta_width = width - shell.width;
+    const int delta_height = height - shell.height;
+    if (delta_width == 0 && delta_height == 0) {
+      set_status(shell, L"画布大小：尺寸未变（未产生撤销步）");
+      return;
+    }
+    comp_txn txn = nullptr;
+    if (comp_txn_begin(shell.document, "Canvas Size", &txn) != COMP_OK || txn == nullptr) {
+      set_status(shell, L"画布大小：无法开启事务（未改动）");
+      return;
+    }
+    const int dx = comp_ui::doc_anchor_dx(shell.doc_dialog_anchor, delta_width);
+    const int dy = comp_ui::doc_anchor_dy(shell.doc_dialog_anchor, delta_height);
+    bool ok = true;
+    if (dx != 0 || dy != 0) {
+      /*
+       * transform 是每层**文档坐标**下的绝对落位（引擎的转画布也是逐层改
+       * transform，不区分根/子层），所以按锚点平移必须遍历**引擎里的全部图层**。
+       * 这里刻意不用 shell.layers：那是面板的可见行（折叠组里的子层不在其中，
+       * 按它挪会只挪组不挪子层，整组就散了）。comp_layer_list 给的是堆叠序全量。
+       */
+      size_t count = 0;
+      ok = comp_layer_list(shell.document, nullptr, 0, &count) == COMP_OK;
+      std::vector<comp_layer_id> ids(count);
+      if (ok && count > 0) {
+        ok = comp_layer_list(shell.document, ids.data(), count, &count) == COMP_OK;
+        ids.resize(count);
+      }
+      for (size_t index = 0; ok && index < ids.size(); ++index) {
+        comp_rect transform{};
+        float rotation = 0.0f;
+        if (comp_layer_get_transform(shell.document, ids[index], &transform, &rotation) !=
+            COMP_OK) {
+          ok = false;
+          break;
+        }
+        transform.x += dx;
+        transform.y += dy;
+        if (comp_layer_set_transform(shell.document, ids[index], transform, rotation) !=
+            COMP_OK) {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (ok) {
+      comp_size size{};
+      size.width = width;
+      size.height = height;
+      ok = comp_document_set_size(shell.document, size) == COMP_OK;
+    }
+    if (!ok) {
+      comp_txn_abort(txn);
+      set_status(shell, L"画布大小：应用失败（已回滚，文档未改动）");
+      return;
+    }
+    if (comp_txn_commit(txn) != COMP_OK) {
+      set_status(shell, L"画布大小：提交失败（文档未改动）");
+      return;
+    }
+    sync_document_buffers(shell);
+    finish_canvas_command(shell);
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[224];
+    wsprintfW(buffer, L"已改画布为 %d×%d（锚点 %s）", width, height,
+              widen_utf8(comp_ui::doc_anchor_name(shell.doc_dialog_anchor)).c_str());
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  if (kind == comp_ui::DocDialogKind::HistoryLimit) {
+    const int steps = shell.doc_dialog_steps;
+    const size_t budget_bytes =
+        static_cast<size_t>(shell.doc_dialog_budget_mb) * 1024ull * 1024ull;
+    const comp_result limit_result =
+        comp_document_set_history_limit(shell.document, static_cast<size_t>(steps));
+    const comp_result budget_result =
+        comp_document_set_history_budget(shell.document, budget_bytes);
+    if (limit_result != COMP_OK || budget_result != COMP_OK) {
+      set_status(shell, L"历史容量：设置失败（引擎拒绝，可能已部分生效）");
+      return;
+    }
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"历史容量：%d 步 / %d MiB", steps, shell.doc_dialog_budget_mb);
+    refresh_history_status(shell, buffer);
+    return;
+  }
 }
 
 /* 定义在下方（要用到 load_document / refresh_* 族），这里先声明：对话框入口需要它。 */
@@ -8536,7 +9126,26 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       open_document_dialog(window, shell);
       break;
     case kCmdSave:
+      /* Ctrl+S / 文件>保存：有路径就静默覆盖，没有才弹对话框（见 save_document_quick）。 */
+      save_document_quick(window, shell);
+      break;
+    /* ---- 文件 > 新建文档… / 另存为… ---- */
+    case kCmdNewDocumentDialog:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::NewDocument);
+      break;
+    case kCmdSaveAs:
       save_document_dialog(window, shell);
+      break;
+    /* ---- 图像 > 图像大小… / 画布大小…（对应上游 Image Size / Canvas Size） ---- */
+    case kCmdImageSize:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::ImageSize);
+      break;
+    case kCmdCanvasSize:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::CanvasSize);
+      break;
+    /* ---- 编辑 > 历史记录容量… ---- */
+    case kCmdHistorySettings:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::HistoryLimit);
       break;
     case kCmdOpenImage:
       open_image_dialog(window, shell);
@@ -9799,6 +10408,70 @@ void draw_trim_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
   int hint_y = bottom - 104;
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
+ * 文档级对话框面板（新建 / 图像大小 / 画布大小 / 历史容量）。行几何与命中同源
+ * （ui_core::doc_dialog_row_rect / doc_dialog_row_at），值文本与状态栏同源
+ * （doc_dialog_value_text），所以「面板显示什么」只有一处真相。
+ */
+void draw_doc_dialog(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const std::wstring title = widen_utf8(comp_ui::doc_dialog_title(shell.doc_dialog));
+  TextOutW(dc, left + 10, y, title.c_str(), static_cast<int>(title.size()));
+  y += 22;
+  SetTextColor(dc, RGB(150, 210, 255));
+  const std::wstring subtitle = widen_utf8(comp_ui::doc_dialog_subtitle(shell.doc_dialog));
+  TextOutW(dc, left + 10, y, subtitle.c_str(), static_cast<int>(subtitle.size()));
+
+  const int row_count = comp_ui::doc_dialog_row_count(shell.doc_dialog);
+  for (int row = 0; row < row_count; ++row) {
+    const comp_ui::Rect row_rect = comp_ui::doc_dialog_row_rect(panel_rect, row);
+    const bool focused = row == shell.doc_dialog_focus;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6,
+                     row_rect.bottom() + 2};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    const std::wstring label =
+        widen_utf8(comp_ui::doc_dialog_row(shell.doc_dialog, row).label);
+    /* 键入态只在聚焦行显示草稿，别的行仍显示已生效的值（-/= 改的是已生效值）。 */
+    if (focused && !shell.doc_dialog_input.empty()) {
+      wsprintfW(line, L"%s = %s_", label.c_str(), shell.doc_dialog_input.c_str());
+    } else {
+      wsprintfW(line, L"%s = %s", label.c_str(),
+                doc_dialog_value_text(shell, row).c_str());
+    }
+    TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const std::wstring hint = widen_utf8(comp_ui::doc_dialog_hint(shell.doc_dialog));
+  int hint_y = bottom - 86;
+  TextOutW(dc, left + 10, hint_y, hint.c_str(), static_cast<int>(hint.size()));
+  hint_y += 18;
+  const wchar_t* keys[] = {
+      L"Tab / Shift+Tab 切行 · 方向键切行",
+      L"- / = 步进 · 数字键直接输入",
+      L"回车应用 · Esc 取消",
+  };
+  for (const wchar_t* key : keys) {
+    TextOutW(dc, left + 10, hint_y, key, lstrlenW(key));
     hint_y += 18;
   }
 }
@@ -11111,6 +11784,32 @@ void draw_panel_toggles(HDC dc, const ShellState& shell, const Layout& layout) {
   }
 }
 
+/*
+ * 标题栏：后端 + 文件名 + 脏标记（*）。present 每帧调用，但文本没变就不发
+ * SetWindowTextW——缓存字符串的目的只是省消息，不是第二份真相：
+ * 文件名来自 shell.document_path，脏标记每帧向引擎 comp_document_is_dirty 现问。
+ */
+void update_window_title(HWND window, ShellState& shell) {
+  std::wstring title = L"Compositor (Windows shell) - ";
+  title += backend_label(shell.backend);
+  if (!shell.document_path.empty()) {
+    const std::string& path = shell.document_path;
+    const size_t slash = path.find_last_of("/\\");
+    title += L" - ";
+    title += widen_utf8(slash == std::string::npos ? path : path.substr(slash + 1));
+  } else if (shell.document != nullptr) {
+    title += L" - 未命名";
+  }
+  int32_t dirty = 0;
+  if (shell.document != nullptr &&
+      comp_document_is_dirty(shell.document, &dirty) == COMP_OK && dirty != 0) {
+    title += L" *";
+  }
+  if (title == shell.window_title_cache) return;
+  shell.window_title_cache = title;
+  SetWindowTextW(window, title.c_str());
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -11122,6 +11821,7 @@ void present(HWND window, ShellState& shell) {
      */
     shell.filter_preview_pending = false;
   }
+  update_window_title(window, shell);
 
   RECT client{};
   GetClientRect(window, &client);
@@ -11211,7 +11911,9 @@ void present(HWND window, ShellState& shell) {
     draw_layer_panel(memory_dc, shell, layout.layer_panel);
   }
   if (layout.adjust_panel.w > 0 && !layout.adjust_collapsed) {
-    if (path_panel_visible(shell)) {
+    if (shell.doc_dialog != comp_ui::DocDialogKind::None) {
+      draw_doc_dialog(memory_dc, shell, layout.adjust_panel);
+    } else if (path_panel_visible(shell)) {
       draw_path_panel(memory_dc, shell, layout.adjust_panel);
     } else if (history_panel_visible(shell)) {
       draw_history_panel(memory_dc, shell, layout.adjust_panel);
@@ -12360,6 +13062,85 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
 
+  /*
+   * 文档级对话框（新建 / 图像大小 / 画布大小 / 历史容量）：模态吃键，Ctrl 组合
+   * 仍可穿透（与滤镜/效果/修边面板同一条模态规矩）。键入态也在这里处理——
+   * doc_dialog_input 只属于这个对话框，不必另开分支。
+   */
+  if (shell.doc_dialog != comp_ui::DocDialogKind::None && !ctrl) {
+    if (!shell.doc_dialog_input.empty()) {
+      switch (key) {
+        case VK_ESCAPE:
+          shell.doc_dialog_input.clear();
+          set_status(shell, L"已取消输入");
+          return;
+        case VK_BACK:
+          shell.doc_dialog_input.pop_back();
+          if (shell.doc_dialog_input.empty()) {
+            set_status(shell, L"已取消输入");
+          } else {
+            wchar_t buffer[96];
+            wsprintfW(buffer, L"输入中：%s", shell.doc_dialog_input.c_str());
+            set_status(shell, buffer);
+          }
+          return;
+        case VK_RETURN:
+          /* 键入态下回车 = 落值 + 应用，少按一次键（apply 内部先提交草稿）。 */
+          doc_dialog_apply(window, shell);
+          return;
+        case VK_TAB:
+          /* 先落值再切行，免得切走即丢草稿。 */
+          doc_dialog_commit_input(shell);
+          doc_dialog_focus_row(shell, shift ? -1 : 1);
+          return;
+        default:
+          break;
+      }
+      if (key >= '0' && key <= '9') {
+        doc_dialog_begin_input(shell, static_cast<wchar_t>(key));
+        return;
+      }
+      return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+    }
+    switch (key) {
+      case VK_ESCAPE:
+        doc_dialog_close(shell, L"已取消");
+        return;
+      case VK_TAB:
+        doc_dialog_focus_row(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        doc_dialog_apply(window, shell);
+        return;
+      case VK_UP:
+        doc_dialog_focus_row(shell, -1);
+        return;
+      case VK_DOWN:
+        doc_dialog_focus_row(shell, 1);
+        return;
+      case VK_LEFT:
+      case VK_OEM_MINUS:
+        doc_dialog_step(shell, -1);
+        return;
+      case VK_RIGHT:
+      case VK_OEM_PLUS:
+        doc_dialog_step(shell, 1);
+        return;
+      case VK_SPACE:
+        /* 空格 = 步进 +1：开/关、背景、锚点都用同一颗键翻。 */
+        doc_dialog_step(shell, 1);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      doc_dialog_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键吞掉：面板打开时不让工具字母键把底层工具换掉。 */
+    return;
+  }
+
   /* 修边面板的容差键入态：只吃数字/退格/回车/Esc。 */
   if (!shell.trim_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -13379,9 +14160,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           InvalidateRect(window, nullptr, FALSE);
           return 0;
         }
-        /* 文字键入态下空格是字符，不是临时抓手。 */
+        /*
+         * 文字键入态下空格是字符，不是临时抓手；文档级对话框打开时空格归面板
+         * （开关 / 背景 / 锚点都用空格翻），不然这里的临时抓手会先吞掉它。
+         */
         const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (wparam == VK_SPACE && !(shell->type_active && !ctrl)) {
+        const bool dialog_owns_space = shell->doc_dialog != comp_ui::DocDialogKind::None;
+        if (wparam == VK_SPACE && !dialog_owns_space && !(shell->type_active && !ctrl)) {
           /* 空格 = 临时抓手：按下不重复触发，松开才结束。 */
           if (!shell->space_down) {
             shell->space_down = true;
@@ -13615,6 +14400,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
+          if (shell->doc_dialog != comp_ui::DocDialogKind::None && layout.adjust_panel.w > 0) {
+            /* 点行 = 聚焦到该行；行几何与绘制共用 doc_dialog_row_rect。 */
+            const int row = comp_ui::doc_dialog_row_at(
+                layout.adjust_panel, comp_ui::doc_dialog_row_count(shell->doc_dialog),
+                mouse_x, mouse_y);
+            if (row >= 0) {
+              shell->doc_dialog_input.clear();
+              doc_dialog_focus_row(*shell, row - shell->doc_dialog_focus);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
           if (shell->effect_open && layout.adjust_panel.w > 0) {
             /* 点参数行 = 聚焦到该行；行几何与绘制共用 effect_param_row_rect。 */
             const int row = comp_ui::effect_param_row_at(
@@ -13665,6 +14462,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           if (!shell->effect_open && !shell->filter_open && !shell->trim_open &&
               !type_panel_visible(*shell) &&
+              shell->doc_dialog == comp_ui::DocDialogKind::None &&
               !shell->color_range_open && !path_panel_visible(*shell) &&
               !history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
@@ -14517,6 +15315,28 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       /*
+       * Ctrl+Alt+N / S / I / C：新建文档… / 另存为… / 图像大小… / 画布大小…
+       * 放在 Alt 组合里是因为 Ctrl+N、Ctrl+S、Ctrl+I 各自已被占用（即时新建 /
+       * 保存 / 反相），不带 Alt 就会改掉既有手感；Ctrl+Shift+S 也已被导出占用。
+       */
+      if (shell != nullptr) {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl) {
+          UINT command = 0;
+          switch (wparam) {
+            case 'N': command = kCmdNewDocumentDialog; break;
+            case 'S': command = kCmdSaveAs; break;
+            case 'I': command = kCmdImageSize; break;
+            case 'C': command = kCmdCanvasSize; break;
+            default: break;
+          }
+          if (command != 0) {
+            run_shell_command(window, *shell, command);
+            return 0;
+          }
+        }
+      }
+      /*
        * Alt+[ / Alt+]：模糊模式调半径，涂抹/液化与减淡/加深/海绵调强度。
        * 普通 [ ] 已用于笔刷，Ctrl+[ ] 用于图层不透明度，因此放到 Alt 组合，
        * 且必须在这里吞掉，否则 DefWindowProc 会响铃。
@@ -14717,8 +15537,10 @@ HMENU build_menu() {
 
   HMENU file_menu = CreatePopupMenu();
   AppendMenuW(file_menu, MF_STRING, kCmdNew, L"新建(&N)\tCtrl+N");
+  AppendMenuW(file_menu, MF_STRING, kCmdNewDocumentDialog, L"新建文档…(&W)\tCtrl+Alt+N");
   AppendMenuW(file_menu, MF_STRING, kCmdOpen, L"打开(&O)...\tCtrl+O");
-  AppendMenuW(file_menu, MF_STRING, kCmdSave, L"保存(&S)...\tCtrl+S");
+  AppendMenuW(file_menu, MF_STRING, kCmdSave, L"保存(&S)\tCtrl+S");
+  AppendMenuW(file_menu, MF_STRING, kCmdSaveAs, L"另存为…(&A)\tCtrl+Alt+S");
   AppendMenuW(file_menu, MF_STRING, kCmdOpenImage, L"打开位图(&I)...\tCtrl+Shift+O");
   AppendMenuW(file_menu, MF_STRING, kCmdImportImage, L"置入(&P)...");
   AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);
@@ -14733,6 +15555,7 @@ HMENU build_menu() {
   AppendMenuW(edit_menu, MF_SEPARATOR, 0, nullptr);
   /* 选区三条（全选/取消/反选）已搬到单独的「选择」菜单，ID 不变。 */
   AppendMenuW(edit_menu, MF_STRING, kCmdHistoryPanel, L"历史记录(&H)…\tCtrl+Alt+H");
+  AppendMenuW(edit_menu, MF_STRING, kCmdHistorySettings, L"历史记录容量…(&C)");
   AppendMenuW(edit_menu, MF_STRING, kCmdListCommands, L"枚举引擎命令(&L)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(edit_menu), L"编辑(&E)");
 
@@ -14857,6 +15680,10 @@ HMENU build_menu() {
   AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotateCCW, L"逆时针 90°(&W)");
   AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotate180, L"180°(&1)");
   HMENU image_menu = CreatePopupMenu();
+  /* 上游 Image Size / Canvas Size：壳侧面板 + 既有 ABI，不新增导出。 */
+  AppendMenuW(image_menu, MF_STRING, kCmdImageSize, L"图像大小…(&I)\tCtrl+Alt+I");
+  AppendMenuW(image_menu, MF_STRING, kCmdCanvasSize, L"画布大小…(&C)\tCtrl+Alt+C");
+  AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(image_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image_rotate_menu),
               L"图像旋转(&R)");
   AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
@@ -17613,10 +18440,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     set_status(shell, L"文字：未找到随仓字体（resources/fonts），文字工具只用 5×7 点阵（ASCII）");
   }
   {
-    /* 标题上也标出实际后端：不打开状态栏也能一眼判断走的是 GPU 还是 CPU。 */
-    wchar_t title[96];
-    wsprintfW(title, L"Compositor (Windows shell) - %s", backend_label(shell.backend));
-    SetWindowTextW(window, title);
+    /* 标题统一由 update_window_title 生成（后端 + 文件名 + 脏标记），首帧前先填一次。 */
+    update_window_title(window, shell);
   }
   /* 蚂蚁线相位定时器：无选区时处理函数直接返回，不产生重绘。 */
   SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);

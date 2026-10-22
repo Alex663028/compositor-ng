@@ -3795,3 +3795,158 @@ COMP_TEST(ui_core_selection_drag_rect) {
                    source, 3, Point{std::numeric_limits<double>::quiet_NaN(), 0}, false),
                10, 20, 100, 50));
 }
+
+/*
+ * P0 文档级对话框的行模型。这里钉的是「面板显示的数字 = 写进文档的数字」：
+ * 行数与行序必须与壳里的取值 switch 一一对应，夹取口径必须与 ABI 注释同界，
+ * 命中测试必须与绘制几何同源。
+ */
+COMP_TEST(ui_core_doc_dialog_rows) {
+  using comp_ui::DocDialogKind;
+  using comp_ui::DocRowKind;
+
+  /* 1. 四种对话框的行数与行序（顺序是壳取值 switch 的约定，不能随便调）。 */
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::None) == 0);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::NewDocument) == 4);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::ImageSize) == 4);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::CanvasSize) == 3);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::HistoryLimit) == 2);
+
+  const comp_ui::DocRowSpec new_w = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 0);
+  const comp_ui::DocRowSpec new_h = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 1);
+  const comp_ui::DocRowSpec new_dpi = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 2);
+  const comp_ui::DocRowSpec new_bg = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 3);
+  COMP_CHECK(new_w.kind == DocRowKind::Number && new_h.kind == DocRowKind::Number);
+  /* 宽高同步长：用同一个 64 步，避免「按两下宽度跳 64、高度跳 1」的手感不一致。 */
+  COMP_CHECK(new_w.step == new_h.step && new_w.min == new_h.min && new_w.max == new_h.max);
+  COMP_CHECK(new_dpi.kind == DocRowKind::Number && new_dpi.min == comp_ui::kDocDpiMin);
+  COMP_CHECK(new_bg.kind == DocRowKind::Choice && new_bg.choice_count == 3);
+
+  const comp_ui::DocRowSpec image_lock = comp_ui::doc_dialog_row(DocDialogKind::ImageSize, 2);
+  const comp_ui::DocRowSpec image_percent = comp_ui::doc_dialog_row(DocDialogKind::ImageSize, 3);
+  COMP_CHECK(image_lock.kind == DocRowKind::Toggle);
+  COMP_CHECK(image_percent.kind == DocRowKind::Number && image_percent.max == 10000);
+
+  const comp_ui::DocRowSpec canvas_anchor = comp_ui::doc_dialog_row(DocDialogKind::CanvasSize, 2);
+  COMP_CHECK(canvas_anchor.kind == DocRowKind::Choice && canvas_anchor.choice_count == 9);
+
+  /* 2. 越界行返回空标签的安全默认值（绘制侧会照常打出空行，但不会越界读）。 */
+  const comp_ui::DocRowSpec missing = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 99);
+  COMP_CHECK(missing.label != nullptr && missing.label[0] == '\0');
+
+  /* 3. 夹取：与 comp_document_desc 的 1..30000 同界，0 步历史 = 引擎默认。 */
+  COMP_CHECK(comp_ui::clamp_doc_size(-5) == comp_ui::kDocSizeMin);
+  COMP_CHECK(comp_ui::clamp_doc_size(0) == comp_ui::kDocSizeMin);
+  COMP_CHECK(comp_ui::clamp_doc_size(30001) == comp_ui::kDocSizeMax);
+  COMP_CHECK(comp_ui::clamp_doc_size(1920) == 1920);
+  COMP_CHECK(comp_ui::clamp_doc_dpi(0) == comp_ui::kDocDpiMin);
+  COMP_CHECK(comp_ui::clamp_doc_dpi(99999) == comp_ui::kDocDpiMax);
+  /* 历史两项的 0 是「合法值 = 交回引擎默认」，不能被夹到 1。 */
+  COMP_CHECK(comp_ui::clamp_history_steps(0) == 0);
+  COMP_CHECK(comp_ui::clamp_history_steps(-1) == 0);
+  COMP_CHECK(comp_ui::clamp_history_steps(99999) == comp_ui::kDocHistoryStepsMax);
+  COMP_CHECK(comp_ui::clamp_history_budget_mb(0) == 0);
+  COMP_CHECK(comp_ui::clamp_history_budget_mb(-8) == 0);
+  COMP_CHECK(comp_ui::clamp_history_budget_mb(999999) == comp_ui::kDocHistoryBudgetMaxMb);
+
+  /* 4. 行几何与命中：第 0 行紧贴标题下沿，行高整格，行间无缝隙、无重叠。 */
+  const Rect panel{900, 60, 320, 640};
+  const Rect row0 = comp_ui::doc_dialog_row_rect(panel, 0);
+  const Rect row1 = comp_ui::doc_dialog_row_rect(panel, 1);
+  COMP_CHECK(row0.y == panel.y + comp_ui::kDocDialogRowsTop);
+  COMP_CHECK(row1.y == row0.bottom());
+  COMP_CHECK(row0.h == comp_ui::kDocDialogRowHeight);
+
+  const double first_y = panel.y + comp_ui::kDocDialogRowsTop + 4.0;
+  COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 4, panel.x + 10.0, first_y) == 0);
+  COMP_CHECK(comp_ui::doc_dialog_row_at(
+                 panel, 4, panel.x + 10.0,
+                 first_y + comp_ui::kDocDialogRowHeight * 3) == 3);
+  /* 超出末行 = 未命中（不是夹到末行：点空白不该改最后一行的值）。 */
+  COMP_CHECK(comp_ui::doc_dialog_row_at(
+                 panel, 4, panel.x + 10.0,
+                 first_y + comp_ui::kDocDialogRowHeight * 4) == -1);
+  /* 标题区与面板外一律未命中。 */
+  COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 4, panel.x + 10.0, panel.y + 10.0) == -1);
+  COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 4, panel.x - 5.0, first_y) == -1);
+  COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 0, panel.x + 10.0, first_y) == -1);
+}
+
+COMP_TEST(ui_core_doc_dialog_anchor) {
+  /* 1. 四角钉住不动、四边只动一个轴、居中两轴各动一半——这是画布大小的全部语义。 */
+  const int dw = 100;
+  const int dh = 60;
+  COMP_CHECK(comp_ui::doc_anchor_dx(0, dw) == 0);   /* 左上 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(0, dh) == 0);
+  COMP_CHECK(comp_ui::doc_anchor_dx(8, dw) == dw);  /* 右下 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(8, dh) == dh);
+  COMP_CHECK(comp_ui::doc_anchor_dx(2, dw) == dw);  /* 右上 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(2, dh) == 0);
+  COMP_CHECK(comp_ui::doc_anchor_dx(6, dw) == 0);   /* 左下 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(6, dh) == dh);
+  COMP_CHECK(comp_ui::doc_anchor_dx(4, dw) == dw / 2); /* 居中 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(4, dh) == dh / 2);
+  COMP_CHECK(comp_ui::doc_anchor_dx(1, dw) == dw / 2); /* 上中 */
+  COMP_CHECK(comp_ui::doc_anchor_dy(1, dh) == 0);
+
+  /* 2. 负增量（缩画布）同样按锚点分：居中向右上挪，右下整幅挪。 */
+  COMP_CHECK(comp_ui::doc_anchor_dx(0, -40) == 0);
+  COMP_CHECK(comp_ui::doc_anchor_dx(8, -40) == -40);
+  COMP_CHECK(comp_ui::doc_anchor_dx(4, -40) == -20);
+
+  /* 3. 半量取整朝零：-5/2 = -2（不是 -3），避免内容在奇偶差上抖动。 */
+  COMP_CHECK(comp_ui::doc_anchor_offset(-5, 1) == -2);
+  COMP_CHECK(comp_ui::doc_anchor_offset(5, 1) == 2);
+  COMP_CHECK(comp_ui::doc_anchor_offset(1, 1) == 0);
+
+  /* 4. 非法锚点回落到居中，而不是回落到「左上」——静默贴边比不动更意外。 */
+  COMP_CHECK(comp_ui::doc_anchor_dx(-1, dw) == dw / 2);
+  COMP_CHECK(comp_ui::doc_anchor_dy(99, dh) == dh / 2);
+
+  /* 5. 九个名字互不相同，且顺序与 3×3 行优先一致。 */
+  COMP_CHECK(std::string(comp_ui::doc_anchor_name(0)) == "左上");
+  COMP_CHECK(std::string(comp_ui::doc_anchor_name(4)) == "居中");
+  COMP_CHECK(std::string(comp_ui::doc_anchor_name(8)) == "右下");
+  COMP_CHECK(std::string(comp_ui::doc_anchor_name(9)) == "?");
+}
+
+COMP_TEST(ui_core_doc_dialog_percent_and_aspect) {
+  /* 1. 百分比换算 ±1 取整误差内往返（面板回显不会抖）。 */
+  const int bases[] = {1, 37, 1280, 4096, 30000};
+  for (const int base : bases) {
+    COMP_CHECK(comp_ui::doc_size_from_percent(base, 100) == base);
+    const int scaled = comp_ui::doc_size_from_percent(base, 50);
+    COMP_CHECK(scaled <= base);
+    /* 回显误差上界随基准尺寸缩小：base=1 时四舍五入本身就吃掉 50 个百分点，
+     * 这不是漂移，是 1 px 的画布没有「半像素」。 */
+    const int tolerance = 1 + 100 / base;
+    const int back = comp_ui::doc_percent_from_size(base, scaled);
+    COMP_CHECK(back >= 50 - tolerance && back <= 50 + tolerance);
+  }
+
+  /* 2. 百分比越界：0/负数当 1%，超上限按尺寸上限截断（不是溢出成负数）。 */
+  COMP_CHECK(comp_ui::doc_size_from_percent(1280, 0) ==
+             comp_ui::doc_size_from_percent(1280, 1));
+  COMP_CHECK(comp_ui::doc_size_from_percent(1280, 10000) == comp_ui::kDocSizeMax);
+  COMP_CHECK(comp_ui::doc_percent_from_size(0, 100) == 100);
+  COMP_CHECK(comp_ui::doc_percent_from_size(1280, 30000) == 2344);
+  COMP_CHECK(comp_ui::doc_percent_from_size(1280, 1) == 1);
+
+  /* 3. 约束比例从**原始**尺寸推另一个轴：连续两次改宽不会累积取整误差。 */
+  COMP_CHECK(comp_ui::doc_locked_height(1280, 720, 640) == 360);
+  COMP_CHECK(comp_ui::doc_locked_width(1280, 720, 360) == 640);
+  COMP_CHECK(comp_ui::doc_locked_height(300, 200, 150) == 100);
+  COMP_CHECK(comp_ui::doc_locked_width(300, 200, 100) == 150);
+  /* 第二次仍以原始 1280×720 为基准，结果与第一次相同。 */
+  COMP_CHECK(comp_ui::doc_locked_height(1280, 720, 640) == 360);
+
+  /* 4. 极端比例：放大到上限时另一轴同步夹取，仍保持 1..30000。 */
+  const int huge_width = comp_ui::clamp_doc_size(comp_ui::kDocSizeMax);
+  const int linked = comp_ui::doc_locked_height(1, 1, huge_width);
+  COMP_CHECK(huge_width == comp_ui::kDocSizeMax);
+  COMP_CHECK(linked == comp_ui::kDocSizeMax);
+
+  /* 5. 退化输入（原始宽高为 0）不除零，原样返回。 */
+  COMP_CHECK(comp_ui::doc_locked_height(0, 720, 640) == 720);
+  COMP_CHECK(comp_ui::doc_locked_width(1280, 0, 360) == 1280);
+}

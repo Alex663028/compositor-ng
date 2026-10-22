@@ -1,0 +1,286 @@
+# BACKLOG —— 以 Photoshop 正常使用为基准的功能缺口
+
+> 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
+> 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
+> 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
+> 硬约束：ABI 145 导出只能**纯尾部追加**；回归 6/6、壳自检 257 项 SHA、视觉探针 80/80 不得因新增功能而破（落地规则见 §6）。
+> **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
+> P0-3 另存为 + 标题脏标记、P1-8 历史容量入口。四项**全部零 ABI 新增**（仍 145），
+> 视觉探针 80 → **86 条**（只追加 `doc_dialog` 场景，既有阈值未动），其余断言见 §2 各条。
+
+标签说明（用于排期与判断"能不能只改外壳"）：
+
+| 标签 | 含义 | 典型成本 |
+|------|------|----------|
+| 【接线】 | 引擎 / ABI 已有能力，外壳没有入口或 UI 没接 | S（≤0.5 天） |
+| 【壳层】 | 用现有 ABI 在 Windows 壳内即可完成 | S–M |
+| 【ABI 追加】 | 需要新增导出、枚举值或结构体尾字段（纯追加） | M |
+| 【引擎】 | 需要新的领域模型或像素实现 | M–XL |
+| 【架构】 | 需要改外壳结构（多文档、面板系统、输入栈） | L–XL |
+
+---
+
+## 1. 现状快照
+
+| 维度 | 本仓 | Photoshop（参照） | 差距性质 |
+|------|------|-------------------|----------|
+| C ABI | **145** 个导出（本次精确统计） | — | 契约面稳定 |
+| 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
+| 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合被固定为 Normal（`comp_file.cpp:285`） |
+| 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
+| 图层样式 | **6**（描边/投影/颜色叠加/内阴影/外发光/内发光） | 10 | 缺斜面和浮雕 / 缎光 / 渐变叠加 / 图案叠加 |
+| 滤镜 | **9**（`comp_filter.h:38-48`） | 100+ | 无锐化 / 降噪 / 模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染 |
+| 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/EXR + `.comp` | 20+ | 无 PSD 导出、TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
+| 文档 | **单文档**、单个 `ShellState::document` | 多标签 | 新建会直接销毁旧文档（`main.cpp:8166`） |
+| 面板 | 10 个（图层/调整/曲线/裁剪/滤镜/效果/色彩范围/路径/历史/文字） | 15+ | 无通道 / 导航器 / 色板 / 属性 / 动作 |
+| 菜单 | 9 个顶层菜单 | 11 | 无「视图 > 标尺/参考线/网格」、无「窗口」 |
+| 色彩 | 仅 sRGB；`.comp` 拒绝其它色彩空间（`comp_file.cpp:653-656`） | RGB/CMYK/Lab/灰度/位图/索引 + ICC | 无 `Image > Mode`、无 8/16 位文档模式、无色彩管理 |
+| 位深 | 图层可以是 RGBA16/16F；**文档合成模式没有开关** | 8/16/32 位文档 | `comp_document_desc` 只有 width/height/dpi/color_space（`comp_engine.h:56-61`） |
+| 视图辅助 | 无标尺、无参考线、无网格、无对齐 | 全套 | 全仓 0 命中 |
+| 剪贴板 | 无（全仓无 `Clipboard` / `CF_DIB`，ABI 无 copy/paste） | 全套 | 跨应用复制粘贴不可用 |
+| 命令表 | `comp_command_*` 仅 **7** 条（`comp_command_abi.cpp:30-39`） | 动作/脚本可录制全部命令 | 自动化没有地基 |
+
+数字不是完成度：README §6.4 的口径 A（引擎核）≈97%、口径 B（产品功能面）≈60% 仍然成立——
+**像素保真度接近满配，缺的是把能力做成用户路径**。
+
+---
+
+## 2. P0 —— 不做这些，"正常使用 PS" 第一天就断
+
+### P0-1 新建文档没有对话框：尺寸 / 分辨率 / 背景 / 预设全固定
+- **现状**：`create_document()` 固定 `kDefaultWidth/kDefaultHeight`、`dpi=72`、`sRGB`、无背景选项（`main.cpp:8153-8160`）。
+- **PS 行为**：新建对话框给画布尺寸、分辨率、背景（白/透明/背景色）、颜色模式、位深、预设（A4/1080p/照片…）。
+- **做法**：引擎侧 `comp_document_desc` 已带 width/height/dpi/color_space → 【接线】先做尺寸/分辨率/背景；位深需在 `comp_document_desc` **尾部追加** `pixel_format`（纯追加，宿主重编译）→ 【ABI 追加】。
+- **验收**：新建 3000×2000 @300dpi 后 `comp_document_size` + resolution 回读一致；背景为透明时首层 alpha=0。
+- 规模：S（不含位深）/ M（含位深）。
+- **已落地（2026-10-22，零 ABI 新增）**：`文件 > 新建文档…`（Ctrl+Alt+N）打开右栏模态面板：
+  宽 / 高 / 分辨率 / 背景（白 / 透明 / 前景色），Tab 切行、数字键入、回车新建、Esc 取消；
+  面板记住上次设置（与 PS 的 Remember Last Used Settings 同效）。`Ctrl+N` 保持**立即新建**
+  （1280×720@72 透明），不弹面板——`visual_check.py` 的 view 场景依赖这个行为。
+  背景填充走 `comp_layer_set_pixels` 一步写入首层（0 白 / 1 透明 / 2 前景色），
+  因此**填了底色即视为已修改**（标题栏出现 ` *`），这是如实反映而非缺陷。
+  仍未做：颜色模式、位深、A4/1080p 预设（需 `comp_document_desc` 尾部追加字段，见本条原文）。
+
+
+### P0-2 图像大小 / 画布大小：ABI 齐了，UI 一条都没有
+- **现状**：`comp_document_resize_image`（整篇重采样，`comp_engine.h:94`）与 `comp_document_set_size`（裁画布，`:84`）已实现并有单测，但**外壳零调用**——全仓只有 `tests/` 出现（`grep resize_image` 在壳内 0 命中）；菜单里也没有「图像大小 / 画布大小」（`main.cpp:14859-14866` 只有旋转/修边/反相）。
+- **PS 行为**：图像大小（像素/百分比、重采样算法、分辨率、约束比例）；画布大小（锚点九宫格、相对/绝对、扩画布填背景色）。
+- **做法**：【接线】做两个对话框。注意两条已记录边界：`resize_image` 会**丢弃选区**、**不缩放效果 JSON 参数**（`comp_engine.h:88-93`）；`set_size` **不做内容偏移**，画布锚点需壳先 `comp_layer_move` 再 `set_size`，或引擎追加一个带 anchor 的入口 【ABI 追加】。
+- **验收**：`test_image_size.cpp` 已覆盖引擎语义；UI 走 `scripts/visual_check.py` 新增场景（只追加，不改既有断言）。
+- **已落地（2026-10-22，零 ABI 新增）**：`图像 > 图像大小…`（Ctrl+Alt+I：宽 / 高 / 约束比例 /
+  百分比，基准取打开时的尺寸所以连续微调不累积取整误差）与 `图像 > 画布大小…`
+  （Ctrl+Alt+C：宽 / 高 / 九宫格锚点）。
+  - **画布锚点不需要新 ABI**：壳先 `comp_txn_begin`，按锚点算 `dx/dy`，
+    用 `comp_layer_list` 枚举**全部**引擎图层（含折叠组的子层，不止面板可见行）
+    `get_transform`/`set_transform` 平移，再 `comp_document_set_size`，一次提交 = 一步撤销；
+    任何一步失败 `comp_txn_abort`，不留半成品。
+  - 尺寸变化后 `rgba`/`framebuffer` 必须按新尺寸重分配（`render_canvas` 直接用
+    `shell.width*shell.height` 索引），统一在 `sync_document_buffers` 里只在长度变化时重分配。
+  - 已知边界按原文保留：`resize_image` 丢弃选区、不缩放效果参数；`set_size` 裁掉的内容不可恢复
+    （面板副标题如实写）。
+  - 探针：`doc_dialog` 场景量的是**画布屏幕宽高比**（空透明文档是纯黑，`detect_document_rect`
+    可靠）：新建 640×480 → 4:3、图像大小 320×120 → 8:3（顺带证明空格关掉了约束比例）、
+    画布大小 520×120 → 13:3、Esc 取消不改尺寸。
+
+
+### P0-3 文档生命周期：另存为 / 关闭提示 / 最近文件 / 多文档
+- **现状**：保存只有一个路径（`kCmdSave`），没有「另存为」；`create_document` 直接 `comp_document_destroy` 旧文档，**未保存修改无提示**（`main.cpp:8166`）；退出同样无 `comp_document_is_dirty` 检查（ABI 已有该查询）；无最近文件列表。
+- **PS 行为**：另存为、关闭/退出前「保存/不保存/取消」、最近打开、多标签并行编辑、崩溃恢复。
+- **做法**：另存为 / dirty 提示 = 【壳层】S（`comp_document_is_dirty` + `comp_document_save` 新路径）；最近文件 = 【壳层】S（注册表或本地配置）；**多文档 = 【架构】**：`ShellState` 单句柄、面板与选区状态都挂在全局，需要文档上下文对象化。
+- **验收**：关闭 dirty 文档必须出现三选一；取消后文档与撤销栈不变。
+- **部分落地（2026-10-22）**：
+  - **另存为**：`文件 > 另存为…`（Ctrl+Alt+S）走 `GetSaveFileNameW`，成功后把路径记进
+    `document_path`；`文件 > 保存`（Ctrl+S）对有路径的文档直接写回，无路径时退化成另存为。
+  - **标题栏脏标记**：`update_window_title` 每次 `present()` 读 `comp_document_is_dirty`
+    （不是壳自己维护的副本），标题形如 `Compositor (Windows shell) - CPU - 未命名 *`；
+    文本先与缓存比较，不变化就不 `SetWindowTextW`（避免每帧刷标题）。
+  - **关闭/退出提示仍未做**：刻意不用 `MessageBox`——自动化 `stop()` 是「post WM_CLOSE 后等 5 秒」，
+    阻塞式弹窗会让每次目视跑成超时；要做就得是**面板内**的三选一，属于独立一批。
+  - 最近文件、多文档未做（多文档按原文仍是【架构】）。
+
+
+### P0-4 剪贴板：复制 / 剪切 / 粘贴 / 贴入 / 清除
+- **现状**：全仓无剪贴板代码，ABI 也没有 copy/paste。引擎已有 `comp_render_flatten`（取合成像素）与 `comp_layer_set_pixels`（写图层像素），所以**不必新增 ABI**。
+- **PS 行为**：复制（选区内像素）、合并拷贝、剪切、粘贴为新图层、贴入选区、清除。
+- **做法**：【壳层】M——`render_flatten` → 按选区 coverage 裁剪 → 转 `CF_DIBV5` 写剪贴板；粘贴读 DIB → `comp_layer_add` + `comp_layer_set_pixels`（一步撤销）。跨应用色彩假设 sRGB（与 P0-9 关联）。
+- **验收**：复制→粘贴往返 8 位逐字节相等（含 alpha）；贴入时落点按选区 bounds；无选区时复制整层。
+
+### P0-5 选区持久化与高级编辑
+- **现状**：已有全选/取消/反选、色彩范围、扩展/收缩、按图层像素载入、羽化、路径、矩形/椭圆/套索/魔棒（`comp_selection.h` 18 个导出）。**缺**：
+  - **通道**：没有任何「alpha 通道 / 存储选区」概念（ABI 无 save/load selection；`.comp` manifest 也无 selection 键，`comp_file.cpp:382-473`）；
+  - **修改**只有羽化/扩展/收缩三种（`comp_selection.h:52-56`），无边界 / 平滑 / Grow / Similar；
+  - 无变换选区（有手柄缩放，但没有「变换选区」命令与数值输入）；
+  - 无快速选择 / 对象选择 / 快速蒙版 / Select and Mask（细化边缘、输出到蒙版/新图层）。
+- **PS 行为**：存储选区到通道、载入选区、修改菜单全集、变换选区、快速选择、快速蒙版、选择并遮住。
+- **性质**：【ABI 追加】+【引擎】——通道是新的文档模型（还需 `.comp` 持久化与合成语义），Grow/Similar 是新算法，快速选择是连通域+边缘模型。
+- **验收**：存/载选区往返 coverage 逐字节相等；`.comp` 保存再打开后选区与通道仍在；Grow 后边界单调外扩。
+
+### P0-6 文字：仍是"一次性栅格化"，没有可编辑文本与字体选择
+- **现状**：`COMP_TOOL_TYPE` 直接把文字画进图层像素（破坏性）；`comp_type_style` 只有字号/行距/字距/抗锯齿（`comp_layer.h:762-767`），无对齐、粗斜体、基线偏移、段落框；外壳只加载**一个**随包字体 `NotoSansSC-Regular-Subset.ttf`（`main.cpp:6077`），无字体选择器。CJK 输入通路已打通（M43 / IME 已验证），但输入完即固化。
+- **PS 行为**：文字图层可反复编辑、系统字体枚举与选择、点文字/段落文字、对齐、行距字距基线、竖排、路径文字、文字变形、栅格化。
+- **性质**：【引擎】XL——类型图层模型（文本 + 样式 + 几何，合成时栅格化）、字体枚举（`comp_font_load_file` 已能加载任意 TTF，缺枚举与回退链）、重编辑 UI。这是"PS 正常使用"里最痛的一条：做海报/封面时改一个字就要重画。
+- **建议切分**：① 文本图层模型 + 无损重编辑（P0）；② 字体枚举/选择（P1）；③ 段落框/对齐/竖排/变形（P1–P2）。
+- **验收**：改字号/文本后重新合成，非文本像素逐字节不变；保存 `.comp` 再打开文本仍可编辑。
+
+### P0-7 文件格式：PSD 只读、TIFF/WebP 不可用、无 PDF
+- **现状**：`docs/format-import-matrix.md:44-51` 明确：PSD 只读（stb_image，拍平）、TIFF/HEIF/WebP 登记为不可用、HDR 只读、EXR 读写；无 PDF / SVG / PSB / RAW 解码。
+- **PS 行为**：PSD/PSB 分层读写、TIFF（LZW/ZIP、图层）、WebP/HEIF、PDF 导出、SVG 放置、RAW 导入。
+- **性质**：【引擎】L–XL，且**需先定第三方库策略**（与"零依赖自研"取向冲突）。最优先是 **PSD 分层导出**：交付给上下游的刚需，当前只能 `.comp` + 位图。
+- **验收**：导出的 PSD 在第三方阅读器（PIL/psd-tools）+ 本仓重新导入后图层数/位置/不透明度一致；不支持的参数显式拒绝，不静默丢弃。
+
+### P0-8 视图辅助：标尺 / 参考线 / 网格 / 对齐 + 通道面板
+- **现状**：全仓 0 命中（ABI 与外壳均无 `guide/ruler/grid/snap`）。注意 README §6.3 的 `guides` 指的是 **Camera Raw 几何校准参数**（`camera_raw.cpp:394-415`），**不是画布参考线**——画布参考线完全不存在。
+- **PS 行为**：标尺、从标尺拖参考线、显示/隐藏/锁定/清除参考线、网格与对齐（图层/参考线/文档边界）、智能参考线。
+- **性质**：【引擎】+【壳层】M——参考线是文档模型（要进 `.comp`），吸附是交互层。
+- **验收**：拖参考线到 12.5px 时按设备像素对齐；存盘再开参考线位置不变；对齐开关不改变像素结果（只影响交互）。
+
+### P0-9 色彩模式与位深
+- **现状**：`color_space` 只是字符串，`.comp` 仅接受 `"sRGB"`（`comp_file.cpp:653-656`）；无 `Image > Mode`，无灰度/CMYK/Lab/索引，无 ICC 配置、无软打样、无 16/32 位文档模式开关（`comp_document_desc` 无 pixel_format）。
+- **PS 行为**：模式转换（含合并/不拼合提示）、转换为配置文件、指定配置文件、校样设置/色域警告。
+- **性质**：【引擎】XL（色彩管理是独立子系统）。可切两刀：① 8/16 位文档模式 + 灰度/RGB 转换（M–L）；② ICC/CMYK/Lab 与软打样（XL）。
+- **验收**：位深切换后 8 位像素逐字节不变；灰度转换有明确色度学口径与往返测试；非 sRGB 文档在 `.comp` 里有可识别的 profile 字段（追加）。
+
+### P0-10 界面可用性基线：选项栏 / 光标预览 / HiDPI
+- **现状**：无工具选项栏——代码注释里作者自己写明「本壳没有选项栏」（`main.cpp:6824`、`:13263`）；画笔无尺寸/圆形光标预览（全文件未用 `IDC_CROSS`，只有箭头与手柄缩放光标）；`shells/windows` **没有 manifest、源码无 `SetProcessDpi*`**，高 DPI 屏由系统位图拉伸；面板不能浮动/合并（`docs/shell-parity.md` §5.11）。
+- **PS 行为**：选项栏、笔刷大小光标、HiDPI 原生渲染、可停靠/浮动面板。
+- **性质**：【壳层】S（选项栏/光标）+ S（DPI awareness）+【架构】L（面板停靠系统）。
+- **验收**：200% 缩放下 1px 线条仍为 1 设备像素；触摸笔刷尺寸可见且不遮挡落点；窗口 resize 后布局不重叠。
+
+---
+
+## 3. P1 —— 专业工作流常用，但第一天不致命
+
+### P1-1 图层样式补全与组混合
+- 补 Bevel & Emboss / Satin / Gradient Overlay / Pattern Overlay（6 → 10）；合并为**一个图层样式对话框**（当前只有「效果子菜单 + 参数面板」）；全局光角度/高度。
+- 组支持混合模式（现在 `comp_file.cpp:285` 对组强制 Normal）；Pass Through 应成为显式枚举而非仅 `isolated` 开关。
+- 性质：【引擎】M +【ABI 追加】（新 effect kind 追加到 `COMP_EFFECT_*` 尾部，值 6..9）。
+
+### P1-2 图层管理
+锁定（像素/位置/透明/全部）、图层链接、颜色标签、按类型/名称/颜色过滤、图层复合（Layer Comps）、智能对象与智能滤镜、栅格化、合并可见、反向排列、样式拷贝/粘贴、新建填充层（纯色/渐变/图案）。
+- 性质：【引擎】M–L；锁定与标签可先做【ABI 追加】+【壳层】S。
+
+### P1-3 变换
+自由变换全套：斜切/扭曲/透视/变形（Warp 网格）、数值变换、再次变换（Ctrl+Shift+T）、变换选区、内容识别缩放。
+- 现状：只有移动/缩放/15° 旋转与 3 种采样模式；无 skew/distort/perspective（ABI 0 命中）。
+- 性质：【引擎】L（需要任意四边形/网格重采样与几何模型扩展）。
+
+### P1-4 画笔系统
+画笔预设库、间距/圆度/角度、纹理/双重画笔/动态、压感（WinTab / WM_POINTER）、混合器画笔、图案图章、背景橡皮擦 / 魔术橡皮擦、颜色替换、历史记录艺术画笔、笔刷光标表现。
+- 现状：`comp_tool_brush` 有 diameter/pressure/hardness/flow/grain/seed（`comp_layer.h:556-575`），但外壳恒 `pressure=1.0`、`flow=1.0`（`main.cpp:6522`），无预设、无间距、无数位板。
+- 性质：【引擎】M（间距/纹理/动态）+【壳层】M（Wintab/Pointer 输入、预设存储）。
+
+### P1-5 滤镜家族（引擎已就绪的优先接线）
+- **立即可做**：Camera Raw 滤镜入口【接线】——`comp_camera_raw_apply` + 763 张表 + 资源文件都在（`docs/camera-raw.md:13-18`），外壳 0 处调用，用户完全拿不到。
+- 新增：锐化/智能锐化/USM、降噪、模糊画廊（场景/光圈/倾斜偏移/旋转/路径）、其他（高反差保留/最小值/最大值/位移/自定）、液化独立对话框（现有 Push 仅笔刷）、扭曲/像素化/风格化/渲染各族、消失点。
+- 性质：复用 `engine/imaging` 内核的部分为 M；全新滤镜族 L。
+
+### P1-6 调整补全
+补 Brightness/Contrast、Vibrance、Selective Color、Photo Filter、Channel Mixer、Color Lookup、Posterize、Threshold、Desaturate、Shadows/Highlights；**破坏性 Image > Adjustments 全族**（现在只有反相）；自动色调/对比度/颜色。
+- 性质：12 → 20+ kind 【ABI 追加】（尾部）+【引擎】像素实现（多数可复用 AdjustPixels）。
+
+### P1-7 渐变升级
+多色标（>2）、色标中点、不透明度中点、角度/对称/菱形、抖动、渐变预设库与编辑器；渐变映射调整同步支持多色标。
+- 现状：`comp_tool_gradient` 只有 `color0/color1`，类型 0=线性/1=径向（`comp_layer.h:660-669`）。
+- 性质：【ABI 追加】（新结构体 `comp_gradient_stops` 尾字段）+【引擎】M。
+
+### P1-8 面板 / 工作区 / 首选项
+面板浮动/停靠/合并/分组、保存工作区、工具选项栏持久化、首选项（内存/历史步数/缓存盘/单位/网格）、快捷键自定义、明暗主题。
+- 性质：【架构】L +【壳层】M；历史步数/字节预算 ABI 已有（`comp_undo.h:49-61`），壳只显示已用字节（`main.cpp:768-772`），**没有设置入口**。
+- **设置入口已补（2026-10-22）**：`编辑 > 历史记录容量…`（Ctrl+Alt+H）打开两个数值行
+  （步数上限 / 内存上限 MiB），回车调 `comp_document_set_history_limit` +
+  `comp_document_set_history_budget`。**0 输入回显为「引擎默认」**（200 步 / 512 MiB），
+  不把引擎默认值抄进壳里当第二份真源。面板、工作区保存、首选项其余项仍未做。
+
+
+### P1-9 打印与输出
+打印对话框、纸张/缩放/位置、色彩配置文件、出血与角线、PDF/X；导出预设与批量导出。
+- 性质：新子系统（不建议现在做；无色彩管理时打印是假的）。
+
+### P1-10 自动化
+动作录制/播放、批处理、脚本/命令面板、数据驱动图形。
+- 现状：`comp_command_*` 只有 7 条命令（`comp_command_abi.cpp:30-39`），与外壳 kCmd* 是两套体系。
+- 性质：【引擎】+【架构】——先把命令表统一为单一真源（外壳菜单/快捷键/动作共用），再做录制。
+
+---
+
+## 4. P2 —— 长尾与可选
+
+- 3D 图层、视频图层、时间轴动画、360 全景编辑。
+- 画板（Artboards）、切片、注释、计数工具、测量记录。
+- 变量与数据组、图像处理器脚本。
+- 完整色彩管理：CMYK/Lab/专色/ICC/软打样/色域警告、32 位 HDR 显示与广色域。
+- 文件长尾：PSB、RAW（DNG/CR2/NEF…）解码、SVG 放置、AVIF、GIF 动画、HDR 导出、PDF 导入。
+- 云文档/字体同步/协作/版本历史（PS 需要账号体系，非本仓取向）。
+- 辅助功能：UI Automation、屏幕阅读器、高对比度主题。
+- 平台：macOS / Linux 壳、鸿蒙真机验证（README §6.2 已记证据边界）。
+- 性能：调整层与 HDR 表面的 GPU 路径（README §6.4 ③ 已记两条整篇回落）。
+
+---
+
+## 5. 明确不做（与 README §6.4 口径一致，不占缺口）
+
+- **ML 类**：Select Subject、Remove Background、Neural Filters、天空替换、内容识别填充的模型部分。
+- **需要第三方解码器且尚未定策略**：HEIF/WebP/TIFF/RAW（`docs/format-import-matrix.md` §3 已给出各自落地路线，缺的是"引不引库"的决策）。
+- **上游 Compositor 本身没有的**：不作为"vs Photoshop"的必达项，除非用户明确要求。
+
+---
+
+## 6. 硬约束的落地规则（每条需求提交前自查）
+
+1. **ABI 只追加**：新导出加在对应头文件末尾并新建 `.cpp`；枚举**只在末尾追加**（当前末尾：`COMP_TOOL_HISTORY_BRUSH=19`、`COMP_FILTER_PROGRESSIVE_BLUR=8`、`COMP_EFFECT_KIND_COUNT=6`、`COMP_ADJUSTMENT_COLOR_BALANCE=11`、`COMP_FORMAT_*`=8）；结构体字段只能尾部追加（`comp_tool_op_desc` 已有 "S5/S9/S10 尾部追加" 先例）。
+2. **冻结值不得重排**：像素格式/后端/表面/编解码/结果码/混合/工具/调整/效果/滤镜/格式的数值都是 ABI。
+3. **回归门禁**：任何引擎改动后 `E:\python-3.14.5-embed-amd64\python.exe scripts/build.py` + `scripts/run_regression.py --require-ohos` 必须 6/6。
+4. **壳自检 SHA**：既有 **257 项**的输出文本与顺序**不得改动**。新能力验证优先放 `tests/` 与 `scripts/visual_check.py`；若必须新增 selftest 项，**只能追加到末尾**，并把基线更新作为一次显式审批（否则 SHA 必变，等于破了硬约束）。
+5. **视觉探针**：只追加场景，不改既有 80 条断言的阈值与命令 ID；前台焦点问题沿用已修的 `SPI_SETFOREGROUNDLOCKTIMEOUT` 方案，不从终端后台启动。
+6. **工具表**：新增工具必须同时改 `ui_core.h tool_table()`、`scripts/check_tool_table.py` 基线、快捷键冲突检查，并追加 `COMP_TOOL_*` 值。
+7. **每条功能的通用契约**：非法参数在事务前拒绝；失败不留半成品、不写历史；一步撤销；无操作不记空步；可重复（seed 固定）。
+
+---
+
+## 7. 建议推进顺序（最短路径到"能当 PS 用"）
+
+| 阶段 | 内容 | 预估 | 理由 |
+|------|------|------|------|
+| A | P0-2 图像/画布大小、P1-5 Camera Raw 入口、P0-1 新建对话框、P0-3 另存为/脏提示 | 3–5 天 | 全是【接线】/【壳层】，零 ABI 风险，立刻补上"改尺寸/存副本"的日常动作 |
+| B | P0-4 剪贴板、P0-10 选项栏/光标/DPI | 1–2 周 | 壳层为主，跨应用工作流打通 |
+| C | P0-5 选区通道 + 修改补全 + 变换选区 | 2–3 周 | 引擎 + ABI 追加，所有下游编辑的入口 |
+| D | P0-6① 文本图层可编辑 → P1-4 字体选择/画笔预设 | 3–5 周 | 最痛的用户体验缺口 |
+| E | P0-7 PSD 分层导出（先定第三方策略） | 2–4 周 | 交付刚需 |
+| F | P1-1/2/3 样式/图层/变换、P1-6/7 调整/渐变、P1-5 滤镜族 | 6–10 周 | 专业工作流 |
+| G | P0-9 色彩管理、P1-9 打印、P1-10 自动化、P0-3 多文档 | 视排期 | 各自独立子系统，建议单独立项 |
+
+---
+
+## 8. 顺带记录的文档漂移（不属于功能缺口，但会误导排期）
+
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **145** 个（本次唯一化统计）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **86 条 / 18 场景**（2026-10-22 追加 `doc_dialog` 后；原 80 条含 IME 6/6）。
+- README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
+- §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
+
+---
+
+## 附录：证据索引
+
+| 结论 | 证据 |
+|------|------|
+| 145 个导出 | `engine/abi/include/compositor/*.h`（`COMP_API ... comp_*` 唯一化计数） |
+| 新建固定参数 | `shells/windows/src/main.cpp:8153-8160` |
+| 新建销毁旧文档 | `shells/windows/src/main.cpp:8166` |
+| 无图像/画布大小菜单 | `shells/windows/src/main.cpp:14859-14866`；ABI 有 `comp_engine.h:84,94`（**2026-10-22 已接线，见 P0-2**） |
+| 单文档 | `ShellState` 仅一个 `comp_document`；`main.cpp:8166` |
+| 无剪贴板 | 全仓 `Clipboard|CF_DIB` 0 命中；ABI 无 copy/paste |
+| 选区仅三种修改 | `engine/abi/include/compositor/comp_selection.h:52-56` |
+| 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767` |
+| 单一随包字体 | `shells/windows/src/main.cpp:6077` |
+| 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
+| 6 种效果 / 12 种调整 | `comp_layer.h:300-313`；`README.md:1462-1500` |
+| 9 种滤镜 | `engine/abi/include/compositor/comp_filter.h:38-48` |
+| 格式可用性 | `docs/format-import-matrix.md:44-51` |
+| 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
+| 组强制 Normal | `engine/format/comp_file.cpp:285` |
+| `.comp` 不存选区/路径/参考线 | `engine/format/comp_file.cpp:382-473` |
+| 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
+| Camera Raw 无壳入口 | ABI 3 个导出；`shells/windows/src/*` 内 `camera` 0 命中；`docs/camera-raw.md:13-18` |
+| 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
+| 壳自检/视觉探针基线 | Hermes 2026-10-22 终验：257 项 failures=0、SHA256 `377de660…`；视觉探针 **86/86**（Claude 2026-10-22 追加 `doc_dialog` 后复核，257 项 SHA 未变） |
