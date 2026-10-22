@@ -276,6 +276,39 @@ COMP_API comp_result comp_selection_apply_color_range(comp_document document,
                                                       comp_selection_combine combine,
                                                       int32_t* out_changed);
 
+/* ------------------------------------------------------- 手柄重采样（S46） */
+
+/*
+ * 基础蒙版的紧包围盒（非零像素的包围盒，**不含**羽化外扩）。
+ * 没有选区或显式空选区时写 {0, 0, 0, 0}。
+ *
+ * 与 comp_selection_get_bounds 的区别：那个口径是「可见 coverage 的范围」，
+ * 羽化会把包围盒外扩 ceil(2 * feather)；选区手柄要贴在**真正被变换的那张
+ * 蒙版**上，所以用这一个。宿主画手柄、算拖拽起点都用它。
+ */
+COMP_API comp_result comp_selection_get_base_bounds(comp_document document, comp_rect* out_bounds);
+
+/*
+ * 把选区整体重采样到绝对矩形 bounds（画在选区边上的扩缩手柄）。
+ *
+ * 源矩形恒为当前 `comp_selection_get_base_bounds`，因此
+ * `bounds == get_base_bounds()` 是**恒等变换**：逐字节不变、out_changed = 0，
+ * 不会因为手柄没动就多一条撤销步。这是 comp_selection_modify（相对扩缩）
+ * 无法表达的语义：手柄给的是**绝对落点**，不是「再扩几像素」。
+ *
+ * 采样是双线性（保留抗锯齿边缘）；bounds 越出画布的部分直接丢弃（画布外
+ * 没有选区）。feather 半径原样保留——羽化是选区参数，不是几何的一部分
+ * （与 comp_selection_translate 同口径）。宽或高 <= 0 的退化 bounds 等价于
+ * 「把选区收成空」：写入显式空选区（active 仍为 1）。不做镜像翻转，手柄
+ * 拖过头时的夹取由宿主负责。
+ *
+ * 没有选区 / 基础蒙版为空时无操作（out_changed = 0）；一步撤销
+ * （加入调用方已开启的显式事务，或自成一个隐式步）。
+ * out_bounds 为 NULL -> COMP_ERR_INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_selection_set_bounds(comp_document document, comp_rect bounds,
+                                               int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

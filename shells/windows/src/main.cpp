@@ -576,6 +576,17 @@ struct ShellState {
   std::vector<comp_ui::BoundarySegment> selection_segments;
   int32_t selection_phase = 0;    /* 蚂蚁线相位 0..7 px */
   bool selection_truncated = false; /* 线段数超过缓冲上限（如实提示） */
+  /*
+   * §5.44 选区扩缩手柄：8 个把手画在**基础蒙版**的紧包围盒上（不含羽化外扩，
+   * 羽化是选区参数不是几何），几何全在 ui_core::selection_* 里，壳只做
+   * 「取包围盒 → 命中 → 拖拽矩形 → 松手一次 set_bounds」。
+   * selection_base 由 refresh_selection 从引擎取回，壳内不另算包围盒。
+   * 拖动期间 selection_handle_current 是**预览**落点，引擎还没动。
+   */
+  comp_ui::Rect selection_base{};
+  int selection_handle_drag = -1;           /* -1 = 未拖；0..7 = 手柄序号 */
+  comp_ui::Rect selection_handle_source{};  /* 按下瞬间的紧包围盒（拖拽基准） */
+  comp_ui::Rect selection_handle_current{}; /* 拖拽预览落点（文档坐标） */
   /* 框选（Marquee 工具）进行中的矩形，文档坐标。 */
   bool marquee_active = false;
   comp_ui::Point marquee_start{};
@@ -4219,6 +4230,7 @@ void refresh_selection(ShellState& shell) {
   shell.selection_mask.clear();
   shell.selection_segments.clear();
   shell.selection_truncated = false;
+  shell.selection_base = comp_ui::Rect{};
   if (shell.document == nullptr || shell.width <= 0 || shell.height <= 0) return;
 
   int32_t active = 0;
@@ -4237,6 +4249,16 @@ void refresh_selection(ShellState& shell) {
     return;
   }
   shell.selection_active = true;
+
+  /*
+   * §5.44 手柄几何：基础蒙版的**紧**包围盒。取不到就留空——空包围盒不会画
+   * 手柄，也不会被命中，比用 coverage 反推一个「大概的」框诚实。
+   * （显式空选区的紧包围盒是 {0,0,0,0}，同样不画手柄：没有可拖的边。）
+   */
+  comp_rect base{};
+  if (comp_selection_get_base_bounds(shell.document, &base) == COMP_OK) {
+    shell.selection_base = comp_ui::Rect{base.x, base.y, base.w, base.h};
+  }
 
   shell.selection_segments.resize(kMaxAntSegments);
   const int needed = comp_ui::selection_boundary_segments(
@@ -4838,8 +4860,155 @@ void lasso_end(HWND window, ShellState& shell) {
       });
 }
 
-/* ------------------------------------------------------------ 魔棒（S7） */
+/* ------------------------------------------------------- 选区手柄（§5.44） */
 
+/*
+ * 手柄只在「用户正在做选区」的工具下出现：Marquee / Lasso / Wand / Move。
+ * 画笔类的落点含义是画图，画上去的手柄会抢命中、也会误导（PS 同规矩）。
+ * 拖动中或其它工具的临时态里一律不出现，避免两套拖拽语义打架。
+ */
+bool selection_handles_available(const ShellState& shell) {
+  if (shell.document == nullptr || !shell.selection_active) return false;
+  if (shell.selection_base.empty()) return false;
+  if (shell.marquee_active || shell.lasso_active || shell.crop_active ||
+      shell.pen_dragging || shell.zoom_marquee_active) {
+    return false;
+  }
+  switch (shell.tool) {
+    case comp_ui::ToolId::Marquee:
+    case comp_ui::ToolId::Lasso:
+    case comp_ui::ToolId::Wand:
+    case comp_ui::ToolId::Move:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/*
+ * 手柄锚点的**屏幕**坐标。手柄是屏幕尺寸（不随缩放变），所以命中与绘制都
+ * 走同一份屏幕点：两边各算一遍必然分叉，这是本仓反复踩过的坑。
+ */
+void selection_handle_centers(const ShellState& shell, const Layout& layout,
+                              const comp_ui::Rect& doc_rect, comp_ui::Point* out) {
+  for (int i = 0; i < comp_ui::kSelectionHandleCount; ++i) {
+    const comp_ui::Point doc = comp_ui::selection_handle_point(doc_rect, i);
+    out[i] = shell.view.doc_to_screen(doc.x, doc.y, layout.canvas, shell.width, shell.height);
+  }
+}
+
+/* 命中半径 7 px：7×7 的方块，给 1 px 余量，缩放每帧重算不会「点边缘失手」。 */
+constexpr double kSelectionHandleHitPx = 7.0;
+
+/*
+ * 按在手柄上 = 开始扩缩。返回 true 表示「这次点击已经是手柄的」（无论成败），
+ * 调用方据此**不要**再退化成框选/整层拖动——与 layer_handle_begin 同一约定。
+ */
+bool selection_handle_begin(HWND window, ShellState& shell, int x, int y,
+                            const Layout& layout) {
+  if (!selection_handles_available(shell)) return false;
+  comp_ui::Point centers[comp_ui::kSelectionHandleCount];
+  selection_handle_centers(shell, layout, shell.selection_base, centers);
+  const int hit = comp_ui::selection_handle_hit(
+      centers, comp_ui::kSelectionHandleCount,
+      comp_ui::Point{static_cast<double>(x), static_cast<double>(y)}, kSelectionHandleHitPx);
+  if (hit < 0) return false;
+  shell.selection_handle_drag = hit;
+  shell.selection_handle_source = shell.selection_base;
+  shell.selection_handle_current = shell.selection_base;
+  SetCapture(window);
+  set_status(shell, L"选区手柄：拖动缩放选区（Shift 拖角 = 等比，Esc 取消）");
+  return true;
+}
+
+void selection_handle_extend(ShellState& shell, int x, int y, const Layout& layout) {
+  if (shell.selection_handle_drag < 0) return;
+  const comp_ui::Point doc =
+      shell.view.screen_to_doc(x, y, layout.canvas, shell.width, shell.height);
+  const bool lock_aspect = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  shell.selection_handle_current = comp_ui::selection_drag_rect(
+      shell.selection_handle_source, shell.selection_handle_drag, doc, lock_aspect);
+}
+
+/*
+ * 取消：拖动阶段引擎**从未被写入**（松手才提交），所以这里只是丢掉预览。
+ * 不 ReleaseCapture —— 与 marquee_cancel 等同一写法，捕获由调用点负责。
+ */
+void selection_handle_cancel(ShellState& shell) {
+  shell.selection_handle_drag = -1;
+  shell.selection_handle_source = comp_ui::Rect{};
+  shell.selection_handle_current = comp_ui::Rect{};
+}
+
+void selection_handle_end(HWND window, ShellState& shell) {
+  if (shell.selection_handle_drag < 0) return;
+  /* 先落状态再放捕获：ReleaseCapture 会同步派发 WM_CAPTURECHANGED -> cancel。 */
+  const comp_ui::Rect target = shell.selection_handle_current;
+  const comp_ui::Rect source = shell.selection_handle_source;
+  selection_handle_cancel(shell);
+  ReleaseCapture();
+  if (shell.document == nullptr) return;
+
+  /* 手柄没动（含只抖了一像素又拖回来）：不写引擎，也就不产生撤销步。 */
+  if (target.x == source.x && target.y == source.y && target.w == source.w &&
+      target.h == source.h) {
+    set_status(shell, L"选区手柄：选区未变化");
+    return;
+  }
+
+  comp_rect bounds{};
+  bounds.x = target.x;
+  bounds.y = target.y;
+  bounds.w = target.w;
+  bounds.h = target.h;
+  int32_t changed = 0;
+  const comp_result result = comp_selection_set_bounds(shell.document, bounds, &changed);
+  if (result != COMP_OK) {
+    set_status(shell, L"选区手柄：缩放失败（选区状态异常）");
+    return;
+  }
+  refresh_selection(shell);
+  if (changed != 0) {
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"选区手柄：已缩放至 %d×%d 像素", target.w, target.h);
+    finish_selection_command(shell, buffer);
+  } else {
+    set_status(shell, L"选区手柄：选区未变化");
+  }
+}
+
+/*
+ * 手柄方向 -> 系统缩放光标。角用斜双箭头（NWSE / NESW），边用单轴箭头；
+ * 与 PS 同一套手感，也让「能不能拖」在按下前就能看出来。
+ * IDC_* 在本 SDK 里是 char* 宏（MAKEINTRESOURCEA），与 LoadCursorW 的
+ * LPCWSTR 不符：按同文件既有写法转换。
+ */
+HCURSOR selection_handle_cursor(int index) {
+  LPCWSTR id = nullptr;
+  switch (index) {
+    case 0:
+    case 4:
+      id = reinterpret_cast<LPCWSTR>(IDC_SIZENWSE);
+      break;
+    case 2:
+    case 6:
+      id = reinterpret_cast<LPCWSTR>(IDC_SIZENESW);
+      break;
+    case 1:
+    case 5:
+      id = reinterpret_cast<LPCWSTR>(IDC_SIZENS);
+      break;
+    case 3:
+    case 7:
+      id = reinterpret_cast<LPCWSTR>(IDC_SIZEWE);
+      break;
+    default:
+      return nullptr;
+  }
+  return LoadCursorW(nullptr, id);
+}
+
+/* ------------------------------------------------------------ 魔棒（S7） */
 bool wand_available(const ShellState& shell) {
   return shell.document != nullptr && shell.tool == comp_ui::ToolId::Wand;
 }
@@ -7823,6 +7992,8 @@ bool create_document(ShellState& shell) {
   move_cancel(shell);
   eyedropper_cancel(shell);
   marquee_cancel(shell);
+  /* §5.44 换文档时手柄拖动的预览属于旧文档坐标，一并作废。 */
+  selection_handle_cancel(shell);
   lasso_cancel(shell);
   pen_cancel(shell);
   refresh_layers(shell);
@@ -7863,6 +8034,8 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   move_cancel(shell);
   eyedropper_cancel(shell);
   marquee_cancel(shell);
+  /* §5.44 换文档时手柄拖动的预览属于旧文档坐标，一并作废。 */
+  selection_handle_cancel(shell);
   lasso_cancel(shell);
   pen_cancel(shell);
   refresh_layers(shell);
@@ -10069,6 +10242,56 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dash_pen);
   }
 
+  /*
+   * §5.44 选区手柄：8 个把手画在**基础蒙版**的紧包围盒上（与蚂蚁线的口径不同：
+   * 蚂蚁线画的是含羽化的有效 coverage）。拖动中把手跟着**预览**落点走，并把
+   * 落点画成双描边矩形——用户看到的就是松手后选区会变成的框。
+   * 命中与绘制共用 selection_handle_centers，两处坐标不可能分叉。
+   */
+  if (shell.selection_handle_drag >= 0) {
+    const comp_ui::Rect& preview = shell.selection_handle_current;
+    const comp_ui::Point a = shell.view.doc_to_screen(preview.x, preview.y, layout.canvas,
+                                                     shell.width, shell.height);
+    const comp_ui::Point b = shell.view.doc_to_screen(preview.right(), preview.bottom(),
+                                                     layout.canvas, shell.width, shell.height);
+    const int left = static_cast<int>(std::lround(std::min(a.x, b.x)));
+    const int top = static_cast<int>(std::lround(std::min(a.y, b.y)));
+    const int right = static_cast<int>(std::lround(std::max(a.x, b.x)));
+    const int bottom = static_cast<int>(std::lround(std::max(a.y, b.y)));
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(0, 0, 0));
+    HGDIOBJ old_pen = SelectObject(dc, solid);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, dotted);
+    Rectangle(dc, left, top, right, bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+    DeleteObject(solid);
+    DeleteObject(dotted);
+  }
+  if (selection_handles_available(shell)) {
+    comp_ui::Point centers[comp_ui::kSelectionHandleCount];
+    selection_handle_centers(shell, layout,
+                             shell.selection_handle_drag >= 0 ? shell.selection_handle_current
+                                                              : shell.selection_base,
+                             centers);
+    HBRUSH fill = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN frame = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HGDIOBJ old_brush = SelectObject(dc, fill);
+    HGDIOBJ old_pen = SelectObject(dc, frame);
+    for (int i = 0; i < comp_ui::kSelectionHandleCount; ++i) {
+      const int cx = static_cast<int>(std::lround(centers[i].x));
+      const int cy = static_cast<int>(std::lround(centers[i].y));
+      /* 7×7 方块（3 px 半径 + 1 px 黑框）：够大能点中，又不盖住 1 px 的蚂蚁线。 */
+      Rectangle(dc, cx - 3, cy - 3, cx + 4, cy + 4);
+    }
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(frame);
+    DeleteObject(fill);
+  }
+
   /* 框选预览：文档坐标两点 -> 屏幕矩形；白实线 + 黑虚线（M 键切椭圆）。 */
   if (shell.marquee_active) {
     const comp_ui::Point a = shell.view.doc_to_screen(shell.marquee_start.x,
@@ -11819,6 +12042,22 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return;
   }
 
+  /*
+   * §5.44 选区手柄拖动中：Esc 取消。拖动阶段引擎从未被写入（松手才提交），
+   * 所以「取消」只是丢掉预览 + 放掉捕获，不产生撤销步；其余按键吞掉，
+   * 免得切工具/撤销在拖动中途把状态撕成两半。
+   */
+  if (shell.selection_handle_drag >= 0) {
+    if (key == VK_ESCAPE) {
+      selection_handle_cancel(shell);
+      ReleaseCapture();
+      InvalidateRect(window, nullptr, FALSE);
+      set_status(shell, L"选区手柄：已取消，选区未变");
+      return;
+    }
+    return;
+  }
+
   /* 前景色十六进制键入态最先生效：它是模态输入，不能漏到工具快捷键。 */
   if (!shell.color_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -13402,6 +13641,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             } else if (progressive_axis_available(*shell)) {
               /* 滤镜面板指着 Progressive Blur：画布拖拽只定渐变轴（不画图）。 */
               progressive_axis_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (selection_handle_begin(window, *shell, mouse_x, mouse_y, layout)) {
+              /*
+               * §5.44 按在选区手柄上 = 扩缩选区。必须排在框选/套索/魔棒/移动之前：
+               * 否则「按在把手上」会变成「重新框一个选区」或「把像素搬走」。
+               * 返回 true 表示「这次点击归手柄」：调用链到此为止，不再退化成
+               * 框选/套索/魔棒/整层拖动。
+               */
             } else if (crop_available(*shell)) {
               /* 已有框时，再按一次画布 = 重新起框（对齐 PS 的「点框外取消、框内重来」语义） */
               crop_begin(window, *shell, mouse_x, mouse_y, layout);
@@ -13667,6 +13913,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
+      if (shell != nullptr && shell->selection_handle_drag >= 0) {
+        /* §5.44 松手才写引擎：整次拖动 = 一步撤销（不出手的拖动不产生撤销步）。 */
+        selection_handle_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->lasso_active) {
         lasso_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
@@ -13741,6 +13993,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (drag_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        /* §5.44 手柄拖动也收不到松手：丢掉预览即可（引擎从未写入，无撤销步）。 */
+        if (shell->selection_handle_drag >= 0) {
+          selection_handle_cancel(*shell);
+          InvalidateRect(window, nullptr, FALSE);
+        }
         /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
         shell->zoom_marquee_active = false;
         lasso_cancel(*shell);
@@ -13769,6 +14026,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (drag_was_active) InvalidateRect(window, nullptr, FALSE);
         eyedropper_cancel(*shell);
         marquee_cancel(*shell);
+        /* §5.44 手柄拖动也收不到松手：丢掉预览即可（引擎从未写入，无撤销步）。 */
+        if (shell->selection_handle_drag >= 0) {
+          selection_handle_cancel(*shell);
+          InvalidateRect(window, nullptr, FALSE);
+        }
         /* 缩放拖框没有半成品可回滚，丢掉矩形即可（松手事件已收不到）。 */
         shell->zoom_marquee_active = false;
         lasso_cancel(*shell);
@@ -13806,6 +14068,33 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         if (cursor != nullptr) {
           SetCursor(cursor);
           return TRUE;
+        }
+      }
+      /*
+       * §5.44 选区手柄：悬停/拖动时给方向光标。拖动中用 drag 序号判定——
+       * 指针可能已离开把手，但形状必须保持到松手（同分界线那条规矩）。
+       */
+      if (shell != nullptr && LOWORD(lparam) == HTCLIENT &&
+          (shell->selection_handle_drag >= 0 || selection_handles_available(*shell))) {
+        POINT pt{};
+        if (GetCursorPos(&pt) != 0 && ScreenToClient(window, &pt) != 0) {
+          Layout layout{};
+          if (client_layout(*shell, &layout) && layout.canvas.contains(pt.x, pt.y)) {
+            int index = shell->selection_handle_drag;
+            if (index < 0) {
+              comp_ui::Point centers[comp_ui::kSelectionHandleCount];
+              selection_handle_centers(*shell, layout, shell->selection_base, centers);
+              index = comp_ui::selection_handle_hit(
+                  centers, comp_ui::kSelectionHandleCount,
+                  comp_ui::Point{static_cast<double>(pt.x), static_cast<double>(pt.y)},
+                  kSelectionHandleHitPx);
+            }
+            HCURSOR cursor = selection_handle_cursor(index);
+            if (cursor != nullptr) {
+              SetCursor(cursor);
+              return TRUE;
+            }
+          }
         }
       }
       /*
@@ -13916,6 +14205,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             eyedropper_sample(*shell, mouse_x, mouse_y, layout);
           } else if (shell->marquee_active) {
             marquee_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+          } else if (shell->selection_handle_drag >= 0) {
+            /* §5.44 只改预览落点：引擎在松手前不动，拖动中途没有撤销步。 */
+            selection_handle_extend(*shell, mouse_x, mouse_y, layout);
             InvalidateRect(window, nullptr, FALSE);
           } else if (shell->lasso_active) {
             lasso_extend(*shell, mouse_x, mouse_y, layout);

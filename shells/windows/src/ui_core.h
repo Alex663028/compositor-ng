@@ -2068,6 +2068,140 @@ inline bool selection_contains_point(const uint8_t* mask, int width, int height,
          static_cast<uint8_t>(threshold);
 }
 
+/* ------------------------------------------------------- 选区手柄（S46） */
+
+/*
+ * 八个手柄的下标：0=左上 1=上 2=右上 3=右 4=右下 5=下 6=左下 7=左。
+ * **偶数都是角、奇数都是边**——拖拽的等比锁定只对偶数生效，绘制与命中表
+ * 都按这个顺序排列，不要在中途插入新值。
+ */
+inline constexpr int kSelectionHandleCount = 8;
+
+/* 手柄在**文档坐标**里的锚点：四角 + 四边中点。矩形是左闭右开的像素网格，
+ * 所以右/下边取 x + w / y + h（与 CanvasView::doc_to_screen 同一口径）。
+ * 索引越界返回矩形中心，调用方不该依赖这个兜底。 */
+inline Point selection_handle_point(const Rect& rect, int index) {
+  const double x0 = static_cast<double>(rect.x);
+  const double y0 = static_cast<double>(rect.y);
+  const double x1 = static_cast<double>(rect.x + rect.w);
+  const double y1 = static_cast<double>(rect.y + rect.h);
+  const double cx = (x0 + x1) * 0.5;
+  const double cy = (y0 + y1) * 0.5;
+  switch (index) {
+    case 0: return Point{x0, y0};
+    case 1: return Point{cx, y0};
+    case 2: return Point{x1, y0};
+    case 3: return Point{x1, cy};
+    case 4: return Point{x1, y1};
+    case 5: return Point{cx, y1};
+    case 6: return Point{x0, y1};
+    case 7: return Point{x0, cy};
+    default: return Point{cx, cy};
+  }
+}
+
+/*
+ * 屏幕坐标命中：centers 由调用方用 doc_to_screen 把手柄锚点换算好。
+ * 手柄大小是**屏幕像素**（不随缩放变），所以命中也在屏幕空间做；
+ * 返回最近的、距离不超过 tolerance 的手柄，都没有则 -1。
+ */
+inline int selection_handle_hit(const Point* centers, int count, Point p, double tolerance) {
+  if (centers == nullptr || count <= 0 || !(tolerance > 0.0)) return -1;
+  if (!(p.x == p.x) || !(p.y == p.y)) return -1; /* NaN：绝不命中 */
+  int best = -1;
+  double best_d2 = tolerance * tolerance;
+  for (int i = 0; i < count; ++i) {
+    const double dx = p.x - centers[i].x;
+    const double dy = p.y - centers[i].y;
+    const double d2 = dx * dx + dy * dy;
+    if (d2 <= best_d2) {
+      best = i;
+      best_d2 = d2;
+    }
+  }
+  return best;
+}
+
+/*
+ * 手柄拖拽的结果矩形（**文档坐标**，整数像素，可以落在画布外——裁切是引擎的事）。
+ *
+ * 规则与 PS 的手柄一致：被拖的那条边/那个角跟着鼠标走，对边不动；
+ * lock_aspect 只对**角**生效（保持源矩形宽高比，锚点是对角线另一端），
+ * 边手柄忽略它（PS 里边手柄也不等比）。
+ *
+ * 拖过头（越过对边）夹到 1 像素并停住，**不做镜像翻转**——引擎的
+ * comp_selection_set_bounds 也只有「收成空」这一种退化语义。
+ * 传 NaN 或 index 越界时原样返回 source（调用方应当已经命中过手柄）。
+ */
+inline Rect selection_drag_rect(const Rect& source, int index, Point point, bool lock_aspect) {
+  if (source.empty() || index < 0 || index >= kSelectionHandleCount) return source;
+  if (!(point.x == point.x) || !(point.y == point.y)) return source;
+
+  const bool moves_left = index == 0 || index == 6 || index == 7;
+  const bool moves_right = index == 2 || index == 3 || index == 4;
+  const bool moves_top = index == 0 || index == 1 || index == 2;
+  const bool moves_bottom = index == 4 || index == 5 || index == 6;
+
+  double left = static_cast<double>(source.x);
+  double top = static_cast<double>(source.y);
+  double right = static_cast<double>(source.x + source.w);
+  double bottom = static_cast<double>(source.y + source.h);
+
+  if (lock_aspect && (index % 2) == 0) {
+    const double aspect =
+        static_cast<double>(source.w) / static_cast<double>(source.h);
+    const double anchor_x = moves_left ? right : left;
+    const double anchor_y = moves_top ? bottom : top;
+    const double dx = std::fabs(point.x - anchor_x);
+    const double dy = std::fabs(point.y - anchor_y);
+    double width = std::max(dx, dy * aspect);
+    if (!(width > 1.0)) width = 1.0;
+    const double height = width / aspect;
+    if (moves_left) {
+      left = anchor_x - width;
+      right = anchor_x;
+    } else {
+      left = anchor_x;
+      right = anchor_x + width;
+    }
+    if (moves_top) {
+      top = anchor_y - height;
+      bottom = anchor_y;
+    } else {
+      top = anchor_y;
+      bottom = anchor_y + height;
+    }
+  } else {
+    if (moves_left) left = point.x;
+    if (moves_right) right = point.x;
+    if (moves_top) top = point.y;
+    if (moves_bottom) bottom = point.y;
+  }
+
+  /* 夹到至少 1 像素：先夹再取整，round 的单调性保证结果宽度 >= 1。 */
+  if (!(right - left >= 1.0)) {
+    if (moves_left) {
+      left = right - 1.0;
+    } else {
+      right = left + 1.0;
+    }
+  }
+  if (!(bottom - top >= 1.0)) {
+    if (moves_top) {
+      top = bottom - 1.0;
+    } else {
+      bottom = top + 1.0;
+    }
+  }
+
+  const long x0 = std::lround(left);
+  const long y0 = std::lround(top);
+  const long x1 = std::lround(right);
+  const long y1 = std::lround(bottom);
+  return Rect{static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+              static_cast<int>(y1 - y0)};
+}
+
 /*
  * 色彩范围容差（P0-4 第二批）：0..200，与引擎 kMaxColorRangeFuzziness 同口径。
  * 缺省 40 抄自上游 `ColorRangeEdit.fuzziness`；**0 是合法值**（只选完全同色），

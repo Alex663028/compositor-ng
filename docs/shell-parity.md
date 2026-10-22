@@ -399,7 +399,7 @@ CPU 烘焙后照样上 GPU，§6.27），仍整篇回落的是调整层与 HDR/R
 | Move 工具拖拽平移图层 | 已做（2026-10-21，§5.24 / §5.36） | 无选区 + 选中图层时拖动 = 改 transform；有选区时按落点分流：选区内搬像素、选区外拖整层；一次拖动一步撤销 |
 | Spot Healing（`J`） | 已做（2026-10-21，§5.25） | 折线在宿主侧光栅化成图层像素空间的 coverage 蒙版，一次 `comp_tool_apply` |
 | 工具按钮图标 | 已做（2026-10-21，§5.40） | 20 个工具图标按 32×32 逻辑网格用 GDI 现画，跟随按钮缩放；不新增 .rc/.ico/字体资源，构建产物仍是单文件 exe |
-| 选区扩缩手柄 | 未做 | 面板里的**数值**扩缩已接（`comp_selection_modify` 1..500）；缺的是画在选区边上的拖拽手柄——手柄要重采样蒙版，而 ABI 没有「按任意覆盖率写回选区」的入口（`comp_selection_modify` 是相对扩缩，无法表达手柄的绝对位移），壳侧不自造 |
+| 选区扩缩手柄 | 已做（2026-10-22，§5.44） | 选区边上 8 个把手（Marquee/Lasso/Wand/Move 下出现），拖动调 `selection_drag_rect` 出预览、松手一次 `comp_selection_set_bounds`；ABI 尾部追加 `comp_selection_get_base_bounds` / `_set_bounds`（138 → 140）——源恒为紧包围盒（不含羽化）、双线性、恒等逐字节不变且不落撤销步、退化 = 显式空选区 |
 | Brush/Eraser 逐笔撤销粒度 | 已做 | 每一笔 = 一次 `comp_tool_apply` = 一步撤销（笔迹预览只在宿主侧，不落文档）；「笔中逐段撤销」上游也没有 |
 | 滤镜实时预览 | 已做（2026-10-21，§5.35） | 改参数即出帧：宿主事务里应用 → 取帧 → abort，预览只在 framebuffer，文档不动；回车真应用，结果与预览逐字节一致 |
 | 面板缩放 / 停靠 | 部分做（2026-10-21，§5.33；2026-10-22，§5.43） | 宽度可拖：左右面板内侧 5 px 分界线，图层面板 168–520 px、右侧面板 240–560 px，双击分界线复位；整块收起/展开已做（F7 / F8、视图菜单、标题行按钮，收起后留 24 px 竖条）；停靠的另外两件（拖出成浮窗 / 面板合并）未做 |
@@ -1848,6 +1848,116 @@ Layers / Adjustments）、「视图」菜单两项（勾选态 = 已收起）都
 壳自检 **245 项不变**（基线 SHA256 仍 `26b3e910e3b9ccb7…`）；
 `run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
 目视项见 `docs/manual-test.md` **M41**。
+
+### 5.44 选区扩缩手柄：8 个把手 + 绝对矩形重采样（§5.11「选区扩缩手柄」，2026-10-22）
+
+**1. 缺口。** 选区早就有了，面板里的**数值**扩缩（`comp_selection_modify`，
+1..500 px）也早就接了，但选区的四条边上**没有可拖的把手**。缺的不是 UI 而是
+ABI：手柄给出的是「把选区改到这个矩形」，而既有入口只有**相对**扩缩
+（再扩几像素），表达不了绝对位移；壳侧又不能自己改蒙版（选区在引擎里，
+壳只持有一份 coverage 副本）。所以这一项必须先补 ABI，再谈把手。
+
+**2. ABI 尾部追加两个导出（138 → 140）。**
+
+- `comp_selection_get_base_bounds(document, comp_rect* out)`：基础蒙版的**紧**包围盒
+  （非零像素的 bbox，**不含**羽化外扩）。注意它与既有的 `comp_selection_get_bounds`
+  是**两种口径**：后者是「可见 coverage 的范围」，羽化会把盒子外扩 `ceil(2*feather)`；
+  手柄必须贴在**真正被变换的那张蒙版**上，所以用前者。没有选区/显式空选区时写
+  `{0,0,0,0}`；`out` 为 NULL → `COMP_ERR_INVALID_ARGUMENT`（在事务之前拒绝）。
+- `comp_selection_set_bounds(document, comp_rect bounds, int32_t* out_changed)`：
+  源矩形**不是**调用方给的，恒为当前 `get_base_bounds()`；调用方只给落点。
+
+既有的枚举、结构体、签名一个没动，只是尾部追加。
+
+**3. 变换语义（四条都是刻意定的）。**
+
+1. **恒等 = 逐字节不变、`changed = 0`。** 源 = 当前紧包围盒，所以
+   `bounds == get_base_bounds()` 必然不发生重采样。实现里 `masks_equal` 再兜一层：
+   万一坐标换算有舍入，也**不会**因为「把把手拖回原处」多出一条撤销步。
+2. **双线性重采样，保留抗锯齿边。** 目标像素中心 → 源坐标：
+   `(x + 0.5 - target.x) * scale + source.x - 0.5`，`scale = source.w / target.w`。
+   减 0.5 是因为源像素中心在整数格点上；`target == source` 时这里恰好落到整数，
+   双线性权重全在原像素上（这就是第 1 条成立的算术原因）。最近邻会让椭圆选区
+   变成锯齿，所以不用。
+3. **画布裁剪与缩放比解耦。** 越出画布的部分直接丢弃（画布外没有选区），
+   但 `scale` 仍按**原样**的 target 算——贴着画布边界拖时，内容不能被悄悄拉伸。
+   `target.x + target.w` 用 int64 中间量，避免整数溢出。
+4. **退化 = 显式空选区，不是「取消选区」。** `w <= 0 || h <= 0` 写入一张全 0 蒙版，
+   `active` 仍为 1：用户在 PS 里把把手拖到对边，得到的是「有选区但空」，
+   不是「没有选区」（两者在合成限制与后续相加/相减语义上不同）。
+   `feather` 半径原样保留——羽化是选区**参数**，不是几何，与
+   `comp_selection_translate` 同口径。不做镜像翻转；拖过头的夹取由宿主负责。
+
+一次调用 = 一步撤销（`ImplicitTxn("Transform Selection")`，加入调用方已开的显式
+事务，或自成一步）；没有选区/基础蒙版为空时无操作、`changed = 0`、不落撤销步。
+
+**4. 几何全在 ui_core：手柄是屏幕尺寸，不是文档尺寸。** 新增
+`kSelectionHandleCount = 8` 与下标表 **0=左上 1=上 2=右上 3=右 4=右下 5=下 6=左下 7=左**
+（**偶数都是角、奇数都是边**，绘制/命中/拖拽三处共用这一个顺序）：
+
+- `selection_handle_point(rect, index)`：文档坐标锚点。矩形是左闭右开像素网格，
+  右/下边取 `x + w` / `y + h`（与 `doc_to_screen` 同口径，不另立一套）。
+- `selection_handle_hit(centers, count, p, tolerance)`：**屏幕空间**命中，返回最近的、
+  距离 ≤ tolerance 的手柄，否则 -1。手柄大小不随缩放变，所以不能在文档空间做命中；
+  命中点由调用方用 `doc_to_screen` 换算好——**与绘制共用同一份屏幕坐标**，
+  这一仓反复踩的「看得见点不中」就是两处各算一遍造成的。NaN 永不命中
+  （`!(p.x == p.x)`），否则 NaN 比较全假会误判成「命中第一个」。
+- `selection_drag_rect(source, index, point, lock_aspect)`：文档坐标结果矩形。
+  只动被拖的那条边/那个角，对边不动；`lock_aspect` **只对角生效**（PS 里边手柄
+  也不等比），锚点是对角线另一端，且按**主导轴**取宽：
+  `width = max(|dx|, |dy| * aspect)`——只按 dx 算会让「往下拖得比往右多」时
+  比例失守。拖过对边夹到 1 px 并停住（先夹再 round，round 单调性保证宽 ≥ 1），
+  **不镜像**（引擎也只有「收成空」这一种退化语义）。NaN / index 越界原样返回 source。
+
+**5. 壳只做四件事：取包围盒 → 命中 → 拖拽矩形 → 松手一次 `set_bounds`。**
+
+- **生效工具**：Marquee / Lasso / Wand / Move。画笔类工具的落点含义是画图，
+  把手会抢命中也会误导（PS 同规矩）；框选/套索/裁剪/钢笔/缩放框的临时态里一律不出现。
+- **点击优先级**：`selection_handle_begin` 排在框选、套索、魔棒、Move 整层拖动**之前**。
+  返回 true 表示「这次点击归手柄」，调用链到此为止——否则按在把手上会退化成
+  新框选，直接把用户想改的选区删掉。与 `layer_handle_begin` 同一约定。
+- **拖动只出预览**：`selection_handle_current` 是文档坐标落点，引擎在松手前不动，
+  所以拖动中途**没有**撤销步，也不需要「拖一半失败怎么办」的回滚。
+- **松手一次提交**：先落 `target`/`source` 再 `selection_handle_cancel()`，
+  **然后**才 `ReleaseCapture()`——`ReleaseCapture` 会同步派发
+  `WM_CAPTURECHANGED`，顺序反了会把刚要提交的落点自己清掉。
+  落点与源矩形逐字段相等（含抖动一像素又拖回来）时**不调引擎**，状态栏如实说
+  「选区未变化」，不产生撤销步。提交后 `refresh_selection` 重新取紧包围盒与蚂蚁线。
+- **取消**：`Esc`（拖动中按键整个被手柄吃掉，其它快捷键不生效）、`WM_KILLFOCUS`、
+  `WM_CAPTURECHANGED`、换/开文档都走 `selection_handle_cancel`。取消只丢预览，
+  幂等，不 `ReleaseCapture`（捕获由调用点负责）。
+- **悬停光标**：`WM_SETCURSOR` 里先判拖动（按 drag 序号），再判命中；角给斜双箭头
+  （0/4 → `IDC_SIZENWSE`，2/6 → `IDC_SIZENESW`），边给单轴箭头
+  （1/5 → `IDC_SIZENS`，3/7 → `IDC_SIZEWE`），且只在画布矩形内生效。
+
+**6. 绘制。** 8 个 7×7 白底 + 1 px 黑框的方块（GDI `Rectangle`，**屏幕尺寸**，
+放大画布不会变成巨块），锚点用 `selection_handle_centers`——与命中共用一份。
+拖动期间额外画一个双笔画预览矩形（白色实线 + 黑色 `PS_DOT`），从当前落点换算，
+让「松手会变成多大」在松手前就看得见。蚂蚁线仍从缓存的 `selection_segments` 画，
+口径不变；所有覆盖层都裁在 `layout.canvas` 内。
+
+**7. 边界。** ① 只做「拖动缩放」，透视/变形/旋转手柄属于 §5.39 的变换手柄，不在此列；
+② 不做「Alt 从中心缩放」「Shift 边上等比」（PS 也没有）；③ 把手不改羽化值、
+不改选区模式（相加/相减），一次拖动就是一个 REPLACE 式的几何变换；
+④ 引擎侧不记「上一次的矩形」，每次拖动都以当前紧包围盒为基准，所以两次拖动
+是串行的、可撤销的，不会累积误差；⑤ 收起面板/切工具不打断拖动（拖动中被
+`WM_CAPTURECHANGED` 收敛）。
+
+**8. 验证。** 单测 604 → **610 例 / 0 失败**：ABI 层 4 例（`selection_base_bounds_ignores_feather`
+——羽化不改紧包围盒、可见包围盒确实更大、取消选择后返回 `{0,0,0,0}`、NULL 参数在
+事务前拒绝；`selection_transform_bounds_identity_is_byte_identical`——带羽化椭圆
+逐字节不变 + `changed = 0` + 撤销深度不动 + 羽化保留；`selection_transform_bounds_rescales_the_mask`
+——16×12→32×24 面积四倍、内点 255、最外圈 0<v<255（双线性）、旧轮廓消失、
+一步撤销回原矩形、再缩到 8×6；`selection_transform_bounds_collapses_to_an_explicit_empty_selection`
+——退化矩形得到 `active=1` 的空蒙版、可撤销、无选区时无操作、越出画布只保留画布内部分）；
+UI 层 2 例（`ui_core_selection_handle_points_and_hit`：8 个锚点位置、最近命中、
+容差边界、空表/NaN 不命中；`ui_core_selection_drag_rect`：四边/四角单向移动、
+对角不动、Shift 角等比按主导轴、边手柄忽略 Shift、拖过头夹 1 px、NaN/越界不炸）。
+PE 导出 **138 → 140**（尾部追加 `comp_selection_get_base_bounds` /
+`comp_selection_set_bounds`，既有导出与签名不变）；壳自检 **245 项不变**
+（基线 SHA256 仍 `26b3e910e3b9ccb7…`——本轮没有动任何既有自检路径）；
+`run_regression.py --require-ohos` **6/6 通过**；`build_windows_shell.py` 零警告。
+目视项见 `docs/manual-test.md` **M42**。
 
 
 

@@ -1306,3 +1306,151 @@ COMP_TEST(selection_wand_radius_averages_the_reference_window) {
   COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
   COMP_CHECK(bounds.w == 2);
 }
+
+/* --------------------------------------------------- 手柄重采样（S46） */
+
+COMP_TEST(selection_base_bounds_ignores_feather) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  comp_rect base{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 8 && base.y == 8 && base.w == 16 && base.h == 12);
+
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 4, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK_MSG(base.x == 8 && base.y == 8 && base.w == 16 && base.h == 12,
+                 "feather is a parameter, not part of the base bbox");
+
+  comp_rect visible{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &visible) == COMP_OK);
+  COMP_CHECK_MSG(visible.w > base.w, "the visible bounds include the feather spread");
+
+  /* 取消选择后没有可变换的蒙版：返回空矩形而不是上一次的坐标。 */
+  COMP_CHECK(comp_selection_deselect(fixture.document, &changed) == COMP_OK);
+  base = comp_rect{1, 2, 3, 4};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 0 && base.y == 0 && base.w == 0 && base.h == 0);
+
+  /* 空指针在事务之前拒绝。 */
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+}
+
+COMP_TEST(selection_transform_bounds_identity_is_byte_identical) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  /* 用椭圆拿一条抗锯齿边，恒等变换必须原样保留这些半透明像素。 */
+  const float ellipse[4] = {10.3f, 11.7f, 21.4f, 18.2f};
+  COMP_CHECK(comp_selection_apply_shape(fixture.document, COMP_SELECTION_ELLIPSE, ellipse, 2,
+                                        COMP_SELECTION_ADD, 1, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 3, &changed) == COMP_OK);
+
+  const std::vector<uint8_t> before = coverage(fixture.document);
+  comp_rect base{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+
+  const size_t depth = undo_depth_of(fixture.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_set_bounds(fixture.document, base, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "handles that did not move must not create an undo step");
+  COMP_CHECK(undo_depth_of(fixture.document) == depth);
+  COMP_CHECK_MSG(feather_of(fixture.document) == 3.0f, "transform keeps the feather radius");
+
+  const std::vector<uint8_t> after = coverage(fixture.document);
+  COMP_CHECK(after.size() == before.size() &&
+             std::equal(before.begin(), before.end(), after.begin()));
+}
+
+COMP_TEST(selection_transform_bounds_rescales_the_mask) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+
+  const size_t depth = undo_depth_of(fixture.document);
+  /* 16x12 -> 32x24，左上角落在 (0,0)：面积四倍、位置也变了。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_set_bounds(fixture.document, comp_rect{0, 0, 32, 24}, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+
+  const std::vector<uint8_t> scaled = coverage(fixture.document);
+  COMP_CHECK_MSG(at(scaled, 16, 12) == 255, "the interior is fully selected");
+  COMP_CHECK_MSG(at(scaled, 1, 1) == 255, "one pixel inside the new rect is already solid");
+  COMP_CHECK_MSG(at(scaled, 0, 0) > 0 && at(scaled, 0, 0) < 255,
+                 "bilinear sampling fades the outermost ring");
+  COMP_CHECK_MSG(at(scaled, 40, 30) == 0, "the old outline is gone");
+  comp_rect base{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 0 && base.y == 0 && base.w == 32 && base.h == 24);
+
+  /* 一次变换一步撤销：回到原来的 16x12。 */
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 8 && base.y == 8 && base.w == 16 && base.h == 12);
+
+  /* 缩到一半：内容仍在，只是采样成 8x6。 */
+  COMP_CHECK(comp_selection_set_bounds(fixture.document, comp_rect{8, 8, 8, 6}, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.w == 8 && base.h == 6);
+  const std::vector<uint8_t> shrunk = coverage(fixture.document);
+  COMP_CHECK_MSG(at(shrunk, 11, 10) >= 250, "downscaling keeps the interior selected");
+  COMP_CHECK(at(shrunk, 20, 16) == 0);
+}
+
+COMP_TEST(selection_transform_bounds_collapses_to_an_explicit_empty_selection) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+
+  const size_t depth = undo_depth_of(fixture.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_set_bounds(fixture.document, comp_rect{8, 8, 0, 0}, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+  COMP_CHECK_MSG(active_of(fixture.document) == 1,
+                 "a collapsed handle drag leaves an explicit empty selection");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 0);
+
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 255L * 16L * 12L);
+
+  /* 没有选区 = 无操作，不产生撤销步。 */
+  Fixture empty;
+  COMP_CHECK(empty.document != nullptr);
+  const size_t empty_depth = undo_depth_of(empty.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_set_bounds(empty.document, comp_rect{4, 4, 8, 8}, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 0);
+  COMP_CHECK(undo_depth_of(empty.document) == empty_depth);
+  COMP_CHECK(active_of(empty.document) == 0);
+
+  /* 越出画布：只保留画布内的部分，越界不崩。 */
+  Fixture clipped;
+  COMP_CHECK(clipped.document != nullptr);
+  COMP_CHECK(rect(clipped.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_set_bounds(clipped.document, comp_rect{-60, -48, 128, 96}, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> wide = coverage(clipped.document);
+  COMP_CHECK_MSG(at(wide, 32, 24) == 255, "the interior is selected after clipping");
+  comp_rect clipped_bounds{};
+  COMP_CHECK(comp_selection_get_base_bounds(clipped.document, &clipped_bounds) == COMP_OK);
+  COMP_CHECK(clipped_bounds.x == 0 && clipped_bounds.y == 0);
+  COMP_CHECK(clipped_bounds.w == kWidth && clipped_bounds.h == kHeight);
+}

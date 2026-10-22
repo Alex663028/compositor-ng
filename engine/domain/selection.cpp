@@ -1027,6 +1027,91 @@ bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool
   return true;
 }
 
+/* ------------------------------------------------------- 手柄重采样（S46） */
+
+/* 双线性取样：画布外的点按 0 处理（基础蒙版在紧包围盒外本来就是 0，
+ * 这条规则只影响缩放到包围盒外沿的那一圈目标像素）。 */
+double sample_mask_bilinear(const std::vector<uint8_t>& base, int32_t width, int32_t height,
+                            double x, double y) {
+  const int32_t x0 = static_cast<int32_t>(std::floor(x));
+  const int32_t y0 = static_cast<int32_t>(std::floor(y));
+  const double fx = x - static_cast<double>(x0);
+  const double fy = y - static_cast<double>(y0);
+  const auto at = [&base, width, height](int32_t px, int32_t py) -> double {
+    if (px < 0 || py < 0 || px >= width || py >= height) return 0.0;
+    return static_cast<double>(base[static_cast<size_t>(py) * static_cast<size_t>(width) + px]);
+  };
+  const double top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+  const double bottom = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+  return top * (1.0 - fy) + bottom * fy;
+}
+
+comp_rect selection_base_bounds(const SelectionState& selection) {
+  comp_rect result{0, 0, 0, 0};
+  if (!selection.active) return result;
+  int32_t x0 = 0;
+  int32_t y0 = 0;
+  int32_t x1 = 0;
+  int32_t y1 = 0;
+  if (!nonzero_bounds(selection.base, &x0, &y0, &x1, &y1)) return result;
+  result.x = x0;
+  result.y = y0;
+  result.w = x1 - x0 + 1;
+  result.h = y1 - y0 + 1;
+  return result;
+}
+
+bool selection_transform_bounds(SelectionState* selection, comp_rect target, bool* changed) {
+  if (changed != nullptr) *changed = false;
+  if (selection == nullptr) return false;
+  if (!selection->active) return true;
+
+  const int32_t width = selection->base.width;
+  const int32_t height = selection->base.height;
+  if (width <= 0 || height <= 0) return false;
+  const std::vector<uint8_t>& base = selection->base.pixel_data();
+  if (base.size() != static_cast<size_t>(width) * static_cast<size_t>(height)) return false;
+
+  const comp_rect source = selection_base_bounds(*selection);
+  std::vector<uint8_t> next(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+
+  if (source.w > 0 && source.h > 0 && target.w > 0 && target.h > 0) {
+    /* 目标矩形按画布裁剪；缩放比仍按**原样**的 target 算，否则贴着画布边界
+     * 拖动时内容会被悄悄拉伸。int64 中间量避免 target.x + target.w 溢出。 */
+    const int64_t x_begin = std::max<int64_t>(0, target.x);
+    const int64_t x_end = std::min<int64_t>(width, static_cast<int64_t>(target.x) + target.w);
+    const int64_t y_begin = std::max<int64_t>(0, target.y);
+    const int64_t y_end = std::min<int64_t>(height, static_cast<int64_t>(target.y) + target.h);
+
+    const double scale_x = static_cast<double>(source.w) / static_cast<double>(target.w);
+    const double scale_y = static_cast<double>(source.h) / static_cast<double>(target.h);
+
+    for (int64_t y = y_begin; y < y_end; ++y) {
+      /* 目标像素中心 → 源像素坐标：源像素中心在整数格点上，所以再减 0.5。
+       * target == source 时这里恰好得到整数，双线性权重全落在原像素上，
+       * 因此恒等变换逐字节不变。 */
+      const double sy = (static_cast<double>(y) + 0.5 - static_cast<double>(target.y)) * scale_y +
+                        static_cast<double>(source.y) - 0.5;
+      uint8_t* row = next.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+      for (int64_t x = x_begin; x < x_end; ++x) {
+        const double sx =
+            (static_cast<double>(x) + 0.5 - static_cast<double>(target.x)) * scale_x +
+            static_cast<double>(source.x) - 0.5;
+        const double value = sample_mask_bilinear(base, width, height, sx, sy);
+        long rounded = std::lround(value);
+        if (rounded < 0) rounded = 0;
+        if (rounded > 255) rounded = 255;
+        row[static_cast<size_t>(x)] = static_cast<uint8_t>(rounded);
+      }
+    }
+  }
+
+  if (masks_equal(next, base)) return true; /* 恒等 / 空选区 / 收缩到画布外 */
+  store_base(selection, width, height, std::move(next));
+  if (changed != nullptr) *changed = true;
+  return true;
+}
+
 comp_result selection_apply_color_range(SelectionState* selection, int32_t canvas_width,
                                         int32_t canvas_height, const Document& document,
                                         const uint8_t* include, size_t include_count,

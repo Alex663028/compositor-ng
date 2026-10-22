@@ -160,6 +160,27 @@ bool selection_load_layer(SelectionState* selection, int32_t canvas_width, int32
  */
 bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed);
 
+/*
+ * 把基础蒙版整体重采样到绝对矩形 target（选区手柄的落点）。
+ *
+ * 源矩形**不是**调用方给的：恒为当前基础蒙版的紧包围盒（`selection_base_bounds`，
+ * 不含羽化外扩）。因此 `target == source` 是恒等变换——逐字节不变、changed = false，
+ * 不会因为手柄没拖动就产生一条撤销步。
+ *
+ * 采样：目标像素中心反向映射回源坐标，双线性插值（保留抗锯齿边缘）。目标矩形
+ * 可以越出画布，越出部分直接丢弃（画布外没有选区）。feather 半径原样保留——
+ * 羽化是选区的参数，不是几何的一部分（与 translate 同口径）。
+ * 任何一边 <= 0 的退化目标视为「把选区收成空」：写入显式空选区（active 保持 1），
+ * 与退化形状 replace 的语义一致；不做镜像翻转（手柄拖过头停在 1 像素由外壳夹取）。
+ * 没有选区、或基础蒙版本来就是空的时候无操作（changed = false）。
+ * 画布尺寸与蒙版缓冲不一致（损坏状态）返回 false。
+ */
+bool selection_transform_bounds(SelectionState* selection, comp_rect target, bool* changed);
+
+/* 基础蒙版的紧包围盒（含任何非零像素，**不含**羽化外扩）。
+ * 没有选区或显式空选区返回 {0, 0, 0, 0}——手柄据此决定画不画。 */
+comp_rect selection_base_bounds(const SelectionState& selection);
+
 /* ------------------------------------------------------------ 魔棒（S7） */
 
 /* 参考色邻域半边长的上限（与 tool_ops 的 select.radius 同口径）。 */

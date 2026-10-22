@@ -484,3 +484,37 @@ comp_result comp_selection_apply_color_range(comp_document document, const uint8
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)
 }
+
+/* ------------------------------------------------------- 手柄重采样（S46） */
+
+comp_result comp_selection_get_base_bounds(comp_document document, comp_rect* out_bounds) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_bounds == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_bounds is null");
+  }
+  *out_bounds = compositor::selection_base_bounds(doc->selection());
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_set_bounds(comp_document document, comp_rect bounds,
+                                      int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  compositor::abi::ImplicitTxn txn(doc, "Transform Selection");
+  bool changed = false;
+  if (!compositor::selection_transform_bounds(&doc->selection(), bounds, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "selection mask is corrupt");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}

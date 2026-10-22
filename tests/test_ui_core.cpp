@@ -3670,3 +3670,83 @@ COMP_TEST(ui_core_transform_uniform_scale_locks_aspect) {
       comp_ui::rect_center_point(rotated), 90.0);
   COMP_CHECK(same_point(anchor_after, anchor_before, 1.5));
 }
+
+/* --------------------------------------------------- 选区手柄（S46） */
+
+COMP_TEST(ui_core_selection_handle_points_and_hit) {
+  const Rect bounds{10, 20, 100, 50};
+
+  /* 1. 八个锚点：四角 + 四边中点；右/下边落在 x+w / y+h 上（像素网格口径）。 */
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 0), Point{10, 20}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 1), Point{60, 20}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 2), Point{110, 20}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 3), Point{110, 45}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 4), Point{110, 70}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 5), Point{60, 70}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 6), Point{10, 70}));
+  COMP_CHECK(same_point(comp_ui::selection_handle_point(bounds, 7), Point{10, 45}));
+
+  /* 2. 命中：容差内取最近的一个，容差外返回 -1。 */
+  Point centers[comp_ui::kSelectionHandleCount];
+  for (int i = 0; i < comp_ui::kSelectionHandleCount; ++i) {
+    centers[i] = comp_ui::selection_handle_point(bounds, i);
+  }
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{13, 23}, 6.0) == 0);
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{113, 46}, 6.0) == 3);
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{60, 68}, 6.0) == 5);
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{61, 45}, 6.0) == -1);
+
+  /* 3. 精确落在两个手柄中点时按「距离相等取后者」的确定性结果，不随编译器。 */
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{35, 20}, 40.0) == 1);
+  COMP_CHECK(comp_ui::selection_handle_hit(centers, comp_ui::kSelectionHandleCount,
+                                           Point{std::numeric_limits<double>::quiet_NaN(), 20},
+                                           6.0) == -1);
+}
+
+COMP_TEST(ui_core_selection_drag_rect) {
+  const Rect source{10, 20, 100, 50};
+  /* Rect 没有 operator==（C++17 不合成）：统一走字段比较，避免各写一遍。 */
+  const auto is = [](const Rect& r, int x, int y, int w, int h) {
+    return r.x == x && r.y == y && r.w == w && r.h == h;
+  };
+  const auto drag = [&source](int index, double x, double y, bool lock) {
+    return comp_ui::selection_drag_rect(source, index, Point{x, y}, lock);
+  };
+
+  /* 1. 每个手柄只动自己那条边（对边钉住）。 */
+  COMP_CHECK(is(drag(3, 150, 200, false), 10, 20, 140, 50));
+  COMP_CHECK(is(drag(7, 0, 200, false), 0, 20, 110, 50));
+  COMP_CHECK(is(drag(5, 0, 100, false), 10, 20, 100, 80));
+  COMP_CHECK(is(drag(1, 0, 40, false), 10, 40, 100, 30));
+  COMP_CHECK(is(drag(0, 30, 40, false), 30, 40, 80, 30));
+  COMP_CHECK(is(drag(4, 60, 45, false), 10, 20, 50, 25));
+
+  /* 2. 拖过头：夹到 1 像素，不出现负宽高、也不镜像。 */
+  COMP_CHECK(is(drag(3, 5, 0, false), 10, 20, 1, 50));
+  COMP_CHECK(is(drag(7, 400, 0, false), 109, 20, 1, 50));
+  COMP_CHECK(is(drag(1, 0, 400, false), 10, 69, 100, 1));
+
+  /* 3. Shift 等比：角手柄保持源比例（100:50 = 2），锚点是对角。 */
+  const Rect locked = drag(4, 210, 220, true);
+  COMP_CHECK(is(locked, 10, 20, 400, 200));
+  COMP_CHECK_MSG(locked.w == 2 * locked.h, "aspect lock keeps 2:1");
+  /* 锚点东南角 (110,70)：dx = 200，dy = 150；等比按主导轴 dy*aspect = 300，
+   * 所以宽 300（不是 dx 的 200），左边界 = 110 - 300 = -190。 */
+  COMP_CHECK(is(drag(0, -90, -80, true), -190, -80, 300, 150));
+
+  /* 4. 边手柄忽略 Shift（PS 同语义），只做普通单边拖拽。 */
+  COMP_CHECK(is(drag(1, 999, 60, true), 10, 60, 100, 10));
+
+  /* 5. 退化输入：空矩形 / 越界索引 / NaN 一律原样返回。 */
+  const Rect empty_source{10, 20, 0, 50};
+  COMP_CHECK(is(comp_ui::selection_drag_rect(empty_source, 3, Point{0, 0}, false), 10, 20, 0, 50));
+  COMP_CHECK(is(drag(8, 0, 0, false), 10, 20, 100, 50));
+  COMP_CHECK(is(comp_ui::selection_drag_rect(
+                   source, 3, Point{std::numeric_limits<double>::quiet_NaN(), 0}, false),
+               10, 20, 100, 50));
+}
