@@ -4,28 +4,30 @@
 #include <cstring>
 
 #include "core/comp_geometry.h"
+#include "core/comp_live_handles.h"
 
 namespace compositor {
 namespace abi {
 
 /*
- * 句柄校验（轻量方案）：reinterpret_cast 之后核对对象内置 magic。
- * 挡住的真实误用——
- *   - 销毁后使用：~Engine/~Document 会把 magic 改成 kHandlePoisoned；
- *   - 类型混淆：把 comp_engine 当 comp_document 传（或反过来）；
- *   - 野指针/未初始化句柄：magic 对上的概率约 2^-32，且对象布局前缀
- *     恰好是 vtable 指针与成员，随机值命中不了。
+ * 句柄校验（双闸门）：
+ *   1. 先查「存活对象登记表」（is_live_handle）：表里只有构造成功过、且尚未
+ *      析构的对象指针。查询只哈希指针值、不解引用，因此**完全野的句柄**
+ *      （宿主传了个未映射地址）在这里就会被挡下来——直接解引用读 magic 的
+ *      老做法在这一步就段错误了。
+ *   2. 再读对象内置 magic：挡住销毁后使用（dtor 把 magic 改成 kHandlePoisoned）
+ *      与类型混淆（把 comp_engine 当 comp_document 传，或拿字体句柄当引擎）。
  * 失败一律返回 nullptr，由调用方转成 COMP_ERR_INVALID_ARGUMENT。
  */
 Engine* as_engine(comp_engine handle) {
   Engine* engine = reinterpret_cast<Engine*>(handle);
-  if (engine == nullptr || !engine->is_alive()) return nullptr;
+  if (engine == nullptr || !is_live_handle(engine) || !engine->is_alive()) return nullptr;
   return engine;
 }
 
 Document* as_document(comp_document handle) {
   Document* document = reinterpret_cast<Document*>(handle);
-  if (document == nullptr || !document->is_alive()) return nullptr;
+  if (document == nullptr || !is_live_handle(document) || !document->is_alive()) return nullptr;
   return document;
 }
 

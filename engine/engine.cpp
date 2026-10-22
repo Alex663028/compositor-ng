@@ -3,6 +3,7 @@
 
 #include <new>
 
+#include "core/comp_live_handles.h"
 #include "core/comp_parallel.h"
 #include "domain/camera_raw_tables.h"
 #include "domain/document.h"
@@ -47,6 +48,9 @@ Engine::Engine(const comp_engine_desc& desc) {
 
   const size_t effective = comp_parallel_set_threads(desc.worker_threads);
   threads_ = static_cast<uint32_t>(effective);
+  /* 登记为存活对象：as_engine 解引用前先查本表，野句柄被挡成错误码而不是段错误。
+   * 放在构造体最后：此前任何抛异常的路径都不会留下「登记了却没对象」的脏表项。 */
+  register_live_handle(this);
 }
 
 void Engine::adopt_render_backend(std::unique_ptr<RenderBackend> backend, comp_backend actual) {
@@ -55,6 +59,11 @@ void Engine::adopt_render_backend(std::unique_ptr<RenderBackend> backend, comp_b
 }
 
 Engine::~Engine() {
+  /*
+   * 先从登记表注销：此后该指针即便是被释放后再被宿主误传进来，
+   * is_live_handle 也查不到，as_engine 不会解引用已释放的内存。
+   */
+  unregister_live_handle(this);
   /*
    * 兜底清理：宿主若先销毁引擎（反序），在册文档一并销毁。
    * 先 swap 摘掉列表再逐个 delete——Document 析构会回调 detach_document，

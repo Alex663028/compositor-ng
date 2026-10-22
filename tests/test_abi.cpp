@@ -942,6 +942,50 @@ COMP_TEST(handle_type_confusion_is_rejected) {
   comp_engine_destroy(engine);
 }
 
+/*
+ * 野句柄：完全未映射的地址传给引擎 / 文档入口不得段错误。
+ *
+ * as_engine / as_document 解引用前先查「存活对象登记表」（core/comp_live_handles.h），
+ * 查不到就判 nullptr。刻意用 2^48——所有受支持平台的用户态地址空间之外，保证
+ * 未映射：一旦退回「直接解引用读 magic」的老路径，本测试会段错误而不是断言失败，
+ * 这正是要钉死的行为（与 font 侧 font_abi_wild_and_released_handles_never_crash
+ * 同构）。
+ */
+COMP_TEST(wild_engine_document_handles_never_crash) {
+  const comp_engine kWildEngine = reinterpret_cast<comp_engine>(0x1000000000000ULL);
+  const comp_document kWildDocument = reinterpret_cast<comp_document>(0x1000000000000ULL);
+
+  comp_backend backend = COMP_BACKEND_CPU;
+  COMP_CHECK(comp_engine_backend(kWildEngine, &backend) == COMP_ERR_INVALID_ARGUMENT);
+  uint32_t threads = 0;
+  COMP_CHECK(comp_engine_threads(kWildEngine, &threads) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_engine_last_error(kWildEngine) != nullptr); /* 返回空串，不是崩溃 */
+  comp_engine_destroy(kWildEngine); /* 野句柄释放必须是空操作，不崩 */
+
+  comp_size size{};
+  COMP_CHECK(comp_document_size(kWildDocument, &size) == COMP_ERR_INVALID_ARGUMENT);
+  comp_document_destroy(kWildDocument);
+
+  /* 真实句柄仍然好用：本测试通过本身也证明登记表没有误伤正常路径。 */
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+  COMP_CHECK(comp_engine_threads(engine, &threads) == COMP_OK);
+
+  /* 引擎句柄当文档句柄用：登记表命中（Engine 活着）但 magic 挡下——
+   * 同样是 INVALID_ARGUMENT，不是崩溃。 */
+  comp_document fake = reinterpret_cast<comp_document>(engine);
+  COMP_CHECK(comp_document_size(fake, &size) == COMP_ERR_INVALID_ARGUMENT);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
 /* 命令列表：desc 模式必须提供文档（enabled 按文档状态求值）；
  * count-only 模式不要求文档（外壳可在打开文档前枚举命令表）。 */
 COMP_TEST(command_list_requires_document_for_desc_mode) {

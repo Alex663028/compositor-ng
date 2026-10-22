@@ -8,7 +8,6 @@
 #include <new>
 #include <system_error>
 #include <mutex>
-#include <unordered_set>
 
 /* FreeType 的规矩：先 ft2build.h（它定义 FT_*_H 这组包含宏），再按宏包含具体头。 */
 #include <ft2build.h>
@@ -17,6 +16,7 @@
 #include FT_TRUETYPE_IDS_H
 
 #include "../core/comp_handle_magic.h"
+#include "../core/comp_live_handles.h"
 
 namespace compositor {
 namespace {
@@ -141,37 +141,22 @@ void set_message(std::string* message, const char* text) {
 /* 100 MB 上限：字体再大也不该整块读进内存（.ttc 里确实有这种怪物）。 */
 constexpr size_t kMaxFontBytes = 100u * 1024u * 1024u;
 
-/* ---------- 存活字体登记表（ABI 句柄安全，见 font_face.h 的说明） ---------- */
-
-/* 函数内 static：避开全局构造顺序问题，首次调用时初始化。 */
-std::mutex& live_fonts_mutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-std::unordered_set<FontFace*>& live_fonts() {
-  static std::unordered_set<FontFace*> fonts;
-  return fonts;
-}
+/* ---------- 存活字体登记表：转发共享表（core/comp_live_handles.h） ---------- */
 
 }  // namespace
 
+/* 三个 font 侧入口都是共享存活登记表的薄转发：表键是 const void*，
+ * Engine / Document / FontFace 共用一张表；类型区分仍交给各自对象的 magic。 */
 void register_live_font(FontFace* face) noexcept {
-  if (face == nullptr) return;
-  std::lock_guard<std::mutex> lock(live_fonts_mutex());
-  live_fonts().insert(face);
+  register_live_handle(face);
 }
 
 void unregister_live_font(FontFace* face) noexcept {
-  if (face == nullptr) return;
-  std::lock_guard<std::mutex> lock(live_fonts_mutex());
-  live_fonts().erase(face);
+  unregister_live_handle(face);
 }
 
 bool is_live_font(FontFace* face) noexcept {
-  if (face == nullptr) return false;
-  std::lock_guard<std::mutex> lock(live_fonts_mutex());
-  return live_fonts().count(face) > 0;
+  return is_live_handle(face);
 }
 
 FontFace::FontFace() = default;

@@ -113,7 +113,8 @@ comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_en
 
 void comp_engine_destroy(comp_engine engine) {
   /*
-   * as_engine 已做 magic 校验：NULL、已销毁句柄（含重复 destroy）均为无操作。
+   * as_engine 先查存活登记表再校验 magic：NULL、已销毁句柄（含重复 destroy）、
+   * 完全野的地址均为无操作。
    * ~Engine 会兜底销毁所有在册文档——宿主先销毁引擎的反序用法从此安全。
    */
   Engine::destroy(compositor::abi::as_engine(engine));
@@ -244,7 +245,8 @@ comp_result comp_document_save(comp_document document, const char* comp_path_utf
 void comp_document_destroy(comp_document document) {
   /*
    * 经引擎分配器析构（与 Document::create 的 placement new 配对）。
-   * as_document 已校验 magic：NULL 与已销毁句柄均为无操作（重复 destroy 安全）。
+   * as_document 先查存活登记表再校验 magic：NULL、已销毁句柄（含重复
+   * destroy）、完全野的地址均为无操作。
    * ~Document 会自行从引擎登记表摘掉自己。
    */
   Document::destroy(compositor::abi::as_document(document));

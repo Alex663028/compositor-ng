@@ -5,11 +5,13 @@
  * 与 ABI 的关系：comp_engine 不透明句柄在 abi 层被 reinterpret_cast 为 Engine*。
  * Engine 持有跨文档共享的资源：分配器、渲染后端选择、工作线程数、最近错误。
  *
- * 句柄有效性（轻量方案，不引入全局句柄表）：
- *   对象内置一枚构造期写入、析构期擦除的 magic。abi 层的 as_engine/as_document
- *   在 reinterpret_cast 之后核对它——销毁后使用、类型混淆（拿引擎句柄当文档
- *   句柄）、绝大多数野指针都会被挡成 COMP_ERR_INVALID_ARGUMENT，而不是静默
- *   解引用。代价是一次整数比较，ABI 类型与二进制布局均不变。
+ * 句柄有效性（双闸门）：
+ *   对象内置一枚构造期写入、析构期擦除的 magic；构造期还把自己登记进共享的
+ *   「存活对象登记表」（core/comp_live_handles.h，构造登记 / 析构注销）。
+ *   abi 层的 as_engine/as_document **先查表、再读 magic**——销毁后使用、
+ *   类型混淆（拿引擎句柄当文档句柄）被 magic 挡住，完全野的指针（未映射
+ *   地址）被登记表挡住，一律变成 COMP_ERR_INVALID_ARGUMENT 而不是段错误。
+ *   ABI 类型与二进制布局均不变。
  */
 #ifndef COMPOSITOR_ENGINE_ENGINE_H
 #define COMPOSITOR_ENGINE_ENGINE_H

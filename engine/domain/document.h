@@ -203,9 +203,10 @@ class Document {
   void touch_all_layers() noexcept;
 
   /*
-   * 句柄有效性（与 Engine 同一套轻量方案，见 engine.h 文件头）：
-   * 构造期置 kDocumentMagic，析构期 poison。abi 层 as_document 据此
-   * 把「销毁后使用 / 类型混淆 / 野指针」挡成错误码而不是静默解引用。
+   * 句柄有效性（与 Engine 同一套双闸门，见 engine.h 文件头）：
+   * 构造期置 kDocumentMagic 并登记进共享存活表，析构期注销并 poison。
+   * abi 层 as_document 先查表、再读 magic，把「销毁后使用 / 类型混淆 /
+   * 野指针」挡成错误码而不是静默解引用。
    */
   bool is_alive() const noexcept { return handle_magic_ == kDocumentMagic; }
 

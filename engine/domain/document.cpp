@@ -13,6 +13,7 @@
 #include "compositing/compositor.h"
 #include "compositing/effect_eval.h"
 #include "compositing/resample.h"
+#include "core/comp_live_handles.h"
 #include "domain/history.h"
 #include "domain/layer_merge.h"
 #include "engine.h"
@@ -37,9 +38,17 @@ Document::Document(Engine* engine, int32_t width, int32_t height, float dpi,
   state_.color_space = color_space.empty() ? std::string("sRGB") : std::move(color_space);
   /* 历史的内存记账按「独占字节」口径：活文档资产不计入（见 history.h）。 */
   history_.set_live(&state_);
+  /* 登记为存活对象：as_document 解引用前先查本表，野句柄被挡成错误码而不是段错误。
+   * 放在构造体最后：此前任何抛异常的路径都不会留下「登记了却没对象」的脏表项。 */
+  register_live_handle(this);
 }
 
 Document::~Document() {
+  /*
+   * 先从存活登记表注销：此后该指针被宿主误传进来时 is_live_handle 查不到，
+   * as_document 不会解引用已释放的内存（与 ~FontFace / ~Engine 同一套约定）。
+   */
+  unregister_live_handle(this);
   /*
    * 作废所有活跃事务句柄：句柄内持有的 document 裸指针即将失效，
    * 不清的话宿主在文档销毁后再 commit/abort 就是 use-after-free。
