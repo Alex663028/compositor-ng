@@ -5263,6 +5263,96 @@ PE 导出 **138 → 140**；壳自检 **245 项 / 失败 0**（基线 SHA256 仍
 **6/6 通过**；`build_windows_shell.py` 零警告。文档：`docs/shell-parity.md` §5.44
 （并回填 §5.11），`docs/manual-test.md` M42。
 
+### 6.74 字体：引入 FreeType + 字体加载层（P5-0 / P5-1，2026-10-22，Claude）
+
+**P0-5 的第一、二步。** 文字工具一直只有编译进内核的 5×7 点阵 ASCII，排不了中文。
+要接真字体先得有个字体引擎，而「零依赖、以源码 vendoring」是这个仓既有规矩
+（libpng / zlib / stb 都这么进来）。
+
+**1. P5-0：FreeType 2.13.3 进 `engine/third_party/freetype/`，三路构建对齐。**
+只编需要的模块（`base` / `truetype` / `smooth` / `sfnt` / `psnames` / `cff` /
+`psaux` / `pshinter`），不引 harfbuzz、不引 png/brotli（`FT_CONFIG_OPTION_*`
+一律关）；`scripts/build.py`、`scripts/build_ohos.sh`、鸿蒙 `CMakeLists.txt`
+三处源文件清单必须一致——漏一个模块是链接期才炸的错误，不是编译期。
+
+**2. P5-1：`engine/domain/font_face.*` + 5 个导出（140 → 145）。**
+`comp_font_load_file` / `comp_font_load_memory` / `comp_font_release` /
+`comp_font_get_metrics` / `comp_font_name`。句柄与引擎无关（可在 `comp_engine_create`
+之前加载），内置 magic 判活：释放后再用得到 `COMP_ERR_STATE` 而不是读已释放内存；
+**重复释放是宿主错误，不是「安全空操作」**——文档曾这么写，本轮改成实话。
+`comp_font_metrics` 给 em 比例（ascender / descender / line_gap / height /
+max_advance）与 `has_cjk`、`units_per_em`、`scalable`，宿主的可用性判断不需要自己解析
+name 表。`FontFace::render_glyph` 用 `FT_Set_Char_Size` 的 26.6 定点保留小数字号、
+`FT_LOAD_NO_HINTING | FT_LOAD_RENDER` 取灰度 coverage，`FT_Bitmap.pitch` 为负时
+按行号从尾取行（自下而上存行是合法情形）；`FT_Face` 非线程安全，全程持内部互斥锁。
+
+**3. 随仓字体：`resources/fonts/NotoSansSC-Regular-Subset.ttf`。**
+Noto Sans SC 可变字体固定到 Regular（wght=400）后按固定字符集裁剪：ASCII + Latin-1、
+常用标点、CJK 标点、全角形式、**GB2312 一级汉字 3755**；31036 → 4491 字形，
+1.23 MB。产物族名 `Noto Sans SC Subset`（OFL 要求修改版不冒用保留名），
+`OFL.txt` 同目录一起分发；`scripts/make_font_subset.py` 可重放，字节确定，
+不随宿主机器装了什么字体而变（见 `resources/fonts/README.md`）。
+
+**4. 验证。** 单测 610 → **614 例 / 0 失败**（`tests/test_font.cpp`：加载失败路径、
+magic 判活与重复释放、度量字段、小数字号的 26.6 定点、缺字步进、子集里真有中文
+字形、OFL 名字表未被裁掉）；PE 导出 **140 → 145**；壳自检 **245 项不变**（引擎侧
+新能力，壳还没接）；`run_regression.py --require-ohos` 6/6（鸿蒙交叉编译也编进了
+FreeType）。
+
+### 6.75 文字字体轨道：UTF-8 / CJK 排版与栅格化（P5-2，2026-10-22，Claude）
+
+**引擎侧接上 P5-1 的字体。** 不传字体时旧轨道一个字节都不许变，所以是一条**并行**
+轨道而不是改语义：`comp_tool_op_desc` **尾部**追加 `comp_font type_font`
+（既有字段偏移不变，宿主需用同版本头文件编译），`type_measure_text_with_font` /
+`type_rasterize_with_font` 是新的内部入口，旧的两个函数原样保留。
+
+- **UTF-8 严格解码**：拒绝过长编码、代理对、> U+10FFFF、孤立续字节、Tab 等控制
+  字符；不合格整段 `kBadText`，不当成「能排多少排多少」。
+- **量纲**：字体轨道下 `font_size` 是 **em 高**（旧轨道是格子高，7 px = 1 倍），
+  行步进 = `font_size × line_height`，首行基线 = 文本框顶 + `ascender × font_size`；
+  逐字形用字体自己的 `advance`，`letter_spacing` 加在字形之间。
+- **文本框四周各留一 em 余量再裁到图层**：负左侧距与重音不会被切掉；字形原点取整到
+  像素（已知取舍，亚像素定位留给以后）；重叠像素取**最大**覆盖率而不是相加，免得
+  相邻字形接缝处叠亮。
+- **缺字只占步进、不画 .notdef 方框**，个数如实写进 note；`kFontError` 专指宿主态
+  错误（句柄失效 / FreeType 失败），**绝不静默回落到 5×7**。
+- 顺手修掉 `build_font_layout` 的行尾哨兵缺失：只有行首没有行尾，最后一行永远落不进
+  循环，单行文本量出 `line_count = 0`、宽 0 且一个字都不画——新用例接入当天抓到。
+
+**验证。** 单测 614 → **619 例 / 0 失败**；**无新导出，仍 145**；P5-11 的 22 条
+逐字节断言（不传字体时旧轨道）全部保持通过；壳自检尚未接（P5-3 才接）。
+
+### 6.76 Windows 壳字体轨道：中文输入、em 字号、缺字如实回报（P5-3，2026-10-22，Claude）
+
+**P0-5 的壳半边。** 启动加载随仓字体，面板第四行 `Typeface` 切轨道，键入只走
+`WM_CHAR`（输入法才进得来），退格按码点删。ABI 零新增，仍 145 导出。
+
+- **字体从哪来**：`load_shipped_font` 依次探 `<exe>/resources/fonts`、
+  `<exe>/../resources/fonts`（开发构建的 `build/` 就在仓根下一层）、`<cwd>/resources/fonts`；
+  闸门是 `scalable && units_per_em > 0 && has_cjk`，位图或纯拉丁字体一律不选。
+  找不到不是错误：状态栏如实说「未找到随仓字体」，工具退回点阵。
+- **删掉 `type_ascii_from_vk`**：VK→ASCII 看不见输入法（中文永远打不进去），且与
+  `TranslateMessage` 派发的 `WM_CHAR` 各插一遍，开输入法时双字。现在 `WM_CHAR` 是
+  唯一来源，UTF-16 代理对在壳里拼成码点，孤立半个丢弃。
+- **编辑按码点**：`Backspace` 走 `type_utf8_erase_last`，按字节删会留下半个汉字，
+  引擎如实拒收成 `kBadText`（用户看到的是「退格把整段字弄没了」）。缓冲不是完整
+  UTF-8 时函数返回 0 且不动——不猜该丢哪个字节。
+- **预览是估计值**：外壳没有「只度量不落墨」的 ABI 入口，也不为此加导出；宽度按
+  CJK/全角 1 em、其余 0.55 em 估（±5%），界面数字带 `≈`，状态栏写「宽度是估计值」。
+  画布仍不预演字形——GDI 画一套与 FreeType 落出来的不是一回事。
+- **面板**：第 4 行是**开关行**（`type_panel_row_is_toggle`），数字键不进输入态；
+  行号只追加，前三行的几何与命中顺序不变。
+
+**验证。** 单测 **619 例 / 0 失败**（换内容：22 条 VK 断言 → UTF-8 助手与字体轨道度量
+30 条）；壳自检 **245 → 257 项**，基线 `compositor_shell_selftest.txt` 重新生成
+（SHA256 `377DE660D48AC933…`）；`run_regression.py --require-ohos` 6/6；
+`build_windows_shell.py` 零警告。边界与目视项：`docs/shell-parity.md` §5.45、
+`docs/manual-test.md` **M43**（留 ALEX 真机）。
+
+**鸿蒙侧**：`shells/ohos` 目前只接引擎/文档/IO/render，**还没有文字工具**，所以没有
+「缺字体」可回落；将来接入时须把 `resources/fonts` 打进 assets、用沙箱路径调
+`comp_font_load_file`，失败时按同一条规矩退回点阵并如实提示，不得静默画方框。
+
 
 
 

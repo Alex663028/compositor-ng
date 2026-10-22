@@ -36,7 +36,8 @@ compositor-ng 是「同引擎、两壳」结构：
 | 历史记录画笔（P1） | `Y` 工具 + 历史面板取样（Shift+点行），画布折线 → 一次 `COMP_TOOL_HISTORY_BRUSH` | （未接 UI） | `comp_tool_apply`（kind 尾部追加，导出数仍 138） | **已达成**（§5.20）：取样不回跳；一笔 = 一个撤销步；`Alt+[ / ]` 调不透明度 |
 | 渐变工具（S9） | 画布拖拽两端点 → 一次 `COMP_TOOL_GRADIENT` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；线性/径向、Shift 反向） |
 | 形状工具（S10） | 画布拖拽对角点/两端点 → 一次 `COMP_TOOL_SHAPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；矩形/椭圆/直线，Shift 正方、Alt 从中心） |
-| 文字工具（S11） | 点击落插入点 + 键入 ASCII → 一次 `COMP_TOOL_TYPE` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板；内置 5×7 点阵，ASCII-only） |
+| 字体加载（P5-1/P5-3） | 启动加载 `resources/fonts/NotoSansSC-Regular-Subset.ttf`，面板第四行 `Typeface` 切换 | （未接 UI，也未打包字体） | `comp_font_load_file` / `_load_memory` / `_release` / `_get_metrics` / `_name`（尾部追加，140 → 145） | **已达成（Windows）**：字体不可用时如实退回 5×7 点阵并提示；鸿蒙壳还没有文字工具，故无「缺字体」可回落（见 §5.45 末段） |
+| 文字工具（S11，P5-3 起含 CJK） | 点击落插入点 + 键入（`WM_CHAR`/输入法，UTF-8）→ 一次 `COMP_TOOL_TYPE` | （未接 UI） | `comp_tool_apply` + `comp_tool_op_desc.type_font`（尾部追加） | **已达成**（§5.45）：随仓字体轨道支持 CJK，面板 `Typeface` 可切回内置 5×7 点阵（ASCII-only，逐字节不变） |
 | 编解码能力查询 | 导入/导出菜单 | 预留 | `comp_io_codec_support` | 已达成 |
 | PNG 导入/导出 | 可用 | 可用 | `comp_io_import` / `comp_io_export` | 已达成（libpng+zlib） |
 | JPEG 导入/导出 | 可用（有损） | 可用 | 同上 | 已达成（stb） |
