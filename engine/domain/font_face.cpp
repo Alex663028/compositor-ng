@@ -7,6 +7,8 @@
 #include <fstream>
 #include <new>
 #include <system_error>
+#include <mutex>
+#include <unordered_set>
 
 /* FreeType 的规矩：先 ft2build.h（它定义 FT_*_H 这组包含宏），再按宏包含具体头。 */
 #include <ft2build.h>
@@ -139,11 +141,45 @@ void set_message(std::string* message, const char* text) {
 /* 100 MB 上限：字体再大也不该整块读进内存（.ttc 里确实有这种怪物）。 */
 constexpr size_t kMaxFontBytes = 100u * 1024u * 1024u;
 
+/* ---------- 存活字体登记表（ABI 句柄安全，见 font_face.h 的说明） ---------- */
+
+/* 函数内 static：避开全局构造顺序问题，首次调用时初始化。 */
+std::mutex& live_fonts_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_set<FontFace*>& live_fonts() {
+  static std::unordered_set<FontFace*> fonts;
+  return fonts;
+}
+
 }  // namespace
+
+void register_live_font(FontFace* face) noexcept {
+  if (face == nullptr) return;
+  std::lock_guard<std::mutex> lock(live_fonts_mutex());
+  live_fonts().insert(face);
+}
+
+void unregister_live_font(FontFace* face) noexcept {
+  if (face == nullptr) return;
+  std::lock_guard<std::mutex> lock(live_fonts_mutex());
+  live_fonts().erase(face);
+}
+
+bool is_live_font(FontFace* face) noexcept {
+  if (face == nullptr) return false;
+  std::lock_guard<std::mutex> lock(live_fonts_mutex());
+  return live_fonts().count(face) > 0;
+}
 
 FontFace::FontFace() = default;
 
 FontFace::~FontFace() {
+  /* 先从登记表注销：此后该指针即便是被 delete 释放后再被宿主误传进来，
+   * is_live_font 也查不到，as_font 不会解引用已释放的内存。 */
+  unregister_live_font(this);
   handle_magic_ = kHandlePoisoned;
   if (face_ != nullptr) {
     FT_Done_Face(static_cast<FT_Face>(face_));
@@ -232,6 +268,8 @@ FontFace* FontFace::create_from_bytes(std::vector<uint8_t> bytes, int32_t face_i
     return nullptr;
   }
   if (!self->init_from_bytes(std::move(bytes), face_index, status, message)) return nullptr;
+  /* 登记为存活字体：这是 as_font 在解引用前能查到的唯一凭据。 */
+  register_live_font(self.get());
   return self.release();
 }
 

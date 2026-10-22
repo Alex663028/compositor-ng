@@ -552,3 +552,97 @@ COMP_TEST(comp_tool_type_with_font_paints_cjk_and_undoes_in_one_step) {
   comp_document_destroy(doc);
   comp_engine_destroy(engine);
 }
+
+/*
+ * 野句柄 / 已释放句柄不得崩溃（as_font 先查存活登记表再解引用）。
+ *
+ * 刻意用一个保证落在用户态寻址范围之外的地址（2^48，Windows 与 Linux x64 的
+ * 用户态上限都是 2^47）：一旦 as_font 退回「直接解引用读 magic」的老路径，
+ * 这个测试会段错误而不是断言失败——这正是要钉死的行为。
+ */
+COMP_TEST(font_abi_wild_and_released_handles_never_crash) {
+  /* 2^48：所有受支持平台的用户态地址空间之外，保证未映射。 */
+  const comp_font kWild = reinterpret_cast<comp_font>(0x1000000000000ULL);
+
+  comp_font_metrics metrics{};
+  COMP_CHECK(comp_font_get_metrics(kWild, &metrics) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_font_name(kWild, COMP_FONT_NAME_FAMILY) == nullptr);
+  comp_font_release(kWild); /* 野句柄释放也必须是空操作，不崩。 */
+
+  /* 释放后的句柄：先正常加载、释放，再复用。 */
+  comp_font font = nullptr;
+  COMP_CHECK(comp_font_load_file(kFontPath, 0, &font) == COMP_OK);
+  if (font == nullptr) return;
+  comp_font_release(font);
+
+  comp_font_metrics released_metrics{};
+  COMP_CHECK(comp_font_get_metrics(font, &released_metrics) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_font_name(font, COMP_FONT_NAME_FAMILY) == nullptr);
+  comp_font_release(font); /* 重复释放：安全空操作。 */
+
+  /* 工具调用里传野句柄 / 已释放句柄 -> COMP_ERR_STATE（不改画布、不加撤销步）。 */
+  comp_engine engine = nullptr;
+  comp_engine_desc engine_desc{};
+  engine_desc.app_name = "compositor-font-handle-guard-tests";
+  engine_desc.version = "1.0.0";
+  engine_desc.backend = COMP_BACKEND_CPU;
+  engine_desc.worker_threads = 1;
+  COMP_CHECK(comp_engine_create(&engine_desc, &engine) == COMP_OK);
+  if (engine == nullptr) return;
+
+  comp_document doc = nullptr;
+  comp_document_desc doc_desc{};
+  doc_desc.width = 64;
+  doc_desc.height = 32;
+  doc_desc.dpi = 72.0f;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &doc) == COMP_OK);
+  if (doc == nullptr) {
+    comp_engine_destroy(engine);
+    return;
+  }
+
+  comp_layer_id layer = 0;
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "text";
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  layer_desc.transform = comp_rect{0, 0, 64, 32};
+  COMP_CHECK(comp_layer_add(doc, &layer_desc, &layer) == COMP_OK);
+
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_TYPE;
+  desc.type.text = "Hi";
+  desc.type.text_length = 2;
+  desc.type.origin_x = 4.0;
+  desc.type.origin_y = 4.0;
+  desc.type.style.font_size = 48.0;
+  desc.type.style.line_height = 1.25;
+  desc.type.style.letter_spacing = 0.0;
+  desc.type.style.antialias = 1;
+  desc.type.color[0] = 255;
+  desc.type.color[1] = 255;
+  desc.type.color[2] = 255;
+  desc.type.color[3] = 255;
+  desc.type.opacity = 1.0f;
+
+  size_t undo_before = 0;
+  COMP_CHECK(comp_document_history_stats(doc, &undo_before, nullptr) == COMP_OK);
+
+  char note[256] = {0};
+  size_t note_size = 0;
+  for (const comp_font bad : {kWild, font}) {
+    note[0] = '\0';
+    note_size = 0;
+    desc.type_font = bad;
+    COMP_CHECK_MSG(comp_tool_apply(doc, layer, &desc, note, sizeof(note), &note_size) ==
+                       COMP_ERR_STATE,
+                   "a wild or released font handle is a state error, never a crash");
+  }
+
+  size_t undo_after = 0;
+  COMP_CHECK(comp_document_history_stats(doc, &undo_after, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(undo_after == undo_before, "a rejected type op adds no undo step");
+
+  comp_document_destroy(doc);
+  comp_engine_destroy(engine);
+}

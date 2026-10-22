@@ -26,7 +26,9 @@ namespace abi {
 /* 句柄 <-> 内部类型转换。 */
 Engine* as_engine(comp_engine handle);
 Document* as_document(comp_document handle);
-/* 字体句柄（P5-1）：与 Engine/Document 同一套 magic 校验。 */
+/* 字体句柄（P5-1）：解引用前先查「存活字体登记表」（is_live_font），
+ * 命中才读 magic——使完全野的句柄也不会段错误（Engine/Document 句柄
+ * 仍是裸 magic 校验，同一类野指针风险对它们依然存在）。 */
 FontFace* as_font(comp_font handle);
 
 /* 校验句柄；失败返回 COMP_ERR_INVALID_ARGUMENT。 */

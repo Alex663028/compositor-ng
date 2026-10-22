@@ -3,7 +3,9 @@
  * comp_font_abi.cpp — 字体加载 C ABI 实现（P5-1）。
  *
  * 句柄就是 FontFace* 的 reinterpret_cast，靠对象内置的 kFontMagic 校验
- * （与 Engine/Document 同一套轻量方案，见 comp_abi_internal.h 的注释）。
+ * （与 Engine/Document 同一套轻量方案，见 comp_abi_internal.h 的注释）；
+ * 解引用前先查「存活字体登记表」（is_live_font，见 domain/font_face.h），
+ * 使完全野的句柄也不会段错误。
  * 字体句柄不挂在引擎上，因此这里没有 last_error 文本，失败原因只由返回码表达；
  * 需要细粒度原因（例如「不是字体」vs「内存不足」）的宿主应看 comp_result。
  */
@@ -17,7 +19,17 @@ namespace abi {
 
 FontFace* as_font(comp_font handle) {
   FontFace* font = reinterpret_cast<FontFace*>(handle);
-  if (font == nullptr || !font->is_alive()) return nullptr;
+  /*
+   * 先查存活登记表，命中才允许解引用读 magic：
+   *   - 完全野的句柄（如 0xDEADBEEF 落在未映射页）在表里查不到，直接判 nullptr，
+   *     不会段错误；调用方据此返回 COMP_ERR_STATE / COMP_ERR_INVALID_ARGUMENT。
+   *   - 已释放的句柄在 ~FontFace 里已注销，同样查不到。
+   *   - 表里命中的指针必然指向尚未析构的对象，读 magic 安全；再核对一次 magic
+   *     是为了挡类型混淆（别的类型对象恰好分配在同一地址）。
+   * 查询只哈希指针值本身，不解引用，野指针查询本身也是安全的。
+   */
+  if (font == nullptr || !is_live_font(font)) return nullptr;
+  if (!font->is_alive()) return nullptr;
   return font;
 }
 
@@ -89,13 +101,14 @@ COMP_API comp_result comp_font_load_memory(const void* data, size_t size, int32_
 
 COMP_API void comp_font_release(comp_font font) {
   FontFace* face = as_font(font);
-  if (face == nullptr) return; /* NULL：安全空操作。 */
+  if (face == nullptr) return; /* NULL / 无效 / 已释放：安全空操作。 */
   /*
-   * 注意：已释放的句柄是**宿主错误**，不是「安全空操作」——as_font 要读对象里的
-   * magic，而对象已经被 delete，读它就是未定义行为。这与 comp_engine_destroy /
-   * comp_document_destroy 同一套约定：句柄一经释放即不可再用，重复释放在契约外。
+   * 句柄一经释放即不可再用（与 comp_engine / comp_document 同一套约定）。
+   * as_font 先查存活登记表再读 magic，因此重复释放（把已 delete 的句柄再传
+   * 进来）不会再解引用已释放的内存——判 nullptr 后原路返回，是安全的空操作；
+   * 但这仍是宿主错误，契约外行为，不要依赖。
    */
-  delete face;
+  delete face; /* ~FontFace 会把自己从登记表注销。 */
 }
 
 COMP_API comp_result comp_font_get_metrics(comp_font font, comp_font_metrics* out_metrics) {

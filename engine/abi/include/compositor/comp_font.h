@@ -79,7 +79,12 @@ COMP_API comp_result comp_font_load_memory(const void* data, size_t size, int32_
  *
  * 句柄一经释放即**不可再用**（与 comp_engine / comp_document 同一套约定）：
  * 释放后句柄指向的对象已经被 delete，再传给任何字体函数（包括第二次 release）
- * 都是宿主错误，契约外行为——不要在释放后保留或复用句柄。
+ * 都是宿主错误——不要在释放后保留或复用句柄。
+ *
+ * 防护：非句柄值（野指针、已释放句柄、别的类型的句柄）传给任何字体函数都
+ * **不会崩溃**——本头所有函数在校验阶段就把它挡成错误码（COMP_ERR_INVALID_ARGUMENT
+ * 等）/ NULL 返回；comp_font_release 对它们是安全空操作。这是刻意的兜底，
+ * 不代表宿主可以放松句柄生命周期管理。
  */
 COMP_API void comp_font_release(comp_font font);
 

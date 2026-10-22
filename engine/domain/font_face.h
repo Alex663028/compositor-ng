@@ -143,6 +143,22 @@ class FontFace {
   std::string postscript_name_{};
 };
 
+/* ABI 句柄安全（as_font 先查表再解引用）。
+ *
+ * 背景：句柄就是 FontFace* 的 reinterpret_cast，靠对象内置 magic 校验。但**完全野
+ * 的**句柄（宿主传了个 0xDEADBEEF 之类的未映射地址）在解引用读 magic 那一刻就
+ * 段错误了，根本走不到比较。登记表记录**当前存活**的 FontFace 指针（构造成功时
+ * 登记、析构时注销），as_font 先查表命中才允许读对象里的 magic。
+ *
+ * 表带一把全局互斥锁；字体不是每像素热路径（一次文字操作栅格化一次），一次
+ * 哈希查找的代价可以忽略。查询只哈希指针值本身，不解引用，所以野指针查询本身
+ * 也是安全的。
+ */
+void register_live_font(FontFace* face) noexcept;
+void unregister_live_font(FontFace* face) noexcept;
+/* 形参刻意不带 const：表里的键是 FontFace*，宿主侧传进来的句柄也是。 */
+bool is_live_font(FontFace* face) noexcept;
+
 }  // namespace compositor
 
 #endif  // COMPOSITOR_DOMAIN_FONT_FACE_H
