@@ -2041,6 +2041,125 @@ def scene_options_bar(shell, checker):
                       "画布变化像素 %d" % pixel_diff(img_choice, img_shape, canvas, 24))
 
 
+def long_bright_rows(img, xa, xb, y_from, y_to, min_px=60, threshold=150):
+    """横跨整幅的蚂蚁线所在行（长亮行）。
+
+    蚂蚁线是白/黑交替虚线且**逐帧走动**，所以任何逐像素对比都会把相位差当成
+    变化；能稳定量的是「哪几行有横贯画布的虚线」。角上手柄只有几个像素，
+    min_px 一挡就滤掉了。边界命令的结果就是「原本 1 条长亮行 -> 环带两侧 2 条」。
+    """
+    rows = []
+    for row in range(int(y_from), int(y_to)):
+        count = count_bright(img, (int(xa), row, int(xb), row + 1), threshold)
+        if count >= min_px:
+            rows.append(row)
+    return rows
+
+
+def brightest_column(img, col_x, y_from, y_to, span=6, threshold=150):
+    """在 col_x 附近找竖直蚂蚁线所在的列（亮像素最多的那一列）。"""
+    best_col, best_count = int(col_x), -1
+    for col in range(int(col_x) - span, int(col_x) + span + 1):
+        count = count_bright(img, (col, int(y_from), col + 1, int(y_to)), threshold)
+        if count > best_count:
+            best_col, best_count = col, count
+    return best_col, best_count
+
+
+def scene_selection_modify(shell, checker):
+    """
+    P0-5 修改补全：选择 > 边界 / 平滑 的「菜单 -> 键入半径 -> 回车」全链路。
+
+    这条功能的失败方式：菜单没接上（回车没反应）、键入态被工具快捷键吃掉
+    （半径永远进不去，P0-5 修过一次）、或者命令执行了但选区没变。四条分别量：
+      1. 前置：矩形选区画出 1 条横贯长亮行（= 上边蚂蚁线）；
+      2. 边界 21 px：原线消失，上下各出现 1 条新蚂蚁线（环带两侧），状态栏报半径；
+      3. 平滑 100 px：直边仍留在原行（开闭运算不动直边），左上角贴身的一段
+         竖边/横边被圆弧换掉（两小块扫描窗从「有虚线」变「全空」）；
+      4. 平滑后 Ctrl+Z 一步，回退到矩形（单条长亮行 + 两块扫描窗的虚线复原）。
+
+    半径取 21 / 100 而不是 3 / 6 / 30：画布默认 49% 缩放，3 个文档像素只有
+    1.5 个屏幕像素，环带两侧的两条虚线会重叠成一条；平滑用 30 时圆角只把边线
+    起点推出约 15 屏幕像素，和蚂蚁线「4 亮 4 暗」的周期同量级，相位一漂就把
+    差异吃掉。100 文档像素约 49 屏幕像素，圆弧在贴角 8~26 px 这一段上离边线
+    还有 6 px 以上，扫描窗里只剩原来的直边虚线，平滑后必空。
+    """
+    scene = "selection_modify"
+    cmd_border = 1058  # main.cpp: kCmdSelectBorder
+    cmd_smooth = 1059  # main.cpp: kCmdSelectSmooth
+    left, top, right, bottom = shell.document_rect()
+    x0, y0 = left + 60, top + 60
+    x1, y1 = right - 60, bottom - 60
+    xa, xb = x0 + 40, x1 - 40  # 中段扫描窗，避开四个角手柄与左右竖线
+
+    shell.select_tool("marquee")
+    shell.drag(x0, y0, x1, y1, steps=10)
+    before = shell.shot("55_modify_rect")
+    rows_before = long_bright_rows(before, xa, xb, y0 - 16, y0 + 16)
+    checker.check(scene, "前置：矩形选区上边是一条横贯长亮行",
+                  len(rows_before) == 1, "长亮行 %s" % rows_before)
+    line_row = rows_before[0] if rows_before else y0
+
+    # 边界 21 px：dilate(11) - erode(10)，外侧比原线外 11 px、内侧内 10 px，
+    # 于是上边变成两条长亮行，原线所在行落进环带内部（不再有虚线）。
+    shell.command(cmd_border)
+    shell.type_text("21")
+    shell.press(VK_RETURN)
+    border = shell.shot("56_modify_border21")
+    rows_border = long_bright_rows(border, xa, xb, y0 - 40, y0 + 40)
+    above = [row for row in rows_border if row < line_row]
+    below = [row for row in rows_border if row > line_row]
+    checker.check(scene, "边界 21 px：原线消失、上下各出一条新蚂蚁线",
+                  len(above) == 1 and len(below) == 1 and len(rows_border) == 2,
+                  "长亮行 %s（原线 %d）" % (rows_border, line_row))
+    status_border = pixel_diff(border, before, shell.layout["status"], 24)
+    checker.check(scene, "状态栏报告「已将选区边界 21 px」", status_border > 20,
+                  "状态栏变化像素 %d" % status_border)
+
+    # 退回矩形再平滑：开运算不动直边，只把直角磨圆 100 px。
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.3)
+    shell.command(cmd_smooth)
+    shell.type_text("100")
+    shell.press(VK_RETURN)
+    smooth = shell.shot("57_modify_smooth100")
+    rows_smooth = long_bright_rows(smooth, xa, xb, y0 - 40, y0 + 40)
+    checker.check(scene, "平滑 100 px：直边留在原行（仍是一条长亮行）",
+                  rows_smooth == [line_row], "长亮行 %s" % rows_smooth)
+
+    # 左上角：圆角最直接的证据是「贴角那一段竖线/横线被圆弧替换掉了」。
+    # 两块扫描窗都紧贴角点、避开了 5×5 的白色角手柄，且只取离角 8~26 px 的一段：
+    # 磨圆 100 文档像素（屏幕上约 49 px）后，圆弧在这一段上离边线还有 6 px 以上，
+    # 不会落进窗里；而原来的直边在这里必然有虚线（窗长跨 2 个以上虚线周期）。
+    # 数「窗内亮像素」与虚线相位无关。
+    col_left, col_count = brightest_column(before, x0, y0 + 40, y0 + 160)
+    v_win = (col_left - 1, line_row + 8, col_left + 2, line_row + 26)
+    h_win = (col_left + 4, line_row, col_left + 26, line_row + 1)
+    v_before = count_bright(before, v_win, 150)
+    h_before = count_bright(before, h_win, 150)
+    v_smooth = count_bright(smooth, v_win, 150)
+    h_smooth = count_bright(smooth, h_win, 150)
+    checker.check(scene, "前置：贴角两窗（竖边/横边各一段）都有虚线",
+                  abs(col_left - x0) <= 2 and col_count >= 30 and
+                  v_before >= 6 and h_before >= 6,
+                  "左边线列 %d(%d)、竖窗 %d、横窗 %d" %
+                  (col_left, col_count, v_before, h_before))
+    checker.check(scene, "平滑 100 px 磨圆直角（贴角两窗清空）",
+                  v_smooth == 0 and h_smooth == 0,
+                  "竖窗 %d->%d、横窗 %d->%d" % (v_before, v_smooth, h_before, h_smooth))
+
+    # 撤销一步：回到矩形——单条长亮行在原行，两块扫描窗的虚线也都回来。
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.3)
+    undone = shell.shot("58_modify_smooth_undo")
+    rows_undo = long_bright_rows(undone, xa, xb, y0 - 40, y0 + 40)
+    v_undo = count_bright(undone, v_win, 150)
+    h_undo = count_bright(undone, h_win, 150)
+    checker.check(scene, "平滑撤销一步后回到矩形（角部虚线复原）",
+                  rows_undo == [line_row] and v_undo >= 6 and h_undo >= 6,
+                  "长亮行 %s、竖窗 %d、横窗 %d" % (rows_undo, v_undo, h_undo))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -2077,6 +2196,7 @@ SCENES = [    ("start", scene_start, ()),
     ("clipboard", scene_clipboard, ()),
     ("close_prompt", scene_close_prompt, ()),
     ("options_bar", scene_options_bar, ()),
+    ("selection_modify", scene_selection_modify, ()),
 ]
 
 

@@ -163,6 +163,9 @@ constexpr UINT kCmdSelectInvert = 1033;
 /* P0-4：扩展/收缩走同一个键入态（op 由菜单项决定），载入用当前图层像素。 */
 constexpr UINT kCmdSelectExpand = 1047;
 constexpr UINT kCmdSelectContract = 1048;
+/* P0-5：边界/平滑复用一个键入选区半径的输入态（op 决定量程 1..500 / 1..100）。 */
+constexpr UINT kCmdSelectBorder = 1058;
+constexpr UINT kCmdSelectSmooth = 1059;
 constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
@@ -762,14 +765,21 @@ struct ShellState {
   std::wstring type_input;
   /* 新选区羽化半径（Shift+F 键入）：形状/套索/魔棒提交时同事务应用。 */
   int selection_feather = comp_ui::kMinSelectionFeather;
-  std::wstring feather_input; /* 羽化键入缓冲；非空 = 输入态 */
+  std::wstring feather_input; /* 羽化键入缓冲 */
+  /*
+   * 输入态必须与「缓冲是否为空」分开记：刚进输入态时缓冲就是空的，若拿
+   * `!empty()` 当判据，第一个数字会被当成工具快捷键吃掉、缓冲永远填不上
+   * （P0-5 修：此前扩展/收缩在壳里实际不可用）。
+   */
+  bool feather_input_active = false;
   /*
    * 扩展/收缩（P0-4）：同一个键入态服务两个菜单项，op 记住这次是扩还是缩，
    * 回车时才真正调 comp_selection_modify。0 被引擎拒（见 ui_core 的
    * kMinSelectionGrow 注释），所以这里额外记一版「上次用的半径」给提示用。
    */
   comp_selection_modify_op modify_op = COMP_SELECTION_EXPAND;
-  std::wstring modify_input; /* 扩展/收缩半径键入缓冲；非空 = 输入态 */
+  std::wstring modify_input; /* 扩展/收缩/边界/平滑半径键入缓冲 */
+  bool modify_input_active = false;
   int selection_grow = comp_ui::kMinSelectionGrow;
   /*
    * 色彩范围（P0-4 第二批）：对齐上游 ColorRangeSheet——打开面板就开一个显式
@@ -2661,6 +2671,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_enabled_recursive(menu, kCmdSelectInvert, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectExpand, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectContract, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectBorder, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectSmooth, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectLoadPixels, enabled.selection_load_pixels);
 }
 
@@ -5211,6 +5223,7 @@ void refresh_feather_input_status(ShellState& shell) {
 
 void begin_feather_input(ShellState& shell) {
   shell.feather_input.clear();
+  shell.feather_input_active = true;
   wchar_t buffer[192];
   wsprintfW(buffer, L"新选区羽化：键入 0..%d 后回车（当前 %d px）",
             comp_ui::kMaxSelectionFeather, shell.selection_feather);
@@ -5226,6 +5239,7 @@ void commit_feather_input(ShellState& shell) {
   const int value =
       comp_ui::clamp_selection_feather(_wtoi(shell.feather_input.c_str()));
   shell.feather_input.clear();
+  shell.feather_input_active = false;
   shell.selection_feather = value;
 
   wchar_t buffer[224];
@@ -5252,43 +5266,71 @@ void commit_feather_input(ShellState& shell) {
 /* --------------------------------------------------- 扩展 / 收缩（P0-4） */
 
 /*
- * 扩展与收缩共用一套键入态：菜单点哪条只决定 modify_op，半径的键入/退格/
- * 回车/Esc 语义完全一致（与羽化同款），所以不做两份状态机。
+ * 扩展/收缩/边界/平滑共用一套键入态：菜单点哪条只决定 modify_op，半径的键入/
+ * 退格/回车/Esc 语义完全一致（与羽化同款），所以不做四份状态机。量程按 op 分：
+ * 扩展/收缩/边界都是 1..500（引擎 kMaxSelectionGrow），平滑 1..100。
  */
 const wchar_t* modify_op_name(comp_selection_modify_op op) {
-  return op == COMP_SELECTION_CONTRACT ? L"收缩" : L"扩展";
+  switch (op) {
+    case COMP_SELECTION_CONTRACT:
+      return L"收缩";
+    case COMP_SELECTION_BORDER:
+      return L"边界";
+    case COMP_SELECTION_SMOOTH:
+      return L"平滑";
+    case COMP_SELECTION_EXPAND:
+    default:
+      return L"扩展";
+  }
+}
+
+int modify_op_min(comp_selection_modify_op op) {
+  return op == COMP_SELECTION_SMOOTH ? comp_ui::kMinSelectionSmooth : comp_ui::kMinSelectionGrow;
+}
+
+int modify_op_max(comp_selection_modify_op op) {
+  return op == COMP_SELECTION_SMOOTH ? comp_ui::kMaxSelectionSmooth : comp_ui::kMaxSelectionGrow;
+}
+
+int modify_op_clamp(comp_selection_modify_op op, int value) {
+  return op == COMP_SELECTION_SMOOTH ? comp_ui::clamp_selection_smooth(value)
+                                     : comp_ui::clamp_selection_grow(value);
 }
 
 void refresh_modify_input_status(ShellState& shell) {
   wchar_t buffer[192];
   wsprintfW(buffer, L"选区%s：%s px（回车应用 / Esc 取消，%d..%d）",
             modify_op_name(shell.modify_op), shell.modify_input.c_str(),
-            comp_ui::kMinSelectionGrow, comp_ui::kMaxSelectionGrow);
+            modify_op_min(shell.modify_op), modify_op_max(shell.modify_op));
   set_status(shell, buffer);
 }
 
 void begin_modify_input(ShellState& shell, comp_selection_modify_op op) {
+  /* 重开一次 = 丢掉上一轮的半截输入（鼠标还能在键入态里点菜单）。 */
+  shell.modify_input.clear();
+  shell.modify_input_active = false;
   if (shell.document == nullptr) {
     set_status(shell, L"选区：还没有文档");
     return;
   }
   /* 空选区扩展没有意义（引擎会如实返回无变化），先在入口拦下来。 */
   if (!shell.selection_active) {
-    set_status(shell, L"选区：先建立一个选区，再扩展/收缩");
+    set_status(shell, L"选区：先建立一个选区，再扩展/收缩/边界/平滑");
     return;
   }
   shell.modify_op = op;
-  shell.modify_input.clear();
+  shell.modify_input_active = true;
+  const int previous = modify_op_clamp(op, shell.selection_grow);
   wchar_t buffer[192];
   wsprintfW(buffer, L"选区%s：键入 %d..%d px 后回车（上次 %d px）",
-            modify_op_name(op), comp_ui::kMinSelectionGrow, comp_ui::kMaxSelectionGrow,
-            shell.selection_grow);
+            modify_op_name(op), modify_op_min(op), modify_op_max(op), previous);
   set_status(shell, buffer);
 }
 
 void commit_modify_input(ShellState& shell) {
   const int typed = _wtoi(shell.modify_input.c_str());
   shell.modify_input.clear();
+  shell.modify_input_active = false;
   /* 0 是「用户还没键入」的常见残留，按下限 1 处理会有 1px 的意外扩展，
    * 所以 0 先拦成提示，不写进画布也不占撤销步。 */
   if (typed <= 0) {
@@ -5303,7 +5345,7 @@ void commit_modify_input(ShellState& shell) {
     set_status(shell, L"选区：当前没有选区可改");
     return;
   }
-  const int value = comp_ui::clamp_selection_grow(typed);
+  const int value = modify_op_clamp(shell.modify_op, typed);
   shell.selection_grow = value;
 
   int32_t changed = 0;
@@ -10197,6 +10239,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdSelectContract:
       begin_modify_input(shell, COMP_SELECTION_CONTRACT);
       break;
+    /* ---- P0-5：修改补全（边界 / 平滑），同样走键入态 ---- */
+    case kCmdSelectBorder:
+      begin_modify_input(shell, COMP_SELECTION_BORDER);
+      break;
+    case kCmdSelectSmooth:
+      begin_modify_input(shell, COMP_SELECTION_SMOOTH);
+      break;
     case kCmdSelectLoadPixels:
       load_layer_pixels_selection(shell);
       break;
@@ -14169,15 +14218,17 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
   }
 
   /* 羽化半径键入态（Shift+F）：只吃数字/退格/回车/Esc，其余键一律屏蔽。 */
-  if (!shell.feather_input.empty()) {
+  if (shell.feather_input_active) {
     if (key == VK_ESCAPE) {
       shell.feather_input.clear();
+      shell.feather_input_active = false;
       set_status(shell, L"已取消羽化输入");
       return;
     }
     if (key == VK_BACK) {
       shell.feather_input.pop_back();
       if (shell.feather_input.empty()) {
+        shell.feather_input_active = false;
         set_status(shell, L"已取消羽化输入");
       } else {
         refresh_feather_input_status(shell);
@@ -14195,16 +14246,18 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 输入态下屏蔽其它快捷键，避免误触发 */
   }
 
-  /* 扩展/收缩半径键入态（P0-4）：同款输入机，回车才落盘（一步撤销）。 */
-  if (!shell.modify_input.empty()) {
+  /* 扩展/收缩/边界/平滑半径键入态（P0-4 / P0-5）：同款输入机，回车才落盘。 */
+  if (shell.modify_input_active) {
     if (key == VK_ESCAPE) {
       shell.modify_input.clear();
+      shell.modify_input_active = false;
       set_status(shell, L"已取消选区修改");
       return;
     }
     if (key == VK_BACK) {
       shell.modify_input.pop_back();
       if (shell.modify_input.empty()) {
+        shell.modify_input_active = false;
         set_status(shell, L"已取消选区修改");
       } else {
         refresh_modify_input_status(shell);
@@ -16984,6 +17037,8 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectExpand, L"扩展(&E)...");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectContract, L"收缩(&O)...");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectBorder, L"边界(&B)...");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectSmooth, L"平滑(&S)...");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);

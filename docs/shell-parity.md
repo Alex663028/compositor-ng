@@ -2263,6 +2263,125 @@ Cancel                    → 只 doc_dialog_close，文档与撤销栈都不动
 `check_tool_table.py` PASS（20 工具）；`run_regression.py --require-ohos` 6/6；
 壳自检 257 项 failures=0、SHA `377DE660D48AC933…` 与基线逐字节一致。
 
+### 5.50 选区修改补全：边界 / 平滑（P0-5 第一批，2026-10-22）
+
+P0-4 接了扩展/收缩，P0-5 的「修改补全」还剩四条：边界、平滑、扩展至相似、选区变换。
+本批落地前两条——引擎侧只**追加两个枚举值**（`COMP_SELECTION_BORDER = 3`、
+`COMP_SELECTION_SMOOTH = 4`），导出数仍 **146**；两条命令复用 P0-4 已经打通的
+`comp_selection_modify` 通道，ABI 没有新增函数。
+
+#### 边界：环带总宽 amount，奇偶都对称
+
+```
+outer = dilate(ceil(amount/2))          # resize_base 的正距离
+inner = erode(floor(amount/2))          # resize_base 的负距离；0 时跳过
+band  = outer * (255 - inner) / 255     # 8 位乘法相减，软边仍是软边
+```
+
+`amount = 1 → 只有外侧 1 px`，`2 → 外 1 + 内 1`，`3 → 外 2 + 内 1`，环带总宽恒为
+`amount`，奇数时外侧多 1 px。这与 PS 的 Select > Modify > Border 同口径（Border 21
+得到约 21 px 宽的环带）。**本批同时修了一处文档与实现不一致**：`selection.h`、
+`comp_selection.h` 与 `border_base()` 的注释原先写「两侧各 amount 像素（总宽
+2×amount）」，而代码、单测（`selection_border_keeps_a_ring_on_both_sides` 断言
+Border 2 只保留 7/8 与 23/24 各 2 列）和实测（Border 21 → 屏幕上原线上下各一条
+新蚂蚁线，间距 10 px ≈ 20 文档像素）都是「总宽 amount」。改的是注释，不是行为。
+
+覆盖率相减**不能**用布尔与非：羽化过的边缘是半选，布尔相减会把它变成硬边；8 位乘法
+相减后半选仍是半选，这正是 PS 里「羽化后的选区做边界」的观感。两趟外扩/内缩都复用
+`resize_base` 的精确欧氏距离场，所以环带内外沿的位置与扩缩命令一致。
+
+#### 平滑：开 + 闭的形态学，直边逐像素不变
+
+```
+opened = dilate(erode(mask, r), r)      # 削掉比 2r 窄的凸起/毛刺
+closed = erode(dilate(opened, r), r)    # 补掉比 2r 窄的凹口
+```
+
+`erode_binary` / `dilate_binary` 都走 `edt_1d` / `edt_2d` 的**精确欧氏距离场**，
+不是方框核；判定用 `sqrt(field) - 0.5 >= r`（腐蚀）与 `<= r`（膨胀），所以整像素
+直边是恒等的（腐蚀再膨胀把它逐字节复原），只有拐角与毛刺被改。窗口取
+`bounds ± (r + 2)` 并补一圈零边界，画布外的部分按「未选中」处理——这是腐蚀的
+正确语义，也是窗口不需要整幅图的原因。输出是二值 0/255：平滑的定义是改形状，
+不是改软边；要软边请随后羽化。半径 1..100（`kMaxSelectionSmooth`）。
+
+`smooth_base` 的结果与旧蒙版**逐字节相等**时，`selection_modify` 走 `masks_equal`
+短路、`out_changed = 0`，壳不占撤销步——所以「对规整矩形反复平滑」不会堆出一串
+空撤销。
+
+#### 壳侧：菜单、键入态与量程
+
+| 项 | 值 |
+|----|----|
+| `kCmdSelectBorder` | `1058` |
+| `kCmdSelectSmooth` | `1059` |
+| 菜单项 | 选择 > 边界(&B)... / 平滑(&S)... |
+| 量程 | 边界 1..500（与扩展/收缩同为 `kMaxSelectionGrow`）、平滑 1..100 |
+| 键入态 | 与扩展/收缩/羽化共用一套：`begin_modify_input` → 数字/退格/回车/Esc → `commit_modify_input` |
+
+四条「修改」命令的半径量程不同，但状态机只有一份：`modify_op` 记住是哪条命令，
+`modify_op_min/max/clamp` 按 op 选量程——这样菜单、快捷键、键入解析不会各写一遍
+夹取逻辑。上次用过的半径共用 `selection_grow` 一个字段，`begin_modify_input` 用
+`modify_op_clamp(op, selection_grow)` 显示「上次 N px」，从边界切到平滑时 500 会
+被夹成 100 而不是显示一个必然非法的值。0 在壳侧就拦成提示（`半径必须 ≥ 1 px`），
+不把必然 `INVALID_ARGUMENT` 的调用打到引擎上。
+
+顺带修掉一个 P0-4 遗留的输入态缺陷：此前「缓冲非空」被当成「正在键入」，于是在空
+缓冲上按退格会被工具快捷键吃掉、重开菜单也不会清状态。现在显式记录
+`feather_input_active` / `modify_input_active` 两个布尔，键入态的开关与缓冲内容
+解耦（Esc 退出、回车提交、菜单重开都复位）。这个缺陷 `--selftest` 测不到（不走
+消息泵），是本批用视觉探针量出来的。
+
+#### 测试侧
+
+- `tests/test_selection.cpp`：`selection_border_keeps_a_ring_on_both_sides`
+  断言 Border 2/1/3 的环带位置、中心为空、拐角抗锯齿（`0 < c < 255`）、不动羽化
+  半径；`selection_smooth_rounds_corners_and_keeps_straight_edges` 断言直边四边
+  逐像素保留（255）、直角被磨圆（`< 255`）、2 px 宽的刺被 2 px 半径削掉、
+  蒙版总和下降。
+- `tests/test_ui_core.cpp`：`ui_core_selection_smooth_clamps_to_engine_range`
+  （0 / 负数 → 1，100 边界保持，101 / 5000 → 100，并与 `kMin/kMaxSelectionSmooth`
+  同值）。
+- 单测 628 → **631 例 / 0 失败**。
+
+#### 视觉探针 `selection_modify`（7 条）
+
+蚂蚁线是**白/黑交替且逐帧走动**的虚线，所以任何逐像素对比都会把相位差当成几何差
+（本批一开始就踩了：拿 1 px 窗口做 `pixel_diff`，读到「上 5 下 237」）。能稳定量的
+只有结构：哪几行有横贯画布的长亮行、贴角的小窗口里有没有虚线。新增两个助手
+`long_bright_rows()`（长亮行扫描，`min_px` 滤掉角手柄）与 `brightest_column()`
+（定位竖边所在列）。
+
+| # | 断言 | 实测 |
+|---|------|------|
+| 1 | 前置：矩形上边是 1 条横贯长亮行 | `[238]` |
+| 2 | 边界 21 px：原线消失、上下各出一条 | `[233, 243]`（原线 238；两侧间距 10 屏幕 px ≈ 20 文档像素，与「总宽 21」一致） |
+| 3 | 状态栏报半径 | 状态栏变化 2286 像素 |
+| 4 | 平滑 100 px：直边留在原行 | `[238]`（开闭运算对直边恒等） |
+| 5 | 前置：贴角两窗（竖 3×18、横 22×1）都有虚线 | 10 / 10 |
+| 6 | 平滑 100 px 磨圆直角（两窗清空） | 10→0 / 10→0 |
+| 7 | 平滑撤销一步回到矩形 | 长亮行 `[238]`、两窗 8 / 12 复原 |
+
+半径取 21 / 100 而不是 3 / 30 是量出来的：49% 缩放下虚线是「4 亮 4 暗」8 屏幕像素
+周期，30 文档像素的圆角只把边线起点推出约 15 屏幕像素，和相位同量级；100 文档像素
+≈ 49 屏幕像素，贴角 8~26 px 这一段的圆弧离边线还有 6 px 以上，扫描窗里只剩原来的
+直边虚线，平滑后必空。另外每个角上有 5×5 的白色选中手柄，扫描窗必须避开它（这也是
+「取第一个亮像素」方案失败的原因：手柄被当成选区边线）。
+
+#### 已知边界
+
+- **扩展至相似（Grow）没做**：按邻居颜色扩散需要新的 ABI 导出（选区 + 参考点 +
+  容差），本批坚持零新增，留到下一批。
+- **选区变换（Transform Selection）没做**：§5.44 的 8 把手只改矩形选区，任意
+  路径/魔法棒选区的自由变换需要新的重采样入口。
+- 平滑是二值输出：半径 100 会把羽化过的软边压成硬边（PS 同款行为），需要软边请
+  平滑后再羽化。
+- 边界在画布边缘会内缩（外扩被画布裁掉），与扩展命令同口径。
+
+`visual_check.py` **122 条 / 23 场景 / 0 失败**；单测 **631 例 / 0 失败**；
+`check_tool_table.py` PASS（20 工具）；`run_regression.py --require-ohos` 6/6；
+壳自检 257 项 failures=0、SHA `377DE660D48AC933…` 与基线逐字节一致。
+
+
 
 
 

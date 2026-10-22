@@ -1586,6 +1586,20 @@ COMP_TEST(ui_core_selection_grow_clamps_to_engine_range) {
   COMP_CHECK(comp_ui::step_selection_grow(1, -5) == 1);
 }
 
+/* ------------------------------------------- P0-5: 边界 / 平滑半径 */
+
+COMP_TEST(ui_core_selection_smooth_clamps_to_engine_range) {
+  /* 边界复用扩展/收缩的 1..500；平滑是 PS 同量程的 1..100。 */
+  COMP_CHECK(comp_ui::clamp_selection_smooth(0) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_smooth(-3) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_smooth(1) == 1);
+  COMP_CHECK(comp_ui::clamp_selection_smooth(100) == 100);
+  COMP_CHECK(comp_ui::clamp_selection_smooth(101) == 100);
+  COMP_CHECK(comp_ui::clamp_selection_smooth(5000) == 100);
+  COMP_CHECK(comp_ui::kMinSelectionSmooth == 1);
+  COMP_CHECK(comp_ui::kMaxSelectionSmooth == 100);
+}
+
 COMP_TEST(ui_core_coverage_intersects_selection_mask) {
   /* 255 旁路、0 全丢、中间值按比例并四舍五入。 */
   uint8_t coverage[] = {255, 255, 255, 200, 0, 0};

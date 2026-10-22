@@ -52,7 +52,9 @@ typedef enum comp_selection_combine {
 typedef enum comp_selection_modify_op {
   COMP_SELECTION_FEATHER  = 0, /* 羽化（按 sqrt 叠加，上限 250） */
   COMP_SELECTION_EXPAND   = 1, /* 外扩（被画布裁掉） */
-  COMP_SELECTION_CONTRACT = 2  /* 内缩（画布边缘也一起内缩） */
+  COMP_SELECTION_CONTRACT = 2, /* 内缩（画布边缘也一起内缩） */
+  COMP_SELECTION_BORDER   = 3, /* 边界：沿轮廓内外总宽 amount 像素的环带 */
+  COMP_SELECTION_SMOOTH   = 4  /* 平滑：开+闭形态学，圆角但保留直边 */
 } comp_selection_modify_op;
 
 /*
@@ -119,11 +121,18 @@ COMP_API comp_result comp_selection_invert(comp_document document, int32_t* out_
 /* ----------------------------------------------------------- 羽化/扩缩 */
 
 /*
- * op = COMP_SELECTION_FEATHER / EXPAND / CONTRACT。
- * amount 范围：feather 1..250，expand/contract 1..500。
+ * op = COMP_SELECTION_FEATHER / EXPAND / CONTRACT / BORDER / SMOOTH。
+ * amount 范围：feather 1..250，expand/contract/border 1..500，smooth 1..100。
  * 没有选区或显式空选区时一律无操作（out_changed = 0）。
  * 扩缩是精确的欧氏距离场（不是方框），边缘按整像素中心计算：
  * 对整像素选区，「外扩 N」与「内缩 N」后的边界落在整像素上。
+ *
+ * BORDER 沿选区轮廓保留一条**总宽 amount 像素**的环带（外扩 ceil(amount/2)
+ * 减内缩 floor(amount/2)，奇数时外侧多 1 px），覆盖率按 8 位乘法相减，羽化过
+ * 的边缘相减后仍是软边；
+ * SMOOTH 走开+闭的形态学，圆化拐角与毛刺但逐像素保留直边，本来就规整的选区
+ * 是恒等变换（out_changed = 0，不产生撤销步）。两者都只改基础蒙版、不动
+ * feather 半径。
  */
 COMP_API comp_result comp_selection_modify(comp_document document,
                                            comp_selection_modify_op op,

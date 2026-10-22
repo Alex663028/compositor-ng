@@ -16,6 +16,8 @@
 > 视觉探针 97 → **102 条**（只追加 `close_prompt` 场景）。
 > **同日第五批**：P0-10 工具选项栏（工具参数从右栏搬到工具条下，零 ABI 新增），
 > 视觉探针 102 → **115 条 / 22 场景**（只追加 `options_bar` 场景）；DPI 与浮动面板仍未做。
+> **同日第六批**：P0-5 选区修改补全（边界 / 平滑，**只追加两个枚举值**、导出数仍 146），
+> 视觉探针 115 → **122 条 / 23 场景**（只追加 `selection_modify` 场景）；Grow/Similar 与变换选区仍未做。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -148,9 +150,17 @@
     （老程序兼容面），也不做 ICC 转换（与 P0-9 关联）。
 
 ### P0-5 选区持久化与高级编辑
+- **已落地（修改补全第一批，2026-10-22，零导出新增）**：`comp_selection_modify`
+  尾部追加 `COMP_SELECTION_BORDER = 3`（环带总宽 N，外扩 ceil(N/2) 减内缩
+  floor(N/2)）与 `COMP_SELECTION_SMOOTH = 4`（开+闭形态学，精确欧氏距离场，
+  直边逐像素保留、拐角磨圆，半径 1..100）。壳侧菜单 1058/1059、与扩展/收缩共用
+  键入态；顺带修掉「缓冲非空即键入态」的输入态缺陷。详见 `docs/shell-parity.md`
+  §5.50、`docs/manual-test.md` M49、`visual_check.py --scene selection_modify`（7 条）。
+  **仍未做**：Grow / Similar（需新导出，按邻居颜色扩散）、通道 save/load selection、
+  变换选区。
 - **现状**：已有全选/取消/反选、色彩范围、扩展/收缩、按图层像素载入、羽化、路径、矩形/椭圆/套索/魔棒（`comp_selection.h` 18 个导出）。**缺**：
   - **通道**：没有任何「alpha 通道 / 存储选区」概念（ABI 无 save/load selection；`.comp` manifest 也无 selection 键，`comp_file.cpp:382-473`）；
-  - **修改**只有羽化/扩展/收缩三种（`comp_selection.h:52-56`），无边界 / 平滑 / Grow / Similar；
+  - **修改**已有羽化/扩展/收缩/~~边界 / 平滑~~（上条已补），仍无 Grow / Similar；
   - 无变换选区（有手柄缩放，但没有「变换选区」命令与数值输入）；
   - 无快速选择 / 对象选择 / 快速蒙版 / Select and Mask（细化边缘、输出到蒙版/新图层）。
 - **PS 行为**：存储选区到通道、载入选区、修改菜单全集、变换选区、快速选择、快速蒙版、选择并遮住。
@@ -320,7 +330,7 @@
 ## 8. 顺带记录的文档漂移（不属于功能缺口，但会误导排期）
 
 - README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **146** 个（尾部追加 `comp_layer_get_pixels` 之后）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **115 条 / 22 场景**（2026-10-22 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar` 后；原 80 条含 IME 6/6）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **122 条 / 23 场景**（2026-10-22 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
 - §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
 
@@ -336,7 +346,7 @@
 | 无图像/画布大小菜单 | `shells/windows/src/main.cpp:14859-14866`；ABI 有 `comp_engine.h:84,94`（**2026-10-22 已接线，见 P0-2**） |
 | 单文档 | `ShellState` 仅一个 `comp_document`；`main.cpp:8166` |
 | 无剪贴板 | 全仓 `Clipboard|CF_DIB` 0 命中；ABI 无 copy/paste |
-| 选区仅三种修改 | `engine/abi/include/compositor/comp_selection.h:52-56` |
+| 选区修改仅五种 | `engine/abi/include/compositor/comp_selection.h:52-58`（羽化/扩/缩/边界/平滑；Grow/Similar 仍无） |
 | 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767` |
 | 单一随包字体 | `shells/windows/src/main.cpp:6077` |
 | 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
@@ -349,4 +359,4 @@
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
-| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-22 五批改动后逐字节复核未变）；视觉探针 **115/115 / 22 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`） |
+| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-22 六批改动后逐字节复核未变）；视觉探针 **122/122 / 23 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`） |

@@ -352,6 +352,144 @@ bool resize_base(const SelectionState& selection, int32_t delta, std::vector<uin
   return true;
 }
 
+/* ------------------------------------------------------------------ 边界 */
+
+/*
+ * 边界（Border）：沿选区轮廓保留一条**总宽 amount 像素**的环带。
+ *
+ * 用「外扩 ceil(amount/2)」减「内缩 floor(amount/2)」表达，两趟都复用
+ * resize_base 的精确距离场与抗锯齿覆盖率，所以环带内外沿仍是软的，不会
+ * 突然变成硬边。环带总宽恒为 amount，奇偶半径都对称（奇数时外侧多 1 px）：
+ *   amount = 1 -> 外扩 1 px − 原选区，只有外侧 1 px；
+ *   amount = 2 -> 外扩 1 px − 内缩 1 px，外 1 + 内 1；
+ *   amount = 3 -> 外扩 2 px − 内缩 1 px，外 2 + 内 1。
+ * 参数口径取「环带总宽」而不是「单侧宽度」：与 PS 的 Select > Modify > Border
+ * 一致（Border 21 得到约 21 px 宽的环带，而不是两侧各 21 px）。
+ * 覆盖率相减用 8 位乘法（a * (255 - b) / 255），不是布尔与非——半选的边缘
+ * 相减后仍然是半选，这正是 PS 里「羽化后的选区做边界」看到的样子。
+ */
+bool border_base(const SelectionState& selection, int32_t amount, std::vector<uint8_t>* out) {
+  if (amount < 1) return false;
+  std::vector<uint8_t> outer;
+  if (!resize_base(selection, (amount + 1) / 2, &outer)) return false;
+
+  const int32_t shrink = amount / 2;
+  std::vector<uint8_t> inner;
+  if (shrink > 0) {
+    if (!resize_base(selection, -shrink, &inner)) return false;
+  } else {
+    inner = selection.base.pixel_data();
+  }
+  if (inner.size() != outer.size()) return false;
+
+  out->resize(outer.size());
+  for (size_t i = 0; i < outer.size(); ++i) {
+    const int32_t band = static_cast<int32_t>(outer[i]) * (255 - static_cast<int32_t>(inner[i]));
+    (*out)[i] = static_cast<uint8_t>((band + 127) / 255);
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------------ 平滑 */
+
+/*
+ * 二值形态学的一步：用欧氏距离场的符号判断像素是否保留，半径按像素定义。
+ * 与 resize_base 同口径——覆盖率满的像素到最近反色像素的距离减去 0.5 才是
+ * 「到边界」的距离，所以半径 1 恰好削掉/长出一圈整像素。
+ */
+std::vector<uint8_t> erode_binary(const std::vector<uint8_t>& inside, int32_t width,
+                                  int32_t height, int32_t radius) {
+  std::vector<float> field;
+  edt_2d(inside, width, height, /*seeds_are_inside=*/false, &field);
+  std::vector<uint8_t> out(inside.size(), 0);
+  const float limit = static_cast<float>(radius);
+  for (size_t i = 0; i < inside.size(); ++i) {
+    if (inside[i] == 0) continue;
+    if (std::sqrt(field[i]) - 0.5f >= limit) out[i] = 1;
+  }
+  return out;
+}
+
+std::vector<uint8_t> dilate_binary(const std::vector<uint8_t>& inside, int32_t width,
+                                   int32_t height, int32_t radius) {
+  std::vector<float> field;
+  edt_2d(inside, width, height, /*seeds_are_inside=*/true, &field);
+  std::vector<uint8_t> out(inside.size(), 0);
+  const float limit = static_cast<float>(radius);
+  for (size_t i = 0; i < inside.size(); ++i) {
+    if (inside[i] != 0) {
+      out[i] = 1;
+      continue;
+    }
+    if (std::sqrt(field[i]) - 0.5f <= limit) out[i] = 1;
+  }
+  return out;
+}
+
+/*
+ * 平滑（Smooth）：先开后闭的形态学，圆化凹陷与凸起但不动直边。
+ *
+ *   open  = dilate(erode(mask, N), N)  —— 削掉比 2N 窄的凸起/毛刺；
+ *   close = erode(dilate(open, N), N)  —— 补上比 2N 窄的缺口。
+ *
+ * 直边在开+闭下逐像素还原（先削一圈再长回一圈），所以「本来就规整的矩形
+ * 选区做平滑」是恒等变换、不产生撤销步；只有拐角/锯齿才会被磨圆。这与 PS
+ * 「Smooth 把边界磨成圆弧」的观感一致，也是为什么它不能用模糊+阈值实现
+ * （那会把直边也糊掉）。
+ *
+ * 只在 bounds 外扩 N+2 的窗口里算；窗口外本来就是 0，形态学也不会把选区
+ * 长出这个范围。窗口贴着画布边时，外层补一圈 0 表示画布外——与 resize_base
+ * 的 Contract 同口径（选区贴边时平滑会向内收，而不是把画布外当选中）。
+ * 输出是 0/255 的二值蒙版：平滑不生产新的半选边缘（半选由 feather 负责）。
+ */
+bool smooth_base(const SelectionState& selection, int32_t radius, std::vector<uint8_t>* out) {
+  const int32_t width = selection.base.width;
+  const int32_t height = selection.base.height;
+  if (width <= 0 || height <= 0) return false;
+  const std::vector<uint8_t>& base = selection.base.pixel_data();
+  if (base.size() != static_cast<size_t>(width) * static_cast<size_t>(height)) return false;
+
+  int32_t bx0 = 0;
+  int32_t by0 = 0;
+  int32_t bx1 = 0;
+  int32_t by1 = 0;
+  if (!nonzero_bounds(selection.base, &bx0, &by0, &bx1, &by1)) return false;
+
+  const int32_t pad = radius + 2;
+  const int32_t wx0 = std::max(0, bx0 - pad);
+  const int32_t wy0 = std::max(0, by0 - pad);
+  const int32_t wx1 = std::min(width, bx1 + 1 + pad); /* 半开 */
+  const int32_t wy1 = std::min(height, by1 + 1 + pad);
+  const int32_t ww = wx1 - wx0;
+  const int32_t wh = wy1 - wy0;
+
+  const int32_t gw = ww + 2;
+  const int32_t gh = wh + 2;
+  std::vector<uint8_t> grid(static_cast<size_t>(gw) * static_cast<size_t>(gh), 0);
+  for (int32_t y = 0; y < wh; ++y) {
+    const uint8_t* source = selection.base.row(wy0 + y);
+    uint8_t* target = grid.data() + static_cast<size_t>(y + 1) * gw + 1;
+    for (int32_t x = 0; x < ww; ++x) {
+      target[x] = source[wx0 + x] >= 128 ? 1 : 0;
+    }
+  }
+
+  const std::vector<uint8_t> opened = dilate_binary(
+      erode_binary(grid, gw, gh, radius), gw, gh, radius);
+  const std::vector<uint8_t> closed = erode_binary(
+      dilate_binary(opened, gw, gh, radius), gw, gh, radius);
+
+  out->assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+  for (int32_t y = 0; y < wh; ++y) {
+    uint8_t* target = out->data() + static_cast<size_t>(wy0 + y) * width + wx0;
+    const uint8_t* source = closed.data() + static_cast<size_t>(y + 1) * gw + 1;
+    for (int32_t x = 0; x < ww; ++x) {
+      target[x] = source[x] != 0 ? 255 : 0;
+    }
+  }
+  return true;
+}
+
 /* ------------------------------------------------------------------ 羽化 */
 
 /* 一维盒式模糊（边缘钳制 = 上游 clampedToExtent）：滑动窗口 O(1) / 像素。 */
@@ -651,8 +789,10 @@ bool selection_invert(SelectionState* selection, bool* changed) {
 bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, bool* changed) {
   if (changed != nullptr) *changed = false;
   if (selection == nullptr) return false;
-  if (op < kSelectionFeather || op > kSelectionContract) return false;
-  const int32_t limit = op == kSelectionFeather ? kMaxSelectionFeather : kMaxSelectionGrow;
+  if (op < kSelectionFeather || op > kSelectionSmooth) return false;
+  const int32_t limit = op == kSelectionFeather ? kMaxSelectionFeather
+                        : op == kSelectionSmooth ? kMaxSelectionSmooth
+                                                 : kMaxSelectionGrow;
   if (amount < 1 || amount > limit) return false;
   /* 没有选区或显式空选区：上游 canModifySelection == false，一律无操作。 */
   if (!selection->active || selection_is_empty(*selection)) return true;
@@ -670,9 +810,15 @@ bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, boo
     return true;
   }
 
-  const int32_t delta = op == kSelectionExpand ? amount : -amount;
   std::vector<uint8_t> next;
-  if (!resize_base(*selection, delta, &next)) return false;
+  if (op == kSelectionBorder) {
+    if (!border_base(*selection, amount, &next)) return false;
+  } else if (op == kSelectionSmooth) {
+    if (!smooth_base(*selection, amount, &next)) return false;
+  } else {
+    const int32_t delta = op == kSelectionExpand ? amount : -amount;
+    if (!resize_base(*selection, delta, &next)) return false;
+  }
   if (masks_equal(next, selection->base.pixel_data())) return true; /* 等值短路 */
   store_base(selection, selection->base.width, selection->base.height, std::move(next));
   if (changed != nullptr) *changed = true;

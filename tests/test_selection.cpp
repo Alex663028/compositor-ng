@@ -467,6 +467,131 @@ COMP_TEST(selection_expand_is_clipped_to_canvas) {
   COMP_CHECK(at(mask, 8, 21) == 0);
 }
 
+COMP_TEST(selection_border_keeps_a_ring_on_both_sides) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+
+  /* 边界 2 = 环带总宽 2 px（外扩 1 减内缩 1，奇数半径时外侧多 1 px）。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 2, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK(at(mask, 7, 12) == 255);   /* 原选区外一像素 */
+  COMP_CHECK(at(mask, 8, 12) == 255);   /* 原选区最外一列被算进环带 */
+  COMP_CHECK(at(mask, 9, 12) == 0);     /* 内缩 1 之后的部分被减掉 */
+  COMP_CHECK(at(mask, 12, 12) == 0);    /* 中心必须是空的 */
+  COMP_CHECK(at(mask, 22, 12) == 0);
+  COMP_CHECK(at(mask, 23, 12) == 255);
+  COMP_CHECK(at(mask, 24, 12) == 255);
+  COMP_CHECK(at(mask, 25, 12) == 0);
+  COMP_CHECK(at(mask, 12, 7) == 255);
+  COMP_CHECK(at(mask, 12, 8) == 255);
+  COMP_CHECK(at(mask, 12, 9) == 0);
+  COMP_CHECK(at(mask, 12, 19) == 255);
+  COMP_CHECK(at(mask, 12, 20) == 255);
+  COMP_CHECK_MSG(at(mask, 7, 7) > 0 && at(mask, 7, 7) < 255, "border corner is antialiased");
+  /* 边界 1 = 只保留外沿 1 px（内缩为 0，不碰原选区）。 */
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 1, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  mask = coverage(fixture.document);
+  COMP_CHECK(at(mask, 7, 12) == 255);
+  COMP_CHECK(at(mask, 8, 12) == 0);
+  COMP_CHECK(at(mask, 24, 12) == 255);
+  COMP_CHECK(at(mask, 23, 12) == 0);
+  COMP_CHECK(at(mask, 12, 12) == 0);
+
+  /* 边界 3 = 外沿 2 px + 内沿 1 px。 */
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 3, &changed) == COMP_OK);
+  mask = coverage(fixture.document);
+  COMP_CHECK(at(mask, 6, 12) == 255);
+  COMP_CHECK(at(mask, 5, 12) == 0);
+  COMP_CHECK(at(mask, 8, 12) == 255);
+  COMP_CHECK(at(mask, 9, 12) == 0);
+  COMP_CHECK(at(mask, 10, 12) == 0);
+
+  /* 边界不动羽化半径（与扩缩同口径）。 */
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 4, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 2, &changed) == COMP_OK);
+  COMP_CHECK(feather_of(fixture.document) == 4.0f);
+
+  /* 越界半径与无选区：参数闸在引擎里，且不产生撤销步。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 501, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(changed == -1);
+  COMP_CHECK(comp_selection_deselect(fixture.document, nullptr) == COMP_OK);
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_BORDER, 3, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+}
+
+COMP_TEST(selection_smooth_rounds_corners_and_keeps_straight_edges) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const std::vector<uint8_t> before = coverage(fixture.document);
+
+  /* 规整矩形做平滑：直边逐像素保留，四个直角被磨圆（开运算的必然结果，
+   * 这正是「平滑」要找的东西——不是把直边也糊掉）。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_SMOOTH, 2, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> rounded = coverage(fixture.document);
+  COMP_CHECK(at(rounded, 8, 12) == 255);
+  COMP_CHECK(at(rounded, 23, 12) == 255);
+  COMP_CHECK(at(rounded, 12, 8) == 255);
+  COMP_CHECK(at(rounded, 12, 19) == 255);
+  COMP_CHECK(at(rounded, 12, 12) == 255);
+  COMP_CHECK_MSG(at(rounded, 8, 8) < 255, "convex corner is rounded");
+  COMP_CHECK(mask_sum(rounded) < mask_sum(before));
+
+  /* 在规整矩形顶上长一根 2 px 宽的刺（x 12..13, y 4..7）。 */
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const float spike[8] = {12.0f, 4.0f, 14.0f, 4.0f, 14.0f, 8.0f, 12.0f, 8.0f};
+  changed = 0;
+  COMP_CHECK(comp_selection_apply_shape(fixture.document, COMP_SELECTION_POLYGON, spike, 4,
+                                       COMP_SELECTION_ADD, 0, &changed) == COMP_OK);
+  std::vector<uint8_t> spiked = coverage(fixture.document);
+  COMP_CHECK(at(spiked, 12, 5) == 255);
+  COMP_CHECK(at(spiked, 13, 5) == 255);
+
+  /* 半径 2 的开运算削掉比 4 px 窄的凸起，闭运算把直边还原。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_SMOOTH, 2, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> smoothed = coverage(fixture.document);
+  COMP_CHECK(at(smoothed, 12, 5) == 0);
+  COMP_CHECK(at(smoothed, 13, 5) == 0);
+  COMP_CHECK(at(smoothed, 12, 4) == 0);
+  COMP_CHECK_MSG(at(smoothed, 8, 12) == 255 && at(smoothed, 23, 12) == 255 &&
+                     at(smoothed, 12, 8) == 255 && at(smoothed, 12, 19) == 255,
+                 "smooth must keep straight edges byte-identical");
+  COMP_CHECK(at(smoothed, 12, 12) == 255);
+  COMP_CHECK(mask_sum(smoothed) < mask_sum(spiked));
+
+  /* 平滑半径上限 100（PS 同量程）。 */
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_SMOOTH, 101, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(changed == -1);
+
+  /* 无选区时无操作。 */
+  COMP_CHECK(comp_selection_deselect(fixture.document, nullptr) == COMP_OK);
+  changed = -1;
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_SMOOTH, 2, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+}
+
 COMP_TEST(selection_rejects_bad_arguments) {
   Fixture fixture;
   COMP_CHECK(fixture.document != nullptr);

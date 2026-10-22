@@ -2192,6 +2192,22 @@ inline int step_selection_grow(int radius, int direction) {
   return next < kMinSelectionGrow ? kMinSelectionGrow : (next > kMaxSelectionGrow ? kMaxSelectionGrow : next);
 }
 
+/*
+ * 选区平滑半径：1..100，与引擎 kMaxSelectionSmooth 同口径。
+ *
+ * 四条「修改」命令共用同一套键入态，但量程不同（扩展/收缩/边界到 500，
+ * 平滑到 100），所以命令入口各自钳自己的上限（clamp_selection_grow /
+ * clamp_selection_smooth），键入态只记用户敲的数字。
+ */
+inline constexpr int kMinSelectionSmooth = 1;
+inline constexpr int kMaxSelectionSmooth = 100;
+
+inline int clamp_selection_smooth(int value) {
+  if (value < kMinSelectionSmooth) return kMinSelectionSmooth;
+  if (value > kMaxSelectionSmooth) return kMaxSelectionSmooth;
+  return value;
+}
+
 /* ------------------------------------------------------------ 工具选项栏（P0-10） */
 
 /*

@@ -65,7 +65,9 @@ enum SelectionCombine {
 enum SelectionModify {
   kSelectionFeather = 0,
   kSelectionExpand = 1,
-  kSelectionContract = 2
+  kSelectionContract = 2,
+  kSelectionBorder = 3, /* 边界：沿轮廓内外总宽 amount 像素的环带 */
+  kSelectionSmooth = 4  /* 平滑：开 + 闭形态学，圆化边界但保留直边 */
 };
 
 /* 上限：先挡住荒谬输入，避免为「一个请求」分配几个 GB。
@@ -75,6 +77,8 @@ constexpr int32_t kMaxSelectionPoints = 1 << 18;
 constexpr int32_t kMaxSelectionSegments = 1 << 16;
 constexpr int32_t kMaxSelectionFeather = 250;
 constexpr int32_t kMaxSelectionGrow = 500;
+/* 平滑半径与 PS 的「半径 1..100」同量程；再大就只剩「把选区磨成圆」了。 */
+constexpr int32_t kMaxSelectionSmooth = 100;
 /* 色彩范围的 fuzziness 上限（上游 ColorRangeEdit.fuzzinessRange = 0...200）。 */
 constexpr int32_t kMaxColorRangeFuzziness = 200;
 
@@ -117,9 +121,11 @@ bool selection_deselect(SelectionState* selection, bool* changed);
 /* 反选：没有选区时无操作；反选「全选」得到**无选区**（上游 inverse.isEmpty ⇒ nil）。 */
 bool selection_invert(SelectionState* selection, bool* changed);
 
-/* op = kSelectionFeather / kSelectionExpand / kSelectionContract。
- * amount 范围：feather 1..250，expand/contract 1..500（上游同一组闸）。
- * 没有选区或显式空选区时无操作（changed = false）。 */
+/* op = kSelectionFeather / kSelectionExpand / kSelectionContract / kSelectionBorder /
+ * kSelectionSmooth。
+ * amount 范围：feather 1..250，expand/contract/border 1..500，smooth 1..100。
+ * 没有选区或显式空选区时无操作（changed = false）。
+ * border 与 smooth 只改基础蒙版、不动 feather 半径（与 expand/contract 同口径）。 */
 bool selection_modify(SelectionState* selection, int32_t op, int32_t amount, bool* changed);
 
 /*

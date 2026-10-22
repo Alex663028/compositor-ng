@@ -175,18 +175,21 @@ comp_result comp_selection_modify(comp_document document, comp_selection_modify_
     return COMP_ERR_INVALID_ARGUMENT;
   }
   COMP_ABI_TRY(engine)
-  if (op < COMP_SELECTION_FEATHER || op > COMP_SELECTION_CONTRACT) {
+  if (op < COMP_SELECTION_FEATHER || op > COMP_SELECTION_SMOOTH) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection modify op");
   }
-  const int32_t limit =
-      op == COMP_SELECTION_FEATHER ? compositor::kMaxSelectionFeather : compositor::kMaxSelectionGrow;
+  const int32_t limit = op == COMP_SELECTION_FEATHER ? compositor::kMaxSelectionFeather
+                        : op == COMP_SELECTION_SMOOTH ? compositor::kMaxSelectionSmooth
+                                                      : compositor::kMaxSelectionGrow;
   if (amount < 1 || amount > limit) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "selection amount out of range");
   }
 
   const char* label = op == COMP_SELECTION_FEATHER  ? "Feather Selection"
                       : op == COMP_SELECTION_EXPAND ? "Expand Selection"
-                                                    : "Contract Selection";
+                      : op == COMP_SELECTION_CONTRACT ? "Contract Selection"
+                      : op == COMP_SELECTION_BORDER ? "Border Selection"
+                                                    : "Smooth Selection";
   compositor::abi::ImplicitTxn txn(doc, label);
   bool changed = false;
   if (!compositor::selection_modify(&doc->selection(), op, amount, &changed)) {
