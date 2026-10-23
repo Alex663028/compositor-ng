@@ -14,6 +14,7 @@
 #include "compositing/resample.h"
 #include "core/comp_geometry.h"
 #include "domain/document.h"
+#include "domain/guide.h"
 #include "domain/text_layer.h"
 #include "engine.h"
 #include "format/comp_json.h"
@@ -474,6 +475,19 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
     const auto it = layer_uuid.find(state.active_layer);
     if (it != layer_uuid.end()) manifest.set("activeLayerID", JsonValue::string(it->second));
   }
+  /* 参考线：空表不写键，保证「没有参考线的文档」存出的 manifest 与旧版逐字节
+   * 一致。键名走 engine 前缀（engineGuides）——上游 manifest 另有同名 `guides`
+   * 键但其结构未文档化，不能拿它当自己的格式（见 comp_file.h / domain/guide.h）。 */
+  if (!state.guides.empty()) {
+    JsonValue guides = JsonValue::array({});
+    for (const Guide& guide : state.guides) {
+      JsonValue entry = JsonValue::object({});
+      entry.set("axis", JsonValue::integer(static_cast<long long>(guide.axis)));
+      entry.set("position", JsonValue::number(guide.position));
+      guides.push(std::move(entry));
+    }
+    manifest.set("engineGuides", std::move(guides));
+  }
 
   JsonValue layers = JsonValue::array({});
   for (const Layer& layer : state.layers) {
@@ -764,6 +778,44 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
   DocumentState& state = doc->state();
   state.layers.clear();
   state.document_id = document_id;
+
+  /* 参考线（engineGuides）。缺键 = 没有参考线（旧 manifest 直接兼容）；
+   * 键存在就必须是合法数组——坏数据静默丢弃会让「存过参考线怎么没了」
+   * 无从排查，与图层字段的严格读法一致。 */
+  const JsonValue* guide_entries = manifest.find("engineGuides");
+  if (guide_entries != nullptr && !guide_entries->is_null()) {
+    if (!guide_entries->is_array()) {
+      if (error != nullptr) *error = "engineGuides must be an array";
+      return false;
+    }
+    if (guide_entries->as_array().size() > kMaxGuides) {
+      if (error != nullptr) *error = "too many guides in manifest";
+      return false;
+    }
+    for (const JsonValue& entry : guide_entries->as_array()) {
+      if (!entry.is_object()) {
+        if (error != nullptr) *error = "engineGuides must contain objects";
+        return false;
+      }
+      const JsonValue* axis = entry.find("axis");
+      const JsonValue* position = entry.find("position");
+      if (axis == nullptr || position == nullptr || !axis->is_number() || !position->is_number()) {
+        if (error != nullptr) *error = "guide must carry numeric axis and position";
+        return false;
+      }
+      const long long axis_value = axis->as_integer(-1);
+      const double position_value = position->as_number();
+      if (axis_value < 0 || axis_value > 1 ||
+          !guide_is_valid(static_cast<uint32_t>(axis_value), position_value)) {
+        if (error != nullptr) *error = "guide axis or position is invalid";
+        return false;
+      }
+      Guide guide;
+      guide.axis = static_cast<uint32_t>(axis_value);
+      guide.position = position_value;
+      state.guides.push_back(guide);
+    }
+  }
 
   const JsonValue* layers = manifest.find("layers");
   if (layers != nullptr && layers->is_array()) {

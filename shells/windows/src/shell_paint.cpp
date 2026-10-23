@@ -1863,6 +1863,9 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
                     layout.canvas.bottom());
   SetBkMode(dc, TRANSPARENT);
 
+  /* 网格压在所有覆盖层之下：它是背景参考，不能盖住选区/笔迹/把手。 */
+  draw_grid_lines(dc, shell, layout);
+
   /*
    * 移动预览：拖动期间蚂蚁线整体跟着鼠标走，像素与轮廓在松开时一次性提交。
    * 偏移取整到文档像素，和 move_end 提交的 dx/dy 完全一致，预览不会「差一像素」。
@@ -2461,8 +2464,16 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     DeleteObject(dotted);
   }
 
+  /* 参考线压在选区与笔迹之上、变换手柄之下：它是对齐基准，必须看得见，但不该
+   * 抢走把手（把手是唯一「按住就改几何」的点击目标）。 */
+  draw_guides(dc, shell, layout);
+
   /* 变换手柄画在最后：它压在所有预览之上（可点时必须可见）。 */
   draw_transform_frame(dc, shell, layout);
+
+  /* 标尺最上层：它占着画布最外 18px，任何覆盖层画进去都会被尺子盖住，
+   * 用户看到的就是「尺子区域只显示尺子」——命中测试与绘制口径因此一致。 */
+  draw_rulers(dc, shell, layout);
 
   RestoreDC(dc, saved);
 }

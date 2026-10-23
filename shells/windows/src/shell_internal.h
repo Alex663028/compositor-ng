@@ -543,6 +543,25 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void move_extend(ShellState& shell, int x, int y, const Layout& layout);
   void move_cancel(ShellState& shell);
   void move_end(HWND window, ShellState& shell);
+  /*
+   * ROI #3 标尺 / 参考线 / 网格 / 吸附（shell_guides.cpp）。三个 draw_* 画在
+   * 画布覆盖层里（shell_paint.cpp 调用），其余是交互与开关。
+   */
+  void view_toggle_rulers(ShellState& shell);
+  void view_toggle_guides(ShellState& shell);
+  void view_toggle_grid(ShellState& shell);
+  void view_toggle_snap(ShellState& shell);
+  void view_clear_guides(ShellState& shell);
+  bool guide_drag_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout);
+  void guide_drag_extend(ShellState& shell, int x, int y, const Layout& layout);
+  void guide_drag_end(HWND window, ShellState& shell, int x, int y);
+  void guide_drag_cancel(ShellState& shell);
+  /* 换文档 / 销毁文档前调用：只清壳侧拖动状态，不碰引擎（旧句柄可能已失效）。 */
+  void guide_drag_forget(ShellState& shell);
+  bool guide_hover_update(ShellState& shell, int x, int y, const Layout& layout);
+  void draw_grid_lines(HDC dc, const ShellState& shell, const Layout& layout);
+  void draw_guides(HDC dc, const ShellState& shell, const Layout& layout);
+  void draw_rulers(HDC dc, const ShellState& shell, const Layout& layout);
   void forget_color_range(ShellState& shell);
   bool fill_document_background(ShellState& shell, int background);
   bool create_document_with(ShellState& shell, int width, int height, int dpi, int background);

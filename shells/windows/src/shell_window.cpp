@@ -7,6 +7,8 @@
  */
 #include "shell_internal.h"
 
+#include <compositor/comp_guide.h> /* ROI #3：菜单里按参考线条数置灰「清除参考线」 */
+
 namespace comp_shell {
 
 
@@ -162,6 +164,19 @@ void sync_menu_state(HWND window, ShellState& shell) {
   /* §5.43：勾选 = 已收起（竖条态），与画出来的形态一致。 */
   menu_set_checked_recursive(menu, kCmdPanelLayers, shell.layer_panel_collapsed);
   menu_set_checked_recursive(menu, kCmdPanelAdjust, shell.adjust_panel_collapsed);
+  /*
+   * ROI #3 视图开关：勾选 = 当前打开。全部按文档状态刷新（默认：参考线与对齐
+   * 打开、标尺与网格关闭）。「清除参考线」没有参考线时置灰——空点击不值得进状态栏。
+   */
+  menu_set_checked_recursive(menu, kCmdViewRulers, shell.doc.show_rulers);
+  menu_set_checked_recursive(menu, kCmdViewGuides, shell.doc.show_guides);
+  menu_set_checked_recursive(menu, kCmdViewGrid, shell.doc.show_grid);
+  menu_set_checked_recursive(menu, kCmdViewSnap, shell.doc.snap_enabled);
+  size_t guide_total = 0;
+  const bool has_guides = shell.doc.document != nullptr &&
+                          comp_guide_count(shell.doc.document, &guide_total) == COMP_OK &&
+                          guide_total > 0;
+  menu_set_enabled_recursive(menu, kCmdViewClearGuides, has_guides);
   if (checks.sampling >= 0) {
     menu_radio_check_recursive(menu, kCmdSamplingBase,
                                kCmdSamplingBase + static_cast<UINT>(comp_ui::kSamplingCount) - 1,
@@ -1847,6 +1862,23 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       case '1':
         run_shell_command(window, shell, kCmdViewActual);
         return;
+      /*
+       * ROI #3 视图参考：与上游同键位。
+       *   Ctrl+R         标尺
+       *   Ctrl+;         参考线显示
+       *   Ctrl+Shift+;   对齐（吸附）
+       *   Ctrl+'         网格
+       * 四个键此前都空着；它们只改覆盖层/落点，不改文档像素。
+       */
+      case 'R':
+        run_shell_command(window, shell, kCmdViewRulers);
+        return;
+      case VK_OEM_1:
+        run_shell_command(window, shell, shift ? kCmdViewSnap : kCmdViewGuides);
+        return;
+      case VK_OEM_7:
+        run_shell_command(window, shell, kCmdViewGrid);
+        return;
       case VK_OEM_PLUS:
         run_shell_command(window, shell, kCmdViewZoomIn);
         return;
@@ -2751,6 +2783,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
           if (layout.canvas.contains(mouse_x, mouse_y)) {
+            /*
+             * ROI #3：从标尺拖出参考线 / Move 工具拖动已有参考线。必须排在工具
+             * 状态机最前面——标尺条与参考线常驻可见，落到它们身上的按下如果先
+             * 交给画笔，就会在画布上落一笔再把线拖走。
+             */
+            if (guide_drag_begin(window, *shell, mouse_x, mouse_y, layout)) {
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
             if (shell->tool == comp_ui::ToolId::Hand || shell->space_down) {
               begin_pan(window, *shell, mouse_x, mouse_y);
             } else if (zoom_tool_available(*shell)) {
@@ -2927,6 +2968,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_LBUTTONUP:
+      /* ROI #3 参考线松手：它持有捕获且开着事务，必须最先收尾。 */
+      if (shell != nullptr && shell->doc.guide_drag_active) {
+        guide_drag_end(window, *shell, mouse_x, mouse_y);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       /* §6.60 面板分界线松手：宽度已在拖动中实时生效，这里只收尾捕获与状态栏。 */
       if (shell != nullptr && shell->panel_resize_target != 0) {
         panel_resize_end(*shell);
@@ -3138,6 +3185,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_CAPTURECHANGED:
       if (shell != nullptr) {
         /* 捕获被别处抢走（菜单弹出/切窗口）时，拖行与框选一并取消，不留悬挂状态。 */
+        /* ROI #3 参考线拖动同理：abort 事务，新建的那条随回滚一起消失。 */
+        guide_drag_cancel(*shell);
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
         shell->doc.histogram_drag = false;
@@ -3249,6 +3298,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       if (shell != nullptr) {
         Layout layout{};
         if (client_layout(*shell, &layout)) {
+          /* ROI #3 参考线拖动持有捕获：先于面板悬停与工具状态机。 */
+          if (shell->doc.guide_drag_active) {
+            guide_drag_extend(*shell, mouse_x, mouse_y, layout);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           /* §6.60 面板分界线拖动优先：宽度实时生效，画面不动（pan 已补偿）。 */
           if (shell->panel_resize_target != 0) {
             panel_resize_extend(*shell, mouse_x);
@@ -3268,6 +3323,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           const int toggle_hover = comp_ui::panel_toggle_at(layout, mouse_x, mouse_y);
           if (toggle_hover != shell->panel_toggle_hover) {
             shell->panel_toggle_hover = toggle_hover;
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          /* ROI #3：Move 工具贴近参考线时描亮（只在高亮序号变化时重画）。 */
+          if (guide_hover_update(*shell, mouse_x, mouse_y, layout)) {
             InvalidateRect(window, nullptr, FALSE);
           }
           /* P0-3 曲线拖动优先：几何用按下时冻结的绘图区，写入落在同一个事务里。 */
@@ -3899,6 +3958,17 @@ HMENU build_menu() {
   AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(view_menu, MF_STRING, kCmdPanelLayers, L"图层面板收起/展开(&L)\tF7");
   AppendMenuW(view_menu, MF_STRING, kCmdPanelAdjust, L"调整面板收起/展开(&J)\tF8");
+  /*
+   * ROI #3 视图参考：标尺 / 参考线 / 网格 / 对齐。四项都是**只读覆盖层**，
+   * 「对齐」只影响拖动落点，因此这整个子菜单里的开关都不会改变像素结果。
+   * 勾选态由 sync_menu_state 按当前文档刷新（换文档会跟着变）。
+   */
+  AppendMenuW(view_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(view_menu, MF_STRING, kCmdViewRulers, L"标尺(&U)\tCtrl+R");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewGuides, L"参考线(&G)\tCtrl+;");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewGrid, L"网格(&D)\tCtrl+'");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewSnap, L"对齐(&A)\tCtrl+Shift+;");
+  AppendMenuW(view_menu, MF_STRING, kCmdViewClearGuides, L"清除参考线(&C)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view_menu), L"视图(&V)");
 
   /* 工具菜单与工具条、快捷键共用同一张表（tool_table），不另抄一份键位。 */

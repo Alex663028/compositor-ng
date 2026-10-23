@@ -225,6 +225,16 @@ constexpr UINT kCmdLayerRasterizeText = 1572; /* 图层 > 栅格化文字 */
  * 给族名/样式名。缺的只是「把系统里的字体列出来让用户挑」这条产品通路。
  */
 constexpr UINT kCmdLayerFonts = 1573; /* 图层 > 字体… */
+/*
+ * ROI #3 视图开关（1580 段，空号段）：标尺 / 参考线 / 网格 / 吸附 / 清除参考线。
+ * 键位与上游同义（Ctrl+R / Ctrl+; / Ctrl+' / Ctrl+Shift+;）。壳层零新增 ABI——
+ * 参考线的读写走同批尾部追加的 6 个 comp_guide_* 导出（152 → 158）。
+ */
+constexpr UINT kCmdViewRulers = 1580;      /* 视图 > 标尺（Ctrl+R） */
+constexpr UINT kCmdViewGuides = 1581;      /* 视图 > 参考线（Ctrl+;） */
+constexpr UINT kCmdViewGrid = 1582;        /* 视图 > 网格（Ctrl+'） */
+constexpr UINT kCmdViewSnap = 1583;        /* 视图 > 对齐（Ctrl+Shift+;） */
+constexpr UINT kCmdViewClearGuides = 1584; /* 视图 > 清除参考线 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -511,6 +521,30 @@ struct DocumentContext {
   int path_serial = 0; /* 命名用流水号（删除后不复用，避免重名） */
   bool history_open = false;
   int history_scroll = 0;
+  /*
+   * ROI #3 视图开关。按**文档**记而不是按会话记：换文档时连同文档一起复位，
+   * 否则会出现「A 文档关掉的标尺在 B 文档莫名打开」。参考线本身不是开关，
+   * 它存在引擎文档里（随 .comp 往返、随撤销回退）。
+   */
+  bool show_rulers = false; /* 标尺条（Ctrl+R）：默认关，否则盖住画布最外 18px */
+  bool show_guides = true;  /* 参考线可见（Ctrl+;）：没有参考线时画不出东西 */
+  bool show_grid = false;   /* 网格（Ctrl+'）：50 文档像素一格 */
+  bool snap_enabled = true; /* 拖动吸附（Ctrl+Shift+;）：只改落点，不改像素 */
+  /*
+   * 参考线拖动（持有鼠标捕获）。整次拖动包在一个显式事务里 = 一步撤销；
+   * 拖到标尺上松手 = 删除（这条是本次新建的则 abort，不留空撤销步）。
+   * guide_drag_doc 与 layer_move_doc 同一用途：捕获被抢走/换文档时先核对
+   * 句柄再 abort，避免对已销毁文档调用引擎。
+   */
+  bool guide_drag_active = false;
+  bool guide_drag_created = false; /* true = 本次拖动新建（松手落回标尺要 abort） */
+  int32_t guide_drag_index = -1;
+  uint32_t guide_drag_axis = 0;
+  double guide_drag_drop = 0.0; /* 当前落点（文档像素，已吸附） */
+  bool guide_drag_changed = false;
+  comp_txn guide_drag_txn = nullptr;
+  comp_document guide_drag_doc = nullptr;
+  int32_t guide_hover = -1; /* 悬停高亮的参考线序号；-1 = 无 */
   bool needs_fit = true; /* 新文档/打开文档后，下一次绘制时适配窗口 */
 };
 

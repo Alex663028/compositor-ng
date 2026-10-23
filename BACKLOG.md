@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **152**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **132 条 / 25 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **158**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **145 条 / 27 场景**；落地规则见 §6）。
 > 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
 > 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -43,7 +43,7 @@
 
 | 维度 | 本仓 | Photoshop（参照） | 差距性质 |
 |------|------|-------------------|----------|
-| C ABI | **152** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
+| C ABI | **158** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
 | 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
@@ -52,10 +52,10 @@
 | 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/PSD/EXR + `.comp` | 20+ | PSD 只是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
 | 文档 | **单文档**、单个 `ShellState::document` | 多标签 | 新建会直接销毁旧文档（`shell_document.cpp:255/313`） |
 | 面板 | 10 个（图层/调整/曲线/裁剪/滤镜/效果/色彩范围/路径/历史/文字） | 15+ | 无通道 / 导航器 / 色板 / 属性 / 动作 |
-| 菜单 | 9 个顶层菜单 | 11 | 无「视图 > 标尺/参考线/网格」、无「窗口」 |
+| 菜单 | 9 个顶层菜单 | 11 | 「视图 > 标尺/参考线/网格/对齐」已补（2026-10-23），仍无「窗口」 |
 | 色彩 | 仅 sRGB；`.comp` 拒绝其它色彩空间（`comp_file.cpp:653-656`） | RGB/CMYK/Lab/灰度/位图/索引 + ICC | 无 `Image > Mode`、无 8/16 位文档模式、无色彩管理 |
 | 位深 | 图层可以是 RGBA16/16F；**文档合成模式没有开关** | 8/16/32 位文档 | `comp_document_desc` 只有 width/height/dpi/color_space（`comp_engine.h:56-61`） |
-| 视图辅助 | 无标尺、无参考线、无网格、无对齐 | 全套 | 全仓 0 命中 |
+| 视图辅助 | 标尺 / 参考线 / 网格 / 吸附 | 全套 | 已可用（§P0-8）；缺锁定参考线、图层/选区吸附、可配置网格 |
 | 剪贴板 | 复制/合并拷贝/剪切/粘贴/贴入选区/清除（自定义格式 + CF_DIBV5） | 全套 | 已可用；跨应用仅 32 位 DIB，无色彩管理 |
 | 命令表 | `comp_command_*` 仅 **7** 条（`comp_command_abi.cpp:30-39`） | 动作/脚本可录制全部命令 | 自动化没有地基 |
 
@@ -63,9 +63,9 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-23）**：
-日常使用路径 **≈74%**，全功能面 **≈51%**（190 条 PS 核心条目加权，原始命中 89 条）；
-与口径 A/B 的差异原因在该文件 §3 说明。ROI 前 4 项里字体选择、PSD 分层导出与
-锐化/降噪入口已落地，剩下「标尺参考线」，日常路径约到 85%。
+日常使用路径 **≈75%**，全功能面 **≈51%**（190 条 PS 核心条目加权，原始命中 90 条）；
+与口径 A/B 的差异原因在该文件 §3 说明。ROI 前 4 项（字体选择、PSD 分层导出、
+锐化/降噪入口、标尺/参考线/网格/对齐）已全部落地，日常路径 70% → 75%。
 
 ---
 
@@ -232,10 +232,23 @@
   位置 / 不透明度 / 蒙版一致；不支持的变体显式拒绝，不静默丢弃（`tests/test_psd.cpp`，11 例）。
 
 ### P0-8 视图辅助：标尺 / 参考线 / 网格 / 对齐 + 通道面板
-- **现状**：全仓 0 命中（ABI 与外壳均无 `guide/ruler/grid/snap`）。注意 README §6.3 的 `guides` 指的是 **Camera Raw 几何校准参数**（`camera_raw.cpp:394-415`），**不是画布参考线**——画布参考线完全不存在。
-- **PS 行为**：标尺、从标尺拖参考线、显示/隐藏/锁定/清除参考线、网格与对齐（图层/参考线/文档边界）、智能参考线。
-- **性质**：【引擎】+【壳层】M——参考线是文档模型（要进 `.comp`），吸附是交互层。
-- **验收**：拖参考线到 12.5px 时按设备像素对齐；存盘再开参考线位置不变；对齐开关不改变像素结果（只影响交互）。
+
+- **现状**：画布部分**已落地（2026-10-23，README §6.91 / docs/shell-parity.md §5.54）**：
+  标尺（顶部/左侧 18px，1-2-5 刻度）、参考线（从标尺拖出、Move 工具拖动、拖回标尺删除、
+  清除全部）、网格（50px，每 5 格加粗）、吸附（8 设备像素，候选 = 画布三线 + 网格 +
+  同轴参考线）。参考线是文档状态：随 `.comp` 的 `engineGuides` 往返、随撤销回退，
+  引擎/ABI 尾部追加 6 个 `comp_guide_*` 导出（152 → 158），壳层零新增。
+  **通道面板仍未做。**
+- **PS 行为**：标尺、从标尺拖参考线、显示/隐藏/锁定/清除参考线、网格与对齐（图层/
+  参考线/文档边界）、智能参考线、通道面板。
+- **剩余缺口**：参考线锁定与旋转、按图层包围盒/选区边界吸附（智能参考线）、
+  可配置网格间距与子网格、回读 DPI 的物理单位刻度、通道面板（独立子系统，含选区
+  通道存储，与 P0-5 的「存储/载入选区通道」合并做）。
+- **性质**：剩余部分【壳层】S +【引擎】M（通道模型）。
+- **验收**（已达成）：拖参考线到 12.5px 时按设备像素对齐；存盘再开参考线位置不变；
+  对齐开关不改变像素结果（只影响交互）。三项分别由 `tests/test_guides.cpp` 的
+  `guide_comp_round_trip`、`tests/test_ui_core.cpp` 的
+  `ui_core_rulers_and_snap_tolerance` 与 `scripts/visual_check.py` 的 `guides` 场景钉住。
 
 ### P0-9 色彩模式与位深
 - **现状**：`color_space` 只是字符串，`.comp` 仅接受 `"sRGB"`（`comp_file.cpp:653-656`）；无 `Image > Mode`，无灰度/CMYK/Lab/索引，无 ICC 配置、无软打样、无 16/32 位文档模式开关（`comp_document_desc` 无 pixel_format）。
@@ -387,11 +400,13 @@
 
 > 2026-10-23 校正一轮：下面每条都重新对着当前代码数过一遍，数字与指针已更新。
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **152** 个
-  （尾部追加 `comp_layer_get_pixels`、4 个文字图层导出、以及 PSD 分层读写的
-  `comp_io_import_document` / `comp_io_export_document`）。
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **158** 个
+  （尾部追加 `comp_layer_get_pixels`、4 个文字图层导出、PSD 分层读写的
+  `comp_io_import_document` / `comp_io_export_document`，以及 6 个 `comp_guide_*` 画布参考线导出）。
 - README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **132 条 / 25 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker` 后；原 80 条含 IME 6/6）。
-- README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
+- README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
+  2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
+  与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。
 - §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
 - `comp_layer.h` 的 `comp_tool_type` 注释原先只写"画进当前图层、不可再编辑"，没提可编辑
   文字图层；已补一行指路（`comp_layer_add_text` / `comp_layer_set_text`），行为未改。
@@ -402,7 +417,7 @@
 
 | 结论 | 证据 |
 |------|------|
-| 152 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 152） |
+| 158 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 158） |
 | 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
 | 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
 | 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |
@@ -416,7 +431,7 @@
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
 | 组强制 Normal | `engine/format/comp_file.cpp:285` |
-| `.comp` 不存选区/路径/参考线 | `engine/format/comp_file.cpp:382-473` |
+| `.comp` 不存选区/路径（参考线自 2026-10-23 起存 `engineGuides`） | `engine/format/comp_file.cpp:382-473` |
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |

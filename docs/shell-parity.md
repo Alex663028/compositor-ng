@@ -45,6 +45,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 离屏上屏（GPU 协同） | AUTO → D3D12 离屏计算 + 回读；**HWND 直呈已落地（S16，`caps().window_present`）** | `presentSurface` 返回 `UNSUPPORTED` | `comp_render_document`(kind=HWND/HARMONY_WINDOW) / `comp_render_present` / `comp_render_flatten` | **部分达成**：Windows 的设备侧离屏（S13）与交换链直呈（S16）都已落地；鸿蒙设备侧交换链未落地，窗口表面如实拒绝 |
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
 | 工具条 / 画布导航 | 20 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
+| 标尺 / 参考线 / 网格 / 对齐（ROI #3） | 视图菜单五项 + `Ctrl+R` / `Ctrl+;` / `Ctrl+Shift+;` / `Ctrl+'`；从标尺拖出、Move 工具拖动、拖回标尺删除，整次拖动一步撤销 | （未接 UI） | `comp_guide_add` / `_move` / `_remove` / `_count` / `_get` / `_clear`（尾部追加，152 → 158） | **已达成（Windows）**（§5.54）：参考线随 `.comp` 的 `engineGuides` 往返（12.5 原样），吸附只改落点不改像素 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
 `COMP_ERR_UNSUPPORTED`**，不伪造成功。Windows 侧已在 S16 补上 D3D12 交换链直呈
@@ -2612,6 +2613,95 @@ CJK 子串匹配）。鼠标点击命中的行即应用，滚轮 3 行/格。入
 两个字体目录，不读注册表，「已注册但文件不在目录里」的字体看不到；④ `.ttc` 只看前
 8 个面；⑤ 扫描是首次打开面板时才启动（不拖慢启动），但首次打开的那一瞬仍同步扫
 6 个文件。
+
+### 5.54 标尺 / 参考线 / 网格 / 对齐（ROI #3，2026-10-23）
+
+`docs/ps-parity.md` §4 的 ROI 第 3 顺位。视图维此前的 60% 是「缩放 + 平移 + 适合
+窗口」，缺的是定位工具：量距离、对边、排版的日常动作一个都做不了。本批补上标尺、
+参考线、网格与吸附。参考线是文档状态，所以这一项穿过三层：引擎域
+（`engine/domain/guide.*`）、ABI（`comp_guide.h` 尾部追加 6 个导出，152 → **158**）
+与外壳。**壳层自身零新增导出**，只消费那 6 个入口。
+
+**1. 三条不变式。** ① 吸附只改拖动落点，不参与像素合成，所以对齐开关开与关必须
+逐字节同画面；② 一整次拖动 = 一步撤销；③ 值没变只 `abort`，绝不 commit 空步
+（`Document::txn_commit` 无条件进历史）。
+
+**2. 标尺叠在画布内部，不切 `layout`。** `Layout::kRulerThickness = 18`，顶部/左侧
+两条 18px 带子直接用 `layout.canvas` 的内边缘算矩形（`ruler_top_rect` /
+`ruler_left_rect` / `ruler_corner_rect`），`Layout` 一个字段都没改。这不是省事，是
+**避免连锁补偿**：一旦从 `layout` 里切掉 18px，缩放锚点、平移夹取、面板分界、
+所有命中测试都要跟着减偏移，任何一处漏了就出现「点在线的左边却选中右边的图层」。
+代价是标尺会盖住画面最上/最左 18px——所以默认关闭，`Ctrl+R` 才出现。
+
+**3. 刻度是 1-2-5 序列。** `ruler_major_step(zoom)` 从 `{1,2,5} × 10^n` 里挑第一个
+满足「屏幕间距 ≥ 56px」的档位；间距 ≥ 40px 时再插 `step/5` 次刻度。数字用
+`ExtTextOutW` + `ETO_CLIPPED` 贴着条带内边画，`Segoe UI -11`；角落方块最后画，
+盖住两条刻度带的交叉。极端输入有下界保护：`zoom <= 0` 或 NaN 一律回落 5000，
+不会让 `log10` 求出负无穷或空序列。
+
+**4. 参考线拖动状态机。** `guide_drag_begin` 分三条路：上标尺 → 新建
+**横线**（`COMP_GUIDE_HORIZONTAL`，position 是 y），左标尺 → 新建**竖线**
+（`COMP_GUIDE_VERTICAL`，position 是 x），
+画布上只在 **Move 工具**下才认已存在的线（其它工具要给画笔让出起笔）。按下即
+`comp_txn_begin` 并 `SetCapture`；第一帧 `guide_drag_extend` 才真正
+`comp_guide_add` / `comp_guide_move`，因此单击不会留下一条零位移的空撤销步。
+`guide_drag_end` **先清 active 状态再做后续**（`ReleaseCapture` 会同步回调
+`WM_CAPTURECHANGED`，顺序反了就会重入一个已经结束的拖动）：
+
+- 落在标尺上：本次新建的 `abort`（线随事务回滚，等于「拖出来又拖回去」）；
+  已有线 `comp_guide_remove` + commit；
+- 位置没变：`abort`；
+- 其余：`comp_txn_commit`。
+
+捕获被菜单弹出或切窗抢走时走 `guide_drag_cancel`（abort）。文档替换在
+`forget_color_range` 里先 `guide_drag_forget` 再动旧文档——向已释放的 `Document`
+abort 就是 UAF，和那里既有的 color_range 注释是同一条理由。
+
+**5. 吸附候选与手感。** 容差 `kGuideSnapPx = 8.0` **设备像素**，经
+`snap_tolerance_doc(zoom)` 换成文档像素（8 / zoom），所以 2% 和 800% 下的抓取手感
+一致。候选：画布 `0` / 中线 / 另一边，网格可见时「最接近的一条网格线」，其它
+**同轴**参考线（被拖的那条排除）。距离相等时保留先出现的（画布 → 网格 → 参考线），
+NaN 候选跳过，所有候选就地扫描、不分配数组。命中半径是另一组常量
+（`kGuideHitPx = 4.0` 设备像素）——1px 的线太细点不中，太粗会吃掉画笔起笔；
+悬停的线画成 2px 高亮（`RGB(140,225,255)`，常规色 `RGB(0,174,239)`）。
+
+**6. 网格与视图开关的归属。** 网格固定 `kGridStep = 50` 文档像素、每 5 格加粗
+（`kGridMajorEvery`），不随缩放变密度——变密会让人误以为文档尺寸变了。四个开关
+（标尺 / 参考线 / 网格 / 吸附）存在 `DocumentContext` 里而不是 `ShellState`：它们是
+「这个文档的视图设置」，换文档应回默认（标尺、网格关；参考线可见、吸附开）。
+复位点统一在 `forget_color_range`，三条文档替换路径都经过它。命令号
+`kCmdViewRulers..kCmdViewClearGuides = 1580..1584`，勾选态与「清除参考线」的置灰
+由 `sync_menu_state` 同步；快捷键 `Ctrl+R` / `Ctrl+;` / `Ctrl+Shift+;` / `Ctrl+'`。
+
+**7. 存盘。** 参考线写进 manifest 的 `engineGuides`：
+`[{"axis":0|1,"position":double}]`（`0` = 水平线，`position` 是 y；`1` = 竖直线，
+`position` 是 x），空数组不写、缺键即「没有参考线」。位置是 `double` 文档像素，
+`12.5` 原样往返。上游同名 `guides` 键**不读不写**：两边语义没有逐字核对过，
+静默互读只会让对齐线跳位（`engine/format/comp_file.h` 顶部约定与 README §6.3 已同步）。
+
+**8. 测试。** `tests/test_guides.cpp` 新增 5 例：验参与 `guide_snap_to`（12.5 命中）、
+ABI CRUD 各一步撤销（`changed = 0` 不落步）、非法参数拒绝、`.comp` 往返（12.5
+两次存盘两次读取都相等，加载后不占撤销栈）、坏条目（非数组/超容量/非对象/字段
+非法）显式报错。`tests/test_ui_core.cpp` 另新增 `ui_core_rulers_and_snap_tolerance`：
+18px 厚度、三块矩形的几何与 `Rect::contains` 的半开区间边界、1-2-5 序列的
+`step * zoom >= 56` 与尾数 ∈ {1,2,5} 及最小性、`ruler_major_step` 在
+1.0 / 32.0 / 0.02 / 0 / 负 / NaN 下的取值、`ruler_hit` 的条带归属（隐藏与空布局
+返回 0）、`snap_tolerance_doc` 的 `tol * zoom == 8` 对所有缩放成立、非法缩放
+回落 400。单测 661 → **667 例 / 0 失败**。
+
+视觉探针追加 `guides` 场景 9 条（只加场景，不改既有阈值）：标尺默认关（边缘着色
+0 px）、对齐开关整幅差异 **0**、开标尺 10553 px、拖出参考线 623 px、关标尺后
+仍是 623 px、清除参考线 0 px、再显示仍是 623 px、网格变化 21188 px、关网格后与
+开网格前差异 **0** px。全量 `--scene all` **145 条 / 27 场景 / 0 失败**（首跑
+`blend` 偶发 3 条，单场景与整轮重跑均 0 失败，本轮未改动该场景）。壳自检没有覆盖
+标尺/参考线绘制，仍为 **263 项 / failures=0 / SHA256 与基线一致**。
+
+**9. 边界（如实记）。** ① 标尺没有选区范围高亮，也没有「拖动时的虚线预览」；
+刻度只用像素，没有单位切换（`ProjectInfo.dpi` 已读，但标尺不换算）。② 参考线
+不可旋转/锁定；吸附候选不含图层包围盒和选区边界——那要跨图层树求几何，留下一轮。
+③ 网格间距不可配置，没有子网格。④ 吸附只接在参考线拖动上，画笔 / 选框 / Move
+的落点还没共用这一套。⑤ 参考线位置是文档像素的绝对值，画布尺寸变小后越界的线
+会留在文档外（不自动夹取，避免「改画布就悄悄挪我的线」）。
 
 
 

@@ -236,6 +236,17 @@ void forget_color_range(ShellState& shell) {
    * 历史；只把滚动归零，否则可能停在新文档根本到不了的行上。
    */
   shell.doc.history_scroll = 0;
+  /*
+   * ROI #3：参考线拖动持有旧文档的事务与捕获，必须在旧文档被销毁**之前**收尾
+   * （abort 打到已释放对象上就是 UAF，同 color_range 那条注释）。视图开关是
+   * 按文档存的，新文档一律回到默认：标尺/网格默认关（它们会盖住画面），
+   * 参考线可见与吸附默认开（对齐开关只影响交互，不影响像素）。
+   */
+  guide_drag_forget(shell);
+  shell.doc.show_rulers = false;
+  shell.doc.show_guides = true;
+  shell.doc.show_grid = false;
+  shell.doc.snap_enabled = true;
 }
 
 bool create_document_with(ShellState& shell, int width, int height, int dpi, int background) {
@@ -1483,6 +1494,22 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdViewZoomOut:
       view_zoom_step(shell, 1.0 / 1.2);
+      break;
+    /* ---- ROI #3 标尺 / 参考线 / 网格 / 对齐（都是视图开关，不进文档像素） ---- */
+    case kCmdViewRulers:
+      view_toggle_rulers(shell);
+      break;
+    case kCmdViewGuides:
+      view_toggle_guides(shell);
+      break;
+    case kCmdViewGrid:
+      view_toggle_grid(shell);
+      break;
+    case kCmdViewSnap:
+      view_toggle_snap(shell);
+      break;
+    case kCmdViewClearGuides:
+      view_clear_guides(shell);
       break;
     case kCmdLayerSelectUp:
       panel_move_selection(shell, 1); /* 面板自上而下：上移一行 = 索引 +1 */

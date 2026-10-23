@@ -22,11 +22,15 @@
  *     {"origin":[x,y],"size":[w,h],"rotation":0,"flipX":false,"flipY":false,
  *      "sampling":"High quality"}；写成 {x,y,w,h} 会让上游解码失败。
  *   - 引擎自有的扩展字段一律加 "engine" 前缀（engineLayerID / engineEffects /
- *     engineAdjustments / engineClippingSourceID），既不与上游键冲突，也保证
- *     「本引擎 → 上游 → 本引擎」往返不丢信息。
+ *     engineAdjustments / engineClippingSourceID / engineGuides），既不与上游键
+ *     冲突，也保证「本引擎 → 上游 → 本引擎」往返不丢信息。
  *
- * 显式不建模（保真边界，见 README）：上游 guides（对齐参考线）、live-mask 的
- * 启用状态、文本/形状/效果的上游语义字段——读取时忽略。
+ * 显式不建模（保真边界，见 README）：live-mask 的启用状态、文本/形状/效果的上游
+ * 语义字段——读取时忽略。参考线**不是**这一类：本引擎把它写在自己的 engineGuides
+ * 键里（[{"axis":0|1,"position":x}]：0 = 水平线、position 是 y，1 = 竖直线、
+ * position 是 x；位置是 double 文档像素，12.5 这类半像素值原样
+ * 往返），上游的同名 `guides` 键依旧不读——两边语义没有逐字核对过，静默互读只会
+ * 让对齐线在往返后跳位。空数组不写，旧 manifest 缺键即「没有参考线」。
  */
 #ifndef COMPOSITOR_FORMAT_COMP_FILE_H
 #define COMPOSITOR_FORMAT_COMP_FILE_H

@@ -444,7 +444,7 @@ bash scripts/build_ohos_shell.sh      # NAPI 共享库 libcompositor_ohos.so
 | 合成 | W3C 合成公式 + 蒙版/剪贴近似；**合成路径已升级为 FilterGraph 有向图**：图层树按节点递归求值，组默认**穿透**（组内子层混合模式穿透组边界、组不透明度乘进子层，对齐上游 `LayerGroups.swift`），`isolated` 组先把子树自合成到透明缓冲、再作为单元参与混合；悬空父级 / 成环 / 超深 64 一律显式报错 | 组级裁剪与组级效果、GPU 侧求值 |
 | 变换 | **平移/缩放/旋转/翻转统一走逆映射重采样**（`compositing/resample`）：目标像素反解源坐标后取样，采样模式 `Nearest` / `Smooth`（双线性）/ `High quality`（Catmull-Rom，缺省），对齐上游 `LayerTransform.sampling`；恒等变换在整数对齐下**逐字节精确**；旋转按目标矩形裁剪（不做包围盒扩张） | 与 macOS 参考输出逐像素基准比对；透视/网格变形 |
 | 图像格式 | `.comp` 内图层像素按位深落盘：RGBA8 → `images/<uuid>.png`，RGBA16/RGBA16F → `images/<uuid>.exr`（线性光、直通 alpha；16 位用 FLOAT 通道保低位，HDR 用 HALF 通道逐位精确）；蒙版用 8 位灰度 `images/<uuid>.mask.png`（符合上游 `LayerMask.isValid`） | 更大色深 / 硬件编解码 |
-| 交换格式键名 | 完整对齐上游 `ProjectManifest` / `ProjectLayerRecord`：`format`/`version`(13)/`supported`/`colorSpace`/`resolution`/`documentID`/`width`/`height`/`activeLayerID`/`layers`；图层 id 与 `parentID`/`maskSourceID` 用 UUID，`transform` 为六键形态（`origin`/`size`/`rotation`/`flipX`/`flipY`/`sampling`）。引擎自有键一律 **`engine` 前缀**（`engineLayerID`/`enginePixelFormat`/`engineClippingSourceID`/`engineAdjustments`/`engineEffects`/`engineIsolated`），避免与上游对象型键（`effects`/`text`/`shape`/`adjustment`）同名冲突 | 上游未建模字段（`guides`、live-mask 启用态等）按原样保真 |
+| 交换格式键名 | 完整对齐上游 `ProjectManifest` / `ProjectLayerRecord`：`format`/`version`(13)/`supported`/`colorSpace`/`resolution`/`documentID`/`width`/`height`/`activeLayerID`/`layers`；图层 id 与 `parentID`/`maskSourceID` 用 UUID，`transform` 为六键形态（`origin`/`size`/`rotation`/`flipX`/`flipY`/`sampling`）。引擎自有键一律 **`engine` 前缀**（`engineLayerID`/`enginePixelFormat`/`engineClippingSourceID`/`engineAdjustments`/`engineEffects`/`engineIsolated`/`engineGuides`），避免与上游对象型键（`effects`/`text`/`shape`/`adjustment`/`guides`）同名冲突 | 上游未建模字段（live-mask 启用态等）按原样保真；参考线写在本引擎的 `engineGuides`（§6.91），上游同名 `guides` 不读不写 |
 | 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走树内自研的分层读写器 `format/psd_codec`（§6.87：`comp_io_import_document` / `comp_io_export_document` 分层往返；拍平的 `comp_io_export` 仍不支持 PSD）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。**EXR 已由树内自研 scanline 读取器接入**（C3b，§6.1.18：NONE/RLE/ZIPS/ZIP 可读，PIZ/PXR24/B44/DWA 与 tiled/deep/multipart 如实拒绝，写侧仍 `UNSUPPORTED`）；32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
 | 调整图层参数 | 面板控件与 JSON **都由引擎元数据驱动**：键名表 `engine/domain/adjustment_table.cpp` 是唯一真源（12 种 kind，点分 `json_path` 逐字沿用上游字段名），外壳经 ABI 取 `label` / `min` / `max` / `default`；settings JSON 由 `comp_layer_adjustment_build_settings` 组装（**壳内不拼、不解析 JSON**）；写入口 `add` / `update` / `update_at` 一律校验，`.comp` 读取路径不校验以保真 | Curves / Levels 需专用曲线编辑器（当前 `editable=false`，仅白名单放行）；删除接口 `comp_layer_remove_adjustment` 已补（面板 `Ctrl+Shift+D`） |
 
@@ -1457,8 +1457,10 @@ Windows 侧推荐编译器仍是 clang-cl。
 
 以下上游字段在 `.comp` 读写时**原样保真**，但内核暂不参与合成计算，避免跨端往返丢信息：
 
-- `guides`（画布参考线）、live-mask 的启用状态；
+- live-mask 的启用状态；
 - 文本 / 形状的上游语义参数（引擎侧承载自有参数，上游对象型键不覆盖）；
+- 上游 `guides` 键——参考线由本引擎写在自己的 `engineGuides` 里（§6.91），
+  两边语义没有逐字核对过，**不静默互读**；
 - `maskSourceID` 仅原样保真，不参与合成。
 
 **图层效果已参与合成（2026-10-16 起，见 `compositing/effect_eval.cpp`）**：
@@ -5772,6 +5774,10 @@ C 与 D 差 20 个点属预期：PS 的功能条目长尾极重（滤镜 100+、
 ② 锐化/降噪入口（调整滤镜维 55→70%）；③ 标尺/参考线/网格/对齐（视图维 60→80%）；
 ④ PSD 分层导出（文档维 70→85%）。做完这四项，日常路径约到 **85%**。
 
+> 2026-10-23 晚校正：四项落地后实测 **75%**（各维得分见 `docs/ps-parity.md` §2），
+> 当时的 85% 是按「每维独立可加」估的，高估了约 10 个点——权重重算后每项只加
+> 0.5～1 分。同日后续批次见 §6.87–§6.91。
+
 **本轮验证基线（实跑）：** `build.py` **640 例 / 0 失败、零告警**；
 `run_regression.py --require-ohos` **6/6**；壳自检 **257 项 failures=0**、SHA256
 `377de660d48ac933…` 与基线一致；OHOS `compile ok=114 fail=0`；`^COMP_API` **150**；
@@ -6136,6 +6142,129 @@ alpha 不变、note 含 `bilateral`、一步撤销；`reduce_color_noise = 0` �
   高频纹理上肉眼可辨（`docs/filters.md` §5 第 9 条）。
 
 详见 `docs/filters.md` §3.10 / §3.11 / §5 / §8。
+
+### 6.91 标尺 / 参考线 / 网格 / 对齐（ROI #3，2026-10-23，Claude）
+
+`docs/ps-parity.md` §4 的 ROI 第 3 顺位，视图维 60% → 80%。这一维此前只有缩放、
+平移和适合窗口，缺的正是「把东西摆到该在的位置」那一套：没有标尺就量不了距离，
+没有参考线就对不齐，没有网格排不了版。三条验收口径从开工前钉到现在，一条没改：
+
+1. 拖参考线到 12.5px 时按**设备像素**对齐（8 设备像素的抓取半径，与缩放无关）；
+2. 存盘再开参考线位置不变（`12.5` 这类半像素值原样往返）；
+3. 对齐开关**不改变像素结果**，只影响交互落点。
+
+**ABI 只做尾部追加：152 → 158。** 参考线在引擎里是**文档状态**，所以这一项不
+全是壳层活：`comp_guide.h` 追加 6 个导出（`count` / `get` / `add` / `move` /
+`remove` / `clear`），既有导出与结构体布局一个不动；壳层自身**零新增导出**，
+只消费这 6 个入口做开关、拖动和覆盖层绘制。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_guide.h` | **新增**：`comp_guide`（`axis` + `double position`）与 6 个导出，参数闸/事务/容量（128 条）契约写在头注释 |
+| `engine/abi/src/comp_guide_abi.cpp` | **新增**：导出薄封装，`comp_document` → `Document` 的转换沿用既有模式 |
+| `engine/domain/guide.h` / `guide.cpp` | **新增**：验参、增删改、吸附到候选（`guide_snap_to`）、文档状态约束 |
+| `engine/domain/domain_state.h` | `DocumentState::guides`；纳入整篇快照撤销，因此参考线自动随撤销回退 |
+| `engine/format/comp_file.h` / `comp_file.cpp` | `engineGuides` 读写（空表不写键，缺键 = 没有参考线，坏条目显式报错） |
+| `shells/windows/src/ui_core.h` | `kRulerThickness = 18`、`ruler_top/left/corner_rect`、`ruler_major_step`（1-2-5 序列）、`ruler_hit`、`snap_tolerance_doc`——纯几何，无 Windows 头 |
+| `shells/windows/src/shell_guides.cpp` | **新增**：吸附候选、参考线命中、四个开关、拖动状态机、标尺/参考线/网格绘制 |
+| `shells/windows/src/shell_state.h` | 命令号 1580..1584；`show_rulers` / `show_guides` / `show_grid` / `snap_enabled` 收进 `DocumentContext`（按文档存） |
+| `shells/windows/src/shell_document.cpp` | 五个命令分派；`forget_color_range` 统一复位视图开关并收尾拖动 |
+| `shells/windows/src/shell_window.cpp` | 视图菜单五项 + 勾选态、`Ctrl+R` / `Ctrl+;` / `Ctrl+Shift+;` / `Ctrl+'`、鼠标按下/移动/松手/失捕获分派 |
+| `tests/test_guides.cpp` | **新增** 5 例：参数闸、CRUD + 撤销、越界拒绝、`.comp` 往返（12.5）、坏条目拒绝 |
+| `tests/test_ui_core.cpp` | +1 例 `ui_core_rulers_and_snap_tolerance` |
+| `scripts/visual_check.py` | 追加 `guides` 场景（9 条断言） |
+
+**标尺画在画布里面，不切布局。** 18px 的顶部/左侧条带直接叠在 `layout.canvas`
+的内边缘上，`layout` 本身一个字段都没动——缩放锚点、平移夹取、命中测试、面板
+分界线全部沿用原口径，省掉「标尺吃掉 18px 后所有坐标都要补偿」的连锁改动。
+默认**关**（它会盖住画面），`Ctrl+R` 开。刻度走 1-2-5 序列，挑第一个屏幕间距
+≥ 56px 的档位；间距 ≥ 40px 时再插 `step/5` 次刻度。角落方块最后画，盖住两条
+刻度带的交叉处。单位是文档像素，缩放时刻度值跟着变、屏幕间距保持稳定。
+
+**参考线是文档状态，不是视图态。** 因此它随 `.comp` 的 `engineGuides` 往返、
+随撤销/重做回退，也在保存后重新打开时留在原位。三个入口：
+
+- 从**标尺拖出**新建：上标尺拖出横线（position 是 y），左标尺拖出竖线（轴由来源条带决定）；
+- 画布上用 **Move 工具**拖动已有线（其它工具不抢起笔）；
+- 拖回标尺松手 = 删除。
+
+一整次拖动 = **一步撤销**：按下时开显式事务，第一帧真正移动才写 `add`/`move`
+（单击不产生空步），松手提交；值没变就 `abort`；本次新建又拖回标尺的，`abort`
+回滚，线随事务一起消失。捕获被菜单或切窗抢走时 `guide_drag_cancel` 同样 abort。
+三条文档替换路径（新建 / 打开 / 载入）都经 `forget_color_range`，那里在旧文档
+销毁**之前**先 `guide_drag_forget`——向已释放的文档 abort 就是 UAF。视图开关
+按文档存，换文档一律回默认：标尺/网格关，参考线可见与吸附开。
+
+**网格**是 50 文档像素的固定间距、每 5 格加粗一条，密度的稳定比「随缩放变密」
+更重要（变密会让人以为文档尺寸变了）。它只在文档矩形内绘制，开关不走文档。
+
+**吸附只改落点，没有像素通路。** 容差取 8 设备像素，除以缩放换成文档像素，
+所以「手感」在 2% 和 800% 下一致。候选依次是：画布 0 / 中线 / 另一边、最近的
+一条网格线（仅网格可见时）、其它同轴参考线（被拖的那条排除）；距离相等时保留
+先出现的候选，结果逐次可复现；NaN 候选直接跳过；参考线命中半径 4 设备像素，
+悬停的线加粗成 2px 高亮。
+
+**存盘格式**：`engineGuides: [{"axis":0|1,"position":double}]`，其中
+`0` = 水平线（`position` 是 y）、`1` = 竖直线（`position` 是 x），与 ABI 的
+`COMP_GUIDE_HORIZONTAL` / `COMP_GUIDE_VERTICAL` 同值。空数组不写，缺键即
+「没有参考线」；非数组、条目超 128、条目不是对象或字段不合法一律显式报错，
+不静默丢弃。上游的 `guides` 键**不读不写**——两边语义没有逐字核对过，
+静默互读只会让对齐线在往返后跳位（`engine/format/comp_file.h` 与 §6.3 已同步）。
+
+**新增单测 6 例**（661 → **667 例 / 0 失败**）。`tests/test_guides.cpp` 5 例：
+`guide_domain_validation_and_snap`（轴/坐标验参、`guide_snap_to` 的容差与 12.5
+命中）、`guide_abi_crud_and_undo`（add/move/remove 各一步撤销、`changed=0` 不落步）、
+`guide_abi_rejects_invalid`、`guide_comp_round_trip`（12.5 存两次读两次都相等，
+且加载后不占撤销栈）、`guide_comp_rejects_bad_entries`。
+`tests/test_ui_core.cpp` 1 例 `ui_core_rulers_and_snap_tolerance`：18px 厚度、
+三块矩形的位置与半开区间边界、1-2-5 序列的最小性（`step*zoom >= 56` 且
+尾数 ∈ {1,2,5}）、`ruler_major_step` 在 1.0 / 32.0 / 0.02 / 0 / 负 / NaN 下的取值、
+`ruler_hit` 的条带归属与隐藏/空布局返回 0、`snap_tolerance_doc` 的
+`tol * zoom == 8` 对所有缩放成立且非法缩放回落 400。
+
+**视觉探针 `guides`（9 条，追加在 `SCENES` 末尾）**：
+
+| # | 断言 | 实测 |
+|---|------|------|
+| 1 | 标尺默认关，画布上方没有刻度带 | 边缘着色像素 0 |
+| 2 | 切「对齐」开关不改变任何像素 | 整幅差异 0 |
+| 3 | `Ctrl+R` 打开标尺，出现 18px 刻度带 | 刻度带像素 10553 |
+| 4 | 从上标尺拖出横向参考线 | 参考线像素 623 |
+| 5 | 关标尺后参考线仍在（文档态 ≠ 视图态） | 623 |
+| 6 | 「清除参考线」把线删干净 | 0 |
+| 7 | 再次显示参考线，位置没有漂移 | 623 |
+| 8 | 网格叠加 | 画面变化 21188 |
+| 9 | 关网格后回到只有参考线的画面 | 与开网格前差异 0 |
+
+第 2 条排在最前，是刻意的：此时一条参考线都还没有，悬停高亮不可能扰动比较；
+再往后才引入线、标尺和网格。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **667 例 / 0 失败**（`test_guides.cpp` +5、UI 核心 +1） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 与基线一致 |
+| OHOS 交叉编译 | `compile ok=117 fail=0` |
+| `^COMP_API` 导出 | **158**（152 → 158，尾部追加 6 个 `comp_guide_*`，无重排） |
+| `scripts/visual_check.py --scene all` | **145 条 / 27 场景 / 0 失败**（`guides` 9 条全过） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+全量首跑时 `blend` 场景有 3 条失败（底层矩形没落笔，连带后两条判据失真）；
+单独重跑 `blend` 5/5、整轮重跑 145/0，均为同一构建产物——记为该场景的**偶发**
+（手写 ASCII 文档里的旧场景，与本节改动无调用关系：参考线代码只在 Move 工具
+或标尺上介入，`shape` 拖拽在 `guide_drag_begin` 里因为工具不是 Move 直接返回
+false——不写状态、不开事务、不接管捕获），不在本轮改动它。
+
+**已知边界**：
+
+- 标尺不带选区范围高亮、不带鼠标拖动出「辅助线预览」的那条虚线；刻度只有数字，
+  没有单位切换（文档 DPI 已读进 `ProjectInfo`，但标尺仍按像素显示）。
+- 参考线只有整条直线，没有旋转/锁定；拖动吸附候选不含图层包围盒与选区边界
+  （只有画布三线、网格、已有参考线）——后两者要跨图层树求几何，留下一轮。
+- 网格是固定 50px，不可配置间距与子网格数。
+- 吸附只在**参考线拖动**上生效；画笔、选框、Move 的落点还没有接同一套吸附。
 
 
 

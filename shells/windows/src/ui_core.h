@@ -234,6 +234,13 @@ struct Layout {
   static constexpr int kHistogramHeight = 64;
   /* 绘图区比整块高度小一圈，留给标题行；折线本身画在这块里。 */
   static constexpr int kHistogramPlotHeight = 40;
+  /*
+   * ROI #3 标尺条：画在**画布内侧**（上边 / 左边各 18px），不从布局里切走一条带。
+   * 画布矩形是缩放居中、pan 补偿与文档像素换算的唯一锚点，切走 18px 会让所有
+   * 既有命中测试与视觉基线整体偏移 18px。代价是标尺盖住画布最外 18px（放大时
+   * 正好是文档边缘），所以标尺默认关闭，用户要看的时候才开。
+   */
+  static constexpr int kRulerThickness = 18;
 
   Rect toolbar{};
   Rect options{}; /* §5.49 工具选项栏；高度不够时为空矩形 */
@@ -380,6 +387,58 @@ inline int panel_toggle_at(const Layout& layout, double x, double y) {
   if (layout.layer_toggle.contains(x, y)) return 1;
   if (layout.adjust_toggle.contains(x, y)) return 2;
   return 0;
+}
+
+/* ------------------------------------------------------------ 标尺 / 吸附 */
+
+inline Rect ruler_top_rect(const Rect& canvas) {
+  return Rect{canvas.x, canvas.y, canvas.w, Layout::kRulerThickness};
+}
+
+inline Rect ruler_left_rect(const Rect& canvas) {
+  return Rect{canvas.x, canvas.y, Layout::kRulerThickness, canvas.h};
+}
+
+/* 左上角交叉块：两把尺子共用，画在最上层，盖住刻度起点。 */
+inline Rect ruler_corner_rect(const Rect& canvas) {
+  return Rect{canvas.x, canvas.y, Layout::kRulerThickness, Layout::kRulerThickness};
+}
+
+/*
+ * 主刻度步长（文档像素）：取 1-2-5 序列里第一个「屏幕间距 >= 56px」的值。
+ * 固定 56px 是标签宽度（最多 7 位数 + 边距）的经验下限：只要屏幕间距不小于它，
+ * 标签就永不相撞；缩放越大，命中的步长越细，读数精度自动跟着变。
+ */
+inline double ruler_major_step(double zoom) {
+  const double safe = (zoom > 0.0) ? zoom : CanvasView::kMinZoom;
+  static const double kSteps[] = {1.0,   2.0,   5.0,    10.0,   20.0,   50.0,   100.0,
+                                  200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0};
+  for (double step : kSteps) {
+    if (step * safe >= 56.0) return step;
+  }
+  return kSteps[sizeof(kSteps) / sizeof(kSteps[0]) - 1];
+}
+
+/*
+ * 标尺命中：0 = 未命中，1 = 上尺（拖出水平参考线），2 = 左尺（拖出垂直参考线）。
+ * 标尺没显示时整块失效——看不见的尺子不能抢画布最外 18px 的点击。
+ * 左上角落在上尺之内，因此从角上拖出的是水平参考线（与上游一致）。
+ */
+inline int ruler_hit(const Layout& layout, double x, double y, bool rulers_visible) {
+  if (!rulers_visible || layout.canvas.empty()) return 0;
+  if (ruler_top_rect(layout.canvas).contains(x, y)) return 1;
+  if (ruler_left_rect(layout.canvas).contains(x, y)) return 2;
+  return 0;
+}
+
+/*
+ * 吸附半径：以**设备像素**给出再换算回文档像素。若直接用文档像素，800% 时
+ * 8 文档像素在屏幕上是 64px（隔着半个画布都在吸），2% 时又不到 1 个设备像素
+ * （永远吸不上）。按设备像素给，各缩放级手感一致。
+ */
+inline double snap_tolerance_doc(double zoom, double device_px = 8.0) {
+  const double safe = (zoom > 0.0) ? zoom : CanvasView::kMinZoom;
+  return device_px / safe;
 }
 
 /* ------------------------------------------------------------ 工具条 */

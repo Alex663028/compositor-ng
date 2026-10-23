@@ -4341,3 +4341,101 @@ COMP_TEST(ui_core_font_label_filter) {
   COMP_CHECK(comp_ui::font_label_matches(L"5×7 点阵（内置，仅 ASCII）", L"ascii"));
 }
 
+/*
+ * ROI #3：标尺几何 / 刻度步长 / 命中 / 吸附半径。
+ *
+ * 标尺是**画在画布内侧**的 18px 条带（不从布局里切走），所以这里钉的是：
+ *   1. 三条矩形都贴画布左上角、宽度厚度恒定，且互不越界；
+ *   2. 主刻度走 1-2-5 序列，屏幕间距永不小于 56px（标签不相撞），缩放越大越细；
+ *   3. 命中顺序：上尺优先，左上角算上尺（拖出水平参考线），标尺隐藏时整块失效；
+ *   4. 吸附半径按设备像素换算，缩放级之间手感一致，非法缩放回落到 2%。
+ */
+COMP_TEST(ui_core_rulers_and_snap_tolerance) {
+  const Rect canvas{100, 50, 800, 600};
+
+  /* 1. 三条矩形：厚度恒定、贴左上角，交叉块等于两把尺子的交集。 */
+  COMP_CHECK(comp_ui::Layout::kRulerThickness == 18);
+  const Rect top = comp_ui::ruler_top_rect(canvas);
+  const Rect left = comp_ui::ruler_left_rect(canvas);
+  const Rect corner = comp_ui::ruler_corner_rect(canvas);
+  COMP_CHECK(top.x == canvas.x && top.y == canvas.y && top.w == canvas.w);
+  COMP_CHECK(top.h == comp_ui::Layout::kRulerThickness);
+  COMP_CHECK(left.x == canvas.x && left.y == canvas.y &&
+             left.h == canvas.h && left.w == comp_ui::Layout::kRulerThickness);
+  COMP_CHECK(corner.x == canvas.x && corner.y == canvas.y &&
+             corner.w == comp_ui::Layout::kRulerThickness &&
+             corner.h == comp_ui::Layout::kRulerThickness);
+  /* 条带都在画布内侧（画布是缩放/平移的锚点，标尺不得让它变形）。 */
+  COMP_CHECK(top.right() == canvas.right() && top.bottom() <= canvas.bottom());
+  COMP_CHECK(left.bottom() == canvas.bottom() && left.right() <= canvas.right());
+
+  /* 2. 刻度步长：1-2-5 序列 + 屏幕间距 >= 56px，且是满足条件的最小值。 */
+  const double zooms[] = {0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 32.0};
+  for (const double zoom : zooms) {
+    const double step = comp_ui::ruler_major_step(zoom);
+    COMP_CHECK(step * zoom >= 56.0 - 1e-9);
+    /* 序列成员判定：首位 1/2/5 再乘 10 的幂。 */
+    double mantissa = step;
+    while (mantissa >= 10.0) mantissa /= 10.0;
+    COMP_CHECK(near_value(mantissa, 1.0) || near_value(mantissa, 2.0) ||
+               near_value(mantissa, 5.0));
+    /* 最小性：退一档就不够了（否则标签会比需要的更稀，读数精度白丢）。 */
+    double smaller = 0.0;
+    if (near_value(mantissa, 2.0)) smaller = step * 0.5;
+    if (near_value(mantissa, 5.0)) smaller = step * 0.4;
+    if (near_value(mantissa, 1.0) && step > 1.0) smaller = step * 0.5;
+    if (smaller > 0.0) COMP_CHECK(smaller * zoom < 56.0 + 1e-9);
+  }
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(1.0), 100.0));
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(32.0), 2.0));
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(0.02), 5000.0));
+  /* 非法缩放（0 / 负数 / NaN）回落到下限 2%，不返回 0 或 inf。 */
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(0.0), 5000.0));
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(-4.0), 5000.0));
+  COMP_CHECK(near_value(comp_ui::ruler_major_step(
+                            std::numeric_limits<double>::quiet_NaN()),
+                        5000.0));
+
+  /* 3. 命中：上尺 1、左尺 2、左上角 1、画布其余 0。 */
+  const Layout fixed = comp_ui::compute_layout(1280, 800);
+  COMP_CHECK(!fixed.canvas.empty());
+  COMP_CHECK(comp_ui::ruler_hit(fixed, static_cast<double>(fixed.canvas.x + 200),
+                                static_cast<double>(fixed.canvas.y + 6), true) == 1);
+  COMP_CHECK(comp_ui::ruler_hit(fixed, static_cast<double>(fixed.canvas.x + 6),
+                                static_cast<double>(fixed.canvas.y + 300), true) == 2);
+  /* 左上角落在上尺里（顺序决定语义：从角上拖出水平参考线）。 */
+  COMP_CHECK(comp_ui::ruler_hit(fixed, static_cast<double>(fixed.canvas.x + 6),
+                                static_cast<double>(fixed.canvas.y + 6), true) == 1);
+  /* 画布中央不命中；标尺隐藏时连条带也不命中。 */
+  COMP_CHECK(comp_ui::ruler_hit(fixed, static_cast<double>(fixed.canvas.x + 200),
+                                static_cast<double>(fixed.canvas.y + 200), true) == 0);
+  COMP_CHECK(comp_ui::ruler_hit(fixed, static_cast<double>(fixed.canvas.x + 6),
+                                static_cast<double>(fixed.canvas.y + 6), false) == 0);
+  /* 半开区间：条带右/下边界外一像素就不算标尺。 */
+  COMP_CHECK(comp_ui::ruler_hit(
+                 fixed, static_cast<double>(fixed.canvas.x + 200),
+                 static_cast<double>(fixed.canvas.y + comp_ui::Layout::kRulerThickness), true) == 0);
+  COMP_CHECK(comp_ui::ruler_hit(
+                 fixed, static_cast<double>(fixed.canvas.x + comp_ui::Layout::kRulerThickness),
+                 static_cast<double>(fixed.canvas.y + 300), true) == 0);
+  /* 空布局失效：不看尺寸为 0 的画布。 */
+  const Layout empty{};
+  COMP_CHECK(comp_ui::ruler_hit(empty, 0.0, 0.0, true) == 0);
+
+  /* 4. 吸附半径：device_px / zoom，缩放级之间屏幕手感一致。 */
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(1.0), 8.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(4.0), 2.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(8.0), 1.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(0.02), 400.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(1.0, 4.0), 4.0));
+  for (const double zoom : zooms) {
+    /* 反算回设备像素必须还是 8：这就是「手感与缩放无关」的可判定口径。 */
+    COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(zoom) * zoom, 8.0, 1e-9));
+  }
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(0.0), 400.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(-2.0), 400.0));
+  COMP_CHECK(near_value(comp_ui::snap_tolerance_doc(
+                            std::numeric_limits<double>::quiet_NaN()),
+                        400.0));
+}
+

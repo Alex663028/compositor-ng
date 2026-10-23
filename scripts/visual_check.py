@@ -2388,6 +2388,90 @@ def scene_font_picker(shell, checker):
                   restored < 200, "与打开前的差异 %d" % restored)
 
 
+def scene_guides(shell, checker):
+    """ROI #3：标尺 / 参考线 / 网格 / 对齐。
+
+    断言口径全部可算（颜色计数 / 像素差），不依赖观感：
+      1. 标尺默认关闭；打开后画布顶部 18px 变成标尺底色；
+      2. 从上尺拖进画布 → 出现一条贯穿画布的青色参考线；
+      3. 关标尺**不删**参考线（参考线是文档状态，标尺只是画不画它）；
+      4. Ctrl+; 隐藏参考线后青色消失，再按一次回来（视图开关可逆）；
+      5. Ctrl+' 网格是覆盖层（打开后画布必然有像素变化）；
+      6. Ctrl+Shift+; 对齐开关**一个像素都不改**——它只吸附拖动落点。
+
+    场景顺序有意先做第 6 步：此时画布上还没有参考线，指针悬停不可能产生
+    高亮状态，两帧必须在画布矩形内逐像素相同。
+
+    存盘往返（拖到 12.5px 后关闭再打开位置不变）由 tests/test_guides.cpp 的
+    .comp round-trip 用例覆盖——要落盘就得点模态文件对话框，脚本无法无人值守。
+    """
+    scene = "guides"
+    canvas = shell.layout["canvas"]
+    cl, ct, cr, cb = canvas
+    band = (cl, ct, cr, ct + 18)                       # 上尺条带
+    body = (cl + 24, ct + 24, cr - 24, cb - 24)        # 避开标尺与画布边缘
+
+    before = shell.shot("91_guides_off")
+    ruler_px = count_matching(before, band, (46, 48, 54), 6)
+    checker.check(scene, "标尺默认关闭（画布上方没有标尺条）",
+                  ruler_px < 50, "标尺底色像素 %d" % ruler_px)
+
+    # 6. 对齐开关：只改交互，不改像素。
+    shell.command(1583)  # 视图 > 对齐（关）
+    snap_off = shell.shot("92_snap_off")
+    snap_delta = pixel_diff(before, snap_off, canvas)
+    checker.check(scene, "关闭对齐不改变任何像素（只影响拖动落点）",
+                  snap_delta == 0, "画布差异像素 %d" % snap_delta)
+    shell.command(1583)  # 恢复默认
+
+    # 1. 打开标尺。
+    shell.command(1580)  # 视图 > 标尺
+    ruled = shell.shot("93_rulers_on")
+    ruler_px = count_matching(ruled, band, (46, 48, 54), 6)
+    checker.check(scene, "打开标尺：画布顶部 18px 出现标尺条",
+                  ruler_px > (cr - cl) * 8, "标尺底色像素 %d" % ruler_px)
+
+    # 2. 从上尺拖出水平参考线。
+    shell.select_tool("move")
+    x0 = (cl + cr) // 2
+    shell.drag(x0, ct + 6, x0, ct + (cb - ct) // 2)
+    guided = shell.shot("94_guide_added")
+    guide_px = count_matching(guided, body, (0, 174, 239), 40)
+    checker.check(scene, "从标尺拖出参考线：画布上出现贯穿的青色细线",
+                  guide_px > (cr - cl) // 3, "参考线像素 %d" % guide_px)
+
+    # 3. 关标尺：参考线仍在。
+    shell.command(1580)
+    kept = shell.shot("95_rulers_off_guide_kept")
+    kept_px = count_matching(kept, body, (0, 174, 239), 40)
+    checker.check(scene, "关闭标尺后参考线仍在（文档状态 ≠ 标尺可见性）",
+                  kept_px > (cr - cl) // 3, "参考线像素 %d" % kept_px)
+
+    # 4. 隐藏 / 显示参考线。
+    shell.command(1581)  # 视图 > 参考线
+    hidden = shell.shot("96_guides_hidden")
+    hidden_px = count_matching(hidden, body, (0, 174, 239), 40)
+    checker.check(scene, "隐藏参考线后画布恢复干净（青色消失）",
+                  hidden_px < 20, "参考线像素 %d" % hidden_px)
+    shell.command(1581)
+    shown = shell.shot("97_guides_shown")
+    shown_px = count_matching(shown, body, (0, 174, 239), 40)
+    checker.check(scene, "再次显示参考线（视图开关可逆，位置没有丢）",
+                  shown_px > (cr - cl) // 3, "参考线像素 %d" % shown_px)
+
+    # 5. 网格覆盖层。
+    shell.command(1582)  # 视图 > 网格
+    grid = shell.shot("98_grid_on")
+    grid_delta = pixel_diff(shown, grid, body)
+    checker.check(scene, "打开网格：画布出现 50px 网格覆盖层",
+                  grid_delta > 500, "网格变化像素 %d" % grid_delta)
+    shell.command(1582)
+    grid_off = shell.shot("99_grid_off")
+    back_delta = pixel_diff(shown, grid_off, body)
+    checker.check(scene, "关闭网格后画布回到只有参考线的样子",
+                  back_delta == 0, "与开网格前的差异像素 %d" % back_delta)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -2414,6 +2498,7 @@ SCENES = [    ("start", scene_start, ()),
     ("selection_modify", scene_selection_modify, ()),
     ("text_layer", scene_text_layer, ()),
     ("font_picker", scene_font_picker, ()),
+    ("guides", scene_guides, ()),
 ]
 
 

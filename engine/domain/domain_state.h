@@ -50,6 +50,16 @@ struct SelectionState {
   MaskBuffer base;
 };
 
+/* 画布参考线（标尺拖出的对齐线）。
+ * 放进 DocumentState 而不是外壳的设置表：参考线要进 `.comp`、要随撤销回退，
+ * 而撤销/事务快照只认 DocumentState（同选区的理由）。
+ * axis 取 0 = 水平（position 是 y）、1 = 垂直（position 是 x）；位置是连续的
+ * 文档像素，取整发生在交互层。详细契约见 domain/guide.h。 */
+struct Guide {
+  uint32_t axis = 0;
+  double position = 0.0;
+};
+
 struct DocumentState {
   int32_t width = 0;
   int32_t height = 0;
@@ -69,6 +79,9 @@ struct DocumentState {
    * 撤销/重做、事务快照与事务回滚都只认 DocumentState，旁路成员会漏掉。
    * 注意 base 的尺寸是**文档尺寸**，换画布（Image Size）时必须同步处理。 */
   SelectionState selection;
+
+  /* 参考线（见 Guide）。空向量 = 无参考线；落盘为 manifest 的 engineGuides。 */
+  std::vector<Guide> guides;
 };
 
 }  // namespace compositor
