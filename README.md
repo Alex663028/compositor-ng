@@ -6372,7 +6372,98 @@ false——不写状态、不开事务、不接管捕获），不在本轮改动
 - 通道面板状态（开/关、选中行）按文档存，但不写进 `.comp`，重开从第一行开始。
 - 通道与「快速蒙版」「选择并遮住」还没有打通；通道也不能作为图层蒙版直接使用。
 
+### 6.93 HiDPI：Per-Monitor V2 感知 + 逻辑像素排版（ROI #7，2026-10-23，Claude）
 
+`docs/ps-parity.md` §4 的 ROI 第 7 顺位，视图维 50% → 55%（全功能面）／ 80% → 85%
+（日常路径）。改造前外壳没有声明
+DPI 感知，200% 缩放下整个窗口被系统位图拉伸：文字发虚，1px 分隔线变成 2 个
+糊掉的设备像素。验收口径三条：
+
+1. 进程在任何窗口创建之前就声明 **Per-Monitor V2**，跨屏拖动收到 `WM_DPICHANGED`
+   并按新 DPI 重排，不是被系统拉伸；
+2. 壳层的排版常量、命中半径、行高仍按**逻辑像素（DIP）**书写，不做 155 处乘系数；
+3. 100% 缩放下与改造前**逐像素一致**（不能为了 HiDPI 动到既有 145 条视觉断言）。
+
+**没有资源清单，所以感知在运行时声明。** 构建脚本是 ziglang 直接编译链接，
+没有 `.rc` / manifest 管线；为一行感知去搭整套资源编译不划算。`shell_dpi.cpp`
+按 `user32!SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` →
+`shcore!SetProcessDpiAwareness(2)` → `SetProcessDPIAware()` 三级降级动态取函数，
+三项全失败（`ERROR_ACCESS_DENIED`，说明清单已声明过）同样按成功处理。降级顺序
+写死成这个次序是因为 V2 才会给非客户区（标题栏/菜单/滚动条）发 `WM_DPICHANGED`，
+系统感知在跨屏时只会位图拉伸——正是本轮要消灭的东西。
+
+**一个坐标系，三个换算点。** `present()` 在内存 DC 上开 `MM_ANISOTROPIC`，
+`SetWindowExtEx(逻辑宽高)` + `SetViewportExtEx(设备宽高)`，比例即 DPI 缩放；
+于是绘制、命中测试、蚂蚁线、参考线、选区手柄全都继续用同一套逻辑数字，
+两套坐标系真正交界的地方只剩三处：
+
+| 边界 | 为什么必须换算 |
+|---|---|
+| `GetClientRect` | 给设备像素，`compute_layout` 要逻辑像素（`client_layout` 统一换算） |
+| 鼠标坐标 | 鼠标消息恒为设备像素，`WM_MOUSEMOVE`/滚轮/`WM_SETCURSOR` 统一按 `dpi_logical` 换算 |
+| 初始窗口尺寸 | DPI 感知进程里 `CreateWindowEx` 的宽高是设备像素，默认尺寸要 `dpi_device` 放大 |
+
+`dpi == 96` 时**完全不开映射模式**，所以 100% 下渲染路径与改造前逐字节相同——
+这是 145 条视觉断言与 263 项自检基线能原样通过的原因。
+
+**字体要自己建一份。** 内存 DC 的默认字体是 stock 对象，瓶颈不在映射模式，而在
+stock 字体未必是可缩放字体；这里用 `GetObjectW` 复制它的 `LOGFONTW` 再
+`CreateFontIndirectW` 选入 DC，字号仍是逻辑单位，由映射放大到设备高度。上屏前
+必须把字体选回原对象（否则句柄泄漏），并把映射模式清回 `MM_TEXT`——`BitBlt`
+的源矩形同样受映射模式影响，留着 `MM_ANISOTROPIC` 会让 GDI 按逻辑比例再换算
+一次。这里没有用 `SaveDC`/`RestoreDC` 包住整帧，因为 `RestoreDC` 会连选中的
+位图一起回滚。
+
+**顺带修掉一处真实分叉**：`present()` 过去自己算了一遍 `compute_layout(w, h)`
+（默认面板宽度），而命中测试走 `client_layout()`（用户拖过的面板宽度）。拖完
+分界线后命中矩形变了、画面纹丝不动。现在两者共用 `client_layout`。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/shell_dpi.cpp` | **新增**：感知降级链、`dpi_for_system/window`、逻辑↔设备换算 |
+| `shells/windows/src/shell_state.h` | `ShellState::dpi`（96 起算） |
+| `shells/windows/src/shell_internal.h` | 6 个 DPI 入口声明 + 逻辑像素契约注释 |
+| `shells/windows/src/main.cpp` | 启动第一行声明感知；初始窗口按系统 DPI 放大；`--dpi=N` 诊断覆盖 |
+| `shells/windows/src/shell_window.cpp` | `client_layout` 换算；鼠标/滚轮/光标逻辑化；`WM_DPICHANGED` |
+| `shells/windows/src/shell_paint.cpp` | `present` 设备/逻辑双尺寸、映射模式与可缩放字体、统一 `client_layout` |
+
+**`--dpi=N`（96..480）是诊断开关**，与 `--selftest` / `--present-bench` 同类：
+显示器恒为 100% 的机器（CI、远程会话）没有别的办法触发非 96 的映射路径，这个
+开关让 M52 的手动验证在任何设备上都能复现 150%/200% 的排版与字号。它只改壳层
+自己的换算基准，不动进程感知，也不改窗口实际像素尺寸——所以窗口还是 1264×661
+设备像素时，逻辑面积只剩 843×441（150%）或 632×330（200%），面板会按「小窗口」
+逻辑拥挤，这与在 100% 下手动把窗口缩到同样大小是同一幅画面（已对比确认）。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **674 例 / 0 失败**（本轮无引擎/单测改动） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 与基线一致（未加自检场景，基线未动） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **163**（本轮零 ABI 改动） |
+| `scripts/visual_check.py --scene all` | **145 条 / 27 场景 / 0 失败**（100% 下逐像素不变） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| 进程感知实测 | `Shcore!GetProcessDpiAwareness` = **2（per-monitor）**，本机 `GetDpiForWindow`=96 |
+| DPI 覆盖截图 | `report/assets/s15/dpi-check-96/144/192[-samesize-half].png` |
+
+**已知边界**：
+
+- **画布的缩放语义仍是逻辑像素**：`zoom=100%` 在 200% 屏上是「1 文档像素 = 2
+  设备像素」，即 2 倍整数放大（GDI 整数倍缩放是像素复制，不糊，但信息量等同于
+  PS 的 200%）。PS 的口径是 100% = 1 设备像素。改这个要把 `View` 变换整体挪到
+  设备坐标系（`doc_to_screen`/`screen_to_doc` 的每个调用点都要跟着改），风险
+  远超本轮 S 级改动，已记入 `BACKLOG.md` 等单独一轮。
+- 非整数缩放比（125%/150%）下字体会由 GDI 按映射光栅化，笔画略软；整数倍
+  （200%）等同像素复制。
+- 逻辑面积过小（`--dpi=192` 配 1280 宽窗口时只有 632 逻辑像素）时，工具条右侧
+  状态文字会与图标重叠。这是既有的「窄窗口」表现，不是 DPI 引入的（已用
+  100% + 843px 窗口做对照）。
+- 没有资源清单，所以「右键 → 属性 → 兼容性 → 高 DPI」这类用户级覆盖仍然生效，
+  用户可以强制把进程退回系统感知；壳层不会去对抗它。
+- 每显示器 V2 的 `WM_GETDPISCALEDSIZE` 没有实现：窗口在跨屏时按系统建议尺寸
+  走，非客户区高度变化会有一次轻微尺寸跳变。
 
 
 

@@ -643,6 +643,20 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void set_retouch_mode(ShellState& shell, int mode);
   void set_tone_state(ShellState& shell, int state);
   void brush_step(ShellState& shell, int direction, bool hardness);
+  /*
+   * ROI #7 HiDPI（shell_dpi.cpp）。壳层的排版常量全部是**逻辑像素**，上屏时
+   * 靠 memory DC 的 MM_ANISOTROPIC 映射统一放大，所以除了下面四条入口，其余
+   * 代码不需要知道 DPI 存在：
+   *   - dpi_enable_awareness：进程级 Per-Monitor V2（必须在建窗前调用）；
+   *   - dpi_for_system / dpi_for_window：取 DPI（旧系统上退回 GetDeviceCaps）；
+   *   - dpi_logical / dpi_device：设备像素 <-> 逻辑像素。
+   */
+  void dpi_enable_awareness();
+  int dpi_for_system();
+  int dpi_for_window(HWND window);
+  int dpi_logical(int device_px, int dpi);
+  int dpi_device(int logical_px, int dpi);
+  int shell_dpi(const ShellState& shell);
   bool client_layout(const ShellState& shell, Layout* out);
   void panel_resize_begin(HWND window, ShellState& shell, int target, int mouse_x);
   void panel_resize_extend(ShellState& shell, int mouse_x);

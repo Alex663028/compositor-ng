@@ -2710,9 +2710,20 @@ void present(HWND window, ShellState& shell) {
 
   RECT client{};
   GetClientRect(window, &client);
-  const int client_width = client.right - client.left;
-  const int client_height = client.bottom - client.top;
-  const Layout layout = comp_ui::compute_layout(client_width, client_height);
+  /* ROI #7：客户区是设备像素，排版是逻辑像素——两套尺寸在 present 里并存。 */
+  const int device_width = client.right - client.left;
+  const int device_height = client.bottom - client.top;
+  const int dpi = shell_dpi(shell);
+  const int logical_width = dpi_logical(device_width, dpi);
+  const int logical_height = dpi_logical(device_height, dpi);
+  /*
+   * 排版与命中测试共用 client_layout：过去这里单独算了一版（用默认面板宽度），
+   * 结果拖动分界线只改了命中矩形、画面纹丝不动。合并之后两者不可能再分叉。
+   */
+  Layout layout{};
+  if (!client_layout(shell, &layout)) {
+    layout = comp_ui::compute_layout(logical_width, logical_height);
+  }
 
   /* 新文档 / 打开文档后按窗口适配一次；之后缩放与平移完全由用户操作决定。 */
   if (shell.doc.needs_fit) {
@@ -2723,10 +2734,35 @@ void present(HWND window, ShellState& shell) {
   }
 
   HDC memory_dc = CreateCompatibleDC(dc);
-  HBITMAP bitmap = CreateCompatibleBitmap(dc, client_width, client_height);
+  HBITMAP bitmap = CreateCompatibleBitmap(dc, device_width, device_height);
   HGDIOBJ old_bitmap = SelectObject(memory_dc, bitmap);
 
-  RECT fill{0, 0, client_width, client_height};
+  /*
+   * ROI #7：把整帧的逻辑坐标映射到设备像素。MM_ANISOTROPIC + window/viewport
+   * 比例 = DPI 缩放，于是排版常量、命中半径、行高都不必乘系数——绘制与命中
+   * 测试天然同一套数字。100% 时（dpi == 96）完全不开映射，与改造前逐像素一致。
+   *
+   * 字体必须自己建一份：DC 默认字体是 stock 对象，未必是可缩放字体，映射模式
+   * 下可能不会被放大。这里复制它的 LOGFONT（同一字面、同一字号）再选入，字号
+   * 仍是「逻辑单位」，GDI 会按映射把它光栅化到设备高度。
+   */
+  HFONT ui_font = nullptr;
+  HGDIOBJ old_font = nullptr;
+  const bool dpi_scaled = dpi != 96 && logical_width > 0 && logical_height > 0;
+  if (dpi_scaled) {
+    SetMapMode(memory_dc, MM_ANISOTROPIC);
+    SetWindowExtEx(memory_dc, logical_width, logical_height, nullptr);
+    SetViewportExtEx(memory_dc, device_width, device_height, nullptr);
+    LOGFONTW font{};
+    HGDIOBJ stock_font = GetCurrentObject(memory_dc, OBJ_FONT);
+    if (stock_font != nullptr &&
+        GetObjectW(stock_font, sizeof(font), &font) == static_cast<int>(sizeof(font))) {
+      ui_font = CreateFontIndirectW(&font);
+      if (ui_font != nullptr) old_font = SelectObject(memory_dc, ui_font);
+    }
+  }
+
+  RECT fill{0, 0, logical_width, logical_height};
   HBRUSH background = CreateSolidBrush(RGB(32, 32, 36));
   FillRect(memory_dc, &fill, background);
   DeleteObject(background);
@@ -2829,7 +2865,17 @@ void present(HWND window, ShellState& shell) {
   draw_panel_dividers(memory_dc, shell, layout);
   draw_status_bar(memory_dc, shell, layout.status);
 
-  BitBlt(dc, 0, 0, client_width, client_height, memory_dc, 0, 0, SRCCOPY);
+  /*
+   * 上屏前把映射模式清回 MM_TEXT：BitBlt 的源矩形同样受映射模式影响，留着
+   * MM_ANISOTROPIC 会让 GDI 按逻辑比例再换算一次（尺寸对、采样方式不对）。
+   * 字体也必须先选回原对象才能删。
+   */
+  if (ui_font != nullptr) {
+    SelectObject(memory_dc, old_font);
+    DeleteObject(ui_font);
+  }
+  SetMapMode(memory_dc, MM_TEXT);
+  BitBlt(dc, 0, 0, device_width, device_height, memory_dc, 0, 0, SRCCOPY);
   SelectObject(memory_dc, old_bitmap);
   DeleteObject(bitmap);
   DeleteDC(memory_dc);

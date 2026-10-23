@@ -2760,6 +2760,59 @@ SHA256 与基线一致**（未改自检场景）。边界：没有通道缩略�
 复制/直接编辑蒙版；载入只有 replace / 加选 / 减选，没有「反向 / 相交」；面板开关
 与选中行不写进 `.comp`。
 
+### 5.56 HiDPI：Per-Monitor V2 感知 + 逻辑像素排版（ROI #7，2026-10-23）
+
+`docs/ps-parity.md` §4 的 ROI 第 7 顺位，视图维 50% → 55%（全功能面）／ 80% → 85%
+（日常路径）。引擎零改动、零新增
+导出（**163** 不变），全部落在 `shells/windows/src`。完整设计见 README §6.93，
+本节只记壳层落点与坑。
+
+**1. 感知在运行时声明，不靠清单。** 构建是 ziglang 直接编译链接，没有 `.rc` /
+manifest 管线，所以 `dpi_enable_awareness()` 作为 `wWinMain` 的第一条语句（必须在
+任何 `CreateWindowEx` 之前，包括 `--present-bench` 那条路径）调用，按
+`SetProcessDpiAwarenessContext(V2)` → `shcore.SetProcessDpiAwareness(2)` →
+`SetProcessDPIAware()` 降级；全部失败（`ERROR_ACCESS_DENIED` = 清单已声明）也当
+成功。实测本机 `Shcore!GetProcessDpiAwareness` 返回 **2（per-monitor）**。
+
+**2. 排版常量一个都不乘系数。** `present()` 在内存 DC 上开 `MM_ANISOTROPIC`，
+window 范围 = 逻辑宽高、viewport 范围 = 设备宽高；绘制与命中测试继续用同一套
+逻辑数字。真正的换算点只有三处：`client_layout` 里的 `GetClientRect`、
+`window_proc` 顶部的鼠标坐标（`WM_MOUSEMOVE` 的 `lparam`、`WM_MOUSEWHEEL` 与
+两处 `WM_SETCURSOR` 的 `GetCursorPos`+`ScreenToClient` 结果）、以及
+`main.cpp` 的初始窗口尺寸。`dpi == 96` 时映射模式**完全不开**，所以 100% 下与
+改造前逐像素相同。
+
+**3. 字体与映射模式的进出。** 内存 DC 的默认字体是 stock 对象，未必可缩放：
+`GetObjectW` 取出 `LOGFONTW` 再 `CreateFontIndirectW` 选入，画完先选回原字体再
+`DeleteObject`；随后 `SetMapMode(memory_dc, MM_TEXT)` 才 `BitBlt`——`BitBlt` 的
+源矩形也受映射模式影响，留着各向异性会让 GDI 再换算一次。没有用
+`SaveDC`/`RestoreDC` 包整帧：`RestoreDC` 会连选中的位图一起回滚。
+
+**4. 顺带修掉 `present` / 命中测试的分叉。** 过去 `present` 自己调
+`compute_layout(w, h)`（默认面板宽度），命中测试走 `client_layout()`（用户拖过的
+宽度）；拖完分界线只改命中矩形、画面不动。现在两边共用 `client_layout`，这条
+历史缺陷是 ROI #7 排查时暴露的，与 DPI 本身无关但不修就会在非 96 下同样发作。
+
+**5. `WM_DPICHANGED`。** 从 `HIWORD(wparam)` 取新 DPI（夹取 96..480），按系统
+建议的 `RECT` 走 `SetWindowPos(SWP_NOZORDER | SWP_NOACTIVATE)`，更新
+`shell->dpi` 后整窗失效重绘；不 `break` 给 `DefWindowProc`（否则系统会再按老
+DPI 调整一次）。跨屏时画布缩放与滚动位置保持不变（`needs_fit` 不重设），这是
+用户操作状态，不该被 DPI 事件重置。
+
+**6. `--dpi=N` 诊断开关。** 与 `--selftest` / `--present-bench` 同类：只覆盖壳层
+自己的换算基准，不动进程感知、不改窗口像素尺寸。用处是让恒为 100% 的机器（CI、
+远程会话）也能复现 150%/200% 的排版与字号；手动测试 M52 用它出图。注意覆盖后
+窗口设备像素不变，逻辑面积会变小，面板拥挤是「小窗口」逻辑的既有表现——已用
+100% + 843×441 客户区做过对照，两者画面结构一致。
+
+**7. 测试与边界。** 本轮无引擎/单测改动（**674 例 / 0 失败**），
+`run_regression.py --require-ohos` **6/6 PASS**，视觉探针 **145 条 / 27 场景 /
+0 失败**，壳自检 **263 项 / failures=0 / SHA256 与基线一致**（按既有规矩没加
+自检场景，DPI 验证走手动 M52 + 进程感知查询）。边界：画布 `zoom` 仍是逻辑像素
+语义（200% 屏上 100% = 2 倍整数放大），要改成 PS 的「1 设备像素」需要把 `View`
+变换整体挪到设备坐标系，记入 `BACKLOG.md`；`WM_GETDPISCALEDSIZE` 未实现，跨屏
+时窗口尺寸会有一次轻微跳变；没有清单，所以用户的兼容性 DPI 覆盖仍然有效。
+
 
 
 

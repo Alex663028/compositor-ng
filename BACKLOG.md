@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **158**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **145 条 / 27 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **163**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **145 条 / 27 场景**；落地规则见 §6）。
 > 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
 > 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -26,6 +26,16 @@
 > 仓库根目录清理、视觉探针 `_park_pointer()` 加固（见 shell-parity §5.52）。
 > **2026-10-23 第八批**：P0-6 ② 字体枚举与选择器（**零 ABI 新增**，仍 152；系统字体扫描 +
 > 过滤 + 应用到文字图层，见 README §6.89、shell-parity §5.53）；段落框仍未做。
+> **2026-10-23 第九批（按 README §6.4 ROI 顺序推进，5 项）**：
+> ① PSD 分层导出自研读写器替换 stb 单层路径（ABI 零新增，§6.87）；
+> ② 组混合模式 + Pass Through（`engineBlendMode` / `engineIsolated`，ABI 零新增，§6.87）；
+> ③ 锐化 / 降噪入口（`comp_filter` 尾部追加 2 个 kind，150 → **152**，§6.90）；
+> ④ 标尺 / 参考线 / 网格 / 对齐（尾部追加 6 个 `comp_guide_*`，152 → **158**，§6.91）；
+> ⑤ 存储 / 载入选区通道（尾部追加 5 个 `comp_selection_channel_*`，158 → **163**，§6.92）；
+> ⑥ HiDPI Per-Monitor V2 感知 + 逻辑像素排版（ABI 零新增，§6.93）。
+> 视觉探针 128 → **145 条 / 27 场景**（只追加 `sharpen_denoise`、`font_picker`、`guides`，
+> 既有阈值未动）；壳自检 263 项 SHA 未变。ROI 前 7 项至此全部落地，下一项为破坏性
+> `Image > Adjustments` 族。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -43,7 +53,7 @@
 
 | 维度 | 本仓 | Photoshop（参照） | 差距性质 |
 |------|------|-------------------|----------|
-| C ABI | **158** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
+| C ABI | **163** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
 | 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
@@ -63,9 +73,10 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-23）**：
-日常使用路径 **≈75%**，全功能面 **≈51%**（190 条 PS 核心条目加权，原始命中 90 条）；
-与口径 A/B 的差异原因在该文件 §3 说明。ROI 前 4 项（字体选择、PSD 分层导出、
-锐化/降噪入口、标尺/参考线/网格/对齐）已全部落地，日常路径 70% → 75%。
+日常使用路径 **≈76%**，全功能面 **≈52%**（190 条 PS 核心条目加权，原始命中 92 条）；
+与口径 A/B 的差异原因在该文件 §3 说明。ROI **前 7 项**（字体选择、PSD 分层导出、
+锐化/降噪入口、标尺/参考线/网格/对齐、存储/载入选区通道、组混合模式、HiDPI）
+已全部落地，日常路径 70% → 76%。
 
 ---
 
@@ -271,13 +282,19 @@
   魔棒 2 组，渐变 1 组，形状 2 组；Stepper 只有左右 18 px 箭头带响应，Choice 点击前向循环。
   参数复用既有 `ShellState` 字段，与右栏面板同一份数值。详见 `docs/shell-parity.md` §5.49、
   `docs/manual-test.md` M48、`visual_check.py --scene options_bar`（13 条）。
-  **仍未做**：数字直输、DPI awareness/manifest、浮动/停靠面板、十字/隐藏光标模式。
+  **HiDPI 已落地（2026-10-23，README §6.93 / docs/shell-parity.md §5.56）**：运行时
+  `SetProcessDpiAwarenessContext(Per-Monitor V2)`（无 manifest 管线，按
+  `shcore` → `SetProcessDPIAware` 三级降级），排版常量仍按逻辑像素书写，
+  `present()` 用 `MM_ANISOTROPIC` 统一放大，鼠标/客户区/初始窗口三处显式换算，
+  `WM_DPICHANGED` 重排；100% 下逐像素与改造前一致。`--dpi=N` 是诊断开关。
+  **仍未做**：数字直输、浮动/停靠面板、十字/隐藏光标模式。
 - **现状**：~~无工具选项栏~~ 已补（同上）；~~画笔无尺寸/圆形光标预览~~ **已过时**：笔尖轮廓早就有了（`main.cpp:12663-12682`，
   `comp_ui::tool_has_brush_tip` + `brush_tip_radius(brush_size, zoom)`，黑白双描边椭圆，随缩放变化），
-  这一项只剩「十字/隐藏光标模式」没做；`shells/windows` **没有 manifest、源码无 `SetProcessDpi*`**，
-  高 DPI 屏由系统位图拉伸；面板不能浮动/合并（`docs/shell-parity.md` §5.11）。
+  这一项只剩「十字/隐藏光标模式」没做；~~高 DPI 屏由系统位图拉伸~~ **已过时**：
+  Per-Monitor V2 已落地（`shell_dpi.cpp`，全程 `--dpi=N` 可复现）；面板不能
+  浮动/合并（`docs/shell-parity.md` §5.11）。
 - **PS 行为**：选项栏、笔刷大小光标、HiDPI 原生渲染、可停靠/浮动面板。
-- **性质**：【壳层】S（选项栏/光标）+ S（DPI awareness）+【架构】L（面板停靠系统）。
+- **性质**：【壳层】S（选项栏/光标）+ ~~S（DPI awareness）~~ 已落地 +【架构】L（面板停靠系统）。
 - **验收**：200% 缩放下 1px 线条仍为 1 设备像素；触摸笔刷尺寸可见且不遮挡落点；窗口 resize 后布局不重叠（已由
   `ui_core_layout_never_overlaps_at_any_size` 覆盖选项栏）。
 
@@ -354,6 +371,19 @@
 - 现状：`comp_command_*` 只有 7 条命令（`comp_command_abi.cpp:30-39`），与外壳 kCmd* 是两套体系。
 - 性质：【引擎】+【架构】——先把命令表统一为单一真源（外壳菜单/快捷键/动作共用），再做录制。
 
+### P1-11 画布缩放改成设备像素口径（HiDPI 后续，2026-10-23 记）
+
+- **现状**：`View::doc_to_screen` 的输入是**逻辑像素**的画布矩形，`zoom=1` 在 200%
+  屏上是「1 文档像素 = 2 设备像素」（等于 PS 的 200% 观感）。ROI #7 只把**界面**
+  挪进了原生像素，画布仍走 `MM_ANISOTROPIC` 的整体放大：整数倍时是像素复制（不糊，
+  但看得到的信息量是 PS 的一半），125%/150% 这类分数倍会被 GDI 重采样。
+- **PS 行为**：100% 缩放 = 1 图像像素对 1 物理像素；缩放数字也按物理像素计。
+- **性质**：【壳层】M——要把 `View` 变换整体挪到设备坐标系，`doc_to_screen` /
+  `screen_to_doc` 的每个调用点（选区手柄、参考线、标尺、笔尖轮廓、取色、变换）
+  都要跟着换成设备矩形；`ui_core.h` 是两壳共用的，OHOS 壳要同步。
+- **验收**：200% 下 100% 缩放时，文档像素与设备像素一一对应（截图逐像素比对）；
+  现有 145 条视觉断言在 96 DPI 下不变。
+
 ---
 
 ## 4. P2 —— 长尾与可选
@@ -408,10 +438,11 @@
 
 > 2026-10-23 校正一轮：下面每条都重新对着当前代码数过一遍，数字与指针已更新。
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **158** 个
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **163** 个
   （尾部追加 `comp_layer_get_pixels`、4 个文字图层导出、PSD 分层读写的
-  `comp_io_import_document` / `comp_io_export_document`，以及 6 个 `comp_guide_*` 画布参考线导出）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **132 条 / 25 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker` 后；原 80 条含 IME 6/6）。
+  `comp_io_import_document` / `comp_io_export_document`、6 个 `comp_guide_*` 画布参考线导出
+  与 5 个 `comp_selection_channel_*` 选区通道导出；滤镜枚举另追加 2 个 kind，不增导出）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **145 条 / 27 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
   2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
   与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。
@@ -425,7 +456,7 @@
 
 | 结论 | 证据 |
 |------|------|
-| 158 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 158） |
+| 163 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 163） |
 | 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
 | 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
 | 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |
@@ -438,9 +469,9 @@
 | 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
-| 组强制 Normal | `engine/format/comp_file.cpp:285` |
+| 组 blendMode 仍写 Normal | `engine/format/comp_file.cpp:364-365`（上游兼容）；组自己的模式走 `engineBlendMode` / `engineIsolated`（同文件 :416-421、:990-1002，2026-10-23 §6.87 已支持） |
 | `.comp` 不存选区/路径（参考线自 2026-10-23 起存 `engineGuides`） | `engine/format/comp_file.cpp:382-473` |
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
-| 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
-| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **132/132 / 25 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`） |
+| DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
+| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **145/145 / 27 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`） |

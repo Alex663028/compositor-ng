@@ -128,6 +128,12 @@ std::string narrow_utf8(const std::wstring& text) {
 using namespace comp_shell;
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
+  /*
+   * ROI #7：DPI 感知必须在**任何窗口创建之前**设置（含 --present-bench 的窗口）。
+   * 失败不阻断启动——最坏情况退回系统位图拉伸，功能不受影响。
+   */
+  dpi_enable_awareness();
+
   /* --selftest[=报告文件]：无窗口端到端自检（只走 C ABI），用于真机可审计验证。 */
   if (command_line != nullptr && wcsstr(command_line, L"--selftest") != nullptr) {
     const wchar_t* equals = wcschr(command_line, L'=');
@@ -181,9 +187,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     return 1;
   }
 
+  /*
+   * ROI #7：DPI 感知进程里 CreateWindowEx 的宽高是**设备像素**。默认尺寸按
+   * 96 DPI 的逻辑像素给出，这里换算到当前系统 DPI，否则 200% 下首屏只有
+   * 半个屏幕大小。文档默认尺寸仍用 kDefaultWidth/kDefaultHeight（逻辑值）。
+   */
+  const int startup_dpi = dpi_for_system();
   HWND window = CreateWindowExW(0, class_name, L"Compositor (Windows shell)", WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, kDefaultWidth, kDefaultHeight, nullptr,
-                                build_menu(), instance, nullptr);
+                                CW_USEDEFAULT, CW_USEDEFAULT,
+                                dpi_device(kDefaultWidth, startup_dpi),
+                                dpi_device(kDefaultHeight, startup_dpi), nullptr, build_menu(),
+                                instance, nullptr);
   if (window == nullptr) {
     comp_engine_destroy(shell.engine);
     return 1;
@@ -191,6 +205,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
 
   g_shell = &shell;
   shell.window = window; /* 视图命令需要客户区矩形，必须早于首次绘制设置 */
+  /* ROI #7：首帧之前拿到窗口所在显示器的 DPI（WM_CREATE 时 g_shell 还没挂上）。 */
+  shell.dpi = dpi_for_window(window);
+  /*
+   * --dpi=N：诊断用的换算基准覆盖（96..480）。显示器恒为 100% 的机器（CI、
+   * 远程会话）没有别的办法触发非 96 的 MM_ANISOTROPIC 映射路径，这个开关让
+   * M52 的手动验证与截图复核在任何设备上都能复现 150%/200% 的排版与字号。
+   * 它只改壳层自己的换算基准，不动进程 DPI 感知，也不改窗口实际像素尺寸。
+   */
+  if (command_line != nullptr) {
+    const wchar_t* dpi_flag = wcsstr(command_line, L"--dpi=");
+    if (dpi_flag != nullptr) {
+      const int parsed = _wtoi(dpi_flag + wcslen(L"--dpi="));
+      if (parsed >= 96 && parsed <= 480) shell.dpi = parsed;
+    }
+  }
   create_document(shell);
   /*
    * P5-3：随仓字体在这里一次性加载（字体句柄独立于引擎，不需要文档）。

@@ -658,6 +658,12 @@ struct ShellState {
   bool panning = false;
   POINT pan_anchor{};
   HWND window = nullptr;
+  /*
+   * ROI #7：当前窗口所在显示器的 DPI（96 = 100%）。壳层的全部排版常量都是
+   * **逻辑像素**（DIP），上屏时由 MM_ANISOTROPIC 映射统一放大到设备像素；
+   * 只有窗口尺寸、位图尺寸与鼠标坐标需要在这两个坐标系之间换算。
+   */
+  int dpi = 96;
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;

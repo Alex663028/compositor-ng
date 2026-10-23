@@ -459,7 +459,13 @@ bool client_layout(const ShellState& shell, Layout* out) {
   prefs.adjust_panel_width = shell.adjust_panel_width;
   prefs.layer_panel_collapsed = shell.layer_panel_collapsed;
   prefs.adjust_panel_collapsed = shell.adjust_panel_collapsed;
-  *out = comp_ui::compute_layout(client.right - client.left, client.bottom - client.top, prefs);
+  /*
+   * ROI #7：GetClientRect 给的是**设备像素**，排版常量是逻辑像素——这里换算是
+   * 唯一的入口（present 与此函数共用，命中测试与绘制因此永远同一套矩形）。
+   */
+  const int dpi = shell_dpi(shell);
+  *out = comp_ui::compute_layout(dpi_logical(client.right - client.left, dpi),
+                                 dpi_logical(client.bottom - client.top, dpi), prefs);
   return true;
 }
 
@@ -2246,8 +2252,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   ShellState* shell = g_shell;
-  const int mouse_x = static_cast<int>(static_cast<short>(LOWORD(lparam)));
-  const int mouse_y = static_cast<int>(static_cast<short>(HIWORD(lparam)));
+  /*
+   * ROI #7：鼠标消息里的坐标恒为**设备像素**，而布局与命中全部在逻辑像素里，
+   * 在过程入口统一换算一次。WM_MOUSEWHEEL 的 lParam 是屏幕坐标，它单独走
+   * device_* + ScreenToClient 再换算，不直接吃这两个值。
+   */
+  const int device_x = static_cast<int>(static_cast<short>(LOWORD(lparam)));
+  const int device_y = static_cast<int>(static_cast<short>(HIWORD(lparam)));
+  const int window_dpi = shell != nullptr ? shell_dpi(*shell) : 96;
+  const int mouse_x = dpi_logical(device_x, window_dpi);
+  const int mouse_y = dpi_logical(device_y, window_dpi);
   switch (message) {
     case WM_CREATE:
       /* 拖放导入：注册后 Windows 才会把 OLE 拖放转成 WM_DROPFILES。 */
@@ -3370,6 +3384,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           (shell->doc.selection_handle_drag >= 0 || selection_handles_available(*shell))) {
         POINT pt{};
         if (GetCursorPos(&pt) != 0 && ScreenToClient(window, &pt) != 0) {
+          /* ROI #7：GetCursorPos 是屏幕像素，ScreenToClient 之后仍是设备像素。 */
+          pt.x = dpi_logical(pt.x, shell_dpi(*shell));
+          pt.y = dpi_logical(pt.y, shell_dpi(*shell));
           Layout layout{};
           if (client_layout(*shell, &layout) && layout.canvas.contains(pt.x, pt.y)) {
             int index = shell->doc.selection_handle_drag;
@@ -3397,6 +3414,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           shell->tool == comp_ui::ToolId::Zoom && shell->doc.document != nullptr) {
         POINT pt{};
         if (GetCursorPos(&pt) != 0 && ScreenToClient(window, &pt) != 0) {
+          /* ROI #7：同上，光标坐标换成逻辑像素再与画布矩形比。 */
+          pt.x = dpi_logical(pt.x, shell_dpi(*shell));
+          pt.y = dpi_logical(pt.y, shell_dpi(*shell));
           Layout layout{};
           if (client_layout(*shell, &layout) && layout.canvas.contains(pt.x, pt.y)) {
             HCURSOR cursor = zoom_cursor_handle((GetKeyState(VK_MENU) & 0x8000) != 0);
@@ -3726,9 +3746,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_MOUSEWHEEL:
       if (shell != nullptr) {
         nudge_flush(*shell);
-        /* WM_MOUSEWHEEL 的坐标是屏幕坐标，先换算到客户区。 */
-        POINT cursor{mouse_x, mouse_y};
+        /*
+         * WM_MOUSEWHEEL 的坐标是屏幕坐标：先换算到客户区（设备像素），再按
+         * DPI 换成逻辑像素（ROI #7）。这里不能用工人入口的 mouse_*——那两个
+         * 值是拿 lParam 当客户区坐标换算出来的，对滚轮消息没有意义。
+         */
+        POINT cursor{device_x, device_y};
         ScreenToClient(window, &cursor);
+        cursor.x = dpi_logical(cursor.x, window_dpi);
+        cursor.y = dpi_logical(cursor.y, window_dpi);
         Layout layout{};
         if (client_layout(*shell, &layout) && layout.canvas.contains(cursor.x, cursor.y)) {
           const int delta = static_cast<short>(HIWORD(wparam));
@@ -3836,6 +3862,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case WM_SIZE:
       if (shell != nullptr) InvalidateRect(window, nullptr, FALSE);
+      break;
+    case WM_DPICHANGED:
+      /*
+       * ROI #7：跨屏或改显示缩放时 Windows 给出新 DPI 与**建议窗口矩形**。
+       * 建议矩形要照收——它是按新 DPI 换算过的物理尺寸，不采纳的话窗口会带着
+       * 旧 DPI 的物理大小跳屏，视觉尺寸突跳一档。排版本身都是逻辑像素，改完
+       * 状态重绘即可，不需要重算任何常量。
+       */
+      if (shell != nullptr) {
+        const UINT new_dpi = HIWORD(static_cast<DWORD>(wparam));
+        if (new_dpi >= 96 && new_dpi <= 480) shell->dpi = static_cast<int>(new_dpi);
+        const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+        if (suggested != nullptr) {
+          SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                       suggested->right - suggested->left, suggested->bottom - suggested->top,
+                       SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       break;
     case WM_CLOSE:
       /* 关窗也收口：微调事务里的位移已经生效，不 commit 就丢掉那一步的撤销能力。 */

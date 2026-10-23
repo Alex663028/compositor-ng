@@ -1557,6 +1557,57 @@ Progressive 轴预览与回车后结果是否同一条轴。
 引擎侧 `tests/test_selection_channels.cpp` 7 例覆盖验参、往返、合并语义、容量与
 撤销、`.comp` 往返与坏条目、画布几何（丢弃 / 转置）。
 
+## M52 HiDPI：Per-Monitor V2 感知 + 逻辑像素排版（ROI #7，2026-10-23）
+
+> 进程在**任何窗口创建之前**声明 Per-Monitor V2（`SetProcessDpiAwarenessContext`，
+> 失败依次降级到 `shcore!SetProcessDpiAwareness(2)`、`SetProcessDPIAware`）；壳层
+> 所有排版常量仍是 96 DPI 下的逻辑像素，由 `present()` 的 `MM_ANISOTROPIC`
+> （`SetWindowExtEx` = 逻辑尺寸，`SetViewportExtEx` = 设备尺寸）统一放大，鼠标、
+> 命中与绘制因此共用同一坐标系。**96 DPI 下不设映射模式**，渲染路径与改造前
+> 逐像素相同。`--dpi=N`（96..480）只覆盖壳层自己的换算基准，用于在 100% 显示器
+> 上复现 150%/200% 的排版；它不改进程感知，也不改窗口物理尺寸。
+
+**准备**：一块 100% 缩放的显示器即可（不要求真的高 DPI）；`build/compositor_shell.exe`
+可用。验证进程感知（PowerShell，一步）：
+
+```powershell
+Add-Type -Name ShcoreM52 -Namespace Cap -MemberDefinition '[DllImport("shcore.dll")] public static extern int GetProcessDpiAwareness(System.IntPtr h, out int v);'
+$v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v); $v
+```
+
+1. 先用默认参数启动一次：上面的脚本应返回 **`2`**（per-monitor）。返回 `0` 说明
+   进程还是 unaware，后续缩放全部由系统位图拉伸承担——这是失败项，不是观感差异。
+2. `compositor_shell.exe --dpi=96` 启动（对照组）：版式与平常完全一致，截图应与
+   `report/assets/s15/dpi-check-96.png` 结构相同。
+3. `compositor_shell.exe --dpi=144`（150%）：工具条、三栏、面板标题、状态栏整体
+   按 1.5× 放大；文字与 1 px 分隔线应是**设备像素原生的**（不是放大后的模糊块）。
+   画布区域同样随逻辑尺寸放大，所以 100% 缩放下的文档像素也会被放大 1.5 倍——
+   这是已知口径（第 8 条），**不是**本轮的失败项。对照 `dpi-check-144.png`。
+4. `compositor_shell.exe --dpi=192`（200%）：同上，2× 放大；截图与 96 基线在结构上
+   应一一对应（`dpi-check-192.png`；同尺寸下缩到 50% 的 `dpi-check-192-samesize-half.png`
+   与 96 基线对照）。
+5. **命中一致性**（最容易出回归的一项）：在 `--dpi=144` 下依次点工具按钮、
+   点右栏面板行、拖面板分界线、在画布上点按取色、拉一个矩形选区。落点必须与
+   看到的像素对齐；任何「点偏 1.5 倍」的偏移都说明某处漏了换算。
+6. 窗口 DPI 变化：在真实多显示器机器上把窗口拖到另一块不同缩放的屏幕，应收到
+   `WM_DPICHANGED` 并按系统建议矩形重排，不出现半截面板或空白条；拖回来再验一次。
+7. 关掉 `--dpi` 开关再跑 `scripts/visual_check.py --scene all`：必须仍是
+   **145 条 / 0 失败**；`--selftest` 仍是 **263 项 failures=0**，SHA256
+   `2f3b81c4fc599cb7…` 与基线逐字节一致（96 DPI 下渲染路径未被改动）。
+8. 已知限制（不是 bug，已记 BACKLOG P1-11）：画布 `zoom` 仍是逻辑像素口径，
+   200% 屏上 100% 缩放 = 2 设备像素/文档像素（Photoshop 是 1:1 物理像素）；
+   125% 这类非整数倍率下，字体可能比整数倍率略软。画布坐标系整体迁移到设备空间
+   才能修，涉及选区手柄/参考线/标尺/笔尖轮廓与 OHOS 壳，单独排期。
+
+**不该发生**：同一处内容被放大两次（系统再叠一层位图拉伸）；`--dpi=144` 下点击
+落点按 1:1 处理（偏一半）；字号/行高在映射模式下变成 0 或被裁切；96 DPI 下
+视觉探针或自检基线发生任何字节变化。
+
+**自动化**：`scripts/visual_check.py --scene all`（145 条，96 DPI 路径）与壳层
+`--selftest`（263 项 SHA 基线）守 96 DPI 不回归；150%/200% 由上面的截图与
+`GetProcessDpiAwareness` 返回值人工复核，截图产物在
+`report/assets/s15/dpi-check-*.png`。
+
 
 - 交互外壳主画布无直呈：走 `PrintWindow`/GDI 路径，`comp_render_document(kind=HWND)` 仍是 `UNSUPPORTED`；
   直呈能力经 `--present-bench` 独立窗口验证（D3D12 构建 + 合格文档才启用）。
