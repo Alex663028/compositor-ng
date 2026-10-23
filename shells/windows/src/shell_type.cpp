@@ -222,7 +222,8 @@ void type_commit(ShellState& shell) {
   desc.font_path_utf8 =
       (type_font_track(shell) && !shell.type_font_path.empty()) ? shell.type_font_path.c_str()
                                                                 : nullptr;
-  desc.font_face_index = 0; /* 随仓字体只有一个面 */
+  /* 面号来自字体面板（.ttc 集合）；内置点阵轨道恒 0——ABI 本来也只在路径非空时采信。 */
+  desc.font_face_index = type_font_track(shell) ? shell.type_face_index : 0;
   desc._reserved = 0;
 
   const comp_layer_id selected = selected_layer_id(shell);
@@ -323,7 +324,9 @@ void type_step_param(ShellState& shell, int direction, bool spacing) {
  * 不会漂移。
  */
 bool type_panel_visible(const ShellState& shell) {
-  return shell.tool == comp_ui::ToolId::Type && !shell.doc.filter_open;
+  /* 字体面板开着时右栏归它（同一块区域，画两层只会互相咬字）。 */
+  return shell.tool == comp_ui::ToolId::Type && !shell.doc.filter_open &&
+         !font_panel_visible(shell);
 }
 
 double type_panel_value(const ShellState& shell, int row) {

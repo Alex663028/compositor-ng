@@ -4211,3 +4211,104 @@ COMP_TEST(ui_core_doc_dialog_percent_and_aspect) {
   COMP_CHECK(comp_ui::doc_locked_height(0, 720, 640) == 720);
   COMP_CHECK(comp_ui::doc_locked_width(1280, 0, 360) == 1280);
 }
+
+/*
+ * 字体面板（P0-6②）：行几何与过滤匹配。
+ *
+ * 面板比路径/历史多占一行（扫描进度 + 过滤词），列表从 y+80 起、底部留 4 行
+ * 提示。这里钉的是「画在哪一行 = 点中哪一行」：几何公式、滚动夹取、命中范围
+ * 一次对齐；再钉住过滤的语义（ASCII 不区分大小写、中文按码元逐字比、空过滤
+ * 恒真），免得「输了个字母列表就空了」被当成扫描失败。
+ */
+COMP_TEST(ui_core_font_panel_rows) {
+  const comp_ui::Rect panel{1000, 100, 330, 648};
+  COMP_CHECK(comp_ui::kFontRowHeight == 22);
+  COMP_CHECK(comp_ui::kFontRowsTop == 80);
+  COMP_CHECK(comp_ui::kFontPanelFooter == 88);
+
+  /* 1. 行几何：列表顶着过滤行，行高恒定，滚动只平移。 */
+  const comp_ui::Rect first = comp_ui::font_row_rect(panel, 0);
+  COMP_CHECK(first.x == panel.x && first.w == panel.w && first.h == comp_ui::kFontRowHeight);
+  COMP_CHECK(first.y == panel.y + comp_ui::kFontRowsTop);
+  COMP_CHECK(comp_ui::font_row_rect(panel, 3).y == first.y + 3 * comp_ui::kFontRowHeight);
+
+  /* 2. 可视行数：648 高减去 80 的表头与 88 的提示区，整除 22。 */
+  const int visible = comp_ui::font_visible_rows(panel);
+  COMP_CHECK(visible == (panel.h - comp_ui::kFontRowsTop - comp_ui::kFontPanelFooter) /
+                            comp_ui::kFontRowHeight);
+  COMP_CHECK(visible > 0);
+
+  /* 3. 滚动夹取：少于可视行数不滚；超出按上限截断，负数归零。 */
+  COMP_CHECK(comp_ui::font_clamp_scroll(panel, 5, 3) == 0);
+  COMP_CHECK(comp_ui::font_clamp_scroll(panel, 100, -7) == 0);
+  COMP_CHECK(comp_ui::font_clamp_scroll(panel, 100, 999) == 100 - visible);
+
+  /* 4. 选行跟随：窗口内不动，越界只滚最小距离。 */
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 100, 3, 0) == 0);
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 100, visible - 1, 0) == 0);
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 100, visible, 0) == 1);
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 100, 99, 0) == 99 - visible + 1);
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 100, 2, 10) == 2);
+  COMP_CHECK(comp_ui::font_ensure_visible(panel, 5, 9, 0) == 0);
+
+  /* 滚到底时最后一行仍完整落在可视区内，不压到底部提示。 */
+  const int tail_scroll = comp_ui::font_clamp_scroll(panel, 100, 999);
+  COMP_CHECK(tail_scroll + visible == 100);
+  const comp_ui::Rect last = comp_ui::font_row_rect(panel, visible - 1);
+  COMP_CHECK(last.bottom() <= panel.bottom() - comp_ui::kFontPanelFooter);
+
+  /* 5. 命中：行首/行尾同一行；表头、提示区、面板外、空列表都返回 -1。 */
+  for (int row = 0; row < 3; ++row) {
+    const comp_ui::Rect rect = comp_ui::font_row_rect(panel, row);
+    const double x = static_cast<double>(rect.x + 4);
+    COMP_CHECK(comp_ui::font_row_at(panel, 100, 0, x, static_cast<double>(rect.y)) == row);
+    COMP_CHECK(comp_ui::font_row_at(panel, 100, 0, x, static_cast<double>(rect.bottom()) - 1.0) ==
+               row);
+  }
+  COMP_CHECK(comp_ui::font_row_at(panel, 100, 0, static_cast<double>(first.x + 4),
+                                  static_cast<double>(panel.y + 10)) == -1);
+  COMP_CHECK(comp_ui::font_row_at(panel, 100, 0, static_cast<double>(panel.right() + 4),
+                                  static_cast<double>(first.y)) == -1);
+  COMP_CHECK(comp_ui::font_row_at(panel, 0, 0, static_cast<double>(first.x + 4),
+                                  static_cast<double>(first.y)) == -1);
+  COMP_CHECK(comp_ui::font_row_at(panel, 100, 0, static_cast<double>(first.x + 4),
+                                  static_cast<double>(panel.bottom()) - 4.0) == -1);
+  /* 滚过 2 行后屏幕第一行是绝对第 2 行。 */
+  COMP_CHECK(comp_ui::font_row_at(panel, 100, 2, static_cast<double>(first.x + 4),
+                                  static_cast<double>(first.y)) == 2);
+}
+
+COMP_TEST(ui_core_font_label_filter) {
+  /* 空过滤恒真：列表不会因为「还没输入」而空。 */
+  COMP_CHECK(comp_ui::font_label_matches(L"", L""));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L""));
+  /* 空标签配非空过滤必然不匹配（避免空行冒充命中）。 */
+  COMP_CHECK(!comp_ui::font_label_matches(L"", L"a"));
+
+  /* ASCII 大小写不敏感，两端都折叠；子串而非前缀——"Sans" 里也能找到 "ans"。 */
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"noto"));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"NOTO"));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"Sans"));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"ans"));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"sc"));
+  COMP_CHECK(comp_ui::font_label_matches(L"Noto Sans SC", L"Noto Sans SC"));
+  COMP_CHECK(!comp_ui::font_label_matches(L"Noto Sans SC", L"Noto Serif"));
+  /* 过滤词比标签长：直接不匹配，不越界读。 */
+  COMP_CHECK(!comp_ui::font_label_matches(L"Abc", L"abcd"));
+
+  /* 中文按码元逐字比：能匹配中间片段，不做拼音/分词。 */
+  COMP_CHECK(comp_ui::font_label_matches(L"思源黑体", L"思源"));
+  COMP_CHECK(comp_ui::font_label_matches(L"思源黑体", L"黑体"));
+  COMP_CHECK(!comp_ui::font_label_matches(L"思源黑体", L"宋体"));
+  /* 空格是标签的一部分，不会被忽略。 */
+  COMP_CHECK(!comp_ui::font_label_matches(L"思源黑体", L"思源 黑体"));
+
+  /* 混合标签：中文过滤词不会命中纯英文标签，反之亦然。 */
+  COMP_CHECK(comp_ui::font_label_matches(L"思源黑体 Noto Sans SC", L"noto"));
+  COMP_CHECK(comp_ui::font_label_matches(L"思源黑体 Noto Sans SC", L"黑体"));
+  COMP_CHECK(!comp_ui::font_label_matches(L"Noto Sans SC", L"思源"));
+
+  /* 真实条目名（内置点阵）里的 ASCII 也能被小写过滤词找到。 */
+  COMP_CHECK(comp_ui::font_label_matches(L"5×7 点阵（内置，仅 ASCII）", L"ascii"));
+}
+

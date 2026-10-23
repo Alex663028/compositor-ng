@@ -55,6 +55,15 @@ constexpr int kDefaultHeight = 720;
 /* 蚂蚁线：虚线 4 px / 间隔 4 px，每 120 ms 前进 1 px（一个周期 8 px）。 */
 constexpr UINT_PTR kAntsTimerId = 1;
 constexpr UINT kAntsTimerPeriodMs = 120;
+/*
+ * 字体目录扫描：字体文件会有上百个、单个几十 MB，一次性同步扫完会冻住 UI
+ * （实测 153 个文件 1.2 s）。所以扫描按 WM_TIMER 分片推进，每片只探测几支字体；
+ * 面板在扫描期间照常可开、可滚、可用已探测到的条目。
+ */
+constexpr UINT_PTR kFontScanTimerId = 2;
+constexpr UINT kFontScanPeriodMs = 30;
+constexpr int kFontScanPerTick = 6;   /* 每片探测的文件数（约 50 ms） */
+constexpr int kFontScanMaxFaces = 8;  /* .ttc 集合最多探测的面数 */
 constexpr int kAntsDashPx = 4;
 constexpr int kAntsGapPx = 4;
 constexpr int kAntsPhasePeriod = kAntsDashPx + kAntsGapPx;
@@ -210,6 +219,12 @@ constexpr UINT kCmdEditClear = 1571;      /* 编辑 > 清除（Backspace） */
  * 要再画像素必须先显式栅格化（与上游同一规矩）。入口在图层菜单。
  */
 constexpr UINT kCmdLayerRasterizeText = 1572; /* 图层 > 栅格化文字 */
+/*
+ * P0-6 ②：字体枚举与选择器。ABI 零新增——`comp_font_load_file` 本来就能加载
+ * 任意 TTF/OTF/TTC，`comp_font_get_metrics` 给 face_count，`comp_font_name`
+ * 给族名/样式名。缺的只是「把系统里的字体列出来让用户挑」这条产品通路。
+ */
+constexpr UINT kCmdLayerFonts = 1573; /* 图层 > 字体… */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -270,6 +285,30 @@ enum class LayerInput { None, Rename, Opacity };
     std::wstring name;
     std::vector<comp_ui::PenAnchor> anchors;
   };
+
+/*
+ * 字体目录里的一项 = 一个**可加载的面**（.ttc 集合按面拆成多项）。
+ * 三个标记各有用处：
+ *   builtin —— index 0 的「5×7 点阵」轨道，path 为空，永远可用；
+ *   shipped —— 随仓 Noto Sans SC（exe/resources/fonts），排最前；
+ *   cjk     —— 该面含 U+4F60（comp_font_metrics.has_cjk），面板标 [CJK]。
+ * 扫描期只探测、不缓存句柄：FontFace 没有全局缓存，句柄留着就是几十 MB 常驻。
+ */
+struct ShellFontEntry {
+  std::wstring label;
+  std::string path; /* UTF-8；builtin 为空串 */
+  int32_t face_index = 0;
+  bool builtin = false;
+  bool shipped = false;
+  bool cjk = false;
+};
+
+/* 待探测的候选文件（目录枚举阶段就定好顺序与去重）。 */
+struct FontCandidate {
+  std::wstring path_w;
+  std::string path_utf8;
+  bool shipped = false;
+};
 
 /*
  * 单个文档的运行态。构造/销毁不碰引擎——句柄的所有权仍在文档生命周期
@@ -528,6 +567,23 @@ struct ShellState {
    * 走内置 5×7 点阵轨道时为空串，comp_text_desc.font_path_utf8 传 nullptr。 */
   std::string type_font_path;
   int type_panel_focused = comp_ui::kTypePanelFontSizeRow;
+  /*
+   * 字体面板（P0-6②）。目录是**应用会话态**：扫描一次，跨文档复用；
+   * 选择/滚动/过滤词同理，换文档不重置。条目的 usable 判断在探测阶段做完，
+   * 面板只按 label 过滤——扫描结果不再重算。
+   */
+  std::vector<ShellFontEntry> font_entries; /* [0] 恒为内置 5×7 点阵 */
+  std::vector<int> font_filtered;           /* 过滤后的 font_entries 下标 */
+  std::vector<FontCandidate> font_scan_queue;
+  size_t font_scan_cursor = 0;
+  bool font_scan_started = false;
+  bool font_scan_done = false;
+  int font_scan_skipped = 0; /* 探不出族名/不可缩放的候选数 */
+  bool font_open = false;
+  int font_selected = 0; /* 指向 font_filtered 的行号 */
+  int font_scroll = 0;
+  std::wstring font_filter; /* 面板第 3 行的过滤词（空 = 不过滤） */
+  int type_face_index = 0;  /* comp_text_desc.font_face_index：.ttc 里的面号 */
   int selection_feather = comp_ui::kMinSelectionFeather;
   int selection_grow = comp_ui::kMinSelectionGrow;
   bool cursor_valid = false;

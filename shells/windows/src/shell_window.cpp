@@ -1477,6 +1477,58 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     return; /* 其余按键吞掉：避免工具字母键把面板留在「另一个工具」上。 */
   }
 
+  /*
+   * 字体面板（P0-6②）打开且可见时键盘归面板。顺序与右栏的绘制优先级一致：
+   * 对话框 -> 路径 -> 历史 -> 字体。字母与中文走 WM_CHAR（输入法提交的也是
+   * WM_CHAR），这里只管导航、应用与退格；其余键一律吞掉，别让工具快捷键
+   * 在面板背后换工具。
+   */
+  if (font_panel_visible(shell) && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        /* 先退过滤（用户往往只是想回到完整列表），再按一次才关面板。 */
+        if (!shell.font_filter.empty()) {
+          font_filter_clear(shell);
+        } else {
+          font_panel_close(shell);
+          set_status(shell, L"已关闭字体面板");
+        }
+        return;
+      case VK_UP:
+        font_select(shell, -1);
+        return;
+      case VK_DOWN:
+        font_select(shell, 1);
+        return;
+      case VK_PRIOR:
+      case VK_NEXT: {
+        int page = 8;
+        Layout layout{};
+        if (client_layout(shell, &layout)) {
+          const int rows = comp_ui::font_visible_rows(layout.adjust_panel);
+          if (rows > 1) page = rows - 1;
+        }
+        font_select(shell, key == VK_PRIOR ? -page : page);
+        return;
+      }
+      case VK_HOME:
+        font_select_edge(shell, false);
+        return;
+      case VK_END:
+        font_select_edge(shell, true);
+        return;
+      case VK_RETURN:
+        font_apply_row(shell, shell.font_selected);
+        return;
+      case VK_BACK:
+        font_filter_backspace(shell);
+        return;
+      default:
+        break;
+    }
+    return; /* 其余按键吞掉：面板是模态的（与应用对话框同口径）。 */
+  }
+
   /* 文字属性面板输入态：与滤镜面板同一套输入规矩，目标值是字号/行距/字距。 */
   if (!shell.doc.type_input.empty()) {
     if (key == VK_ESCAPE) {
@@ -1634,6 +1686,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       case VK_OEM_PLUS:
         type_panel_step(shell, 1);
         return;
+      case VK_RETURN:
+        /* 字体行回车 = 打开字体面板（选真实字体）；其余行没有「回车落值」的语义。 */
+        if (comp_ui::type_panel_row_is_toggle(shell.type_panel_focused)) {
+          font_panel_toggle(window, shell);
+          return;
+        }
+        break;
       default:
         break;
     }
@@ -2211,6 +2270,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
       }
       /*
+       * 字体面板（P0-6②）：WM_CHAR 是键入与输入法的共同出口，中文字体名也能
+       * 直接过滤。排在 type_active 之前——KEYDOWN 已把面板打开时的键归面板，
+       * 这里若先喂给文字缓冲，会变成「插入点在闪、过滤词不动」。
+       */
+      if (shell != nullptr && font_panel_visible(*shell)) {
+        font_filter_char(*shell, static_cast<wchar_t>(wparam));
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
        * 文字工具（P5-3）同一个出口：WM_CHAR / WM_IME_CHAR 送来的码元进 UTF-8
        * 缓冲。落点后键盘是模态的，字符不再兼作工具快捷键（快捷键在 KEYDOWN
        * 里已经处理过的会置 type_skip_char，这里跳过它对应的那个字符）。
@@ -2478,8 +2547,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (font_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 字体面板：单击 = 选中并应用（改轨道 + 若是文字图层则重排一次，一步撤销）。
+             * 空白处也吞掉，别漏给调整面板——面板开着时右栏没有第二个来源。
+             */
+            const int count = font_row_count(*shell);
+            const int scroll =
+                comp_ui::font_clamp_scroll(layout.adjust_panel, count, shell->font_scroll);
+            const int row =
+                comp_ui::font_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+            if (row >= 0) font_apply_row(*shell, row);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           if (!shell->doc.effect_open && !shell->doc.filter_open && !shell->doc.trim_open &&
-              !type_panel_visible(*shell) &&
+              !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
               shell->doc.doc_dialog == comp_ui::DocDialogKind::None &&
               !shell->doc.color_range_open && !path_panel_visible(*shell) &&
               !history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
@@ -3318,6 +3402,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
         return 0;
       }
+      /* 字体扫描分片：每片探几个文件，扫完自己 KillTimer。面板关闭时停表，
+       * 已探条目与 cursor 保留——下次打开面板接着扫，不必从头再来。 */
+      if (shell != nullptr && wparam == kFontScanTimerId) {
+        font_scan_step(window, *shell);
+        return 0;
+      }
       break;
     case WM_SYSKEYDOWN:
       /*
@@ -3511,8 +3601,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
           }
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && font_panel_visible(*shell) &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* 字体面板滚轮翻列表：一格 3 行，夹取在 ui_core。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int count = font_row_count(*shell);
+            const int next = shell->font_scroll + (delta > 0 ? -3 : 3);
+            shell->font_scroll = comp_ui::font_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          return 0;
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
                    !layout.adjust_collapsed && !shell->doc.effect_open && !shell->doc.filter_open &&
-                   !type_panel_visible(*shell) &&
+                   !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
           /*
            * P0-3：调整参数表滚动（色阶每页 5 行 / 小窗口），一格 3 行，夹取在 ui_core。
@@ -3632,6 +3734,8 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlatten, L"拼合图像(&F)");
   /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
+  /* P0-6 ②：字体面板（枚举系统字体，切换下一次打字的字体轨道）。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerFonts, L"字体…(&O)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectUp, L"选择上一图层(&U)\t↑");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectDown, L"选择下一图层(&D)\t↓");

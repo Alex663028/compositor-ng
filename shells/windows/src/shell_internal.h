@@ -452,6 +452,31 @@ static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTE
   void type_panel_begin_input(ShellState& shell, wchar_t character);
   void type_panel_backspace(ShellState& shell);
   void type_panel_commit_input(ShellState& shell);
+
+  /* -------------------------------------------------- 字体面板（P0-6②） */
+  /*
+   * 目录扫描只做「读文件 -> 读度量的族名/样式名 -> 释放」，不跨调用持有句柄：
+   * comp_font 没有全局缓存，句柄留着会让每个字体几十 MB 常驻。
+   * 扫描按 WM_TIMER 分片（kFontScanPerTick 个文件/片），扫描中面板照常可用。
+   */
+  bool font_panel_visible(const ShellState& shell);
+  void font_panel_toggle(HWND window, ShellState& shell);
+  void font_panel_close(ShellState& shell);
+  void font_scan_start(HWND window, ShellState& shell);
+  void font_scan_step(HWND window, ShellState& shell);
+  void font_select_current_track(ShellState& shell, bool force);
+  /* 按当前 filter 重建 font_filtered，并把选中行夹回合法范围。 */
+  void font_refilter(ShellState& shell);
+  int font_row_count(const ShellState& shell);
+  const ShellFontEntry* font_entry_at_row(const ShellState& shell, int row);
+  void font_select(ShellState& shell, int delta);
+  void font_select_edge(ShellState& shell, bool end);
+  void font_apply_row(ShellState& shell, int row);
+  void font_filter_char(ShellState& shell, wchar_t unit);
+  void font_filter_backspace(ShellState& shell);
+  void font_filter_clear(ShellState& shell);
+  /* keep_prefix = true 时把「第 n/m 行 + 名字」追加到当前状态栏，不覆盖上一条消息。 */
+  void font_status(ShellState& shell, bool keep_prefix = false);
   bool marquee_available(const ShellState& shell);
   void marquee_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout);
   void marquee_extend(ShellState& shell, int x, int y, const Layout& layout);
@@ -563,6 +588,7 @@ static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTE
   void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_type_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
+  void draw_font_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   bool clip_axis_aligned(const comp_ui::Rect& canvas, comp_ui::Point* a, comp_ui::Point* b);
   void draw_transform_frame(HDC dc, const ShellState& shell, const Layout& layout);
   void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout);

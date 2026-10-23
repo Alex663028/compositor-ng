@@ -2266,6 +2266,50 @@ def scene_text_layer(shell, checker):
                   "面板文字像素 %d（栅格化前 %d）" % (rows_undo, rows_two))
 
 
+def scene_font_picker(shell, checker):
+    """P0-6 ②：字体选择器面板（右栏出现 / 过滤 / 两次 Esc 才关闭）。
+
+    不依赖机器上装了哪些字体：只断言面板「出现 / 重绘 / 仍在 / 消失」，
+    列表内容与族名一律不做像素断言（不同机器的字体目录必然不同）。
+
+    为什么两次 Esc：面板里第一次 Esc 只清过滤词（有过滤时），第二次才关面板。
+    这条顺序是键盘路径的公开语义，退化成「一次就关」会让用户丢掉过滤词。
+    """
+    scene = "font_picker"
+    adjust = shell.layout["adjust"]
+    shell.select_tool("type")
+
+    before = shell.shot("86_font_picker_before")
+    shell.command(1573)  # 图层 > 字体…
+    opened = shell.shot("87_font_picker_open")
+    changed = pixel_diff(before, opened, adjust)
+    checker.check(scene, "字体面板在右栏出现（替换文字属性面板）",
+                  changed > 2000, "右栏变化像素 %d" % changed)
+
+    # 过滤行在标题（y+8）与计数行（y+30）之下：从 y+48 起比对，避开「扫描中 n/m」
+    # 这种随时间变化的进度文本。
+    body = (adjust[0], adjust[1] + 48, adjust[2], adjust[3])
+    shell.type_text("zzzz")  # 过滤词：几乎不可能命中任何字体
+    filtered = shell.shot("88_font_picker_filtered")
+    typed = pixel_diff(opened, filtered, body)
+    checker.check(scene, "键入过滤词后列表重绘（空结果显示无匹配提示）",
+                  typed > 50, "面板变化像素 %d" % typed)
+
+    # 第一次 Esc：只清过滤词，面板仍在（与打开前相比仍是大片不同）
+    shell.press(VK_ESCAPE)
+    still_open = shell.shot("89_font_picker_esc_cleared")
+    survived = pixel_diff(before, still_open, adjust)
+    checker.check(scene, "第一次 Esc 只清过滤词，面板仍在",
+                  survived > 2000, "相对打开前的差异 %d" % survived)
+
+    # 第二次 Esc：关闭面板，右栏回到文字属性面板（与打开前几乎逐像素一致）
+    shell.press(VK_ESCAPE)
+    closed = shell.shot("90_font_picker_closed")
+    restored = pixel_diff(before, closed, adjust)
+    checker.check(scene, "第二次 Esc 关闭后右栏回到文字属性面板",
+                  restored < 200, "与打开前的差异 %d" % restored)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -2290,6 +2334,7 @@ SCENES = [    ("start", scene_start, ()),
     ("options_bar", scene_options_bar, ()),
     ("selection_modify", scene_selection_modify, ()),
     ("text_layer", scene_text_layer, ()),
+    ("font_picker", scene_font_picker, ()),
 ]
 
 

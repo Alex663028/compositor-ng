@@ -1469,6 +1469,9 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);
       break;
+    case kCmdLayerFonts:
+      font_panel_toggle(window, shell);
+      break;
     case kCmdViewFit:
       view_fit(shell);
       break;

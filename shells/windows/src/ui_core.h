@@ -4088,6 +4088,61 @@ inline int history_row_at(const Rect& panel, int count, int scroll, double x, do
                      kHistoryRowHeight);
 }
 
+/* ---------------------------------------------- 字体面板（P0-6②，S45） */
+
+/*
+ * 字体列表比路径/历史多一行：标题（8+22）之后是「扫描进度 / 命中数」（y+30）
+ * 与过滤词（y+54），列表从 y+80 起。底部留 4 行快捷键提示——字体行的操作比
+ * 「回车/双击」多（过滤、清空过滤、应用、关闭），少写一行用户就记不全。
+ * 行几何全部走下面这组函数：画在哪一行，点中就应用哪一行。
+ */
+inline constexpr int kFontRowHeight = 22;
+inline constexpr int kFontRowsTop = 80;
+inline constexpr int kFontPanelFooter = 88;
+
+inline int font_visible_rows(const Rect& panel) {
+  return list_visible_rows(panel, kFontRowsTop, kFontPanelFooter, kFontRowHeight);
+}
+
+inline int font_clamp_scroll(const Rect& panel, int count, int scroll) {
+  return list_clamp_scroll(panel, count, scroll, kFontRowsTop, kFontPanelFooter, kFontRowHeight);
+}
+
+inline int font_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  return list_ensure_visible(panel, count, index, scroll, kFontRowsTop, kFontPanelFooter,
+                             kFontRowHeight);
+}
+
+inline Rect font_row_rect(const Rect& panel, int row) {
+  return list_row_rect(panel, row, kFontRowsTop, kFontRowHeight);
+}
+
+inline int font_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  return list_row_at(panel, count, scroll, x, y, kFontRowsTop, kFontPanelFooter, kFontRowHeight);
+}
+
+/*
+ * 过滤：ASCII 大小写不敏感的子串匹配，非 ASCII 码元按原样比较。
+ * 字体族名里既有 "Noto Sans SC" 也有「思源黑体」这类本地化名，统一按 UTF-16
+ * 码元逐个比——中文名不该因为「没有大小写概念」而被排除在匹配之外。
+ */
+inline bool font_label_matches(const std::wstring& label, const std::wstring& filter) {
+  if (filter.empty()) return true;
+  if (label.size() < filter.size()) return false;
+  for (size_t start = 0; start + filter.size() <= label.size(); ++start) {
+    size_t i = 0;
+    for (; i < filter.size(); ++i) {
+      wchar_t left = label[start + i];
+      wchar_t right = filter[i];
+      if (left >= L'A' && left <= L'Z') left = static_cast<wchar_t>(left - L'A' + L'a');
+      if (right >= L'A' && right <= L'Z') right = static_cast<wchar_t>(right - L'A' + L'a');
+      if (left != right) break;
+    }
+    if (i == filter.size()) return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------ 调整参数面板（P0-3） */
 
 /*

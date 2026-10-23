@@ -5919,6 +5919,117 @@ SHA256 `377de660d48ac933…` → `2f3b81c4fc599cb7…`。diff 仅一处：`[summ
 语义段仍写着「PSD 只读」「EXR 不可用」，并在顶部标注第 2–5 节是 M5 当时的快照
 （83 cases / 27 项自检），不可当当前基线引用。
 
+### 6.89 字体枚举与选择器：系统字体列表 + 分片扫描 + 应用到文字图层（P0-6 ②，2026-10-23，Claude）
+
+`docs/ps-parity.md` §4 的 ROI 第 1 顺位。日常路径里最刺眼的一格是文字维：能打字、能改
+字、能存盘，**但选不了字体**——随包只有一支 `NotoSansSC-Regular-Subset.ttf`。
+
+问题不在引擎能力。字体 ABI 早就齐了：`comp_font_load_file` 能读任意 TTF/OTF/TTC
+（含 `.ttc` 面号），`comp_font_get_metrics` 给 `face_count` / `scalable` /
+`units_per_em` / `has_cjk`，`comp_font_name` 给族名与样式名，`comp_font_release`
+归还。缺的是**「把系统里的字体列出来让用户挑」这条产品通路**。
+
+**本轮 ABI 零新增**（`^COMP_API` 仍 **152**）。枚举放在壳侧，因为「字体装在哪个目录、
+认哪些扩展名、per-user 装在哪」是平台知识，引擎不该知道；像素与排版仍然全部回引擎。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/shell_fonts.cpp`（新） | 目录枚举、分片扫描、过滤、选择、应用 |
+| `shells/windows/src/ui_core.h` | 字体列表的行几何 / 滚动 / 命中 / 标签匹配纯函数 + 面板常量 |
+| `shells/windows/src/shell_state.h` | `ShellFontEntry` / `FontCandidate` 与扫描状态（放在会话态，换文档不丢） |
+| `shells/windows/src/shell_paint.cpp` | `draw_font_panel`；右栏绘制分派插在历史面板之后 |
+| `shells/windows/src/shell_window.cpp` | 键鼠 / 滚轮 / `WM_CHAR` / `WM_TIMER` 接线，菜单 `图层 > 字体…(O)` |
+| `shells/windows/src/shell_document.cpp` | 菜单命令分派 |
+| `shells/windows/src/shell_type.cpp` | 文字属性面板与字体面板互斥（同一块右栏） |
+| `tests/test_ui_core.cpp` | 新增 2 例：行几何 / 滚动 / 命中、标签过滤匹配 |
+
+**扫描：分片，且句柄立刻归还。** 候选按「随仓字体 → `%WINDIR%\Fonts` →
+`%LOCALAPPDATA%\Microsoft\Windows\Fonts`」收集，只认 `.ttf/.otf/.ttc`，路径小写去重
+（Windows 大小写不敏感）。`comp_font` 没有全局缓存，每个面都是「打开 → 读名字与度量 →
+立即 release」，只留字符串——否则常驻几十 MB。`units_per_em == 0` 的位图字体不进列表
+（排不了版）。
+
+同步扫一遍 153 个文件实测约 **1.2 s**，足以把 UI 冻住一截。所以扫描走 `WM_TIMER`
+（id 2）：每 30 ms 探 6 个文件，`kFontScanMaxFaces = 8` 限制 `.ttc` 的面数。
+`font_scan_start` 同步探第一片，面板打开立刻有内容；其余片在后台补齐，期间可滚、
+可应用已探到的条目，状态栏显示 `扫描中 n/m`。
+
+**排序与选中。** 面板顺序是「内置点阵 → 随仓 → 含 CJK → 名字（大小写不敏感）」。
+扫描结束时的排序会打乱 `font_filtered` 里存的下标，所以先按身份（`path` +
+`face_index` + `builtin`）记下当前选中项，`stable_sort` 后重建下标再定位——否则面板
+会在扫描结束时跳到一支无名字体上。
+
+**面板与互斥。** 右栏一次只挂一个面板的既有不变式不改：字体面板打开时先关路径 /
+历史 / 裁剪 / 效果 / 滤镜（色彩范围持有显式事务，先 `color_range_cancel`），而
+`font_panel_visible` 反过来在那些面板打开时让位（状态保留，关掉别的面板它就回来）。
+`type_panel_visible` 同样排除字体面板，避免同一块区域画两层。菜单命令先测
+`font_panel_visible` 而不是 `font_open`，所以面板被别的面板挡住时再点菜单是重新露出，
+不是把它关掉。
+
+**键盘与鼠标。** `↑/↓` 选行，`PgUp/PgDn` 翻页（按面板实际可见行数 − 1），`Home/End`
+跳两端，`Enter` 应用，点击命中的行也应用，滚轮 3 行/格。直接键入字母或中文就是过滤
+（`WM_CHAR` 进 `font_filter`），`Backspace` 删字符，`Esc` 先清过滤词、再按一次才关
+面板；其他按键在面板可见时一律吞掉——面板是模态的。入口是 `图层 > 字体…(O)` 与文字
+属性面板「字体」行上的回车。
+
+**应用语义：不换算字号。** 两条轨道的字号量纲不同（真实字体是 em 高，内置点阵是格子
+高），切换时**不改数值**，与 `type_panel_toggle_font` 同一口径——硬换算只会制造一个
+没人要的 5.2。真实字体必须**先真的 `comp_font_load_file` 成功**才置 `type_use_font`，
+否则用户打完字才在提交时撞上 `COMP_ERR_IO`。
+
+选中图层是文字层时，应用字体会把这一层重排一遍：`comp_layer_get_text` 两段式取出完整
+`comp_text_desc`，只替换 `font_path_utf8` / `font_face_index`，再
+`comp_layer_set_text` —— **一步撤销、一次重渲**。非文字层不动（字体面板改的是
+「下一次打字」的轨道，不该给像素层记一条空撤销步）。切回内置点阵而文本含 CJK 时，
+引擎如实拒绝（`kBadText → COMP_ERR_INVALID_ARGUMENT`），状态栏照实写「内置 5×7 点阵
+只排 ASCII；含中文请选真实字体」，不做静默替换。
+
+**新增测试（`tests/test_ui_core.cpp`，+2 例）。** 一例钉行几何与滚动：
+`kFontRowHeight = 22`、`kFontRowsTop = 80`、footer 88，可视行数公式、
+`font_clamp_scroll` 上下界、`font_ensure_visible`、末行不压 footer、`font_row_at` 的
+表头 / footer / 越界 / 空列表都返回 −1。另一例钉标签过滤：ASCII 大小写不敏感子串
+（`ans`、`sc`）、CJK 子串（`思源`、`黑体`）、不匹配（`宋体`）、空格敏感
+（`思源 黑体` 不匹配带空格两侧的标签），以及内置条目能被 `ascii` 命中。
+
+**视觉探针 `font_picker`（4 条，追加在 `SCENES` 末尾）。** 只加场景，不改既有阈值或
+命令 id。不同机器装的字体必然不同，所以断言只覆盖面板的「出现 / 重绘 / 仍在 / 消失」，
+不做字体名或列表内容的像素断言：
+
+| # | 断言 | 实测 |
+|---|------|------|
+| 1 | 菜单开启后字体面板替换右栏 | 右栏变化 30375 px |
+| 2 | 键入过滤词后列表重绘（空结果显示无匹配提示） | 面板变化 14831 px |
+| 3 | 第一次 Esc 只清过滤词，面板仍在 | 相对打开前 34889 px |
+| 4 | 第二次 Esc 关闭后回到文字属性面板 | 与打开前差异 **0** px |
+
+第 4 条是逐像素相等：关闭路径把右栏完整还原，没有残留。加上本场景后全量为
+**132 条 / 25 场景 / 0 失败**（连跑两次一致）。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **656 例 / 0 失败**（新增 2 条字体面板用例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（656 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` == 基线（本轮未改自检路径） |
+| OHOS 交叉编译 | `compile ok=115 fail=0` + NAPI 壳 rc=0 |
+| `^COMP_API` 导出 | **152**（未变；本轮零 ABI 变更） |
+| `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败** |
+| `scripts/visual_check.py --scene all` | **132 条 / 25 场景 / 0 失败**（只追加 `font_picker`） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界（不算本轮缺陷，但要说清）：**
+
+- **没有回退链**：选中字体缺字时仍是引擎现状（单面排字），不会自动找同族补字。
+  回退链仍在 BACKLOG P1-4 的未完成侧。
+- `.comp` 里存的是**绝对 Windows 路径**（`comp_text_desc.font_path_utf8`），跨设备 /
+  换系统打开时同名字体在原路径不存在就回落到内置点阵；可移植性需要「字体身份 +
+  本机解析」两层，属后续。
+- 只扫两个字体目录，不读注册表：「已注册但没有文件落在目录里」的字体看不到。
+- `.ttc` 只列前 8 个面。
+
+详见 `docs/shell-parity.md` §5.53。
+
 
 
 

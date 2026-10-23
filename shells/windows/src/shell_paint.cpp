@@ -1663,6 +1663,94 @@ void draw_type_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
 }
 
 /*
+ * 字体面板（P0-6②）。行几何走 ui_core.h 的 font_row_rect / font_row_at：
+ * 画在哪一行，点中就应用哪一行。扫描可能是分片的，顶部实时给进度；「当前
+ * 轨道」那一行用 ▲ 标出——用户不需要凭记忆回想上一支字体叫什么。
+ */
+void draw_font_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[320];
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"字体（Fonts）";
+  TextOutW(dc, left + 10, panel_rect.y + 8, title, lstrlenW(title));
+
+  const int count = font_row_count(shell);
+  SetTextColor(dc, RGB(150, 210, 255));
+  if (!shell.font_scan_done) {
+    wsprintfW(line, L"%d 支可用（含内置）· 扫描中 %d/%d", count,
+              static_cast<int>(shell.font_scan_cursor),
+              static_cast<int>(shell.font_scan_queue.size()));
+  } else if (shell.font_scan_skipped > 0) {
+    wsprintfW(line, L"%d 支可用（含内置）· %d 个文件不可用", count, shell.font_scan_skipped);
+  } else {
+    wsprintfW(line, L"%d 支可用（含内置 5×7 点阵）", count);
+  }
+  TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+
+  /* 过滤行：空的时候给用法，非空时把词本身显示出来（Backspace 可删）。 */
+  SetTextColor(dc, shell.font_filter.empty() ? RGB(140, 144, 156) : RGB(255, 236, 150));
+  if (shell.font_filter.empty()) {
+    const wchar_t* filter_hint = L"过滤：直接键入字母或中文";
+    TextOutW(dc, left + 10, panel_rect.y + 54, filter_hint, lstrlenW(filter_hint));
+  } else {
+    wsprintfW(line, L"过滤：%s｜Backspace 删字符", shell.font_filter.c_str());
+    TextOutW(dc, left + 10, panel_rect.y + 54, line, lstrlenW(line));
+  }
+
+  const int scroll = comp_ui::font_clamp_scroll(panel_rect, count, shell.font_scroll);
+  const int visible = comp_ui::font_visible_rows(panel_rect);
+  if (count == 0) {
+    SetTextColor(dc, RGB(170, 150, 110));
+    const wchar_t* empty = L"没有匹配的字体（Backspace 删过滤词）";
+    TextOutW(dc, left + 12, panel_rect.y + comp_ui::kFontRowsTop, empty, lstrlenW(empty));
+  }
+  for (int row = 0; row < visible; ++row) {
+    const int index = scroll + row;
+    if (index >= count) break;
+    const ShellFontEntry* entry = font_entry_at_row(shell, index);
+    if (entry == nullptr) break;
+    const comp_ui::Rect rect = comp_ui::font_row_rect(panel_rect, row);
+    if (index == shell.font_selected) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
+      FillRect(dc, &band, highlight);
+      DeleteObject(highlight);
+    }
+    const bool current =
+        entry->builtin
+            ? !type_font_track(shell)
+            : (type_font_track(shell) && entry->path == shell.type_font_path &&
+               entry->face_index == shell.type_face_index);
+    SetTextColor(dc, index == shell.font_selected ? RGB(250, 250, 255) : RGB(196, 200, 210));
+    wsprintfW(line, L"%s%s%s", current ? L"▲ " : L"   ", entry->label.c_str(),
+              entry->cjk ? L"  [CJK]" : L"");
+    RECT text_box{rect.x + 8, rect.y, rect.right() - 6, rect.bottom()};
+    DrawTextW(dc, line, -1, &text_box,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"↑ / ↓ 选择 · Enter 或点击应用",
+      L"键入字母或中文过滤 · Backspace 删字符",
+      L"字号不换算（em 高 ↔ 点阵格高）",
+      L"Esc 先清过滤词，再按一次关闭",
+  };
+  int hint_y = bottom - 8 - 4 * 18 + 4;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 画布叠加层（选区蚂蚁线 / 框选矩形 / 笔迹预览 / 笔尖轮廓）。
  *
  * 只画在画布矩形内：先把轴对齐线段裁到画布，再生成虚线段，避免 32 倍缩放
@@ -2634,6 +2722,8 @@ void present(HWND window, ShellState& shell) {
       draw_path_panel(memory_dc, shell, layout.adjust_panel);
     } else if (history_panel_visible(shell)) {
       draw_history_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (font_panel_visible(shell)) {
+      draw_font_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.doc.color_range_open) {
       draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.doc.trim_open) {

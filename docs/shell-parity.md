@@ -2523,6 +2523,94 @@ P1-4；② 没有段落框、对齐、竖排、变形；③ **框内再次编辑
 逐条一致。顺带记一句环境事实：这条断言此前能过，靠的是「鼠标恰好不在画布上」，
 属于运气——不是壳的 bug，也不是探针算法的错。
 
+### 5.53 字体枚举与选择器：平台知识在壳、像素在引擎（P0-6 ②，2026-10-23）
+
+`docs/ps-parity.md` §4 的 ROI 第 1 顺位。文字维在日常路径里原本只有 55%，卡点不是
+渲染而是「选不了字体」：外壳只加载一支随包 `NotoSansSC-Regular-Subset.ttf`。
+本批补这条产品通路，**ABI 零新增**（`^COMP_API` 仍 152）。
+
+**1. 为什么在壳里枚举，且不需要新 ABI。** 引擎的字体 ABI 早就够用：
+`comp_font_load_file`（UTF-8 路径 + 面号，超过 100 MB 拒收）、`comp_font_get_metrics`
+（`face_count` / `scalable` / `units_per_em` / `has_cjk`）、`comp_font_name`
+（族名 / 样式名）、`comp_font_release`。缺的只是「把系统里的字体列出来让用户挑」。
+字体装在哪个目录、认哪些扩展名、per-user 装在哪，是**平台知识**，引擎不该知道；
+所以目录扫描与新面板全部在 `shells/windows/src/shell_fonts.cpp`，像素与排版仍然
+全部回引擎。壳只保留字符串，不持有 `comp_font`——`comp_font` 没有全局缓存，句柄
+常驻就是几十 MB。
+
+**2. 扫描：分片，且每面读完立即归还。** 候选顺序是「随仓字体 → `%WINDIR%\Fonts` →
+`%LOCALAPPDATA%\Microsoft\Windows\Fonts`」，只认 `.ttf/.otf/.ttc`，路径小写去重
+（Windows 大小写不敏感）。`.ttc` 按面拆条目，每份文件最多 `kFontScanMaxFaces = 8`
+个面；`units_per_em == 0` 的位图字体不进列表（排不了版）。每个面都是「打开 → 读名字
+与度量 → 立即 release」，`probe_face` 不持有任何句柄。
+
+同步扫一遍 153 个文件实测约 **1.2 s**，足以冻住 UI。所以扫描走 `WM_TIMER`（id 2，
+30 ms 一片，每片 `kFontScanPerTick = 6` 个文件）：`font_scan_start` 同步探第一片，
+面板打开立刻有内容，其余片在后台补齐；期间可滚、可应用已探到的条目，状态栏与面板
+标题都显示 `扫描中 n/m`。面板关闭时 `KillTimer`，但 `cursor` 与已探条目保留，下次
+打开接着走。
+
+**3. 排序与选中按身份恢复。** 面板顺序是「内置点阵 → 随仓 → 含 CJK → 名字
+（大小写不敏感）」，只在扫描**全部结束**时排一次。排序会打乱 `font_filtered` 里存的
+`font_entries` 下标，所以结束前先按 `path + face_index + builtin` 记下当前选中项，
+`stable_sort` 后重建 `font_filtered` 再按身份找回——否则面板会在扫描结束时跳到某支
+无名字体上（这是写实现时先想到、再用 `stable_sort` 保证同名同面顺序稳定的理由）。
+
+**4. 右栏单面板不变式，双向让位。** 字体面板打开时先关路径 / 历史 / 裁剪 / 效果 /
+滤镜面板（色彩范围持有显式事务，先 `color_range_cancel` 再让位），并清掉滤镜预览帧。
+反过来 `font_panel_visible` 在那些面板打开时返回 false（`font_open` 与扫描进度保留，
+关掉别的面板它就回来）；`type_panel_visible` 同样排除字体面板。这样 paint / 键盘 /
+点击 / 滚轮四处的分派顺序只要一致（对话框 → 路径 → 历史 → 字体），就不会出现
+「键被一边吃掉、画面画的是另一边」。菜单命令走 `font_panel_toggle`，它先测
+`font_panel_visible` 而不是 `font_open`，所以面板被别的面板挡住时，再点一次菜单是
+**重新露出来**，不是把它关掉。
+
+**5. 应用：先验证句柄，再改轨道；文字层一步撤销。** `apply_track` 对真实字体必须
+先 `comp_font_load_file` + `comp_font_get_metrics` 成功，才换掉 `type_font` 并置
+`type_use_font`；失败只报状态栏，不改任何状态——否则用户打完字才在提交时撞
+`COMP_ERR_IO`。回到内置点阵不释放已有句柄（切回来无需再读盘）。
+
+两条轨道的字号量纲不同（真实字体按 em 高，内置点阵按格子高），切换时**不换算数值**，
+与 `type_panel_toggle_font` 同一口径：用户调好的 48 px 在字体轨道是 48 px 的 em，
+回到点阵就是 48 px 的格子；硬换算只会制造一个没人要的 5.2。
+
+选中图层是文字层时，应用字体会重排这一层：`comp_layer_get_text` 两段式取回完整
+`comp_text_desc`（含文本、原点、字号、行距、字距、颜色、不透明度），只替换
+`font_path_utf8` / `font_face_index`，再 `comp_layer_set_text`——**恰好一步撤销**。
+`get_text` 回的 `font_path_utf8` 指向引擎内部字符串，替换前先拷进本地 `std::string`；
+`set_text` 返回后不再引用它。非文字层不调用 `set_text`：字体面板改的是「下一次打字」
+的轨道，没必要给像素层记一条空撤销步。
+
+切回内置点阵而文本含 CJK 时，引擎如实拒绝（`kBadText → COMP_ERR_INVALID_ARGUMENT`），
+状态栏写明「内置 5×7 点阵只排 ASCII；含中文请选真实字体」，不做静默替换。
+
+**6. 键盘 / 鼠标。** 面板可见时是模态的：`↑/↓` 选行、`PgUp/PgDn` 翻页（按面板实际
+可见行数 − 1）、`Home/End` 跳两端、`Enter` 应用、`Backspace` 删过滤字符、`Esc`
+先清过滤词、再按一次才关面板；其余按键一律吞掉。直接键入字母或中文就是过滤
+（`WM_CHAR` 进 `font_filter`，`font_label_matches` 做大小写不敏感的 ASCII 子串与
+CJK 子串匹配）。鼠标点击命中的行即应用，滚轮 3 行/格。入口是 `图层 > 字体…(O)`
+（`kCmdLayerFonts`）与文字属性面板「字体」行上的回车。
+
+**7. 测试。** `tests/test_ui_core.cpp` 新增 2 例：一例钉行几何与滚动
+（`kFontRowHeight = 22`、`kFontRowsTop = 80`、footer 88、可视行数公式、
+`font_clamp_scroll` 上下界、`font_ensure_visible`、末行不压 footer、`font_row_at` 的
+表头 / footer / 越界 / 空列表都返回 −1）；一例钉过滤匹配（`ans`、`sc` 的大小写不敏感
+子串，`思源`、`黑体` 的 CJK 子串，`宋体` 不匹配，`思源 黑体` 因空格不匹配，内置条目
+能被 `ascii` 命中）。单测 654 → **656 例 / 0 失败**。
+
+视觉探针追加 `font_picker` 场景 4 条（只加场景，不改既有阈值）：面板出现
+（右栏变化 30375 px）、过滤词重绘（14831 px）、第一次 Esc 只清过滤词（相对打开前
+34889 px，面板仍在）、第二次 Esc 还原（与打开前差异 **0** px）。全量 128 →
+**132 条 / 25 场景 / 0 失败**。壳自检没有走字体面板的既有路径，仍为
+**263 项 / failures=0 / SHA256 `2f3b81c4fc599cb7…`**。
+
+**8. 边界（如实记）。** ① 没有回退链：选中面缺字时仍按单面排字，不会自动找同族补字，
+仍属 BACKLOG P1-4；② `.comp` 存的是**绝对 Windows 路径**，跨设备打开时同名字体不在
+原路径就回落到内置点阵，可移植性需要「字体身份 + 本机解析」两层，属后续；③ 只扫
+两个字体目录，不读注册表，「已注册但文件不在目录里」的字体看不到；④ `.ttc` 只看前
+8 个面；⑤ 扫描是首次打开面板时才启动（不拖慢启动），但首次打开的那一瞬仍同步扫
+6 个文件。
+
 
 
 
