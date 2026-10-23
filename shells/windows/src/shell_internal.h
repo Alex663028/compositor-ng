@@ -189,6 +189,10 @@ static_assert(static_cast<int>(comp_ui::FilterId::MotionBlur) == COMP_FILTER_MOT
               "FilterId::MotionBlur must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTER_PROGRESSIVE_BLUR,
               "FilterId::ProgressiveBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Sharpen) == COMP_FILTER_SHARPEN,
+              "FilterId::Sharpen must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_REDUCE_NOISE,
+              "FilterId::ReduceNoise must match comp_filter_kind");
 /* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
  * 按真实面板矩形夹滚动位置。 */
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：

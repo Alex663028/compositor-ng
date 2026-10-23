@@ -179,6 +179,16 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
         desc.progressive_blur.end_y = shell.doc.progressive_axis_final.y;
       }
       break;
+    case comp_ui::FilterId::Sharpen:
+      desc.sharpen.amount = panel.value(0);
+      desc.sharpen.radius = panel.value(1);
+      desc.sharpen.threshold = panel.value(2);
+      break;
+    case comp_ui::FilterId::ReduceNoise:
+      desc.reduce_noise.strength = panel.value(0);
+      desc.reduce_noise.preserve_details = panel.value(1);
+      desc.reduce_noise.reduce_color_noise = panel.value(2);
+      break;
     default:
       break;
   }

@@ -48,7 +48,7 @@
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
 | 图层样式 | **6**（描边/投影/颜色叠加/内阴影/外发光/内发光） | 10 | 缺斜面和浮雕 / 缎光 / 渐变叠加 / 图案叠加 |
-| 滤镜 | **9**（`comp_filter.h:38-48`） | 100+ | 无锐化 / 降噪 / 模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染 |
+| 滤镜 | **11**（`comp_filter.h:39-51`） | 100+ | 无模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染；锐化（USM）与降噪已进 Filter 菜单 |
 | 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/PSD/EXR + `.comp` | 20+ | PSD 只是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
 | 文档 | **单文档**、单个 `ShellState::document` | 多标签 | 新建会直接销毁旧文档（`shell_document.cpp:255/313`） |
 | 面板 | 10 个（图层/调整/曲线/裁剪/滤镜/效果/色彩范围/路径/历史/文字） | 15+ | 无通道 / 导航器 / 色板 / 属性 / 动作 |
@@ -63,9 +63,9 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-23）**：
-日常使用路径 **≈72%**，全功能面 **≈51%**（190 条 PS 核心条目加权，原始命中 87 条）；
-与口径 A/B 的差异原因在该文件 §3 说明。ROI 前 4 项里字体选择与 PSD 分层导出已落地，
-剩下「锐化/降噪入口 → 标尺参考线」，日常路径约到 85%。
+日常使用路径 **≈74%**，全功能面 **≈51%**（190 条 PS 核心条目加权，原始命中 89 条）；
+与口径 A/B 的差异原因在该文件 §3 说明。ROI 前 4 项里字体选择、PSD 分层导出与
+锐化/降噪入口已落地，剩下「标尺参考线」，日常路径约到 85%。
 
 ---
 
@@ -298,7 +298,12 @@
     失败时面板留在原地、参数不丢；ABI 没有「读回当前 Camera Raw 参数」的 getter，
     所以每次打开都是零草稿（副标题已写明）。
   - 探针：新增 `camera_raw` 场景 5 条（面板打开 / +1 EV 变亮 / 一步撤销 / -1 EV 变暗）。
-- 新增：锐化/智能锐化/USM、降噪、模糊画廊（场景/光圈/倾斜偏移/旋转/路径）、其他（高反差保留/最小值/最大值/位移/自定）、液化独立对话框（现有 Push 仅笔刷）、扭曲/像素化/风格化/渲染各族、消失点。
+- **已落地（2026-10-23，零 ABI 新增）**：`滤镜 > Sharpen`（USM：amount / radius /
+  threshold，复用 `blur_rgba8_copy`）与 `滤镜 > Reduce Noise`（5×5 YCoCg 双边 +
+  色度平滑），滤镜 9 → 11 种。面板动作号随之从 1210 让到 1220..1222
+  （1210 现在是 Sharpen 的菜单项，见 `docs/filters.md` §8）。
+  探针：`sharpen_denoise` 场景 4 条（两个面板能打开 + 方差一降一升）。
+- 新增：智能锐化、模糊画廊（场景/光圈/倾斜偏移/旋转/路径）、其他（高反差保留/最小值/最大值/位移/自定）、液化独立对话框（现有 Push 仅笔刷）、扭曲/像素化/风格化/渲染各族、消失点。
 - 性质：复用 `engine/imaging` 内核的部分为 M；全新滤镜族 L。
 
 ### P1-6 调整补全
@@ -407,7 +412,7 @@
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
 | 6 种效果 / 12 种调整 | `comp_layer.h:300-313`；`README.md:1462-1500` |
-| 9 种滤镜 | `engine/abi/include/compositor/comp_filter.h:38-48` |
+| 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
 | 组强制 Normal | `engine/format/comp_file.cpp:285` |

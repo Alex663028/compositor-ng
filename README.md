@@ -6030,6 +6030,112 @@ SHA256 `377de660d48ac933…` → `2f3b81c4fc599cb7…`。diff 仅一处：`[summ
 
 详见 `docs/shell-parity.md` §5.53。
 
+### 6.90 锐化 / 降噪入口：Filter 菜单补上 Sharpen 与 Reduce Noise（ROI #2，2026-10-23，Claude）
+
+`docs/ps-parity.md` §4 的 ROI 第 2 顺位。高斯模糊、动感模糊早在 Filter 菜单里，
+真正缺的是**锐化与降噪**——修图日常里最后两道必做的收尾，没有它们，出图前后
+只能靠调整图层去凑。
+
+九种滤镜里有七个的像素内核本仓早有（暗角 / 色调对比 / 颗粒 / 镜头 / 噪声 /
+模糊），Motion Blur 与 Progressive Blur 在 P1 批次补过。锐化与降噪没有现成内核，
+所以这一轮是**引擎 + ABI 尾部字段 + 壳层入口**三段一起做。
+
+**ABI 仍然零新增**（`^COMP_API` 仍 **152**）：`comp_filter_kind` 尾部追加
+`COMP_FILTER_SHARPEN = 9` / `COMP_FILTER_REDUCE_NOISE = 10`，
+`comp_filter_desc` 尾部追加 `comp_filter_sharpen` / `comp_filter_reduce_noise`
+两个子结构。两端同源编译，不做跨版本结构协商。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/filters.h` | 两个设置结构 + kind 枚举 + §3.10 / §3.11 口径注释 |
+| `engine/domain/filters.cpp` | `sharpen_pixels`（USM）、`reduce_noise_pixels`（YCoCg 双边）、参数闸 / 恒等判据 / 分派 / note |
+| `engine/abi/include/compositor/comp_filter.h` | 尾部两个 kind 与两个子结构 |
+| `engine/abi/src/comp_filter_abi.cpp` | 六个字段搬运 |
+| `shells/windows/src/ui_core.h` | `filter_table()` 追加两行（Sharpen 3 参数 / Reduce Noise 3 参数） |
+| `shells/windows/src/shell_filter.cpp` | `build_filter_desc` 的两个 case |
+| `shells/windows/src/shell_state.h` | 面板动作号 1210..1212 → **1220..1222**（见下） |
+| `tests/test_filters.cpp` | +5 例（锐化方向 / 阈值 / 降噪方差 / 色度 / ABI 映射） |
+| `tests/test_ui_core.cpp` | 面板表 9 → 11 行，新增两行的缺省 / 量程断言 |
+| `scripts/visual_check.py` | 新场景 `sharpen_denoise` + `region_std` 助手 |
+
+**Sharpen 的口径是经典 USM**：`src + amount / 100 * (src - blur(src))`，
+`blur` 直接复用共享的 `blur_rgba8_copy`（与高斯模糊、色调对比同一个三遍盒式实现），
+`sigma = max(0.1, radius * scale)`。运算落在预乘像素上、逐通道夹到 `[0, alpha]`，
+**alpha 逐字节不变**——半透明边缘的颜色不会因为锐化越过自身 coverage。
+`threshold` 按通道判：差值小于阈值的通道保持原值，所以低对比细节（120/128 的
+棋盘格）在 `threshold = 30` 时**逐字节不动**。
+
+上游的 detail 模糊是 Core Image 的高斯，本仓是盒式近似；note 写明
+`as an unsharp mask over the shared box-blur approximation`，只保证
+「amount 越大越锐、radius 越大 halo 越宽、threshold 以下不动、alpha 不变」四条
+可观察口径。
+
+**Reduce Noise 是单尺度双边**：5×5 窗口，工作在 unpermultiply 后的直通颜色上，
+先转 YCoCg，权重取 Y 轴之差（亮度边沿保留），色度两轴按窗口均值平滑，
+最后按原 alpha 重新预乘。
+
+```
+Y = (r + 2g + b) / 4        Co = r - b        Cg = g - (r + b) / 2
+range_sigma = 2 + strength / 10 * (1 - preserve_details / 100) * 60
+```
+
+`reduce_color_noise` 只决定「色度往窗口均值混多少」：0 时色度基本不动，100 时
+色噪按键收窄。alpha 逐字节不变。上游的内部算法（细节层 + 多尺度）不公开，
+note 写明 `a 5x5 bilateral on luma with chroma smoothing`，不声称逐像素等同。
+**上游对话框第四行 `sharpen_details` 不做**：锐化已有独立滤镜，不把两条锐化
+通路塞进同一个算子（`docs/filters.md` §3.11 记边界）。
+
+**一个必须先修的命令号冲突。** 滤镜菜单项是 `kCmdFilterBase(1200) + 序号`，
+面板动作（应用 / 重置 / 关闭）原先占 1210..1212。滤镜涨到 11 个之后，
+1210 正是 **Sharpen 的菜单项**——点「Sharpen」会触发「应用」而不是开面板。
+本轮把动作号让到 **1220..1222**，1211..1219 留空做后续滤镜的头寸，
+`scripts/visual_check.py` 的 `CMD_FILTER_APPLY` 同步改为 1220。
+（这是本轮唯一一次改既有命令 id，属于「两个功能抢同一格」的修正，不是重排。）
+
+**新增测试（`tests/test_filters.cpp`，+5 例 = 27 例）。** 锐化：硬边对比跨边显著
+上升、平坦区逐字节不动、alpha 不变、一步撤销；阈值 30 时 120/128 棋盘格逐字节
+不变、阈值 0 时改变。降噪：噪声方差压到 0.5× 以下、硬边对比保留 > 0.8×、
+alpha 不变、note 含 `bilateral`、一步撤销；`reduce_color_noise = 0` 时平均
+`|r - b|` 基本不动、= 100 时明显收窄。ABI：六个字段搬运、note 两段式、
+零初始化恒等、越界（radius 0.05 / threshold 256 / strength 0.05 / preserve 101）
+在边界同样被拒。越界用例从 19 组涨到 **29 组**。
+
+**视觉探针 `sharpen_denoise`（4 条，追加在 `SCENES` 中 `filter` 之后）。**
+同一块噪声场上两个算子给出相反方向的方差变化，这比看截图直观：
+
+| # | 断言 | 实测 |
+|---|------|------|
+| 1 | 1210 打开 Reduce Noise 面板（旧 id 是「应用」） | 首行高亮 6045 px |
+| 2 | Strength = 10 后噪声方差下降 | σ 12.0 → 7.4 |
+| 3 | 1209 打开 Sharpen 面板 | 首行高亮 6081 px |
+| 4 | Amount = 300 后方差回升 | σ 7.4 → 25.5 |
+
+写这个场景时踩到一个坑并已写进注释：连按 `=` 步进会**每格出一帧全分辨率预览**，
+消息堆在队列里，紧接着的截图拍到的还是旧帧（第一次跑测出「锐化后方差反而下降」）。
+现在两个算子都用「键入数值 + 回车」一次落地，并在截图前等 0.8 s。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **661 例 / 0 失败**（新增 5 条滤镜用例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` == 基线 |
+| OHOS 交叉编译 | `compile ok=115 fail=0` |
+| `^COMP_API` 导出 | **152**（本轮零 ABI 变更） |
+| `scripts/visual_check.py --scene all` | **136 条 / 26 场景 / 0 失败** |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界**：
+
+- 两个内核都跑在 8 位工作副本上（16 位图层先降位、HDR 拒绝），与既有的七个滤镜
+  同一条边界。
+- Reduce Noise 的色度平滑是**固定窗口均值**，不随 `strength` 缩放；强度只作用于
+  亮度双边。这与 Photoshop 的「Remove Color Noise」滑块不是逐位相同的模型。
+- Sharpen 的 halo 宽度由盒式模糊决定，radius > 64 时盒式与高斯的形状差在
+  高频纹理上肉眼可辨（`docs/filters.md` §5 第 9 条）。
+
+详见 `docs/filters.md` §3.10 / §3.11 / §5 / §8。
 
 
 

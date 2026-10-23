@@ -13,6 +13,10 @@
  * 分档三角混合）；缺的都是**产品入口**：参数契约、与图层几何的装配、
  * 一步撤销、与选区的混合。本文件把那条通路收口成一个领域入口。
  *
+ * 尾部追加（kind 9 / 10）：Sharpen（Unsharp Mask）复用高斯内核，
+ * Reduce Noise（双边滤波）是本文件新增的边沿保留平滑。两者同样受下面三条
+ * 口径与 8 位工作副本边界约束。
+ *
  * 与工具层（tool_ops.h）的分工：
  *   - 工具层按「笔迹 / coverage」工作，一次调用通常落一笔；
  *   - 本层按「整层一次」工作，参数是面板上的滤镜设置，语义对齐上游
@@ -215,6 +219,46 @@ struct ProgressiveBlurSettings {
   bool auto_axis = true;
 };
 
+/*
+ * Sharpen / Unsharp Mask（上游 Filter > Sharpen > Unsharp Mask）。
+ *
+ * `amount` 0..500（百分比，0 = 恒等）；`radius` 0.1..250 是 detail 半径
+ * （图层像素，预览再乘 scale）；`threshold` 0..255 是「低于它不动」的通道差
+ * 阈值，用来避免把噪点一起放大。
+ *
+ * 口径 = 经典 USM：`src + amount/100 * (src - blur(src))`。`radius` 复用共享的
+ * `blur_rgba8_copy`（与 Gaussian Blur / Tonal Contrast 同一实现），不做第二套
+ * 高斯。运算落在**预乘**像素上、逐通道夹到 `[0, alpha]`，alpha 不变——图层轮廓
+ * 不向外扩散（半透明边缘的颜色不会因为锐化越过自身 coverage）。
+ */
+struct SharpenSettings {
+  double amount = 0.0;
+  double radius = 1.0;
+  double threshold = 0.0;
+};
+
+/*
+ * Reduce Noise（上游 Filter > Noise > Reduce Noise 的常用子集）。
+ *
+ * `strength` 0..10（0 = 恒等），`preserve_details` 0..100（越高越保留细节，
+ * 双边滤波的值域 sigma 越小），`reduce_color_noise` 0..100（只平滑色度：
+ * 亮度按双边结果、色度按窗口均值混合）。
+ *
+ * 实现：5×5 的双边滤波，工作在**直通（unpremultiply 后）**颜色上，先转 YCoCg，
+ * 窗口权重取 Y 轴（≈亮度）之差（亮度边沿保留），色度两轴按窗口均值平滑；
+ * alpha 逐字节不变。
+ * 上游的算法内部不公开（细节层 + 小波一类的多尺度），本仓只保证三条可观察
+ * 口径：噪声方差下降、边沿对比保留、色噪按键平滑；不声称逐像素等同。
+ *
+ * 边界：`sharpen_details`（上游对话框第四行）不在本结构里——锐化已有独立
+ * 滤镜，不把两条锐化通路塞进同一个算子；见 docs/filters.md §3.11。
+ */
+struct ReduceNoiseSettings {
+  double strength = 0.0;
+  double preserve_details = 50.0;
+  double reduce_color_noise = 25.0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -226,6 +270,8 @@ enum FilterKind {
   kFilterGrain = 6,
   kFilterMotionBlur = 7,
   kFilterProgressiveBlur = 8,
+  kFilterSharpen = 9,
+  kFilterReduceNoise = 10,
 };
 
 /*
@@ -243,6 +289,8 @@ struct FilterSettings {
   GrainSettings grain;
   MotionBlurSettings motion_blur;
   ProgressiveBlurSettings progressive_blur;
+  SharpenSettings sharpen;
+  ReduceNoiseSettings reduce_noise;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

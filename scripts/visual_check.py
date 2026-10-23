@@ -94,7 +94,9 @@ CMD_ADJ_KIND_PREV = 1014
 CMD_ADJ_ADD = 1022
 CMD_ADJ_APPLY = 1023
 CMD_ADJ_VALUE_UP = 1021
-CMD_FILTER_APPLY = 1210
+# 面板动作号落在 1220 段：滤镜序号涨到 11 个（1200..1210）后，1210 已经是
+# Sharpen 的菜单项，旧的应用号会和它抢同一个 id（见 shell_state.h）。
+CMD_FILTER_APPLY = 1220
 CMD_NEW_DOCUMENT_DIALOG = 1560
 CMD_SAVE_AS = 1561
 CMD_IMAGE_SIZE = 1562
@@ -264,6 +266,17 @@ def median_luma(img, rect):
         if running * 2 >= total:
             return value
     return 255
+
+
+def region_std(img, rect):
+    """区域亮度的标准差（锐化 / 降噪的可观察口径：同一块噪声场的方差）。"""
+    hist = img.crop(rect).convert("L").histogram()
+    total = sum(hist)
+    if total == 0:
+        return 0.0
+    mean = sum(value * count for value, count in enumerate(hist)) / float(total)
+    variance = sum((value - mean) ** 2 * count for value, count in enumerate(hist)) / float(total)
+    return variance ** 0.5
 
 
 def count_color(image, target, tol=18):
@@ -1267,6 +1280,71 @@ def scene_filter(shell, checker):
     checker.check(scene, "Esc 关闭滤镜面板后回到调整面板",
                   near(pixel(img, adjust[0] + 4, adjust[1] + 4), COL_ADJ_BG, 8),
                   "实测 %s" % (pixel(img, adjust[0] + 4, adjust[1] + 4),))
+
+
+def scene_sharpen_denoise(shell, checker):
+    """Sharpen(1209) / Reduce Noise(1210) 的面板入口与像素方向。
+
+    这一场的核心不是「参数能不能存」，而是**命令号没被抢**：1210 以前是滤镜面板的
+    「应用」，现在必须打开 Reduce Noise 面板。噪声场用 Add Noise 现铺，之后两个
+    滤镜对同一块区域给出相反方向的方差变化，方向错了就说明走错了算子。
+    """
+    scene = "sharpen_denoise"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("8899aa")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left, top, right, bottom, steps=8)
+
+    # 1) 先铺噪声：锐化/降噪都需要一块有方差的场才量得出方向。
+    shell.command(CMD_FILTER_BASE + 5)  # Add Noise
+    shell.type_text("40")  # 幅度小一点：太大就全被 0/255 夹住，方向量不出来
+    shell.press(VK_RETURN)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.8)
+    img = shell.shot("90_sharpen_noise_before")
+    probe = (left + 20, top + 20, left + 80, top + 80)
+    noisy = region_std(img, probe)
+
+    adjust = shell.layout["adjust"]
+    row1 = (adjust[0] + 6, adjust[1] + 53, adjust[2] - 8, adjust[1] + 73)
+
+    # 2) Reduce Noise 走 1210：这个 id 以前是滤镜面板的「应用」，被抢就看不出面板。
+    shell.command(CMD_FILTER_BASE + 10)
+    img = shell.shot("91_reduce_noise_panel")
+    checker.check(scene, "Reduce Noise 面板打开且第一参数高亮",
+                  count_matching(img, row1, COL_HIGHLIGHT, 12) > 100,
+                  "高亮像素 %d" % count_matching(img, row1, COL_HIGHLIGHT, 12))
+    # Strength 默认 0 = 恒等，键入 10 后回车一次落值并应用（键入 + Tab 会丢缓冲）。
+    # 用一次真应用而不是连按步进键：每一步都出一帧全分辨率预览，消息会堆在队列里，
+    # 紧接着的截图就会拍到旧帧（本场景第一次跑就栽在这上面）。
+    shell.type_text("10")
+    shell.press(VK_RETURN)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.8)
+    img = shell.shot("92_reduce_noise_applied")
+    denoised = region_std(img, probe)
+    checker.check(scene, "Reduce Noise 压低局部方差（噪声被平滑）",
+                  denoised < noisy * 0.8,
+                  "σ %.1f -> %.1f" % (noisy, denoised))
+
+    # 3) Sharpen 走 1209：面板能打开 + 第一参数高亮 = 命令号确实落到新滤镜上。
+    shell.command(CMD_FILTER_BASE + 9)
+    img = shell.shot("93_sharpen_panel")
+    checker.check(scene, "Sharpen 面板打开且第一参数高亮",
+                  count_matching(img, row1, COL_HIGHLIGHT, 12) > 100,
+                  "高亮像素 %d" % count_matching(img, row1, COL_HIGHLIGHT, 12))
+    shell.type_text("300")
+    shell.press(VK_RETURN)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.8)
+    img = shell.shot("94_sharpen_applied")
+    sharpened = region_std(img, probe)
+    checker.check(scene, "Sharpen 拉大局部方差（噪声更硬）",
+                  sharpened > denoised * 1.5,
+                  "σ %.1f -> %.1f" % (denoised, sharpened))
 
 
 def scene_adjustment(shell, checker):
@@ -2319,6 +2397,7 @@ SCENES = [    ("start", scene_start, ()),
     ("type", scene_type, ()),
     ("ime", scene_ime, ()),
     ("filter", scene_filter, ()),
+    ("sharpen_denoise", scene_sharpen_denoise, ()),
     ("adjustment", scene_adjustment, ()),
     ("curve_levels", scene_curve_levels, ()),
     ("layers", scene_layers, ()),

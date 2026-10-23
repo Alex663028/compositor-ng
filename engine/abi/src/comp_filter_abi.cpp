@@ -85,6 +85,14 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.progressive_blur.inverted = desc.progressive_blur.inverted != 0;
   /* explicit_axis = 0（零初始化）用缺省轴，与域层 auto_axis = true 对齐。 */
   settings.progressive_blur.auto_axis = desc.progressive_blur.explicit_axis == 0;
+
+  settings.sharpen.amount = desc.sharpen.amount;
+  settings.sharpen.radius = desc.sharpen.radius;
+  settings.sharpen.threshold = desc.sharpen.threshold;
+
+  settings.reduce_noise.strength = desc.reduce_noise.strength;
+  settings.reduce_noise.preserve_details = desc.reduce_noise.preserve_details;
+  settings.reduce_noise.reduce_color_noise = desc.reduce_noise.reduce_color_noise;
   return settings;
 }
 

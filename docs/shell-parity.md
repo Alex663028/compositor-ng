@@ -158,9 +158,11 @@ compositor-ng 是「同引擎、两壳」结构：
   探长度会把滤镜应用两遍；壳用固定 512 字节缓冲一次调用。
 - **面板夹取，ABI 拒绝**：键入手输先用 `clamp_filter_param` 夹到量程内，
   ABI 侧仍是越界拒绝（不静默 clamp）。
-- **九个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
+- **十一个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
   （Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
-  Add Noise / Grain / Motion Blur / Progressive Blur）。布尔项（`Preserve` /
+  Add Noise / Grain / Motion Blur / Progressive Blur / Sharpen / Reduce Noise）。
+  滤镜序号涨到 11 个后菜单号占满 1200..1210，面板的应用 / 重置 / 关闭动作
+  挪到 1220..1222（见 `shell_state.h`，`filters.md` §8）。布尔项（`Preserve` /
   `Gaussian` / `Mono` / `Radial` / `Inverted`）在面板上是
   0/1 行，`build_filter_desc` 用 `>= 0.5` 转成 ABI 的 int32；`Seed` 用
   `llround` 转 `uint32`（面板量程 0..4294967295，正好是 uint32 全域）。

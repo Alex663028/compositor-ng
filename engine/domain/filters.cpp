@@ -13,6 +13,8 @@
  *   Motion Blur     本文件（上游是 Core Image CIMotionBlur，见 motion_blur_pixels）
  *   Progressive Blur 本文件（上游是 Core Image CIMaskedVariableBlur，见
  *                   progressive_blur_pixels：分档三角混合逼近逐像素半径）
+ *   Sharpen         adjustment_eval.h blur_rgba8_copy + 本文件 sharpen_pixels（USM）
+ *   Reduce Noise    本文件 reduce_noise_pixels（YCoCg 双边 + 色度平滑）
  *
  * 本文件只做「校验 -> 装配 -> 调用 -> 选区混合 -> 事务」，不重新定义内核语义。
  */
@@ -165,6 +167,34 @@ bool progressive_blur_valid(const ProgressiveBlurSettings& s, std::string* error
   /* 显式轴的端点必须有限；落在画布/图层外是合法的（渐变轴常常横跨整幅画布）。 */
   if (!finite(s.start_x) || !finite(s.start_y) || !finite(s.end_x) || !finite(s.end_y)) {
     return set_error(error, "progressive blur axis endpoint is not finite");
+  }
+  return true;
+}
+
+bool sharpen_valid(const SharpenSettings& s, std::string* error) {
+  /* 0 = 恒等；>0 时按上游量程 0.1..500。中间那段 (0, 0.1) 显式拒绝。 */
+  if (s.amount != 0.0 && !in_range(s.amount, 0.1, 500.0)) {
+    return set_error(error, "sharpen amount must be 0 or in 0.1..500");
+  }
+  if (!in_range(s.radius, 0.1, 250.0)) {
+    return set_error(error, "sharpen radius out of 0.1..250");
+  }
+  if (!in_range(s.threshold, 0.0, 255.0)) {
+    return set_error(error, "sharpen threshold out of 0..255");
+  }
+  return true;
+}
+
+bool reduce_noise_valid(const ReduceNoiseSettings& s, std::string* error) {
+  /* 0 = 恒等；>0 时按上游量程 0.1..10。 */
+  if (s.strength != 0.0 && !in_range(s.strength, 0.1, 10.0)) {
+    return set_error(error, "reduce noise strength must be 0 or in 0.1..10");
+  }
+  if (!in_range(s.preserve_details, 0.0, 100.0)) {
+    return set_error(error, "reduce noise preserve details out of 0..100");
+  }
+  if (!in_range(s.reduce_color_noise, 0.0, 100.0)) {
+    return set_error(error, "reduce noise color noise out of 0..100");
   }
   return true;
 }
@@ -542,6 +572,169 @@ comp_result progressive_blur_pixels(uint8_t* rgba, int32_t width, int32_t height
   return COMP_OK;
 }
 
+/*
+ * Sharpen / Unsharp Mask：`src + amount/100 * (src - blur(src))`。
+ *
+ * 与 Tonal Contrast / Gaussian Blur 共用 blur_rgba8_copy（sigma = radius * scale），
+ * 不另起一套高斯。运算落在预乘像素上、逐通道夹到 [0, alpha]：
+ *   - alpha 不变，图层轮廓不会因为锐化向外扩张；
+ *   - 半透明像素的颜色不会越过自身 coverage（预乘不变式）。
+ * threshold 按**逐通道**差值判：|src - blur| <= threshold 的通道保持原值，
+ * 用来避免把平坦区的噪点一起放大（与 Photoshop 的 Threshold 同一用途）。
+ */
+comp_result sharpen_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                           const SharpenSettings& s, double scale) {
+  if (s.amount <= 0.0) return COMP_OK;
+  const double sigma = std::max(0.1, s.radius * scale);
+  std::vector<uint8_t> blurred;
+  if (!blur_rgba8_copy(rgba, width, height, stride, static_cast<float>(sigma), &blurred)) {
+    return COMP_ERR_OUT_OF_MEMORY;
+  }
+  const size_t blurred_stride = static_cast<size_t>(width) * 4u;
+  const double gain = s.amount / 100.0;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* soft = blurred.data() + static_cast<size_t>(y) * blurred_stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4;
+      const double alpha = p[3];
+      if (alpha == 0.0) continue;
+      const uint8_t* b = soft + static_cast<size_t>(x) * 4;
+      for (int c = 0; c < 3; ++c) {
+        const double diff = static_cast<double>(p[c]) - static_cast<double>(b[c]);
+        if (std::fabs(diff) <= s.threshold) continue;
+        const double value = static_cast<double>(p[c]) + gain * diff;
+        const double clamped = value < 0.0 ? 0.0 : (value > alpha ? alpha : value);
+        p[c] = static_cast<uint8_t>(std::lround(clamped));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* YCoCg：亮度与两个色度轴。用它做降噪的理由是「亮度边沿保留、色噪单独平滑」
+ * 天然正交——RGB 逐通道双边在强色边两侧会把分量拉成灰边。 */
+struct YCoCg {
+  double y;
+  double co;
+  double cg;
+};
+
+YCoCg ycocg_of(const uint8_t* p) {
+  const double r = static_cast<double>(p[0]);
+  const double g = static_cast<double>(p[1]);
+  const double b = static_cast<double>(p[2]);
+  return YCoCg{(r + 2.0 * g + b) * 0.25, r - b, g - 0.5 * (r + b)};
+}
+
+/*
+ * Reduce Noise：5×5 双边滤波（亮度）+ 色度均值混合。
+ *
+ * 输入是预乘 RGBA8，先落到**直通**颜色副本（transparent 像素不参与累加，
+ * 否则边缘会向透明区发黑），每像素：
+ *   1. 亮度 Y 按空间权重 × 亮度差权重累加（差越大权重越小 → 边沿保留）；
+ *   2. 色度 Co/Cg 用同一组权重取均值，再按 reduce_color_noise 混回；
+ *   3. 用 YCoCg 逆变换重建 RGB 并夹到 0..255，最后按**原** alpha 预乘写回。
+ *
+ * 值域 sigma：strength / 10 越大、preserve_details 越低，平滑越强
+ * （`2 + strength01 * (1 - preserve) * 60`，单位是 0..255 的亮度差）。
+ * alpha 逐字节不变；strength = 0 时在入口短路（恒等）。
+ */
+comp_result reduce_noise_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                const ReduceNoiseSettings& s) {
+  if (s.strength <= 0.0 || width <= 0 || height <= 0) return COMP_OK;
+
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> straight(row_bytes * static_cast<size_t>(height), 0);
+  for (int32_t y = 0; y < height; ++y) {
+    const uint8_t* src = rgba + static_cast<size_t>(y) * stride;
+    uint8_t* dst = straight.data() + static_cast<size_t>(y) * row_bytes;
+    for (int32_t x = 0; x < width; ++x) {
+      const uint8_t* p = src + static_cast<size_t>(x) * 4;
+      uint8_t* q = dst + static_cast<size_t>(x) * 4;
+      q[3] = p[3];
+      if (p[3] == 0) continue;
+      const double alpha = p[3] / 255.0;
+      for (int c = 0; c < 3; ++c) {
+        const double value = std::min(255.0, static_cast<double>(p[c]) / alpha);
+        q[c] = static_cast<uint8_t>(std::lround(value));
+      }
+    }
+  }
+
+  constexpr int kRadius = 2;
+  constexpr double kSpatialSigma = 1.2;
+  constexpr size_t kWindow = static_cast<size_t>(2 * kRadius + 1);
+  double spatial[kWindow][kWindow];
+  for (int dy = -kRadius; dy <= kRadius; ++dy) {
+    for (int dx = -kRadius; dx <= kRadius; ++dx) {
+      const double distance = static_cast<double>(dx * dx + dy * dy);
+      spatial[dy + kRadius][dx + kRadius] =
+          std::exp(-distance / (2.0 * kSpatialSigma * kSpatialSigma));
+    }
+  }
+
+  const double strength01 = s.strength / 10.0;
+  const double preserve01 = s.preserve_details / 100.0;
+  const double range_sigma = 2.0 + strength01 * (1.0 - preserve01) * 60.0;
+  const double range_scale = 1.0 / (2.0 * range_sigma * range_sigma);
+  const double color_weight = s.reduce_color_noise / 100.0;
+
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* center_row = straight.data() + static_cast<size_t>(y) * row_bytes;
+    for (int32_t x = 0; x < width; ++x) {
+      const uint8_t* p = center_row + static_cast<size_t>(x) * 4;
+      if (p[3] == 0) continue;
+      const YCoCg center = ycocg_of(p);
+      double weight_sum = 0.0;
+      double y_sum = 0.0;
+      double co_sum = 0.0;
+      double cg_sum = 0.0;
+      for (int dy = -kRadius; dy <= kRadius; ++dy) {
+        int ny = y + dy;
+        if (ny < 0) ny = 0;
+        if (ny >= height) ny = height - 1;
+        const uint8_t* neighbor_row = straight.data() + static_cast<size_t>(ny) * row_bytes;
+        for (int dx = -kRadius; dx <= kRadius; ++dx) {
+          int nx = x + dx;
+          if (nx < 0) nx = 0;
+          if (nx >= width) nx = width - 1;
+          const uint8_t* q = neighbor_row + static_cast<size_t>(nx) * 4;
+          if (q[3] == 0) continue;
+          const YCoCg neighbor = ycocg_of(q);
+          const double delta = neighbor.y - center.y;
+          const double weight =
+              spatial[dy + kRadius][dx + kRadius] * std::exp(-delta * delta * range_scale);
+          weight_sum += weight;
+          y_sum += weight * neighbor.y;
+          co_sum += weight * neighbor.co;
+          cg_sum += weight * neighbor.cg;
+        }
+      }
+      if (weight_sum <= 0.0) continue;
+      const double mean_y = y_sum / weight_sum;
+      const double mean_co = co_sum / weight_sum;
+      const double mean_cg = cg_sum / weight_sum;
+      /* 亮度走双边结果（边沿保留）；色度按 reduce_color_noise 向窗口均值混合。 */
+      const double co = center.co + color_weight * (mean_co - center.co);
+      const double cg = center.cg + color_weight * (mean_cg - center.cg);
+      const double r = mean_y + (co - cg) * 0.5;
+      const double b = mean_y - (co + cg) * 0.5;
+      const double g = mean_y + cg * 0.5;
+      const double alpha = static_cast<double>(p[3]);
+      const double channels[3] = {r, g, b};
+      for (int c = 0; c < 3; ++c) {
+        const double clamped = channels[c] < 0.0 ? 0.0 : (channels[c] > 255.0 ? 255.0 : channels[c]);
+        const double premultiplied = std::lround(clamped * alpha / 255.0);
+        row[static_cast<size_t>(x) * 4u + static_cast<size_t>(c)] =
+            static_cast<uint8_t>(premultiplied);
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -566,6 +759,10 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
     case kFilterProgressiveBlur:
       return progressive_blur_pixels(rgba, width, height, stride, settings.progressive_blur, scale,
                                      line);
+    case kFilterSharpen:
+      return sharpen_pixels(rgba, width, height, stride, settings.sharpen, scale);
+    case kFilterReduceNoise:
+      return reduce_noise_pixels(rgba, width, height, stride, settings.reduce_noise);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -593,6 +790,8 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterGrain: return grain_valid(settings.grain, error);
     case kFilterMotionBlur: return motion_blur_valid(settings.motion_blur, error);
     case kFilterProgressiveBlur: return progressive_blur_valid(settings.progressive_blur, error);
+    case kFilterSharpen: return sharpen_valid(settings.sharpen, error);
+    case kFilterReduceNoise: return reduce_noise_valid(settings.reduce_noise, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -613,6 +812,8 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterProgressiveBlur:
       /* 上游 guard strongest > 0：两端半径都为 0 时原样返回。 */
       return std::max(settings.progressive_blur.from, settings.progressive_blur.to) <= 0.0;
+    case kFilterSharpen: return settings.sharpen.amount == 0.0;
+    case kFilterReduceNoise: return settings.reduce_noise.strength == 0.0;
   }
   return true;
 }
@@ -628,6 +829,8 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterGrain: return "Grain";
     case kFilterMotionBlur: return "Motion Blur";
     case kFilterProgressiveBlur: return "Progressive Blur";
+    case kFilterSharpen: return "Sharpen";
+    case kFilterReduceNoise: return "Reduce Noise";
   }
   return "filter";
 }
@@ -784,6 +987,14 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
       if (settings.progressive_blur.auto_axis) {
         *note += ", axis defaulted to the layer's mid-line";
       }
+    }
+    if (settings.kind == kFilterSharpen) {
+      *note += " as an unsharp mask over the shared box-blur approximation (sigma = radius * "
+               "scale; alpha untouched)";
+    }
+    if (settings.kind == kFilterReduceNoise) {
+      *note += " as a 5x5 bilateral on luma with chroma smoothing (alpha untouched; the upstream "
+               "multi-scale algorithm is not public)";
     }
     if (clip) *note += ", clipped to the document selection";
   }

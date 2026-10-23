@@ -2,9 +2,10 @@
 /*
  * comp_filter.h — Filter 菜单的 C ABI（P1 滤镜批次）。
  *
- * 语义唯一真源见 `domain/filters.h` 的文件头：九个算子（Vignette / Tonal
+ * 语义唯一真源见 `domain/filters.h` 的文件头：十一个算子（Vignette / Tonal
  * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain /
- * Motion Blur / Progressive Blur）的像素口径、选区混合与能力边界都写在那里。
+ * Motion Blur / Progressive Blur / Sharpen / Reduce Noise）的像素口径、选区混合
+ * 与能力边界都写在那里。
  *
  * 本头文件只暴露一件事：一次「整层」滤镜调用。
  *
@@ -44,7 +45,9 @@ typedef enum comp_filter_kind {
   COMP_FILTER_ADD_NOISE       = 5,
   COMP_FILTER_GRAIN           = 6,
   COMP_FILTER_MOTION_BLUR     = 7,
-  COMP_FILTER_PROGRESSIVE_BLUR = 8
+  COMP_FILTER_PROGRESSIVE_BLUR = 8,
+  COMP_FILTER_SHARPEN          = 9,
+  COMP_FILTER_REDUCE_NOISE     = 10
 } comp_filter_kind;
 
 /*
@@ -164,8 +167,41 @@ typedef struct comp_filter_progressive_blur {
 } comp_filter_progressive_blur;
 
 /*
+ * Sharpen（Unsharp Mask，上游 Filter > Sharpen > Unsharp Mask）。
+ *   amount     0 = 恒等；否则 0.1..500（百分比，上游量程）
+ *   radius     0.1..250（高斯 detail 半径，图层像素；预览再乘 scale）
+ *   threshold  0..255（通道差低于它不动，避免放大噪点）
+ *
+ * 口径 = 经典 USM：`src + amount/100 * (src - blur(src))`，alpha 不变。
+ */
+typedef struct comp_filter_sharpen {
+  double amount;
+  double radius;
+  double threshold;
+} comp_filter_sharpen;
+
+/*
+ * Reduce Noise（上游 Filter > Noise > Reduce Noise 的常用子集）。
+ *   strength             0 = 恒等；否则 0.1..10（上游量程 0..10）
+ *   preserve_details     0..100（越高越保留细节、平滑越弱）
+ *   reduce_color_noise   0..100（只平滑色度，亮度不动）
+ *
+ * 未暴露 `sharpen_details`（上游对话框第四行）：锐化已有独立滤镜，
+ * 不把两条锐化通路塞进同一个算子；边界记在 docs/filters.md §3.11。
+ */
+typedef struct comp_filter_reduce_noise {
+  double strength;
+  double preserve_details;
+  double reduce_color_noise;
+} comp_filter_reduce_noise;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
+ *
+ * `sharpen` / `reduce_noise` 是尾部追加（kind 9 / 10）：旧宿主按旧头文件
+ * 编译时描述符更小，**新宿主必须用同一份头文件**——本仓两端同源构建，
+ * 不提供跨版本结构体协商（导出符号表仍只做尾部追加）。
  */
 typedef struct comp_filter_desc {
   comp_filter_kind             kind;
@@ -178,6 +214,8 @@ typedef struct comp_filter_desc {
   comp_filter_grain            grain;
   comp_filter_motion_blur      motion_blur;
   comp_filter_progressive_blur progressive_blur;
+  comp_filter_sharpen          sharpen;
+  comp_filter_reduce_noise     reduce_noise;
 } comp_filter_desc;
 
 /*

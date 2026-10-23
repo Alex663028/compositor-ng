@@ -24,6 +24,8 @@ Motion Blur 在上游走 Core Image 的 `CIMotionBlur`、Progressive Blur 走
 | Grain | `adjust_grain`（与 Grain 调整层同一内核） | `grain` / `GrainSettings` |
 | Motion Blur | 本文件 `motion_blur_pixels`（盒式线积分，见 §5） | `angle` / `distance`（Core Image `CIMotionBlur`） |
 | Progressive Blur | 本文件 `progressive_blur_pixels`（8 档 `blur_rgba8_copy` 三角混合，见 §3.9） | `progressive*`（Core Image `CIMaskedVariableBlur`） |
+| Sharpen | `blur_rgba8_copy` + 本文件 `sharpen_pixels`（经典 USM，见 §3.10） | Filter > Sharpen > Unsharp Mask |
+| Reduce Noise | 本文件 `reduce_noise_pixels`（YCoCg 双边 + 色度平滑，见 §3.11） | Filter > Noise > Reduce Noise |
 
 与工具层（[`docs/tool-ops.md`](tool-ops.md)）的分工：
 
@@ -206,6 +208,45 @@ alpha。因此 alpha 通道逐字节不变，轮廓不向外扩散，透明邻�
   `axis defaulted to the layer's mid-line`。
 - `scale` 只乘半径，不改正则方向：降采样预览看起来与全尺寸一致。
 
+### 3.10 Sharpen / Unsharp Mask（`COMP_FILTER_SHARPEN`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `amount` | 0 = 恒等；否则 0.1..500 | 0 | 锐化量（百分比） |
+| `radius` | 0.1..250 | 1 | detail 半径（图层像素；预览再乘 `scale`） |
+| `threshold` | 0..255 | 0 | 通道差低于它不动（避免放大噪点） |
+
+- 口径 = 经典 USM：`src + amount / 100 * (src - blur(src))`。`blur` 复用共享的
+  `blur_rgba8_copy`（与 Gaussian Blur / Tonal Contrast 同一实现），
+  `sigma = max(0.1, radius * scale)`，不另起一套高斯。
+- 运算落在**预乘**像素上、逐通道夹到 `[0, alpha]`，alpha 逐字节不变：
+  图层轮廓不向外扩散，半透明边缘的颜色不会因为锐化越过自身 coverage。
+- `threshold` 按通道判据：`|src - blur| <= threshold` 的通道保持原值，
+  因此低对比细节（例如 120/128 的棋盘格）在阈值足够大时逐字节不动。
+- 恒等判据只看 `amount`：`amount = 0` 时不碰像素、不开事务；
+  `(0, 0.1)` 与 `radius` 越界显式拒绝，不静默夹到端点。
+- `out_changed` 是**参数**口径而非像素口径：`amount > 0` 就是一步事务，
+  即使阈值把每个通道都放过了（像素逐字节不变），这一步仍如实计入撤销栈。
+
+### 3.11 Reduce Noise（`COMP_FILTER_REDUCE_NOISE`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `strength` | 0 = 恒等；否则 0.1..10 | 0 | 整体强度 |
+| `preserve_details` | 0..100 | 50 | 越高越保留细节（双边值域 sigma 越小） |
+| `reduce_color_noise` | 0..100 | 25 | 只平滑色度：亮度按双边结果、色度按窗口均值混合 |
+
+- 实现：5×5 双边滤波，工作在**直通（unpremultiply 后）**颜色上，先转 YCoCg
+  （`Y = (r + 2g + b) / 4`、`Co = r - b`、`Cg = g - (r + b) / 2`），窗口权重取
+  Y 轴之差（亮度边沿保留），色度两轴按窗口均值平滑，最后按原 alpha 重新预乘。
+- `range_sigma = 2 + strength / 10 * (1 - preserve_details / 100) * 60`：
+  `strength` 越大、`preserve_details` 越低，窗口越愿意跨过亮度差取平均。
+- alpha 逐字节不变（噪声不向透明区扩散）。
+- 上游算法内部不公开（细节层 + 多尺度一类），本仓只保证三条可观察口径：
+  噪声方差下降、边沿对比保留、色噪按键平滑（见 §5 第 10 条）。
+- 上游对话框第四行 `sharpen_details` 不在本结构里：锐化已有独立滤镜
+  （§3.10），不把两条锐化通路塞进同一个算子。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -243,13 +284,21 @@ note 写明 `document selection is empty`。
    `distance` 的均匀条纹同方差）；本仓直接对长度 `distance` 做盒式平均。
    方向与长度两条可观察口径一致，形状不声称逐像素等同，note 写明
    `CIMotionBlur's radius is the equivalent standard deviation`。
-7. **后五例同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur /
-   Progressive Blur 都跑在 8 位工作副本上（见 §6），HDR 拒绝。
+7. **其余算子同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur /
+   Progressive Blur / Sharpen / Reduce Noise 都跑在 8 位工作副本上（见 §6），HDR 拒绝。
 8. **Progressive Blur 是 8 档混合，不是逐像素半径**。上游 `CIMaskedVariableBlur`
    逐像素连续变化半径；本仓把 `[from, to]` 切成 8 档、逐档均匀模糊后按三角权重
    混合（见 §3.9）。可观察口径一致：两端半径、渐变方向、`radial` / `inverted`
    语义；过渡带内不声称逐像素等同，note 写明
    `8-level blend ... the ramp is not pixel-identical`。
+9. **Sharpen 的 detail 模糊是盒式近似**。上游 USM 在 Core Image 的高斯上做，
+   本仓复用共享的三遍盒式模糊（`blur_rgba8_copy`），`sigma = max(0.1, radius * scale)`。
+   保证「amount 越大越锐、radius 越大 halo 越宽、threshold 以下不动、alpha 不变」
+   四条可观察口径，不声称逐像素等同；note 写明
+   `as an unsharp mask over the shared box-blur approximation`。
+10. **Reduce Noise 是多尺度算法的单尺度近似**。上游内部不公开；本仓用 5×5 双边
+    + YCoCg 色度平滑，只保证「噪声方差下降、边沿对比保留、色噪按键平滑」
+   三条可观察口径，note 写明 `a 5x5 bilateral on luma with chroma smoothing`。
 
 ## 6. 16 位与 HDR
 
@@ -263,12 +312,13 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（22 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（27 例，ABI + 域层混合视角）钉住：
 
-- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增五个 kind 的零初始化）；
-- 越界参数在事务之前拒绝（20 组，含 NaN scale / 轴端点；覆盖 blur radius、
+- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增七个 kind 的零初始化）；
+- 越界参数在事务之前拒绝（29 组，含 NaN scale / 轴端点；覆盖 blur radius、
   noise amount、grain size / roughness、motion blur angle / distance、
-  progressive blur from / to 的边界内外）；
+  progressive blur from / to、sharpen amount / radius / threshold、
+  reduce noise strength / preserve details / color noise 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -289,8 +339,13 @@ note 写明 `document selection is empty`。
   显式水平轴的锐端在 `start`、`inverted` 换到另一端；径向档中心锐、角上糊；
   `scale = 0.25` 时远端比全尺寸更锐；`from == to` 与同 sigma 的 Gaussian Blur
   **逐字节相同**；一步撤销；
+- Sharpen 让硬边更陡（跨边对比明显上升）、平坦区逐字节不动、alpha 不变、一步撤销；
+  `threshold = 30` 时 120/128 的低对比棋盘格**逐字节不动**（阈值之外才改）；
+- Reduce Noise 把噪声方差压到原来的一半以下、硬边对比保留（> 0.8×）、
+  alpha 不变、note 含 `bilateral`、一步撤销；
+  `reduce_color_noise = 0` 时平均 `|r - b|` 基本不动，= 100 时明显收窄（只动色度）；
 - ABI 正确搬运五个新 kind 的字段（含布尔与 `explicit_axis` 的反相映射），
-  越界值在 ABI 边界同样被拒。
+  以及 Sharpen / Reduce Noise 的六个字段，越界值在 ABI 边界同样被拒。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -311,8 +366,14 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 | Grain 0..3 | `grain.amount/size/roughness/seed` | 0 / 1.5 / 50 / 0 |
 | Motion Blur 0..1 | `motion_blur.angle/distance` | 0 / 0 |
 | Progressive Blur 0..3 | `progressive_blur.from/to/radial/inverted` | 0 / 20 / 0 / 0 |
+| Sharpen 0..2 | `sharpen.amount/radius/threshold` | 0 / 1 / 0 |
+| Reduce Noise 0..2 | `reduce_noise.strength/preserve_details/reduce_color_noise` | 0 / 50 / 25 |
 | （渐变轴） | `progressive_blur.start_x/start_y/end_x/end_y` + `explicit_axis = 1` | 画布拖拽定轴；未拖拽时 `explicit_axis = 0` 用缺省中线 |
 
+- **命令号**：菜单项 = `kCmdFilterBase(1200) + 滤镜序号`，当前 1200..1210。
+  面板动作（应用 / 重置 / 关闭）**不在**这段里：滤镜涨到 11 个之后 1210 是
+  Sharpen，原先放在 1210..1212 的应用/重置/关闭会与它抢同一个 id（Sharpen 菜单
+  变成「应用」、面板打不开）。动作号现落在 1220..1222，见 `shell_state.h`。
 - **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
   值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。
 - **一次调用**：壳用固定 512 字节 note 缓冲调用一次 `comp_filter_apply`，不做

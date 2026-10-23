@@ -94,7 +94,7 @@ constexpr UINT kCmdLayerBlendPrev = 1034; /* S21：混合模式按菜单序后�
 constexpr UINT kCmdLayerBlendNext = 1035; /* S21：混合模式按菜单序前进一步 */
 constexpr UINT kCmdBlendBase = 1300;      /* S21：+ 混合模式档位 0..23，菜单直达 */
 /*
- * S22 命令 id 段（1400 起，避开 1001..1046 单体、1100..1116 工具、1200..1212 滤镜、
+ * S22 命令 id 段（1400 起，避开 1001..1046 单体、1100..1116 工具、1200..1222 滤镜、
  * 1300..1323 混合模式四段已占用区间）。
  * 这一组接的是「引擎早已实现、壳一直没调」的像素级图层能力：蒙版 / 剪贴蒙版 /
  * 组隔离 / 采样 / 重排 / 直方图。它们与混合模式的差别只在于壳没开口子。
@@ -226,10 +226,16 @@ constexpr UINT kCmdLayerRasterizeText = 1572; /* 图层 > 栅格化文字 */
  */
 constexpr UINT kCmdLayerFonts = 1573; /* 图层 > 字体… */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
-constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
-constexpr UINT kCmdFilterApply = 1210;
-constexpr UINT kCmdFilterReset = 1211;
-constexpr UINT kCmdFilterClose = 1212;
+constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
+/*
+ * 面板动作号落在 1220 段：滤镜档位从 9 个涨到 11 个（尾追加 Sharpen /
+ * Reduce Noise）后，1200..1210 已被档位占满，原先放在 1210..1212 的
+ * 应用/重置/关闭会与 Sharpen 抢同一个 id（菜单项永远打不开锐化）。
+ * 1220 起给档位留下 1211..1219 的余量，后续再加滤镜不需要再搬家。
+ */
+constexpr UINT kCmdFilterApply = 1220;
+constexpr UINT kCmdFilterReset = 1221;
+constexpr UINT kCmdFilterClose = 1222;
 
 /* ===== 面板行 / 键入态 ===== */
 struct LayerRow {

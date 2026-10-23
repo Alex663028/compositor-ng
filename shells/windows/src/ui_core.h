@@ -828,7 +828,7 @@ inline int step_swatch(int index, int direction) {
 /* ------------------------------------------------------------ 滤镜面板 */
 
 /*
- * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..8，尾部追加）；
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..10，尾部追加）；
  * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
  */
 enum class FilterId : int {
@@ -841,6 +841,8 @@ enum class FilterId : int {
   Grain = 6,
   MotionBlur = 7,
   ProgressiveBlur = 8,
+  Sharpen = 9,
+  ReduceNoise = 10,
   Count
 };
 
@@ -951,6 +953,24 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"To", 0.0, 250.0, 1.0, 20.0},
         {"Radial 0/1", 0.0, 1.0, 1.0, 0.0},
         {"Inverted 0/1", 0.0, 1.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::Sharpen,
+       "Sharpen",
+       3,
+       {{"Amount", 0.0, 500.0, 1.0, 0.0},
+        {"Radius", 0.1, 250.0, 0.5, 1.0},
+        {"Threshold", 0.0, 255.0, 1.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
+        {"", 0.0, 0.0, 0.0, 0.0}}},
+      {FilterId::ReduceNoise,
+       "Reduce Noise",
+       3,
+       {{"Strength", 0.0, 10.0, 1.0, 0.0},
+        {"Preserve", 0.0, 100.0, 5.0, 50.0},
+        {"Color Noise", 0.0, 100.0, 5.0, 25.0},
+        {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0}}},
   };

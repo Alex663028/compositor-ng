@@ -2,14 +2,14 @@
 /*
  * test_filters.cpp — P1 滤镜批次（Vignette / Tonal Contrast / Bloom /
  * Lens Correction / Gaussian Blur / Add Noise / Grain / Motion Blur /
- * Progressive Blur）的回归护栏。
+ * Progressive Blur / Sharpen / Reduce Noise）的回归护栏。
  *
- * 为什么需要这组用例：这九个算子在上游是 Filter 菜单的一条通路
+ * 为什么需要这组用例：这十一个算子在上游是 Filter 菜单的一条通路
  * （Filters.swift + PixelFilter.run），本仓的像素内核早已就位，缺的是产品入口。
  * 本组用例冻结入口落地之后的契约：
  *   1. 恒等设置是**真 no-op**：不动像素、不开事务、out_changed = 0；
  *   2. 参数闸在开事务之前：越界参数 -> INVALID_ARGUMENT，不进撤销栈；
- *   3. 九个算子分别可观察地改变像素，且各恰好一步撤销；
+ *   3. 十一个算子分别可观察地改变像素，且各恰好一步撤销；
  *   4. Bloom 只加光、不改 alpha（预乘不变式：颜色不超过 alpha）；
  *   5. 选区委剪按**文档坐标**混合；图层带偏移时用 effective_bounds() 的原点；
  *   6. 16 位图层落 8 位工作副本并在 note 里写明，撤销恢复 16 位；
@@ -237,7 +237,8 @@ COMP_TEST(filters_new_kinds_are_identity_at_zero_initialisation) {
   const size_t undo_before = undo_depth(document);
 
   const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain,
-                              kFilterMotionBlur, kFilterProgressiveBlur};
+                              kFilterMotionBlur, kFilterProgressiveBlur, kFilterSharpen,
+                              kFilterReduceNoise};
   for (FilterKind kind : kinds) {
     FilterSettings settings;
     settings.kind = kind; /* 其余字段零初始化：radius / amount 为 0 = 恒等 */
@@ -388,6 +389,72 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
     s.progressive_blur.to = 20.0;
     s.progressive_blur.start_x = std::numeric_limits<double>::quiet_NaN();
     cases.push_back({"progressive blur axis endpoint is not finite", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 0.05; /* (0, 0.1) 越界，与 Gaussian Blur / Add Noise 同规矩 */
+    cases.push_back({"sharpen amount between 0 and 0.1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 500.5;
+    cases.push_back({"sharpen amount above 500", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 100.0;
+    s.sharpen.radius = 0.05;
+    cases.push_back({"sharpen radius below 0.1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 100.0;
+    s.sharpen.radius = 250.5;
+    cases.push_back({"sharpen radius above 250", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 100.0;
+    s.sharpen.threshold = -1.0;
+    cases.push_back({"sharpen threshold below 0", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterSharpen;
+    s.sharpen.amount = 100.0;
+    s.sharpen.threshold = 255.5;
+    cases.push_back({"sharpen threshold above 255", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterReduceNoise;
+    s.reduce_noise.strength = 0.05;
+    cases.push_back({"reduce noise strength between 0 and 0.1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterReduceNoise;
+    s.reduce_noise.strength = 10.5;
+    cases.push_back({"reduce noise strength above 10", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterReduceNoise;
+    s.reduce_noise.strength = 3.0;
+    s.reduce_noise.preserve_details = 100.5;
+    cases.push_back({"reduce noise preserve details above 100", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterReduceNoise;
+    s.reduce_noise.strength = 3.0;
+    s.reduce_noise.reduce_color_noise = -0.5;
+    cases.push_back({"reduce noise color noise below 0", s});
   }
 
   for (const Case& item : cases) {
@@ -1477,5 +1544,347 @@ COMP_TEST(filters_abi_maps_the_progressive_blur_fields) {
   desc.progressive_blur.to = 20.0;
   desc.progressive_blur.end_y = std::numeric_limits<double>::quiet_NaN();
   COMP_CHECK(comp_filter_apply(as_document_handle(&auto_doc), auto_id, &desc, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+/* ================================================== 2c. P1 锐化 / 降噪 */
+
+namespace {
+
+/* 竖直硬边：左半 60、右半 200。没有过渡带，锐化只可能在边沿做出（更陡的）过渡。 */
+std::vector<uint8_t> hard_edge(int32_t width, int32_t height) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 255);
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                 static_cast<size_t>(x)) * 4u;
+      const uint8_t value = x < width / 2 ? 60 : 200;
+      p[0] = p[1] = p[2] = value;
+    }
+  }
+  return out;
+}
+
+/* 一段列区间内某通道的均值：读「边两侧差了多少」用，不受单像素抖动影响。 */
+double column_mean(const std::vector<uint8_t>& rgba, int32_t width, int32_t height, int32_t x0,
+                   int32_t x1, int32_t channel) {
+  double sum = 0.0;
+  int64_t count = 0;
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = x0; x <= x1; ++x) {
+      sum += static_cast<double>(channel_at(rgba, width, x, y, channel));
+      ++count;
+    }
+  }
+  return count == 0 ? 0.0 : sum / static_cast<double>(count);
+}
+
+/* 确定性伪随机灰噪：左半基准 100、右半基准 190，±32 的逐像素抖动。
+ * 不引随机源——同一份字节每次跑都一样，回归才可复现。 */
+std::vector<uint8_t> noisy_band(int32_t width, int32_t height, uint32_t seed) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 255);
+  uint32_t state = seed;
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      state = state * 1664525u + 1013904223u;
+      const int32_t offset = static_cast<int32_t>((state >> 16) & 0x3fu) - 32;
+      int32_t value = (x < width / 2 ? 100 : 190) + offset;
+      value = value < 0 ? 0 : (value > 255 ? 255 : value);
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                 static_cast<size_t>(x)) * 4u;
+      p[0] = p[1] = p[2] = static_cast<uint8_t>(value);
+    }
+  }
+  return out;
+}
+
+/* 只有色度在抖的场：YCoCg 的 Y 恒为 128，Co/Cg 逐像素伪随机。
+ * 用来区分「亮度平滑」与「色度平滑」两条通路。 */
+std::vector<uint8_t> chroma_noise(int32_t width, int32_t height, uint32_t seed) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 255);
+  uint32_t state = seed;
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      state = state * 1664525u + 1013904223u;
+      const double co = (static_cast<double>((state >> 16) & 0xffu) - 128.0) * 0.6;
+      state = state * 1664525u + 1013904223u;
+      const double cg = (static_cast<double>((state >> 16) & 0x7fu) - 64.0) * 0.6;
+      const double r = 128.0 + (co - cg) * 0.5;
+      const double b = 128.0 - (co + cg) * 0.5;
+      const double g = 128.0 + cg * 0.5;
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                 static_cast<size_t>(x)) * 4u;
+      p[0] = static_cast<uint8_t>(std::lround(r));
+      p[1] = static_cast<uint8_t>(std::lround(g));
+      p[2] = static_cast<uint8_t>(std::lround(b));
+    }
+  }
+  return out;
+}
+
+/* 全图平均 |r - b|：色度噪声的强度，不依赖任何单点。 */
+double mean_chroma_span(const std::vector<uint8_t>& rgba) {
+  double sum = 0.0;
+  size_t count = 0;
+  for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+    const double r = static_cast<double>(rgba[i]);
+    const double b = static_cast<double>(rgba[i + 2]);
+    sum += std::fabs(r - b);
+    ++count;
+  }
+  return count == 0 ? 0.0 : sum / static_cast<double>(count);
+}
+
+}  // namespace
+
+COMP_TEST(filters_sharpen_steepens_a_hard_edge_and_is_one_step_undo) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  const std::vector<uint8_t> pattern = hard_edge(size, size);
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+  const size_t undo_before = undo_depth(document);
+
+  const double contrast_before = column_mean(pattern, size, size, size / 2, size / 2 + 3, 0) -
+                                 column_mean(pattern, size, size, size / 2 - 4, size / 2 - 1, 0);
+
+  FilterSettings settings;
+  settings.kind = kFilterSharpen;
+  settings.sharpen.amount = 200.0;
+  settings.sharpen.radius = 2.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "sharpen is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "one sharpen is exactly one undo step");
+  COMP_CHECK_MSG(note.find("unsharp mask") != std::string::npos,
+                 "the note records the USM formulation");
+
+  const std::vector<uint8_t> sharp = pixels_of(document, id);
+  COMP_CHECK_MSG(changed_pixels(sharp, pattern) > 0, "the sharpen actually moves pixels");
+  COMP_CHECK_MSG(alpha_channel_identical(sharp, pattern),
+                 "sharpen leaves every alpha byte alone (no outward spread)");
+  const double contrast_after = column_mean(sharp, size, size, size / 2, size / 2 + 3, 0) -
+                                column_mean(sharp, size, size, size / 2 - 4, size / 2 - 1, 0);
+  COMP_CHECK_MSG(contrast_after > contrast_before + 10.0,
+                 "the step across the edge gets steeper, not softer");
+
+  /* 远离边沿的平坦区（离边 24 px 以上）不该无中生有：那里 src == blur(src)。 */
+  bool flat_kept = true;
+  for (int32_t y = 8; y < size - 8 && flat_kept; ++y) {
+    for (int32_t x = 4; x < 12; ++x) {
+      if (channel_at(sharp, size, x, y, 0) != channel_at(pattern, size, x, y, 0)) {
+        flat_kept = false;
+        break;
+      }
+    }
+  }
+  COMP_CHECK_MSG(flat_kept, "flat areas far from any edge stay byte-identical");
+
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == pattern, "one undo restores the source");
+}
+
+COMP_TEST(filters_sharpen_threshold_spares_low_contrast_detail) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  /* 4 px 一格的 120/128 棋盘：局部落差只有 8，低于阈值就该原样保留。 */
+  std::vector<uint8_t> chess = checkerboard(size, size);
+  for (size_t i = 0; i + 3 < chess.size(); i += 4) {
+    const uint8_t value = chess[i] > 200 ? 128 : 120;
+    chess[i] = chess[i + 1] = chess[i + 2] = value;
+  }
+
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, chess, comp_rect{0, 0, size, size});
+
+  FilterSettings settings;
+  settings.kind = kFilterSharpen;
+  settings.sharpen.amount = 300.0;
+  settings.sharpen.radius = 2.0;
+  settings.sharpen.threshold = 30.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "a thresholded sharpen is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(pixels_of(document, id) == chess,
+                 "differences below the threshold are left byte-identical");
+
+  /* 同一组参数把阈值降到 0，同样的落差就会被放大。 */
+  settings.sharpen.threshold = 0.0;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "the same sharpen with threshold 0 runs");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(changed_pixels(pixels_of(document, id), chess) > 0,
+                 "with threshold 0 the same low-contrast detail is sharpened");
+}
+
+COMP_TEST(filters_reduce_noise_lowers_variance_and_keeps_the_edge) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 64;
+  const std::vector<uint8_t> pattern = noisy_band(size, size, 7u);
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+  const size_t undo_before = undo_depth(document);
+
+  /* 边两侧取远离边界的列区间，避免把「混边」误当成「保边」。 */
+  const double edge_before = column_mean(pattern, size, size, 34, 41, 0) -
+                             column_mean(pattern, size, size, 22, 29, 0);
+  const double variance_before = window_variance(pattern, size, 8, 8, 16);
+
+  FilterSettings settings;
+  settings.kind = kFilterReduceNoise;
+  settings.reduce_noise.strength = 10.0;
+  settings.reduce_noise.preserve_details = 0.0;
+  settings.reduce_noise.reduce_color_noise = 0.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "reduce noise is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "one denoise is exactly one undo step");
+  COMP_CHECK_MSG(note.find("bilateral") != std::string::npos,
+                 "the note records the bilateral formulation");
+
+  const std::vector<uint8_t> smooth = pixels_of(document, id);
+  COMP_CHECK_MSG(alpha_channel_identical(smooth, pattern), "reduce noise leaves alpha untouched");
+  COMP_CHECK_MSG(changed_pixels(smooth, pattern) > 0, "the denoise actually moves pixels");
+  COMP_CHECK_MSG(window_variance(smooth, size, 8, 8, 16) < variance_before * 0.5,
+                 "the noise variance drops inside a flat band");
+
+  const double edge_after = column_mean(smooth, size, size, 34, 41, 0) -
+                            column_mean(smooth, size, size, 22, 29, 0);
+  COMP_CHECK_MSG(edge_after > edge_before * 0.8,
+                 "the hard edge on the range axis survives (bilateral, not a plain blur)");
+
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == pattern, "one undo restores the source");
+}
+
+COMP_TEST(filters_reduce_noise_smooths_chroma_only_when_asked) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 48;
+  const std::vector<uint8_t> pattern = chroma_noise(size, size, 11u);
+
+  const double span_before = mean_chroma_span(pattern);
+  COMP_CHECK_MSG(span_before > 10.0, "the fixture really carries chroma noise");
+
+  FilterSettings settings;
+  settings.kind = kFilterReduceNoise;
+  settings.reduce_noise.strength = 10.0;
+  settings.reduce_noise.preserve_details = 0.0;
+  settings.reduce_noise.reduce_color_noise = 0.0;
+
+  Document luma_only(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id luma_id = add_layer_with(&luma_only, pattern, comp_rect{0, 0, size, size});
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&luma_only, luma_id, settings, 1.0, &code, &changed, &note, &error),
+                 "reduce noise with color noise 0 runs");
+  COMP_CHECK(code == COMP_OK);
+  const double span_luma_only = mean_chroma_span(pixels_of(luma_only, luma_id));
+  COMP_CHECK_MSG(std::fabs(span_luma_only - span_before) < 1.5,
+                 "color noise 0 leaves the chroma axis alone");
+
+  Document colored(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id colored_id = add_layer_with(&colored, pattern, comp_rect{0, 0, size, size});
+  settings.reduce_noise.reduce_color_noise = 100.0;
+  COMP_CHECK_MSG(filter_apply(&colored, colored_id, settings, 1.0, &code, &changed, &note, &error),
+                 "reduce noise with color noise 100 runs");
+  COMP_CHECK(code == COMP_OK);
+  const double span_colored = mean_chroma_span(pixels_of(colored, colored_id));
+  COMP_CHECK_MSG(span_colored < span_before * 0.6,
+                 "color noise 100 pulls the chroma axis toward the window mean");
+}
+
+COMP_TEST(filters_abi_maps_the_sharpen_and_reduce_noise_fields) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, hard_edge(size, size),
+                                          comp_rect{0, 0, size, size});
+
+  char note[512] = {0};
+  size_t note_size = 0;
+  int32_t changed = 0;
+
+  /* Sharpen：amount / radius / threshold 三个字段都要过 ABI。 */
+  comp_filter_desc sharpen{};
+  sharpen.kind = COMP_FILTER_SHARPEN;
+  sharpen.sharpen.amount = 150.0;
+  sharpen.sharpen.radius = 1.5;
+  sharpen.sharpen.threshold = 4.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &sharpen, 1.0, &changed, note,
+                                   sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the sharpen desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(std::string(note).find("Sharpen applied") != std::string::npos,
+                 "the note names the sharpen");
+  COMP_CHECK_MSG(std::string(note).find("unsharp mask") != std::string::npos,
+                 "the sharpen note keeps the USM caveat");
+
+  /* 零初始化 amount = 恒等（radius / threshold 不为 0 也不算数）。 */
+  comp_filter_desc sharpen_identity{};
+  sharpen_identity.kind = COMP_FILTER_SHARPEN;
+  sharpen_identity.sharpen.radius = 5.0;
+  changed = -1;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &sharpen_identity, 1.0,
+                                   &changed, note, sizeof(note), &note_size) == COMP_OK,
+                 "amount 0 is the sharpen identity");
+  COMP_CHECK_MSG(changed == 0, "the identity sharpen reports out_changed = 0");
+
+  sharpen.sharpen.radius = 0.05;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &sharpen, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  sharpen.sharpen.radius = 1.5;
+  sharpen.sharpen.threshold = 256.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &sharpen, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* Reduce Noise：strength / preserve_details / reduce_color_noise 三个字段。 */
+  Document noisy(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id noisy_id = add_layer_with(&noisy, noisy_band(size, size, 3u),
+                                                comp_rect{0, 0, size, size});
+  comp_filter_desc denoise{};
+  denoise.kind = COMP_FILTER_REDUCE_NOISE;
+  denoise.reduce_noise.strength = 6.0;
+  denoise.reduce_noise.preserve_details = 40.0;
+  denoise.reduce_noise.reduce_color_noise = 60.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&noisy), noisy_id, &denoise, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the reduce noise desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(std::string(note).find("Reduce Noise applied") != std::string::npos,
+                 "the note names the denoise");
+  COMP_CHECK_MSG(std::string(note).find("bilateral") != std::string::npos,
+                 "the denoise note keeps the bilateral caveat");
+
+  comp_filter_desc denoise_identity{};
+  denoise_identity.kind = COMP_FILTER_REDUCE_NOISE;
+  denoise_identity.reduce_noise.preserve_details = 0.0;
+  changed = -1;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&noisy), noisy_id, &denoise_identity, 1.0,
+                                   &changed, note, sizeof(note), &note_size) == COMP_OK,
+                 "strength 0 is the reduce noise identity");
+  COMP_CHECK_MSG(changed == 0, "the identity denoise reports out_changed = 0");
+
+  denoise.reduce_noise.strength = 0.05;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&noisy), noisy_id, &denoise, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  denoise.reduce_noise.strength = 6.0;
+  denoise.reduce_noise.preserve_details = 101.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&noisy), noisy_id, &denoise, 1.0, &changed,
                                nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }
