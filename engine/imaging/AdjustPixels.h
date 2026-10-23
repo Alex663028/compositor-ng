@@ -35,6 +35,19 @@ void adjust_color_balance(uint8_t *rgba, size_t width, size_t height, size_t str
 // After resampling with a filter that rings (Lanczos), premultiplied RGBA colors can exceed their alpha;
 // this clamps each channel back to its pixel's alpha. `count` is the number of pixels.
 void rgba_clamp_premultiplied(uint8_t *rgba, size_t count);
+// Photoshop's legacy Brightness/Contrast on premultiplied RGBA pixels: one affine map per channel,
+// `brightness` and `contrast` both −100…100 (0 is no change). Alpha is kept.
+void adjust_brightness_contrast(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                                double brightness, double contrast);
+// Desaturate on premultiplied RGBA pixels: every pixel becomes its luminosity (0.299 R + 0.587 G +
+// 0.114 B). Alpha is kept.
+void adjust_desaturate(uint8_t *rgba, size_t width, size_t height, size_t stride);
+// Threshold on premultiplied RGBA pixels: luminance at or above `level` (0…255) becomes white and
+// below it becomes black. Alpha is kept, so the layer's silhouette survives.
+void adjust_threshold(uint8_t *rgba, size_t width, size_t height, size_t stride, double level);
+// Posterize on premultiplied RGBA pixels: each channel is snapped to one of `levels` (2…255) evenly
+// spaced steps. 255 levels leaves the image unchanged. Alpha is kept.
+void adjust_posterize(uint8_t *rgba, size_t width, size_t height, size_t stride, int levels);
 // One step of Camera Raw: up to eight measured color tables (`size`³ sRGB colors, red slowest, 3 bytes each) blended
 // by weight, for settings between the ones measured. A null table is no change.
 typedef struct {

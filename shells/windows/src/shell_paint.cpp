@@ -901,7 +901,8 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   wchar_t line[256];
   int y = panel_rect.y + 8;
   SetTextColor(dc, RGB(240, 240, 244));
-  const wchar_t* title = L"调整（Adjustment）";
+  const wchar_t* title = shell.doc.adj_destructive ? L"调整（图像 > 破坏性落墨）"
+                                                   : L"调整（Adjustment）";
   TextOutW(dc, left + 10, y, title, lstrlenW(title));
   y += 22;
 
@@ -1044,8 +1045,17 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
       L"色阶：顶部 RGB/R/G/B 切通道页",
       L"Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除",
   };
-  const wchar_t* const* hints =
-      shell.doc.adj_kind == COMP_ADJUSTMENT_CURVES ? curve_hints : slider_hints;
+  const wchar_t* destructive_hints[] = {
+      L"图像 > 调整：一次性作用到像素（不产生调整层）",
+      L"Tab 切参数 · 拖动滑杆只改预览值",
+      L"数字键输入 · 回车提交 · - / = 调值",
+      L"Ctrl+Shift+U 应用（整次操作一步撤销）",
+      L"Esc 退出破坏性调整（未应用的参数丢弃）",
+  };
+  const wchar_t* const* hints = shell.doc.adj_destructive
+                                    ? destructive_hints
+                                    : (shell.doc.adj_kind == COMP_ADJUSTMENT_CURVES ? curve_hints
+                                                                                    : slider_hints);
   int hint_y = height - 96;
   for (int i = 0; i < 5; ++i) {
     TextOutW(dc, left + 10, hint_y, hints[i], lstrlenW(hints[i]));

@@ -48,8 +48,21 @@ struct AdjustmentKindInfo {
   const char* extra_roots;       /* 允许出现但不由面板编辑的顶层键（空格分隔，可空串） */
 };
 
-/* .comp kind 编码总数（0..11 合法），与上游 `AdjustmentKind` 的 CaseIterable 顺序一致。 */
-constexpr uint32_t kAdjustmentKindCount = 12;
+/*
+ * kind 编码总数（0..15 合法）。
+ *
+ * 0..11 与上游 `AdjustmentKind` 的 CaseIterable 顺序一致（冻结，不得改动序号）；
+ * 12..15 是本仓追加的破坏性调整（Brightness/Contrast、Desaturate、Threshold、
+ * Posterize），追加在尾部，既不挪动既有 kind 的编码，也不影响 `.comp` 里
+ * 既有的 `engineAdjustments[].kind`。
+ */
+constexpr uint32_t kAdjustmentKindCount = 16;
+
+/* 上游 `AdjustmentKind` 声明的种类数：0..11。追加 kind 从此之后开始编号。 */
+constexpr uint32_t kUpstreamAdjustmentKindCount = 12;
+
+/* 该 kind 是否可作为**破坏性调整**（Image > Adjustments）作用在像素图层上。 */
+bool adjustment_kind_is_destructive(uint32_t kind);
 
 /* kind 非法（>= kAdjustmentKindCount）时返回 nullptr。 */
 const AdjustmentKindInfo* adjustment_kind_info(uint32_t kind);

@@ -16,8 +16,10 @@
 #include <string>
 #include <vector>
 
+#include "compositing/adjustment_eval.h"
 #include "compositing/compositor.h"
 #include "core/comp_geometry.h"
+#include "domain/adjustment_table.h"
 #include "domain/crop.h"
 #include "domain/document.h"
 #include "domain/selection.h"
@@ -462,6 +464,132 @@ comp_result invert_layer(Document* doc, comp_layer_id target, int32_t* out_chang
   if (status != COMP_OK) {
     abort_txn();
     return fail(status, failure);
+  }
+  doc->touch_layer(target); /* S18：commit 之前换号。 */
+  if (owns_txn && doc->txn_commit(&txn_error) != COMP_OK) return fail(COMP_ERR_STATE, txn_error);
+  if (out_changed != nullptr) *out_changed = 1;
+  return COMP_OK;
+}
+
+comp_result apply_layer_adjustment(Document* doc, comp_layer_id target, uint32_t kind,
+                                   const std::string& settings_json, int32_t* out_changed,
+                                   std::string* error) {
+  if (out_changed != nullptr) *out_changed = 0;
+  auto fail = [error](comp_result code, const std::string& text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+  if (doc == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "adjustment needs a document");
+
+  /* 参数闸在开事务之前（同 invert_layer）：非法 kind / 非法 settings 不进撤销栈。 */
+  if (kind >= kAdjustmentKindCount) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown adjustment kind");
+  }
+  if (!adjustment_kind_is_destructive(kind)) {
+    if (kind == COMP_ADJUSTMENT_INVERT) {
+      return fail(COMP_ERR_INVALID_ARGUMENT,
+                  "invert has its own entry point (comp_layer_invert)");
+    }
+    return fail(COMP_ERR_INVALID_ARGUMENT,
+                "this adjustment is not a per-pixel map; use comp_filter_apply");
+  }
+  std::string settings_error;
+  if (!adjustment_validate_settings(kind, settings_json, &settings_error)) {
+    return fail(COMP_ERR_INVALID_ARGUMENT,
+                settings_error.empty() ? "adjustment settings are invalid" : settings_error);
+  }
+
+  const Layer* probe = doc->find(target);
+  if (probe == nullptr) {
+    return fail(COMP_ERR_NOT_FOUND, "adjustment target layer was not found");
+  }
+  if (probe->is_group) return fail(COMP_ERR_STATE, "adjustment cannot run on a group layer");
+  if (!probe->has_pixels()) return fail(COMP_ERR_STATE, "adjustment layer has no pixels");
+
+  const SelectionState& selection = doc->state().selection;
+  const bool clip = selection.active;
+  if (clip && selection_is_empty(selection)) {
+    /* 显式空选区（与 filter_apply / invert_layer 同口径）：什么都不改。 */
+    if (out_changed != nullptr) *out_changed = 0;
+    return COMP_OK;
+  }
+
+  const bool owns_txn = !doc->txn_active();
+  std::string txn_error;
+  if (owns_txn && doc->txn_begin("Image: Adjustments", &txn_error) != COMP_OK) {
+    return fail(COMP_ERR_STATE, txn_error);
+  }
+  auto abort_txn = [&]() {
+    if (owns_txn) doc->txn_abort(&txn_error);
+  };
+
+  Layer* layer = doc->find(target);
+  if (layer == nullptr) {
+    abort_txn();
+    return fail(COMP_ERR_NOT_FOUND, "adjustment target layer vanished after the parameter gate");
+  }
+
+  comp_result status = COMP_OK;
+  std::string failure;
+  bool pixel_format_changed = false;
+  bool pixels_changed = false;
+  try {
+    if (layer->pixels.format == COMP_PIXEL_RGBA16) {
+      if (!deep_to_rgba8(layer->pixels, &layer->pixels)) {
+        status = COMP_ERR_OUT_OF_MEMORY;
+        failure = "adjustment could not build the 8-bit working copy";
+      } else {
+        /* 位深变了就是一次可见改动，哪怕颜色通道逐字节相同。 */
+        pixel_format_changed = true;
+      }
+    } else if (layer->pixels.format != COMP_PIXEL_RGBA8) {
+      status = COMP_ERR_UNSUPPORTED;
+      failure = "adjustment needs an 8-bit or 16-bit layer (an HDR layer has no path)";
+    }
+    if (status == COMP_OK) {
+      const int32_t w = layer->pixels.width;
+      const int32_t h = layer->pixels.height;
+      const size_t stride = layer->pixels.stride();
+      const std::vector<uint8_t> original = layer->pixels.pixel_data();
+      uint8_t* pixels = layer->pixels.writable_pixels().data();
+
+      Adjustment adjustment;
+      adjustment.kind = kind;
+      adjustment.settings_json = settings_json;
+      std::string eval_error;
+      if (!apply_adjustments({adjustment}, pixels, w, h, stride, nullptr, &eval_error)) {
+        status = COMP_ERR_STATE;
+        failure = eval_error.empty() ? "adjustment evaluation failed" : eval_error;
+      } else {
+        if (clip) {
+          std::vector<uint8_t> coverage;
+          selection_effective_coverage(selection, &coverage);
+          blend_through_selection(pixels, stride, original.data(), w, h, coverage, *layer,
+                                  doc->state().width, doc->state().height);
+        }
+        /* 无变化不进历史（同 filter_apply）：逐行比对，跳过的行长不影响判断。 */
+        const size_t row_bytes = static_cast<size_t>(w) * 4u;
+        for (int32_t y = 0; y < h && !pixels_changed; ++y) {
+          const uint8_t* row = pixels + static_cast<size_t>(y) * stride;
+          if (std::memcmp(row, original.data() + static_cast<size_t>(y) * row_bytes, row_bytes) != 0) {
+            pixels_changed = true;
+          }
+        }
+      }
+    }
+  } catch (...) {
+    abort_txn();
+    throw;
+  }
+  if (status != COMP_OK) {
+    abort_txn();
+    return fail(status, failure);
+  }
+  if (!pixels_changed && !pixel_format_changed) {
+    /* 默认参数（或选区全 0 但 active）下与原图逐字节相同：撤销栈里不留空步。 */
+    abort_txn();
+    if (out_changed != nullptr) *out_changed = 0;
+    return COMP_OK;
   }
   doc->touch_layer(target); /* S18：commit 之前换号。 */
   if (owns_txn && doc->txn_commit(&txn_error) != COMP_OK) return fail(COMP_ERR_STATE, txn_error);

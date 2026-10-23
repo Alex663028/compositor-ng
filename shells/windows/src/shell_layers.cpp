@@ -2303,6 +2303,8 @@ void refresh_adjustments(ShellState& shell) {
 }
 
 void panel_cycle_kind(ShellState& shell, int32_t delta) {
+  /* 换类型 = 回到调整层面板：破坏性面板里按这个键会退出落墨态（kind 可能不再可破坏）。 */
+  if (shell.doc.adj_destructive) panel_exit_destructive(shell);
   const int32_t total = static_cast<int32_t>(COMP_ADJUSTMENT_KIND_COUNT);
   int32_t kind = shell.doc.adj_kind + delta;
   if (kind < 0) kind = total - 1;
@@ -2318,6 +2320,8 @@ void panel_cycle_kind(ShellState& shell, int32_t delta) {
 }
 
 void panel_select_adjustment(ShellState& shell, int32_t delta) {
+  /* 选的永远是「已有调整层」；在破坏性面板里选调整即退出落墨态。 */
+  if (shell.doc.adj_destructive) panel_exit_destructive(shell);
   const int32_t count = static_cast<int32_t>(shell.doc.adj_settings.size());
   if (count == 0) {
     set_status(shell, L"该图层没有调整（Ctrl+Shift+A 新增）");
@@ -2470,6 +2474,14 @@ void panel_commit_input(ShellState& shell) {
 
 /* settings JSON 由引擎组装（壳内不拼 JSON、不解析 JSON）。 */
 bool build_settings_json(const ShellState& shell, std::string* out_json) {
+  /* 破坏性 Curves 没有参数表（adj_values 为空），settings 由曲线编辑器的寄存串给出。 */
+  if (shell.doc.adj_destructive && shell.doc.adj_kind == COMP_ADJUSTMENT_CURVES) {
+    if (out_json != nullptr) {
+      *out_json = shell.doc.destructive_curve_settings.empty() ? std::string("{}")
+                                                               : shell.doc.destructive_curve_settings;
+    }
+    return true;
+  }
   std::vector<const char*> values;
   values.reserve(shell.doc.adj_values.size());
   for (const std::string& text : shell.doc.adj_values) values.push_back(text.c_str());
@@ -2491,6 +2503,15 @@ bool build_settings_json(const ShellState& shell, std::string* out_json) {
 }
 
 void panel_apply_adjustment(ShellState& shell, bool add) {
+  if (shell.doc.adj_destructive) {
+    /* 破坏性面板没有「新增调整」这个动作：同样的参数键落的是像素。 */
+    if (add) {
+      set_status(shell, L"破坏性调整：Ctrl+Shift+U 直接作用于像素，Esc 退出");
+      return;
+    }
+    panel_apply_destructive(shell);
+    return;
+  }
   const comp_layer_id id = selected_layer_id(shell);
   if (shell.doc.document == nullptr || id == 0) {
     set_status(shell, L"请先用 ↑↓ 选择一个图层");
@@ -2533,6 +2554,91 @@ void panel_apply_adjustment(ShellState& shell, bool add) {
             result == COMP_OK ? (add ? L"已新增调整" : L"已应用调整")
                               : (add ? L"新增调整失败" : L"应用调整失败"),
             widen_ascii(adjustment_kind_name(kind)).c_str());
+  refresh_history_status(shell, buffer);
+}
+
+/* ---------------------------------------- 破坏性调整（ROI #8，图像 > 调整） */
+
+/*
+ * 与调整层面板共用同一份参数行（键名 / 量程 / 缺省值都来自 ABI 参数表），
+ * 区别只在落点：这里没有「选中的调整」，Ctrl+Shift+U 调
+ * comp_layer_apply_adjustment 一次性写进像素，不产生 engineAdjustments 条目。
+ * 拖动滑杆时 selected_adjustment 恒为 -1，所以只是编辑缓冲预览，不会边拖边落墨。
+ */
+void panel_begin_destructive(ShellState& shell, uint32_t kind) {
+  if (shell.doc.document == nullptr || selected_layer_id(shell) == 0) {
+    set_status(shell, L"图像调整：请先选择一个图层");
+    return;
+  }
+  shell.doc.adj_kind = static_cast<int32_t>(kind);
+  shell.doc.adj_channel = 0;
+  shell.doc.selected_adjustment = -1;
+  reset_adjustment_values(shell);
+  /* Curves 没有参数表，点列走这条寄存串（其余 kind 不用它，进态时一律重置）。 */
+  shell.doc.destructive_curve_settings = "{\"curves\":{}}";
+  /*
+   * 去色没有可调参数（曲线同样 0 项，但曲线要在面板里拉点，不能提前落墨），
+   * 所以只对 Desaturate 走「点菜单即应用」，其余进面板态等 Ctrl+Shift+U。
+   */
+  if (kind == COMP_ADJUSTMENT_DESATURATE) {
+    shell.doc.adj_destructive = false; /* 一次性落墨，不进入面板态 */
+    panel_apply_destructive(shell);
+    return;
+  }
+  shell.doc.adj_destructive = true;
+  refresh_curve_points(shell);
+  wchar_t buffer[200];
+  wsprintfW(buffer, L"破坏性调整：%s — Ctrl+Shift+U 应用，Esc 退出",
+            widen_ascii(adjustment_kind_name(kind)).c_str());
+  set_status(shell, buffer);
+}
+
+void panel_exit_destructive(ShellState& shell) {
+  if (!shell.doc.adj_destructive) return;
+  shell.doc.adj_destructive = false;
+  shell.doc.destructive_curve_settings.clear();
+  refresh_adjustments(shell); /* 回到调整层面板：kind/值以选中图层的调整列表为准 */
+  set_status(shell, L"已退出破坏性调整（未应用的参数已丢弃）");
+}
+
+/* 把当前参数行一次性落到像素上；失败时文档不变（引擎在开事务前就拒了）。 */
+void panel_apply_destructive(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  if (shell.doc.document == nullptr || id == 0) {
+    set_status(shell, L"图像调整：请先选择一个图层");
+    return;
+  }
+  std::string json;
+  if (!build_settings_json(shell, &json)) {
+    set_status(shell, L"应用被拒：参数不合法");
+    return;
+  }
+  const uint32_t kind = static_cast<uint32_t>(shell.doc.adj_kind);
+  int32_t changed = 0;
+  const comp_result result =
+      comp_layer_apply_adjustment(shell.doc.document, id, kind, json.c_str(), &changed);
+  shell.doc.needs_render = true;
+  if (result == COMP_ERR_UNSUPPORTED) {
+    set_status(shell, L"图像调整：HDR（RGBA16F）图层不受支持（未改动）");
+    return;
+  }
+  if (result == COMP_ERR_STATE) {
+    set_status(shell, L"图像调整：组图层或没有像素的图层（未改动）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"图像调整失败（未改动）");
+    return;
+  }
+  wchar_t buffer[200];
+  if (changed == 0) {
+    /* 显式空选区 / 恒等参数：引擎不落墨也不进历史。 */
+    wsprintfW(buffer, L"%s：结果与像素相同，未进历史",
+              widen_ascii(adjustment_kind_name(kind)).c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已应用破坏性调整：%s", widen_ascii(adjustment_kind_name(kind)).c_str());
   refresh_history_status(shell, buffer);
 }
 
@@ -2715,6 +2821,11 @@ void adjust_scroll_to_focus(ShellState& shell) {
  * 纯函数（见 comp_layer.h 的契约）。拖动期间用显式事务把多次写入折成一步。
  */
 const std::string* selected_adjustment_settings(const ShellState& shell) {
+  /* 破坏性 Curves 没有可写的调整对象，点列寄存态就是它的「settings」。 */
+  if (shell.doc.adj_destructive) {
+    return shell.doc.adj_kind == COMP_ADJUSTMENT_CURVES ? &shell.doc.destructive_curve_settings
+                                                        : nullptr;
+  }
   if (shell.doc.selected_adjustment < 0 ||
       shell.doc.selected_adjustment >= static_cast<int32_t>(shell.doc.adj_settings.size())) {
     return nullptr;
@@ -2775,6 +2886,12 @@ bool curve_write_points(ShellState& shell) {
     return false;
   }
   json.resize(need);
+  if (shell.doc.adj_destructive) {
+    /* 破坏性态：只更新寄存串（纯函数，不开事务、不写文档），像素等 Ctrl+Shift+U。 */
+    shell.doc.destructive_curve_settings = json;
+    shell.doc.needs_render = true;
+    return true;
+  }
   if (comp_layer_update_adjustment_at(shell.doc.document, id,
                                       static_cast<size_t>(shell.doc.selected_adjustment),
                                       COMP_ADJUSTMENT_CURVES, json.c_str()) != COMP_OK) {
@@ -2830,6 +2947,16 @@ void curve_begin_drag(ShellState& shell, const comp_ui::Rect& plot, int32_t poin
     return;
   }
   if (shell.doc.document == nullptr) return;
+  if (shell.doc.adj_destructive) {
+    /* 破坏性态没有文档可写：整段拖动只改寄存串，不需要事务，也不占撤销步。 */
+    shell.doc.curve_drag_txn = nullptr;
+    shell.doc.curve_drag_point = point;
+    shell.doc.curve_focus_point = point;
+    shell.doc.curve_drag_dirty = false;
+    shell.doc.curve_drag_plot = plot;
+    curve_drag_to(shell, plot, x, y);
+    return;
+  }
   if (comp_txn_begin(shell.doc.document, "Adjust Curve", &shell.doc.curve_drag_txn) != COMP_OK) {
     shell.doc.curve_drag_txn = nullptr;
     set_status(shell, L"曲线：无法开启事务（未改动）");
@@ -2851,6 +2978,16 @@ void curve_drag_finish(ShellState& shell, bool commit) {
   shell.doc.curve_drag_txn = nullptr;
   shell.doc.curve_drag_dirty = false;
   ReleaseCapture();
+
+  if (shell.doc.adj_destructive) {
+    /* 破坏性态：寄存串已是最新，不碰撤销栈；也不能 refresh_adjustments（那会把面板
+     * 打回调整层模式），点列从寄存串重读即可。 */
+    shell.doc.needs_render = true;
+    refresh_curve_points(shell);
+    shell.doc.curve_focus_point = focused;
+    set_status(shell, L"曲线参数已改（Ctrl+Shift+U 落墨，Esc 退出）");
+    return;
+  }
 
   bool committed = false;
   if (txn != nullptr) {
@@ -2922,6 +3059,11 @@ void curve_delete_point(ShellState& shell, int32_t index) {
                        shell.doc.curve_xy.begin() + 2 * index + 2);
   shell.doc.curve_focus_point = -1;
   const bool ok = curve_write_points(shell); /* 隐式事务 = 一步撤销 */
+  if (shell.doc.adj_destructive) {
+    shell.doc.needs_render = true;
+    set_status(shell, ok ? L"已删除曲线控制点（Ctrl+Shift+U 落墨）" : L"删除曲线控制点失败");
+    return;
+  }
   refresh_adjustments(shell);
   refresh_history_status(shell, ok ? L"已删除曲线控制点（一步撤销）" : L"删除曲线控制点失败");
 }

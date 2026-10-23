@@ -1566,3 +1566,93 @@ void adjust_camera_raw_calibration(uint8_t *rgba, size_t width, size_t height, s
         }
     } });
 }
+
+// The four destructive adjustments below (Image > Adjustments) are plain per-pixel maps on
+// premultiplied RGBA, so each one unpremultiplies, works on straight 0…255 values, and writes back
+// `min(alpha, round(out * alpha))` like the kernels above. Fully transparent pixels are left alone.
+
+// Photoshop's legacy Brightness/Contrast: a single affine map on every channel, where the contrast
+// term is the classic 259 factor. `brightness` and `contrast` are −100…100 (the panel's range).
+void adjust_brightness_contrast(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                                double brightness, double contrast) {
+    double b = (brightness < -100 ? -100 : brightness > 100 ? 100 : brightness) * 2.55;
+    double c = (contrast < -100 ? -100 : contrast > 100 ? 100 : contrast) * 2.55;
+    // The 259 formula is singular at 259; the panel's ±100 only reaches ±255, so clamping to 254
+    // is the same guard Photoshop applies rather than a behavior change.
+    if (c > 254.0) c = 254.0;
+    if (c < -254.0) c = -254.0;
+    double factor = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            for (int ch = 0; ch < 3; ++ch) {
+                double v = fmin(255.0, p[ch] * 255.0 / alpha);
+                double out = factor * (v - 128.0) + 128.0 + b;
+                p[ch] = (uint8_t)fmin(alpha, fmax(0.0, floor(out * alpha / 255.0 + 0.5)));
+            }
+        }
+    } });
+}
+
+// Desaturate: the luminosity weights Photoshop uses (the same trio Color Balance already keeps).
+void adjust_desaturate(uint8_t *rgba, size_t width, size_t height, size_t stride) {
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double r = fmin(255.0, p[0] * 255.0 / alpha);
+            double g = fmin(255.0, p[1] * 255.0 / alpha);
+            double b = fmin(255.0, p[2] * 255.0 / alpha);
+            double gray = 0.299 * r + 0.587 * g + 0.114 * b;
+            uint8_t q = (uint8_t)fmin(alpha, fmax(0.0, floor(gray * alpha / 255.0 + 0.5)));
+            p[0] = p[1] = p[2] = q;
+        }
+    } });
+}
+
+// Threshold: luminance at or above `level` becomes white, below becomes black. Alpha is untouched,
+// so a thresholded layer keeps its shape instead of turning into a rectangle.
+void adjust_threshold(uint8_t *rgba, size_t width, size_t height, size_t stride, double level) {
+    if (level < 0) level = 0;
+    if (level > 255) level = 255;
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double r = fmin(255.0, p[0] * 255.0 / alpha);
+            double g = fmin(255.0, p[1] * 255.0 / alpha);
+            double b = fmin(255.0, p[2] * 255.0 / alpha);
+            uint8_t q = (0.299 * r + 0.587 * g + 0.114 * b) >= level ? (uint8_t)alpha : 0;
+            p[0] = p[1] = p[2] = q;
+        }
+    } });
+}
+
+// Posterize: `levels` evenly spaced steps per channel. 255 levels is an identity, so it is skipped
+// rather than paid for.
+void adjust_posterize(uint8_t *rgba, size_t width, size_t height, size_t stride, int levels) {
+    if (levels < 2) levels = 2;
+    if (levels >= 255) return;
+    double span = (double)(levels - 1);
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            for (int ch = 0; ch < 3; ++ch) {
+                double v = fmin(255.0, p[ch] * 255.0 / alpha);
+                double step = floor(v * span / 255.0 + 0.5);
+                double out = step * 255.0 / span;
+                p[ch] = (uint8_t)fmin(alpha, fmax(0.0, floor(out * alpha / 255.0 + 0.5)));
+            }
+        }
+    } });
+}

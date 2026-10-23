@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **163**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **145 条 / 27 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **164**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **154 条 / 28 场景**；落地规则见 §6）。
 > 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
 > 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -36,6 +36,11 @@
 > 视觉探针 128 → **145 条 / 27 场景**（只追加 `sharpen_denoise`、`font_picker`、`guides`，
 > 既有阈值未动）；壳自检 263 项 SHA 未变。ROI 前 7 项至此全部落地，下一项为破坏性
 > `Image > Adjustments` 族。
+> **2026-10-23 第十批**：破坏性 `Image > Adjustments` 族（ROI #8，**尾部追加 1 个导出**，
+> 163 → **164**：`comp_layer_apply_adjustment`；kind 表 12 → 16，尾部追加 Brightness/Contrast、
+> Desaturate、Threshold、Posterize，像素复用调整层的同一批求值器；壳侧 `图像 > 调整`
+> 十一项 + 破坏性面板态，见 README §6.94）。视觉探针 145 → **154 条 / 28 场景**
+> （只追加 `destructive_adjust` 场景）；壳自检 263 项 SHA 未变。ROI 八项至此全部落地。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -53,10 +58,10 @@
 
 | 维度 | 本仓 | Photoshop（参照） | 差距性质 |
 |------|------|-------------------|----------|
-| C ABI | **163** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
+| C ABI | **164** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
 | 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
-| 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
+| 调整种类 | **16**（`comp_layer.h:300-322`；前 12 种对齐上游，后 4 种为本仓追加） | 调整菜单 20+ | 破坏性 `Image > Adjustments` 已落地 11 种（含反相，§6.94）；仍缺 Vibrance / Selective Color / Photo Filter / Channel Mixer / Color Lookup / Shadows-Highlights / 可选颜色 / 自动色调·对比度·颜色 |
 | 图层样式 | **6**（描边/投影/颜色叠加/内阴影/外发光/内发光） | 10 | 缺斜面和浮雕 / 缎光 / 渐变叠加 / 图案叠加 |
 | 滤镜 | **11**（`comp_filter.h:39-51`） | 100+ | 无模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染；锐化（USM）与降噪已进 Filter 菜单 |
 | 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/PSD/EXR + `.comp` | 20+ | PSD 只是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
@@ -73,10 +78,10 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-23）**：
-日常使用路径 **≈76%**，全功能面 **≈52%**（190 条 PS 核心条目加权，原始命中 92 条）；
-与口径 A/B 的差异原因在该文件 §3 说明。ROI **前 7 项**（字体选择、PSD 分层导出、
-锐化/降噪入口、标尺/参考线/网格/对齐、存储/载入选区通道、组混合模式、HiDPI）
-已全部落地，日常路径 70% → 76%。
+日常使用路径 **≈77%**，全功能面 **≈53%**（190 条 PS 核心条目加权，原始命中 96 条）；
+与口径 A/B 的差异原因在该文件 §3 说明。ROI **前 8 项**（字体选择、PSD 分层导出、
+锐化/降噪入口、标尺/参考线/网格/对齐、存储/载入选区通道、组混合模式、HiDPI、
+破坏性 `图像 > 调整`）已全部落地，日常路径 70% → 77%。
 
 ---
 
@@ -345,8 +350,14 @@
 - 性质：复用 `engine/imaging` 内核的部分为 M；全新滤镜族 L。
 
 ### P1-6 调整补全
-补 Brightness/Contrast、Vibrance、Selective Color、Photo Filter、Channel Mixer、Color Lookup、Posterize、Threshold、Desaturate、Shadows/Highlights；**破坏性 Image > Adjustments 全族**（现在只有反相）；自动色调/对比度/颜色。
-- 性质：12 → 20+ kind 【ABI 追加】（尾部）+【引擎】像素实现（多数可复用 AdjustPixels）。
+补 Brightness/Contrast、Vibrance、Selective Color、Photo Filter、Channel Mixer、Color Lookup、Posterize、Threshold、Desaturate、Shadows/Highlights；**破坏性 Image > Adjustments 全族**（原来只有反相）；自动色调/对比度/颜色。
+- **已落地（2026-10-23，README §6.94，kind 12 → 16 + 1 个导出尾部追加）**：
+  Brightness/Contrast、Posterize、Threshold、Desaturate 四个 kind 与破坏性
+  `Image > Adjustments` 全族（11 种，复用调整层求值器；`comp_layer_apply_adjustment`）。
+  壳侧 `图像 > 调整` 十一项，一发性落墨、一步撤销、无变化不进历史。
+- **剩余**：Vibrance、Selective Color、Photo Filter、Channel Mixer、Color Lookup、
+  Shadows/Highlights、自动色调/对比度/颜色。
+- 性质：16 → 20+ kind 【ABI 追加】（尾部）+【引擎】像素实现（多数可复用 AdjustPixels）。
 
 ### P1-7 渐变升级
 多色标（>2）、色标中点、不透明度中点、角度/对称/菱形、抖动、渐变预设库与编辑器；渐变映射调整同步支持多色标。
@@ -382,7 +393,7 @@
   `screen_to_doc` 的每个调用点（选区手柄、参考线、标尺、笔尖轮廓、取色、变换）
   都要跟着换成设备矩形；`ui_core.h` 是两壳共用的，OHOS 壳要同步。
 - **验收**：200% 下 100% 缩放时，文档像素与设备像素一一对应（截图逐像素比对）；
-  现有 145 条视觉断言在 96 DPI 下不变。
+  现有 154 条视觉断言在 96 DPI 下不变。
 
 ---
 
@@ -438,11 +449,12 @@
 
 > 2026-10-23 校正一轮：下面每条都重新对着当前代码数过一遍，数字与指针已更新。
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **163** 个
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **164** 个
   （尾部追加 `comp_layer_get_pixels`、4 个文字图层导出、PSD 分层读写的
-  `comp_io_import_document` / `comp_io_export_document`、6 个 `comp_guide_*` 画布参考线导出
-  与 5 个 `comp_selection_channel_*` 选区通道导出；滤镜枚举另追加 2 个 kind，不增导出）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **145 条 / 27 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides` 后；原 80 条含 IME 6/6）。
+  `comp_io_import_document` / `comp_io_export_document`、6 个 `comp_guide_*` 画布参考线导出、
+  5 个 `comp_selection_channel_*` 选区通道导出与 `comp_layer_apply_adjustment` 破坏性调整导出；
+  滤镜 / 调整枚举另追加 2 个与 4 个 kind，不增导出）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **154 条 / 28 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
   2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
   与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。
@@ -456,7 +468,7 @@
 
 | 结论 | 证据 |
 |------|------|
-| 163 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 163） |
+| 164 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 164） |
 | 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
 | 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
 | 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |
@@ -465,7 +477,7 @@
 | 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767`（可编辑文字对象见同文件尾部 P0-6 ①） |
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
-| 6 种效果 / 12 种调整 | `comp_layer.h:300-313`；`README.md:1462-1500` |
+| 6 种效果 / 16 种调整 | `engine/abi/include/compositor/comp_layer.h:300-322`（调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 |
 | 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
@@ -474,4 +486,4 @@
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **145/145 / 27 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`） |
+| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **154/154 / 28 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`） |

@@ -1778,6 +1778,13 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
     }
   }
 
+  /* ROI #8：破坏性调整态下 Esc 只退出该态（不关窗、不改像素，与输入态同一规矩）。 */
+  if (key == VK_ESCAPE && shell.doc.adj_destructive) {
+    panel_exit_destructive(shell);
+    InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
+
   if (key == VK_ESCAPE) {
     /* 钢笔有未提交路径时 Esc 只取消路径，不关窗（与输入态的 Esc 同规矩）。 */
     if (shell.tool == comp_ui::ToolId::Pen && !shell.doc.pen_anchors.empty()) {
@@ -4076,6 +4083,23 @@ HMENU build_menu() {
   AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotateCCW, L"逆时针 90°(&W)");
   AppendMenuW(image_rotate_menu, MF_STRING, kCmdImageRotate180, L"180°(&1)");
   HMENU image_menu = CreatePopupMenu();
+  /*
+   * ROI #8：图像 > 调整（PS Image > Adjustments）。这里的每一项都是**破坏性**
+   * 一次性落墨（comp_layer_apply_adjustment），与「调整」面板里的可编辑调整层
+   * 并存；两边的参数键 / 量程 / 缺省值同源（ABI 参数表），壳内不抄类型名表。
+   * 无参数的去色点菜单即应用，其余进面板态等 Ctrl+Shift+U。
+   */
+  HMENU image_adjust_menu = CreatePopupMenu();
+  for (size_t i = 0; i < kImageAdjustKindCount; ++i) {
+    const uint32_t kind = kImageAdjustKinds[i];
+    /* 前 7 项是上游冻结的调整类型，其后是本仓 S27 追加的四项。 */
+    if (i == 7) AppendMenuW(image_adjust_menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(image_adjust_menu, MF_STRING,
+                kCmdImageAdjustBase + static_cast<UINT>(kind),
+                widen_ascii(adjustment_kind_name(kind)).c_str());
+  }
+  AppendMenuW(image_adjust_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(image_adjust_menu, MF_STRING, kCmdImageInvert, L"反相(&I)\tCtrl+I");
   /* 上游 Image Size / Canvas Size：壳侧面板 + 既有 ABI，不新增导出。 */
   AppendMenuW(image_menu, MF_STRING, kCmdImageSize, L"图像大小…(&I)\tCtrl+Alt+I");
   AppendMenuW(image_menu, MF_STRING, kCmdCanvasSize, L"画布大小…(&C)\tCtrl+Alt+C");
@@ -4085,7 +4109,8 @@ HMENU build_menu() {
   AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(image_menu, MF_STRING, kCmdImageTrim, L"修边…(&T)");
   AppendMenuW(image_menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(image_menu, MF_STRING, kCmdImageInvert, L"反相(&I)\tCtrl+I");
+  AppendMenuW(image_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image_adjust_menu),
+              L"调整(&J)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(image_menu), L"图像(&I)");
 
   /*

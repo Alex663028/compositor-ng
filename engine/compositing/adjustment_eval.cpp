@@ -636,6 +636,39 @@ bool apply_color_balance(uint8_t* buf, int32_t width, int32_t height, size_t str
   return true;
 }
 
+/* kind 12 — Brightness/Contrast。 */
+bool apply_brightness_contrast(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                               const Settings& s) {
+  const double brightness = s.clamp(s.number("brightnessContrastSettings", "brightness", 0.0), -100.0, 100.0);
+  const double contrast = s.clamp(s.number("brightnessContrastSettings", "contrast", 0.0), -100.0, 100.0);
+  /* 0/0 是恒等：不白跑一趟，也让「默认参数不算改动」在 out_changed 上成立。 */
+  if (brightness == 0.0 && contrast == 0.0) return false;
+  adjust_brightness_contrast(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride,
+                             brightness, contrast);
+  return true;
+}
+
+/* kind 13 — Desaturate（无参数，恒有改动；全灰的图仍是「改过」。 */
+bool apply_desaturate(uint8_t* buf, int32_t width, int32_t height, size_t stride, const Settings&) {
+  adjust_desaturate(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride);
+  return true;
+}
+
+/* kind 14 — Threshold。 */
+bool apply_threshold(uint8_t* buf, int32_t width, int32_t height, size_t stride, const Settings& s) {
+  const double level = s.clamp(s.number("thresholdSettings", "level", 128.0), 0.0, 255.0);
+  adjust_threshold(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, level);
+  return true;
+}
+
+/* kind 15 — Posterize。 */
+bool apply_posterize(uint8_t* buf, int32_t width, int32_t height, size_t stride, const Settings& s) {
+  const double levels = s.clamp(s.number("posterizeSettings", "levels", 4.0), 2.0, 255.0);
+  adjust_posterize(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride,
+                   static_cast<int>(std::lround(levels)));
+  return true;
+}
+
 /*
  * 单条调整的 8 位求值（kind 已确认被支持）。返回「是否真的改变了像素」。
  *
@@ -659,6 +692,10 @@ bool apply_adjustment_eight_bit(uint8_t* buf, int32_t width, int32_t height, siz
     case 9: return apply_invert(buf, count);
     case 10: return apply_black_white(buf, width, height, stride, settings);
     case 11: return apply_color_balance(buf, width, height, stride, settings);
+    case 12: return apply_brightness_contrast(buf, width, height, stride, settings);
+    case 13: return apply_desaturate(buf, width, height, stride, settings);
+    case 14: return apply_threshold(buf, width, height, stride, settings);
+    case 15: return apply_posterize(buf, width, height, stride, settings);
     default: return false;
   }
 }

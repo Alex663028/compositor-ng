@@ -1454,3 +1454,226 @@ COMP_TEST(color_range_runs_on_the_merged_composite) {
   COMP_CHECK_MSG(mask_sum(mask) == 255L * 64L,
                  "the match runs on the merged composite across layers");
 }
+
+/* ================================================= 破坏性调整（Image > Adjustments） */
+
+/* 探针色 (100,150,200)：亮度 0.299R+0.587G+0.114B = 140.75。 */
+COMP_TEST(adjustment_desaturate_and_threshold_write_premultiplied_pixels) {
+  const uint8_t r = 100, g = 150, b = 200;
+
+  {
+    DomainDoc doc(16, 8);
+    COMP_CHECK(doc.handle() != nullptr);
+    const comp_layer_id id = domain_solid(&doc.document, 16, 8, r, g, b);
+    COMP_CHECK(id != 0);
+    const std::vector<uint8_t> before = doc.pixels_of(id);
+    const size_t depth_before = undo_depth(doc.handle());
+
+    int32_t changed = 0;
+    COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_DESATURATE, nullptr,
+                                           &changed) == COMP_OK);
+    COMP_CHECK(changed == 1);
+    COMP_CHECK_MSG(undo_depth(doc.handle()) == depth_before + 1, "one undo step");
+    const std::vector<uint8_t> after = doc.pixels_of(id);
+    /* 0.299*100 + 0.587*150 + 0.114*200 = 140.75，四舍五入到 141；alpha 不动。 */
+    COMP_CHECK(after[0] == 141 && after[1] == 141 && after[2] == 141 && after[3] == 255);
+
+    COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+    COMP_CHECK_MSG(doc.pixels_of(id) == before, "undo restores the color layer");
+  }
+
+  {
+    /* level 128 < 140.75 -> 白；level 150 > 140.75 -> 黑。两次各建一个文档。 */
+    DomainDoc doc(16, 8);
+    COMP_CHECK(doc.handle() != nullptr);
+    const comp_layer_id id = domain_solid(&doc.document, 16, 8, r, g, b);
+    COMP_CHECK(id != 0);
+    int32_t changed = 0;
+    COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_THRESHOLD,
+                                           "{\"thresholdSettings\":{\"level\":128}}", &changed) == COMP_OK);
+    COMP_CHECK(changed == 1);
+    const std::vector<uint8_t> white = doc.pixels_of(id);
+    COMP_CHECK(white[0] == 255 && white[1] == 255 && white[2] == 255 && white[3] == 255);
+
+    COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+    COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_THRESHOLD,
+                                           "{\"thresholdSettings\":{\"level\":150}}", &changed) == COMP_OK);
+    COMP_CHECK(changed == 1);
+    const std::vector<uint8_t> black = doc.pixels_of(id);
+    /* 预乘黑 = (0,0,0,alpha)：阈值化不碰 alpha，图层轮廓保留。 */
+    COMP_CHECK(black[0] == 0 && black[1] == 0 && black[2] == 0 && black[3] == 255);
+  }
+}
+
+COMP_TEST(adjustment_brightness_contrast_defaults_are_a_noop) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_solid(&doc.document, 16, 8, 100, 150, 200);
+  COMP_CHECK(id != 0);
+  const std::vector<uint8_t> before = doc.pixels_of(id);
+  const size_t depth_before = undo_depth(doc.handle());
+
+  /* 缺省 settings（"{}" 与 NULL 等价）在 0/0 下是恒等：不入撤销栈。 */
+  int32_t changed = 7;
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, "{}",
+                                         &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "identity settings change nothing");
+  COMP_CHECK_MSG(undo_depth(doc.handle()) == depth_before, "identity settings add no history");
+  COMP_CHECK(doc.pixels_of(id) == before);
+
+  /* brightness = -20 -> 每通道减 51（255 * 0.2 = 51）。 */
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST,
+                                         "{\"brightnessContrastSettings\":{\"brightness\":-20}}",
+                                         &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> after = doc.pixels_of(id);
+  COMP_CHECK(after[0] == 49 && after[1] == 99 && after[2] == 149 && after[3] == 255);
+  COMP_CHECK(undo_depth(doc.handle()) == depth_before + 1);
+
+  COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+  COMP_CHECK(doc.pixels_of(id) == before);
+}
+
+COMP_TEST(adjustment_posterize_snaps_channels_to_the_level_count) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_solid(&doc.document, 16, 8, 100, 150, 200);
+  COMP_CHECK(id != 0);
+  int32_t changed = 0;
+  /* 4 级 -> 步长 255/3 = 85：100 -> 85，150 -> 170，200 -> 170。 */
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_POSTERIZE,
+                                         "{\"posterizeSettings\":{\"levels\":4}}", &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> after = doc.pixels_of(id);
+  COMP_CHECK(after[0] == 85 && after[1] == 170 && after[2] == 170 && after[3] == 255);
+
+  /* 255 级等价于 8 位原图，必须是恒等且不留历史。 */
+  const size_t depth_before = undo_depth(doc.handle());
+  changed = 7;
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_POSTERIZE,
+                                         "{\"posterizeSettings\":{\"levels\":255}}", &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "255 levels is the identity");
+  COMP_CHECK(undo_depth(doc.handle()) == depth_before);
+}
+
+COMP_TEST(adjustment_rejects_groups_unknown_hdr_and_unsupported_kinds) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id solid = domain_solid(&doc.document, 16, 8, 90, 90, 90);
+  COMP_CHECK(solid != 0);
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "group";
+  group_desc.is_group = 1;
+  comp_layer_id group_id = 0;
+  COMP_CHECK(doc.document.create_layer(group_desc, &group_id) != 0);
+  const comp_layer_id hdr = domain_hdr_layer(&doc.document);
+  COMP_CHECK(hdr != 0);
+
+  const size_t depth_before = undo_depth(doc.handle());
+  int32_t changed = 7;
+
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), group_id, COMP_ADJUSTMENT_DESATURATE, "{}",
+                                         &changed) == COMP_ERR_STATE);
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), 999999ull, COMP_ADJUSTMENT_DESATURATE, "{}",
+                                         &changed) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), hdr, COMP_ADJUSTMENT_DESATURATE, "{}",
+                                         &changed) == COMP_ERR_UNSUPPORTED);
+
+  /* 越界 kind、邻域/随机源的 5..8、以及有专用入口的反相，都在参数闸上被拒。 */
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), solid, 99u, "{}", &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), solid, COMP_ADJUSTMENT_GAUSSIAN_BLUR, "{}",
+                                         &changed) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), solid, COMP_ADJUSTMENT_INVERT, "{}",
+                                         &changed) == COMP_ERR_INVALID_ARGUMENT);
+  /* settings 越界 / 未知顶层键同样被拒（与 add_adjustment 同一份校验）。 */
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), solid, COMP_ADJUSTMENT_THRESHOLD,
+                                         "{\"thresholdSettings\":{\"level\":999}}", &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), solid, COMP_ADJUSTMENT_POSTERIZE,
+                                         "{\"nope\":1}", &changed) == COMP_ERR_INVALID_ARGUMENT);
+
+  COMP_CHECK_MSG(undo_depth(doc.handle()) == depth_before, "all refusals record no history");
+  /* 拒绝也不许写像素。 */
+  const std::vector<uint8_t> pixels = doc.pixels_of(solid);
+  COMP_CHECK(pixels[0] == 90 && pixels[1] == 90 && pixels[2] == 90);
+}
+
+COMP_TEST(adjustment_clips_to_the_selection_in_document_coordinates) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_solid(&doc.document, 16, 8, 100, 150, 200);
+  COMP_CHECK(id != 0);
+  const std::vector<uint8_t> before = doc.pixels_of(id);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect_select(doc.handle(), 0.0f, 0.0f, 8.0f, 8.0f, COMP_SELECTION_REPLACE, &changed) ==
+             COMP_OK);
+  COMP_CHECK(changed == 1);
+
+  changed = -1;
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_DESATURATE, "{}",
+                                         &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> after = doc.pixels_of(id);
+  for (int32_t y = 0; y < 8; ++y) {
+    for (int32_t x = 0; x < 16; ++x) {
+      const size_t i = (static_cast<size_t>(y) * 16 + static_cast<size_t>(x)) * 4u;
+      if (x < 8) {
+        COMP_CHECK(after[i] == 141 && after[i + 1] == 141 && after[i + 2] == 141);
+      } else {
+        COMP_CHECK(after[i] == 100 && after[i + 1] == 150 && after[i + 2] == 200);
+      }
+      COMP_CHECK(after[i + 3] == 255);
+    }
+  }
+
+  COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+  COMP_CHECK_MSG(doc.pixels_of(id) == before, "undo restores the un-adjusted layer");
+}
+
+COMP_TEST(adjustment_with_an_explicitly_empty_selection_is_a_noop) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_solid(&doc.document, 16, 8, 100, 150, 200);
+  COMP_CHECK(id != 0);
+  const std::vector<uint8_t> before = doc.pixels_of(id);
+  const size_t depth_before = undo_depth(doc.handle());
+
+  /* 全 0 coverage 的显式选区（active 但 base 全 0，与「没有选区」可区分）。 */
+  doc.document.state().selection.active = true;
+  doc.document.state().selection.feather = 0.0f;
+  doc.document.state().selection.base.resize(16, 8, 0);
+
+  int32_t changed = 7;
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_THRESHOLD,
+                                         "{\"thresholdSettings\":{\"level\":128}}", &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "an explicitly empty selection changes nothing");
+  COMP_CHECK(undo_depth(doc.handle()) == depth_before);
+  COMP_CHECK(doc.pixels_of(id) == before);
+}
+
+COMP_TEST(adjustment_flattens_a_16bit_layer_to_8bit_and_undo_restores) {
+  DomainDoc doc(16, 8);
+  COMP_CHECK(doc.handle() != nullptr);
+  const comp_layer_id id = domain_wide_layer(&doc.document);
+  COMP_CHECK(id != 0);
+  const std::vector<uint8_t> before = doc.pixels_of(id);
+  const size_t depth_before = undo_depth(doc.handle());
+
+  int32_t changed = -1;
+  COMP_CHECK(comp_layer_apply_adjustment(doc.handle(), id, COMP_ADJUSTMENT_DESATURATE, "{}",
+                                         &changed) == COMP_OK);
+  /* 16 位的全零像素经过 8 位工作副本仍是零，但位深本身变了，仍算一次改动。 */
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(doc.document.find(id)->pixels.format == COMP_PIXEL_RGBA8,
+                 "the layer becomes an 8-bit working copy");
+  COMP_CHECK(doc.pixels_of(id).size() == static_cast<size_t>(16) * 8 * 4u);
+  COMP_CHECK(undo_depth(doc.handle()) == depth_before + 1);
+
+  COMP_CHECK(comp_document_undo(doc.handle()) == COMP_OK);
+  COMP_CHECK_MSG(doc.document.find(id)->pixels.format == COMP_PIXEL_RGBA16,
+                 "undo restores the 16-bit asset");
+  COMP_CHECK(doc.pixels_of(id) == before);
+}

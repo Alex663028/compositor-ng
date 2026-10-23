@@ -1670,6 +1670,20 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       PostMessageW(window, WM_CLOSE, 0, 0);
       return;
     default:
+      /*
+       * ROI #8 图像 > 调整：kCmdImageAdjustBase + kind。菜单只给 kImageAdjustKinds
+       * 里的 kind 发号（表在 shell_state.h，与菜单构建共用），其余号一律忽略。
+       */
+      if (id >= kCmdImageAdjustBase && id < kCmdImageAdjustBase + 64) {
+        const uint32_t kind = id - kCmdImageAdjustBase;
+        for (size_t i = 0; i < kImageAdjustKindCount; ++i) {
+          if (kImageAdjustKinds[i] == kind) {
+            panel_begin_destructive(shell, kind);
+            break;
+          }
+        }
+        break;
+      }
       /* 滤镜菜单项：kCmdFilterBase + 滤镜序号。 */
       if (id >= kCmdFilterBase && id < kCmdFilterBase + comp_ui::filter_count()) {
         open_filter_panel(shell, static_cast<comp_ui::FilterId>(id - kCmdFilterBase));

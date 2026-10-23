@@ -140,6 +140,30 @@ const AdjustmentParam kColorBalanceParams[] = {
     {"colorBalanceSettings.preserveLuminosity", "Preserve Lum", kAdjustmentParamBool, 0.0, 1.0, 1.0},
 };
 
+/*
+ * 12..15 是本仓 S27 追加的破坏性调整，键名沿上游 `XxxSettings` 的命名风格自定；
+ * 它们不参与 .comp ← 上游的 kind 互操作，但作为调整图层写入 .comp 时同样合法。
+ */
+
+/* 12 Brightness/Contrast（Photoshop 旧版公式，见 AdjustPixels.c） */
+const AdjustmentParam kBrightnessContrastParams[] = {
+    {"brightnessContrastSettings.brightness", "Brightness", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"brightnessContrastSettings.contrast", "Contrast", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+};
+
+/* 13 Desaturate：无参数（等价于红/绿/蓝混合器全 0）。 */
+const AdjustmentParam kDesaturateParams[] = {};
+
+/* 14 Threshold */
+const AdjustmentParam kThresholdParams[] = {
+    {"thresholdSettings.level", "Level", kAdjustmentParamNumber, 0.0, 255.0, 128.0},
+};
+
+/* 15 Posterize：级数 2..255，255 即恒等。 */
+const AdjustmentParam kPosterizeParams[] = {
+    {"posterizeSettings.levels", "Levels", kAdjustmentParamNumber, 2.0, 255.0, 4.0},
+};
+
 /* kind 顺序必须与上游 `AdjustmentKind` 的 CaseIterable 声明顺序一致（.comp 的 kind 即序号）。 */
 const AdjustmentKindInfo kKinds[kAdjustmentKindCount] = {
     {0, "Hue/Saturation", "Hue, saturation and lightness shifts", kHsvParams,
@@ -164,6 +188,14 @@ const AdjustmentKindInfo kKinds[kAdjustmentKindCount] = {
      COMP_ARRAY_LEN(kBlackWhiteParams), true, kNoRoots},
     {11, "Color Balance", "Color balance for shadows, midtones and highlights",
      kColorBalanceParams, COMP_ARRAY_LEN(kColorBalanceParams), true, kNoRoots},
+    {12, "Brightness/Contrast", "Legacy brightness and contrast", kBrightnessContrastParams,
+     COMP_ARRAY_LEN(kBrightnessContrastParams), true, kNoRoots},
+    {13, "Desaturate", "Desaturate has no settings", kDesaturateParams,
+     COMP_ARRAY_LEN(kDesaturateParams), false, kNoRoots},
+    {14, "Threshold", "Split the image into black and white at a level", kThresholdParams,
+     COMP_ARRAY_LEN(kThresholdParams), true, kNoRoots},
+    {15, "Posterize", "Reduce the number of tonal levels per channel", kPosterizeParams,
+     COMP_ARRAY_LEN(kPosterizeParams), true, kNoRoots},
 };
 
 /* 顶层键白名单 = 各参数路径的根段 + extra_roots。 */
@@ -312,6 +344,30 @@ JsonValue build_defaults(const AdjustmentKindInfo& info) {
 const AdjustmentKindInfo* adjustment_kind_info(uint32_t kind) {
   if (kind >= kAdjustmentKindCount) return nullptr;
   return &kKinds[kind];
+}
+
+bool adjustment_kind_is_destructive(uint32_t kind) {
+  switch (kind) {
+    case 0:   /* Hue/Saturation */
+    case 1:   /* Levels */
+    case 2:   /* Curves */
+    case 3:   /* Exposure */
+    case 4:   /* Gradient Map */
+    case 10:  /* Black & White */
+    case 11:  /* Color Balance */
+    case 12:  /* Brightness/Contrast */
+    case 13:  /* Desaturate */
+    case 14:  /* Threshold */
+    case 15:  /* Posterize */
+      return true;
+    default:
+      /*
+       * 5..8（Grain / Add Noise / Gaussian Blur / Motion Blur）需要邻域或随机源，
+       * 不是逐像素映射，破坏性入口一律拒绝，调用方应走 `comp_filter_apply`；
+       * 9 Invert 有专用入口 `comp_layer_invert`，避免同一语义两条实现。
+       */
+      return false;
+  }
 }
 
 bool adjustment_validate_settings(uint32_t kind, const std::string& settings_json, std::string* error) {

@@ -310,9 +310,18 @@ typedef enum comp_adjustment_kind {
   COMP_ADJUSTMENT_INVERT = 9,
   COMP_ADJUSTMENT_BLACK_WHITE = 10,
   COMP_ADJUSTMENT_COLOR_BALANCE = 11,
+  /*
+   * 12…15 是本仓在 S27 追加的**破坏性**调整（Image > Adjustments 用），
+   * 上游 `AdjustmentKind` 没有这四种，故不参与 .comp 的 kind 白名单互操作；
+   * 作为调整图层使用时同样合法（它们的求值器只做逐像素映射）。
+   */
+  COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST = 12,
+  COMP_ADJUSTMENT_DESATURATE = 13,
+  COMP_ADJUSTMENT_THRESHOLD = 14,
+  COMP_ADJUSTMENT_POSTERIZE = 15,
 } comp_adjustment_kind;
 
-#define COMP_ADJUSTMENT_KIND_COUNT 12
+#define COMP_ADJUSTMENT_KIND_COUNT 16
 
 /* 参数类型。 */
 typedef enum comp_param_type {

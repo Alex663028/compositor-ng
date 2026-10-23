@@ -46,6 +46,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 离屏 present/wait | 无操作成功 | 无操作成功 | `comp_render_present` / `comp_render_wait` | 已达成 |
 | 工具条 / 画布导航 | 20 工具按钮、滚轮缩放、中键/空格平移 | （未接 UI） | 无（纯外壳，不跨 ABI） | **仅 Windows**：鸿蒙壳尚无对应面板，不影响共享语义 |
 | 标尺 / 参考线 / 网格 / 对齐（ROI #3） | 视图菜单五项 + `Ctrl+R` / `Ctrl+;` / `Ctrl+Shift+;` / `Ctrl+'`；从标尺拖出、Move 工具拖动、拖回标尺删除，整次拖动一步撤销 | （未接 UI） | `comp_guide_add` / `_move` / `_remove` / `_count` / `_get` / `_clear`（尾部追加，152 → 158） | **已达成（Windows）**（§5.54）：参考线随 `.comp` 的 `engineGuides` 往返（12.5 原样），吸附只改落点不改像素 |
+| 破坏性 `图像 > 调整`（ROI #8） | 子菜单十一项（`kCmdImageAdjustBase` + kind）+ 破坏性面板态（`Ctrl+Shift+U` 落墨、Esc 退出） | （未接 UI） | `comp_layer_apply_adjustment`（尾追加，163 → 164）+ kind 12…15 | **已达成（Windows）**（§5.57）：参数与调整层面板同源；去色点即落墨；一步撤销、无变化不进历史 |
 
 「有边界」表示：接口已完整接线，但因缺少设备侧上屏实现，两壳统一**如实返回
 `COMP_ERR_UNSUPPORTED`**，不伪造成功。Windows 侧已在 S16 补上 D3D12 交换链直呈
@@ -66,6 +67,10 @@ compositor-ng 是「同引擎、两壳」结构：
 | 栅格格式 | `UNKNOWN/PNG/JPEG/…/PSD` | 0/1/2/…/7 |
 | 结果码 | `COMP_OK` / `COMP_ERR_INVALID_ARGUMENT` / `COMP_ERR_UNSUPPORTED` | 0/1/4 |
 | 编解码状态 | `BUILTIN/UNAVAILABLE/VENDORED` | 0/1/2 |
+| 调整 kind | `HUE_SATURATION…COLOR_BALANCE` + 本仓追加的 `BRIGHTNESS_CONTRAST/DESATURATE/THRESHOLD/POSTERIZE` | 0…11 / 12…15（`COMP_ADJUSTMENT_KIND_COUNT` = 16） |
+
+调整 kind 的计数另由 `tests/test_adjustment.cpp::adjustment_destructive_kind_set_is_explicit`
+锁定（`test_shell_contract.cpp` 只锁 kind=3 的参数元数据）；新增 kind 只能追加在 15 之后。
 
 任何一处需要变更，先改 README §5 冻结表与本文，再同步两壳。
 
@@ -2812,13 +2817,49 @@ DPI 调整一次）。跨屏时画布缩放与滚动位置保持不变（`needs_
 语义（200% 屏上 100% = 2 倍整数放大），要改成 PS 的「1 设备像素」需要把 `View`
 变换整体挪到设备坐标系，记入 `BACKLOG.md`；`WM_GETDPISCALEDSIZE` 未实现，跨屏
 时窗口尺寸会有一次轻微跳变；没有清单，所以用户的兼容性 DPI 覆盖仍然有效。
+---
 
+### 5.57 图像 > 调整：破坏性一次落墨（ROI #8，2026-10-23）
 
+引擎侧见 README §6.94。壳层要解决的是「同一批参数、两种落点」：`图像 > 调整`
+下面的每一项都是**破坏性**的一次性落墨（`comp_layer_apply_adjustment`），而
+「调整」面板里那套是**非破坏可编辑调整层**。壳内不复制参数表——两边都走
+`comp_layer_adjustment_param_*`，只在提交那一步分叉。
 
+**1. 命令号与菜单共表。** `kCmdImageAdjustBase = 1590`，命令 = 基数 + kind；
+菜单构建（`shell_window.cpp`）与命令分发（`shell_document.cpp` 的 `default` 分支）
+共用 `shell_state.h::kImageAdjustKinds[]`。11 个 kind 都在表里，表外的号一律忽略：
+漏加一项只会少一个菜单项，不会出现「菜单能点、命令不认」。前 7 项与后 4 项之间
+插一条分隔线（后者是本仓追加、上游没有的类型）。
 
+**2. 破坏性面板态。** 点菜单后 `adj_destructive = true`，`selected_adjustment`
+强制为 `-1`。这一个标志同时解决三件事：
 
+- 参数行照旧渲染（标题改成「调整（图像 > 破坏性落墨）」），但 `selected_adjustment`
+  为 -1 让 `adjust_write_live` 提前返回、`adjust_begin_drag` 不开事务——**拖滑杆
+  只是预览**，不会边拖边落墨；
+- `Ctrl+Shift+A`（新增调整层）在破坏性态被拒，避免把一次性参数误存成图层；
+- `Ctrl+Shift+U` 走 `panel_apply_destructive` 一次性提交，`Esc` / 切类型
+  （`Ctrl+Shift+J/K`）/ 选行（`,` `.`）都退出并丢弃未应用的参数。
 
+**3. 无参数的去色点即落墨。** `Desaturate` 的 `param_count = 0`，进面板态没有意义，
+所以 `panel_begin_destructive` 对它直接提交（`adj_destructive` 保持 false）。
+**Curves 同样是 0 参数，但不能同样处理**——它要在面板里拉点，是这四个之外唯一的例外。
 
+**4. 破坏性 Curves 的点列寄存在壳内。** 曲线编辑器原有的写入路径是
+`comp_layer_curves_set_points` + `comp_layer_update_adjustment_at`，后者需要
+「第几条调整」，破坏性态没有调整对象可写。于是点列先存进
+`ShellState::destructive_curve_settings`（纯函数改写 JSON 串，不开事务、不占撤销步），
+`Ctrl+Shift+U` 时由 `build_settings_json` 原样交给引擎，`Esc` 时清空。没有这条寄存，
+`图像 > 调整 > Curves` 会打开一个拉不动点的死面板——这是本轮实现过程中发现并补上的。
 
+**5. 失败与无变化都如实回显。** 引擎在开事务之前就拒掉非法参数，壳只负责把状态栏
+写清楚：HDR（RGBA16F）→「不受支持（未改动）」；组 / 无像素 →「组图层或没有像素的
+图层（未改动）」；`changed == 0`（恒等参数或显式空选区）→「结果与像素相同，未进历史」。
+最后一条是可验证的：视觉探针 `destructive_adjust` 对同一阈值连续落墨两次，再一次
+`Ctrl+Z` 必须回到阈值之前，证明空操作确实没进撤销栈。
 
-
+**6. 验证。** `scripts/visual_check.py` 追加 `destructive_adjust` 场景 9 条
+（进态标题带差异、+40 变亮、一步撤销、去色三通道拉平、阈值二值化、空操作不进历史、
+色调分离量化、曲线抬中点后落墨变亮、Esc 退出）。全量 **154 条 / 28 场景 / 0 失败**，
+既有 145 条阈值一处未动；96 DPI 的布局与命中路径零改动。

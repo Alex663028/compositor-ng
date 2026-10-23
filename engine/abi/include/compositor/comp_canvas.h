@@ -2,13 +2,15 @@
 /*
  * comp_canvas.h —「图像」菜单的画布级操作（S25）。
  *
- * 三个入口，语义唯一真源是 Photoshop 的 Image 菜单与上游 Compositor：
+ * 四个入口，语义唯一真源是 Photoshop 的 Image 菜单与上游 Compositor：
  *   comp_document_rotate_canvas  Image > Image Rotation（90° CW / CCW / 180°）
  *                                ← 上游 CanvasRotation.swift（quarterTurned）
  *   comp_document_trim           Image > Trim
  *                                ← 上游 ImageTrim.swift
  *   comp_layer_invert            Image > Adjustments > Invert（破坏性一次性）
  *                                ← 上游 PixelInvert.swift
+ *   comp_layer_apply_adjustment  Image > Adjustments 的其余破坏性调整（S27）
+ *                                ← 本仓追加，复用 adjustment_table 的参数真源
  *
  * 贯穿全篇的口径（与 comp_crop_* 一致）：
  *   1. 坐标是**文档像素**、左上原点；
@@ -127,6 +129,45 @@ COMP_API comp_result comp_document_trim(comp_document document, comp_trim_option
  */
 COMP_API comp_result comp_layer_invert(comp_document document, comp_layer_id layer,
                                        int32_t* out_changed);
+
+/* ------------------------------------------- 破坏性调整（Image > Adjustments） */
+
+/*
+ * 把一条调整一次性落到目标图层的像素上（PS Image > Adjustments）。
+ *
+ * `kind` 取 comp_adjustment_kind 中**逐像素可破坏**的取值：
+ *   0 Hue/Saturation、1 Levels、2 Curves、3 Exposure、4 Gradient Map、
+ *   10 Black & White、11 Color Balance、12 Brightness/Contrast、
+ *   13 Desaturate、14 Threshold、15 Posterize。
+ * 5..8（Grain / Add Noise / Gaussian Blur / Motion Blur）不是逐像素映射，
+ * 请走 comp_filter_apply；9（Invert）请走 comp_layer_invert。越界 kind 与
+ * 上述不可破坏 kind 一律 COMP_ERR_INVALID_ARGUMENT。
+ *
+ * `settings_json_utf8` 为 UTF-8 JSON 对象（键名见 comp_layer_adjustment_param_at
+ * 暴露的参数表，如 "exposureSettings.gamma"）；NULL 或空串按 "{}" 处理，
+ * 缺键回落默认值。校验口径与 comp_layer_add_adjustment 完全相同——同一份
+ * adjustment_table，所以面板构造出来的 settings 可以直接喂进来。非法 kinds
+ * 或非法 settings 在开事务之前就失败，文档不变。
+ *
+ * 与调整层的分工：调整层是非破坏、可编辑、随合成求值；本入口是破坏性落墨，
+ * 像素改动只靠撤销栈回退，两者共用同一批求值器，因此同一 kind 得出同样的像素。
+ *
+ * 其余口径与 comp_layer_invert 完全一致：
+ * - 活动选区存在时按 coverage 与原像素混合（文档坐标，含图层 rotation / flip）；
+ *   显式空选区 = 什么都不改，out_changed = 0；
+ * - 16 位图层先落 8 位工作副本，**写回后该图层永久变成 RGBA8**；
+ *   HDR（RGBA16F）图层返回 COMP_ERR_UNSUPPORTED；
+ * - 图层不存在 / 是组 / 无像素 → COMP_ERR_NOT_FOUND / COMP_ERR_STATE；
+ * - 一步撤销（显式事务内加入，否则自成隐式步）。
+ *
+ * 额外的恒等短路：结果与原像素逐字节相同（例如默认参数的 Brightness/Contrast）
+ * 时不入撤销栈，out_changed = 0。
+ *
+ * out_changed 可为 NULL。
+ */
+COMP_API comp_result comp_layer_apply_adjustment(comp_document document, comp_layer_id layer,
+                                                 uint32_t kind, const char* settings_json_utf8,
+                                                 int32_t* out_changed);
 
 #ifdef __cplusplus
 } /* extern "C" */

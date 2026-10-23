@@ -304,6 +304,10 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   bool build_settings_json(const ShellState& shell, std::string* out_json);
   void panel_apply_adjustment(ShellState& shell, bool add);
   void panel_remove_adjustment(ShellState& shell);
+  /* ROI #8：Image > Adjustments 的破坏性落墨（ABI comp_layer_apply_adjustment）。 */
+  void panel_begin_destructive(ShellState& shell, uint32_t kind);
+  void panel_apply_destructive(ShellState& shell);
+  void panel_exit_destructive(ShellState& shell);
   std::wstring param_status_text(const comp_ui::FilterPanel& panel);
   void open_filter_panel(ShellState& shell, comp_ui::FilterId id);
   void close_filter_panel(ShellState& shell);

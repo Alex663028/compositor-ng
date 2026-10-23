@@ -97,6 +97,10 @@ CMD_ADJ_VALUE_UP = 1021
 # 面板动作号落在 1220 段：滤镜序号涨到 11 个（1200..1210）后，1210 已经是
 # Sharpen 的菜单项，旧的应用号会和它抢同一个 id（见 shell_state.h）。
 CMD_FILTER_APPLY = 1220
+# 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..15 是本仓追加的破坏性调整
+# （Brightness/Contrast、Desaturate、Threshold、Posterize），0..11 里只有逐像素可做的
+# 那几项才发号（见 shells/windows/src/shell_state.h::kImageAdjustKinds）。
+CMD_IMAGE_ADJUST_BASE = 1590
 CMD_NEW_DOCUMENT_DIALOG = 1560
 CMD_SAVE_AS = 1561
 CMD_IMAGE_SIZE = 1562
@@ -2472,6 +2476,121 @@ def scene_guides(shell, checker):
                   back_delta == 0, "与开网格前的差异像素 %d" % back_delta)
 
 
+def scene_destructive_adjust(shell, checker):
+    """ROI #8：图像 > 调整 的破坏性落墨（命令号 1590 + kind）。
+
+    与 `adjustment` / `curve_levels` 的分工：那两场验的是**调整图层**（非破坏、可再
+    编辑）；这里验的是同一批求值器的一次性落墨入口。四条断言对应四条契约：面板能
+    开（标题换字样，说明不是新增调整图层）、落墨真的改像素、一次 Ctrl+Z 能回去、
+    结果没变的那次落墨**不进历史**。
+    """
+    scene = "destructive_adjust"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("336699")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left, top, right, bottom, steps=8)
+    shell.select_tool("select")
+
+    img = shell.shot("100_destructive_before")
+    region = (left + 10, top + 10, right - 10, bottom - 10)
+    before = mean_rgb(img, region)
+    adjust = shell.layout["adjust"]
+    # 标题只占面板顶部 22 px；下一行「类型 n/16」在 +30，落在带外，比较才不会被种类名污染。
+    title_band = (adjust[0] + 6, adjust[1] + 6, adjust[2] - 6, adjust[1] + 26)
+    idle_title = img
+
+    # 1) 1590+12 = Brightness/Contrast：进破坏性面板，参数行与调整面板共用。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 12)
+    img = shell.shot("101_bc_panel")
+    checker.check(scene, "图像 > 调整 > Brightness/Contrast 打开破坏性面板",
+                  pixel_diff(idle_title, img, title_band) > 20,
+                  "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
+    # 键入 40 而不是连按步进键：每按一次都出一帧全分辨率预览，消息会堆在队列里。
+    shell.type_text("40")
+    shell.press(VK_RETURN)
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    img = shell.shot("102_bc_applied")
+    lifted = mean_rgb(img, region)
+    checker.check(scene, "破坏性 Brightness/Contrast +40 直接改像素",
+                  brightness(lifted) > brightness(before) + 15,
+                  "前 %s 后 %s" % (before, lifted))
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.4)
+    img = shell.shot("103_bc_undo")
+    undo = mean_rgb(img, region)
+    checker.check(scene, "一次 Ctrl+Z 回到破坏性调整前",
+                  abs(brightness(undo) - brightness(before)) < 8,
+                  "撤销后 %s 原 %s" % (undo, before))
+
+    # 2) 1590+13 = Desaturate：无参数，单击即落墨（不该停在面板态）。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 13)
+    shell.wait(0.8)
+    img = shell.shot("104_desaturate")
+    gray = mean_rgb(img, region)
+    checker.check(scene, "Desaturate 单击即落墨（三通道拉平）",
+                  max(gray) - min(gray) <= 3 and (max(before) - min(before)) > 40,
+                  "前 %s 后 %s" % (before, gray))
+
+    # 3) 1590+14 = Threshold：默认 128，中灰（≈92）落到黑。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 14)
+    shell.type_text("128")
+    shell.press(VK_RETURN)
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    img = shell.shot("105_threshold")
+    binary = mean_rgb(img, region)
+    checker.check(scene, "Threshold 128 把中灰压成纯黑或纯白",
+                  brightness(binary) < 8 or brightness(binary) > 247,
+                  "阈值后 %s（阈值前 %s）" % (binary, gray))
+    # 同参数再落一次：像素没变 -> 不得多出一步撤销。这一步错了，下面的 Ctrl+Z 会停在黑屏。
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.4)
+    img = shell.shot("106_threshold_noop_undo")
+    restored = mean_rgb(img, region)
+    checker.check(scene, "结果未变的第二次落墨不进历史（一次 Ctrl+Z 回到阈值前）",
+                  abs(brightness(restored) - brightness(gray)) < 8,
+                  "撤销后 %s 阈值前 %s" % (restored, gray))
+
+    # 4) 1590+15 = Posterize：中灰 3 级量化到中间档（≈128），仍是平的。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 15)
+    shell.type_text("3")
+    shell.press(VK_RETURN)
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    img = shell.shot("107_posterize")
+    poster = mean_rgb(img, region)
+    checker.check(scene, "Posterize 3 级把中灰量化到中间档",
+                  region_std(img, region) < 1.5 and abs(brightness(poster) - brightness(gray)) > 15,
+                  "灰 %s -> %s σ %.1f" % (gray, poster, region_std(img, region)))
+
+    # 5) 1590+2 = Curves：点列没有可写的调整对象，走壳的寄存串；拖中点抬亮后落墨。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 2)
+    px, py, side = adjust_curve_plot(shell)
+    # 恒等曲线上没有控制点：按在绘图区中间 = 加点，同一次拖动把它抬到 y≈0.8。
+    shell.drag(px + side / 2.0, py + side / 2.0, px + side / 2.0, py + side * 0.2, steps=8)
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    img = shell.shot("108_curve_destructive")
+    curved = mean_rgb(img, region)
+    checker.check(scene, "破坏性 Curves：拖曲线抬中点后落墨变亮",
+                  brightness(curved) > brightness(poster) + 20,
+                  "Posterize 后 %s 曲线后 %s" % (poster, curved))
+
+    # 6) Esc 只退破坏性态：标题回到「调整（Adjustment）」，且像素不再被落墨。
+    shell.press(VK_ESCAPE)
+    shell.wait(0.2)
+    img = shell.shot("109_escaped")
+    checker.check(scene, "Esc 退出破坏性模式（标题回到 Adjustment）",
+                  pixel_diff(idle_title, img, title_band) == 0,
+                  "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -2499,6 +2618,7 @@ SCENES = [    ("start", scene_start, ()),
     ("text_layer", scene_text_layer, ()),
     ("font_picker", scene_font_picker, ()),
     ("guides", scene_guides, ()),
+    ("destructive_adjust", scene_destructive_adjust, ()),
 ]
 
 

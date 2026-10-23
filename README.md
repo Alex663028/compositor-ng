@@ -446,7 +446,7 @@ bash scripts/build_ohos_shell.sh      # NAPI 共享库 libcompositor_ohos.so
 | 图像格式 | `.comp` 内图层像素按位深落盘：RGBA8 → `images/<uuid>.png`，RGBA16/RGBA16F → `images/<uuid>.exr`（线性光、直通 alpha；16 位用 FLOAT 通道保低位，HDR 用 HALF 通道逐位精确）；蒙版用 8 位灰度 `images/<uuid>.mask.png`（符合上游 `LayerMask.isValid`） | 更大色深 / 硬件编解码 |
 | 交换格式键名 | 完整对齐上游 `ProjectManifest` / `ProjectLayerRecord`：`format`/`version`(13)/`supported`/`colorSpace`/`resolution`/`documentID`/`width`/`height`/`activeLayerID`/`layers`；图层 id 与 `parentID`/`maskSourceID` 用 UUID，`transform` 为六键形态（`origin`/`size`/`rotation`/`flipX`/`flipY`/`sampling`）。引擎自有键一律 **`engine` 前缀**（`engineLayerID`/`enginePixelFormat`/`engineClippingSourceID`/`engineAdjustments`/`engineEffects`/`engineIsolated`/`engineGuides`），避免与上游对象型键（`effects`/`text`/`shape`/`adjustment`/`guides`）同名冲突 | 上游未建模字段（live-mask 启用态等）按原样保真；参考线写在本引擎的 `engineGuides`（§6.91），上游同名 `guides` 不读不写 |
 | 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走树内自研的分层读写器 `format/psd_codec`（§6.87：`comp_io_import_document` / `comp_io_export_document` 分层往返；拍平的 `comp_io_export` 仍不支持 PSD）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。**EXR 已由树内自研 scanline 读取器接入**（C3b，§6.1.18：NONE/RLE/ZIPS/ZIP 可读，PIZ/PXR24/B44/DWA 与 tiled/deep/multipart 如实拒绝，写侧仍 `UNSUPPORTED`）；32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
-| 调整图层参数 | 面板控件与 JSON **都由引擎元数据驱动**：键名表 `engine/domain/adjustment_table.cpp` 是唯一真源（12 种 kind，点分 `json_path` 逐字沿用上游字段名），外壳经 ABI 取 `label` / `min` / `max` / `default`；settings JSON 由 `comp_layer_adjustment_build_settings` 组装（**壳内不拼、不解析 JSON**）；写入口 `add` / `update` / `update_at` 一律校验，`.comp` 读取路径不校验以保真 | Curves / Levels 需专用曲线编辑器（当前 `editable=false`，仅白名单放行）；删除接口 `comp_layer_remove_adjustment` 已补（面板 `Ctrl+Shift+D`） |
+| 调整图层参数 | 面板控件与 JSON **都由引擎元数据驱动**：键名表 `engine/domain/adjustment_table.cpp` 是唯一真源（16 种 kind：前 12 种对齐上游枚举，后 4 种为本仓追加的 Brightness/Contrast、Desaturate、Threshold、Posterize；点分 `json_path` 逐字沿用上游字段名），外壳经 ABI 取 `label` / `min` / `max` / `default`；settings JSON 由 `comp_layer_adjustment_build_settings` 组装（**壳内不拼、不解析 JSON**）；写入口 `add` / `update` / `update_at` 一律校验，`.comp` 读取路径不校验以保真 | Curves / Levels 需专用曲线编辑器（当前 `editable=false`，仅白名单放行）；删除接口 `comp_layer_remove_adjustment` 已补（面板 `Ctrl+Shift+D`） |
 
 | 后端 | **④ 接口切片已落地**：`rhi.h` 定义 `RenderBackend` + `BackendCaps` + 工厂；`AUTO` 按平台择优，GPU 后端不可用则**显式回落 CPU** 并在 error 写明原因 | 接入真实设备路径（`COMP_HAS_D3D12` / `COMPOSITOR_ENABLE_VULKAN_COMPUTE` 已在代码中预留开关） |
 | GPU 计算内核 | 着色器三份（HLSL / GLSL / C++ 镜像）**同源**于 `render/gpu_kernel.*`，`gpu_kernel_validate` + 单测锁定 24 分支与上游规范名；无 GPU 的机器上由 C++ 镜像把 GPU 语义钉在 CPU 基准上 |真机逐像素比对 |
@@ -481,6 +481,13 @@ bash scripts/build_ohos_shell.sh      # NAPI 共享库 libcompositor_ohos.so
    `comp_layer_update_adjustment_at` / `comp_layer_remove_adjustment`）与 IO 侧的
    `comp_io_codec_support`、状态枚举 `COMP_CODEC_VENDORED`，同属**纯函数/枚举尾部追加**：
    不改既有结构体布局，只读查询不开事务，故对 v1 冻结面零破坏。
+
+10. **调整 kind 也只在尾部追加**：`comp_adjustment_kind` 的 0..11 与上游
+    `AdjustmentKind` 逐字对齐并冻结，本仓追加的四项（`BRIGHTNESS_CONTRAST = 12`、
+    `DESATURATE = 13`、`THRESHOLD = 14`、`POSTERIZE = 15`）排在最后，
+    `COMP_ADJUSTMENT_KIND_COUNT` 随之 12 → 16，既有编号一个未动；
+    破坏性落墨入口 `comp_layer_apply_adjustment` 同样是纯函数尾部追加（163 → 164），
+    不改任何结构体布局。外部调用方按 `KIND_COUNT` 分配数组的代码只需重新编译。
 
 不透明句柄的结构体 tag 名刻意与 typedef 名不同（`comp_engine_handle` / `comp_document_handle` /
 `comp_txn_handle`）：在 C++ 下 `typedef struct comp_engine* comp_engine;` 会与注入普通命名空间的
@@ -537,7 +544,7 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
   顺时针 90 度像素级映射、水平翻转、Smooth 与 Nearest 在非整数倍缩放下的差异、采样模式的
   `.comp` manifest 往返、非法采样值被拒。
 - `test_imaging.cpp`：覆盖可确定性断言的像素内核；依赖浮点收敛的内核只做冒烟调用。
-- `test_adjustment.cpp`：12 种 kind 的名称与上游枚举逐字锁定；各 kind 缺省 settings 必过校验；
+- `test_adjustment.cpp`：16 种 kind 的名称与枚举逐字锁定（前 12 种对齐上游，后 4 种为本仓追加）；各 kind 缺省 settings 必过校验；
   越界/类型错/未知顶层键被拒；ABI 元数据（`param_count` / `param_at` / `validate`）与
   `.comp` 往返后「kind 与 settings 逐字节回读」护栏。
 - `test_codec.cpp`：能力表只陈述事实（PNG = `VENDORED`/`BUILTIN`、JPEG = `VENDORED` 且 note 含
@@ -600,7 +607,7 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
 
 | 项 | 实测证据 |
 |----|----------|
-| 调整参数键名表 | `docs/adjustment-json-keys.md` 收录 12 种 kind 的 `json_path` / 类型 / 范围 / 默认值，逐字对齐上游 `LayerAdjustment.swift` 及其嵌套 Settings 结构 |
+| 调整参数键名表 | `docs/adjustment-json-keys.md` 收录 16 种 kind 的 `json_path` / 类型 / 范围 / 默认值，其中前 12 种逐字对齐上游 `LayerAdjustment.swift` 及其嵌套 Settings 结构，后 4 种为本仓追加（§6.94） |
 | 写入口校验 | `comp_layer_add_adjustment` / `comp_layer_update_adjustment` / `comp_layer_update_adjustment_at` 一律校验；越界、类型错、未知顶层键在断言中被拒（实机自检出现 `out-of-range panel value rejected`） |
 | 调整删除接口 | `comp_layer_remove_adjustment` 已补：越界索引显式 `INVALID_ARGUMENT`，成功后 `adjustment_count` 归零（`tests/test_adjustment.cpp` + 实机自检 3 项） |
 | 面板控件由引擎驱动 | 外壳经 `comp_layer_adjustment_param_count` / `param_at` 取控件元数据，经 `comp_layer_adjustment_build_settings` 组装 settings JSON（壳内不拼、不解析 JSON）；实机自检回读 `{"exposureSettings":{"exposure":1.5,"offset":0.25,"gamma":2.2}}` |
@@ -6465,10 +6472,98 @@ stock 字体未必是可缩放字体；这里用 `GetObjectW` 复制它的 `LOGF
 - 每显示器 V2 的 `WM_GETDPISCALEDSIZE` 没有实现：窗口在跨屏时按系统建议尺寸
   走，非客户区高度变化会有一次轻微尺寸跳变。
 
+---
 
+### 6.94 破坏性 Image > Adjustments：一次落墨、与调整层同源（ROI #8，2026-10-23，Claude）
 
+`docs/ps-parity.md` §4 的 ROI 第 8 顺位，调整维 70% → 78%。此前 `图像` 菜单里
+与调整有关的只有「反相」一条破坏性入口，其余 11 种只能在调整面板里建**调整层**，
+用户在 PS 里习惯的 `Image > Adjustments > 亮度/对比度` 这条路完全不存在。本轮把
+整族接上，验收口径三条：
 
+1. **同 kind 同像素**：破坏性落墨与调整层共用同一批求值器（`compositing/adjustment_eval`），
+   同一 settings 下两条路径产出的像素逐字节相同，不存在两套公式；
+2. **一步撤销、无变化不落空步**：整次落墨恰好一步；结果与原像素相同时引擎不开事务、
+   `out_changed = 0`，撤销栈不长高；
+3. **口径与反相完全一致**：选区按 coverage 混合（文档坐标，含图层 rotation/flip）、
+   显式空选区 = 什么都不改、16 位先落 8 位工作副本、HDR 图层如实拒绝。
 
+**ABI 只做尾部追加：163 → 164。**
 
+| 导出 | 语义 |
+|---|---|
+| `comp_layer_apply_adjustment(doc, layer, kind, settings_json, int32_t* out_changed)` | 把一条调整一次性落到图层像素上；`settings` 校验口径与 `comp_layer_add_adjustment` 完全相同（同一份 `adjustment_table`，所以面板拼出的 JSON 可以直接喂进来）。非法 kind / 非法 settings 在开事务**之前**就失败，文档不变 |
 
+**kind 表 12 → 16。** `COMP_ADJUSTMENT_KIND_COUNT` 随之变 16，四个新值全部追加在
+枚举尾部（`12 Brightness/Contrast`、`13 Desaturate`、`14 Threshold`、`15 Posterize`），
+既有 0..11 的数值一个没动。之所以追加而不是新开枚举：参数真源、面板控件、`.comp`
+序列化、`build_settings/validate` 全都按 kind 号驱动，多一张表就多一处漂移源。
 
+| kind | 名称 | 参数 | 说明 |
+|---|---|---|---|
+| 12 | Brightness/Contrast | `brightnessContrastSettings.brightness` / `.contrast` | 缺省值即恒等（演习了「无变化不进历史」这条短路） |
+| 13 | Desaturate | 无 | 面板 0 参数，菜单点即落墨 |
+| 14 | Threshold | `thresholdSettings.level` | 逐像素二值化，结果只有纯黑/纯白 |
+| 15 | Posterize | `posterizeSettings.levels` | 每通道按级数量化 |
+
+`comp_layer_apply_adjustment` 接受 0/1/2/3/4/10/11/12/13/14/15；5..8（颗粒 / 噪点 /
+高斯模糊 / 动感模糊）不是逐像素映射，走 `comp_filter_apply`；9（反相）走
+`comp_layer_invert`——两条老路保持原样，不与新入口抢语义。
+
+**外壳：`图像 > 调整` 十一项。** 命令号是 `kCmdImageAdjustBase`(1590) + kind，
+菜单构建与命令分发共用 `shell_state.h::kImageAdjustKinds[]` 这一张表（漏加一项
+只会少一个菜单项，不会出现「菜单能点、命令不认」）：
+
+- **无参数的 Desaturate 点菜单即落墨**；其余进**破坏性面板态**：面板标题改成
+  「调整（图像 > 破坏性落墨）」，参数行与调整层面板同源（键名/量程/缺省值都走 ABI
+  参数表），拖滑杆只是预览（`selected_adjustment` 恒为 -1，`adjust_begin_drag`
+  因此不开事务），`Ctrl+Shift+U` 才真落墨；
+- `Esc`、`Ctrl+Shift+J/K`（切类型）、`,`/`.`（选行）都会退出破坏性态并丢弃未应用
+  的参数，状态栏写明「未应用的参数已丢弃」；
+- `Ctrl+Shift+A`（新增调整层）在破坏性态被拒，避免把一次性参数误存成图层；
+- **Curves 是唯一需要面板交互又 0 参数表的 kind**：它的点列寄存在壳内
+  `destructive_curve_settings` 串里（写入走 `comp_layer_curves_set_points` 纯函数，
+  不开事务、不碰撤销栈），`Ctrl+Shift+U` 时原样交给引擎；Esc 时清空。没有这条寄存，
+  菜单里的 Curves 会打开一个拉不动点的死面板。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | `comp_adjustment_kind` 尾部追加 4 个值；`COMP_ADJUSTMENT_KIND_COUNT` 12 → 16 |
+| `engine/abi/include/compositor/comp_canvas.h` | **新增** `comp_layer_apply_adjustment` 声明与口径注释 |
+| `engine/abi/src/comp_canvas_abi.cpp` | 导出实现：kind 白名单 → settings 校验 → 隐式事务 → 逐像素求值 → `touch_layer` → 提交 |
+| `engine/domain/adjustment_table.cpp` | 4 个 kind 的名称/摘要/参数表；`adjustment_kind_is_destructive()` 纳入 12..15 |
+| `engine/compositing/adjustment_eval.cpp` | Brightness/Contrast、Desaturate、Threshold、Posterize 四个求值分支（与调整层共用） |
+| `tests/test_canvas_ops.cpp` | 7 例：去色/阈值写的是预乘像素、亮度对比度缺省即无操作、色调分离按级数量化、组/HDR/不可破坏 kind 被拒、选区按文档坐标裁剪、显式空选区无操作、16 位落 8 位且撤销可复原 |
+| `tests/test_adjustment.cpp` | 2 例：破坏性 kind 集合显式锁定；kind 12..15 作为**调整层**也能 `.comp` 往返 |
+| `shells/windows/src/shell_state.h` | `kCmdImageAdjustBase` + `kImageAdjustKinds[]`；`adj_destructive` / `destructive_curve_settings` |
+| `shells/windows/src/shell_layers.cpp` | `panel_begin_destructive` / `panel_apply_destructive` / `panel_exit_destructive`；破坏性态的曲线读写走寄存串 |
+| `shells/windows/src/shell_window.cpp` | `图像 > 调整` 子菜单；`Ctrl+Shift+U` 落墨、Esc 退出 |
+| `shells/windows/src/shell_document.cpp` | 1590 段命令分发（查表，未知号忽略） |
+| `shells/windows/src/shell_paint.cpp` | 破坏性态的面板标题与提示行 |
+| `scripts/visual_check.py` | **追加** `destructive_adjust` 场景（9 条），既有场景与阈值一处未动 |
+| `docs/adjustment-json-keys.md` | kind 计数、四个新 kind 的参数表、ABI 表 |
+| `docs/ps-parity.md` / `BACKLOG.md` / `docs/shell-parity.md` | ROI 状态、计数、菜单索引 |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **683 例 / 0 失败**（新增 7 例调整落墨） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线逐字节一致（本轮不加自检项） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **164**（163 → 164，纯尾部追加） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **154 条 / 28 场景 / 0 失败**（只追加 `destructive_adjust`；连续两次全量复跑一致） |
+
+**已知边界：**
+
+- **16 位图层落墨后永久变 RGBA8**：深度是有损的，撤销能拿回原 16 位快照，但重做不行
+  ——与 `comp_layer_invert` / `comp_filter_apply` 同一条既有口径；
+- HDR（RGBA16F）图层如实 `COMP_ERR_UNSUPPORTED`，不做隐式色调映射；
+- 破坏性 Curves 的点列只活在壳内寄存串里：Esc 丢弃、不进 `.comp`。它本来就是一发
+  性的，没有可编辑对象可存；
+- 引擎允许 kind 12..15 建**调整层**（`.comp` 往返测试锁的就是这条）：比 PS 多一种
+  用法，但不破坏兼容——PS 只是不在图层面板里给这四个入口。壳侧的调整面板按
+  `COMP_ADJUSTMENT_KIND_COUNT` 驱动，因此这四个也能在面板里建层；
+- 菜单项没有各自的快捷键（PS 也没有），统一走 `Ctrl+Shift+U` 落墨。

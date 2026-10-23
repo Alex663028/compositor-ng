@@ -188,6 +188,24 @@ constexpr UINT kCmdImageRotate180 = 1055; /* 画布 180° */
 constexpr UINT kCmdImageTrim = 1056;      /* 修边（模态面板，回车应用） */
 constexpr UINT kCmdImageInvert = 1057;    /* 图层反相（Ctrl+I） */
 /*
+ * ROI #8 图像 > 调整（1590 段，空号段）：PS 的 Image > Adjustments 是**破坏性**
+ * 一次性落墨——与「调整」面板里的可编辑调整层是两个对象，引擎侧对应
+ * comp_layer_apply_adjustment（ABI 尾部第 164 项）。
+ *
+ * 命令 id = kCmdImageAdjustBase + kind，只给「逐像素可破坏」的 kind 发号
+ * （见 kImageAdjustKinds）；无参数的 Desaturate 点菜单即落墨，其余进破坏性
+ * 面板态：调参 → Ctrl+Shift+U 应用 → Esc 退出。
+ */
+constexpr UINT kCmdImageAdjustBase = 1590;
+constexpr uint32_t kImageAdjustKinds[] = {
+    COMP_ADJUSTMENT_HUE_SATURATION, COMP_ADJUSTMENT_LEVELS,  COMP_ADJUSTMENT_CURVES,
+    COMP_ADJUSTMENT_EXPOSURE,       COMP_ADJUSTMENT_GRADIENT_MAP,
+    COMP_ADJUSTMENT_BLACK_WHITE,    COMP_ADJUSTMENT_COLOR_BALANCE,
+    COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, COMP_ADJUSTMENT_DESATURATE,
+    COMP_ADJUSTMENT_THRESHOLD,      COMP_ADJUSTMENT_POSTERIZE,
+};
+constexpr size_t kImageAdjustKindCount = sizeof(kImageAdjustKinds) / sizeof(kImageAdjustKinds[0]);
+/*
  * P0 文档级对话框（1560 段，空号段，不挤占工具/滤镜/混合模式的连续 id）。
  * 四条入口此前壳里根本没有：新建只有固定的 1280×720、没有分辨率与背景，
  * 图像大小 / 画布大小完全没有，历史容量只能靠改 .comp。全走既有 ABI，
@@ -362,6 +380,18 @@ struct DocumentContext {
   std::vector<std::string> adj_settings; /* 与 adj_kinds 对齐的 settings JSON */
   int32_t selected_adjustment = -1;      /* 已有调整的选中索引；-1 = 未选（新增态） */
   int32_t adj_kind = 3;                  /* 当前编辑 kind，默认 3 = Exposure */
+  /*
+   * ROI #8：破坏性调整态。true 时调整面板的同一批参数行服务
+   * comp_layer_apply_adjustment（Image > Adjustments），Ctrl+Shift+U 直接落墨，
+   * 不产生调整层；selected_adjustment 恒为 -1（没有可编辑对象）。
+   */
+  bool adj_destructive = false;
+  /*
+   * 破坏性 Curves：点列没有可写的调整对象，先寄存在这条 settings 串里（写入走
+   * comp_layer_curves_set_points 纯函数），Ctrl+Shift+U 时由 build_settings_json
+   * 原样交出。只在该态且 kind = Curves 时有效。
+   */
+  std::string destructive_curve_settings;
   int32_t adj_param = 0;                 /* 聚焦的可编辑参数序号 */
   std::vector<std::string> adj_values;   /* 与参数表对齐的 ASCII 编辑值 */
   std::wstring adj_input;                /* 键入缓冲；非空 = 输入态 */

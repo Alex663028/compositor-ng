@@ -1592,7 +1592,7 @@ $v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v);
 6. 窗口 DPI 变化：在真实多显示器机器上把窗口拖到另一块不同缩放的屏幕，应收到
    `WM_DPICHANGED` 并按系统建议矩形重排，不出现半截面板或空白条；拖回来再验一次。
 7. 关掉 `--dpi` 开关再跑 `scripts/visual_check.py --scene all`：必须仍是
-   **145 条 / 0 失败**；`--selftest` 仍是 **263 项 failures=0**，SHA256
+   **154 条 / 0 失败**；`--selftest` 仍是 **263 项 failures=0**，SHA256
    `2f3b81c4fc599cb7…` 与基线逐字节一致（96 DPI 下渲染路径未被改动）。
 8. 已知限制（不是 bug，已记 BACKLOG P1-11）：画布 `zoom` 仍是逻辑像素口径，
    200% 屏上 100% 缩放 = 2 设备像素/文档像素（Photoshop 是 1:1 物理像素）；
@@ -1603,7 +1603,7 @@ $v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v);
 落点按 1:1 处理（偏一半）；字号/行高在映射模式下变成 0 或被裁切；96 DPI 下
 视觉探针或自检基线发生任何字节变化。
 
-**自动化**：`scripts/visual_check.py --scene all`（145 条，96 DPI 路径）与壳层
+**自动化**：`scripts/visual_check.py --scene all`（154 条，96 DPI 路径）与壳层
 `--selftest`（263 项 SHA 基线）守 96 DPI 不回归；150%/200% 由上面的截图与
 `GetProcessDpiAwareness` 返回值人工复核，截图产物在
 `report/assets/s15/dpi-check-*.png`。
@@ -1616,6 +1616,61 @@ $v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v);
 - 文字已支持 CJK（随仓字体）与可编辑文字图层；富文本、字体选择、段落框仍未接（见 M50）。
 - 未实现：Select Subject / Remove Background / RAW 解码 / HEIC / WebP / SVG / PSB / TIFF。
 - 自动化脚本会抢前台（`SetCapture` 需要），跑的时候别用键鼠；它不移动物理光标。
+
+## M53 图像 > 调整：破坏性一次落墨（ROI #8，2026-10-23）
+
+> `图像 > 调整` 下的 11 项是**破坏性**的：参数一次性写进图层像素，不留下可编辑的
+> 调整对象（与「调整」面板里建调整层是两条路，像素结果相同）。参数行、量程、缺省值
+> 与调整面板同源（都来自 ABI 参数表），壳内不另抄一份。落墨统一走 `Ctrl+Shift+U`，
+> 唯有无参数的**去色**是点菜单即应用。
+
+**准备**：`Ctrl+N` 新建 800×600 文档，画一笔颜色（例如中灰 `(128,128,128)` 或
+一幅有明暗的图），确认图层面板里有且只选中一个普通图层。
+
+1. 打开 `图像 > 调整`：子菜单自上而下是 Hue/Saturation、Levels、Curves、Exposure、
+   Gradient Map、Black & White、Color Balance，一条分隔线，再是 Brightness/Contrast、
+   Desaturate、Threshold、Posterize。最后另有一条分隔线 + `反相 Ctrl+I`（老入口，
+   语义不变）。
+2. 点 `Brightness/Contrast`：面板标题变成 `调整（图像 > 破坏性落墨）`，状态栏
+   `破坏性调整：Brightness/Contrast — Ctrl+Shift+U 应用，Esc 退出`；参数行仍是
+   `Brightness` / `Contrast` 两条滑杆，缺省都是 0。
+3. **拖滑杆只是预览**：把 Brightness 拖到 +40，画布变亮，但**图层列表里没有多出
+   调整条目**，`Ctrl+Z` 的撤销栈也没长高（此时按 `Ctrl+Z` 应撤销的是上一步画笔，
+   不是这次预览）。
+4. 按 `Esc`：状态栏 `已退出破坏性调整（未应用的参数已丢弃）`，画面回到拖滑杆之前。
+5. 重新点 `Brightness/Contrast`，Brightness 拖到 +40，按 `Ctrl+Shift+U`：状态栏
+   `已应用破坏性调整：Brightness/Contrast`，像素变亮。**撤销栈只长一步**：一次
+   `Ctrl+Z` 回到 +40 之前（不是先退滑杆、再退落墨）。
+6. 存盘往返：`Ctrl+Alt+S` 存成 `.comp` 再重开。像素是烘进去的，图层的
+   `engineAdjustments` 里**没有**这一条——它不是调整层；重新打开后亮度保持。
+7. `Desaturate`：点菜单**直接落墨**（不进面板态），三通道被拉平成灰；一次 `Ctrl+Z` 复原。
+8. `Threshold`（缺省 level = 128）：结果为纯黑/纯白两色。紧接着**再点一次
+   `Threshold` 并直接 `Ctrl+Shift+U`**（参数没变）：状态栏
+   `Threshold：结果与像素相同，未进历史`，撤销栈不再增长；此时一次 `Ctrl+Z` 应回到
+   阈值化**之前**的彩色画面，证明空操作确实没占步。
+9. `Posterize`（缺省 levels = 4）：每通道只剩 4 级；把 `Levels` 调到 255 再落墨，
+   状态栏显示「结果与像素相同，未进历史」（255 级即恒等）。
+10. `Curves`：面板里拉一个控制点（例如把中点从 128 抬到 190），画布实时变亮；
+    `Ctrl+Shift+U` 落墨后像素变亮，`Esc` 退出。**反向验证**：拉点后直接 `Esc`，
+    状态栏提示参数已丢弃，画面回到拉点之前——点列寄存在壳内，退出即清空。
+11. 选区：拉一个**羽化 5 px** 的矩形选区再落墨 `Threshold`，只有选区内部被二值化，
+    边缘按覆盖度过渡；取消选区后只对选区外落墨，选区外不受影响。显式空选区
+    （拉一个 0 面积选区）落墨应报「结果与像素相同，未进历史」。
+12. 拒绝路径：选中一个**组**再 `Ctrl+Shift+U` → `图像调整：组图层或没有像素的图层
+    （未改动）`；对 HDR（RGBA16F）图层 → `图像调整：HDR（RGBA16F）图层不受支持
+    （未改动）`。两种情况都不要产生撤销步。
+13. 破坏性态下按 `Ctrl+Shift+A`（新增调整层）被拒：状态栏
+    `破坏性调整：Ctrl+Shift+U 直接作用于像素，Esc 退出`，不会把一次性参数存成图层。
+    `Ctrl+Shift+J/K` 切类型、`,` / `.` 选行都会退出破坏性态。
+
+**不该发生**：拖滑杆时就落墨或占用撤销步；一次落墨产生两步撤销；空操作（恒等参数 /
+显式空选区）产生空撤销步；破坏性落墨后图层上多出 `engineAdjustments` 条目；`Esc`
+之后画面仍留着预览；组/HDR 被「凑合着」应用。
+
+**自动化**：`scripts/visual_check.py` 的 `destructive_adjust` 场景 9 条覆盖进态标题、
++40 变亮、一步撤销、去色、阈值、空操作不进历史、色调分离、曲线落墨与 Esc 退出；
+引擎侧 `tests/test_canvas_ops.cpp` 7 例 + `tests/test_adjustment.cpp` 2 例覆盖
+选区混色、组/HDR 拒绝、16 位落 8 位与 kind 12..15 的 `.comp` 往返。
 
 ## 脚本 ↔ 用例对照
 
@@ -1648,8 +1703,9 @@ $v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v);
 | `font_picker` | §5.53 字体选择器（本文无专章） | 4 |
 | `sharpen_denoise` | README §6.90 锐化 / 降噪（本文无专章） | 4 |
 | `guides` | §5.54 标尺 / 参考线 / 网格 / 对齐（本文无专章） | 9 |
+| `destructive_adjust` | M53 图像 > 调整：破坏性一次落墨 | 9 |
 
-合计 27 个场景 145 项。跑完看 `build/visual_check.txt` 摘要与 `report/assets/s15/*.png`；
+合计 28 个场景 154 项。跑完看 `build/visual_check.txt` 摘要与 `report/assets/s15/*.png`；
 脚本退出码 0 才算通过。
 
 ## 结论模板
@@ -1657,8 +1713,7 @@ $v = 0; [Cap.ShcoreM52]::GetProcessDpiAwareness([System.IntPtr]::Zero, [ref]$v);
 ```
 日期 / 执行人 / 机器：
 DPI：96 / 150     显示器：
-M1 通过  M2 通过  M3 通过  M4 通过  M5 通过  M6 通过  M7 通过  M8 通过
-M9 通过  M10 通过 M11 通过 M12 通过 M13 通过 M14 通过 M15 通过 M16 通过 M17 通过 M18 通过 M19 通过 M20 通过 M21 通过 M22 通过 M23 通过 M24 通过 M25 通过 M26 通过 M27 通过 M28 通过
+M1–M53 通过（逐章核对；未做的章节注明原因）
 失败项（编号 + 现象 + 截图）：
 备注（手感/性能/观感）：
 ```

@@ -139,6 +139,36 @@ comp_result document_trim(Document* doc, const TrimOptions& options, int32_t* ou
 comp_result invert_layer(Document* doc, comp_layer_id layer, int32_t* out_changed,
                          std::string* error);
 
+/* ------------------------------------------------- 破坏性调整（Image > Adjustments） */
+
+/*
+ * 把一条调整**一次性**落到图层像素上（PS Image > Adjustments > Brightness/Contrast、
+ * Levels、Curves、Exposure、Hue/Saturation、Black & White、Color Balance、
+ * Gradient Map、Desaturate、Threshold、Posterize）。
+ *
+ * 与调整层的分工：调整层（comp_layer_add_adjustment）是非破坏、可编辑、随合成求值；
+ * 本函数是破坏性落墨，像素一旦改就只靠撤销栈回去。两者共用同一批求值器
+ * （apply_adjustments），因此同一 kind 在两条路上给出的像素完全一致。
+ *
+ * `kind` 必须是 adjustment_kind_is_destructive 认可的 kind（0/1/2/3/4/10/11/12/13/14/15）；
+ * 5..8（Grain / Add Noise / Gaussian Blur / Motion Blur）不是逐像素映射，走
+ * comp_filter_apply；9（Invert）走 comp_layer_invert。settings 按 adjustment_table
+ * 的白名单与区间校验，不合法在开事务之前就失败。
+ *
+ * 其余口径与 invert_layer 完全一致：
+ * - 一步撤销：加入调用方已开启的事务，或自成一个隐式步；
+ * - 显式活动选区存在时按 coverage 与原像素混合（选区按文档坐标解释）；
+ * - 空选区 = 什么都不改，out_changed = 0；
+ * - 16 位图层先落 8 位工作副本；HDR（RGBA16F）拒绝（COMP_ERR_UNSUPPORTED）；
+ * - 组图层 / 无像素图层拒绝（COMP_ERR_STATE）。
+ *
+ * 一处不同：结果与原像素逐字节相同（如默认参数的 Brightness/Contrast）时
+ * 不入撤销栈，out_changed = 0。
+ */
+comp_result apply_layer_adjustment(Document* doc, comp_layer_id layer, uint32_t kind,
+                                   const std::string& settings_json, int32_t* out_changed,
+                                   std::string* error);
+
 }  // namespace compositor
 
 #endif /* COMPOSITOR_DOMAIN_CANVAS_OPS_H */

@@ -121,3 +121,27 @@ comp_result comp_layer_invert(comp_document document, comp_layer_id layer, int32
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }
+
+comp_result comp_layer_apply_adjustment(comp_document document, comp_layer_id layer, uint32_t kind,
+                                        const char* settings_json_utf8, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /*
+   * settings 的校验在领域层做（同一份 adjustment_table，add/update 用的也是它），
+   * ABI 只负责把 NULL 视作 "{}"——与 comp_layer_add_adjustment 的入参口径一致。
+   */
+  const std::string settings = settings_json_utf8 != nullptr ? std::string(settings_json_utf8) : std::string();
+  int32_t changed = 0;
+  std::string error;
+  const comp_result code = compositor::apply_layer_adjustment(doc, layer, kind, settings, &changed, &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(engine, code, error);
+  }
+  if (out_changed != nullptr) *out_changed = changed;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}

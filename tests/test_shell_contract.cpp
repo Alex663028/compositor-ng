@@ -275,6 +275,7 @@ COMP_TEST(shell_contract_adjustment_control_metadata_is_shared) {
                  "exposure first path");
 
   /* 越界必须显式失败，不得回落到某个默认 kind / 默认参数。 */
-  COMP_CHECK(comp_layer_adjustment_kind_name(12, &name) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_adjustment_kind_name(COMP_ADJUSTMENT_KIND_COUNT, &name) ==
+             COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_layer_adjustment_param_at(3, 99, &param) == COMP_ERR_INVALID_ARGUMENT);
 }

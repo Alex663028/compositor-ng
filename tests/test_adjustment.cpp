@@ -33,6 +33,15 @@ const char* const kUpstreamKindNames[] = {
     "Add Noise",      "Gaussian Blur", "Motion Blur", "Invert", "Black & White", "Color Balance",
 };
 
+/*
+ * 本仓在尾部追加的破坏性调整（S27），按 kind 12..15 的顺序。
+ * 它们不在上游 `AdjustmentKind` 里，故单独一张表断言——把 16 条塞进上游表
+ * 会让「逐字对齐上游」这条不变式失去意义。
+ */
+const char* const kLocalKindNames[] = {
+    "Brightness/Contrast", "Desaturate", "Threshold", "Posterize",
+};
+
 comp_engine_desc make_desc() {
   comp_engine_desc desc{};
   desc.app_name = "compositor-adjustment-tests";
@@ -60,17 +69,44 @@ std::string read_text(const std::filesystem::path& path) {
 
 COMP_TEST(adjustment_kind_names_match_upstream) {
   const size_t upstream_count = sizeof(kUpstreamKindNames) / sizeof(kUpstreamKindNames[0]);
-  COMP_CHECK(upstream_count == kAdjustmentKindCount);
-  for (uint32_t kind = 0; kind < kAdjustmentKindCount; ++kind) {
+  const size_t local_count = sizeof(kLocalKindNames) / sizeof(kLocalKindNames[0]);
+  /* 上游 12 条一个不多一个不少，本仓追加的 4 条必须紧接其后。 */
+  COMP_CHECK(upstream_count == kUpstreamAdjustmentKindCount);
+  COMP_CHECK(kUpstreamAdjustmentKindCount + local_count == kAdjustmentKindCount);
+  for (uint32_t kind = 0; kind < kUpstreamAdjustmentKindCount; ++kind) {
     const AdjustmentKindInfo* info = adjustment_kind_info(kind);
     COMP_CHECK_MSG(info != nullptr, "kind info");
     if (info == nullptr) continue;
     COMP_CHECK_MSG(info->kind == kind, "kind index");
     COMP_CHECK_MSG(std::string(info->name) == kUpstreamKindNames[kind], info->name);
   }
+  for (uint32_t i = 0; i < local_count; ++i) {
+    const AdjustmentKindInfo* info = adjustment_kind_info(kUpstreamAdjustmentKindCount + i);
+    COMP_CHECK_MSG(info != nullptr, "local kind info");
+    if (info == nullptr) continue;
+    COMP_CHECK_MSG(info->kind == kUpstreamAdjustmentKindCount + i, "local kind index");
+    COMP_CHECK_MSG(std::string(info->name) == kLocalKindNames[i], info->name);
+  }
   /* 越界 kind 必须显式失败，不得回落到某个默认类型。 */
   COMP_CHECK(adjustment_kind_info(kAdjustmentKindCount) == nullptr);
   COMP_CHECK(adjustment_kind_info(999u) == nullptr);
+}
+
+/*
+ * 破坏性入口能接受的 kind 集必须显式且与实现一致：逐像素映射的 11 种可以，
+ * 邻域/随机源的 4 种（5..8）和已有专用入口的 Invert（9）不行。
+ * 这张表漂移的后果是 comp_layer_apply_adjustment 静默接受 blur 之类，
+ * 所以逐 kind 断言，而不是只数个数。
+ */
+COMP_TEST(adjustment_destructive_kind_set_is_explicit) {
+  const uint32_t expected[] = {0u, 1u, 2u, 3u, 4u, 10u, 11u, 12u, 13u, 14u, 15u};
+  for (uint32_t kind = 0; kind < kAdjustmentKindCount; ++kind) {
+    bool should = false;
+    for (uint32_t value : expected) should = should || value == kind;
+    COMP_CHECK_MSG(adjustment_kind_is_destructive(kind) == should,
+                   adjustment_kind_info(kind) != nullptr ? adjustment_kind_info(kind)->name : "?");
+  }
+  COMP_CHECK(!adjustment_kind_is_destructive(kAdjustmentKindCount));
 }
 
 COMP_TEST(adjustment_defaults_pass_validation) {
@@ -186,7 +222,7 @@ COMP_TEST(adjustment_abi_metadata_surface) {
   const char* name = nullptr;
   COMP_CHECK(comp_layer_adjustment_kind_name(3u, &name) == COMP_OK);
   COMP_CHECK_MSG(name != nullptr && std::string(name) == "Exposure", "kind name");
-  COMP_CHECK(comp_layer_adjustment_kind_name(12u, &name) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_adjustment_kind_name(kAdjustmentKindCount, &name) == COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_layer_adjustment_kind_name(3u, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 
   size_t count = 0;
@@ -195,7 +231,7 @@ COMP_TEST(adjustment_abi_metadata_surface) {
   /* Invert 无参数；面板必须据此不渲染编辑控件。 */
   COMP_CHECK(comp_layer_adjustment_param_count(9u, &count) == COMP_OK);
   COMP_CHECK(count == 0);
-  COMP_CHECK(comp_layer_adjustment_param_count(12u, &count) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_adjustment_param_count(kAdjustmentKindCount, &count) == COMP_ERR_INVALID_ARGUMENT);
 
   comp_adjustment_param param{};
   COMP_CHECK(comp_layer_adjustment_param_at(3u, 0u, &param) == COMP_OK);
@@ -207,7 +243,7 @@ COMP_TEST(adjustment_abi_metadata_surface) {
   COMP_CHECK_MSG(param.default_value == 1.0, "gamma default");
   /* 越界索引与非法 kind 都必须拒绝。 */
   COMP_CHECK(comp_layer_adjustment_param_at(3u, 3u, &param) == COMP_ERR_INVALID_ARGUMENT);
-  COMP_CHECK(comp_layer_adjustment_param_at(12u, 0u, &param) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_adjustment_param_at(kAdjustmentKindCount, 0u, &param) == COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(comp_layer_adjustment_param_at(3u, 0u, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 
   COMP_CHECK(comp_layer_adjustment_validate(3u, "{}") == COMP_OK);
@@ -772,4 +808,88 @@ COMP_TEST(curves_abi_reads_and_writes_points) {
                                           sizeof(untouched), &untouched_size) ==
              COMP_ERR_INVALID_ARGUMENT);
   COMP_CHECK(std::string(untouched) == "SENTINEL");
+}
+
+/*
+ * 追加的 12..15 必须和上游 kind 一样能落盘往返：
+ * `.comp` 的 engineAdjustments 不按 kind 白名单过滤，若哪天加了过滤，
+ * 这两条路的 silently dropped 只有往返用例能抓到。
+ */
+COMP_TEST(adjustment_extended_kinds_round_trip_through_comp) {
+  comp_engine_desc desc = make_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  if (engine == nullptr) return;
+
+  comp_document_desc doc_desc{};
+  doc_desc.width = 4;
+  doc_desc.height = 4;
+  doc_desc.dpi = 72.0f;
+  doc_desc.color_space = "sRGB";
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &doc_desc, &document) == COMP_OK);
+  if (document == nullptr) {
+    comp_engine_destroy(engine);
+    return;
+  }
+
+  comp_layer_desc layer_desc{};
+  layer_desc.name = "extended-holder";
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  comp_layer_id layer = 0;
+  COMP_CHECK(comp_layer_add(document, &layer_desc, &layer) == COMP_OK);
+
+  const char* settings[] = {
+      "{\"brightnessContrastSettings\":{\"brightness\":12,\"contrast\":-8}}",
+      "{}",
+      "{\"thresholdSettings\":{\"level\":200}}",
+      "{\"posterizeSettings\":{\"levels\":8}}",
+  };
+  const uint32_t kinds[] = {COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, COMP_ADJUSTMENT_DESATURATE,
+                            COMP_ADJUSTMENT_THRESHOLD, COMP_ADJUSTMENT_POSTERIZE};
+  for (size_t i = 0; i < 4; ++i) {
+    COMP_CHECK_MSG(comp_layer_add_adjustment(document, layer, kinds[i], settings[i]) == COMP_OK,
+                   settings[i]);
+  }
+
+  const std::filesystem::path comp = temp_comp_path("adjustment_extended.comp");
+  COMP_CHECK(comp_document_save(document, comp.string().c_str()) == COMP_OK);
+
+  comp_document loaded = nullptr;
+  COMP_CHECK(comp_document_load(engine, comp.string().c_str(), &loaded) == COMP_OK);
+  if (loaded != nullptr) {
+    size_t layers = 0;
+    COMP_CHECK(comp_layer_list(loaded, nullptr, 0, &layers) == COMP_OK);
+    std::vector<comp_layer_id> ids(layers, 0);
+    COMP_CHECK(comp_layer_list(loaded, ids.data(), ids.size(), &layers) == COMP_OK);
+
+    /* 加载器可能补背景层，故按「带着 4 条调整的那个图层」定位，不假定 id 顺序。 */
+    comp_layer_id restored = 0;
+    size_t total = 0;
+    for (comp_layer_id candidate : ids) {
+      size_t candidate_count = 0;
+      if (comp_layer_adjustment_count(loaded, candidate, &candidate_count) != COMP_OK) continue;
+      if (candidate_count == 0) continue;
+      restored = candidate;
+      total += candidate_count;
+    }
+    COMP_CHECK_MSG(total == 4, "extended kinds survive the round trip");
+    for (size_t i = 0; i < 4; ++i) {
+      uint32_t kind = 0xFFFFFFFFu;
+      size_t need = 0;
+      COMP_CHECK(comp_layer_adjustment_at(loaded, restored, i, &kind, nullptr, 0, &need) == COMP_OK);
+      std::vector<char> buffer(need + 1, '\0');
+      COMP_CHECK(comp_layer_adjustment_at(loaded, restored, i, &kind, buffer.data(), buffer.size(),
+                                          &need) == COMP_OK);
+      COMP_CHECK_MSG(kind == kinds[i], "kind order");
+      COMP_CHECK_MSG(std::string(buffer.data(), need) == settings[i], buffer.data());
+    }
+    comp_document_destroy(loaded);
+  }
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+  std::error_code error;
+  std::filesystem::remove_all(comp, error);
 }
