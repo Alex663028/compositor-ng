@@ -5589,6 +5589,67 @@ PASS（20 个工具）；`visual_check.py` **115 条 / 22 场景 / 0 失败**—
 `visual_check.py` 的布局镜像同步加了 `options` 与 `option_group_rect/option_control_rect`，
 既有 21 个场景在画布下移 32px 后仍全绿。
 
+### 6.83 外壳拆分：1.9 万行单文件 → 13 个翻译单元 + 文档上下文对象化（【架构】前提，2026-10-23，Claude）
+
+多文档与面板停靠一直卡在两件事上：外壳是**一个 19,046 行的 main.cpp**（改一行
+就要全量重编，冲突面永远是整份文件），以及**所有状态都挂在一份全局 `ShellState`
+里**（换文档只能逐个字段擦洗，没地方放第二份文档的运行态）。本批只做前提，
+不做多文档本身：把文件拆开、把「文档态 / 会话态」分开。**零行为变化**——函数体
+逐字搬家，一行逻辑没改。
+
+- **第一步：状态分层（`shell_state.h`，542 行）**。`DocumentContext` 收 189 个
+  字段（引擎文档句柄、图层镜像与可见性缓存、选区/套索/魔棒中间态、拖拽与
+  变换手柄、面板模态、滤镜/裁剪/曲线/直方图、视图），`ShellState` 收 60 个字段
+  （引擎、工具与笔刷参数、面板宽度、窗口句柄）+ 一个内嵌的 `doc`。划分口径只有
+  一条：**切文档之后必须重建或复位的进 `DocumentContext`**，其余留在 `ShellState`。
+  多文档落地时把 `doc` 换成「标签页 → `DocumentContext`」，其余字段不动。
+- **第二步：翻译单元拆分**。`shell_internal.h`（631 行）收拢 430 个跨文件函数
+  声明（与定义逐字同签名）+ `ClipboardHeader` / `ClipboardImage` / `ToolIconMap`
+  与少量内部常量；每个 .cpp 只 `#include "shell_internal.h"`，就能看到全部兄弟
+  函数。分法是按职责而非行数均衡：
+
+  | 文件 | 职责 | 行数 |
+  |---|---|---|
+  | `main.cpp` | `g_shell`、5 个通用小工具、`wWinMain` | 254 |
+  | `shell_window.cpp` | 窗口过程、键鼠交互、菜单、视图 | 3,853 |
+  | `shell_layers.cpp` | 图层 / 调整 / 曲线 / 效果 / 直方图面板 | 2,949 |
+  | `shell_paint.cpp` | 画布渲染、工具条与各面板绘制、上屏 | 2,663 |
+  | `shell_selftest.cpp` | 自检与呈现基准 | 2,560 |
+  | `shell_tools.cpp` | 笔刷/修复/仿制/渐变/形状/变换 | 1,946 |
+  | `shell_document.cpp` | 文档生命周期、文件对话框、导入导出 | 1,615 |
+  | `shell_selection.cpp` | 选区、套索、魔棒、裁剪、颜色范围 | 1,009 |
+  | `shell_clipboard.cpp` | 图层像素读写与剪贴板 | 703 |
+  | `shell_path_history.cpp` | 钢笔路径与历史面板 | 582 |
+  | `shell_filter.cpp` | 滤镜面板与裁切 | 425 |
+  | `shell_type.cpp` | 文字工具与文字面板 | 390 |
+
+- **只有两处非逐字的机械改动**，都是 C++ 链接规则逼出来的：① `finish_new_selection`
+  的默认实参 `bool* applied = nullptr` 从定义移到声明（默认实参全程序只能出现一次，
+  而其它翻译单元也要能省略它）；② 两个 `const wchar_t*` 常量改成
+  `constexpr const wchar_t*` 才能进头文件（`constexpr` 隐含 inline，不会每个 TU
+  各留一份定义）。其余常量本来就是 `constexpr`。
+- **构建脚本一行未改**：`build_windows_shell.py` 本来就按 `*.cpp` glob 收集源文件，
+  新文件自动纳入编译与链接。壳层仍然只 `#include <compositor/comp_*.h>`
+  （`engine/abi/include`）与 `ui_core.h`，没有因为拆分碰到任何 `engine/` 内部头。
+- **边界（如实记）**：本轮**没有**做多文档本身——没有标签页、没有 `DocumentContext`
+  实例池、没有切换流程，`文件 > 新建 / 打开` 依然直接销毁旧文档；面板停靠同样
+  只是「不再被单文件卡住」。`main.cpp` 里保留的 5 个工具函数
+  （`set_status` / `number_text` / `widen_ascii` / `widen_utf8` / `narrow_utf8`）
+  是被几乎每个 .cpp 调用的小工具，等它们有明确归属再挪。
+
+**验证。** 单测 **631 例 / 0 失败**；`run_regression.py --require-ohos` **6/6**
+（含鸿蒙 113 个文件交叉编译）；壳自检 **257 项 failures=0、SHA256
+`377DE660D48AC933…` 与基线逐字节一致**——这是「零行为变化」最硬的证据；
+`build_windows_shell.py` **零警告**；`check_tool_table.py` PASS（20 个工具）；
+`visual_check.py --scene all` **122 项 / 0 失败**（18 个场景，新 `options_bar`
+13 项同批跑绿）。
+
+**一处既有 flaky（与本批无关，如实记）**：`options_bar` 的「选项栏点击不穿透到
+画布」断言 `== 0` 偶尔报到 17～32 px。用拆分**之前**的 main.cpp 单独构建做对照，
+同一场景 5 次跑有 3 次失败（32 px），拆后 4 次跑 1 次失败（17 px）——差异来自
+`Ctrl+Z` 重绘与两次截图之间的时序，不是拆分引入。没有为了跑绿去放宽阈值，
+留作独立修复（截图前等重绘落地）。
+
 
 
 
