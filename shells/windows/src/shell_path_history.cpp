@@ -292,6 +292,7 @@ void path_panel_toggle(ShellState& shell) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = true;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   const int count = static_cast<int>(shell.doc.paths.size());
   if (shell.doc.path_selected >= count) shell.doc.path_selected = count - 1;
   if (shell.doc.path_selected < 0) shell.doc.path_selected = 0;
@@ -441,6 +442,7 @@ void history_panel_toggle(ShellState& shell) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = true;
+  channel_panel_close(shell);
   Layout layout{};
   if (client_layout(shell, &layout)) {
     shell.doc.history_scroll = comp_ui::history_ensure_visible(

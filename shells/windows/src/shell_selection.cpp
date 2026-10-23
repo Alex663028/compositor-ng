@@ -410,6 +410,7 @@ void color_range_begin(ShellState& shell) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.doc.color_range_include.clear();
   shell.doc.color_range_exclude.clear();
   shell.doc.color_range_fuzziness = comp_ui::kDefaultColorRangeFuzziness;

@@ -1512,6 +1512,79 @@ void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
 }
 
 /*
+ * 通道面板（ROI #5）。排版与路径/历史同一套（ui_core.h 的 channel_row_rect /
+ * channel_row_at），差别只有内容：行 = 引擎里存的选区通道，命名态时摘要行
+ * 换成输入缓冲。行上的分量（feather）没有查询入口，不在此处冒充。
+ */
+void draw_selection_channel_panel(HDC dc, const ShellState& shell,
+                                  const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[384];
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"通道（Channels）";
+  TextOutW(dc, left + 10, panel_rect.y + 8, title, lstrlenW(title));
+
+  const int count = channel_count(shell);
+  if (shell.doc.channel_name_active) {
+    SetTextColor(dc, RGB(255, 210, 120));
+    const std::wstring name_line = L"名字：" + shell.doc.channel_name_input + L"▌";
+    TextOutW(dc, left + 10, panel_rect.y + 30, name_line.c_str(),
+             static_cast<int>(name_line.size()));
+  } else {
+    SetTextColor(dc, RGB(150, 210, 255));
+    wsprintfW(line, L"已存 %d / %d 条（选区 → 通道，PS Alpha 同义）", count,
+              comp_ui::kChannelMaxEntries);
+    TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+  }
+
+  const int scroll = comp_ui::channel_clamp_scroll(panel_rect, count, shell.doc.channel_scroll);
+  const int visible = comp_ui::channel_visible_rows(panel_rect);
+  if (count == 0) {
+    SetTextColor(dc, RGB(170, 150, 110));
+    const wchar_t* empty = L"还没有通道：有选区时按 S 存储";
+    TextOutW(dc, left + 12, panel_rect.y + comp_ui::kChannelRowsTop, empty, lstrlenW(empty));
+  }
+  for (int row = 0; row < visible; ++row) {
+    const int index = scroll + row;
+    if (index >= count) break;
+    const comp_ui::Rect rect = comp_ui::channel_row_rect(panel_rect, row);
+    const bool selected = index == shell.doc.channel_selected;
+    if (selected) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
+      FillRect(dc, &band, highlight);
+      DeleteObject(highlight);
+    }
+    const std::wstring name = channel_name(shell, index);
+    SetTextColor(dc, selected ? RGB(250, 250, 255) : RGB(196, 200, 210));
+    wsprintfW(line, L"%d. %s", index + 1, name.c_str());
+    TextOutW(dc, left + 12, rect.y + 3, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[3] = {
+      shell.doc.channel_name_active ? L"键入名字（UTF-8，≤ 255 字节，中文可用）"
+                                    : L"↑ / ↓ 选择 · 回车（或双击行）载入为选区",
+      shell.doc.channel_name_active ? L"回车保存为新通道（一步撤销）"
+                                    : L"Shift+回车加选 · Ctrl+回车减选",
+      shell.doc.channel_name_active ? L"Esc 取消 · 退格删字"
+                                    : L"S 存储当前选区 · Del 删除 · Esc 关闭",
+  };
+  int hint_y = bottom - 8 - 3 * 18 + 4;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
  * 历史记录面板（P1）。行几何走 ui_core.h 的 history_row_rect / history_row_at，
  * 与命中同源。当前状态（= 引擎 current_index）高亮；它之后的行是「可重做」的
  * 未来状态，用暗色区分。标签直接来自 ABI，不在这里改写成中文。
@@ -2733,6 +2806,8 @@ void present(HWND window, ShellState& shell) {
       draw_path_panel(memory_dc, shell, layout.adjust_panel);
     } else if (history_panel_visible(shell)) {
       draw_history_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (channel_panel_visible(shell)) {
+      draw_selection_channel_panel(memory_dc, shell, layout.adjust_panel);
     } else if (font_panel_visible(shell)) {
       draw_font_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.doc.color_range_open) {

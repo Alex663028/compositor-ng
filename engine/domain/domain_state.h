@@ -60,6 +60,29 @@ struct Guide {
   double position = 0.0;
 };
 
+/* 存储的选区通道（PS 的 Alpha 通道；Select > Save Selection / Load Selection）。
+ *
+ * 与 SelectionState 同一套理由放进 DocumentState：通道要随撤销回退、要进
+ * `.comp`，而快照只认 DocumentState。
+ *
+ * 字段口径：
+ *   - name：UTF-8、单行、非空，≤ kMaxSelectionChannelNameBytes（见
+ *     domain/selection_channel.h）。名字只用于面板与 .comp，不参与像素求值；
+ *   - mask：**未羽化**的硬边 coverage，**文档分辨率**（0/255 与抗锯齿灰阶），
+ *     与 `SelectionState.base` 同构。存硬边而不是「烘焙过羽化」的图，是为了
+ *     存/载往返逐字节相等：羽化是选区参数，载回时一起恢复；
+ *   - feather：保存那一刻的羽化半径，与 mask 成对恢复。
+ *
+ * 注意 mask 尺寸是文档尺寸：换画布（Image Size / Canvas Size / Crop）时必须
+ * 与选区一起丢弃（见 document.cpp / crop.cpp），否则载入会得到错位的选区。
+ * 旋转画布（90°/180°）是例外：坐标系只旋转不缩放，通道蒙版随选区一起转置。
+ */
+struct SelectionChannel {
+  std::string name;
+  float feather = 0.0f;
+  MaskBuffer mask;
+};
+
 struct DocumentState {
   int32_t width = 0;
   int32_t height = 0;
@@ -82,6 +105,10 @@ struct DocumentState {
 
   /* 参考线（见 Guide）。空向量 = 无参考线；落盘为 manifest 的 engineGuides。 */
   std::vector<Guide> guides;
+
+  /* 存储的选区通道（见 SelectionChannel）。空向量 = 没有通道；落盘为
+   * manifest 的 engineChannels，蒙版在 images/<documentID>.channel<N>.png。 */
+  std::vector<SelectionChannel> channels;
 };
 
 }  // namespace compositor

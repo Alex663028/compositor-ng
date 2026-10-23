@@ -6266,6 +6266,113 @@ false——不写状态、不开事务、不接管捕获），不在本轮改动
 - 网格是固定 50px，不可配置间距与子网格数。
 - 吸附只在**参考线拖动**上生效；画笔、选框、Move 的落点还没有接同一套吸附。
 
+### 6.92 存储 / 载入选区通道（ROI #5，2026-10-23，Claude）
+
+`docs/ps-parity.md` §4 的 ROI 第 5 顺位，选区维 80% → 90%，日常路径 75% → 76%。
+对应 PS 的 `Select > Save Selection` / `Load Selection` 与通道面板：把当前选区
+存成一条具名快照，之后原样取回来。验收口径三条：
+
+1. **往返相等**：存 → 载之后，选区蒙版逐字节相同，羽化半径也相同；
+2. **随文档走**：存进 `.comp`，重新打开后通道还在，名字与羽化不变；
+3. **一步撤销**：存储、载入、删除各是一步；结果与当前选区相同时不落空步。
+
+**ABI 只做尾部追加：158 → 163。** 通道是**文档状态**，和参考线同理不能只做壳层：
+
+| 导出 | 语义 |
+|---|---|
+| `comp_selection_channel_count(doc, size_t* out_count)` | 当前通道数 |
+| `comp_selection_channel_get_name(doc, index, char* buf, size_t cap, size_t* out_required)` | 两段式读名：`buf=NULL,cap=0` 只查长度，`out_required` 含 NUL |
+| `comp_selection_channel_save(doc, name_utf8, size_t* out_index)` | 存当前选区；无选区或已满 16 条 → `COMP_ERR_STATE`，坏名字 → `COMP_ERR_INVALID_ARGUMENT` |
+| `comp_selection_channel_load(doc, index, combine, int32_t* out_changed)` | replace / add / subtract；结果未变时 `changed=0` |
+| `comp_selection_channel_remove(doc, index, int32_t* out_changed)` | 删除；列表索引随之前移 |
+
+`combine` 沿用既有的 `COMP_SELECTION_REPLACE` / `ADD` / `SUBTRACT`，没有新增枚举。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_selection.h` | 尾部追加 5 个导出与契约注释（参数闸、名字字节上限 255、状态错误） |
+| `engine/abi/src/comp_selection_abi.cpp` | 薄封装：句柄 → `Document` → domain，沿用既有错误映射 |
+| `engine/domain/selection_channel.h` / `.cpp` | **新增**：容量 16、名字校验（严格 UTF-8 / 无控制字符 / ≤255 字节）、save/load/remove/clear |
+| `engine/domain/domain_state.h` | `std::vector<SelectionChannel> channels`，纳入整篇快照撤销 |
+| `engine/format/comp_file.cpp` | `engineChannels` 读写；蒙版写 `images/<docID>.channel<N>.png`（8 位灰度） |
+| `engine/domain/canvas_ops.cpp` / `crop.cpp` | Image Size / Canvas Size / Crop 丢弃通道；旋转画布逐通道转置 |
+| `shells/windows/src/shell_channels.cpp` | **新增**：通道面板、命名态、载入/加选/减选/删除、键盘与鼠标路由 |
+| `shells/windows/src/shell_state.h` | 命令号 1585/1586；面板状态与命名缓冲进 `DocumentContext` |
+| `shells/windows/src/ui_core.h` | 通道列表几何（行高 22、可见行数、滚动夹取、行命中），与绘制同源 |
+| `shells/windows/src/shell_paint.cpp` | `draw_selection_channel_panel` 与绘制分派 |
+| `shells/windows/src/shell_document.cpp` | 两条命令分派；换文档时 `channel_store_clear` |
+| `shells/windows/src/shell_window.cpp` | 选择菜单两项 + 启用态、面板键位、`WM_CHAR` 命名、单击/双击、滚轮 |
+| `tests/test_selection_channels.cpp` | **新增** 7 例（见下） |
+
+**通道存的是「硬边蒙版 + 羽化参数」，不是烘焙后的 coverage。** 保存时按 COW
+共享一份文档分辨率的 8 位蒙版，零重采样；载回 replace 时把那份蒙版和羽化半径
+一起恢复，所以「存进去 → 取出来」与「选区从没离开过」逐字节等价。若存的是已经
+模糊过的 coverage，载回再羽化就是二次模糊，往返立刻不相等。add / subtract 按
+形状叠加的同一口径把羽化归 0——新几何对应新的羽化参数；只有 replace 恢复通道
+自带的羽化。这也是壳层载入通道时**不能**走 `finish_new_selection` 的原因：那条
+路会把壳的「新选区羽化」盖到通道羽化上。
+
+**`.comp` 格式**：`engineChannels: [{"name": "...", "feather": N}]`，蒙版单独落在
+`images/<docID>.channel<N>.png`，文件名由数组下标派生（与图层资产同一模式）。
+空表不写键，缺键即「没有通道」；非数组、超过 16 条、条目不是对象、名字/羽化
+非法、PNG 尺寸与画布不符，一律显式报错，不静默丢弃。羽化按 0..250 校验。
+
+**换画布为什么丢通道**：蒙版恒为文档分辨率，通道没有独立的坐标系；图像大小/
+画布大小/裁剪之后旧蒙版已经对不上像素。旋转画布不改变像素数，只是坐标轴旋转，
+因此逐通道转置即可，通道跟着文档一起转。
+
+**壳层面板**与路径/历史面板同款：右栏一次只挂一个面板，打开时关闭滤镜、效果、
+路径、历史、色彩范围（色彩范围持有显式事务，先 abort）。键盘在面板可见时是
+模态的：
+
+| 键 | 动作 |
+|---|---|
+| ↑ / ↓ | 选行（高亮滚进可视区） |
+| 回车 | 载入为选区（replace） |
+| Shift+回车 | 加选 |
+| Ctrl+回车 | 减选（`handle_key` 没有 alt 参数，Alt 组合走不到这里） |
+| S | 存储当前选区，进入命名态 |
+| Del | 删除选中通道（选区不动） |
+| Esc | 命名态取消 / 面板关闭 |
+
+命名走 `WM_CHAR`（与图层改名、字体过滤同一条出口），中文和输入法可用；字数上限
+按**转换后的 UTF-8 字节数**算（255 字节，中文约 85 字），而不是 wchar 个数。
+空名字回车用默认名 `Alpha N`。按 `S` 打开命名后，TranslateMessage 还会再送一次
+`WM_CHAR('s')`，所以 KEYDOWN 路径置 `channel_name_skip_char` 把它吃掉；菜单入口
+不置位，从菜单进来时第一个字符不被吞。鼠标：单击行只选中（载入会顶掉现有选区，
+误点代价大），双击载入，面板空白处吞掉点击，点到面板以外则先取消命名再照常处理。
+
+**新增单测 7 例（667 → 674 例 / 0 失败）**，`tests/test_selection_channels.cpp`：
+`selection_channel_domain_contract`（名字校验边界、容量、无选区拒绝）、
+`selection_channel_abi_round_trip_and_undo`（存/载/名字两段式读、一步撤销）、
+`selection_channel_combine_semantics`（replace 恢复羽化、add/subtract 归零、
+未变化不落步）、`selection_channel_capacity_and_undo`（16 条上限与删除后的索引）、
+`selection_channel_comp_round_trip`（存盘重开：名字/羽化/蒙版）、
+`selection_channel_comp_rejects_bad_entries`（坏 JSON 条目逐条拒绝）、
+`selection_channel_follows_canvas_geometry`（换画布丢弃、旋转转置）。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **674 例 / 0 失败**（`test_selection_channels.cpp` +7） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 与基线一致（本轮未改自检场景） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **163**（152 → 158 → 163，尾部追加，无重排） |
+| `scripts/visual_check.py --scene all` | **145 条 / 27 场景 / 0 失败**（本轮未加场景，只新增命令号 1585/1586） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界**：
+
+- 面板只有文字行，没有 PS 那样的通道缩略图、可见性眼睛与颜色标识；通道不能改名、
+  不能复制、不能直接编辑蒙版（先载入成选区再改，是当前唯一路径）。
+- 名字允许重名（引擎不查重），删除按当前索引，不做「删除后回到原选中项」的粘连。
+- 载入只有 replace / 加选 / 减选三种；PS 的「反向 / 与通道相交」没有做。
+- 通道面板状态（开/关、选中行）按文档存，但不写进 `.comp`，重开从第一行开始。
+- 通道与「快速蒙版」「选择并遮住」还没有打通；通道也不能作为图层蒙版直接使用。
+
+
 
 
 

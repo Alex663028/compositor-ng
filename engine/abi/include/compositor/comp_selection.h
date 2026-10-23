@@ -318,6 +318,68 @@ COMP_API comp_result comp_selection_get_base_bounds(comp_document document, comp
 COMP_API comp_result comp_selection_set_bounds(comp_document document, comp_rect bounds,
                                                int32_t* out_changed);
 
+/* ------------------------------------------------- 存储通道（ROI #5） */
+
+/*
+ * 存储的选区通道 = PS 的 Alpha 通道（Select > Save Selection / Load Selection）。
+ *
+ * 通道是**文档状态**：随 `.comp` 保存、随撤销/重做回退，因此归文档句柄。
+ * 每条通道存「硬边选区蒙版 + 羽化半径」：载回时逐字节恢复硬边并恢复同一个
+ * 羽化参数，保存/载入往返相等（不存烘焙过羽化的 coverage，否则二次模糊）。
+ * 蒙版恒为**文档分辨率**；换画布（Image Size / Canvas Size / Crop）会连同
+ * 选区一起丢弃全部通道，旋转画布则逐通道转置。
+ *
+ * 上限：每条文档 16 个通道（kMaxSelectionChannels）。容量满 -> COMP_ERR_STATE。
+ * ABI 尾部追加：冻结面（前序函数与结构体布局）不变。
+ */
+
+/* 通道数。从未保存过的文档返回 0。只读：不开事务、不进撤销栈。 */
+COMP_API comp_result comp_selection_channel_count(comp_document document, size_t* out_count);
+
+/*
+ * 读取第 index 个通道的名字（UTF-8，含结尾 NUL）。
+ *
+ * 与 comp_layer_get_name 同一把两段式尺子：
+ *   - `out_required` 写所需字节数（含 NUL），即使 buffer 不够也照写；
+ *   - `buffer == NULL` 或 `capacity == 0` 是查询模式：只回长度，返回 COMP_OK；
+ *   - 缓冲区不够时拒绝（COMP_ERR_INVALID_ARGUMENT），不静默截断；
+ *   - 索引越界 -> COMP_ERR_INVALID_ARGUMENT；只读，不开事务。
+ */
+COMP_API comp_result comp_selection_channel_get_name(comp_document document, size_t index,
+                                                     char* buffer, size_t capacity,
+                                                     size_t* out_required);
+
+/*
+ * 把**当前选区**存成一个新通道（追加到末尾），`out_index` 写新下标（可为 NULL）。
+ *
+ *   - name_utf8 必须非空、严格 UTF-8（拒绝超长编码、代理区、截断）、无控制字符、
+ *     不超过 255 字节；否则 COMP_ERR_INVALID_ARGUMENT；
+ *   - 没有选区（active = 0）-> COMP_ERR_STATE；
+ *   - 已达 16 个 -> COMP_ERR_STATE；
+ *   - 成功是一步撤销（加入调用方的显式事务，或自成一个隐式步）；蒙版按 COW
+ *     共享，不复制像素。
+ */
+COMP_API comp_result comp_selection_channel_save(comp_document document, const char* name_utf8,
+                                                 size_t* out_index);
+
+/*
+ * 把第 index 个通道载入选区，combine 取 comp_selection_combine：
+ *   - replace：基础蒙版 = 通道蒙版，羽化 = 通道羽化；
+ *   - add：逐像素取最大值（没有选区时蒙版等价于 replace，羽化仍归 0）；
+ *   - subtract：逐像素相减（没有选区时无操作，羽化不动）；
+ *   - add / subtract 把羽化归 0（与形状叠加同口径）。
+ * 结果与当前选区逐字节相同时 out_changed = 0（不产生空撤销步）。
+ * 索引越界、combine 非法 -> COMP_ERR_INVALID_ARGUMENT；一步撤销；out_changed 可为 NULL。
+ */
+COMP_API comp_result comp_selection_channel_load(comp_document document, size_t index,
+                                                 comp_selection_combine combine,
+                                                 int32_t* out_changed);
+
+/* 删除第 index 个通道。越界 -> COMP_ERR_INVALID_ARGUMENT；成功 out_changed = 1。
+ * 一步撤销；out_changed 可为 NULL。 */
+COMP_API comp_result comp_selection_channel_remove(comp_document document, size_t index,
+                                                   int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

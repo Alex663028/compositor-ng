@@ -27,6 +27,7 @@ void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.doc.filter.select(id);
   shell.doc.filter_open = true;
   shell.doc.filter_input.clear();
@@ -328,6 +329,7 @@ void trim_begin(ShellState& shell) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.doc.trim_open = true;
   shell.doc.trim_input.clear();
   /* 参数保留上次设置（上游 Trim 对话框同样记住上次），只把焦点放回第一行。 */

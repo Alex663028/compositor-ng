@@ -16,6 +16,7 @@
 #include "core/comp_live_handles.h"
 #include "domain/history.h"
 #include "domain/layer_merge.h"
+#include "domain/utf8_text.h"
 #include "engine.h"
 
 namespace compositor {
@@ -280,67 +281,14 @@ bool Document::reorder_layer(comp_layer_id id, comp_layer_id before) {
   return true;
 }
 
-namespace {
-
-/*
- * 严格 UTF-8 校验（拒绝超长编码、代理区 U+D800..U+DFFF、> U+10FFFF 与截断）。
- *
- * 为什么在领域层挡而不是交给宿主：图层名会被 .comp 原样写进 JSON 字符串，
- * 坏字节要么让落盘结构损坏，要么在宿主侧显示成替换字符后**再也无法还原**。
- * 本仓的文字通路（P0-5）同样要按这条口径收 UTF-8，这里是唯一的判定实现。
- */
-bool is_valid_utf8(const std::string& text) {
-  size_t i = 0;
-  const size_t n = text.size();
-  while (i < n) {
-    const unsigned char c = static_cast<unsigned char>(text[i]);
-    if (c < 0x80) {
-      ++i;
-      continue;
-    }
-    size_t extra = 0;
-    uint32_t code = 0;
-    if ((c & 0xE0) == 0xC0) {
-      extra = 1;
-      code = c & 0x1Fu;
-    } else if ((c & 0xF0) == 0xE0) {
-      extra = 2;
-      code = c & 0x0Fu;
-    } else if ((c & 0xF8) == 0xF0) {
-      extra = 3;
-      code = c & 0x07u;
-    } else {
-      return false; /* 0x80..0xBF 的孤立续字节、或 0xF8..0xFF */
-    }
-    if (i + extra >= n) return false; /* 截断：续字节不够 */
-    for (size_t k = 1; k <= extra; ++k) {
-      const unsigned char cc = static_cast<unsigned char>(text[i + k]);
-      if ((cc & 0xC0) != 0x80) return false;
-      code = (code << 6) | (cc & 0x3Fu);
-    }
-    /* 超长编码与代理区/越界码点：一律拒绝（RFC 3629 的合法性判定）。 */
-    if (extra == 1 && code < 0x80) return false;
-    if (extra == 2 && code < 0x800) return false;
-    if (extra == 3 && code < 0x10000) return false;
-    if (code >= 0xD800 && code <= 0xDFFF) return false;
-    if (code > 0x10FFFF) return false;
-    i += extra + 1;
-  }
-  return true;
-}
-
-}  // namespace
-
 bool Document::rename_layer(comp_layer_id id, const std::string& name) {
   Layer* layer = find(id);
   if (layer == nullptr) return false;
   if (name.empty() || name.size() > kMaxLayerNameBytes) return false;
-  if (!is_valid_utf8(name)) return false;
+  if (!utf8_is_valid(name)) return false;
   /* 控制字符（含内嵌 NUL）一律拒绝：名字要单行显示、要进 JSON 字符串，
    * 换行或 NUL 只会让面板与 .comp 各自截断出两个不同的名字。 */
-  for (unsigned char c : name) {
-    if (c < 0x20 || c == 0x7F) return false;
-  }
+  if (!utf8_is_single_line(name)) return false;
   layer->name = name;
   /* 名字只进面板与 .comp，不参与像素求值——不动内容修订号，也不让合成缓存
    * 失效（否则改个名字就要重绘整篇）。 */
@@ -928,6 +876,9 @@ bool Document::resize_image(comp_size size, std::string* error) {
    * 与尺寸变更同属一步撤销：撤销后选区回来，重做后再次消失。
    */
   state_.selection = SelectionState{};
+  /* 通道蒙版同样是文档分辨率，跟着旧画布一起失效（见 domain_state.h 的
+   * SelectionChannel 注释）；上游换画布重建文档时 Alpha 通道也一并消失。 */
+  state_.channels.clear();
   invalidate_composite();
   if (!owns_txn) return true;
   /* commit 失败时已自行回滚到快照（见 txn_commit），失败即未发生。 */

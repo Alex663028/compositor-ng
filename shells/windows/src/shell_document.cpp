@@ -231,6 +231,9 @@ void forget_color_range(ShellState& shell) {
   shell.doc.color_range_input.clear();
   /* 路径面板的锚点同样是旧文档坐标：换文档时一起丢掉（关面板只是顺带）。 */
   path_store_clear(shell);
+  /* ROI #5：通道是旧文档的状态，引擎会随文档销毁；壳侧面板连同未提交的命名
+   * 一起复位（命名缓冲留着会把旧名字带给新文档）。 */
+  channel_store_clear(shell);
   /*
    * 历史面板没有壳侧数据（列表直接来自引擎），换文档后可以继续开着显示新文档的
    * 历史；只把滚动归零，否则可能停在新文档根本到不了的行上。
@@ -728,6 +731,7 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.doc.trim_open = false;
   shell.doc.trim_input.clear();
 
@@ -1430,6 +1434,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     /* ---- P0-4 可选：路径面板 ---- */
     case kCmdSelectPaths:
       path_panel_toggle(shell);
+      break;
+    /* ---- ROI #5：存储选区通道（PS Alpha 通道） ---- */
+    case kCmdSelectChannels:
+      channel_panel_toggle(shell);
+      break;
+    case kCmdSelectSaveChannel:
+      channel_save_begin(shell);
       break;
     /* ---- P1：历史记录面板 ---- */
     case kCmdHistoryPanel:

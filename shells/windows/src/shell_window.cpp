@@ -264,6 +264,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_enabled_recursive(menu, kCmdSelectBorder, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectSmooth, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectLoadPixels, enabled.selection_load_pixels);
+  /* ROI #5：存通道需要当前有选区；通道面板本身随时可开（空列表也给提示）。 */
+  menu_set_enabled_recursive(menu, kCmdSelectSaveChannel, enabled.selection_save_channel);
 }
 
 /* 面板值 -> ABI 结构（唯一映射点，与 ui_core 的行序一一对应）。 */
@@ -1493,6 +1495,59 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
   }
 
   /*
+   * ROI #5 通道面板：面板打开且可见时键盘归面板。命名态吞掉所有键（字符从
+   * WM_CHAR 进来）；非命名态下 Ctrl+回车是唯一的 Ctrl 组合（减选），其余
+   * Ctrl 快捷键照常穿透。
+   */
+  if (channel_panel_visible(shell) && (!ctrl || key == VK_RETURN)) {
+    if (shell.doc.channel_name_active) {
+      switch (key) {
+        case VK_ESCAPE:
+          channel_name_cancel(shell);
+          return;
+        case VK_RETURN:
+          channel_name_commit(shell);
+          return;
+        case VK_BACK:
+          channel_name_backspace(shell);
+          return;
+        default:
+          return; /* 字符在 WM_CHAR，其它键在命名态一律吞掉 */
+      }
+    }
+    switch (key) {
+      case VK_ESCAPE:
+        channel_panel_close(shell);
+        set_status(shell, L"已关闭通道面板");
+        return;
+      case VK_UP:
+        channel_select(shell, -1);
+        return;
+      case VK_DOWN:
+        channel_select(shell, 1);
+        return;
+      case VK_RETURN: {
+        const comp_selection_combine combine = ctrl ? COMP_SELECTION_SUBTRACT
+                                             : shift ? COMP_SELECTION_ADD
+                                                     : COMP_SELECTION_REPLACE;
+        channel_load_selected(shell, combine);
+        return;
+      }
+      case 'S':
+        channel_save_begin(shell);
+        /* 同一个按键的 WM_CHAR('s') 别落进刚打开的名字缓冲。 */
+        if (shell.doc.channel_name_active) shell.doc.channel_name_skip_char = true;
+        return;
+      case VK_DELETE:
+        channel_delete_selected(shell);
+        return;
+      default:
+        break;
+    }
+    return; /* 其余按键吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+  }
+
+  /*
    * 字体面板（P0-6②）打开且可见时键盘归面板。顺序与右栏的绘制优先级一致：
    * 对话框 -> 路径 -> 历史 -> 字体。字母与中文走 WM_CHAR（输入法提交的也是
    * WM_CHAR），这里只管导航、应用与退格；其余键一律吞掉，别让工具快捷键
@@ -2302,6 +2357,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
       }
       /*
+       * ROI #5：通道命名。与图层改名同一条出口（WM_CHAR / 输入法），中文通道名
+       * 能直接进来。命名态在 KEYDOWN 里已把键盘收归面板，这里只管字符。
+       */
+      if (shell != nullptr && shell->doc.channel_name_active) {
+        channel_name_char(*shell, static_cast<wchar_t>(wparam));
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
        * 字体面板（P0-6②）：WM_CHAR 是键入与输入法的共同出口，中文字体名也能
        * 直接过滤。排在 type_active 之前——KEYDOWN 已把面板打开时的键归面板，
        * 这里若先喂给文字缓冲，会变成「插入点在闪、过滤词不动」。
@@ -2330,6 +2394,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         nudge_flush(*shell);
         Layout layout{};
         if (client_layout(*shell, &layout)) {
+          /*
+           * ROI #5：通道命名态下点到别处 = 放弃这次命名（不保存），点击照常继续。
+           * 通道面板内的点击由下面的通道分支处理（它先取消命名再选中行），这里
+           * 只负责面板以外的位置——否则用户点工具按钮/画布时名字会一直挂着。
+           */
+          if (shell->doc.channel_name_active &&
+              !(channel_panel_visible(*shell) &&
+                layout.adjust_panel.contains(mouse_x, mouse_y))) {
+            channel_name_cancel(*shell);
+            InvalidateRect(window, nullptr, FALSE);
+          }
           const int button =
               comp_ui::tool_button_at(layout.toolbar, comp_ui::tool_count(), mouse_x, mouse_y);
           if (button >= 0) {
@@ -2598,7 +2673,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
               shell->doc.doc_dialog == comp_ui::DocDialogKind::None &&
               !shell->doc.color_range_open && !path_panel_visible(*shell) &&
-              !history_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
+              !history_panel_visible(*shell) && !channel_panel_visible(*shell) &&
+              layout.adjust_panel.w > 0 &&
               layout.adjust_panel.contains(mouse_x, mouse_y)) {
             /*
              * P0-3 调整面板：上半行 = 聚焦，下半行（滑道）= 聚焦 + 开始拖动。
@@ -2764,6 +2840,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
+          if (channel_panel_visible(*shell) && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * ROI #5 通道面板：点行 = 选中该条；载入走双击或回车，单击不落动作
+             * （与路径面板同规矩——载入会顶掉用户现有选区，误点代价太大）。
+             * 命名态下点面板 = 先取消命名（不保存），再按行选中。
+             */
+            if (shell->doc.channel_name_active) channel_name_cancel(*shell);
+            const int count = channel_count(*shell);
+            const int scroll = comp_ui::channel_clamp_scroll(layout.adjust_panel, count,
+                                                             shell->doc.channel_scroll);
+            const int index =
+                comp_ui::channel_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+            if (index >= 0) {
+              shell->doc.channel_selected = index;
+              channel_status(*shell);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           if (shell->doc.color_range_open && layout.canvas.contains(mouse_x, mouse_y)) {
             /* 面板打开时画布点击只取样，不交给当前工具（上游 sheet 同语义）。 */
             color_range_sample(*shell, mouse_x, mouse_y, layout);
@@ -2905,6 +3001,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           if (index >= 0) {
             shell->doc.path_selected = index;
             path_apply_selected(*shell);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        }
+        /* ROI #5：双击通道行 = 把它载入选区（与路径面板同一入口规矩）。 */
+        if (client_layout(*shell, &layout) && channel_panel_visible(*shell) &&
+            layout.adjust_panel.w > 0) {
+          const int count = channel_count(*shell);
+          const int scroll = comp_ui::channel_clamp_scroll(layout.adjust_panel, count,
+                                                           shell->doc.channel_scroll);
+          const int index =
+              comp_ui::channel_row_at(layout.adjust_panel, count, scroll, mouse_x, mouse_y);
+          if (index >= 0) {
+            shell->doc.channel_name_active = false;
+            shell->doc.channel_name_skip_char = false;
+            shell->doc.channel_name_input.clear();
+            shell->doc.channel_selected = index;
+            channel_load_selected(*shell, COMP_SELECTION_REPLACE);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
@@ -3672,8 +3786,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           return 0;
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && channel_panel_visible(*shell) &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* ROI #5 通道面板滚轮翻列表：一格 3 行，夹取在 ui_core。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int count = channel_count(*shell);
+            const int next = shell->doc.channel_scroll + (delta > 0 ? -3 : 3);
+            shell->doc.channel_scroll =
+                comp_ui::channel_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          return 0;
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
                    !layout.adjust_collapsed && !shell->doc.effect_open && !shell->doc.filter_open &&
                    !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
+                   !channel_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
           /*
            * P0-3：调整参数表滚动（色阶每页 5 行 / 小窗口），一格 3 行，夹取在 ui_core。
@@ -3935,6 +4063,9 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectPaths, L"路径面板(&T)...\tCtrl+Shift+P");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectChannels, L"通道面板(&C)...");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectSaveChannel, L"存储选区到通道(&A)...");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(select_menu), L"选择(&S)");
 
   HMENU view_menu = CreatePopupMenu();

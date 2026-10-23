@@ -113,8 +113,9 @@ bool rotate_canvas(DocumentState* state, int32_t quarter_turns, bool* changed) {
   const int32_t new_w = swap_dims ? old_h : old_w;
   const int32_t new_h = swap_dims ? old_w : old_h;
 
-  /* 无变化的唯一情形：空文档（无图层、无选区）且画布尺寸不变。 */
-  const bool empty_document = state->layers.empty() && !state->selection.active;
+  /* 无变化的唯一情形：空文档（无图层、无选区、无通道）且画布尺寸不变。 */
+  const bool empty_document =
+      state->layers.empty() && !state->selection.active && state->channels.empty();
   if (empty_document && new_w == old_w && new_h == old_h) {
     return true;
   }
@@ -207,6 +208,18 @@ bool rotate_canvas(DocumentState* state, int32_t quarter_turns, bool* changed) {
   } else if (state->selection.active) {
     /* 显式空选区：网格为空，换坐标系后无法对齐，丢弃（与 crop 同口径）。 */
     state->selection = SelectionState{};
+  }
+
+  /* 通道蒙版是文档分辨率：旋转画布只换坐标系，逐通道精确转置。
+   * 任一张损坏（尺寸非法）就整组丢弃——留下错位的通道比没有通道更危险。 */
+  for (SelectionChannel& channel : state->channels) {
+    if (channel.mask.empty()) continue;
+    MaskBuffer turned;
+    if (!rotate_mask_90(channel.mask, &turned, turns)) {
+      state->channels.clear();
+      break;
+    }
+    channel.mask = std::move(turned);
   }
 
   if (changed != nullptr) *changed = true;

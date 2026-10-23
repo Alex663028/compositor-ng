@@ -235,6 +235,13 @@ constexpr UINT kCmdViewGuides = 1581;      /* 视图 > 参考线（Ctrl+;） */
 constexpr UINT kCmdViewGrid = 1582;        /* 视图 > 网格（Ctrl+'） */
 constexpr UINT kCmdViewSnap = 1583;        /* 视图 > 对齐（Ctrl+Shift+;） */
 constexpr UINT kCmdViewClearGuides = 1584; /* 视图 > 清除参考线 */
+/*
+ * ROI #5 存储选区通道（1585 段）：PS 的 Alpha 通道 / Select > Save Selection。
+ * 通道是文档状态（随 .comp 存取、随撤销回退），ABI 尾部追加了 5 个
+ * comp_selection_channel_*（158 → 163）。面板与历史面板同款列表排版。
+ */
+constexpr UINT kCmdSelectChannels = 1585;    /* 选择 > 通道面板… */
+constexpr UINT kCmdSelectSaveChannel = 1586; /* 选择 > 存储选区到通道… */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -521,6 +528,23 @@ struct DocumentContext {
   int path_serial = 0; /* 命名用流水号（删除后不复用，避免重名） */
   bool history_open = false;
   int history_scroll = 0;
+  /*
+   * ROI #5：存储的选区通道（PS Alpha 通道）。列表本身在引擎文档里（随 .comp
+   * 往返、随撤销回退），壳侧只留面板的显示状态。命名输入走 WM_CHAR，与图层
+   * 改名同一条通路；channel_name_active 期间键盘模态（退格/回车/Esc 在
+   * WM_KEYDOWN，字符在 WM_CHAR）。
+   */
+  bool channel_open = false;
+  int channel_selected = 0;
+  int channel_scroll = 0;
+  bool channel_name_active = false;
+  /*
+   * 面板里按 S 开命名时，TranslateMessage 会把同一个按键变成一条 WM_CHAR
+   * （字符 's'）。置位后在 WM_CHAR 里吞掉恰好一个字符——否则默认名会先被
+   * 塞进一个 s。从菜单进命名不置位。
+   */
+  bool channel_name_skip_char = false;
+  std::wstring channel_name_input; /* 存储通道的命名缓冲 */
   /*
    * ROI #3 视图开关。按**文档**记而不是按会话记：换文档时连同文档一起复位，
    * 否则会出现「A 文档关掉的标尺在 B 文档莫名打开」。参考线本身不是开关，

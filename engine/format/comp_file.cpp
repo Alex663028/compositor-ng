@@ -15,6 +15,8 @@
 #include "core/comp_geometry.h"
 #include "domain/document.h"
 #include "domain/guide.h"
+#include "domain/selection.h"
+#include "domain/selection_channel.h"
 #include "domain/text_layer.h"
 #include "engine.h"
 #include "format/comp_json.h"
@@ -141,6 +143,14 @@ std::string pixel_file_name(const std::string& uuid, comp_pixel_format format) {
   return uuid + ".png";
 }
 std::string mask_file_name(const std::string& uuid) { return uuid + ".mask.png"; }
+
+/* 选区通道的资产名**由文档 ID + 数组下标派生**，manifest 里不存路径：
+ * 载入时不接受任何来自文件的路径字符串，也就不存在「manifest 指到 images/
+ * 之外」这类输入。重排/删除通道会让后续下标前移，因此保存时必须整篇重写
+ * 全部通道文件（下面就是这样做的），不能只补写新增的那一个。 */
+std::string channel_file_name(const std::string& document_id, size_t index) {
+  return document_id + ".channel" + std::to_string(index) + ".png";
+}
 
 bool ends_with(const std::string& text, const char* suffix) {
   const size_t length = std::strlen(suffix);
@@ -489,6 +499,40 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
     manifest.set("engineGuides", std::move(guides));
   }
 
+  /* 存储通道（engineChannels）：同样空表不写键。每条只落名字与羽化半径，
+   * 蒙版写到 images/<documentID>.channel<N>.png（名字由数组下标派生）。 */
+  if (!state.channels.empty()) {
+    JsonValue channels = JsonValue::array({});
+    for (size_t i = 0; i < state.channels.size(); ++i) {
+      const SelectionChannel& channel = state.channels[i];
+      if (channel.mask.empty() || channel.mask.width != state.width ||
+          channel.mask.height != state.height) {
+        if (error != nullptr) *error = "selection channel mask size mismatch";
+        return false;
+      }
+      std::vector<uint8_t> png;
+      if (!png_encode_gray8(channel.mask.pixel_data().data(), channel.mask.width,
+                            channel.mask.height, &png, error)) {
+        return false;
+      }
+      if (!write_bytes_file(images_dir / fs::u8path(channel_file_name(state.document_id, i)),
+                            png.data(), png.size(), error)) {
+        return false;
+      }
+
+      double feather = static_cast<double>(channel.feather);
+      if (!(feather >= 0.0)) feather = 0.0; /* 同时挡住 NaN */
+      if (feather > static_cast<double>(kMaxSelectionFeather)) {
+        feather = static_cast<double>(kMaxSelectionFeather);
+      }
+      JsonValue entry = JsonValue::object({});
+      entry.set("name", JsonValue::string(channel.name));
+      entry.set("feather", JsonValue::number(feather));
+      channels.push(std::move(entry));
+    }
+    manifest.set("engineChannels", std::move(channels));
+  }
+
   JsonValue layers = JsonValue::array({});
   for (const Layer& layer : state.layers) {
     const std::string uuid = layer_uuid[layer.id];
@@ -814,6 +858,74 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       guide.axis = static_cast<uint32_t>(axis_value);
       guide.position = position_value;
       state.guides.push_back(guide);
+    }
+  }
+
+  /* 存储通道（engineChannels）。缺键 = 没有通道；键存在则严格读：
+   * 名字必须是合法通道名、feather 在 0..250、蒙版 PNG 必须恰好是文档尺寸。
+   * 资产名由 (documentID, 下标) 派生，manifest 里的路径字段一律不认。 */
+  const JsonValue* channel_entries = manifest.find("engineChannels");
+  if (channel_entries != nullptr && !channel_entries->is_null()) {
+    if (!channel_entries->is_array()) {
+      if (error != nullptr) *error = "engineChannels must be an array";
+      return false;
+    }
+    if (channel_entries->as_array().size() > kMaxSelectionChannels) {
+      if (error != nullptr) *error = "too many selection channels in manifest";
+      return false;
+    }
+    for (size_t i = 0; i < channel_entries->as_array().size(); ++i) {
+      const JsonValue& entry = channel_entries->as_array()[i];
+      if (!entry.is_object()) {
+        if (error != nullptr) *error = "engineChannels must contain objects";
+        return false;
+      }
+      const JsonValue* name = entry.find("name");
+      const JsonValue* feather = entry.find("feather");
+      if (name == nullptr || !name->is_string() || feather == nullptr ||
+          !feather->is_number()) {
+        if (error != nullptr) *error = "selection channel must carry string name and numeric feather";
+        return false;
+      }
+      const std::string channel_name = name->as_string();
+      if (!selection_channel_name_is_valid(channel_name)) {
+        if (error != nullptr) *error = "selection channel name is invalid";
+        return false;
+      }
+      const double feather_value = feather->as_number();
+      if (!(feather_value >= 0.0) ||
+          feather_value > static_cast<double>(kMaxSelectionFeather)) {
+        if (error != nullptr) *error = "selection channel feather is out of range";
+        return false;
+      }
+
+      std::vector<uint8_t> bytes;
+      if (!read_bytes_file(images_dir_of(root) / fs::u8path(channel_file_name(document_id, i)),
+                           &bytes, error)) {
+        return false;
+      }
+      PngImage decoded;
+      if (!png_decode_rgba8(bytes.data(), bytes.size(), &decoded, error)) return false;
+      if (decoded.width != width || decoded.height != height) {
+        if (error != nullptr) *error = "selection channel mask size does not match document";
+        return false;
+      }
+
+      SelectionChannel channel;
+      channel.name = channel_name;
+      channel.feather = static_cast<float>(feather_value);
+      channel.mask.resize(decoded.width, decoded.height, 0);
+      std::vector<uint8_t>& mask_px = channel.mask.writable_pixels();
+      for (int32_t y = 0; y < decoded.height; ++y) {
+        for (int32_t x = 0; x < decoded.width; ++x) {
+          const size_t index =
+              (static_cast<size_t>(y) * static_cast<size_t>(decoded.width) +
+               static_cast<size_t>(x)) * 4u;
+          mask_px[static_cast<size_t>(y) * static_cast<size_t>(decoded.width) +
+                  static_cast<size_t>(x)] = decoded.rgba[index];
+        }
+      }
+      state.channels.push_back(std::move(channel));
     }
   }
 

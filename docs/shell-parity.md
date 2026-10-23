@@ -2703,6 +2703,64 @@ ABI CRUD 各一步撤销（`changed = 0` 不落步）、非法参数拒绝、`.c
 的落点还没共用这一套。⑤ 参考线位置是文档像素的绝对值，画布尺寸变小后越界的线
 会留在文档外（不自动夹取，避免「改画布就悄悄挪我的线」）。
 
+### 5.55 通道面板：存储 / 载入选区（ROI #5，2026-10-23）
+
+`docs/ps-parity.md` §4 的 ROI 第 5 顺位，选区维 80% → 90%。引擎侧
+（`domain/selection_channel.*`、`comp_selection.h` 尾部追加 5 个导出，158 → **163**、
+`engineChannels` + `images/<docID>.channel<N>.png`）见 README §6.92；本节只记壳。
+壳层仍然**零新增导出**。
+
+**1. 面板同构。** 通道面板直接在 `layout.adjust_panel` 里画，行几何在 `ui_core.h`
+（`kChannelRowHeight = 22`、`kChannelRowsTop = 64`、`kChannelPanelFooter = 96`、
+`kChannelMaxEntries = 16`），`channel_clamp_scroll` / `channel_visible_rows` /
+`channel_row_rect` / `channel_row_at` 全部转调既有的 `list_*`。绘制与命中读同一组
+函数，和路径/历史面板一样不存在「画在这一行、点中下一行」。右栏一次只挂一个面板：
+打开通道面板时依次关掉滤镜（先 `filter_preview_forget`）、效果、路径、历史；
+色彩范围持有显式事务，先 `color_range_cancel` 再让位。反向也对称——其它面板的
+打开路径都补了 `channel_panel_close`，文档对话框与换文档路径同理。
+
+**2. 键位是模态的。** `channel_panel_visible() = channel_open && tool != Type`
+（文字工具独占右栏时面板挂着不显示，与既有面板同规矩）。`handle_key` 里通道块
+排在历史之后、字体之前，闸门是 `!ctrl || key == VK_RETURN`——`Ctrl+回车` 必须放
+进来做减选。没有 `alt` 参数（Alt 组合走 `WM_SYSKEYDOWN`），所以加选用 Shift、
+减选用 Ctrl，与 PS 的 Shift/Alt 不同，状态栏与面板底部的提示都写明这一点。
+编辑键在 `WM_KEYDOWN`；字符走 `WM_CHAR`，中文与输入法从那里进来，排在字体面板
+之前、文字缓冲之后。
+
+**3. 命名态的坑。** 面板里按 `S` 会先 `channel_save_begin`，随后
+`TranslateMessage` 还会把 `'s'` 以 `WM_CHAR` 再送一次。因此 KEYDOWN 路径在
+**成功进入命名态之后**置 `channel_name_skip_char`，`channel_name_char` 第一件事
+就是消费它；菜单入口不置位，从菜单进来时第一个字符正常落进缓冲。名字上限按
+`narrow_utf8(next).size() > 255` 判断——按 wchar 计数会放过 85 个汉字以上的名字，
+到引擎才被拒。空名字回车用 `Alpha N`（`channel_count + 1`，允许重名，引擎不查重）。
+提交失败时命名态保持打开，用户改一个字再回车即可，不用从头来。
+
+**4. 载入不走 `finish_new_selection`。** 普通「新选区」命令走那条函数，它会把壳的
+「新选区羽化」盖到结果上；通道自带羽化，套上去就不再是存进去的那份选区。通道载入
+只做 `refresh_selection` + 历史深度提示：`changed == 0` 时给「与当前选区相同」或
+「当前没有选区，减选无操作」并且**不刷新**成「已载入」；`changed != 0` 才走
+`finish_selection_command` 并注明「一步撤销」。
+
+**5. 鼠标。** 单击行只选中（载入会顶掉现有选区，误点代价大），双击载入 replace；
+单击面板空白吞掉点击，不漏给调整滑杆。命名态下点面板内 = 先取消命名再选行；点到
+面板以外 = 先取消命名，点击本身照常继续（工具按钮、画布、其它面板都能用）。滚轮
+在面板上翻列表，一格 3 行，夹取在 `ui_core`；调整面板与滚轮分支都显式排除了
+`channel_panel_visible` 的矩形。
+
+**6. 命令号与菜单。** `kCmdSelectChannels = 1585`（通道面板…）、
+`kCmdSelectSaveChannel = 1586`（存储选区到通道…），挂在「选择」菜单末尾，
+`kCmdSelectSaveChannel` 的启用态接 `enabled.selection_save_channel = has_selection`；
+面板本身随时可开（空列表也给「还没有通道」的提示）。未注册快捷键。
+
+**7. 测试与边界。** 壳层没有新增单测（几何全部复用 `list_*`，已被
+`tests/test_ui_core.cpp` 的列表用例覆盖）；引擎新增 7 例，见 README §6.92。
+本轮 `build.py` **674 例 / 0 失败**，`run_regression.py --require-ohos` **6/6 PASS**，
+视觉探针 **145 条 / 27 场景 / 0 失败**（未加场景），壳自检 **263 项 / failures=0 /
+SHA256 与基线一致**（未改自检场景）。边界：没有通道缩略图与可见性眼睛，不能改名/
+复制/直接编辑蒙版；载入只有 replace / 加选 / 减选，没有「反向 / 相交」；面板开关
+与选中行不写进 `.comp`。
+
+
 
 
 

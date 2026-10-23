@@ -393,6 +393,7 @@ void font_panel_toggle(HWND window, ShellState& shell) {
   shell.doc.trim_input.clear();
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.font_open = true;
   if (!shell.font_scan_started) {
     font_scan_start(window, shell);

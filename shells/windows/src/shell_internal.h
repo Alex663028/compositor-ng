@@ -412,6 +412,22 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void history_step(ShellState& shell, int delta);
   int history_brush_resolved_state(const ShellState& shell);
   void history_panel_toggle(ShellState& shell);
+  /* ROI #5：存储的选区通道（PS Alpha 通道）。 */
+  bool channel_panel_visible(const ShellState& shell);
+  int channel_count(const ShellState& shell);
+  std::wstring channel_name(const ShellState& shell, int index);
+  void channel_status(ShellState& shell);
+  void channel_select(ShellState& shell, int delta);
+  void channel_load_selected(ShellState& shell, comp_selection_combine combine);
+  void channel_delete_selected(ShellState& shell);
+  void channel_panel_toggle(ShellState& shell);
+  void channel_panel_close(ShellState& shell);
+  void channel_store_clear(ShellState& shell);
+  void channel_save_begin(ShellState& shell);
+  void channel_name_char(ShellState& shell, wchar_t ch);
+  void channel_name_backspace(ShellState& shell);
+  void channel_name_commit(ShellState& shell);
+  void channel_name_cancel(ShellState& shell);
   void pen_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout);
   void pen_drag(ShellState& shell, int x, int y, const Layout& layout);
   void pen_up(HWND window, ShellState& shell);
@@ -610,6 +626,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void draw_color_range_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
+  void draw_selection_channel_panel(HDC dc, const ShellState& shell,
+                                    const comp_ui::Rect& panel_rect);
   void draw_type_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_font_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   bool clip_axis_aligned(const comp_ui::Rect& canvas, comp_ui::Point* a, comp_ui::Point* b);

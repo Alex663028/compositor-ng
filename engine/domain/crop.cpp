@@ -163,6 +163,8 @@ bool crop_apply(DocumentState* state, const comp_rect& rect, bool* changed) {
   /* 换画布 = 换坐标系：选区蒙版按旧画布分辨率存的，留下就是错位的。
    * 上游 commitCrop → applyDocumentSize 重建 CanvasDocument，选区自然消失。 */
   state->selection = SelectionState{};
+  /* 通道蒙版是文档分辨率，裁剪后与新画布错位——与选区一起丢弃。 */
+  state->channels.clear();
   if (changed != nullptr) *changed = true;
   return true;
 }

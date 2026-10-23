@@ -21,6 +21,7 @@
 #include "comp_abi_internal.h"
 #include "domain/layer.h"
 #include "domain/selection.h"
+#include "domain/selection_channel.h"
 #include "domain/selection_pixels.h"
 
 namespace {
@@ -517,6 +518,137 @@ comp_result comp_selection_set_bounds(comp_document document, comp_rect bounds,
   bool changed = false;
   if (!compositor::selection_transform_bounds(&doc->selection(), bounds, &changed)) {
     return compositor::abi::fail(engine, COMP_ERR_STATE, "selection mask is corrupt");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+/* ----------------------------------------------------- 存储通道（ROI #5） */
+
+comp_result comp_selection_channel_count(comp_document document, size_t* out_count) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_count == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_count is null");
+  }
+  *out_count = doc->state().channels.size();
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_selection_channel_get_name(comp_document document, size_t index, char* buffer,
+                                            size_t capacity, size_t* out_required) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  const DocumentState& state = doc->state();
+  if (index >= state.channels.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "channel index out of range");
+  }
+  const size_t required = state.channels[index].name.size() + 1; /* 含结尾 NUL */
+  *out_required = required;
+  /* 查询模式：只问长度（capacity 为 0 也算），不碰 buffer。 */
+  if (buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    /* 不静默截断：截断可能切掉一个多字节字符的尾部，宿主拿到的是坏 UTF-8。 */
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "channel name buffer is too small (see out_required)");
+  }
+  std::memcpy(buffer, state.channels[index].name.c_str(), required);
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_selection_channel_save(comp_document document, const char* name_utf8,
+                                        size_t* out_index) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (name_utf8 == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "channel name is null");
+  }
+  /* 有界扫描：调用方可能传未以 NUL 结尾的缓冲，不能直接交给 std::string。 */
+  size_t length = 0;
+  while (length <= compositor::kMaxSelectionChannelNameBytes && name_utf8[length] != '\0') {
+    ++length;
+  }
+  if (length > compositor::kMaxSelectionChannelNameBytes) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "channel name exceeds 255 bytes");
+  }
+  const std::string name(name_utf8, length);
+  if (!compositor::selection_channel_name_is_valid(name)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "invalid channel name (empty, control char, or malformed UTF-8)");
+  }
+  if (!doc->state().selection.active) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "no active selection to save");
+  }
+  if (doc->state().channels.size() >= compositor::kMaxSelectionChannels) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "selection channel limit reached");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Save Selection Channel");
+  size_t index = 0;
+  if (!compositor::selection_channel_save(&doc->state(), name, &index)) {
+    /* 上面已经排除了参数与容量；走到这里说明蒙版尺寸与文档不符（状态损坏）。 */
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "selection channel save failed");
+  }
+  txn.commit();
+  if (out_index != nullptr) *out_index = index;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_channel_load(comp_document document, size_t index,
+                                        comp_selection_combine combine, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (index >= doc->state().channels.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "channel index out of range");
+  }
+  if (combine < COMP_SELECTION_REPLACE || combine > COMP_SELECTION_SUBTRACT) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Load Selection Channel");
+  bool changed = false;
+  if (!compositor::selection_channel_load(&doc->state(), index, combine, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "selection channel mask is corrupt");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_channel_remove(comp_document document, size_t index,
+                                          int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (index >= doc->state().channels.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "channel index out of range");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Delete Selection Channel");
+  bool changed = false;
+  if (!compositor::selection_channel_remove(&doc->state(), index, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "selection channel remove failed");
   }
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)

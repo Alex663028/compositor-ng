@@ -284,7 +284,11 @@ comp_result comp_document_set_size(comp_document document, comp_size size) {
   /* 换画布 = 换坐标系：选区蒙版按旧画布分辨率存的，留下就是错位的。
    * 上游 applyDocumentSize 重建 CanvasDocument，选区不随行（Crop 同口径，
    * 见 domain/crop.cpp）。尺寸没变时保留选区。 */
-  if (resized) state.selection = compositor::SelectionState{};
+  if (resized) {
+    state.selection = compositor::SelectionState{};
+    /* 通道蒙版同样是文档分辨率，随旧画布一起失效（见 domain_state.h）。 */
+    state.channels.clear();
+  }
   /*
    * M1 不做重采样：仅把超出画布的图层包围盒裁剪回画布范围。
    *

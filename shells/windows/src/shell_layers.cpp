@@ -1185,6 +1185,7 @@ void open_effect_panel(ShellState& shell, int kind) {
   filter_preview_forget(shell); /* 滤镜预览帧不能留在新面板底下 */
   shell.doc.path_open = false;
   shell.doc.history_open = false;
+  channel_panel_close(shell);
   shell.doc.effect_open = true;
   shell.doc.effect_kind = comp_ui::clamp_effect_kind(kind);
   reset_effect_values(shell);

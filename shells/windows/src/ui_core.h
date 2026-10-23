@@ -3860,6 +3860,7 @@ struct LayerMenuEnabled {
   bool isolated = false;
   bool selection_modify = false; /* 取消选择/反选/扩展/收缩：都要先有选区 */
   bool selection_load_pixels = false;
+  bool selection_save_channel = false; /* 存储选区到通道：没有选区时引擎会拒 */
   bool layer_rasterize_text = false; /* 栅格化文字：只对可编辑文字图层有动作 */
 };
 
@@ -3886,6 +3887,9 @@ inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
   enabled.isolated = state.has_layer && state.is_group;
   enabled.selection_modify = state.has_selection;
   enabled.selection_load_pixels = state.has_layer;
+  /* 存储通道要一份**当前选区**：没有选区时 comp_selection_channel_save 只会
+     回 COMP_ERR_STATE，提前置灰比让用户白按一次诚实。 */
+  enabled.selection_save_channel = state.has_selection;
   /* 普通图层上「栅格化文字」是纯空操作（引擎幂等返回 OK、不记撤销步），置灰。 */
   enabled.layer_rasterize_text = state.has_layer && state.is_text;
   return enabled;
@@ -4165,6 +4169,41 @@ inline Rect history_row_rect(const Rect& panel, int row) {
 inline int history_row_at(const Rect& panel, int count, int scroll, double x, double y) {
   return list_row_at(panel, count, scroll, x, y, kHistoryRowsTop, kHistoryPanelFooter,
                      kHistoryRowHeight);
+}
+
+/* ---------------------------------------- 通道面板（ROI #5，2026-10-23） */
+
+/*
+ * 与路径/历史同一套列表排版：标题（8+22）之后一行摘要，列表从 y+64 起，
+ * 底部留 3 行提示。上限与引擎的 kMaxSelectionChannels 对齐（16）：引擎才是
+ * 真值，这里只用来画「n / 16」和提前把「满」说清楚。
+ */
+inline constexpr int kChannelRowHeight = 22;
+inline constexpr int kChannelRowsTop = 64;
+inline constexpr int kChannelPanelFooter = 96;
+inline constexpr int kChannelMaxEntries = 16;
+
+inline int channel_visible_rows(const Rect& panel) {
+  return list_visible_rows(panel, kChannelRowsTop, kChannelPanelFooter, kChannelRowHeight);
+}
+
+inline int channel_clamp_scroll(const Rect& panel, int count, int scroll) {
+  return list_clamp_scroll(panel, count, scroll, kChannelRowsTop, kChannelPanelFooter,
+                           kChannelRowHeight);
+}
+
+inline int channel_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  return list_ensure_visible(panel, count, index, scroll, kChannelRowsTop,
+                             kChannelPanelFooter, kChannelRowHeight);
+}
+
+inline Rect channel_row_rect(const Rect& panel, int row) {
+  return list_row_rect(panel, row, kChannelRowsTop, kChannelRowHeight);
+}
+
+inline int channel_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  return list_row_at(panel, count, scroll, x, y, kChannelRowsTop, kChannelPanelFooter,
+                     kChannelRowHeight);
 }
 
 /* ---------------------------------------------- 字体面板（P0-6②，S45） */
