@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 当时只读（2026-10-23 起改为树内自研的分层读写，见 §6.87）；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **625 用例 0 失败**；Windows 外壳实机自检 **257 项全 OK**（与仓内基线逐字节一致）。
+  全量 **654 用例 0 失败**；Windows 外壳实机自检 **263 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -546,6 +546,8 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
   `test_c4_exr_export.cpp` 覆盖合成结果导出（见 §6.1.20）；
   PNG 导出→导入**往返逐字节精确**；JPEG 往返**有损但一致**；`import_layer` 恰好追加一层；
   文件缺失是 IO 错误而非「不支持」；不可用格式（如 TIFF）显式 `UNSUPPORTED`；
+  **PSD 的 note 必须说全两条通道**（含 `comp_io_export_document` 与 `flattened`，且不再出现
+  `READ-ONLY`，见 §6.88）；
   **P1-2 负向入库**：伪造 IHDR（`40000x40000` 与 `1000000x4`，CRC 重算）在 C ABI（libpng 路径）
   与自研 `comp_png` **直调**路径上都被拒，且 `comp_engine_last_error` 带上真实原因（原为临时探针，
   见报告 §6.4-1/§6.4-2）。
@@ -604,7 +606,7 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
 | 面板控件由引擎驱动 | 外壳经 `comp_layer_adjustment_param_count` / `param_at` 取控件元数据，经 `comp_layer_adjustment_build_settings` 组装 settings JSON（壳内不拼、不解析 JSON）；实机自检回读 `{"exposureSettings":{"exposure":1.5,"offset":0.25,"gamma":2.2}}` |
 | 调整图层回读 | `.comp` 往返后 `comp_layer_adjustment_count == 1`，kind 与 settings 逐字节一致（`tests/test_adjustment.cpp`） |
 | 外壳实机自检 | `build/compositor_shell.exe --selftest=<报告文件路径>` 实机 **rc = 0**，**27 项全 OK**（本轮新增调整面板 7 项 + 删除 3 项） |
-| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（只读）；EXR = `BUILTIN`（树内 scanline 读写器，note 写明可写 HALF 与支持的压缩）；未知格式 = `COMP_ERR_NOT_FOUND` |
+| 编解码能力表 | `comp_io_codec_support` 两段式查询：PNG = `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）、JPEG = `VENDORED`（stb，note 含 `stb_image`）、PSD = `VENDORED`（拍平只读；分层读写走 §6.87 的文档入口）；EXR = `BUILTIN`（树内 scanline 读写器，note 写明可写 HALF 与支持的压缩）；未知格式 = `COMP_ERR_NOT_FOUND` |
 | 真实导入 / 导出 | `comp_io_export` / `comp_io_import` / `comp_io_import_layer` 已打通：PNG 8x6 全不透明像素往返 **diffs = 0、worst = 0 LSB**；JPEG 往返有损但一致 |
 | 独立解码器交叉 | `scripts/crosscheck_codec.py` 用 PIL 12.3.0 回读引擎产物：`round_trip.png` / `layer_source.png` / `round_trip.jpg` 全部 `[OK]`、`failures = 0` |
 | 回归（M5 当时） | `summary: 83 cases, 0 failed, 0 check failures`；累计到最新为 **106**（见 §6.1.6） |
@@ -5789,10 +5791,10 @@ PSD 库（vendoring 一个完整的 PSD 库会同时引入它自己的格式解�
 | 项 | 内容 |
 |---|---|
 | `engine/format/psd_codec.{h,cpp}` | 分层读写器。读：8 / 16 位 RGB(A)，raw(0) / RLE(1)，图层记录（名字、可见性、不透明度、偏移、剪贴标志）、图层蒙版（-2）、组（`lsct`）；写：同一子集，RLE 通道 + 16 位 `Lr16` 附加块 |
-| `engine/abi/src/comp_io_abi.cpp` | 新 ABI 只做**纯尾追加**：`comp_io_import_document` / `comp_io_export_document`，`^COMP_API` 150 → **152**；`comp_io_codec_support(PSD)` 维持 `COMP_CODEC_VENDORED` + 非空 note。注意 `codec_registry` 的 note 描述的是**老的拍平路径**：`comp_io_export`（单张合成结果）对 PSD 仍如实 `COMP_ERR_UNSUPPORTED`，分层导出走新入口——本轮不动旧入口与其基线 |
+| `engine/abi/src/comp_io_abi.cpp` | 新 ABI 只做**纯尾追加**：`comp_io_import_document` / `comp_io_export_document`，`^COMP_API` 150 → **152**；`comp_io_codec_support(PSD)` 维持 `COMP_CODEC_VENDORED` + 非空 note。`comp_io_export`（单张合成结果）对 PSD 仍如实 `COMP_ERR_UNSUPPORTED`，分层导出走新入口。**当时登记表的 note 仍写着 `READ-ONLY: ... export unsupported`**（描述的是老的拍平路径）——这是不实陈述，本轮未改，下一轮 §6.88 改正 |
 | `engine/format/comp_file.cpp` | 组混合模式与穿透落进 `.comp`：`engineBlendMode` / `engineIsolated`。**默认值不落盘**（旧工程 manifest 逐字节不变），`blendMode` 仍写 Normal 保持上游兼容 |
 | `scripts/crosscheck_psd.py` | 独立交叉验证：由 psd-tools 现场生成参考 PSD，再让引擎走与宿主同一条 C ABI 导入/导出 |
-| `shells/windows/src/shell_document.cpp` | **壳接线（M1.5）**：打开按扩展名分派（`.psd` → `comp_io_import_document`，其余 → `comp_io_import`）；「文件 > 导出为」过滤器加 PSD，`.psd` → `comp_io_export_document`。分层读失败**不回落**拍平，具名原因进状态栏。壳自检 257 项 / SHA256 与基线逐字节一致（改动落在自检未覆盖的 GUI 入口） |
+| `shells/windows/src/shell_document.cpp` | **壳接线（M1.5）**：打开按扩展名分派（`.psd` → `comp_io_import_document`，其余 → `comp_io_import`）；「文件 > 导出为」过滤器加 PSD，`.psd` → `comp_io_export_document`。分层读失败**不回落**拍平，具名原因进状态栏。壳自检 257 项 / SHA256 与基线逐字节一致——因为**当时这条分派没有任何自检覆盖**（GUI 入口被模态对话框挡着），下一轮 §6.88 补齐 |
 
 **能力边界（超出即拒绝，绝不静默近似）。** 拒绝清单：PSB（版本 2）、32 位、灰度 /
 CMYK / 索引色、ZIP / ZIP+predictor 压缩、`diss`/`dkCl`/`lgCl` 混合模式、真实蒙版通道
@@ -5840,7 +5842,7 @@ CMYK / 索引色、ZIP / ZIP+predictor 压缩、`diss`/`dkCl`/`lgCl` 混合模�
 |---|---|
 | `scripts/build.py` | **654 例 / 0 失败**（新增 3 条剪贴语义用例） |
 | `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
-| 壳自检 | **257 项 failures=0**，SHA256 `377de660d48ac933…` 与基线一致 |
+| 壳自检 | **257 项 failures=0**，SHA256 `377de660d48ac933…` 与基线一致（§6.88 之后为 **263 项 / `2f3b81c4…`**） |
 | OHOS 交叉编译 | `compile ok=115 fail=0`（较上轮 +1，即新增的 `psd_codec.cpp`） |
 | `^COMP_API` 导出 | **152**（150 + 2，纯尾追加） |
 | `scripts/check_tool_table.py` | PASS（20 工具） |
@@ -5849,6 +5851,73 @@ CMYK / 索引色、ZIP / ZIP+predictor 压缩、`diss`/`dkCl`/`lgCl` 混合模�
 
 已知边界：写入侧目前只产出 8 / 16 位 PSD（浮点合成结果显式拒绝，不悄悄截断）；
 WebP 仍未接入（只读导入留作 M1 的可选项）。
+
+### 6.88 修正 PSD 能力描述不实 + 补齐分层入口自检（2026-10-23，Claude）
+
+上一轮（§6.87）交付了分层读写，但留了两个尾巴：**登记表对 PSD 说了假话**，**新入口没有自检**。
+两个都是「引擎能做的事，宿主/回归看不见」——本轮一并收掉，作为**一次**基线变更。
+
+**问题一：note 仍写 `READ-ONLY`。** `codec_registry.cpp` 的 PSD 条目停在 M1 之前：
+`...; READ-ONLY: import supported, export unsupported`。而 M1 之后分层读写早已可用。
+要命的地方在于**宿主唯一能看到的证据就是这条 note**——`comp_io_codec_support` 只回
+`state` + `note`，`can_read` / `can_write` 两个 bool 根本不导出。note 说「导出不支持」，
+宿主就会把「分层可写」报成「整个格式不能写」。
+
+修法三步，**不动 ABI、不动 bool**：
+
+| 改动 | 内容 |
+|---|---|
+| `engine/format/codec_registry.cpp` | PSD note 重写：`vendored real library (...) for flattened read; layered read/write via comp_io_import_document / comp_io_export_document (...); flattened comp_io_export is unsupported - use the document entry points`。两条通道与各自的边界都在里面 |
+| `engine/format/codec_registry.h` | 把 `can_read` / `can_write` 的语义钉死为**栅格（拍平）通道**，并写明「分层能力只能写进 note」的原因 |
+| `engine/abi/src/comp_io_abi.cpp` | `unsupported_write_reason` 加 `flattened`：`PSD flattened export is unsupported: <note>`。用户不会再被告知「整个 PSD 不能写」 |
+
+**刻意没有把 `can_write` 改成 true。** 拍平 `comp_io_export` 对 PSD 确实写不出来
+（`tests/test_codec.cpp` 就在断言这件事）；改成 true 只会让 `unsupported_write_reason`
+落到 `unsupported_reason()`，报出 `PSD is not available in this build` —— 比原来更假。
+**缺陷在文案，不在能力位。**
+
+**问题二：分层分派没有自检。** `.psd` → `comp_io_import_document` 的分派写在
+`open_path_as_document` 里，而这条路径被 GUI 的模态对话框挡着，自动化点不进去；
+上一轮只能说「壳自检 257 项不变」，那**不是证据，是没有覆盖**。分派一旦退化成
+`comp_io_import`，用户看到的是一张「打开了、但只剩一层」的图——不报错，数据已经丢了。
+
+自检做法（`shell_selftest.cpp` 尾部追加，只加不改）：临时目录里建 14×12 两层不透明
+RGBA8 文档（预乘与「像素尺寸 = transform 尺寸」两条 ABI 契约都满足），导出 → 回读 →
+再走壳的 `open_path_as_document`。**判据取图层数**：同一个两层 PSD，拍平路径读回来永远
+是 1 层。这个差异可判定，且不依赖像素容差。新增 6 项：
+
+```
+[OK] PSD layered fixture builds (2 layers)
+[OK] comp_io_export_document(PSD) writes a layered file
+[OK] comp_io_import_document(PSD) round trip keeps both layers
+[OK] flattened comp_io_export(PSD) is still rejected
+[OK] shell open_path_as_document(.psd) takes the layered path
+[OK] shell open_path_as_document(.png) still opens one flattened layer
+```
+
+最后一项是**反向护栏**：分派不能为了 PSD 把普通位图也改道（PNG 仍须是 1 层、240×160）。
+
+**基线变更（附录式，需批准）。** `compositor_shell_selftest.txt` **257 项 → 263 项**，
+SHA256 `377de660d48ac933…` → `2f3b81c4fc599cb7…`。diff 仅一处：`[summary]` 之前插入
+1 个空行 + 6 个 `[OK]`，其余 270 行逐字节不变。新增项只输出固定标签，不含临时路径，
+因此基线仍可逐字节复现。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **654 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` == 新基线 |
+| OHOS 交叉编译 | `compile ok=115 fail=0` + NAPI 壳 rc=0 |
+| `^COMP_API` 导出 | **152**（未变；本轮零 ABI 变更） |
+| `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败** |
+| `scripts/visual_check.py --scene all` | **128 条 / 24 场景 / 0 失败** |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+顺带把 `docs/codec-migration.md` 里同样过时的 PSD / EXR 口径改掉：该文档 §1 表格与失败
+语义段仍写着「PSD 只读」「EXR 不可用」，并在顶部标注第 2–5 节是 M5 当时的快照
+（83 cases / 27 项自检），不可当当前基线引用。
 
 
 

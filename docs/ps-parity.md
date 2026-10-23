@@ -108,7 +108,7 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 |---|---|
 | `scripts/build.py` | **654 例 / 0 失败**，零编译告警 |
 | `scripts/run_regression.py --require-ohos` | **6/6 PASS**（654 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
-| 壳自检 | **257 项 failures=0**，SHA256 `377de660d48ac933…` 与基线逐字节一致 |
+| 壳自检 | **263 项 failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批） |
 | OHOS 交叉编译 | `compile ok=115 fail=0` |
 | `^COMP_API` 导出 | **152**（只尾部追加，无重排） |
 | `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |

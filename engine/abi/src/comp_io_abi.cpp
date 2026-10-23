@@ -125,13 +125,19 @@ std::string unsupported_reason(comp_image_format format) {
          entry->backend + "): " + entry->note;
 }
 
-/* 写侧不可用（如 PSD 只读）与整体不可用要给出不同原因。 */
+/*
+ * 写侧不可用与整体不可用要给出不同原因。
+ *
+ * 这里说的是**拍平写**（comp_io_export：一次合成、一张图）。分层格式还有另一条
+ * 写入口（comp_io_export_document），所以文案必须点明 "flattened"——否则像 PSD
+ * 这种「分层能写、拍平不能写」的格式，用户会读到「PSD 不能导出」这句错话。
+ */
 std::string unsupported_write_reason(comp_image_format format) {
   const compositor::CodecEntry* entry =
       compositor::codec_entry_for(static_cast<uint32_t>(format));
   if (entry == nullptr) return "unknown image format: no codec registered";
   if (!entry->can_write && entry->can_read) {
-    return std::string(entry->name) + " export is unsupported: " + entry->note;
+    return std::string(entry->name) + " flattened export is unsupported: " + entry->note;
   }
   return unsupported_reason(format);
 }

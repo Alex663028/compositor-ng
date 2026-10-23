@@ -265,6 +265,12 @@
 [OK] parity scene flattens on both backends
 [info] parity max_diff = 0 (diff bytes = 0, path = cpu)
 [OK] AUTO backend pixels match the CPU reference
+[OK] PSD layered fixture builds (2 layers)
+[OK] comp_io_export_document(PSD) writes a layered file
+[OK] comp_io_import_document(PSD) round trip keeps both layers
+[OK] flattened comp_io_export(PSD) is still rejected
+[OK] shell open_path_as_document(.psd) takes the layered path
+[OK] shell open_path_as_document(.png) still opens one flattened layer
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

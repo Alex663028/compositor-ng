@@ -30,8 +30,16 @@ struct CodecEntry {
   uint32_t state;      /* CodecState */
   const char* backend; /* "built-in" / 真实库标识 / 候选第三方库名 */
   const char* note;    /* 边界说明（ASCII，避免编译与终端编码风险） */
-  bool can_read;       /* 该格式当前能否 import */
-  bool can_write;      /* 该格式当前能否 export */
+  /*
+   * can_read / can_write 描述的是**栅格通道**（comp_io_import / comp_io_export：
+   * 一次解码成一张图 / 一次合成成一张图）。像 PSD 这种「分层另有一条入口」的格式，
+   * 两条通道能力不同构：拍平读写走 stb（只解不封），分层读写走树内 psd_codec
+   * （comp_io_import_document / comp_io_export_document）。
+   * 因此此处保持「栅格通道」口径，分层能力写在 note 里——宿主只能看到 note
+   * （comp_io_codec_support 不导出这两个 bool），note 说全才算说清。
+   */
+  bool can_read;       /* 栅格通道（comp_io_import）能否读 */
+  bool can_write;      /* 栅格通道（comp_io_export，拍平）能否写 */
 };
 
 /* 返回登记表首地址与条目数（表内顺序 = comp_image_format 枚举顺序）。 */

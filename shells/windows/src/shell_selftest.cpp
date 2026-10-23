@@ -2182,6 +2182,154 @@ int run_selftest(const wchar_t* out_path) {
   }
   if (gpu_engine != nullptr) comp_engine_destroy(gpu_engine);
 
+  /*
+   * ---------------------------------------------------------------- M1.5：PSD 分层入口
+   *
+   * 这一段补的是「引擎有、壳也有，但没人守着」的三条接缝：
+   *   1. comp_io_export_document / comp_io_import_document 的分层往返；
+   *   2. 拍平入口 comp_io_export(PSD) 仍必须被拒绝（分层能写 != 拍平能写）；
+   *   3. 壳的 open_path_as_document(.psd) 走分层入口，而不是拍平入口。
+   *
+   * 第 3 条尤其需要自检：GUI 的「打开 / 导出为」都被模态对话框挡着，自动化点不过去，
+   * 而分派退化成 comp_io_import 时用户看到的是一张「打开了、但只剩一层」的图——
+   * 功能没报错，数据已经丢了。判据取**图层数**：同一个两层的 PSD，拍平路径读回来
+   * 永远是 1 层。这个差异可判定，且不依赖任何像素容差。
+   */
+  wchar_t psd_file[MAX_PATH] = L"";
+  wsprintfW(psd_file, L"%sselftest_psd_layered.psd", io_temp_dir);
+  char psd_path_utf8[MAX_PATH * 2] = {0};
+  WideCharToMultiByte(CP_UTF8, 0, psd_file, -1, psd_path_utf8,
+                      static_cast<int>(sizeof(psd_path_utf8)), nullptr, nullptr);
+
+  /* 夹具像素必须满足两条 ABI 契约：预乘（颜色 <= alpha）与「像素尺寸 = transform 尺寸」
+   * （缩放过的图层 PSD 子集表示不了，那是引擎的显式拒绝，不该在自检里踩）。 */
+  const auto paint_solid_layer = [](comp_document target, comp_layer_id id, int32_t w, int32_t h,
+                                    uint8_t r, uint8_t g, uint8_t b) -> bool {
+    std::vector<uint8_t> px(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u, 0);
+    for (size_t i = 0; i + 3 < px.size(); i += 4) {
+      px[i + 0] = r;
+      px[i + 1] = g;
+      px[i + 2] = b;
+      px[i + 3] = 255;
+    }
+    comp_image image{};
+    image.width = w;
+    image.height = h;
+    image.format = COMP_PIXEL_RGBA8;
+    image.stride = static_cast<size_t>(w) * 4u;
+    image.pixels = px.data();
+    return comp_layer_set_pixels(target, id, &image) == COMP_OK;
+  };
+
+  comp_document_desc psd_desc{};
+  psd_desc.width = 14;
+  psd_desc.height = 12;
+  psd_desc.dpi = 72.0f;
+  psd_desc.color_space = "sRGB";
+  comp_document psd_source = nullptr;
+  bool psd_scene_ok = comp_document_create(engine, &psd_desc, &psd_source) == COMP_OK &&
+                      psd_source != nullptr;
+  size_t psd_base_count = 0;
+  std::vector<comp_layer_id> psd_ids;
+  if (psd_scene_ok && comp_layer_count(psd_source, &psd_base_count) == COMP_OK &&
+      psd_base_count > 0) {
+    psd_ids.resize(psd_base_count);
+    psd_scene_ok =
+        comp_layer_list(psd_source, psd_ids.data(), psd_ids.size(), &psd_base_count) == COMP_OK &&
+        psd_base_count >= 1;
+  } else {
+    psd_scene_ok = false;
+  }
+  if (psd_scene_ok) {
+    psd_scene_ok = paint_solid_layer(psd_source, psd_ids[0], 14, 12, 200, 30, 30);
+  }
+  comp_layer_id psd_top = 0;
+  if (psd_scene_ok) {
+    comp_layer_desc top_desc{};
+    top_desc.name = "psd-top";
+    top_desc.blend = COMP_BLEND_NORMAL;
+    top_desc.opacity = 0.5f;
+    top_desc.transform = comp_rect{0, 0, 14, 12};
+    top_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+    psd_scene_ok = comp_layer_add(psd_source, &top_desc, &psd_top) == COMP_OK && psd_top != 0 &&
+                   paint_solid_layer(psd_source, psd_top, 14, 12, 20, 20, 180);
+  }
+  verify(psd_scene_ok, "PSD layered fixture builds (2 layers)");
+
+  bool psd_export_ok = false;
+  if (psd_scene_ok) {
+    psd_export_ok =
+        comp_io_export_document(psd_source, psd_path_utf8, COMP_FORMAT_PSD, nullptr) == COMP_OK;
+  }
+  verify(psd_export_ok, "comp_io_export_document(PSD) writes a layered file");
+
+  if (psd_export_ok) {
+    comp_document psd_round = nullptr;
+    const bool psd_import_ok = comp_io_import_document(engine, psd_path_utf8, &psd_round) == COMP_OK &&
+                               psd_round != nullptr;
+    size_t round_count = 0;
+    bool round_ok = psd_import_ok && comp_layer_count(psd_round, &round_count) == COMP_OK &&
+                    round_count == 2;
+    if (round_ok) {
+      std::vector<comp_layer_id> round_ids(round_count, 0);
+      round_ok = comp_layer_list(psd_round, round_ids.data(), round_ids.size(), &round_count) ==
+                     COMP_OK &&
+                 round_count == 2;
+      if (round_ok) {
+        /* 图层名（而非位置）是「分层被读回来了」最直接的证据：拍平路径只有一层，
+         * 名字也不会是 psd-top。按 id 逐个找，不依赖列表顺序口径。 */
+        bool name_found = false;
+        for (comp_layer_id id : round_ids) {
+          char name[64] = {0};
+          size_t name_size = 0;
+          if (comp_layer_get_name(psd_round, id, name, sizeof(name), &name_size) == COMP_OK &&
+              std::string(name).find("psd-top") != std::string::npos) {
+            name_found = true;
+          }
+        }
+        round_ok = name_found;
+      }
+    }
+    verify(round_ok, "comp_io_import_document(PSD) round trip keeps both layers");
+    if (psd_round != nullptr) comp_document_destroy(psd_round);
+  }
+
+  /* 拍平写侧不能被「分层能写」连带放开：comp_io_export(PSD) 必须继续显式拒绝。 */
+  verify(psd_source != nullptr &&
+             comp_io_export(psd_source, psd_path_utf8, COMP_FORMAT_PSD, nullptr) ==
+                 COMP_ERR_UNSUPPORTED,
+         "flattened comp_io_export(PSD) is still rejected");
+
+  if (psd_export_ok) {
+    /* 壳的分派：独立构造一份 ShellState（自检不建窗口），只走文档上下文那部分。 */
+    ShellState shell{};
+    shell.engine = engine;
+    open_path_as_document(shell, psd_path_utf8);
+    size_t shell_count = 0;
+    const bool shell_ok = shell.doc.document != nullptr &&
+                          comp_layer_count(shell.doc.document, &shell_count) == COMP_OK &&
+                          shell_count == 2;
+    verify(shell_ok, "shell open_path_as_document(.psd) takes the layered path");
+
+    /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
+    if (probe_png_exists(probe_path)) {
+      open_path_as_document(shell, probe_path);
+      size_t png_count = 0;
+      comp_size png_size{};
+      const bool png_ok = shell.doc.document != nullptr &&
+                          comp_layer_count(shell.doc.document, &png_count) == COMP_OK &&
+                          png_count == 1 &&
+                          comp_document_size(shell.doc.document, &png_size) == COMP_OK &&
+                          png_size.width == 240 && png_size.height == 160;
+      verify(png_ok, "shell open_path_as_document(.png) still opens one flattened layer");
+    }
+    if (shell.doc.document != nullptr) {
+      comp_document_destroy(shell.doc.document);
+      shell.doc.document = nullptr;
+    }
+  }
+  if (psd_source != nullptr) comp_document_destroy(psd_source);
+
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 

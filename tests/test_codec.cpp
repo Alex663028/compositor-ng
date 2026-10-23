@@ -72,9 +72,26 @@ COMP_TEST(codec_support_reports_only_facts) {
                                    &jpeg_need) == COMP_OK);
   COMP_CHECK(std::strstr(jpeg_note.data(), "stb_image") != nullptr);
 
-  /* PSD：可读不可写（stb_image 只解不封），状态 VENDORED 但导出必须 UNSUPPORTED。 */
+  /*
+   * PSD：能力分两条通道，note 必须把两条都说出来。
+   *   - 栅格通道（can_read/can_write，即 comp_io_import / comp_io_export）= stb_image，
+   *     只解不封，拍平导出必须 UNSUPPORTED；
+   *   - 分层通道 = 树内 psd_codec，读写都在，入口是 comp_io_import_document /
+   *     comp_io_export_document。
+   * 宿主只能通过 comp_io_codec_support 的 note 得知这些（can_write 不导出），所以
+   * 一旦 note 退化成旧的「READ-ONLY」，宿主就会把「分层可写」误报成「整个不能写」。
+   */
   COMP_CHECK(comp_io_codec_support(COMP_FORMAT_PSD, &state, nullptr, 0, &note_size) == COMP_OK);
   COMP_CHECK(state == COMP_CODEC_VENDORED);
+  std::vector<char> psd_note(note_size + 1, '\0');
+  COMP_CHECK(comp_io_codec_support(COMP_FORMAT_PSD, nullptr, psd_note.data(), psd_note.size(),
+                                   &note_size) == COMP_OK);
+  COMP_CHECK_MSG(std::strstr(psd_note.data(), "comp_io_export_document") != nullptr,
+                 "the PSD note must point at the layered document entry points");
+  COMP_CHECK_MSG(std::strstr(psd_note.data(), "READ-ONLY") == nullptr,
+                 "PSD is no longer read-only: layered export is supported");
+  COMP_CHECK_MSG(std::strstr(psd_note.data(), "flattened") != nullptr,
+                 "the PSD note must say which channel is still unsupported (the flattened one)");
 
   /* 未登记格式：如实 NOT_FOUND + UNAVAILABLE，不假装可用。 */
   COMP_CHECK(comp_io_codec_support(COMP_FORMAT_UNKNOWN, &state, nullptr, 0, &note_size) ==

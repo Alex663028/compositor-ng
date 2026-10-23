@@ -3,7 +3,9 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **150**）；回归 6/6、壳自检 257 项 SHA、视觉探针不得因新增功能而破（当前 **128 条 / 24 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **152**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **128 条 / 24 场景**；落地规则见 §6）。
+> 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
+> 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
 > P0-3 另存为 + 标题脏标记、P1-8 历史容量入口。四项**全部零 ABI 新增**（仍 145），
 > 视觉探针 80 → **86 条**（只追加 `doc_dialog` 场景，既有阈值未动），其余断言见 §2 各条。
@@ -371,9 +373,10 @@
 
 > 2026-10-23 校正一轮：下面每条都重新对着当前代码数过一遍，数字与指针已更新。
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **150** 个
-  （尾部追加 `comp_layer_get_pixels` 与 4 个文字图层导出之后）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **128 条 / 24 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer` 后；原 80 条含 IME 6/6）。
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **152** 个
+  （尾部追加 `comp_layer_get_pixels`、4 个文字图层导出、以及 PSD 分层读写的
+  `comp_io_import_document` / `comp_io_export_document`）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **128 条 / 24 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
 - §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
 - `comp_layer.h` 的 `comp_tool_type` 注释原先只写"画进当前图层、不可再编辑"，没提可编辑
@@ -403,4 +406,4 @@
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
-| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-23 追加 4 个文字导出与文字图层场景后复核，逐字节未变）；视觉探针 **128/128 / 24 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`） |
+| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **128/128 / 24 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`） |

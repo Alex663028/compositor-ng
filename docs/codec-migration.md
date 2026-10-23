@@ -1,9 +1,15 @@
 # M5 编解码替换：能力登记与落地记录
 
 本文件记录 M5「编解码替换」的**实测证据**、接缝设计与真实库落地结果。
-一句话结论：**PNG 与 JPEG 已接入真实第三方库并真实可用（导入/导出打通），PSD 只读可用；
-TIFF / HEIF / WebP / EXR 本机无第三方库可链接，故如实标记不可用并给出原因**——不写占位实现，
-也不假装成功。
+一句话结论：**PNG 与 JPEG 已接入真实第三方库并真实可用（导入/导出打通）；PSD 拍平只读、
+分层读写走树内 `psd_codec`；EXR / Radiance 走树内自研编解码器；TIFF / HEIF / WebP 本机无
+第三方库可链接，故如实标记不可用并给出原因**——不写占位实现，也不假装成功。
+
+> **2026-10-23 更新（本文 §1 表格的当前口径）。** M5 之后有三次落地改写了下面这张表：
+> PSD 分层读写（§1 行内说明）、EXR 自研 scanline 读写、Radiance 只读。表中「不可用」的
+> 判断对 TIFF / HEIF / WebP 仍然成立。**能力现状的唯一真源是 `engine/format/codec_registry.cpp`**，
+> 宿主可见的口径由 `comp_io_codec_support` 的 `state` + `note` 给出；本文第 2–5 节是 M5 当时的
+> 实测快照（83 cases / 27 项自检），数字已过时，不要再当作当前基线引用。
 
 ## 1. 结论一览
 
@@ -11,15 +17,18 @@ TIFF / HEIF / WebP / EXR 本机无第三方库可链接，故如实标记不可�
 |------|------|------|------|
 | PNG | **可用（vendored 真实库）** | libpng 1.6.44 + zlib 1.3.1 | `engine/third_party/`；导入/导出往返与独立解码器 0 LSB |
 | JPEG | **可用（vendored 真实库，有损）** | stb_image + stb_image_write | 读写；`{"quality":N}` 控制质量，缺省 92 |
-| PSD | **只读可用（vendored 真实库）** | stb_image | 仅导入，导出显式拒绝 |
+| PSD | **分层读写可用；拍平只读** | stb_image（拍平读）+ 树内 `psd_codec`（分层读写） | 拍平 `comp_io_import` / 分层 `comp_io_import_document` / `comp_io_export_document`；拍平 `comp_io_export` 仍显式拒绝 |
 | TIFF | 不可用 | 需 libtiff | 本机无头文件/库，未 vendoring |
 | HEIF | 不可用 | 需 libheif | 同上 |
 | WebP | 不可用 | 需 libwebp | 仅 DevEco 插件目录下非链接态副本 |
-| EXR | 不可用 | 需 OpenEXR | 未找到 `ImfHeader.h` |
+| EXR | **可用（树内自研 scanline，2026-10-19 起）** | `format/exr_codec` | 读写 NONE/RLE/ZIPS/ZIP；导出 scanline NONE + HALF。M5 当时未找到 `ImfHeader.h`，故改为不依赖 OpenEXR 的自研路径 |
+| Radiance | **只读可用（树内浮点通道）** | stb_image（float） | `.hdr/.pic` 导入；导出不支持 |
 
 状态由**编译期实证**决定：`engine/format/codec_lib.{h,cpp}` 用 `__has_include` 探测
 `engine/third_party/` 下的真实库；缺库的机器上同一份源码会如实回落——PNG 走自研 `comp_png`，
 JPEG / PSD 标 `UNAVAILABLE`。登记表（`codec_registry`）是唯一真源，`comp_io_*` 的失败原因由它生成。
+注意登记项的 `can_read` / `can_write` 描述的是**栅格（拍平）通道**：PSD 的分层能力写在 `note` 里，
+宿主只看得到 `note`（`comp_io_codec_support` 不导出这两个 bool），所以 `note` 说全才算说清。
 
 ## 2. 本机探测证据与取源渠道（2026-10-14 实测）
 
@@ -63,10 +72,15 @@ JPEG / PSD 标 `UNAVAILABLE`。登记表（`codec_registry`）是唯一真源，
 
 失败语义（实测）：
 
-- 不可用格式（TIFF / HEIF / WebP / EXR）：`COMP_ERR_UNSUPPORTED`，原因由登记表生成，
-  形如 `host has no OpenEXR headers/libs (ImfHeader.h not found)`。
+- 不可用格式（TIFF / HEIF / WebP）：`COMP_ERR_UNSUPPORTED`，原因由登记表生成，
+  形如 `host has no libtiff headers/libs and it is not vendored in this repo`。
 - 可用格式但文件不存在/损坏：`COMP_ERR_IO`（是 IO 问题，不是「不支持」）。
-- PSD 导出：`COMP_ERR_UNSUPPORTED`，原因 `...; READ-ONLY: import supported, export unsupported`。
+- PSD **拍平**导出：`COMP_ERR_UNSUPPORTED`，原因为
+  `PSD flattened export is unsupported: <note>`，`<note>` 会同时指出分层入口
+  `comp_io_export_document`。旧文案 `READ-ONLY: import supported, export unsupported`
+  在 M1 之后就是不实陈述（分层明明可写），已于 2026-10-23 改正。
+- PSD 分层导入/导出：走 `comp_io_import_document` / `comp_io_export_document`，成功即完整图层树；
+  失败返回具名原因（CMYK/PSB/智能对象/文字图层/图层效果等超出子集的特性一律显式拒绝）。
 
 ## 5. 验收证据
 
@@ -99,8 +113,9 @@ JPEG / PSD 标 `UNAVAILABLE`。登记表（`codec_registry`）是唯一真源，
 
 ## 7. 未覆盖与边界（诚实声明）
 
-- **已接入**：PNG（libpng + zlib）、JPEG（stb，有损）、PSD（stb，只读）。
-- **仍未接入**：TIFF / HEIF / WebP / EXR——不是「忘了做」，是本机确无可链接依赖，
+- **已接入**：PNG（libpng + zlib）、JPEG（stb，有损）、PSD（拍平读走 stb，分层读写走树内
+  `psd_codec`）、EXR（树内 scanline 读写）、Radiance（树内浮点只读）。
+- **仍未接入**：TIFF / HEIF / WebP——不是「忘了做」，是本机确无可链接依赖，
   且本仓不允许引入不可复现的二进制。联网/换机后可按第 6 节接入。
 - 第三方源码以源码形式 vendoring 到 `engine/third_party/`，随仓可复现；
   若目录被移除，`codec_lib` 的 `__has_include` 探测会失败，登记表**自动**回落为

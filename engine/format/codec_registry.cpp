@@ -43,9 +43,21 @@ CodecTable::CodecTable() {
                   : "host has no libjpeg-turbo headers/libs and no C/C++ package manager; "
                     "Python-side PIL jpg is a cross-check reference only, not linkable";
 
+  /*
+   * PSD 的两条通道能力不同构，旧文案「READ-ONLY」在 M1 之后就是不实陈述：
+   *   - 栅格通道（下面这条记录的 can_read/can_write）= stb_image，只解不封；
+   *   - 分层通道 = 树内 psd_codec，读写都在，入口是 comp_io_import_document /
+   *     comp_io_export_document。
+   * note 是宿主唯一看得到的东西（comp_io_codec_support 只回 note 与 state），
+   * 所以两条通道都必须写进来，并点明「拍平写」才是仍未支持的那一条。
+   */
   psd_note = has_stb
                  ? std::string("vendored real library (") + codec_lib_stb_backend() +
-                       "); READ-ONLY: import supported, export unsupported"
+                       ") for flattened read; layered read/write via "
+                       "comp_io_import_document / comp_io_export_document (8/16-bit RGB(A), "
+                       "RLE + raw, layers, groups, masks, clipping; CMYK/PSB/smart objects/"
+                       "text layers/layer effects rejected with a reason); flattened "
+                       "comp_io_export is unsupported - use the document entry points"
                  : "no PSD reader available on host";
 
   hdr_note = has_stb
