@@ -1120,8 +1120,30 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
   const comp_image_format format = comp_io_format_from_path(path_utf8);
   if (format != COMP_FORMAT_UNKNOWN) {
     comp_document document = nullptr;
-    if (comp_io_import(shell.engine, path_utf8, &document) != COMP_OK || document == nullptr) {
-      set_status(shell, L"打开位图失败：格式不支持或文件损坏");
+    /*
+     * PSD 是分层格式，走「整篇文档」入口（M1）：组、蒙版、剪贴、不透明度、
+     * 混合模式全部还原成图层树。其余格式仍走 comp_io_import（单图层）。
+     *
+     * 分层读失败**不回落**到拍平：回落等于在用户不知情的情况下把分层工程换成了
+     * 一张图，比打不开更糟。失败就报错并把引擎给出的具名原因带出来。
+     */
+    const comp_result opened = format == COMP_FORMAT_PSD
+                                   ? comp_io_import_document(shell.engine, path_utf8, &document)
+                                   : comp_io_import(shell.engine, path_utf8, &document);
+    if (opened != COMP_OK || document == nullptr) {
+      /*
+       * 这里不能用 set_status：它只在已有文档时附加 last_error，而打开失败恰恰
+       * 常常发生在「还没有文档」的时候，那样用户就只看得到一句泛泛的失败。
+       */
+      shell.status = format == COMP_FORMAT_PSD ? L"打开 PSD 失败" : L"打开位图失败";
+      const char* engine_error = comp_engine_last_error(shell.engine);
+      if (engine_error != nullptr && engine_error[0] != '\0') {
+        const std::string narrow(engine_error);
+        shell.status += L" | ";
+        shell.status.append(narrow.begin(), narrow.end());
+      } else {
+        shell.status += L"：格式不支持或文件损坏";
+      }
       return;
     }
     forget_color_range(shell);
@@ -1151,7 +1173,9 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
     pen_cancel(shell);
     refresh_layers(shell);
     refresh_selection(shell);
-    refresh_history_status(shell, L"已打开位图");
+    /* 分层读成功要说清楚「带图层」，否则用户会以为又是一张拍平图。 */
+    refresh_history_status(shell,
+                           format == COMP_FORMAT_PSD ? L"已打开 PSD（分层）" : L"已打开位图");
     return;
   }
   load_document(shell, path_utf8);
@@ -1256,7 +1280,7 @@ void export_image_dialog(HWND window, ShellState& shell) {
   dialog.hwndOwner = window;
   dialog.lpstrFilter =
       L"PNG (*.png)\0*.png\0JPEG (*.jpg)\0*.jpg\0EXR (*.exr)\0*.exr\0"
-      L"所有文件\0*.*\0";
+      L"PSD (*.psd)\0*.psd\0所有文件\0*.*\0";
   dialog.lpstrFile = buffer;
   dialog.nMaxFile = MAX_PATH;
   dialog.lpstrDefExt = L"png";
@@ -1269,11 +1293,20 @@ void export_image_dialog(HWND window, ShellState& shell) {
     set_status(shell, L"无法识别的导出格式");
     return;
   }
-  if (comp_io_export(shell.doc.document, utf8, format, nullptr) != COMP_OK) {
+  /*
+   * PSD 走「整篇文档」导出（M1）：图层树直接落盘，不拍平。其余格式仍是一次
+   * 合成、一张图。分层导出拒绝的文档（文字层、HDR、未求值的图层效果…）由引擎
+   * 给出具名原因，set_status 会把它接在状态栏后面——不做「悄悄拍平」。
+   */
+  const comp_result written =
+      format == COMP_FORMAT_PSD
+          ? comp_io_export_document(shell.doc.document, utf8, format, nullptr)
+          : comp_io_export(shell.doc.document, utf8, format, nullptr);
+  if (written != COMP_OK) {
     set_status(shell, L"导出失败：该格式不可用");
     return;
   }
-  set_status(shell, L"已导出图片");
+  set_status(shell, format == COMP_FORMAT_PSD ? L"已导出 PSD（分层）" : L"已导出图片");
 }
 
 void run_shell_command(HWND window, ShellState& shell, UINT id) {

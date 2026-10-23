@@ -103,6 +103,11 @@
 - **入口分工**：`comp_io_import_document` / `comp_io_export_document` 是整篇语义（PSD
   走这里）；`comp_io_import` / `comp_io_export` 仍是单图语义，PSD 单图导出照旧
   `COMP_ERR_UNSUPPORTED`——同一格式的两个语义不混用同一个入口。
+- **Windows 壳接线**（M1.5）：`open_path_as_document` 按扩展名分派——`.psd` 走
+  `comp_io_import_document`（分层），其余走 `comp_io_import`（单层）；「文件 > 导出为」
+  的过滤器新增 PSD，`.psd` 走 `comp_io_export_document`（分层），其余格式不变。
+  分层读失败**不回落**到拍平（回落 = 悄悄毁掉分层工程），失败原因原样带到状态栏。
+  拖入已有文档时仍按「置入图层」语义拍平，与 PS 的置入一致。
 - **证据**：`tests/test_psd.cpp`（11 例，手写 fixture，正反例逐个钉字节）+ 与 psd-tools
   的独立交叉核对（见 README §6.87）。
 

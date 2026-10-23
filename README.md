@@ -5792,6 +5792,7 @@ PSD 库（vendoring 一个完整的 PSD 库会同时引入它自己的格式解�
 | `engine/abi/src/comp_io_abi.cpp` | 新 ABI 只做**纯尾追加**：`comp_io_import_document` / `comp_io_export_document`，`^COMP_API` 150 → **152**；`comp_io_codec_support(PSD)` 维持 `COMP_CODEC_VENDORED` + 非空 note。注意 `codec_registry` 的 note 描述的是**老的拍平路径**：`comp_io_export`（单张合成结果）对 PSD 仍如实 `COMP_ERR_UNSUPPORTED`，分层导出走新入口——本轮不动旧入口与其基线 |
 | `engine/format/comp_file.cpp` | 组混合模式与穿透落进 `.comp`：`engineBlendMode` / `engineIsolated`。**默认值不落盘**（旧工程 manifest 逐字节不变），`blendMode` 仍写 Normal 保持上游兼容 |
 | `scripts/crosscheck_psd.py` | 独立交叉验证：由 psd-tools 现场生成参考 PSD，再让引擎走与宿主同一条 C ABI 导入/导出 |
+| `shells/windows/src/shell_document.cpp` | **壳接线（M1.5）**：打开按扩展名分派（`.psd` → `comp_io_import_document`，其余 → `comp_io_import`）；「文件 > 导出为」过滤器加 PSD，`.psd` → `comp_io_export_document`。分层读失败**不回落**拍平，具名原因进状态栏。壳自检 257 项 / SHA256 与基线逐字节一致（改动落在自检未覆盖的 GUI 入口） |
 
 **能力边界（超出即拒绝，绝不静默近似）。** 拒绝清单：PSB（版本 2）、32 位、灰度 /
 CMYK / 索引色、ZIP / ZIP+predictor 压缩、`diss`/`dkCl`/`lgCl` 混合模式、真实蒙版通道
