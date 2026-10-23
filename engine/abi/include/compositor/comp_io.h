@@ -77,6 +77,54 @@ COMP_API comp_result comp_io_export(comp_document document,
                                     comp_image_format format,
                                     const char* options_json_utf8);
 
+/* --------------------------------------- 整篇文档导入 / 导出（M1 尾部追加） */
+
+/*
+ * 整篇文档语义的导入：**分层格式**读成图层树，画布尺寸 = 文件声明尺寸。
+ *
+ * 与 comp_io_import 的分工：
+ *   - 分层格式（当前只有 PSD：8/16 位 RGB(A)、RLE/raw、图层记录、蒙版、组、剪贴）
+ *     走自研 psd_codec：组、蒙版、剪贴、不透明度、混合模式全部还原成图层树；
+ *   - 其余格式（PNG/JPEG/EXR/…）与 comp_io_import 完全同义（单图层 + 背景层）。
+ *
+ * 能力边界（**明确拒绝，绝不悄悄降级**）：
+ *   PSB、CMYK/灰度/索引色彩模式、32 位通道、ZIP 压缩、图层效果（lsct 之外的
+ *   无法表示的标签）、真实蒙版（-3 通道）、智能对象/文字图层 —— 一律
+ *   COMP_ERR_UNSUPPORTED / COMP_ERR_IO 并给出具名原因。宁可打不开，也不能
+ *   把用户的图打开成「少了几个图层」的样子。
+ *
+ * 失败语义与 comp_io_import 一致：读不出 / 内容损坏 -> COMP_ERR_IO；
+ * 本构建不支持的变体 -> COMP_ERR_UNSUPPORTED（last_error 给出原因）。
+ */
+COMP_API comp_result comp_io_import_document(comp_engine engine,
+                                             const char* path_utf8,
+                                             comp_document* out_document);
+
+/*
+ * 整篇文档语义的导出：**分层格式**写图层树，其余格式与 comp_io_export 同义。
+ *
+ * PSD 写入子集（与 comp_io_import_document 对称）：
+ *   - 8 位文档写 8 位通道；文档里只要有 RGBA16 图层就整体写 16 位通道（Lr16），
+ *     8 位图层按 v*257 无损扩位（PSD 一个文件只有一种位深）；
+ *   - 图层名 / 可见性 / 不透明度 / 混合模式 / 位置尺寸 / 蒙版 / 组（穿透或隔离）
+ *     / 剪贴关系原样写出；组的混合模式与「穿透」语义走 lsct，
+ *     隔离组 = 非 pass 的文件夹记录；
+ *   - 合并图像（文件末尾那份预览）由合成结果填充（8 位 RGBA，16 位文档按
+ *     v*257 扩展到 16 位；布局中的图层数据才是权威）。
+ *
+ * 无法忠实写成 PSD 的文档明确失败（COMP_ERR_UNSUPPORTED + 具名原因），不做
+ * 「写出去看起来成功、读回来变了样」的事：HDR(half) 图层、文字图层、调整图层、
+ * 图层效果（内核尚未求值的）、缩放/旋转/翻转的图层变换、不在下方相邻位置的
+ * 剪贴来源、穿透组自带非 Normal 混合模式。
+ *
+ * options_json_utf8 目前不影响 PSD 输出（保留参数以便与 comp_io_export 同签名）；
+ * 非 PSD 格式原样转交 comp_io_export。
+ */
+COMP_API comp_result comp_io_export_document(comp_document document,
+                                             const char* path_utf8,
+                                             comp_image_format format,
+                                             const char* options_json_utf8);
+
 /* ------------------------------------------------------------- .comp */
 
 /* 保存/加载 .comp 工程目录包。语义与 comp_document_save/load 一致。 */

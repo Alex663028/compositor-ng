@@ -402,6 +402,14 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
     j.set("engineIsolated", JsonValue::boolean(true));
   }
   /*
+   * 组自己的混合模式（engineBlendMode）：上游规定组层的 blendMode 必须是
+   * Normal，组真正的混合模式（隔离组可以有自己的混合模式，如 Multiply）只能走
+   * 引擎键。缺键 = Normal，所以不含此类组的工程落盘结果逐字节不变。
+   */
+  if (layer.is_group && layer.blend != COMP_BLEND_NORMAL) {
+    j.set("engineBlendMode", blend_to_json(layer.blend));
+  }
+  /*
    * 可编辑文字（engineText）：只在是文字图层时落盘，缺键 = 普通图层——与
    * engineIsolated 同一条「默认值不写」的规矩，普通工程的 manifest 因此逐字节不变。
    */
@@ -814,6 +822,25 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       layer.isolated = entry.bool_or("engineIsolated", false);
       layer.opacity = static_cast<float>(entry.number_or("opacity", 1.0));
       if (!blend_from_json(entry, &layer.blend, error)) return false;
+      /*
+       * 组自己的混合模式（engineBlendMode，见 layer_to_json）：存在时覆盖
+       * blendMode 那一份「上游兼容用的 Normal」。未知名字明确报错，不静默当
+       * Normal——那等于改了用户的图。
+       */
+      if (layer.is_group) {
+        const JsonValue* engine_blend = entry.find("engineBlendMode");
+        if (engine_blend != nullptr) {
+          const std::string engine_blend_name =
+              engine_blend->is_string() ? engine_blend->as_string("") : std::string();
+          if (!blend_mode_from_manifest_name(engine_blend_name.data(), engine_blend_name.size(),
+                                             &layer.blend)) {
+            if (error != nullptr) {
+              *error = "layer " + uuid + ": unknown engineBlendMode " + engine_blend_name;
+            }
+            return false;
+          }
+        }
+      }
       transform_from_json(entry, &layer);
       layer.mask_source_uuid = entry.string_or("maskSourceID", "");
 

@@ -14,7 +14,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   S20：烘焙单元也按子树结构键缓存，CPU 烘焙与纹理上传都能跨帧省掉）**、
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
-  PSD 只读；第三方库以源码 vendoring 进 `engine/third_party/`）。
+  PSD 当时只读（2026-10-23 起改为树内自研的分层读写，见 §6.87）；第三方库以源码 vendoring 进 `engine/third_party/`）。
   全量 **625 用例 0 失败**；Windows 外壳实机自检 **257 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
@@ -340,7 +340,7 @@ compositor-ng/
 │       │   ├── comp_engine.h      # 引擎与文档生命周期
 │       │   ├── comp_layer.h       # 图层、调整图层、图层效果（含可见性/组隔离）
 │       │   ├── comp_render.h      # 合成、上屏、缩略图
-│       │   ├── comp_io.h          # 导入导出（真实库 PNG/JPEG/PSD）与 .comp（内层像素为 PNG）
+│       │   ├── comp_io.h          # 导入导出（PNG/JPEG 走第三方库，PSD 走树内分层读写器）与 .comp（内层像素为 PNG）
 │       │   ├── comp_command.h     # 声明式命令模型（可序列化，三端共享）
 │       │   └── comp_undo.h        # 事务与撤销/重做
 │       └── src/                   # ABI 实现（extern "C" 薄封装，不含业务逻辑）
@@ -445,7 +445,7 @@ bash scripts/build_ohos_shell.sh      # NAPI 共享库 libcompositor_ohos.so
 | 变换 | **平移/缩放/旋转/翻转统一走逆映射重采样**（`compositing/resample`）：目标像素反解源坐标后取样，采样模式 `Nearest` / `Smooth`（双线性）/ `High quality`（Catmull-Rom，缺省），对齐上游 `LayerTransform.sampling`；恒等变换在整数对齐下**逐字节精确**；旋转按目标矩形裁剪（不做包围盒扩张） | 与 macOS 参考输出逐像素基准比对；透视/网格变形 |
 | 图像格式 | `.comp` 内图层像素按位深落盘：RGBA8 → `images/<uuid>.png`，RGBA16/RGBA16F → `images/<uuid>.exr`（线性光、直通 alpha；16 位用 FLOAT 通道保低位，HDR 用 HALF 通道逐位精确）；蒙版用 8 位灰度 `images/<uuid>.mask.png`（符合上游 `LayerMask.isValid`） | 更大色深 / 硬件编解码 |
 | 交换格式键名 | 完整对齐上游 `ProjectManifest` / `ProjectLayerRecord`：`format`/`version`(13)/`supported`/`colorSpace`/`resolution`/`documentID`/`width`/`height`/`activeLayerID`/`layers`；图层 id 与 `parentID`/`maskSourceID` 用 UUID，`transform` 为六键形态（`origin`/`size`/`rotation`/`flipX`/`flipY`/`sampling`）。引擎自有键一律 **`engine` 前缀**（`engineLayerID`/`enginePixelFormat`/`engineClippingSourceID`/`engineAdjustments`/`engineEffects`/`engineIsolated`），避免与上游对象型键（`effects`/`text`/`shape`/`adjustment`）同名冲突 | 上游未建模字段（`guides`、live-mask 启用态等）按原样保真 |
-| 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走 stb（只读）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。**EXR 已由树内自研 scanline 读取器接入**（C3b，§6.1.18：NONE/RLE/ZIPS/ZIP 可读，PIZ/PXR24/B44/DWA 与 tiled/deep/multipart 如实拒绝，写侧仍 `UNSUPPORTED`）；32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
+| 编解码 | **PNG 与 JPEG 已接入真实第三方库并真实可用**：`comp_io_export`（拍平 → 落盘）与 `comp_io_import` / `comp_io_import_layer`（文件 → 文档 / 追加图层）已打通；PNG 走 libpng + zlib、JPEG 走 stb（有损，`{"quality":N}`）、PSD 走树内自研的分层读写器 `format/psd_codec`（§6.87：`comp_io_import_document` / `comp_io_export_document` 分层往返；拍平的 `comp_io_export` 仍不支持 PSD）。**HDR 来源（C3，§6.1.17）**：Radiance `.hdr`/`.pic` 走 stb 的**浮点通道**解出线性光，按 1.001 闸判成 HDR(RGBA16F) 或 16 位图层；浮点格式**结构上不许**走 8 位通道。**EXR 已由树内自研 scanline 读取器接入**（C3b，§6.1.18：NONE/RLE/ZIPS/ZIP 可读，PIZ/PXR24/B44/DWA 与 tiled/deep/multipart 如实拒绝，写侧仍 `UNSUPPORTED`）；32 位 float TIFF **仍无解码器**（树内 stb 无 TIFF）。第三方源码 vendoring 到 `engine/third_party/`，`__has_include` 探测缺库时如实回落。`.comp` **内部**像素仍走自研零依赖 `comp_png`（工程包可移植的前提）。**能力边界（P2-4）**：宿主构建走 libpng+zlib，而 `scripts/build_ohos.sh` 的包含路径不含 `engine/third_party/*`，故鸿蒙交叉编译时 `__has_include("png.h")` 探测失败、PNG 会**如实回落**到自研 `comp_png` —— 本行「真实第三方库」的表述**仅对宿主构建成立**，鸿蒙侧是同语义的另一条实现。其余格式集中在 `format/codec_registry` 登记，未链接实现者如实 `UNSUPPORTED` 并给出原因 | 按 `docs/codec-migration.md` 第 6 节继续接入 TIFF / libheif / OpenEXR / lcms2；只改 `codec_lib` 与登记表 |
 | 调整图层参数 | 面板控件与 JSON **都由引擎元数据驱动**：键名表 `engine/domain/adjustment_table.cpp` 是唯一真源（12 种 kind，点分 `json_path` 逐字沿用上游字段名），外壳经 ABI 取 `label` / `min` / `max` / `default`；settings JSON 由 `comp_layer_adjustment_build_settings` 组装（**壳内不拼、不解析 JSON**）；写入口 `add` / `update` / `update_at` 一律校验，`.comp` 读取路径不校验以保真 | Curves / Levels 需专用曲线编辑器（当前 `editable=false`，仅白名单放行）；删除接口 `comp_layer_remove_adjustment` 已补（面板 `Ctrl+Shift+D`） |
 
 | 后端 | **④ 接口切片已落地**：`rhi.h` 定义 `RenderBackend` + `BackendCaps` + 工厂；`AUTO` 按平台择优，GPU 后端不可用则**显式回落 CPU** 并在 error 写明原因 | 接入真实设备路径（`COMP_HAS_D3D12` / `COMPOSITOR_ENABLE_VULKAN_COMPUTE` 已在代码中预留开关） |
@@ -5775,6 +5775,80 @@ C 与 D 差 20 个点属预期：PS 的功能条目长尾极重（滤镜 100+、
 `377de660d48ac933…` 与基线一致；OHOS `compile ok=114 fail=0`；`^COMP_API` **150**；
 `check_tool_table.py` PASS（20 工具）；`visual_check.py --scene all`
 **128 条 / 24 场景 / 0 失败**。
+
+### 6.87 PSD 分层读写：自研常用子集编解码 + 组混合模式落地（2026-10-23，Claude）
+
+**为什么换掉 stb 的 PSD 路径。** `codec_lib.cpp` 里 PSD 走 stb，而 stb 的 PSD
+通道**只解合成结果**：图层名、偏移、不透明度、蒙版、组、剪贴全部丢掉。对一个
+主打「打开 PSD、改完再存回去」的产品，这等于用户每保存一次就销毁一次分层工程。
+所以本轮要的是**分层容器**，不是一张图：树内自研 `format/psd_codec`，不引入第三方
+PSD 库（vendoring 一个完整的 PSD 库会同时引入它自己的格式解释与近似取舍）。
+
+**交付物。**
+
+| 项 | 内容 |
+|---|---|
+| `engine/format/psd_codec.{h,cpp}` | 分层读写器。读：8 / 16 位 RGB(A)，raw(0) / RLE(1)，图层记录（名字、可见性、不透明度、偏移、剪贴标志）、图层蒙版（-2）、组（`lsct`）；写：同一子集，RLE 通道 + 16 位 `Lr16` 附加块 |
+| `engine/abi/src/comp_io_abi.cpp` | 新 ABI 只做**纯尾追加**：`comp_io_import_document` / `comp_io_export_document`，`^COMP_API` 150 → **152**；`comp_io_codec_support(PSD)` 维持 `COMP_CODEC_VENDORED` + 非空 note。注意 `codec_registry` 的 note 描述的是**老的拍平路径**：`comp_io_export`（单张合成结果）对 PSD 仍如实 `COMP_ERR_UNSUPPORTED`，分层导出走新入口——本轮不动旧入口与其基线 |
+| `engine/format/comp_file.cpp` | 组混合模式与穿透落进 `.comp`：`engineBlendMode` / `engineIsolated`。**默认值不落盘**（旧工程 manifest 逐字节不变），`blendMode` 仍写 Normal 保持上游兼容 |
+| `scripts/crosscheck_psd.py` | 独立交叉验证：由 psd-tools 现场生成参考 PSD，再让引擎走与宿主同一条 C ABI 导入/导出 |
+
+**能力边界（超出即拒绝，绝不静默近似）。** 拒绝清单：PSB（版本 2）、32 位、灰度 /
+CMYK / 索引色、ZIP / ZIP+predictor 压缩、`diss`/`dkCl`/`lgCl` 混合模式、真实蒙版通道
+-3、文字层（`TySh`）、智能对象（`SoLd`/`SoLE`/`PlLd`/`vmsk`/`vsms`）、图层特效
+（`lmfx`/`lrFX`/`lfx2`）、调整 / 填充图层（`brit`/`levl`/`curv`/…）。拒绝时 `error`
+写明是哪一条，不是「跳过这一层继续」。
+
+**交叉验证（`scripts/crosscheck_psd.py`，psd-tools 1.26.0）：67 项断言全过。**
+参考文件 64×48 / 8 位、4 层（背景、剪贴层、MULTIPLY 组、组内 MULTIPLY + 不透明度
+180 + 按列渐变蒙版）：
+
+| 断言 | 结果 |
+|---|---|
+| 导入：图层树（名字 / 包围盒 / 混合 / 不透明度 / 可见性 / 剪贴 / 蒙版尺寸） | 与 psd-tools 全等 |
+| 导出后再由 psd-tools 读：图层树 + 文件头（尺寸 / 深度 / 色彩模式） | 与原始文件全等 |
+| 蒙版像素（原始 vs 导出） | 逐字节相同（maxdiff=0） |
+| 图层像素（容差 ≤1） | maxdiff=0 |
+| 引擎 flatten vs psd-tools composite（原始） | max=1，mean=0.0024，>2 的像素 0/12288 |
+| 引擎 flatten vs psd-tools composite（导出文件） | max=0 |
+| 原始 vs 导出的引擎合成结果 | max=1 |
+| 16 位：ABI 建 RGBA16 图层 → 导出 → psd-tools | `depth=16`，像素值与 `>>8` 一致 |
+
+**顺带修掉的两个既有缺陷**（都由上面的交叉验证暴露，且影响范围超出 PSD）：
+
+1. **剪贴栈把成员当成不透明黑，且覆盖度乘两遍**（`compositing/filter_graph.cpp`）。
+   栈成员混合时「额外不透明度」写死成 `1.0`，成员缓冲里的透明像素于是以不透明黑
+   混进栈表面——基底 alpha 还在、RGB 在成员范围外被涂黑；修掉这一半后，成员又
+   因为 `clipping_source` 同时被 `blend_layer_into` 和栈节点各乘一次而掉色
+   （半透明基底 + 不透明绿成员得到 `(64,64,0,128)`，应为 `(0,128,0,128)`）。
+   修法：成员 alpha 取自像素本身并跳过全透明像素；新增
+   `FilterNode::clipping_consumed_by_stack`，求值时用「清掉 `clipping_source` 的
+   图层副本」，与 `composite_layer` 的口径一致。**这是通用合成缺陷，不止 PSD
+   文档会踩**——`tests/test_filter_graph.cpp` 原有两条剪贴用例都用全画布基底，
+   永远覆盖不到「范围之外」，本轮补了 3 条：成员外基底可见、成员 alpha 取自
+   像素、以及同样两条语义在 half 表面上的分支。
+2. **导出的组记录写 0 个通道**（`format/psd_codec.cpp:write_empty_record`）。
+   本仓解码器宽容，第三方不认：psd-tools 合并图层时抛
+   `Channels mismatch: expected 3 != given 0`，整棵图层结构被跳过——导出的 PSD
+   在 Photoshop / psd-tools 里背景凭空消失。改为与 Photoshop 一致的 4 个空通道
+   （`-1/0/1/2`，每个带「压缩=0、长度=0」的 2 字节块）。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **654 例 / 0 失败**（新增 3 条剪贴语义用例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **257 项 failures=0**，SHA256 `377de660d48ac933…` 与基线一致 |
+| OHOS 交叉编译 | `compile ok=115 fail=0`（较上轮 +1，即新增的 `psd_codec.cpp`） |
+| `^COMP_API` 导出 | **152**（150 + 2，纯尾追加） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **128 条 / 24 场景 / 0 失败** |
+| `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败** |
+
+已知边界：写入侧目前只产出 8 / 16 位 PSD（浮点合成结果显式拒绝，不悄悄截断）；
+WebP 仍未接入（只读导入留作 M1 的可选项）。
+
 
 
 

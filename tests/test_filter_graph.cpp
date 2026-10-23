@@ -8,6 +8,7 @@
  *      且组的不透明度乘进子层（对齐上游 LayerOpacity）；
  *   3) 隔离组：子树作为整体参与混合，组的混合模式作用在组结果上。
  */
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,56 @@ size_t top_level_count(const Document& doc) {
     if (layer.parent == 0) ++count;
   }
   return count;
+}
+
+/*
+ * half 编解码只服务本文件的 HDR 用例：取值限于 [0,1] 的精确二进制小数
+ * （0.5、1.0），因此不需要处理次正规与舍入之外的边角。
+ */
+uint16_t half_bits(float value) {
+  if (!(value > 0.0f)) return 0;
+  int exponent = 0;
+  const float mantissa = std::frexp(value, &exponent); /* value = mantissa * 2^exponent */
+  if (exponent > 16) return 0x7C00u;
+  if (exponent < -14) return 0;
+  const uint32_t head = static_cast<uint32_t>(exponent + 14) << 10;
+  const uint32_t tail = static_cast<uint32_t>((mantissa * 2.0f - 1.0f) * 1024.0f + 0.5f);
+  return static_cast<uint16_t>(head + tail);
+}
+
+float half_value(uint16_t bits) {
+  const int exponent = (bits >> 10) & 0x1F;
+  const float fraction = static_cast<float>(bits & 0x3FFu) / 1024.0f;
+  if (exponent == 0) return std::ldexp(fraction, -14);
+  return std::ldexp(1.0f + fraction, exponent - 15);
+}
+
+/* 把一层填成 RGBA16F 的预乘常量色（half 编码见上）。 */
+bool set_half_solid(Layer* layer, int32_t w, int32_t h, float r, float g, float b, float a) {
+  if (layer == nullptr) return false;
+  layer->pixels.resize(w, h, COMP_PIXEL_RGBA16F);
+  for (int32_t y = 0; y < h; ++y) {
+    uint16_t* row = reinterpret_cast<uint16_t*>(layer->pixels.writable_row(y));
+    for (int32_t x = 0; x < w; ++x) {
+      row[x * 4 + 0] = half_bits(r);
+      row[x * 4 + 1] = half_bits(g);
+      row[x * 4 + 2] = half_bits(b);
+      row[x * 4 + 3] = half_bits(a);
+    }
+  }
+  return true;
+}
+
+/* half 缓冲里某像素的预乘分量。 */
+void half_pixel(const ImageBuffer& buffer, int32_t x, int32_t y, float out[4]) {
+  const uint16_t* p =
+      reinterpret_cast<const uint16_t*>(buffer.row(y)) + static_cast<size_t>(x) * 4;
+  for (int i = 0; i < 4; ++i) out[i] = half_value(p[i]);
+}
+
+int round_u8(float value) {
+  const float clamped = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+  return static_cast<int>(clamped * 255.0f + 0.5f);
 }
 
 }  // namespace
@@ -337,6 +388,106 @@ COMP_TEST(clipping_stack_hidden_member_leaves_base_untouched) {
   COMP_CHECK_MSG(shown[3] == hidden[3], "a hidden member does not change the stack coverage");
   /* 蓝成员在可见时会把基底染蓝，隐藏后应回到纯底色。 */
   COMP_CHECK_MSG(shown[2] != hidden[2], "the visible member really contributes colour");
+}
+
+/*
+ * 基底在成员覆盖范围之外必须原样可见。
+ *
+ * 上一轮修掉的缺陷：栈内成员混合时把「额外不透明度」写成常量 1.0，于是成员缓冲
+ * 里的**透明**像素被当成不透明黑混进栈表面，基底 alpha 还在、RGB 却被涂黑。
+ * 全画布基底 + 全画布成员看不出这个问题（没有「范围之外」），所以必须用小成员。
+ */
+COMP_TEST(clipping_stack_keeps_base_visible_outside_partial_member) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id base = add_layer(document, "base", COMP_BLEND_NORMAL, 1.0f, 0, false);
+  set_solid(document, base, 255, 0, 0, 255); /* 不透明红 */
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "member";
+  child_desc.transform = comp_rect{1, 1, 2, 2}; /* 只盖住中间 2x2 */
+  child_desc.opacity = 1.0f;
+  comp_layer_id member = 0;
+  COMP_CHECK(document.create_layer(child_desc, &member));
+  document.find(member)->pixels = ImageBuffer::solid(2, 2, COMP_PIXEL_RGBA8, 0, 255, 0, 255);
+  document.find(member)->clipping_source = base;
+
+  ImageBuffer out;
+  std::string error;
+  COMP_CHECK_MSG(composite_document(document, &out, &error), "composite: " + error);
+  COMP_CHECK_MSG(pixel_matches(out, 0, 0, 255, 0, 0, 255, 0),
+                 "the base keeps its colour outside the member");
+  COMP_CHECK_MSG(pixel_matches(out, 3, 3, 255, 0, 0, 255, 0),
+                 "the bottom-right corner is still the base");
+  COMP_CHECK_MSG(pixel_matches(out, 1, 1, 0, 255, 0, 255, 0),
+                 "the member colours the base inside its own rect");
+}
+
+/*
+ * 成员的有效 alpha 必须取自像素本身，而不是常量。
+ *
+ * 同一处缺陷的另一半：半透明成员曾被当成完全不透明。这里用「不透明红基底 +
+ * 50% 绿成员」钉住数值——source-over 后预乘应为 (127,128,0,255)，而不是
+ * (0,255,0,255)（当成不透明）或 (0,128,0,128)（把栈覆盖度乘两遍）。
+ */
+COMP_TEST(clipping_stack_member_alpha_comes_from_pixel) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id base = add_layer(document, "base", COMP_BLEND_NORMAL, 1.0f, 0, false);
+  set_solid(document, base, 255, 0, 0, 255);
+
+  const comp_layer_id member = add_layer(document, "member", COMP_BLEND_NORMAL, 1.0f, 0, false);
+  /* solid() 的入参是直通色：straight (0,255,0) a=128 -> 预乘 (0,128,0,128)。 */
+  set_solid(document, member, 0, 255, 0, 128);
+  document.find(member)->clipping_source = base;
+
+  ImageBuffer out;
+  std::string error;
+  COMP_CHECK_MSG(composite_document(document, &out, &error), "composite: " + error);
+  COMP_CHECK_MSG(pixel_matches(out, 2, 2, 127, 128, 0, 255, 2),
+                 "a half-transparent member blends at its own alpha");
+}
+
+/*
+ * half 表面上的同两条语义（栈的混合循环有一份独立的 half 分支，
+ * 8 位用例覆盖不到）。基底半透明红、成员只盖住左上角：
+ *   - 成员内：绿以成员 alpha=1 覆盖不透明基底，restore 后仍是 a=0.5；
+ *   - 成员外：基底原样，不得被涂黑。
+ */
+COMP_TEST(clipping_stack_keeps_base_visible_in_half_surface) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  /* 预乘 50% 红。任何 RGBA16F 图层都会把合成表面切到 half。 */
+  const comp_layer_id base = add_layer(document, "base", COMP_BLEND_NORMAL, 1.0f, 0, false);
+  COMP_CHECK(set_half_solid(document.find(base), 4, 4, 0.5f, 0.0f, 0.0f, 0.5f));
+
+  comp_layer_desc child_desc{};
+  child_desc.name = "member";
+  child_desc.transform = comp_rect{0, 0, 2, 2};
+  child_desc.opacity = 1.0f;
+  comp_layer_id member = 0;
+  COMP_CHECK(document.create_layer(child_desc, &member));
+  document.find(member)->pixels = ImageBuffer::solid(2, 2, COMP_PIXEL_RGBA8, 0, 255, 0, 255);
+  document.find(member)->clipping_source = base;
+
+  ImageBuffer out;
+  std::string error;
+  COMP_CHECK_MSG(composite_document(document, &out, &error), "composite: " + error);
+  COMP_CHECK_MSG(out.format == COMP_PIXEL_RGBA16F, "a half layer keeps the surface in half");
+
+  float inside[4];
+  float outside[4];
+  half_pixel(out, 0, 0, inside);
+  half_pixel(out, 3, 3, outside);
+  COMP_CHECK_MSG(round_u8(inside[1]) == 128 && round_u8(inside[3]) == 128,
+                 "the half member blends onto the opaque base and keeps a=0.5");
+  COMP_CHECK_MSG(round_u8(inside[0]) == 0, "no red leaks through the green member");
+  COMP_CHECK_MSG(round_u8(outside[0]) == 128 && round_u8(outside[3]) == 128,
+                 "the base outside the member is untouched half red");
+  COMP_CHECK_MSG(round_u8(outside[1]) == 0, "the member does not tint pixels it does not cover");
 }
 
 /*

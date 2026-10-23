@@ -37,10 +37,15 @@
 #include "format/codec_lib.h"
 #include "format/codec_registry.h"
 #include "format/comp_file.h"
+#include "format/comp_uuid.h"
 #include "format/exr_codec.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
+#include "format/psd_codec.h"
 #include "imaging/DeepPixels.h"
+
+#include <memory>
+#include <unordered_map>
 
 namespace {
 
@@ -375,6 +380,285 @@ bool encode_raster_file(const uint8_t* canvas, int32_t width, int32_t height,
   return false;
 }
 
+/* ------------------------------------------------- PSD 整篇文档（M1） */
+
+comp_result psd_status_to_result(compositor::PsdStatus status) {
+  switch (status) {
+    case compositor::PsdStatus::kOk: return COMP_OK;
+    case compositor::PsdStatus::kUnsupported: return COMP_ERR_UNSUPPORTED;
+    case compositor::PsdStatus::kIo:
+    case compositor::PsdStatus::kDecode: return COMP_ERR_IO;
+  }
+  return COMP_ERR_INTERNAL;
+}
+
+/*
+ * PSD -> 引擎文档。直接建 state.layers（与 comp_file 的 load_project 同路），
+ * 不走 comp_layer_add 的逐层事务：导入是「新建文档」而不是对既有文档的一步编辑，
+ * 每层一个事务只会让撤销栈长出一串与用户操作无关的步骤。
+ *
+ * 口径：
+ *   - 表序即堆叠序（index 0 = 最底层），与 PSD 的图层记录序一致；
+ *   - `parent`/`clipping_source` 在 psd_codec 里都是**表内下标**，这里换成内部 id；
+ *   - 组的「穿透」= !isolated，PSD 的 lsct 已把 pass / 非 pass 读成 pass_through；
+ *   - 像素与蒙版都是预乘、RGBA8 或 RGBA16，蒙版在图层像素空间——与引擎口径相同，
+ *     直接转移所有权，不做任何换算。
+ */
+compositor::PsdStatus import_psd_document(compositor::Engine* engine, const uint8_t* data,
+                                          size_t size, comp_document* out_document,
+                                          std::string* error) {
+  compositor::PsdDocument psd;
+  const compositor::PsdStatus status =
+      compositor::psd_decode_document(data, size, &psd, error);
+  if (status != compositor::PsdStatus::kOk) return status;
+
+  /*
+   * 没有图层记录的 PSD（拍平文件）不是「0 层的文档」：它的内容全在那份我们不读的
+   * 合并图里。交给分层入口会得到一个空文档——那是最坏的失败形态（看起来成功）。
+   */
+  if (psd.layers.empty()) {
+    if (error != nullptr) {
+      *error = "PSD: 文件没有图层记录（已拍平），请用 comp_io_import 导入合成图";
+    }
+    return compositor::PsdStatus::kUnsupported;
+  }
+
+  auto doc = std::unique_ptr<compositor::Document, void (*)(compositor::Document*)>(
+      compositor::Document::create(engine, psd.width, psd.height, 72.0f, "sRGB"),
+      compositor::Document::destroy);
+  compositor::DocumentState& state = doc->state();
+  state.layers.clear();
+  /* 与 comp_document_create 一致：文档一创建就有 documentID（.comp 包的文件名派生自它）。 */
+  state.document_id = compositor::uuid_v4_new();
+
+  std::vector<comp_layer_id> ids(psd.layers.size(), 0);
+  comp_layer_id next_id = 1;
+  state.layers.reserve(psd.layers.size());
+  for (size_t i = 0; i < psd.layers.size(); ++i) {
+    const compositor::PsdLayerData& source = psd.layers[i];
+    compositor::Layer layer;
+    layer.id = next_id++;
+    ids[i] = layer.id;
+    layer.name = source.name.empty() ? "Layer " + std::to_string(i + 1u) : source.name;
+    layer.blend = source.blend;
+    float opacity = static_cast<float>(source.opacity) / 255.0f;
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    layer.opacity = opacity;
+    layer.visible = source.visible;
+    layer.is_group = source.is_group;
+    /* 穿透组 = 不隔离。PSD 的「非 pass 文件夹记录」就是一个隔离组。 */
+    layer.isolated = source.is_group && !source.pass_through;
+    layer.transform = source.bounds;
+    layer.pixels = std::move(source.pixels);
+    layer.mask = std::move(source.mask);
+    state.layers.push_back(std::move(layer));
+  }
+
+  /* 第二趟：跨图层引用（父级 / 剪贴来源）——此时所有 id 都已分配。 */
+  for (size_t i = 0; i < psd.layers.size(); ++i) {
+    const compositor::PsdLayerData& source = psd.layers[i];
+    compositor::Layer& layer = state.layers[i];
+    if (source.parent >= 0) {
+      if (static_cast<size_t>(source.parent) >= ids.size()) {
+        if (error != nullptr) *error = "PSD: 图层父级下标越界";
+        return compositor::PsdStatus::kIo;
+      }
+      layer.parent = ids[static_cast<size_t>(source.parent)];
+    }
+    if (source.clipping_source >= 0) {
+      if (static_cast<size_t>(source.clipping_source) >= ids.size()) {
+        if (error != nullptr) *error = "PSD: 剪贴来源下标越界";
+        return compositor::PsdStatus::kIo;
+      }
+      layer.clipping_source = ids[static_cast<size_t>(source.clipping_source)];
+    }
+  }
+
+  for (compositor::Layer& layer : state.layers) layer.children.clear();
+  for (compositor::Layer& layer : state.layers) {
+    if (layer.parent == 0) continue;
+    compositor::Layer* parent = doc->find(layer.parent);
+    if (parent != nullptr && parent->is_group) parent->children.push_back(layer.id);
+  }
+
+  state.next_layer_id = next_id;
+  /* 最上层为活动层（Photoshop 打开文件后的默认选中项）。 */
+  state.active_layer = ids.back();
+  doc->touch_all_layers();
+  doc->mark_dirty(false);
+  doc->history().clear();
+  /*
+   * 与 comp_document_create / comp_document_load 同一步：先交给引擎登记，
+   * 再把所有权转成不透明句柄。登记失败（bad_alloc）时 unique_ptr 仍会 destroy，
+   * 不会留下既没 attach 也没释放的文档。
+   */
+  engine->attach_document(doc.get());
+  *out_document = reinterpret_cast<comp_document>(doc.release());
+  return compositor::PsdStatus::kOk;
+}
+
+/* 8 位 -> 16 位无损扩位（v*257），PSD 一个文件只有一种位深。 */
+compositor::ImageBuffer widen_rgba16(const compositor::ImageBuffer& source) {
+  compositor::ImageBuffer out;
+  out.resize(source.width, source.height, COMP_PIXEL_RGBA16);
+  const size_t samples = static_cast<size_t>(source.width) * 4u;
+  for (int32_t y = 0; y < source.height; ++y) {
+    const uint8_t* in = source.row(y);
+    uint16_t* dst = reinterpret_cast<uint16_t*>(out.writable_row(y));
+    for (size_t x = 0; x < samples; ++x) dst[x] = static_cast<uint16_t>(in[x]) * 257u;
+  }
+  return out;
+}
+
+/*
+ * 引擎文档 -> PSD。**只做能忠实表示的那一部分**：任何会被写成「另一个样子」的
+ * 属性都在这里明说失败，由 ABI 层翻成 COMP_ERR_UNSUPPORTED。
+ */
+bool build_psd_document(const compositor::Document& doc, compositor::PsdDocument* psd,
+                        std::string* error) {
+  const compositor::DocumentState& state = doc.state();
+  psd->width = state.width;
+  psd->height = state.height;
+  psd->depth = 8;
+  for (const compositor::Layer& layer : state.layers) {
+    if (layer.pixels.empty()) continue;
+    if (layer.pixels.format == COMP_PIXEL_RGBA16F) {
+      if (error != nullptr) {
+        *error = "PSD: 图层 '" + layer.name +
+                 "' 是 HDR（半精度）图层；PSD 子集只支持 8/16 位整数通道，"
+                 "写成浮点会丢掉白点以上的高光";
+      }
+      return false;
+    }
+    if (layer.pixels.format == COMP_PIXEL_RGBA16) psd->depth = 16;
+  }
+
+  std::unordered_map<comp_layer_id, int32_t> index_of;
+  index_of.reserve(state.layers.size() * 2u);
+  for (size_t i = 0; i < state.layers.size(); ++i) {
+    index_of[state.layers[i].id] = static_cast<int32_t>(i);
+  }
+
+  psd->layers.resize(state.layers.size());
+  for (size_t i = 0; i < state.layers.size(); ++i) {
+    const compositor::Layer& layer = state.layers[i];
+    compositor::PsdLayerData& out = psd->layers[i];
+    out.name = layer.name;
+    out.blend = layer.blend;
+    const float opacity = layer.opacity < 0.0f ? 0.0f : (layer.opacity > 1.0f ? 1.0f : layer.opacity);
+    out.opacity = static_cast<uint8_t>(std::lround(opacity * 255.0f));
+    out.visible = layer.visible;
+    out.is_group = layer.is_group;
+    out.pass_through = layer.is_group && !layer.isolated;
+
+    if (layer.parent != 0) {
+      const auto parent = index_of.find(layer.parent);
+      if (parent == index_of.end()) {
+        if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 的父级不存在";
+        return false;
+      }
+      out.parent = parent->second;
+    } else {
+      out.parent = -1;
+    }
+    out.clipping_source = -1;
+
+    if (layer.is_group) {
+      /* 穿透组在 PSD 里没有自己的混合模式（lsct 的 blend 键永远是 pass）：
+       * 写别的键等于把一个「穿透 + Multiply」的组读回来变成隔离组，画面会变。 */
+      if (out.pass_through && layer.blend != COMP_BLEND_NORMAL) {
+        if (error != nullptr) {
+          *error = "PSD: 组 '" + layer.name +
+                   "' 是穿透组却带着自己的混合模式；PSD 的穿透组不支持混合模式";
+        }
+        return false;
+      }
+      if (!layer.pixels.empty() || !layer.mask.empty()) {
+        if (error != nullptr) *error = "PSD: 组 '" + layer.name + "' 带像素或蒙版，无法写成 PSD";
+        return false;
+      }
+      continue;
+    }
+
+    /* ---- 像素层：先过一遍「PSD 表示不了」的属性（宁可失败，不可改名换姓地写） ---- */
+    if (layer.has_text()) {
+      if (error != nullptr) *error = "PSD: 文字图层 '" + layer.name + "' 无法写成 PSD（PSD 子集不含文字图层）";
+      return false;
+    }
+    if (!layer.adjustments.empty()) {
+      if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 带调整图层参数，无法写成 PSD";
+      return false;
+    }
+    if (!layer.effects.empty()) {
+      if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 带图层效果，无法写成 PSD";
+      return false;
+    }
+    if (layer.rotation != 0.0f || layer.flip_x || layer.flip_y) {
+      if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 有旋转/翻转，无法写成 PSD";
+      return false;
+    }
+
+    comp_rect bounds = layer.transform;
+    if (bounds.w <= 0 || bounds.h <= 0) {
+      bounds = comp_rect{0, 0, layer.pixels.width, layer.pixels.height};
+    } else if (!layer.pixels.empty() &&
+               (layer.pixels.width != bounds.w || layer.pixels.height != bounds.h)) {
+      if (error != nullptr) {
+        *error = "PSD: 图层 '" + layer.name +
+                 "' 的变换尺寸与像素尺寸不一致（缩放图层），PSD 子集不能表示";
+      }
+      return false;
+    }
+    out.bounds = bounds;
+
+    if (!layer.pixels.empty() && layer.pixels.format == COMP_PIXEL_RGBA16) {
+      out.pixels = layer.pixels;
+    } else if (!layer.pixels.empty() && psd->depth == 16) {
+      out.pixels = widen_rgba16(layer.pixels);
+    } else {
+      out.pixels = layer.pixels;
+    }
+    out.mask = layer.mask;
+  }
+
+  /* ---- 剪贴关系：PSD 用「相邻上方 + clipping 标志」表达，来源必须是正下方最近的
+   *      非剪贴同级层。engine 允许指向更远的层，那种关系写出去会读回另一个意思。 ---- */
+  for (size_t i = 0; i < state.layers.size(); ++i) {
+    const compositor::Layer& layer = state.layers[i];
+    if (layer.clipping_source == 0) continue;
+    if (layer.is_group) {
+      if (error != nullptr) *error = "PSD: 组 '" + layer.name + "' 不能被剪贴";
+      return false;
+    }
+    const auto source = index_of.find(layer.clipping_source);
+    if (source == index_of.end()) {
+      if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 的剪贴来源不存在";
+      return false;
+    }
+    const int32_t source_index = source->second;
+    const compositor::Layer& base = state.layers[static_cast<size_t>(source_index)];
+    bool adjacent = source_index < static_cast<int32_t>(i) && !base.is_group &&
+                    base.parent == layer.parent;
+    for (int32_t j = static_cast<int32_t>(i) - 1; adjacent && j >= 0; --j) {
+      const compositor::Layer& between = state.layers[static_cast<size_t>(j)];
+      if (between.parent != layer.parent) continue;
+      if (j == source_index) break; /* 走到了基底：关系成立 */
+      if (between.clipping_source != layer.clipping_source) adjacent = false;
+    }
+    if (!adjacent) {
+      if (error != nullptr) {
+        *error = "PSD: 图层 '" + layer.name +
+                 "' 的剪贴来源不是正下方最近的非剪贴同级层，PSD 无法表达该关系";
+      }
+      return false;
+    }
+    psd->layers[i].clipping = true;
+    psd->layers[i].clipping_source = source_index;
+  }
+  return true;
+}
+
 }  // namespace
 
 extern "C" {
@@ -653,6 +937,90 @@ comp_result comp_io_codec_support(comp_image_format format, comp_codec_state* ou
     note_utf8[copy - 1u] = '\0';
   }
   return entry != nullptr ? COMP_OK : COMP_ERR_NOT_FOUND;
+}
+
+comp_result comp_io_import_document(comp_engine engine, const char* path_utf8,
+                                    comp_document* out_document) {
+  if (out_document == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+  *out_document = nullptr;
+  compositor::Engine* e = compositor::abi::as_engine(engine);
+  COMP_ABI_TRY(e)
+  if (e == nullptr) return COMP_ERR_INVALID_ARGUMENT;
+  if (path_utf8 == nullptr) {
+    return compositor::abi::fail(e, COMP_ERR_INVALID_ARGUMENT, "path is null");
+  }
+
+  const comp_image_format format = comp_io_format_from_path(path_utf8);
+  if (format != COMP_FORMAT_PSD) {
+    /* 单图层格式没有「整篇」语义：与 comp_io_import 完全同义（不做第二套解码）。 */
+    return comp_io_import(engine, path_utf8, out_document);
+  }
+
+  std::vector<uint8_t> bytes;
+  std::string error;
+  if (!read_file_bytes(path_utf8, &bytes, &error)) {
+    return compositor::abi::fail(e, COMP_ERR_IO, error.c_str());
+  }
+  const compositor::PsdStatus status =
+      import_psd_document(e, bytes.data(), bytes.size(), out_document, &error);
+  if (status != compositor::PsdStatus::kOk) {
+    /* 失败时不留半成品文档：import_psd_document 只在最后一步交出所有权。 */
+    *out_document = nullptr;
+    const comp_result failure = psd_status_to_result(status);
+    return compositor::abi::fail(e, failure,
+                                 error.empty() ? "PSD document import failed" : error.c_str());
+  }
+  return COMP_OK;
+  COMP_ABI_CATCH(e)
+}
+
+comp_result comp_io_export_document(comp_document document, const char* path_utf8,
+                                    comp_image_format format, const char* options_json_utf8) {
+  compositor::Document* doc = nullptr;
+  compositor::Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (path_utf8 == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "path is null");
+  }
+  if (format != COMP_FORMAT_PSD) {
+    /* 非分层格式：与 comp_io_export 同义（一次合成、一张图）。 */
+    return comp_io_export(document, path_utf8, format, options_json_utf8);
+  }
+
+  compositor::PsdDocument psd;
+  std::string error;
+  if (!build_psd_document(*doc, &psd, &error)) {
+    /* 全是「这个文档 PSD 表示不了」：具名原因走 last_error，码用 UNSUPPORTED。 */
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, error.c_str());
+  }
+  if (psd.width <= 0 || psd.height <= 0) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "document has no canvas size");
+  }
+
+  /*
+   * 合并图像（PSD 末尾那份预览）= 当前合成结果，8 位 RGBA；16 位文档由编码器按
+   * v*257 扩位。它是预览，布局里的图层数据才是权威——但也不能留一张全透明的
+   * 假图，否则没开图层的查看器看到的是一张空图。
+   */
+  const size_t stride = static_cast<size_t>(psd.width) * 4u;
+  std::vector<uint8_t> merged(static_cast<size_t>(psd.height) * stride, 0u);
+  const comp_result flatten =
+      comp_render_flatten(document, merged.data(), COMP_PIXEL_RGBA8, stride);
+  if (flatten != COMP_OK) return flatten;
+
+  std::vector<uint8_t> encoded;
+  if (!compositor::psd_encode_document(psd, merged.data(), COMP_PIXEL_RGBA8, stride, &encoded,
+                                       &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_IO, error.c_str());
+  }
+  if (!write_file_bytes(path_utf8, encoded.data(), encoded.size(), &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_IO, error.c_str());
+  }
+  return COMP_OK;
+  COMP_ABI_CATCH(engine)
 }
 
 } /* extern "C" */

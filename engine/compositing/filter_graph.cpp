@@ -93,6 +93,7 @@ struct GraphBuilder {
            * 若让它们互为下层，就会退化成逐像素 alpha 缩放——那正是本节要修的旧行为。
            */
           member_node.backdrop = -1;
+          member_node.clipping_consumed_by_stack = true;
           graph->nodes.push_back(member_node);
           graph->nodes[stack_index].inputs.push_back(member_index);
           ++visited;
@@ -489,7 +490,22 @@ bool eval_node(const Document& doc, const FilterGraph& graph, int32_t index,
     /* 达因透传：blend_layer_into 现在把 build_layer_unit 的内因（如
      * "layer unit too large"）带上来，保留回退文案仅作内因为空时的兼底。 */
     std::string blend_error;
-    if (!blend_layer_into(out, doc, *layer, opacity_scale, &blend_error)) {
+    /*
+     * 栈内成员的剪贴是**结构性**的（kClippingStack 自己做 extract → 成员 → restore），
+     * 求值这一层时不能再按基底 alpha 逐像素缩放一次：clip 是「在不透明基底上着色」，
+     * 不是「把成员变半透明」。不清掉的话覆盖度会乘两遍——半透明基底 + 不透明成员
+     * 实测从 (0,128,0,128) 掉到 (64,64,0,128)（成员颜色里混进了本该被盖住的底色）。
+     * 单层视图 composite_layer 早就用「清掉 clipping_source 的副本」处理同一件事。
+     */
+    bool blended = false;
+    if (node.clipping_consumed_by_stack) {
+      Layer clip_free = *layer;
+      clip_free.clipping_source = 0;
+      blended = blend_layer_into(out, doc, clip_free, opacity_scale, &blend_error);
+    } else {
+      blended = blend_layer_into(out, doc, *layer, opacity_scale, &blend_error);
+    }
+    if (!blended) {
       set_error(error, blend_error.empty() ? "blend layer failed" : blend_error);
       return false;
     }
@@ -618,17 +634,30 @@ bool build_clipping_stack_surface(const Document& doc, const FilterGraph& graph,
     for (int32_t y = 0; y < surface.height; ++y) {
       uint8_t* dst_row = surface.writable_row(static_cast<size_t>(y));
       const uint8_t* src_row = member_surface.row(static_cast<size_t>(y));
+      /*
+       * 成员的有效 alpha 必须**取自像素本身**：blend_pixels 的第四个参数是
+       * 「额外的」不透明度乘子（blend_layer_into / blend_buffer_into 都先把
+       * src_px[3]/255 算进去再传），不是像素 alpha。这里早期写成常量 1.0，
+       * 于是成员缓冲里所有**透明**像素都被当成不透明黑混进栈表面：基底颜色
+       * 在成员覆盖范围之外被涂成 (0,0,0)，而 restore 又把基底 alpha 还回去，
+       * 结果就是「alpha 没丢、RGB 全黑」。剪贴栈外框因此只在成员内部有颜色。
+       * 全透明像素直接跳过（对任何混合模式都是恒等变换），顺带省一遍混合。
+       */
       if (half_surface) {
         for (int32_t x = 0; x < surface.width; ++x) {
+          const uint16_t* src = reinterpret_cast<const uint16_t*>(src_row +
+                                                                  static_cast<size_t>(x) * bpp);
+          const double member_alpha = static_cast<double>(deep_half_value(src[3]));
+          if (!(member_alpha > 0.0)) continue;
           blend_pixels_half(reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * bpp),
-                            reinterpret_cast<const uint16_t*>(src_row +
-                                                              static_cast<size_t>(x) * bpp),
-                            mode, 1.0);
+                            src, mode, member_alpha);
         }
       } else {
         for (int32_t x = 0; x < surface.width; ++x) {
-          blend_pixels(dst_row + static_cast<size_t>(x) * bpp,
-                       src_row + static_cast<size_t>(x) * bpp, mode, 1.0);
+          const uint8_t* src = src_row + static_cast<size_t>(x) * bpp;
+          const double member_alpha = static_cast<double>(src[3]) / 255.0;
+          if (member_alpha <= 0.0) continue;
+          blend_pixels(dst_row + static_cast<size_t>(x) * bpp, src, mode, member_alpha);
         }
       }
     }

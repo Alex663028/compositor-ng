@@ -45,7 +45,7 @@
 |------|------|------|
 | PNG | `COMP_CODEC_VENDORED`（libpng 1.6.44 + zlib 1.3.1）或 `BUILTIN`（自研 comp_png） | 读 + 写 |
 | JPEG | `COMP_CODEC_VENDORED`（stb_image / stb_image_write，`{"quality":N}`，缺省 92） | 读 + 写（有损） |
-| PSD | `COMP_CODEC_VENDORED`（stb_image） | **只读**；导出 `UNSUPPORTED` |
+| PSD | 拍平导入 `COMP_CODEC_VENDORED`（stb_image）；分层导入/导出 `COMP_CODEC_BUILTIN`（自研 `psd_codec`） | 读 + 写（分层常用子集，见 §3.5）；`comp_io_export` 单图导出仍 `UNSUPPORTED`，整篇走 `comp_io_export_document` |
 | Radiance HDR | `COMP_CODEC_VENDORED`（stb_image 浮点） | **只读** |
 | EXR | `COMP_CODEC_BUILTIN`（本仓 scanline 编解码器） | 读 + 写（NONE/RLE/ZIPS/ZIP） |
 | TIFF | `COMP_CODEC_UNAVAILABLE`（需 libtiff） | 拒绝，原因同矩阵 |
@@ -79,16 +79,34 @@
 
 ### 3.4 PSB — 与 PSD 明确区分
 
-- `.psd` 走 `COMP_CODEC_PSD`（stb_image，只读、拍平合成）；`.psb` 是 Photoshop 的大文档
-  变体（不同文件头/分块/长度字段），**stb_image 不支持**。
+- `.psd` 的**拍平**导入走 `COMP_CODEC_PSD`（stb_image），分层导入/导出走自研
+  `psd_codec`（§3.5）；`.psb` 是 Photoshop 的大文档变体（不同文件头/分块/长度字段），
+  两条通路都**不支持**。
 - 为什么不把 `.psb` 映射到 `COMP_FORMAT_PSD`：那会让解码器读到一个它不认识的容器，错误
   变成 `COMP_ERR_IO`（看起来像「文件坏了」），掩盖「格式不支持」的真实原因；更糟的是某些
   解析器会把前若干字节当 PSD 解析出**半张图**，违反「不输出半成品」。
 - 落地路线：引入 PSB 读取器（libpsd / psd_sdk）或按 PSB 规范扩展自研 PSD 解析，然后新增
   `COMP_FORMAT_PSB` 枚举并登记；在那之前保持 `UNKNOWN`。
 
-## 4. 失败语义与不变量（回归点）
+### 3.5 PSD 分层读写（M1，自研 `psd_codec`）
 
+- **为什么自研而不引第三方**：第三方 PSD 库要么只读、要么把不支持的图层悄悄丢掉；
+  本仓要的是「读得进来、写得回去、表示不了就具名拒绝」的闭环。`engine/format/psd_codec.cpp`
+  零依赖，格式的每个字节都在本仓可审计。
+- **读**：8/16 位 RGB(A)、RLE/raw、图层记录（名称/可见性/不透明度/偏移/剪贴标志）、
+  图层蒙版（含与图层不同的矩形）、组（`lsct` 穿透/隔离）。
+- **写**：同一子集原样写回；组走两条记录（边界分隔 + 文件夹），隔离组保留自己的混合
+  模式，穿透组只写 `pass`。
+- **明确拒绝**（`COMP_ERR_UNSUPPORTED` / `COMP_ERR_IO` + 具名原因，绝不静默降级）：
+  PSB、CMYK/灰度/索引色彩、32 位通道、ZIP 压缩、文字层、智能对象、矢量蒙版、图层效果、
+  调整层、缩放/旋转/翻转、非相邻剪贴来源。
+- **入口分工**：`comp_io_import_document` / `comp_io_export_document` 是整篇语义（PSD
+  走这里）；`comp_io_import` / `comp_io_export` 仍是单图语义，PSD 单图导出照旧
+  `COMP_ERR_UNSUPPORTED`——同一格式的两个语义不混用同一个入口。
+- **证据**：`tests/test_psd.cpp`（11 例，手写 fixture，正反例逐个钉字节）+ 与 psd-tools
+  的独立交叉核对（见 README §6.87）。
+
+## 4. 失败语义与不变量（回归点）
 | 不变量 | 含义 | 证据 |
 |--------|------|------|
 | 错误码分层 | 格式不支持 = `UNSUPPORTED`；文件不存在/损坏/超限 = `IO`；参数空 = `INVALID_ARGUMENT` | `test_import_matrix.cpp`、`test_codec.cpp` |

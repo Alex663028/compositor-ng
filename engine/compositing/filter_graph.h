@@ -53,6 +53,12 @@ struct FilterNode {
   comp_layer_id layer = 0; /* 对应图层 id；文档根节点为 0 */
   FilterNodeKind kind = FilterNodeKind::kSource;
   bool isolated = false;             /* 仅图层组：true=隔离，false=穿透 */
+  /*
+   * true = 本节点是剪贴栈的输入（基底或成员），剪贴由栈节点结构性处理。
+   * 求值该节点时**不得**再按基底 alpha 逐像素缩放（clipping_factor），
+   * 否则覆盖度会被乘两遍；见 eval_node 的 kSource 分支。
+   */
+  bool clipping_consumed_by_stack = false;
   int32_t parent = -1;               /* 父节点索引；文档根为 -1 */
   std::vector<int32_t> inputs;       /* 子节点索引（自下而上的绘制序）；剪贴栈：基底在前 */
   int32_t backdrop = -1;             /* 绘制下层结果所在节点索引；-1=透明画布 */

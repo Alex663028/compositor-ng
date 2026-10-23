@@ -91,9 +91,9 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 | 1 | 字体枚举与选择器 | 【壳层】S–M | 文字维 55% → 75% | 随包字体只有一个，`comp_font_load_file` 已能加载任意 TTF，缺枚举/回退链（BACKLOG P1-4、P0-6②） |
 | 2 | 锐化 / 降噪 / 高斯模糊入口 | 【接线】S | 调整滤镜维 55% → 70% | 高斯模糊、动感模糊已是调整层；锐化/降噪需新像素实现，属 M |
 | 3 | 标尺 / 参考线 / 网格 / 对齐 | 【壳层】M | 视图维 60% → 80% | 纯外壳与文档模型，ABI 可零新增（参考线进 `.comp` 需尾字段） |
-| 4 | PSD 分层导出 | 【引擎】L | 文档维 70% → 85% | 交付刚需；需先定第三方库策略（BACKLOG P0-7） |
+| 4 | ~~PSD 分层导出~~ **已落地（2026-10-23，README §6.87）** | 【引擎】L | 文档维 70% → 85% | 自研分层读写器 `format/psd_codec` 替换 stb 的「只解合成图」路径：8/16 位、组、蒙版、剪贴往返，psd-tools 交叉验证 67/67 |
 | 5 | 存储/载入选区通道 | 【ABI 追加】+【引擎】M | 选区维 80% → 90% | 通道是新文档模型，需 `.comp` 持久化 |
-| 6 | 组混合模式 + Pass Through | 【引擎】S–M | 图层维 85% → 90% | 当前组强制 Normal（`comp_file.cpp:285`），Pass Through 应成为显式枚举 |
+| 6 | ~~组混合模式 + Pass Through~~ **已落地（2026-10-23，README §6.87）** | 【引擎】S–M | 图层维 85% → 90% | 组混合模式进 `.comp` 的 `engineBlendMode` / `engineIsolated`；`blendMode` 仍写 Normal 保持上游兼容 |
 | 7 | HiDPI（manifest + `SetProcessDpi*`） | 【壳层】S | 视图维 60% → 70% | 现在靠系统位图拉伸，200% 缩放下 1px 线不再是 1 设备像素 |
 | 8 | 破坏性 Image > Adjustments 族 | 【ABI 追加】+【引擎】M | 调整维 55% → 65% | 多数可复用 `AdjustPixels`；现在只有反相 |
 
@@ -106,13 +106,14 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 
 | 项 | 结果 |
 |---|---|
-| `scripts/build.py` | **640 例 / 0 失败**，零编译告警 |
-| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（640 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
+| `scripts/build.py` | **654 例 / 0 失败**，零编译告警 |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（654 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
 | 壳自检 | **257 项 failures=0**，SHA256 `377de660d48ac933…` 与基线逐字节一致 |
-| OHOS 交叉编译 | `compile ok=114 fail=0` |
-| `^COMP_API` 导出 | **150**（只尾部追加，无重排） |
+| OHOS 交叉编译 | `compile ok=115 fail=0` |
+| `^COMP_API` 导出 | **152**（只尾部追加，无重排） |
 | `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
 | `scripts/visual_check.py --scene all` | **128 条 / 24 场景 / 0 失败** |
+| `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败**（psd-tools 独立实现，见 README §6.87） |
 
 规模参考：引擎 ≈107k 行、Windows 壳 ≈22k 行（13 个翻译单元）、测试 ≈27.6k 行。
 

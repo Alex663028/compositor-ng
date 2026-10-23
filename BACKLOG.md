@@ -39,13 +39,13 @@
 
 | 维度 | 本仓 | Photoshop（参照） | 差距性质 |
 |------|------|-------------------|----------|
-| C ABI | **150** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
+| C ABI | **152** 个导出（`^COMP_API` 行计数，2026-10-23 实测） | — | 契约面稳定 |
 | 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
-| 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合被固定为 Normal（`comp_file.cpp:285`） |
+| 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **12**（`comp_layer.h:300-313`） | 调整菜单 20+ | 只有调整**图层**，没有破坏性 Image > Adjustments（除反相） |
 | 图层样式 | **6**（描边/投影/颜色叠加/内阴影/外发光/内发光） | 10 | 缺斜面和浮雕 / 缎光 / 渐变叠加 / 图案叠加 |
 | 滤镜 | **9**（`comp_filter.h:38-48`） | 100+ | 无锐化 / 降噪 / 模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染 |
-| 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/EXR + `.comp` | 20+ | 无 PSD 导出、TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
+| 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/PSD/EXR + `.comp` | 20+ | PSD 只是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
 | 文档 | **单文档**、单个 `ShellState::document` | 多标签 | 新建会直接销毁旧文档（`shell_document.cpp:255/313`） |
 | 面板 | 10 个（图层/调整/曲线/裁剪/滤镜/效果/色彩范围/路径/历史/文字） | 15+ | 无通道 / 导航器 / 色板 / 属性 / 动作 |
 | 菜单 | 9 个顶层菜单 | 11 | 无「视图 > 标尺/参考线/网格」、无「窗口」 |
@@ -208,11 +208,17 @@
 - **验收（① 已满足，②③ 沿用）**：改字号/文本后重新合成，非文本像素逐字节不变；
   保存 `.comp` 再打开文本仍可编辑。
 
-### P0-7 文件格式：PSD 只读、TIFF/WebP 不可用、无 PDF
-- **现状**：`docs/format-import-matrix.md:44-51` 明确：PSD 只读（stb_image，拍平）、TIFF/HEIF/WebP 登记为不可用、HDR 只读、EXR 读写；无 PDF / SVG / PSB / RAW 解码。
+### P0-7 文件格式：PSD 分层读写已落地（常用子集）；TIFF/WebP/HEIF/PDF 仍缺
+- **现状（2026-10-23）**：PSD **分层读 + 分层写**已落地（自研 `engine/format/psd_codec.*`，
+  ABI 走 `comp_io_import_document` / `comp_io_export_document`；拍平导入仍走 stb_image）：
+  8/16 位 RGB(A)、RLE/raw、图层记录、蒙版、组（穿透/隔离）、剪贴、不透明度、混合模式；
+  PSB / CMYK / 32 位 / ZIP / 文字 / 智能对象 / 矢量蒙版 / 图层效果 / 调整层**具名拒绝**。
+  TIFF/HEIF/WebP 仍登记为不可用，HDR 只读、EXR 读写；无 PDF / SVG / PSB / RAW 解码。
 - **PS 行为**：PSD/PSB 分层读写、TIFF（LZW/ZIP、图层）、WebP/HEIF、PDF 导出、SVG 放置、RAW 导入。
-- **性质**：【引擎】L–XL，且**需先定第三方库策略**（与"零依赖自研"取向冲突）。最优先是 **PSD 分层导出**：交付给上下游的刚需，当前只能 `.comp` + 位图。
-- **验收**：导出的 PSD 在第三方阅读器（PIL/psd-tools）+ 本仓重新导入后图层数/位置/不透明度一致；不支持的参数显式拒绝，不静默丢弃。
+- **余下**：PSB、TIFF（LZW/ZIP、图层）、WebP/HEIF、PDF 导出、SVG 放置、RAW 导入。
+- **性质**：【引擎】L–XL（PSD 这一块已完成，路线选了零依赖自研，不引第三方 PSD 库）。
+- **验收（已满足）**：导出的 PSD 在第三方阅读器（psd-tools）+ 本仓重新导入后图层数 /
+  位置 / 不透明度 / 蒙版一致；不支持的变体显式拒绝，不静默丢弃（`tests/test_psd.cpp`，11 例）。
 
 ### P0-8 视图辅助：标尺 / 参考线 / 网格 / 对齐 + 通道面板
 - **现状**：全仓 0 命中（ABI 与外壳均无 `guide/ruler/grid/snap`）。注意 README §6.3 的 `guides` 指的是 **Camera Raw 几何校准参数**（`camera_raw.cpp:394-415`），**不是画布参考线**——画布参考线完全不存在。
@@ -355,7 +361,7 @@
 | B | P0-4 剪贴板、P0-10 选项栏/光标/DPI | 1–2 周 | 壳层为主，跨应用工作流打通 |
 | C | P0-5 选区通道 + 修改补全 + 变换选区 | 2–3 周 | 引擎 + ABI 追加，所有下游编辑的入口 |
 | D | P0-6① 文本图层可编辑 → P1-4 字体选择/画笔预设 | 3–5 周 | 最痛的用户体验缺口 |
-| E | P0-7 PSD 分层导出（先定第三方策略） | 2–4 周 | 交付刚需 |
+| E | P0-7 ~~PSD 分层导出~~ → **PSD 分层读写已完成**（2026-10-23，自研常用子集）；余 PSB / TIFF / WebP / PDF | — | 交付刚需已解锁 |
 | F | P1-1/2/3 样式/图层/变换、P1-6/7 调整/渐变、P1-5 滤镜族 | 6–10 周 | 专业工作流 |
 | G | P0-9 色彩管理、P1-9 打印、P1-10 自动化、P0-3 多文档 | 视排期 | 各自独立子系统，建议单独立项 |
 
@@ -379,7 +385,7 @@
 
 | 结论 | 证据 |
 |------|------|
-| 150 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 150） |
+| 152 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 152） |
 | 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
 | 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
 | 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |

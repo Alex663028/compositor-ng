@@ -53,6 +53,16 @@ DEFAULT_OHOS_NDK = "G:/DevEco Studio/sdk/default/openharmony/native"
 
 IS_WINDOWS = os.name == "nt"
 
+# 输出流容错：子进程输出按本地编码解码后仍可能混有无法回写的字符（U+FFFD），
+# 在 GBK 控制台 + 重定向的组合下会让 print 抛 UnicodeEncodeError，把「某步骤
+# 到底过没过」变成一句 unexpected exception。这里只放宽编码错误处理为替换，
+# 不改变任何判定逻辑。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
 
 class Regression:
     """极简步骤执行器：统一计时、打印、记账。"""
