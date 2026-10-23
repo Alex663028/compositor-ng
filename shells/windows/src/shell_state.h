@@ -205,6 +205,11 @@ constexpr UINT kCmdEditCut = 1568;        /* 编辑 > 剪切（Ctrl+X） */
 constexpr UINT kCmdEditPaste = 1569;      /* 编辑 > 粘贴（Ctrl+V） */
 constexpr UINT kCmdEditPasteInto = 1570;  /* 编辑 > 贴入选区（Ctrl+Alt+V） */
 constexpr UINT kCmdEditClear = 1571;      /* 编辑 > 清除（Backspace） */
+/*
+ * P0-6 ①：可编辑文字图层。文字工具提交后选中的是一层「文字对象 + 渲染缓存」，
+ * 要再画像素必须先显式栅格化（与上游同一规矩）。入口在图层菜单。
+ */
+constexpr UINT kCmdLayerRasterizeText = 1572; /* 图层 > 栅格化文字 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..3 */
 constexpr UINT kCmdFilterApply = 1210;
@@ -519,6 +524,9 @@ struct ShellState {
   double type_font_ascender = 0.0;  /* em 比例，来自 comp_font_metrics */
   double type_font_descender = 0.0; /* em 比例，通常为负 */
   std::wstring type_font_label;     /* 面板显示名（"Noto Sans SC Subset" / 未加载） */
+  /* 字体文件路径（UTF-8）：可编辑文字图层把它写进 .comp，重开时原样还原。
+   * 走内置 5×7 点阵轨道时为空串，comp_text_desc.font_path_utf8 传 nullptr。 */
+  std::string type_font_path;
   int type_panel_focused = comp_ui::kTypePanelFontSizeRow;
   int selection_feather = comp_ui::kMinSelectionFeather;
   int selection_grow = comp_ui::kMinSelectionGrow;

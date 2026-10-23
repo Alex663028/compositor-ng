@@ -3724,6 +3724,11 @@ struct LayerMenuState {
   bool multi_selected = false;    /* 面板多选集合 > 1 */
   int32_t effect_count = 0;       /* 选中层已有效果数 */
   int32_t layer_count = 0;
+  /*
+   * P0-6 ①：选中层是否可编辑文字图层（由调用方用 comp_layer_get_text 查询：
+   * 返回 COMP_OK 即文字层，COMP_ERR_STATE 即普通像素层）。栅格化只对文字层有动作。
+   */
+  bool is_text = false;
 };
 
 struct LayerMenuChecks {
@@ -3776,6 +3781,7 @@ struct LayerMenuEnabled {
   bool isolated = false;
   bool selection_modify = false; /* 取消选择/反选/扩展/收缩：都要先有选区 */
   bool selection_load_pixels = false;
+  bool layer_rasterize_text = false; /* 栅格化文字：只对可编辑文字图层有动作 */
 };
 
 inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
@@ -3801,6 +3807,8 @@ inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
   enabled.isolated = state.has_layer && state.is_group;
   enabled.selection_modify = state.has_selection;
   enabled.selection_load_pixels = state.has_layer;
+  /* 普通图层上「栅格化文字」是纯空操作（引擎幂等返回 OK、不记撤销步），置灰。 */
+  enabled.layer_rasterize_text = state.has_layer && state.is_text;
   return enabled;
 }
 

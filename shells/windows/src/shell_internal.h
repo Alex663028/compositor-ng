@@ -273,6 +273,9 @@ static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTE
   void panel_layer_input_backspace(ShellState& shell);
   void panel_commit_layer_input(ShellState& shell);
   comp_layer_id selected_layer_id(const ShellState& shell);
+  /* P0-6 ①：可编辑文字图层的壳侧入口（文字工具提交 / 图层 > 栅格化文字）。 */
+  bool layer_is_text(ShellState& shell, comp_layer_id id);
+  void panel_rasterize_text(ShellState& shell);
   void panel_merge_down(ShellState& shell);
   void panel_flatten(ShellState& shell);
   std::string number_text(double value);
@@ -433,7 +436,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == COMP_FILTE
   void type_commit(ShellState& shell);
   void type_step_param(ShellState& shell, int direction, bool spacing);
   std::wstring exe_directory();
-  comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metrics);
+  comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metrics,
+                              std::string* out_path = nullptr);
   bool load_shell_font(ShellState& shell);
   bool read_whole_file(const std::wstring& path, std::vector<uint8_t>* out);
   bool load_shell_camera_raw_tables(ShellState& shell);

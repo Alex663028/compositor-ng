@@ -144,6 +144,13 @@ void sync_menu_state(HWND window, ShellState& shell) {
     /* 端头直接置灰，而不是点完才在状态栏说「已经是顶层」。 */
     state.can_move_up = comp_ui::plan_layer_reorder(entries.data(), count, index, -1).ok;
     state.can_move_down = comp_ui::plan_layer_reorder(entries.data(), count, index, 1).ok;
+    /* P0-6 ①：只有可编辑文字图层才让「栅格化文字」可点。查询口径就是 ABI 本身：
+     * 文字层返回 COMP_OK，普通像素层返回 COMP_ERR_STATE。 */
+    if (shell.doc.document != nullptr) {
+      size_t required = 0;
+      state.is_text = comp_layer_get_text(shell.doc.document, row->id, nullptr, nullptr, 0,
+                                          &required) == COMP_OK;
+    }
   }
 
   const comp_ui::LayerMenuChecks checks = comp_ui::layer_menu_checks(state);
@@ -209,6 +216,7 @@ void sync_menu_state(HWND window, ShellState& shell) {
   }
   menu_set_enabled_recursive(menu, kCmdLayerMergeDown, enabled.layer_merge_down);
   menu_set_enabled_recursive(menu, kCmdLayerFlatten, enabled.layer_flatten);
+  menu_set_enabled_recursive(menu, kCmdLayerRasterizeText, enabled.layer_rasterize_text);
   menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerBringForward, enabled.move_up);
@@ -3622,6 +3630,8 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeDown, L"向下合并(&M)\tCtrl+E");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlatten, L"拼合图像(&F)");
+  /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectUp, L"选择上一图层(&U)\t↑");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSelectDown, L"选择下一图层(&D)\t↓");

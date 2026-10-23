@@ -152,47 +152,85 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
 }
 
 /*
- * 回车提交：一次 comp_tool_apply = 一步撤销。空缓冲不提交（没有可画的字形，
- * 引擎会以「无字形」拒绝），外壳保持插入点等待输入。
+ * 是否可编辑文字图层。判定直接用 ABI 自己的口径：查询模式下 comp_layer_get_text
+ * 对文字层返回 COMP_OK，对普通像素层返回 COMP_ERR_STATE——外壳不另设一份真相。
+ */
+bool layer_is_text(ShellState& shell, comp_layer_id id) {
+  if (shell.doc.document == nullptr || id == 0) return false;
+  size_t required = 0;
+  return comp_layer_get_text(shell.doc.document, id, nullptr, nullptr, 0, &required) == COMP_OK;
+}
+
+/*
+ * 插入点是否落在选中文字图层的矩形内（= 用户想改这一段文字）。
+ *
+ * 判据用 comp_layer_get_transform 的实话：文字层的矩形就是文本框，落点在框内
+ * 才是「编辑这一段」；点在别处是「另起一段文字」，否则第二次提交会把上一段
+ * 悄悄搬到新位置（用户看到的是上一段文字消失）。
+ */
+static bool type_origin_inside_layer(ShellState& shell, comp_layer_id id) {
+  comp_rect box{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.doc.document, id, &box, &rotation) != COMP_OK) return false;
+  const double x = shell.doc.type_origin.x;
+  const double y = shell.doc.type_origin.y;
+  return x >= static_cast<double>(box.x) && y >= static_cast<double>(box.y) &&
+         x < static_cast<double>(box.x) + static_cast<double>(box.w) &&
+         y < static_cast<double>(box.y) + static_cast<double>(box.h);
+}
+
+/*
+ * 回车提交：**产出一个可编辑文字图层**，不再把字形画进当前层的像素。
+ *
+ * 两条通路，一次提交只记一步撤销：
+ *   - 插入点落在选中的文字层框内 -> comp_layer_set_text（改文本/字号/颜色，重渲这层）；
+ *   - 否则 -> comp_layer_add_text（新建一层文字图层，像素只是它的渲染缓存）。
+ * 参数（含字体文件打不开）在引擎里先于任何副作用校验：失败不建层、不进撤销栈。
+ * 空缓冲不提交：没有可排的字形，留插入点等用户输入。
  */
 void type_commit(ShellState& shell) {
   if (!shell.doc.type_active) return;
   if (shell.doc.type_text.empty()) {
-    set_status(shell, L"文字：还没有输入内容（键入 ASCII 后回车提交，Esc 取消）");
+    set_status(shell, L"文字：还没有输入内容（键入文字后回车提交，Esc 取消）");
     return;
   }
-  const comp_layer_id id = selected_layer_id(shell);
-  if (shell.doc.document == nullptr || id == 0) {
-    set_status(shell, L"文字：请先选择一个图层");
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"文字：无文档");
     return;
   }
 
-  comp_tool_op_desc desc{};
-  desc.kind = COMP_TOOL_TYPE;
-  desc.type.origin_x = shell.doc.type_origin.x;
-  desc.type.origin_y = shell.doc.type_origin.y;
-  desc.type.text = shell.doc.type_text.c_str();
-  desc.type.text_length = static_cast<int32_t>(shell.doc.type_text.size());
-  desc.type.style.font_size = shell.doc.type_font_size;
-  desc.type.style.line_height = shell.doc.type_line_height;
-  desc.type.style.letter_spacing = shell.doc.type_letter_spacing;
-  desc.type.style.antialias = 1;
+  comp_text_desc desc{};
+  desc.text = shell.doc.type_text.c_str();
+  desc.text_length = static_cast<int32_t>(shell.doc.type_text.size());
+  desc.origin_x = shell.doc.type_origin.x;
+  desc.origin_y = shell.doc.type_origin.y;
+  desc.style.font_size = shell.doc.type_font_size;
+  desc.style.line_height = shell.doc.type_line_height;
+  desc.style.letter_spacing = shell.doc.type_letter_spacing;
+  desc.style.antialias = 1;
+  desc.color[0] = shell.foreground.r;
+  desc.color[1] = shell.foreground.g;
+  desc.color[2] = shell.foreground.b;
+  desc.color[3] = 255;
+  desc.opacity = 1.0f;
   /*
-   * type_font 是 comp_tool_op_desc 的**尾字段**：非 NULL 时引擎走字体轨道，
-   * NULL 时沿用 5×7 点阵。开关关掉就传 NULL（而不是「传了句柄但让引擎忽略」），
-   * 两条轨道在 ABI 上只有这一个分叉。
+   * 字体轨道由 font_path 决定（comp_text_desc 没有 comp_font 句柄）：随仓字体
+   * 加载成功时把它的文件路径写进 .comp，重开时同一份字体会被原样找回；走内置
+   * 5×7 点阵时传 NULL。路径为空但开关还开着不可能发生——type_font_track 已经
+   * 要求句柄非空，而句柄只由 load_shipped_font 在同一处给出路径。
    */
-  desc.type_font = type_font_track(shell) ? shell.type_font : nullptr;
-  desc.type.color[0] = shell.foreground.r;
-  desc.type.color[1] = shell.foreground.g;
-  desc.type.color[2] = shell.foreground.b;
-  desc.type.color[3] = 255;
-  desc.type.opacity = 1.0f;
+  desc.font_path_utf8 =
+      (type_font_track(shell) && !shell.type_font_path.empty()) ? shell.type_font_path.c_str()
+                                                                : nullptr;
+  desc.font_face_index = 0; /* 随仓字体只有一个面 */
+  desc._reserved = 0;
 
-  char note[256] = {0};
-  size_t note_size = 0;
+  const comp_layer_id selected = selected_layer_id(shell);
+  const bool editing = layer_is_text(shell, selected) && type_origin_inside_layer(shell, selected);
+  comp_layer_id id = selected;
   const comp_result result =
-      comp_tool_apply(shell.doc.document, id, &desc, note, sizeof(note), &note_size);
+      editing ? comp_layer_set_text(shell.doc.document, selected, &desc)
+              : comp_layer_add_text(shell.doc.document, &desc, &id);
   shell.doc.needs_render = true;
 
   /* 无论成功与否都退出键入态：成功已提交，失败也没有可保留的预览语义。 */
@@ -204,16 +242,50 @@ void type_commit(ShellState& shell) {
 
   wchar_t buffer[384];
   if (result != COMP_OK) {
-    wsprintfW(buffer, L"文字失败（%d）", static_cast<int>(result));
+    wsprintfW(buffer, L"文字失败（%d）%s", static_cast<int>(result),
+              result == COMP_ERR_IO ? L"：字体文件打不开" : L"");
     set_status(shell, buffer);
     return;
   }
-  if (note[0] != '\0' && note_size > 1) {
-    wsprintfW(buffer, L"文字：已应用（%d 行）｜%s", lines, widen_ascii(note).c_str());
+  if (!editing) {
+    /* 新层要进可见性缓存与面板列表，并成为当前层——接着打字就是改这一层。 */
+    set_visible_cache(shell, id, static_cast<uint8_t>(1));
+    refresh_layers(shell);
+    panel_select_layer_id(shell, id);
+    wsprintfW(buffer, L"文字：已新建文字图层（%d 行，图层 > 栅格化文字 可转为像素层）",
+              lines);
   } else {
-    wsprintfW(buffer, L"文字：已应用（%d 行）", lines);
+    refresh_layers(shell);
+    wsprintfW(buffer, L"文字：已更新文字图层（%d 行）", lines);
   }
   refresh_history_status(shell, buffer);
+}
+
+/*
+ * 图层 > 栅格化文字：文字对象丢弃、像素留下，此后就是普通像素层。
+ * 引擎对非文字层幂等返回 OK 且不记撤销步；这里给出明确提示，不做假动作。
+ */
+void panel_rasterize_text(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"栅格化文字：请先选择一个图层");
+    return;
+  }
+  if (!layer_is_text(shell, id)) {
+    set_status(shell, L"栅格化文字：当前图层不是文字图层");
+    return;
+  }
+  if (comp_layer_rasterize_text(shell.doc.document, id) != COMP_OK) {
+    set_status(shell, L"栅格化文字失败");
+    return;
+  }
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  refresh_history_status(shell, L"栅格化文字：已完成（该层现在是像素层）");
 }
 
 /* [ / ] 调字号，Shift+[ / ] 调字距；只在文字工具内生效（其余工具沿用笔刷/魔棒）。 */

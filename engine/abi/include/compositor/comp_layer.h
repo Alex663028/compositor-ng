@@ -771,6 +771,10 @@ typedef struct comp_type_style {
  * `TypeParams` 注释：画进当前图层而不是新建可再编辑的文字图层、自带位图字体、
  * 只做左对齐 + 字号/行距/字距）。
  *
+ * **一次性落墨 vs 可编辑图层**：本结构走 `comp_tool_apply`，把字形直接写进当前
+ * 图层的像素，写完不可再编辑；要「文字对象 + 渲染缓存」并支持反复改文本/字号，
+ * 用本头文件尾部的 `comp_layer_add_text` / `comp_layer_set_text`（P0-6 ①）。
+ *
  * 文本：
  *   - 默认（`comp_tool_op_desc::type_font` 为 NULL）走内置 5×7 位图字体：
  *     `text` 是 UTF-8 缓冲区，但**只接受 0x20..0x7E 与 '\n'**；其它字节（含
@@ -1242,6 +1246,109 @@ COMP_API comp_result comp_layer_get_pixels(comp_document document,
                                            int32_t* out_width,
                                            int32_t* out_height,
                                            comp_pixel_format* out_format);
+
+/* ------------------------------------------- 可编辑文字图层（P0-6 ① 尾部追加） */
+
+/*
+ * 文字图层描述（语义见 domain/text_object.h）。
+ *
+ * 与 `comp_tool_type` 的区别是**语义**上的，不是字段上的：`comp_tool_type` 把文字
+ * 一次性画进当前图层的像素（画完就不可再编辑）；本结构描述一个**持久的文字
+ * 对象**，引擎把它挂到图层上、渲染结果作为该层像素的缓存——改文本/字号/颜色
+ * 只需重新渲染这一层，其它图层逐字节不变，撤销/重做与 `.comp` 往返都把对象
+ * 原样带回来。
+ *
+ * 两个轨道（与 comp_tool_type 完全一致）：
+ *   - `font_path_utf8` 为 NULL/空串：内置 5×7 位图 ASCII，文本只接受
+ *     0x20..0x7E 与 '\n'，`style.font_size` 是 5×7 单元高；
+ *   - 非空：从该路径加载（进程级缓存，见 domain/text_layer.h），文本按 UTF-8
+ *     解码、CJK 可用，`style.font_size` 是 **em 高**。字体打不开 -> COMP_ERR_IO /
+ *     COMP_ERR_DECODE（不静默回落成内置点阵，那会让宿主以为字体生效了）。
+ *
+ * 为什么存路径而不是 comp_font 句柄：文字对象要进 `.comp`，句柄在存盘后就失效；
+ * 路径 + `font_face_index` 是唯一能跨会话还原的标识。`font_family` 只用于回显，
+ * 不参与渲染（族名在不同机器上可能指向不同文件）。
+ *
+ * 几何：`origin_x/origin_y` 是文本框**左上角**（文档像素，可带小数，亚像素偏移
+ * 会保留在字形落位上）。写入成功后图层的 `transform` 被设为文本框矩形（整数
+ * 像素，原点取 floor），因此移动文字图层 = 移动 transform = 移动文本框。
+ *
+ * 参数闸（COMP_ERR_INVALID_ARGUMENT，且不改旧像素、不进撤销栈）：文本为空 /
+ * 超过 65536 字节 / 旧轨道含非可打印 ASCII（含 UTF-8、Tab）/ 字号、行距、字距
+ * 越界或非有限 / 原点非有限或绝对值 > 1e6 / 颜色 alpha 为 0 / opacity 不在
+ * (0, 1] / `_reserved` 非 0。文本框与画布完全不相交 -> COMP_ERR_INVALID_ARGUMENT
+ * （不会建出一张看不见的层）。文本框面积超过画布上限同量级 -> COMP_ERR_UNSUPPORTED。
+ */
+typedef struct comp_text_desc {
+  const char* text;        /* UTF-8；'\n' 断行；上级轨道仅 0x20..0x7E */
+  int32_t text_length;     /* 字节数；1..65536 */
+  double origin_x;         /* 文本框左上角，文档像素 */
+  double origin_y;
+  comp_type_style style;
+  uint8_t color[4];        /* 直通 sRGB + alpha（0..255） */
+  float opacity;           /* (0, 1]，再乘进逐像素覆盖率 */
+  const char* font_path_utf8; /* NULL/空 = 内置 5×7 点阵 ASCII */
+  int32_t font_face_index; /* .ttc 面序号，0 = 第一面；无字体时忽略 */
+  int32_t _reserved;       /* 必须为 0 */
+} comp_text_desc;
+
+/*
+ * 新建文字图层（对齐上游「用文字工具点一下建一个可再编辑的文字层」）。
+ *
+ *   - `desc` / `out_id` 为 NULL -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 参数与字体错误在**开事务之前**拒绝：不建层、不消耗图层 id、不留半成品；
+ *   - 图层名默认取文本第一行前 32 字节（UTF-8 边界安全），空行回落「文字图层」；
+ *   - 新层放在当前活动图层的**上方**（与 comp_layer_add 同一套堆叠语义）；
+ *   - 全局不透明度为 1、混合 Normal、采样 High quality；颜色/透明度由 desc 决定；
+ *   - 一步撤销；返回的 id 可直接用于 comp_layer_set_text / comp_layer_move。
+ */
+COMP_API comp_result comp_layer_add_text(comp_document document,
+                                         const comp_text_desc* desc,
+                                         comp_layer_id* out_id);
+
+/*
+ * 改写已有文字图层的文字对象并重新渲染它的像素。
+ *
+ *   - `id` 不是文字图层 -> COMP_ERR_STATE（提示用 comp_layer_add_text 新建，
+ *     或先 rasterize）；**不会**悄悄把普通图层的像素换成文字；
+ *   - 参数闸同 comp_layer_add_text，失败时旧文本/旧像素原样保留；
+ *   - 成功后图层 `transform` 跟随新文本框、内容修订号推进（合成缓存/GPU 纹理
+ *     自动失效），一步撤销——连续拖动字号滑块时宿主应当用 comp_txn_* 把这些
+ *     调用合并成一个撤销步；
+ *   - 调整/效果/蒙版/混合模式不属于文字对象，改文字时原样保留。
+ */
+COMP_API comp_result comp_layer_set_text(comp_document document,
+                                         comp_layer_id id,
+                                         const comp_text_desc* desc);
+
+/*
+ * 读回文字图层。
+ *
+ *   - 不是文字图层 -> COMP_ERR_STATE；图层不存在 -> COMP_ERR_NOT_FOUND；
+ *   - `out_desc` 非空时整块写入（`text` 字段被改写成 `text_buffer`，可为 NULL）；
+ *   - 文本两段式：`text_buffer == NULL` 或 `capacity == 0` 只回填长度；
+ *     `*out_required` = 文本字节数 **+ 1**（含结尾 NUL，与 comp_layer_get_name
+ *     同一把尺子）；容量不足返回 COMP_ERR_INVALID_ARGUMENT，不写半截字符串；
+ *   - 只读：不开事务、不推进修订号、不影响合成缓存。
+ */
+COMP_API comp_result comp_layer_get_text(comp_document document,
+                                         comp_layer_id id,
+                                         comp_text_desc* out_desc,
+                                         char* text_buffer,
+                                         size_t capacity,
+                                         size_t* out_required);
+
+/*
+ * 把文字图层栅格化：丢掉文字对象，像素保留为普通图层。
+ *
+ *   - 这是「在文字上落笔」「抠图/滤镜改像素」之前的显式闸门：栅格化之后该层
+ *     就再也不能改字号/文本（与 Photoshop 的「栅格化文字」同义）；
+ *   - 不是文字图层 -> COMP_OK 且不改任何东西（幂等，宿主不必先判断）；
+ *   - 一步撤销（撤销后文字对象与可编辑性一起回来）；
+ *   - 图像大小重采样（comp_document_resize_image）会隐式丢弃文字对象：
+ *     非等比缩放无法用「字号 + 文本框」表达，宁可退回普通图层也不撒谎。
+ */
+COMP_API comp_result comp_layer_rasterize_text(comp_document document, comp_layer_id id);
 
 #ifdef __cplusplus
 } /* extern "C" */

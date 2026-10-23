@@ -59,6 +59,14 @@ std::size_t document_state_bytes(const DocumentState& state) {
     for (const Effect& effect : layer.effects) {
       total += string_bytes(effect.settings_json);
     }
+    /* 文字对象随快照一起进历史（撤销天然一致）；它的几个字符串也按容量记账，
+     * 否则一段 64 KB 的文本每步撤销都是一笔不计入预算的常驻内存。 */
+    if (layer.text) {
+      total += sizeof(TextObject);
+      total += string_bytes(layer.text->text);
+      total += string_bytes(layer.text->font_path);
+      total += string_bytes(layer.text->font_family);
+    }
   }
   /* 选区蒙版（深拷贝口径，与图层像素/蒙版一致）。 */
   total += state.selection.base.pixel_data().capacity();

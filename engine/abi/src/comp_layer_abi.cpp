@@ -18,6 +18,7 @@
 #include "domain/adjustment_table.h"
 #include "domain/curves_settings.h"
 #include "domain/effect_table.h"
+#include "domain/text_layer.h"
 #include "domain/tool_ops.h"
 
 using compositor::Document;
@@ -41,6 +42,83 @@ float clamp_opacity(float value) {
   if (value < 0.0f) return 0.0f;
   if (value > 1.0f) return 1.0f;
   return value;
+}
+
+/* comp_text_desc -> 域层 TextObject。只做拷贝与**廉价的**字段闸；文本/样式/
+ * 字体的完整校验交给 text_layer_render（它已经握着字体与排版内核）。
+ * 所有检查都在开事务之前完成：失败不建层、不改旧像素、不进撤销栈。 */
+bool text_desc_to_object(const comp_text_desc* desc, compositor::TextObject* out,
+                         std::string* error) {
+  if (desc == nullptr || out == nullptr) {
+    *error = "text desc is null";
+    return false;
+  }
+  if (desc->text == nullptr) {
+    *error = "text is null";
+    return false;
+  }
+  if (desc->text_length <= 0) {
+    *error = "text_length must be positive";
+    return false;
+  }
+  if (static_cast<size_t>(desc->text_length) > compositor::kMaxTypeCharacters) {
+    *error = "text exceeds the character limit";
+    return false;
+  }
+  if (desc->_reserved != 0) {
+    *error = "_reserved must be 0";
+    return false;
+  }
+  if (desc->font_face_index < 0) {
+    *error = "font_face_index must be >= 0";
+    return false;
+  }
+  out->text.assign(desc->text, static_cast<size_t>(desc->text_length));
+  out->origin_x = desc->origin_x;
+  out->origin_y = desc->origin_y;
+  out->style.font_size = desc->style.font_size;
+  out->style.line_height = desc->style.line_height;
+  out->style.letter_spacing = desc->style.letter_spacing;
+  out->style.antialias = desc->style.antialias != 0;
+  for (int i = 0; i < 4; ++i) out->color[i] = desc->color[i];
+  out->opacity = desc->opacity;
+  out->font_path = desc->font_path_utf8 != nullptr ? desc->font_path_utf8 : "";
+  /* 内置点阵轨道只有一个面；把 face 归零可让同一个 desc（换字体轨道时）
+   * 不会因残留的 face 号被误判成 kBadFaceIndex。 */
+  out->font_face_index = out->font_path.empty() ? 0 : desc->font_face_index;
+  return true;
+}
+
+/* TextLayerStatus -> comp_result。参数类错误一律 INVALID_ARGUMENT（与工具算子同一口径），
+ * 字体错误按 FontLoadStatus 细分，宿主据此区分「路径错」与「文件不是字体」。 */
+comp_result text_layer_result(const compositor::TextLayerReport& report) {
+  using compositor::TextLayerStatus;
+  switch (report.status) {
+    case TextLayerStatus::kOk:
+      return COMP_OK;
+    case TextLayerStatus::kBadArgument:
+    case TextLayerStatus::kBadText:
+    case TextLayerStatus::kBadStyle:
+    case TextLayerStatus::kOutOfCanvas:
+      return COMP_ERR_INVALID_ARGUMENT;
+    case TextLayerStatus::kTooLarge:
+      return COMP_ERR_UNSUPPORTED;
+    case TextLayerStatus::kFontMissing:
+      switch (report.font_status) {
+        case compositor::FontLoadStatus::kNotFound:
+          return COMP_ERR_IO;
+        case compositor::FontLoadStatus::kOutOfMemory:
+          return COMP_ERR_OUT_OF_MEMORY;
+        case compositor::FontLoadStatus::kNotAFont:
+        case compositor::FontLoadStatus::kBadFaceIndex:
+          return COMP_ERR_DECODE;
+        default:
+          return COMP_ERR_INVALID_ARGUMENT;
+      }
+    case TextLayerStatus::kInternal:
+      return COMP_ERR_INTERNAL;
+  }
+  return COMP_ERR_INTERNAL;
 }
 
 }  // namespace
@@ -156,6 +234,16 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
   Layer* layer = doc->find(id);
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /*
+   * 文字图层的像素是 `text` 的渲染缓存，不是独立真源：直接覆写会让 `text` 与画面
+   * 分叉，下一次改字号又把它抹掉。要求宿主先 comp_layer_rasterize_text（与
+   * Photoshop 的「先栅格化才能画」同一条规矩），而不是静默丢掉文字对象。
+   */
+  if (layer->has_text()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "layer is an editable text layer; rasterize it first "
+                                 "(comp_layer_rasterize_text)");
   }
   /*
    * RGBA8 / RGBA16 / RGBA16F 均接受：RGBA8 走正常合成；RGBA16（预乘、native-endian）
@@ -1724,6 +1812,199 @@ comp_result comp_layer_get_pixels(comp_document document, comp_layer_id id, void
       std::memcpy(base + static_cast<size_t>(y) * stride, rgba.row(y), row_bytes);
     }
   }
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/* --------------------------------------------- 可编辑文字图层（P0-6 ①） */
+
+comp_result comp_layer_add_text(comp_document document, const comp_text_desc* desc,
+                                comp_layer_id* out_id) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_id == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_id is null");
+  }
+  compositor::TextObject object;
+  std::string error;
+  if (!text_desc_to_object(desc, &object, &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
+  }
+  /*
+   * 渲染在**事务之前**：字体加载/排版失败时就什么都不发生（不建层、不消耗
+   * 图层 id、不进撤销栈）。这是与 comp_layer_add 相同的「参数闸先于副作用」
+   * 契约。
+   */
+  compositor::ImageBuffer buffer;
+  comp_rect bounds{};
+  int64_t missing_glyphs = 0;
+  const compositor::TextLayerReport report = compositor::text_layer_render(
+      object, doc->state().width, doc->state().height, &buffer, &bounds, &missing_glyphs);
+  if (report.status != compositor::TextLayerStatus::kOk) {
+    return compositor::abi::fail(engine, text_layer_result(report),
+                                 report.message.empty() ? "text layer render failed"
+                                                        : report.message);
+  }
+  /* 文本框即图层矩形，必须过 comp_layer_add 的同一把 transform 尺子；否则
+   * create_layer 会拒绝它，而我们只能报一个「内部错误」掩盖真实原因（文本太长）。 */
+  if (!compositor::is_valid_transform(bounds, 0.0f)) {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                 "text box exceeds the maximum layer size");
+  }
+
+  const std::string name = compositor::text_layer_default_name(object.text);
+  comp_layer_desc layer_desc{};
+  layer_desc.name = name.c_str();
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  layer_desc.transform = bounds;
+  layer_desc.rotation = 0.0f;
+  layer_desc.flip_x = 0;
+  layer_desc.flip_y = 0;
+  layer_desc.is_group = 0;
+  layer_desc._reserved = 0;
+  layer_desc.parent = 0;
+  layer_desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+
+  compositor::abi::ImplicitTxn txn(doc, "Add Text Layer");
+  comp_layer_id id = 0;
+  Layer* layer = doc->create_layer(layer_desc, &id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "failed to create the text layer");
+  }
+  /*
+   * create_layer 给普通图层铺了一张画布大小的全透明缓冲；文字图层只需要文本
+   * 框那么大的缓冲（合成按 transform 取样，不要求整幅画布）。这里整体替换，
+   * 顺带省掉一次画布级的分配。
+   */
+  layer->pixels = std::move(buffer);
+  layer->text = std::move(object);
+  doc->touch_layer(id);
+  txn.commit();
+  *out_id = id;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_set_text(comp_document document, comp_layer_id id,
+                                const comp_text_desc* desc) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (!layer->has_text()) {
+    /* 不把普通图层的像素悄悄换成文字：那会抹掉用户已有内容，而且宿主无法
+     * 从返回值看出发生了什么。要新建文字层用 comp_layer_add_text。 */
+    return compositor::abi::fail(
+        engine, COMP_ERR_STATE,
+        "layer is not a text layer (use comp_layer_add_text to create one)");
+  }
+  compositor::TextObject object;
+  std::string error;
+  if (!text_desc_to_object(desc, &object, &error)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
+  }
+  compositor::ImageBuffer buffer;
+  comp_rect bounds{};
+  int64_t missing_glyphs = 0;
+  const compositor::TextLayerReport report = compositor::text_layer_render(
+      object, doc->state().width, doc->state().height, &buffer, &bounds, &missing_glyphs);
+  if (report.status != compositor::TextLayerStatus::kOk) {
+    return compositor::abi::fail(engine, text_layer_result(report),
+                                 report.message.empty() ? "text layer render failed"
+                                                        : report.message);
+  }
+  if (!compositor::is_valid_transform(bounds, 0.0f)) {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                 "text box exceeds the maximum layer size");
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, "Set Text");
+  layer->text = std::move(object);
+  layer->pixels = std::move(buffer);
+  layer->transform = bounds;
+  /* 文本框可能把图层移出「画布裁剪过的空矩形」状态：重新渲染后它确实有内容。 */
+  layer->clipped_empty = false;
+  doc->touch_layer(id);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_text(comp_document document, comp_layer_id id,
+                                comp_text_desc* out_desc, char* text_buffer, size_t capacity,
+                                size_t* out_required) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (!layer->has_text()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "layer is not a text layer");
+  }
+  const compositor::TextObject& text = *layer->text;
+  const size_t required = text.text.size() + 1; /* 含结尾 NUL，与 comp_layer_get_name 同口径 */
+  *out_required = required;
+  if (out_desc != nullptr) {
+    *out_desc = comp_text_desc{};
+    out_desc->text = text_buffer;
+    out_desc->text_length = static_cast<int32_t>(text.text.size());
+    out_desc->origin_x = text.origin_x;
+    out_desc->origin_y = text.origin_y;
+    out_desc->style.font_size = text.style.font_size;
+    out_desc->style.line_height = text.style.line_height;
+    out_desc->style.letter_spacing = text.style.letter_spacing;
+    out_desc->style.antialias = text.style.antialias ? 1 : 0;
+    for (int i = 0; i < 4; ++i) out_desc->color[i] = text.color[i];
+    out_desc->opacity = text.opacity;
+    out_desc->font_path_utf8 = text.font_path.empty() ? nullptr : text.font_path.c_str();
+    out_desc->font_face_index = text.font_face_index;
+    out_desc->_reserved = 0;
+  }
+  if (text_buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    /* 不静默截断：截断可能切掉一个多字节字符的尾部（与 get_name 同一条理由）。 */
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "text buffer is too small (see out_required)");
+  }
+  std::memcpy(text_buffer, text.text.c_str(), required);
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_layer_rasterize_text(comp_document document, comp_layer_id id) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /* 幂等：普通图层已经是栅格，什么也不做、不记撤销步（宿主不必先判断类型）。 */
+  if (!layer->has_text()) return compositor::abi::ok(engine);
+  compositor::abi::ImplicitTxn txn(doc, "Rasterize Text");
+  layer->text.reset();
+  doc->touch_layer(id);
+  txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }

@@ -3002,6 +3002,30 @@ COMP_TEST(ui_core_layer_menu_enabled_follows_preconditions) {
 }
 
 /*
+ * P0-6 ①：栅格化文字只在「选中层确实是可编辑文字图层」时可点。
+ *
+ * 引擎对普通像素层的 comp_layer_rasterize_text 是幂等空操作（返回 OK、不记撤销
+ * 步），所以不置灰不会丢数据，但会让菜单承诺一件不会发生的事——按 S41 的口径
+ * （只有如实拒绝或纯空操作的项才置灰），它正是该置灰的一类。
+ */
+COMP_TEST(ui_core_layer_menu_rasterize_text_needs_text_layer) {
+  comp_ui::LayerMenuState state;
+  COMP_CHECK(!comp_ui::layer_menu_enabled(state).layer_rasterize_text);
+
+  /* 有层但不是文字层：普通像素层上「栅格化文字」没有动作。 */
+  state.has_layer = true;
+  COMP_CHECK(!comp_ui::layer_menu_enabled(state).layer_rasterize_text);
+
+  /* 文字图层：可用。 */
+  state.is_text = true;
+  COMP_CHECK(comp_ui::layer_menu_enabled(state).layer_rasterize_text);
+
+  /* 没有选中层时即便 is_text 残留为真也不能亮（状态复位由调用方负责，规则兜底）。 */
+  state.has_layer = false;
+  COMP_CHECK(!comp_ui::layer_menu_enabled(state).layer_rasterize_text);
+}
+
+/*
  * 效果档位表（S24）。
  *
  * 数值 0..5 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序

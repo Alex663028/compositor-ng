@@ -659,6 +659,14 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
   Layer* layer = document->find(target);
   if (layer == nullptr) return fail(COMP_ERR_NOT_FOUND, "layer not found");
   if (layer->is_group) return bad_state("group layer has no pixels to operate on");
+  /*
+   * 文字图层的像素是 text 对象的渲染缓存。工具算子写进去，下一次改字号就会被
+   * 整张重渲染抹掉（而且撤销也回不来那段手绘）。与 comp_layer_set_pixels 同一条
+   * 规矩：先栅格化（comp_layer_rasterize_text），文字就此变成普通像素图层。
+   */
+  if (layer->has_text()) {
+    return bad_state("layer is an editable text layer; rasterize it before running pixel tools");
+  }
   if (!layer->has_pixels()) return bad_state("layer has no pixels");
 
   const size_t width = static_cast<size_t>(layer->pixels.width);

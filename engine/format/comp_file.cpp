@@ -14,6 +14,7 @@
 #include "compositing/resample.h"
 #include "core/comp_geometry.h"
 #include "domain/document.h"
+#include "domain/text_layer.h"
 #include "engine.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
@@ -263,6 +264,74 @@ void transform_from_json(const JsonValue& entry, Layer* layer) {
       sampling_from_manifest_name(transform->string_or("sampling", "High quality")));
 }
 
+/* ------------------------------------------------------------ 可编辑文字（P0-6 ①） */
+
+/*
+ * engineText：文字对象的整份可编辑状态。**像素不进这里**——文字图层的像素照旧
+ * 走 imageFile，是 `text` 的渲染缓存；重新打开工程后改字号只需重渲染这一层。
+ *
+ * 为什么存 font_path 而不是字体句柄：字体句柄属于宿主进程，`.comp` 里没有它的
+ * 位置；上游同样以「字体名/文件引用」往返。空路径 = 内置 5×7 点阵。
+ */
+JsonValue text_to_json(const TextObject& text) {
+  JsonValue j = JsonValue::object({});
+  j.set("text", JsonValue::string(text.text));
+  j.set("origin", JsonValue::array({JsonValue::number(text.origin_x),
+                                    JsonValue::number(text.origin_y)}));
+  j.set("fontSize", JsonValue::number(text.style.font_size));
+  j.set("lineHeight", JsonValue::number(text.style.line_height));
+  j.set("letterSpacing", JsonValue::number(text.style.letter_spacing));
+  j.set("antialias", JsonValue::boolean(text.style.antialias));
+  JsonValue color = JsonValue::array({});
+  for (int i = 0; i < 4; ++i) color.push(JsonValue::integer(text.color[i]));
+  j.set("color", std::move(color));
+  j.set("opacity", JsonValue::number(static_cast<double>(text.opacity)));
+  if (!text.font_path.empty()) {
+    j.set("fontPath", JsonValue::string(text.font_path));
+    j.set("fontFaceIndex", JsonValue::integer(text.font_face_index));
+  }
+  if (!text.font_family.empty()) j.set("fontFamily", JsonValue::string(text.font_family));
+  return j;
+}
+
+/*
+ * 读回 engineText。任何让对象**不可渲染**的字段组合都整体丢弃（图层退回普通
+ * 像素图层，画面不变），而不是把半个文字对象塞进图层——半截对象会让下一次
+ * 「改字号」把它渲染成另一张图，用户看到的是静默的内容变化。
+ */
+bool text_from_json(const JsonValue& j, TextObject* out) {
+  TextObject text;
+  text.text = j.string_or("text", "");
+  const JsonValue* origin = j.find("origin");
+  if (origin != nullptr && origin->is_array() && origin->as_array().size() >= 2) {
+    text.origin_x = origin->as_array()[0].as_number(0.0);
+    text.origin_y = origin->as_array()[1].as_number(0.0);
+  }
+  text.style.font_size = j.number_or("fontSize", 0.0);
+  text.style.line_height = j.number_or("lineHeight", 0.0);
+  text.style.letter_spacing = j.number_or("letterSpacing", 0.0);
+  text.style.antialias = j.bool_or("antialias", true);
+  const JsonValue* color = j.find("color");
+  if (color != nullptr && color->is_array() && color->as_array().size() >= 4) {
+    for (int i = 0; i < 4; ++i) {
+      long long value = color->as_array()[i].as_integer(0);
+      if (value < 0) value = 0;
+      if (value > 255) value = 255;
+      text.color[i] = static_cast<uint8_t>(value);
+    }
+  }
+  text.opacity = static_cast<float>(j.number_or("opacity", 0.0));
+  text.font_path = j.string_or("fontPath", "");
+  text.font_face_index = static_cast<int32_t>(j.integer_or("fontFaceIndex", 0));
+  text.font_family = j.string_or("fontFamily", "");
+
+  TextLayerReport report;
+  text_layer_validate(text, &report);
+  if (report.status != TextLayerStatus::kOk) return false;
+  *out = std::move(text);
+  return true;
+}
+
 /* ------------------------------------------------------------ 写：单个图层 */
 
 /* 返回该图层在 manifest 中的记录；uuid 为该图层派生出的 UUID 文本。 */
@@ -331,6 +400,13 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
    */
   if (layer.isolated) {
     j.set("engineIsolated", JsonValue::boolean(true));
+  }
+  /*
+   * 可编辑文字（engineText）：只在是文字图层时落盘，缺键 = 普通图层——与
+   * engineIsolated 同一条「默认值不写」的规矩，普通工程的 manifest 因此逐字节不变。
+   */
+  if (layer.text) {
+    j.set("engineText", text_to_json(*layer.text));
   }
   return j;
 }
@@ -786,6 +862,15 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
           effect.settings_json = e.string_or("settings", "{}");
           layer.effects.push_back(std::move(effect));
         }
+      }
+
+      /* engineText：缺键 = 普通图层；解析出的对象不可渲染则整体忽略（像素照旧
+       * 由 imageFile 读回，画面不变，只是失去可编辑性——好过让半个文字对象
+       * 决定下一次重渲染的结果）。 */
+      const JsonValue* text_entry = entry.find("engineText");
+      if (text_entry != nullptr && text_entry->is_object()) {
+        TextObject text;
+        if (text_from_json(*text_entry, &text)) layer.text = std::move(text);
       }
 
       uuid_to_id[uuid] = layer.id;

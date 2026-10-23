@@ -908,7 +908,6 @@ COMP_TEST(tool_ops_history_brush_is_reachable_through_the_abi_and_undoes_in_one_
   blue.brush.color[0] = 0;
   blue.brush.color[1] = 0;
   blue.brush.color[2] = 255;
-  blue.brush.color[3] = 255;
   blue.brush.diameter = 9.0f;
   blue.brush.hardness = 1.0f;
   blue.brush.pressure = 1.0f;

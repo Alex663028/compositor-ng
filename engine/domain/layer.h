@@ -12,12 +12,14 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
 #include "core/comp_geometry.h"
+#include "domain/text_object.h"
 
 namespace compositor {
 
@@ -245,6 +247,22 @@ struct Layer {
   std::vector<Effect> effects;
 
   /*
+   * 可编辑文字对象（P0-6 ①，语义见 domain/text_object.h）。
+   *
+   * 有值时这一层是**文字图层**：`text` 是唯一真源，`pixels` 是它当前渲染结果的
+   * 缓存（合成/缩略图/合并/GPU 纹理全走既有像素路径，合成内核不感知文字）。
+   * 改文本/字号只需重渲染这一层的像素，其它图层逐字节不动。
+   *
+   * 不变量：
+   *   - 文字图层的像素写入**只能**经 comp_layer_set_text / comp_layer_add_text；
+   *     工具算子与 comp_layer_set_pixels 遇到文字图层一律 COMP_ERR_STATE，
+   *     要求宿主先 rasterize（否则「改字号」会抹掉手绘像素）；
+   *   - 随 DocumentState 快照一起进事务/历史，撤销天然一致；
+   *   - 进 `.comp` 的 `engineText` 键（可选键，缺键 = 普通图层）。
+   */
+  std::optional<TextObject> text;
+
+  /*
    * 内容修订号（S18 / R1，设计见 docs/gpu-layer-revision.md §3）。
    *
    * 标识「这一层的图形输入」（像素 / 蒙版 / 效果 / 调整 / 几何 / 混合参数）处于哪个
@@ -301,6 +319,8 @@ struct Layer {
                          double* out_doc_x, double* out_doc_y) const;
 
   bool has_pixels() const { return !pixels.empty(); }
+  /* 是否为可编辑文字图层（pixels 只是 text 的渲染缓存）。 */
+  bool has_text() const { return text.has_value(); }
 };
 
 }  // namespace compositor

@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI **146** 导出只能**纯尾部追加**；回归 6/6、壳自检 257 项 SHA、视觉探针 80/80 不得因新增功能而破（落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **150**）；回归 6/6、壳自检 257 项 SHA、视觉探针不得因新增功能而破（当前 **128 条 / 24 场景**；落地规则见 §6）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
 > P0-3 另存为 + 标题脏标记、P1-8 历史容量入口。四项**全部零 ABI 新增**（仍 145），
 > 视觉探针 80 → **86 条**（只追加 `doc_dialog` 场景，既有阈值未动），其余断言见 §2 各条。
@@ -18,6 +18,10 @@
 > 视觉探针 102 → **115 条 / 22 场景**（只追加 `options_bar` 场景）；DPI 与浮动面板仍未做。
 > **同日第六批**：P0-5 选区修改补全（边界 / 平滑，**只追加两个枚举值**、导出数仍 146），
 > 视觉探针 115 → **122 条 / 23 场景**（只追加 `selection_modify` 场景）；Grow/Similar 与变换选区仍未做。
+> **2026-10-23 第七批**：外壳拆分（`main.cpp` 1.9 万行 → 13 个翻译单元 + `ShellState` 文档上下文对象化，
+> 零行为改动，见 README §6.83）与 P0-6 ① 可编辑文字图层（**尾部追加 4 个文字导出，146 → 150**，
+> 视觉探针 122 → **128 条 / 24 场景**，只追加 `text_layer` 场景）。同日顺带：§8 文档漂移校正一轮、
+> 仓库根目录清理、视觉探针 `_park_pointer()` 加固（见 shell-parity §5.52）。字体枚举、段落框仍未做。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -53,6 +57,11 @@
 
 数字不是完成度：README §6.4 的口径 A（引擎核）≈97%、口径 B（产品功能面）≈60% 仍然成立——
 **像素保真度接近满配，缺的是把能力做成用户路径**。
+
+**对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-23）**：
+日常使用路径 **≈70%**，全功能面 **≈50%**（190 条 PS 核心条目加权，原始命中 86 条）；
+与口径 A/B 的差异原因在该文件 §3 说明。按 ROI 补「字体选择 → 锐化/降噪入口 →
+标尺参考线 → PSD 分层导出」四项，日常路径约到 85%。
 
 ---
 
@@ -172,11 +181,32 @@
 - **验收**：存/载选区往返 coverage 逐字节相等；`.comp` 保存再打开后选区与通道仍在；Grow 后边界单调外扩。
 
 ### P0-6 文字：仍是"一次性栅格化"，没有可编辑文本与字体选择
-- **现状**：`COMP_TOOL_TYPE` 直接把文字画进图层像素（破坏性）；`comp_type_style` 只有字号/行距/字距/抗锯齿（`comp_layer.h:762-767`），无对齐、粗斜体、基线偏移、段落框；外壳只加载**一个**随包字体 `NotoSansSC-Regular-Subset.ttf`（`main.cpp:6077`），无字体选择器。CJK 输入通路已打通（M43 / IME 已验证），但输入完即固化。
-- **PS 行为**：文字图层可反复编辑、系统字体枚举与选择、点文字/段落文字、对齐、行距字距基线、竖排、路径文字、文字变形、栅格化。
-- **性质**：【引擎】XL——类型图层模型（文本 + 样式 + 几何，合成时栅格化）、字体枚举（`comp_font_load_file` 已能加载任意 TTF，缺枚举与回退链）、重编辑 UI。这是"PS 正常使用"里最痛的一条：做海报/封面时改一个字就要重画。
-- **建议切分**：① 文本图层模型 + 无损重编辑（P0）；② 字体枚举/选择（P1）；③ 段落框/对齐/竖排/变形（P1–P2）。
-- **验收**：改字号/文本后重新合成，非文本像素逐字节不变；保存 `.comp` 再打开文本仍可编辑。
+- **已落地（① 文本图层模型 + 无损重编辑，2026-10-23）**：`Layer::text`
+  （`std::optional<TextObject>`）是文字的真源，图层像素只是它恰好文本框大小的渲染
+  缓存，合成/缩略图/合并/拼合/`.comp` 像素管线一行未改。ABI 尾部追加 4 个导出
+  （146 → **150**）：`comp_layer_add_text` / `comp_layer_set_text` /
+  `comp_layer_get_text` / `comp_layer_rasterize_text`；`.comp` 图层记录追加
+  `engineText` 键（缺键 = 普通像素层，旧工程逐字节照读）。文字层上的
+  `comp_layer_set_pixels` 与 `comp_tool_apply` 一律 `COMP_ERR_STATE`（先栅格化，
+  与上游同规矩），`comp_document_resize_image` 隐式丢弃文字对象。壳侧：文字工具
+  按落点分流（框内 = 改这一层、框外 = 新建一层）、新菜单
+  `图层 > 栅格化文字`、置灰规则进纯函数 `comp_ui::layer_menu_enabled`。
+  验收口径已达成：改字号/文本后重新合成，非文字像素逐字节不变；`.comp` 保存再
+  打开文本仍可编辑（`tests/test_text_layer.cpp` 8 例 + `visual_check.py
+  --scene text_layer` 6 条）。详见 README §6.84、`docs/shell-parity.md` §5.51、
+  `docs/manual-test.md` M50。
+- **剩余现状（②③ 未做）**：`comp_type_style` 只有字号/行距/字距/抗锯齿，无对齐、
+  粗斜体、基线偏移、段落框；外壳只加载**一个**随包字体
+  `NotoSansSC-Regular-Subset.ttf`，无字体枚举与选择器；也没有逐字符光标（框内点击
+  处即新的左上角，不是上游的「光标处插入」）。
+- **PS 行为**：系统字体枚举与选择、点文字/段落文字、对齐、行距字距基线、竖排、
+  路径文字、文字变形、栅格化（栅格化已做）。
+- **性质**：【引擎】L / 【壳层】M——②字体枚举（`comp_font_load_file` 已能加载任意
+  TTF，缺枚举与回退链，P1-4）；③段落框/对齐/竖排/变形（P1–P2）。
+- **建议切分**：① 文本图层模型 + 无损重编辑（**已完成**）；② 字体枚举/选择（P1）；
+  ③ 段落框/对齐/竖排/变形（P1–P2）。
+- **验收（① 已满足，②③ 沿用）**：改字号/文本后重新合成，非文本像素逐字节不变；
+  保存 `.comp` 再打开文本仍可编辑。
 
 ### P0-7 文件格式：PSD 只读、TIFF/WebP 不可用、无 PDF
 - **现状**：`docs/format-import-matrix.md:44-51` 明确：PSD 只读（stb_image，拍平）、TIFF/HEIF/WebP 登记为不可用、HDR 只读、EXR 读写；无 PDF / SVG / PSB / RAW 解码。
@@ -333,10 +363,15 @@
 
 ## 8. 顺带记录的文档漂移（不属于功能缺口，但会误导排期）
 
-- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **146** 个（尾部追加 `comp_layer_get_pixels` 之后）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **122 条 / 23 场景**（2026-10-22 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify` 后；原 80 条含 IME 6/6）。
+> 2026-10-23 校正一轮：下面每条都重新对着当前代码数过一遍，数字与指针已更新。
+
+- README §6.4 ① 写"**112 个**导出 ABI 全有异常护栏"；当前头文件实际导出 **150** 个
+  （尾部追加 `comp_layer_get_pixels` 与 4 个文字图层导出之后）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **257 项**、视觉探针 **128 条 / 24 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer` 后；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 易被读成"画布参考线已有"；实际是 Camera Raw 几何校准参数。**画布参考线不存在**（本清单 P0-8）。
 - §6.4 口径 B 的 48 条分母来自上游 Compositor，不是 Photoshop；用它回答"能当 PS 用吗"会系统性高估（本清单改用 PS 使用路径对照）。
+- `comp_layer.h` 的 `comp_tool_type` 注释原先只写"画进当前图层、不可再编辑"，没提可编辑
+  文字图层；已补一行指路（`comp_layer_add_text` / `comp_layer_set_text`），行为未改。
 
 ---
 
@@ -344,15 +379,14 @@
 
 | 结论 | 证据 |
 |------|------|
-| 145 个导出 | `engine/abi/include/compositor/*.h`（`COMP_API ... comp_*` 唯一化计数） |
-| 新建固定参数 | `shells/windows/src/main.cpp:8153-8160` |
-| 新建销毁旧文档 | `shells/windows/src/main.cpp:8166` |
-| 无图像/画布大小菜单 | `shells/windows/src/main.cpp:14859-14866`；ABI 有 `comp_engine.h:84,94`（**2026-10-22 已接线，见 P0-2**） |
-| 单文档 | `ShellState` 仅一个 `comp_document`；`main.cpp:8166` |
-| 无剪贴板 | 全仓 `Clipboard|CF_DIB` 0 命中；ABI 无 copy/paste |
+| 150 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 150） |
+| 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
+| 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
+| 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |
+| 剪贴板 | 2026-10-22 已落地（P0-4，`编辑` 菜单六项，`shell_clipboard.cpp`）；跨应用仅 `CF_DIBV5` |
 | 选区修改仅五种 | `engine/abi/include/compositor/comp_selection.h:52-58`（羽化/扩/缩/边界/平滑；Grow/Similar 仍无） |
-| 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767` |
-| 单一随包字体 | `shells/windows/src/main.cpp:6077` |
+| 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767`（可编辑文字对象见同文件尾部 P0-6 ①） |
+| 单一随包字体 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`）；枚举/选择未做（P1-4） |
 | 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
 | 6 种效果 / 12 种调整 | `comp_layer.h:300-313`；`README.md:1462-1500` |
 | 9 种滤镜 | `engine/abi/include/compositor/comp_filter.h:38-48` |
@@ -363,4 +397,4 @@
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | 无 DPI 感知 | `shells/windows` 无 `*.manifest`；源码无 `SetProcessDpi*` |
-| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-22 六批改动后逐字节复核未变）；视觉探针 **122/122 / 23 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`） |
+| 壳自检/视觉探针基线 | 壳自检 257 项 failures=0、SHA256 `377de660…`（2026-10-23 追加 4 个文字导出与文字图层场景后复核，逐字节未变）；视觉探针 **128/128 / 24 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`） |

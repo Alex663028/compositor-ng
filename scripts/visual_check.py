@@ -179,6 +179,7 @@ user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetDC.argtypes = [wintypes.HWND]
@@ -388,7 +389,23 @@ class Shell:
             raise RuntimeError("无法把外壳窗口切到前台（拖动工具依赖鼠标捕获，必须前台）")
         self.wait(0.8)  # 等第一帧与 view.fit
         self._read_client()
+        self._park_pointer()
         return self
+
+    def _park_pointer(self):
+        """把**物理指针**停到状态栏，让它别落在画布上。
+
+        笔尖轮廓（`shell_paint.cpp` 的 dotted ellipse）画在最后一次 WM_MOUSEMOVE 的
+        坐标上；本脚本靠 PostMessage 合成鼠标事件，真实指针并不会跟着走。真实指针
+        若恰好停在画布内，窗口激活/悬停时系统会补一条真实 MOUSEMOVE，把合成拖动的
+        坐标顶掉——截图里就凭空多出一个笔尖圈。2026-10-23 全量跑时，`options_bar`
+        的「点击不穿透到画布」就因为这个多出 17 px 而误报（同一场景单跑必过）。
+        状态栏既在画布外、又没有悬停高亮，停这里不会引入任何新的像素。
+        """
+        target = POINT(self.client_w // 2, max(0, self.client_h - 8))
+        if user32.ClientToScreen(self.hwnd, ctypes.byref(target)):
+            user32.SetCursorPos(target.x, target.y)
+            self.wait(0.15)  # 等系统把真实 MOUSEMOVE/MOUSELEAVE 送完
 
     def _find_window(self):
         pid = self.proc.pid
@@ -2174,6 +2191,81 @@ def selftest_has_io_roundtrip():
     return "comp_io_export" in text and "comp_io_import" in text
 
 
+def scene_text_layer(shell, checker):
+    """P0-6 ①：文字工具产出的是「可编辑文字图层」，不是画死的像素。
+
+    三条用户可见承诺，全部用截图与像素证实（不读状态栏文字）：
+      1. 回车提交后图层面板多出一行 —— 新建的是图层，不是涂在选中层上；
+      2. 点回文本框内再提交 —— 还是同一层（行数不变），字形变宽（文字真的改了）；
+      3. 图层 > 栅格化文字 之后在同一位置再提交 —— 又新建一层（像素层不能再改）。
+    """
+    scene = "text_layer"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    layer = shell.layout["layer"]
+    panel = (layer[0], layer[1], layer[0] + 240, layer[1] + 160)
+    origin = (left + 40, top + 40)
+    glyph_box = (origin[0] - 6, origin[1] - 10, origin[0] + 220, origin[1] + 90)
+
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("type")
+
+    before = shell.shot("81_text_layer_before")
+    rows_one = count_bright(before, panel, 150)
+
+    # 1) 第一段文字：提交 = 新建文字图层（面板多一行）
+    shell.click(*origin)
+    shell.type_text("H")
+    shell.press(VK_RETURN)
+    img = shell.shot("82_text_layer_created")
+    rows_two = count_bright(img, panel, 150)
+    checker.check(scene, "提交文字后图层面板多出一行（新建的是图层）",
+                  rows_two > rows_one + 20,
+                  "面板文字像素 %d -> %d" % (rows_one, rows_two))
+    count_h, hx0, _, hx1, _ = glyph_bbox(img, glyph_box)
+    checker.check(scene, "新建的文字图层在画布上有字形", count_h > 10, "字形像素 %d" % count_h)
+
+    # 2) 点回文本框内再提交：同一层改文字（行数不变，字形变宽）
+    inside = (origin[0] + 3, origin[1] + 3)
+    shell.click(*inside)
+    shell.type_text("HH")
+    shell.press(VK_RETURN)
+    img = shell.shot("83_text_layer_edited")
+    rows_after_edit = count_bright(img, panel, 150)
+    checker.check(scene, "框内再提交仍是同一图层（行数不变）",
+                  abs(rows_after_edit - rows_two) <= 20,
+                  "面板文字像素 %d -> %d" % (rows_two, rows_after_edit))
+    count_hh, gx0, _, gx1, _ = glyph_bbox(img, glyph_box)
+    width_h = hx1 - hx0 + 1
+    width_hh = gx1 - gx0 + 1
+    checker.check(scene, "改文字后字形变宽（同一层重新渲染）",
+                  count_hh > count_h and width_hh > width_h + 3,
+                  "字形 %d -> %d 像素，宽 %d -> %d px"
+                  % (count_h, count_hh, width_h, width_hh))
+
+    # 3) 栅格化文字：之后同位置再提交只能新建一层
+    shell.command(1572)  # 图层 > 栅格化文字
+    shell.click(*origin)
+    shell.type_text("H")
+    shell.press(VK_RETURN)
+    img = shell.shot("84_text_layer_rasterized")
+    rows_raster = count_bright(img, panel, 150)
+    checker.check(scene, "栅格化后再提交会新建另一层（像素层不可编辑）",
+                  rows_raster > rows_after_edit + 20,
+                  "面板文字像素 %d -> %d" % (rows_after_edit, rows_raster))
+
+    # 撤销两步应回到「只有一层文字」的状态：栅格化与新建各一步。
+    shell.press(ord("Z"), ctrl=True)
+    shell.press(ord("Z"), ctrl=True)
+    img = shell.shot("85_text_layer_undo")
+    rows_undo = count_bright(img, panel, 150)
+    checker.check(scene, "撤销两步回到单层文字（新建与栅格化各一步）",
+                  abs(rows_undo - rows_two) <= 20,
+                  "面板文字像素 %d（栅格化前 %d）" % (rows_undo, rows_two))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -2197,6 +2289,7 @@ SCENES = [    ("start", scene_start, ()),
     ("close_prompt", scene_close_prompt, ()),
     ("options_bar", scene_options_bar, ()),
     ("selection_modify", scene_selection_modify, ()),
+    ("text_layer", scene_text_layer, ()),
 ]
 
 

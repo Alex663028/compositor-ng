@@ -113,7 +113,8 @@ std::wstring exe_directory() {
  * 字体都不能承担文字工具，宁可继续用点阵，也不要让用户在面板上选到一个
  * 一打字就满屏缺字的字体。自检与窗口启动共用这一条加载路径。
  */
-comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metrics) {
+comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metrics,
+                            std::string* out_path) {
   std::vector<std::wstring> candidates;
   const std::wstring exe_dir = exe_directory();
   if (!exe_dir.empty()) {
@@ -139,6 +140,8 @@ comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metr
       continue;
     }
     if (out_metrics != nullptr) *out_metrics = metrics;
+    /* 路径要留下：可编辑文字图层把字体文件路径写进 .comp，重开时才能原样重现。 */
+    if (out_path != nullptr) *out_path = std::string(utf8);
     if (out_label != nullptr) {
       const char* family = comp_font_name(font, COMP_FONT_NAME_FAMILY);
       *out_label = (family != nullptr && family[0] != '\0') ? widen_utf8(std::string(family))
@@ -152,12 +155,14 @@ comp_font load_shipped_font(std::wstring* out_label, comp_font_metrics* out_metr
 bool load_shell_font(ShellState& shell) {
   comp_font_metrics metrics{};
   std::wstring label;
-  comp_font font = load_shipped_font(&label, &metrics);
+  std::string path;
+  comp_font font = load_shipped_font(&label, &metrics, &path);
   if (font == nullptr) return false;
   shell.type_font = font;
   shell.type_font_ascender = metrics.ascender;
   shell.type_font_descender = metrics.descender;
   shell.type_font_label = label;
+  shell.type_font_path = path;
   /* 默认就走字体轨道：P0-5 的验收是「中文能打、能排、能提交」，多一步切换只是障碍。 */
   shell.type_use_font = true;
   return true;
@@ -1426,6 +1431,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdLayerFlatten:
       panel_flatten(shell);
+      break;
+    /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
+    case kCmdLayerRasterizeText:
+      panel_rasterize_text(shell);
       break;
     case kCmdViewFit:
       view_fit(shell);
