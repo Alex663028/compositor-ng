@@ -60,7 +60,15 @@ class Document {
   Layer* find(comp_layer_id id);
   const Layer* find(comp_layer_id id) const;
 
-  /* 创建图层；成功时返回新图层指针并写入 out_id。 */
+  /*
+   * 创建图层；成功时返回新图层指针并写入 out_id。
+   *
+   * 指针有效期：Layer 对象存在 state_.layers 向量里，返回的是**内部指针**。
+   * 任何增删图层的操作（create_layer / remove_layer / reorder_layer 之外的
+   * undo / redo / 载入工程等整体替换 state_ 的路径）都可能让向量重新分配，
+   * 此前拿到的 Layer* 随即失效。规范是：**不要跨这类操作持有 Layer***，
+   * 需要时按 id 调 find() 重取。ABI 层本来就用 id，只有内部代码需要留意。
+   */
   Layer* create_layer(const comp_layer_desc& desc, comp_layer_id* out_id);
 
   /* 删除图层（含子树）。根级/子级引用一并清理。 */
@@ -204,9 +212,11 @@ class Document {
 
   /*
    * 句柄有效性（与 Engine 同一套双闸门，见 engine.h 文件头）：
-   * 构造期置 kDocumentMagic 并登记进共享存活表，析构期注销并 poison。
-   * abi 层 as_document 先查表、再读 magic，把「销毁后使用 / 类型混淆 /
-   * 野指针」挡成错误码而不是静默解引用。
+   * 构造期置 kDocumentMagic 并登记进共享存活表（类型标签 kDocument），
+   * 析构期注销并 poison。abi 层 as_document 先查表（含类型）、再读 magic，
+   * 把「销毁后使用 / 类型混淆 / 野指针」挡成错误码而不是静默解引用。
+   * 类型必须在解引用之前查：handle_magic_ 在对象尾部（约 +472），拿 160 字节的
+   * Engine 当 Document 读就是越界读，鸿蒙上会直接段错误（F2）。
    */
   bool is_alive() const noexcept { return handle_magic_ == kDocumentMagic; }
 

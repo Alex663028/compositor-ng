@@ -289,6 +289,77 @@ GrayMap subtracted(const GrayMap& a, const GrayMap& b) {
   return out;
 }
 
+/* 逐像素乘一个系数（斜面把「深度 × 不透明度」折算进覆盖率）。 */
+GrayMap scaled(const GrayMap& src, double factor) {
+  GrayMap out;
+  out.resize(src.width, src.height);
+  if (factor <= 0.0) return out;
+  for (size_t i = 0; i < src.data.size(); ++i) {
+    out.data[i] = to_u8(static_cast<double>(src.data[i]) * factor);
+  }
+  return out;
+}
+
+/* 逐像素绝对差（缎光：两个偏移副本的 |a - b|）。 */
+GrayMap abs_difference(const GrayMap& a, const GrayMap& b) {
+  GrayMap out;
+  out.resize(a.width, a.height);
+  for (size_t i = 0; i < a.data.size(); ++i) {
+    out.data[i] = static_cast<uint8_t>(
+        std::abs(static_cast<int>(a.data[i]) - static_cast<int>(b.data[i])));
+  }
+  return out;
+}
+
+/* 形状（alpha > 0）的包围盒；空形状返回 false。渐变叠加用它把投影归一化到形状上。 */
+bool shape_bounds(const GrayMap& shape, int32_t* x0, int32_t* y0, int32_t* x1, int32_t* y1) {
+  int32_t min_x = shape.width;
+  int32_t min_y = shape.height;
+  int32_t max_x = -1;
+  int32_t max_y = -1;
+  for (int32_t y = 0; y < shape.height; ++y) {
+    for (int32_t x = 0; x < shape.width; ++x) {
+      if (shape.at(x, y) == 0) continue;
+      if (x < min_x) min_x = x;
+      if (x > max_x) max_x = x;
+      if (y < min_y) min_y = y;
+      if (y > max_y) max_y = y;
+    }
+  }
+  if (max_x < 0 || max_y < 0) return false;
+  *x0 = min_x;
+  *y0 = min_y;
+  *x1 = max_x;
+  *y1 = max_y;
+  return true;
+}
+
+/* 环绕到 [-180,180]，让 350° 与 -10° 等价。 */
+double wrap_degrees(double degrees) {
+  if (!std::isfinite(degrees)) return 0.0;
+  double wrapped = std::fmod(degrees, 360.0);
+  if (wrapped > 180.0) wrapped -= 360.0;
+  if (wrapped < -180.0) wrapped += 360.0;
+  return wrapped;
+}
+
+/*
+ * 光向量（屏幕坐标，y 轴向下）：angle 是光来的方向，0° = 从右来、90° = 从上来。
+ * altitude 压扁垂直分量（0° = 正侧面、90° = 正上方），与上游 Emboss 的
+ * 「角度 / 高度」两参数同义。返回值已四舍五入到整像素，供 shifted() 使用。
+ */
+void light_vector(double angle_deg, double altitude_deg, double reach, int32_t* dx,
+                  int32_t* dy) {
+  constexpr double kPi = 3.14159265358979323846;
+  const double radians = wrap_degrees(angle_deg) * kPi / 180.0;
+  double altitude = wrap_degrees(altitude_deg);
+  if (altitude < 0.0) altitude = 0.0;
+  if (altitude > 90.0) altitude = 90.0;
+  const double flat = std::cos(altitude * kPi / 180.0);
+  *dx = static_cast<int32_t>(std::lround(std::cos(radians) * reach * flat));
+  *dy = static_cast<int32_t>(std::lround(-std::sin(radians) * reach * flat));
+}
+
 /*
  * 以 coverage 为裁剪铺一层纯色（上游 `fill(color, alpha:coverage:...)`）。
  *
@@ -366,6 +437,66 @@ void recolor_atop(uint8_t* buf, int32_t width, int32_t height, size_t stride,
   }
 }
 
+/*
+ * 以双色线性斜坡做 source-atop（渐变叠加）。
+ *
+ * 归一化口径：把**源形状包围盒**的四个角投影到单位方向 u 上，取最小/最大值作为
+ * 0 与 1。这样无论画布多大、图层落在哪，渐变都铺满形状本身——与上游「渐变覆盖
+ * 图层边界」一致，也不会因为空画布留白而把整段渐变挤到一小块里。
+ *
+ * 与 recolor_atop 同一套预乘/反预乘与不改变 alpha 的规则；区别只是每个像素先按
+ * 自己的投影位置插值出源色，而不是全图一色。
+ */
+void recolor_atop_gradient(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                           const GrayMap& shape, const Rgb& from, const Rgb& to,
+                           double angle_deg, bool reverse, double alpha) {
+  if (alpha <= 0.0) return;
+  int32_t x0 = 0;
+  int32_t y0 = 0;
+  int32_t x1 = 0;
+  int32_t y1 = 0;
+  if (!shape_bounds(shape, &x0, &y0, &x1, &y1)) return;
+  constexpr double kPi = 3.14159265358979323846;
+  const double radians = wrap_degrees(angle_deg) * kPi / 180.0;
+  const double ux = std::cos(radians);
+  const double uy = std::sin(radians); /* 屏幕坐标 y 向下：90° = 自上而下 */
+  double lo = static_cast<double>(x0) * ux + static_cast<double>(y0) * uy;
+  double hi = lo;
+  const double corners[3][2] = {{static_cast<double>(x0), static_cast<double>(y1)},
+                                {static_cast<double>(x1), static_cast<double>(y0)},
+                                {static_cast<double>(x1), static_cast<double>(y1)}};
+  for (const auto& corner : corners) {
+    const double t = corner[0] * ux + corner[1] * uy;
+    lo = std::min(lo, t);
+    hi = std::max(hi, t);
+  }
+  const double span = hi - lo;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = buf + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* px = row + static_cast<size_t>(x) * 4;
+      const uint8_t a = px[3];
+      if (a == 0) continue;
+      double t = span > 0.0
+                     ? (static_cast<double>(x) * ux + static_cast<double>(y) * uy - lo) / span
+                     : 0.0;
+      if (t < 0.0) t = 0.0;
+      if (t > 1.0) t = 1.0;
+      if (reverse) t = 1.0 - t;
+      const Rgb color{from.r + (to.r - from.r) * t, from.g + (to.g - from.g) * t,
+                      from.b + (to.b - from.b) * t};
+      const double a_denom = static_cast<double>(a);
+      for (int c = 0; c < 3; ++c) {
+        const double base_straight = static_cast<double>(px[c]) / a_denom;
+        const double src_channel = c == 0 ? color.r : (c == 1 ? color.g : color.b);
+        const double straight = base_straight * (1.0 - alpha) + src_channel * alpha;
+        const double clamped = straight < 0.0 ? 0.0 : (straight > 1.0 ? 1.0 : straight);
+        px[c] = to_u8(clamped * a_denom);
+      }
+    }
+  }
+}
+
 /* ------------------------------------------------------------------ 逐效果
  *
  * 每个效果被拆成「规划」与「落笔」两步：规划只读参数、决定它落在像素之下
@@ -390,6 +521,14 @@ struct EffectPlan {
   double opacity = 0.0;
   Rgb color;
   bool inside = false;
+  /* P1-1：斜面/缎光/渐变叠加追加的字段。 */
+  double altitude = 0.0;      /* 斜面的光照高度角（度） */
+  double depth = 100.0;       /* 斜面的强度百分比 */
+  double soften = 0.0;        /* 斜面的额外柔化（px） */
+  bool invert = false;        /* 缎光取反 */
+  bool reverse = false;       /* 渐变叠加反向 */
+  Rgb color2;                 /* 渐变终点色 */
+  Rgb shadow_color;           /* 斜面暗面色 */
 };
 
 /*
@@ -465,6 +604,52 @@ DrawKind plan_effect(uint32_t effect, const Settings& s, EffectPlan* plan) {
       return plan->kind;
     }
 
+    /* ---------------------------------------------------- P1-1 追加（inside） */
+
+    case kEffectBevel: {
+      /* 上游 Bevel & Emboss 的量程：angle [-360,360]、altitude [0,90]、
+       * depth [0,1000]、size [0,500]、soften [0,500]。 */
+      plan->angle = s.ranged("angle", 120.0, -360.0, 360.0);
+      plan->altitude = s.ranged("altitude", 30.0, 0.0, 90.0);
+      plan->depth = s.ranged("depth", 100.0, 0.0, 1000.0);
+      plan->size = s.ranged("size", 10.0, 0.0, 500.0);
+      plan->soften = s.ranged("soften", 0.0, 0.0, 500.0);
+      plan->opacity = s.unit("opacity", 0.75);
+      /* 高光色缺省白、暗面色缺省黑（与 PS 的斜面默认一致）。 */
+      plan->color = Rgb{s.unit("red", 1.0), s.unit("green", 1.0), s.unit("blue", 1.0)};
+      plan->shadow_color = Rgb{s.unit("shadow_red", 0.0), s.unit("shadow_green", 0.0),
+                               s.unit("shadow_blue", 0.0)};
+      /* size 为 0 时没有斜面宽度可言；depth 为 0 时亮度差恒为 0。 */
+      if (plan->opacity <= 0.0 || plan->size <= 0.0 || plan->depth <= 0.0) return DrawKind::kNone;
+      plan->kind = DrawKind::kOver;
+      return plan->kind;
+    }
+
+    case kEffectSatin: {
+      plan->angle = s.ranged("angle", 19.0, -360.0, 360.0);
+      plan->distance = s.ranged("distance", 11.0, 0.0, 5000.0);
+      plan->blur = s.ranged("blur", 14.0, 0.0, 500.0);
+      plan->invert = s.boolean("invert", false);
+      plan->opacity = s.unit("opacity", 0.5);
+      plan->color = read_color(s);
+      if (plan->opacity <= 0.0 || plan->distance <= 0.0) {
+        return DrawKind::kNone;
+      }
+      plan->kind = DrawKind::kOver;
+      return plan->kind;
+    }
+
+    case kEffectGradientOverlay: {
+      plan->angle = s.ranged("angle", 90.0, -360.0, 360.0);
+      plan->reverse = s.boolean("reverse", false);
+      plan->opacity = s.unit("opacity", 1.0);
+      plan->color = read_color(s); /* 起点色，缺省黑 */
+      plan->color2 = Rgb{s.unit("red2", 1.0), s.unit("green2", 1.0), s.unit("blue2", 1.0)};
+      if (plan->opacity <= 0.0) return DrawKind::kNone;
+      plan->kind = DrawKind::kOver;
+      return plan->kind;
+    }
+
     default:
       return DrawKind::kNone;
   }
@@ -532,6 +717,56 @@ void draw_planned(const EffectPlan& plan, const GrayMap& shape, uint8_t* target,
       fill_coverage(target, width, height, stride, ring, plan.color, plan.opacity);
       break;
     }
+    /* -------------------------------------------- P1-1 追加（均只在形状内部） */
+    case kEffectBevel: {
+      /*
+       * 斜面 = 「朝光平移的柔化形状」减「背光平移的柔化形状」：
+       * 差值 > 0 的一侧朝向光源（高光），< 0 的一侧背光（暗面）。
+       * 用平移差分而不是逐像素梯度核，是为了复用既有 shifted()/subtracted()，
+       * 且 size 同时决定斜面宽度（平移量）与柔化范围，与 PS 的手感一致。
+       */
+      GrayMap soft = shape;
+      blur_gray(&soft, plan.size);
+      const double reach = std::max(1.0, plan.size * 0.5);
+      int32_t dx = 0;
+      int32_t dy = 0;
+      light_vector(plan.angle, plan.altitude, reach, &dx, &dy);
+      /* 光正对镜头（高度角 90° 且 reach 被压成 0）时没有方向差，效果不可见。 */
+      if (dx == 0 && dy == 0) break;
+      const GrayMap toward = shifted(soft, dx, dy);
+      const GrayMap away = shifted(soft, -dx, -dy);
+      GrayMap highlight = subtracted(toward, away);
+      GrayMap shadow = subtracted(away, toward);
+      if (plan.soften > 0.0) {
+        blur_gray(&highlight, plan.soften);
+        blur_gray(&shadow, plan.soften);
+      }
+      const double gain = plan.depth / 100.0 * plan.opacity;
+      const GrayMap shadow_amount = scaled(shadow, gain);
+      const GrayMap highlight_amount = scaled(highlight, gain);
+      recolor_atop(target, width, height, stride, plan.shadow_color, 1.0, &shadow_amount);
+      recolor_atop(target, width, height, stride, plan.color, 1.0, &highlight_amount);
+      break;
+    }
+    case kEffectSatin: {
+      /* 缎光 = 正反两个偏移副本之差（或取反）柔化后叠色。 */
+      const double reach = std::max(1.0, plan.distance);
+      int32_t dx = 0;
+      int32_t dy = 0;
+      /* 缎光只有方向与距离，没有高度角：altitude 传 0 让偏移量全额生效。 */
+      light_vector(plan.angle, 0.0, reach, &dx, &dy);
+      const GrayMap forward = shifted(shape, dx, dy);
+      const GrayMap backward = shifted(shape, -dx, -dy);
+      GrayMap band = abs_difference(forward, backward);
+      if (plan.blur > 0.0) blur_gray(&band, plan.blur);
+      if (plan.invert) band = inverted(band);
+      recolor_atop(target, width, height, stride, plan.color, plan.opacity, &band);
+      break;
+    }
+    case kEffectGradientOverlay:
+      recolor_atop_gradient(target, width, height, stride, shape, plan.color, plan.color2,
+                            plan.angle, plan.reverse, plan.opacity);
+      break;
     default:
       break;
   }
@@ -573,6 +808,9 @@ int32_t effects_margin(const std::vector<Effect>& effects) {
       case kEffectColorOverlay:
       case kEffectInnerShadow:
       case kEffectInnerGlow:
+      case kEffectBevel:
+      case kEffectSatin:
+      case kEffectGradientOverlay:
         break;
       default:
         break; /* 未知效果不预留空间（它也不会被绘制） */
@@ -596,9 +834,9 @@ bool apply_effects(const std::vector<Effect>& effects, uint8_t* buf, int32_t wid
   if (count == 0) return true;
 
   /*
-   * 六种效果全部基于同一张「图层呈现形状」（上游 masked(image, mask:) 只做一次，
-   * 随后投影/发光/描边都从它派生）。变换与蒙版已烘进 buf，取 alpha 即上游那份
-   * placedMask 的等价物。
+   * 所有效果（含 P1-1 追加的斜面/缎光/渐变叠加）全部基于同一张「图层呈现形状」
+   * （上游 masked(image, mask:) 只做一次，随后投影/发光/描边/斜面都从它派生）。
+   * 变换与蒙版已烘进 buf，取 alpha 即上游那份 placedMask 的等价物。
    */
   GrayMap shape;
   shape_alpha_from(buf, width, height, stride, &shape);

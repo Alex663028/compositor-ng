@@ -290,8 +290,12 @@ struct FontLayout {
  * 严格 UTF-8 解码：拒绝过长编码、代理对、> U+10FFFF 与孤立续字节。
  * '\n' 保留（排版按它断行），其余 C0/C1 控制字符拒绝——字体没有制表位语义，
  * 静默跳过会让宿主以为字符被排上了。
+ *
+ * `out_offsets`（可为 nullptr）逐码点记下起始字节偏移；段落折行只给宿主
+ * 每一行的**字节**区间（图标外层的原文是字节串），没有这份映射就得二次扫串。
  */
-bool decode_utf8(const char* text, size_t size, std::vector<uint32_t>* out, const char** error) {
+bool decode_utf8(const char* text, size_t size, std::vector<uint32_t>* out,
+                 std::vector<size_t>* out_offsets, const char** error) {
   size_t i = 0;
   while (i < size) {
     const unsigned char lead = static_cast<unsigned char>(text[i]);
@@ -337,6 +341,7 @@ bool decode_utf8(const char* text, size_t size, std::vector<uint32_t>* out, cons
       *error = "type text contains a control character (only '\\n' is supported)";
       return false;
     }
+    if (out_offsets != nullptr) out_offsets->push_back(i);
     out->push_back(codepoint);
     i += extra + 1;
   }
@@ -379,7 +384,7 @@ TypeRasterReport build_font_layout(const char* text, size_t size, const TypeRast
 
   out->codepoints.clear();
   out->line_begin.clear();
-  if (!decode_utf8(text, size, &out->codepoints, &error)) {
+  if (!decode_utf8(text, size, &out->codepoints, nullptr, &error)) {
     return make_report(TypeRasterStatus::kBadText, error);
   }
 
@@ -737,6 +742,236 @@ TypeRasterReport type_rasterize_with_font(const char* text, size_t size,
   }
 
   if (out_missing_glyphs != nullptr) *out_missing_glyphs = missing;
+  return make_report(TypeRasterStatus::kOk, "");
+}
+
+/* ---------- 段落排版（P0-6 ③）：折行 + 对齐 ---------- */
+
+namespace {
+
+/* 宽字符（CJK / 全角 / Emoji）：这些文字没有词间空格，必须允许在字与字之间断行，
+ * 否则一整句中文会被当成一个「不可断的词」横向冲出段落框。 */
+bool is_wide_codepoint(uint32_t cp) {
+  return (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) ||
+         (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+         (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+         (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F000 && cp <= 0x1FAFF) ||
+         (cp >= 0x20000 && cp <= 0x3FFFD);
+}
+
+/* 区间 [begin, end) 的步进宽度；字距只在字形之间加（与 measure 同一口径）。 */
+double slice_width(const std::vector<double>& advances, double spacing, size_t begin,
+                   size_t end) {
+  double width = 0.0;
+  size_t count = 0;
+  for (size_t i = begin; i < end; ++i) {
+    width += advances[i] + (count > 0 ? spacing : 0.0);
+    ++count;
+  }
+  return width;
+}
+
+/*
+ * 一段（两个 '\n' 之间）的贪心装行。
+ *
+ * 断点三档，优先级从高到低：
+ *   1. 显式 '\n'（由调用方切开，到这里已经不存在）；
+ *   2. 行内最后一个「可断位置」——空格之后、或宽字符边界；
+ *   3. 没有任何可断位置（超长英文单词/URL）：在溢出点按字符硬断。
+ * 每行至少前进一个字形，保证循环终止；行尾空格不计宽也不进渲染区间。
+ */
+void wrap_paragraph(const std::vector<uint32_t>& codepoints,
+                    const std::vector<size_t>& byte_offsets,
+                    const std::vector<double>& advances, double spacing, size_t paragraph_begin,
+                    size_t paragraph_end, double box_width, size_t text_size,
+                    std::vector<TypeWrapLine>* lines, double* content_width) {
+  const size_t kNoBreak = static_cast<size_t>(-1);
+  size_t i = paragraph_begin;
+  while (i < paragraph_end) {
+    while (i < paragraph_end && codepoints[i] == ' ') ++i; /* 行首空格不占位 */
+    if (i >= paragraph_end) break;
+
+    double width = 0.0;
+    size_t count = 0;
+    size_t j = i;
+    size_t last_break = kNoBreak;
+    while (j < paragraph_end) {
+      if (count > 0 &&
+          (codepoints[j - 1] == ' ' || is_wide_codepoint(codepoints[j]) ||
+           is_wide_codepoint(codepoints[j - 1]))) {
+        last_break = j;
+      }
+      const double add = advances[j] + (count > 0 ? spacing : 0.0);
+      if (box_width > 0.0 && count > 0 && width + add > box_width) break;
+      width += add;
+      ++count;
+      ++j;
+    }
+
+    size_t end = paragraph_end;
+    if (j < paragraph_end) {
+      end = last_break != kNoBreak ? last_break : j;
+      /* 断点落在行首（整行放不下且没有可断位置）时按字符前进一格。 */
+      if (end <= i) end = i + 1;
+      if (end > paragraph_end) end = paragraph_end;
+    }
+
+    size_t trimmed = end;
+    while (trimmed > i && codepoints[trimmed - 1] == ' ') --trimmed;
+    TypeWrapLine line;
+    line.byte_begin = byte_offsets[i];
+    line.byte_end = trimmed < byte_offsets.size() ? byte_offsets[trimmed] : text_size;
+    line.width = slice_width(advances, spacing, i, trimmed);
+    lines->push_back(line);
+    if (line.width > *content_width) *content_width = line.width;
+
+    i = end;
+  }
+}
+
+}  // namespace
+
+TypeRasterReport type_layout_paragraph(const char* text, size_t size,
+                                       const TypeRasterStyle& style, FontFace* font,
+                                       double box_width, int32_t align,
+                                       std::vector<TypeWrapLine>* out_lines,
+                                       TypeParagraphMetrics* out_metrics) {
+  if (out_lines == nullptr || out_metrics == nullptr) {
+    return make_report(TypeRasterStatus::kBadStyle, "paragraph output is null");
+  }
+  *out_lines = {};
+  *out_metrics = {};
+  if (!std::isfinite(box_width) || box_width < 0.0 || box_width > kMaxTypeParagraphBox) {
+    return make_report(TypeRasterStatus::kBadStyle, "paragraph box width is not finite or out of range");
+  }
+  if (align < kTypeAlignLeft || align >= kTypeAlignCount) {
+    return make_report(TypeRasterStatus::kBadStyle, "paragraph alignment must be 0..2");
+  }
+  if (text == nullptr) return make_report(TypeRasterStatus::kBadText, "type text pointer is null");
+  if (size == 0) return make_report(TypeRasterStatus::kBadText, "type text is empty");
+  if (size > kMaxTypeCharacters) {
+    return make_report(TypeRasterStatus::kTooLong, "type text exceeds 65536 characters");
+  }
+
+  std::vector<uint32_t> codepoints;
+  std::vector<size_t> byte_offsets;
+  std::vector<double> advances;
+  const char* error = "";
+  double spacing = 0.0;
+  double first_line_height = 0.0;
+  double line_advance = 0.0;
+  int64_t missing = 0;
+
+  if (font == nullptr) {
+    /* 旧轨道：逐字节 ASCII，步进是常数（已含字距，spacing 必须为 0）。 */
+    if (!scan_text(text, size, &error)) return make_report(TypeRasterStatus::kBadText, error);
+    double scale = 1.0;
+    double advance = 0.0;
+    if (!validate_style(style, &scale, &advance, &error)) {
+      return make_report(TypeRasterStatus::kBadStyle, error);
+    }
+    codepoints.resize(size);
+    byte_offsets.resize(size);
+    for (size_t i = 0; i < size; ++i) {
+      codepoints[i] = static_cast<uint32_t>(static_cast<unsigned char>(text[i]));
+      byte_offsets[i] = i;
+    }
+    advances.assign(size, advance);
+    spacing = 0.0;
+    first_line_height = style.font_size;
+    line_advance = style.font_size * style.line_height;
+  } else {
+    if (!validate_font_style(style, &error)) {
+      return make_report(TypeRasterStatus::kBadStyle, error);
+    }
+    if (!decode_utf8(text, size, &codepoints, &byte_offsets, &error)) {
+      return make_report(TypeRasterStatus::kBadText, error);
+    }
+    const FontMetricsInfo& metrics = font->metrics();
+    if (!metrics.scalable || metrics.units_per_em == 0) {
+      return make_report(TypeRasterStatus::kFontError, "the loaded font is not scalable");
+    }
+    const double ascender = metrics.ascender * style.font_size;
+    const double descender = metrics.descender * style.font_size;
+    if (!(ascender - descender > 0.0)) {
+      return make_report(TypeRasterStatus::kFontError,
+                         "the loaded font has no usable vertical metrics");
+    }
+    first_line_height = ascender - descender;
+    line_advance = style.font_size * style.line_height;
+    spacing = style.letter_spacing;
+    advances.assign(codepoints.size(), 0.0);
+    int64_t glyphs = 0;
+    for (size_t i = 0; i < codepoints.size(); ++i) {
+      if (codepoints[i] == '\n') continue;
+      FontGlyph glyph;
+      if (!font->render_glyph(codepoints[i], style.font_size, &glyph)) {
+        return make_report(TypeRasterStatus::kFontError,
+                           "the loaded font failed to rasterize a glyph");
+      }
+      if (glyph.missing) ++missing;
+      /*
+       * 折行会让任意字形成为某一行**行首**（不吃字距），所以这里比
+       * build_font_layout 多判一条「字形自身步进 >= 0.5」——否则带负字距的
+       * 极小步进字形在排版阶段通过、到逐行渲染时被内核拒绝。
+       */
+      if (!(glyph.advance >= kMinTypeAdvance)) {
+        return make_report(TypeRasterStatus::kBadStyle,
+                           "type letter spacing makes the glyph advance smaller than 0.5 document px");
+      }
+      advances[i] = glyph.advance;
+      ++glyphs;
+    }
+    if (glyphs == 0) {
+      return make_report(TypeRasterStatus::kBadText, "type text has no printable glyphs");
+    }
+  }
+
+  /*
+   * 行内非首字形的步进底限（首字形不吃字距，已在两轨各自的样式闸里判过）：
+   * 空格也算——步进被压成 0 时居中/右对齐会把整行算短，且渲染会叠字。
+   */
+  for (size_t i = 0; i < advances.size(); ++i) {
+    if (codepoints[i] == '\n') continue;
+    if (!(advances[i] + spacing >= kMinTypeAdvance)) {
+      return make_report(TypeRasterStatus::kBadStyle,
+                         "type letter spacing makes the glyph advance smaller than 0.5 document px");
+    }
+  }
+
+  double content_width = 0.0;
+  size_t paragraph_begin = 0;
+  for (size_t i = 0; i <= codepoints.size(); ++i) {
+    if (i != codepoints.size() && codepoints[i] != '\n') continue;
+    const size_t paragraph_end = i;
+    const size_t before = out_lines->size();
+    wrap_paragraph(codepoints, byte_offsets, advances, spacing, paragraph_begin, paragraph_end,
+                   box_width, size, out_lines, &content_width);
+    if (out_lines->size() == before) {
+      /* 空段落（连续换行 / 纯空格行）：保留一个占位的空行，行高照算。 */
+      TypeWrapLine empty;
+      const size_t byte = paragraph_begin < byte_offsets.size() ? byte_offsets[paragraph_begin] : size;
+      empty.byte_begin = byte;
+      empty.byte_end = byte;
+      out_lines->push_back(empty);
+    }
+    paragraph_begin = i + 1;
+  }
+
+  const double block_width = box_width > 0.0 ? box_width : content_width;
+  const double factor =
+      align == kTypeAlignCenter ? 0.5 : (align == kTypeAlignRight ? 1.0 : 0.0);
+  for (TypeWrapLine& line : *out_lines) {
+    double offset = (block_width - line.width) * factor;
+    line.x_offset = offset > 0.0 ? offset : 0.0;
+  }
+
+  out_metrics->line_count = static_cast<int32_t>(out_lines->size());
+  out_metrics->line_advance = line_advance;
+  out_metrics->content_width = content_width;
+  out_metrics->content_height =
+      first_line_height + static_cast<double>(out_metrics->line_count - 1) * line_advance;
+  out_metrics->missing_glyphs = missing;
   return make_report(TypeRasterStatus::kOk, "");
 }
 

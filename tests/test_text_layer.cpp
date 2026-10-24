@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -142,6 +143,59 @@ comp_layer_id background_layer(comp_document document) {
   size_t count = 0;
   COMP_CHECK(comp_layer_list(document, ids, 16, &count) == COMP_OK);
   return count > 0 ? ids[0] : 0;
+}
+
+/* 画布有墨像素的包围盒（文档坐标）。空 -> max_x < 0。 */
+struct InkBox {
+  int32_t min_x = 0;
+  int32_t min_y = 0;
+  int32_t max_x = -1;
+  int32_t max_y = -1;
+};
+
+InkBox ink_box(const std::vector<uint8_t>& canvas) {
+  InkBox box;
+  bool first = true;
+  for (int32_t y = 0; y < kCanvas; ++y) {
+    for (int32_t x = 0; x < kCanvas; ++x) {
+      const size_t index = (static_cast<size_t>(y) * static_cast<size_t>(kCanvas) +
+                            static_cast<size_t>(x)) * 4u + 3u;
+      if (canvas[index] == 0) continue;
+      if (first) {
+        box.min_x = box.max_x = x;
+        box.min_y = box.max_y = y;
+        first = false;
+        continue;
+      }
+      if (x < box.min_x) box.min_x = x;
+      if (x > box.max_x) box.max_x = x;
+      if (y < box.min_y) box.min_y = y;
+      if (y > box.max_y) box.max_y = y;
+    }
+  }
+  return box;
+}
+
+/* 画布 y ∈ [lo, hi) 区间的墨量。 */
+size_t ink_in_rows(const std::vector<uint8_t>& canvas, int32_t lo, int32_t hi) {
+  size_t count = 0;
+  for (int32_t y = lo; y < hi && y < kCanvas; ++y) {
+    for (int32_t x = 0; x < kCanvas; ++x) {
+      const size_t index = (static_cast<size_t>(y) * static_cast<size_t>(kCanvas) +
+                            static_cast<size_t>(x)) * 4u + 3u;
+      if (canvas[index] > 0) ++count;
+    }
+  }
+  return count;
+}
+
+/* 图层局部像素里的墨量（不看别的图层）。 */
+size_t layer_ink(const std::vector<uint8_t>& bytes) {
+  size_t count = 0;
+  for (size_t i = 3; i < bytes.size(); i += 4) {
+    if (bytes[i] > 0) ++count;
+  }
+  return count;
 }
 
 /* 两阶段读文本：先问长度，再取内容。返回是否成功，并回填 desc / text。 */
@@ -314,6 +368,142 @@ COMP_TEST(text_layer_style_change_is_one_undo_step) {
              COMP_ERR_NOT_FOUND);
 }
 
+/* ------------------------------------------------------------ 段落排版（P0-6③） */
+
+/*
+ * 内置 5×7 轨道的量纲确定（字号 14 => 步进 12 px、字形 14 px 高），可以拿像素
+ * 位置当真值：box_width = 60 正好放 5 个步进，「AAAA BBBB」必然折成两行。
+ */
+COMP_TEST(text_layer_paragraph_wraps_inside_the_declared_box) {
+  Fixture f;
+  comp_text_desc desc = make_text("AAAA BBBB", 4.0, 4.0, 14.0);
+  desc.style.line_height = 1.0;
+  desc.box_width = 60.0;
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &desc, &id) == COMP_OK);
+
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(f.document, id, nullptr, 0, &width, &height, &format) == COMP_OK);
+  COMP_CHECK_MSG(width == 60, "段落框的宽就是图层宽（折行后不再按最长行收缩）");
+  COMP_CHECK_MSG(height == 28, "两行 = 14 + 1×14（行距 1.0）");
+
+  comp_text_desc read{};
+  std::string text;
+  COMP_CHECK(read_text(f.document, id, &read, &text, nullptr));
+  COMP_CHECK(read.box_width == 60.0 && read.box_height == 0.0 &&
+             read.align == COMP_TEXT_ALIGN_LEFT);
+  COMP_CHECK_MSG(text == "AAAA BBBB", "存的是原文，折行只是渲染时的布局");
+  COMP_CHECK_MSG(read._reserved2 == 0, "读回时尾部保留字段清零");
+
+  const std::vector<uint8_t> canvas = flatten(f.document);
+  COMP_CHECK_MSG(ink_in_rows(canvas, 4, 18) > 0, "第一行落在框的上半");
+  COMP_CHECK_MSG(ink_in_rows(canvas, 18, 32) > 0, "折下来的第二行落在下半");
+  const InkBox box = ink_box(canvas);
+  COMP_CHECK(box.min_x >= 4 && box.min_y >= 4 && box.max_y < 32);
+  COMP_CHECK_MSG(box.max_x < 64, "字形不越出框宽（内核窗口裁切）");
+
+  /* 同样的文本不加框 = 点文字：一行，框高按内容收缩。 */
+  comp_text_desc point = make_text("AAAA BBBB", 4.0, 4.0, 14.0);
+  point.style.line_height = 1.0;
+  comp_layer_id point_id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &point, &point_id) == COMP_OK);
+  COMP_CHECK(comp_layer_get_pixels(f.document, point_id, nullptr, 0, &width, &height, &format) ==
+             COMP_OK);
+  COMP_CHECK_MSG(width == 108 && height == 14, "点文字不折行：9 × 12 px 宽、一行高");
+}
+
+COMP_TEST(text_layer_paragraph_alignment_shifts_ink_inside_the_box) {
+  int32_t min_x[3] = {0, 0, 0};
+  const int32_t aligns[3] = {COMP_TEXT_ALIGN_LEFT, COMP_TEXT_ALIGN_CENTER, COMP_TEXT_ALIGN_RIGHT};
+  const int32_t expected_shift[3] = {0, 18, 36}; /* (60 - 2×12) × 0 / 0.5 / 1 */
+
+  for (int i = 0; i < 3; ++i) {
+    Fixture f;
+    comp_text_desc desc = make_text("AA", 0.0, 0.0, 14.0);
+    desc.style.line_height = 1.0;
+    desc.box_width = 60.0;
+    desc.align = aligns[i];
+    comp_layer_id id = 0;
+    COMP_CHECK(comp_layer_add_text(f.document, &desc, &id) == COMP_OK);
+    const std::vector<uint8_t> bytes = layer_bytes(f.document, id);
+    COMP_CHECK(!bytes.empty());
+    int32_t first_ink = -1;
+    for (size_t pixel = 0; pixel + 3 < bytes.size(); pixel += 4) {
+      if (bytes[pixel + 3] == 0) continue;
+      first_ink = static_cast<int32_t>((pixel / 4u) % 60u); /* 图层宽 60 */
+      break;
+    }
+    COMP_CHECK_MSG(first_ink >= 0, "对齐后仍然有墨");
+    min_x[i] = first_ink;
+    COMP_CHECK_MSG(first_ink >= expected_shift[i] && first_ink < 60, "墨迹落在框内");
+  }
+
+  COMP_CHECK_MSG(min_x[1] - min_x[0] == expected_shift[1],
+                 "居中对齐整体右移 (60-24)/2 = 18 px");
+  COMP_CHECK_MSG(min_x[2] - min_x[0] == expected_shift[2],
+                 "右对齐整体右移 (60-24) = 36 px");
+}
+
+COMP_TEST(text_layer_paragraph_box_height_clips_without_rewrapping) {
+  Fixture f;
+  comp_text_desc clipped = make_text("AAAA BBBB", 4.0, 4.0, 14.0);
+  clipped.style.line_height = 1.0;
+  clipped.box_width = 60.0;
+  clipped.box_height = 14.0; /* 只留第一行 */
+  comp_layer_id clipped_id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &clipped, &clipped_id) == COMP_OK);
+
+  comp_text_desc full = clipped;
+  full.box_height = 0.0; /* 折行结果不变，只是不裁 */
+  comp_layer_id full_id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &full, &full_id) == COMP_OK);
+
+  int32_t clipped_width = 0;
+  int32_t clipped_height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(f.document, clipped_id, nullptr, 0, &clipped_width,
+                                   &clipped_height, &format) == COMP_OK);
+  int32_t full_width = 0;
+  int32_t full_height = 0;
+  COMP_CHECK(comp_layer_get_pixels(f.document, full_id, nullptr, 0, &full_width, &full_height,
+                                   &format) == COMP_OK);
+  COMP_CHECK_MSG(clipped_height == 14 && full_height == 28, "框高只裁切，不改折行结果");
+  COMP_CHECK_MSG(clipped_width == full_width, "框宽两侧一致");
+
+  const size_t clipped_ink = layer_ink(layer_bytes(f.document, clipped_id));
+  const size_t full_ink = layer_ink(layer_bytes(f.document, full_id));
+  COMP_CHECK_MSG(clipped_ink > 0, "第一行还在");
+  COMP_CHECK_MSG(clipped_ink < full_ink, "第二行被裁掉了");
+
+  /* 框高为 0 的维度退回内容高——与点文字同一条规则。 */
+  comp_text_desc read{};
+  std::string text;
+  COMP_CHECK(read_text(f.document, clipped_id, &read, &text, nullptr));
+  COMP_CHECK(read.box_height == 14.0 && read.box_width == 60.0);
+}
+
+COMP_TEST(text_layer_paragraph_blank_line_keeps_vertical_rhythm) {
+  Fixture f;
+  comp_text_desc desc = make_text("A\n\nB", 4.0, 4.0, 14.0);
+  desc.style.line_height = 1.0;
+  desc.box_width = 60.0;
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &desc, &id) == COMP_OK);
+
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(f.document, id, nullptr, 0, &width, &height, &format) == COMP_OK);
+  COMP_CHECK_MSG(height == 42, "空行占一行：3 行 = 14 + 2×14");
+
+  const std::vector<uint8_t> canvas = flatten(f.document);
+  COMP_CHECK_MSG(ink_in_rows(canvas, 4, 18) > 0, "第一行有墨");
+  COMP_CHECK_MSG(ink_in_rows(canvas, 18, 32) == 0, "空行不落墨");
+  COMP_CHECK_MSG(ink_in_rows(canvas, 32, 46) > 0, "第三行仍在空行之后");
+}
+
 /* ------------------------------------------------------- 先栅格化才能画（错误码闸） */
 
 COMP_TEST(text_layer_pixels_are_read_only_until_rasterized) {
@@ -412,6 +602,24 @@ COMP_TEST(text_layer_rejects_bad_input_without_side_effects) {
   missing_font.font_path_utf8 = "no-such-font-9f3a.ttf";
   COMP_CHECK(comp_layer_add_text(f.document, &missing_font, &id) == COMP_ERR_IO);
 
+  /* P0-6③：段落框与对齐的闸在开事务之前（同样不建层、不进撤销栈）。 */
+  comp_text_desc boxed = make_text("Hi", 0.0, 0.0, 12.0);
+  boxed.box_width = -1.0;
+  COMP_CHECK(comp_layer_add_text(f.document, &boxed, &id) == COMP_ERR_INVALID_ARGUMENT);
+  boxed.box_width = 0.0;
+  boxed.box_height = std::numeric_limits<double>::quiet_NaN();
+  COMP_CHECK(comp_layer_add_text(f.document, &boxed, &id) == COMP_ERR_INVALID_ARGUMENT);
+  boxed.box_height = 0.0;
+  boxed.box_width = 1.0e7; /* 引擎上限 1e6 */
+  COMP_CHECK(comp_layer_add_text(f.document, &boxed, &id) == COMP_ERR_INVALID_ARGUMENT);
+  boxed.box_width = 0.0;
+  boxed.align = COMP_TEXT_ALIGN_COUNT;
+  COMP_CHECK(comp_layer_add_text(f.document, &boxed, &id) == COMP_ERR_INVALID_ARGUMENT);
+  boxed.align = COMP_TEXT_ALIGN_LEFT;
+  boxed._reserved2 = 1;
+  COMP_CHECK(comp_layer_add_text(f.document, &boxed, &id) == COMP_ERR_INVALID_ARGUMENT);
+  boxed._reserved2 = 0;
+
   COMP_CHECK_MSG(layer_count(f.document) == layers_before, "失败不建层");
   COMP_CHECK_MSG(history_steps(f.document) == steps_before, "失败不进撤销栈");
 }
@@ -455,6 +663,58 @@ COMP_TEST(text_layer_survives_comp_round_trip) {
       COMP_CHECK(comp_layer_set_text(loaded, id, &restyled) == COMP_OK);
       COMP_CHECK(read_text(loaded, id, &read, &text, nullptr));
       COMP_CHECK(read.style.font_size == 28.0);
+
+      comp_document_destroy(loaded);
+    }
+  }
+
+  fs::remove_all(path, ignored);
+}
+
+/* P0-6③：段落框与对齐随 engineText 往返；重开工程后仍是同一个段落。 */
+COMP_TEST(text_layer_paragraph_survives_comp_round_trip) {
+  const fs::path path = fs::temp_directory_path() / "compositor_text_paragraph.comp";
+  std::error_code ignored;
+  fs::remove_all(path, ignored);
+
+  comp_layer_id id = 0;
+  int32_t width = 0;
+  int32_t height = 0;
+  {
+    Fixture f;
+    comp_text_desc desc = make_text("AA BB CC", 8.0, 8.0, 14.0);
+    desc.style.line_height = 1.0;
+    desc.box_width = 60.0;
+    desc.box_height = 40.0;
+    desc.align = COMP_TEXT_ALIGN_CENTER;
+    COMP_CHECK(comp_layer_add_text(f.document, &desc, &id) == COMP_OK);
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    COMP_CHECK(comp_layer_get_pixels(f.document, id, nullptr, 0, &width, &height, &format) ==
+               COMP_OK);
+    COMP_CHECK(comp_document_save(f.document, path.string().c_str()) == COMP_OK);
+  }
+
+  {
+    Fixture f;
+    comp_document loaded = nullptr;
+    COMP_CHECK(comp_document_load(f.engine, path.string().c_str(), &loaded) == COMP_OK);
+    if (loaded != nullptr) {
+      comp_text_desc read{};
+      std::string text;
+      COMP_CHECK(read_text(loaded, id, &read, &text, nullptr));
+      COMP_CHECK(text == "AA BB CC");
+      COMP_CHECK(read.box_width == 60.0);
+      COMP_CHECK(read.box_height == 40.0);
+      COMP_CHECK(read.align == COMP_TEXT_ALIGN_CENTER);
+      COMP_CHECK(read._reserved2 == 0);
+
+      /* 像素缓存也回来了：段落框尺寸没有被重排成点文字的尺寸。 */
+      int32_t w = 0;
+      int32_t h = 0;
+      comp_pixel_format format = COMP_PIXEL_RGBA8;
+      COMP_CHECK(comp_layer_get_pixels(loaded, id, nullptr, 0, &w, &h, &format) == COMP_OK);
+      COMP_CHECK(w == width);
+      COMP_CHECK(h == height);
 
       comp_document_destroy(loaded);
     }

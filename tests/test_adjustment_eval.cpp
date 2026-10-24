@@ -128,7 +128,7 @@ comp_layer_id add_adjustment(comp_document doc, uint32_t kind, const char* setti
   return id;
 }
 
-/* 12 个 kind 的非恒等参数（键名逐字取自 adjustment_table 的参数表）。 */
+/* 25 个 kind 的非恒等参数（键名逐字取自 adjustment_table 的参数表）。 */
 struct KindCase {
   uint32_t kind;
   const char* name;
@@ -153,11 +153,27 @@ const KindCase kEvaluatedKinds[] = {
      R"({"blackWhiteSettings":{"reds":100,"yellows":100,"greens":100,"cyans":100,"blues":100,"magentas":100,"tint":false}})"},
     {11, "colorBalance",
      R"({"colorBalanceSettings":{"shadowCyanRed":-60,"midCyanRed":0,"highlightCyanRed":60,"preserveLuminosity":true}})"},
+    {12, "brightnessContrast", R"({"brightnessContrastSettings":{"brightness":20,"contrast":15}})"},
+    {13, "desaturate", R"({})"},
+    {14, "threshold", R"({"thresholdSettings":{"level":128}})"},
+    {15, "posterize", R"({"posterizeSettings":{"levels":4}})"},
+    {16, "vibrance", R"({"vibranceSettings":{"vibrance":60,"saturation":-20}})"},
+    {17, "selectiveColor",
+     R"({"selectiveColorSettings":{"relative":false,"ranges":[{},{},{},{},{"cyan":-50,"magenta":50,"yellow":-20,"black":-10}]}})"},
+    {18, "photoFilter",
+     R"({"photoFilterSettings":{"color":{"red":0.9,"green":0.5,"blue":0.2},"density":60,"preserveLuminosity":true}})"},
+    {19, "channelMixer", R"({"channelMixerSettings":{"redGreen":0.4,"blueBlue":0.8}})"},
+    {20, "colorLookup", R"({"colorLookupSettings":{"look":2,"intensity":100}})"},
+    {21, "shadowsHighlights",
+     R"({"shadowsHighlightsSettings":{"shadows":60,"shadowWidth":50,"highlights":-40,"highlightWidth":50,"radius":8}})"},
+    {22, "autoTone", R"({})"},
+    {23, "autoContrast", R"({})"},
+    {24, "autoColor", R"({})"},
 };
 
 }  // namespace
 
-/* 1. 12 个 kind 全部改变像素（此前它们全部是 no-op）。 */
+/* 1. 全部 25 个 kind 都改变像素（此前它们全部是 no-op）。 */
 COMP_TEST(adjustment_eval_every_kind_changes_pixels) {
   for (const KindCase& c : kEvaluatedKinds) {
     Fixture fx;
@@ -200,6 +216,13 @@ COMP_TEST(adjustment_eval_identity_settings_are_byte_exact) {
       {1, "levels-default",
        R"({"levels":{"ranges":[{"black":0,"gamma":1,"white":255,"outputBlack":0,"outputWhite":255},{},{},{}]}})"},
       {3, "exposure-default", R"({"exposureSettings":{"exposure":0,"offset":0,"gamma":1}})"},
+      /* P1-6 追加族：缺省值落在恒等上的那几个也必须逐字节无改动。 */
+      {16, "vibrance-default", R"({"vibranceSettings":{"vibrance":0,"saturation":0}})"},
+      {17, "selective-default", R"({"selectiveColorSettings":{"relative":true}})"},
+      {19, "channelMixer-default",
+       R"({"channelMixerSettings":{"redRed":1,"redGreen":0,"redBlue":0,"redConstant":0,"greenRed":0,"greenGreen":1,"greenBlue":0,"greenConstant":0,"blueRed":0,"blueGreen":0,"blueBlue":1,"blueConstant":0}})"},
+      {21, "shadows-highlights-default",
+       R"({"shadowsHighlightsSettings":{"shadows":0,"shadowWidth":50,"highlights":0,"highlightWidth":50,"radius":30}})"},
   };
   for (const KindCase& c : kIdentity) {
     Fixture fx;

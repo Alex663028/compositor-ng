@@ -34,12 +34,16 @@ const char* const kUpstreamKindNames[] = {
 };
 
 /*
- * 本仓在尾部追加的破坏性调整（S27），按 kind 12..15 的顺序。
- * 它们不在上游 `AdjustmentKind` 里，故单独一张表断言——把 16 条塞进上游表
+ * 本仓在尾部追加的破坏性调整（S27 / P1-6），按 kind 12..24 的顺序。
+ * 它们不在上游 `AdjustmentKind` 里，故单独一张表断言——把 25 条塞进上游表
  * 会让「逐字对齐上游」这条不变式失去意义。
  */
 const char* const kLocalKindNames[] = {
-    "Brightness/Contrast", "Desaturate", "Threshold", "Posterize",
+    "Brightness/Contrast",  "Desaturate",       "Threshold",
+    "Posterize",            "Vibrance",         "Selective Color",
+    "Photo Filter",         "Channel Mixer",    "Color Lookup",
+    "Shadows/Highlights",   "Auto Tone",        "Auto Contrast",
+    "Auto Color",
 };
 
 comp_engine_desc make_desc() {
@@ -93,13 +97,14 @@ COMP_TEST(adjustment_kind_names_match_upstream) {
 }
 
 /*
- * 破坏性入口能接受的 kind 集必须显式且与实现一致：逐像素映射的 11 种可以，
+ * 破坏性入口能接受的 kind 集必须显式且与实现一致：逐像素映射的 19 种可以，
  * 邻域/随机源的 4 种（5..8）和已有专用入口的 Invert（9）不行。
  * 这张表漂移的后果是 comp_layer_apply_adjustment 静默接受 blur 之类，
  * 所以逐 kind 断言，而不是只数个数。
  */
 COMP_TEST(adjustment_destructive_kind_set_is_explicit) {
-  const uint32_t expected[] = {0u, 1u, 2u, 3u, 4u, 10u, 11u, 12u, 13u, 14u, 15u};
+  const uint32_t expected[] = {0u,  1u,  2u,  3u,  4u,  10u, 11u, 12u, 13u, 14u,
+                               15u, 16u, 17u, 18u, 19u, 20u, 21u, 22u, 23u, 24u};
   for (uint32_t kind = 0; kind < kAdjustmentKindCount; ++kind) {
     bool should = false;
     for (uint32_t value : expected) should = should || value == kind;
@@ -811,7 +816,7 @@ COMP_TEST(curves_abi_reads_and_writes_points) {
 }
 
 /*
- * 追加的 12..15 必须和上游 kind 一样能落盘往返：
+ * 追加的 12..24 必须和上游 kind 一样能落盘往返：
  * `.comp` 的 engineAdjustments 不按 kind 白名单过滤，若哪天加了过滤，
  * 这两条路的 silently dropped 只有往返用例能抓到。
  */
@@ -845,10 +850,28 @@ COMP_TEST(adjustment_extended_kinds_round_trip_through_comp) {
       "{}",
       "{\"thresholdSettings\":{\"level\":200}}",
       "{\"posterizeSettings\":{\"levels\":8}}",
+      "{\"vibranceSettings\":{\"vibrance\":20,\"saturation\":-10}}",
+      "{\"selectiveColorSettings\":{\"relative\":true}}",
+      "{\"photoFilterSettings\":{\"color\":{\"red\":1,\"green\":0.5,\"blue\":0.25},"
+      "\"density\":40,\"preserveLuminosity\":false}}",
+      "{\"channelMixerSettings\":{\"redRed\":1.2}}",
+      "{\"colorLookupSettings\":{\"look\":2,\"intensity\":75}}",
+      "{\"shadowsHighlightsSettings\":{\"shadows\":30,\"radius\":20}}",
+      "{}",
+      "{}",
+      "{}",
   };
-  const uint32_t kinds[] = {COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, COMP_ADJUSTMENT_DESATURATE,
-                            COMP_ADJUSTMENT_THRESHOLD, COMP_ADJUSTMENT_POSTERIZE};
-  for (size_t i = 0; i < 4; ++i) {
+  const uint32_t kinds[] = {
+      COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, COMP_ADJUSTMENT_DESATURATE,
+      COMP_ADJUSTMENT_THRESHOLD,           COMP_ADJUSTMENT_POSTERIZE,
+      COMP_ADJUSTMENT_VIBRANCE,            COMP_ADJUSTMENT_SELECTIVE_COLOR,
+      COMP_ADJUSTMENT_PHOTO_FILTER,        COMP_ADJUSTMENT_CHANNEL_MIXER,
+      COMP_ADJUSTMENT_COLOR_LOOKUP,        COMP_ADJUSTMENT_SHADOWS_HIGHLIGHTS,
+      COMP_ADJUSTMENT_AUTO_TONE,           COMP_ADJUSTMENT_AUTO_CONTRAST,
+      COMP_ADJUSTMENT_AUTO_COLOR,
+  };
+  const size_t kind_total = sizeof(kinds) / sizeof(kinds[0]);
+  for (size_t i = 0; i < kind_total; ++i) {
     COMP_CHECK_MSG(comp_layer_add_adjustment(document, layer, kinds[i], settings[i]) == COMP_OK,
                    settings[i]);
   }
@@ -874,8 +897,8 @@ COMP_TEST(adjustment_extended_kinds_round_trip_through_comp) {
       restored = candidate;
       total += candidate_count;
     }
-    COMP_CHECK_MSG(total == 4, "extended kinds survive the round trip");
-    for (size_t i = 0; i < 4; ++i) {
+    COMP_CHECK_MSG(total == kind_total, "extended kinds survive the round trip");
+    for (size_t i = 0; i < kind_total; ++i) {
       uint32_t kind = 0xFFFFFFFFu;
       size_t need = 0;
       COMP_CHECK(comp_layer_adjustment_at(loaded, restored, i, &kind, nullptr, 0, &need) == COMP_OK);

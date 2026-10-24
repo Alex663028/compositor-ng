@@ -68,12 +68,24 @@ mkdir -p "$OUT"
 # 原 `-DCOMP_NO_D3D12=1` 是全仓零引用的死开关（全仓无一处引用 COMP_NO_D3D12），已删除，
 # 以免后来者误以为「显式关掉了 D3D12」。
 DEFINES=""
-# 注意（P2-4，能力边界）：这里刻意**不**加入 engine/third_party/{zlib,libpng,stb}。
-# 因此 codec_lib.cpp 的 __has_include("png.h") 探测失败 -> 鸿蒙侧 PNG 静默回落到自研
-# comp_png（回落本身是如实的，符合「不假装成功」），但与宿主构建（libpng+vendored）
-# 不是同一条编解码路径。该事实已写入 README「能力边界」一节；若要统一，
-# 应把 third_party 加入下面的包含路径并确认 zlib/libpng 能过 OHOS 交叉编译后一并开启。
 CPPFLAGS="-I$ROOT/engine -I$ROOT/engine/abi/include -I$ROOT/engine/abi/src"
+
+# 编解码后端（P2-4）：与 scripts/build.py 的 INCLUDE_DIRS 同一条口径——目录存在才加入。
+# 这些目录下的 .c 本来就被上面的 `find engine -name "*.c"` 编进静态库，此前只是没给
+# include 路径，导致 codec_lib.cpp 的 __has_include("png.h") / ("stb_image.h") 探测失败：
+# PNG 静默回落自研 comp_png、JPEG/HDR/EXR 直接不可用。补上后鸿蒙与宿主走同一套编解码。
+# 缺目录时不报错（保持「不假装成功」：探测失败仍然如实降级），但会打印一行提示。
+_third_party_missing=""
+for _vendor in zlib libpng stb; do
+  if [ -d "$ROOT/engine/third_party/$_vendor" ]; then
+    CPPFLAGS="$CPPFLAGS -I$ROOT/engine/third_party/$_vendor"
+  else
+    _third_party_missing="$_third_party_missing $_vendor"
+  fi
+done
+if [ -n "$_third_party_missing" ]; then
+  echo "[ohos] 提示：third_party 缺少$_third_party_missing，编解码将降级（PNG 走自研回落，JPEG/HDR/EXR 不可用）" >&2
+fi
 
 # FreeType（P5-0）：与 build.py / CMakeLists.txt 同一份「聚合翻译单元」清单。
 # 目录中的其余 .c 被聚合文件 #include，不能再单独编译；下面的 find 必须排除整棵树。

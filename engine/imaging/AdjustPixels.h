@@ -48,6 +48,39 @@ void adjust_threshold(uint8_t *rgba, size_t width, size_t height, size_t stride,
 // Posterize on premultiplied RGBA pixels: each channel is snapped to one of `levels` (2…255) evenly
 // spaced steps. 255 levels leaves the image unchanged. Alpha is kept.
 void adjust_posterize(uint8_t *rgba, size_t width, size_t height, size_t stride, int levels);
+// Vibrance on premultiplied RGBA pixels: a saturation boost that leans on the already-quiet colors
+// and backs off on saturated ones (and on skin hues), plus a flat saturation term. Both amounts are
+// −100…100 with 0 as no change. Alpha is kept.
+void adjust_vibrance(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                     double vibrance, double saturation);
+// Selective Color on premultiplied RGBA pixels. `ranges` is 9 x 4 floats: reds, yellows, greens,
+// cyans, blues, magentas, whites, neutrals, blacks, each in cyan/magenta/yellow/black order, −1…1
+// (Photoshop's −100…100). `relative` adds a share of what is already there, as Photoshop's Relative
+// mode does; otherwise the amount is absolute. Alpha is kept.
+void adjust_selective_color(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                            const float *ranges, int relative);
+// Photo Filter on premultiplied RGBA pixels: blends toward `r`/`g`/`b` (0…1) by `density` (0…100),
+// then puts the original luminosity back when `preserveLuminosity` is set. Alpha is kept.
+void adjust_photo_filter(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                         double r, double g, double b, double density, int preserveLuminosity);
+// Channel Mixer on premultiplied RGBA pixels. `matrix` is 12 values in row order: for red, green and
+// blue output, the red/green/blue shares and a constant, all −2…2 (Photoshop's −200…200%). The
+// constant is a fraction of full scale. Alpha is kept.
+void adjust_channel_mixer(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                          const double *matrix);
+// Color Lookup with the built-in looks (0 warm film, 1 cool film, 2 teal and orange, 3 mono
+// contrast, 4 vintage fade), blended by `intensity` (0…100). Files (.cube) are not read. Alpha kept.
+void adjust_color_lookup(uint8_t *rgba, size_t width, size_t height, size_t stride, int look,
+                         double intensity);
+// Shadows/Highlights on premultiplied RGBA pixels. `shadows` and `highlights` are 0…100 amounts,
+// `widths` (0…100 each) how far each range reaches, and `radius` the blur used to read the local
+// luminance (1…100). Alpha is kept.
+void adjust_shadows_highlights(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                               double shadows, double shadowWidth, double highlights,
+                               double highlightWidth, double radius);
+// Auto corrections computed from the image itself, `mode` 0 Auto Tone (per channel), 1 Auto Contrast
+// (shared luminance range) and 2 Auto Color (per channel plus a gray-world cast removal). Alpha kept.
+void adjust_auto(uint8_t *rgba, size_t width, size_t height, size_t stride, int mode);
 // One step of Camera Raw: up to eight measured color tables (`size`³ sRGB colors, red slowest, 3 bytes each) blended
 // by weight, for settings between the ones measured. A null table is no change.
 typedef struct {

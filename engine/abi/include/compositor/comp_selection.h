@@ -380,6 +380,57 @@ COMP_API comp_result comp_selection_channel_load(comp_document document, size_t 
 COMP_API comp_result comp_selection_channel_remove(comp_document document, size_t index,
                                                    int32_t* out_changed);
 
+/* ------------------------------------------- 扩大 / 选取相似（P0-5，尾部追加） */
+
+/*
+ * 选择 > 扩大选取（PS Select > Grow；上游未实现）。
+ *
+ * 以**当前基础蒙版**为种子，向 4-连通邻域扩散：一个未选中的像素只要与「把它
+ * 扩散过来的那个已选像素」在预乘 RGBA8 上的四通道差（Chebyshev，alpha 参与，
+ * 与魔棒同一把尺子）每个通道都 <= tolerance，就并入选区，随后它继续向外扩。
+ * 这是「沿颜色梯度漫水」：即使两端总色差很大，只要每一步都小于容差就会走到底。
+ *
+ * 比较在**整篇可见合成**的 8 位视图上做（与色彩范围同源；16 位 / HDR 文档先
+ * 转 8 位）。tolerance 取 0..255，通常直接用魔棒容差。
+ *
+ * 语义与错误码：
+ *   - 没有选区（active = 0）或基础蒙版为空时无操作（out_changed = 0），不会
+ *     静默清掉既有状态；
+ *   - 结果与当前基础蒙版逐字节相同时 out_changed = 0（不产生空撤销步）；
+ *   - 成功合并时羽化归 0（与形状 / 魔棒 / 色彩范围同口径：新建蒙版不继承旧羽化）；
+ *   - tolerance 越界 -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 合成失败 -> COMP_ERR_INTERNAL；
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）。
+ *
+ * out_changed 可为 NULL。
+ */
+COMP_API comp_result comp_selection_grow(comp_document document, int32_t tolerance,
+                                         int32_t* out_changed);
+
+/*
+ * 选择 > 选取相似（PS Select > Similar）。
+ *
+ * **不要求连续**：画布上任何像素，只要它的颜色与当前选区里**某个**像素的颜色
+ * 逐通道差都 <= tolerance，就并入选区。这正是与「扩大选取」（只走 4-连通
+ * 邻域）的本质区别，也和色彩范围（比的是取样色表）不同。
+ *
+ * 实现口径：把当前选区出现过的颜色标进 256³ 三维占位表，做一次立方体
+ * （Chebyshev）膨胀再逐像素查表——与「与某个已选像素逐通道差 <= tolerance」
+ * 严格等价，不是量化近似。tolerance = 0 时只并入颜色完全相同的像素；
+ * tolerance = 255 时所有颜色都满足，等价全选。
+ *
+ * **与 grow 的唯一口径差**：这张表是 RGB 三维的，alpha 不单独参与比较。
+ * 取样面仍是预乘合成，alpha 已折进 RGB（alpha = 0 的像素恒为 RGB 0），所以
+ * 「透明黑」与「预乘后同样是 (0,0,0) 的不透明黑」在这里同色——4 维精确匹配
+ * 需要 4 GiB 占位表，不在本实现的预算内。grow 走的是逐像素 RGBA Chebyshev，
+ * alpha 直接参与，因此同一张图上 grow 与 similar 在纯透明区的结论可以不同。
+ *
+ * 其余语义与 comp_selection_grow 相同（无选区不改、同结果不落步、羽化归 0、
+ * 一步撤销、out_changed 可为 NULL）。
+ */
+COMP_API comp_result comp_selection_similar(comp_document document, int32_t tolerance,
+                                            int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -930,8 +930,29 @@ COMP_TEST(handle_type_confusion_is_rejected) {
   comp_document fake = reinterpret_cast<comp_document>(engine);
   comp_size size{};
   COMP_CHECK_MSG(comp_document_size(fake, &size) == COMP_ERR_INVALID_ARGUMENT,
-                 "engine handle used as document handle is rejected by the magic check");
+                 "engine handle used as document handle is rejected before any dereference");
   comp_document_destroy(fake); /* 无操作，不能真的删掉引擎 */
+
+  /* 反向：文档句柄当引擎句柄传，同样必须拒绝。 */
+  comp_document_desc document_desc{};
+  document_desc.width = 8;
+  document_desc.height = 8;
+  document_desc.dpi = 72.0f;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+  if (document != nullptr) {
+    comp_engine fake_engine = reinterpret_cast<comp_engine>(document);
+    uint32_t fake_threads = 0;
+    COMP_CHECK_MSG(comp_engine_threads(fake_engine, &fake_threads) == COMP_ERR_INVALID_ARGUMENT,
+                   "document handle used as engine handle is rejected");
+    comp_engine_destroy(fake_engine); /* 无操作，不能真的删掉文档 */
+
+    comp_size still_valid{};
+    COMP_CHECK(comp_document_size(document, &still_valid) == COMP_OK);
+    COMP_CHECK(still_valid.width == 8 && still_valid.height == 8);
+
+    comp_document_destroy(document);
+  }
 
   /* 引擎仍然活着且可用。 */
   uint32_t threads = 0;

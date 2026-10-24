@@ -701,6 +701,77 @@ inline double step_brush_hardness(double current, int direction) {
   return clamp_brush_hardness(next);
 }
 
+/*
+ * 流量（P1-4）：笔迹算子把 `flow` 当每 dab 的**覆盖面峰值**（与 PS 的「流量」
+ * 同义）。`comp_tool_op_desc` 顶层还有 opacity，但 COMP_TOOL_STROKE 不读它，
+ * 所以画笔/橡皮擦只暴露流量，不造一个改了没反应的滑杆。
+ *
+ * 下限 0.01 而不是 0：flow = 0 时整笔一个像素都不落，用户会当成「画笔坏了」；
+ * PS 的流量滑杆也停在一个可见的最小档。
+ */
+inline constexpr double kMinBrushFlow = 0.01;
+inline constexpr double kMaxBrushFlow = 1.0;
+
+inline double clamp_brush_flow(double value) {
+  if (!(value >= 0.0)) return kMinBrushFlow; /* NaN / 负数 -> 下限 */
+  return std::min(std::max(value, kMinBrushFlow), kMaxBrushFlow);
+}
+
+inline double step_brush_flow(double current, int direction) {
+  const double base = clamp_brush_flow(current);
+  const double next = base + (direction > 0 ? 0.05 : (direction < 0 ? -0.05 : 0.0));
+  return clamp_brush_flow(next);
+}
+
+/*
+ * 画笔预设（P1-4）：与渐变预设同一做法——外壳没有预设管理器，只有一张
+ * **只读表**：选中即把三个值写回 ShellState，不保存副本（因此手改任一值后
+ * 预设名会退回「自定义」，见 brush_preset_is_custom 的调用方）。
+ * 0 号是「自定义」：它不覆盖任何值，只是当前状态的显示名。
+ */
+inline constexpr int kBrushPresetCount = 5;
+
+struct BrushPresetSpec {
+  const char* name = "";
+  double size = 24.0;
+  double hardness = 0.75;
+  double flow = 1.0;
+};
+
+inline BrushPresetSpec brush_preset_spec(int preset) {
+  switch (preset) {
+    case 1: return BrushPresetSpec{"硬边圆", 24.0, 1.0, 1.0};
+    case 2: return BrushPresetSpec{"软边圆", 80.0, 0.0, 1.0};
+    case 3: return BrushPresetSpec{"喷枪", 160.0, 0.25, 0.35};
+    case 4: return BrushPresetSpec{"细节", 5.0, 1.0, 1.0};
+    default: return BrushPresetSpec{"自定义", 24.0, 0.75, 1.0}; /* 0 与越界 */
+  }
+}
+
+inline const char* brush_preset_name(int preset) { return brush_preset_spec(preset).name; }
+
+inline bool brush_preset_is_custom(int preset) { return preset <= 0; }
+
+/*
+ * 笔压（P1-4）：Win32 的 POINTER_PEN_INFO.pressure 是 0..1024 的整数，且只有
+ * `penMask` 里带 PEN_MASK_PRESSURE 时才有效。没有该位（鼠标、不支持压感的笔、
+ * 远程会话）一律按满笔压 1.0——鼠标路径因此**逐字节不变**。
+ */
+inline double pen_pressure_to_unit(uint32_t raw, bool has_pressure) {
+  if (!has_pressure) return 1.0;
+  const double value = static_cast<double>(raw) / 1024.0;
+  return std::min(std::max(value, 0.0), 1.0);
+}
+
+/*
+ * 一笔只带一个 brush.pressure（ABI 是常量，不是逐点数组），所以整笔取
+ * WM_POINTER 采样的平均；一个采样都没有 = 1.0。
+ */
+inline double average_stroke_pressure(double sum, int count) {
+  if (count <= 0 || !(sum >= 0.0)) return 1.0;
+  return std::min(std::max(sum / static_cast<double>(count), 0.0), 1.0);
+}
+
 /* ------------------------------------------------------------ 前景色 */
 
 /*
@@ -1492,21 +1563,124 @@ inline double step_clone_opacity(double current, int direction) {
 /* ------------------------------------------------------------ 渐变工具（S9） */
 
 /* 渐变类型（镜像 ABI comp_tool_gradient.type；数值必须与 ABI 一致）。 */
-inline constexpr int kGradientLinear = 0; /* 线性：沿两端点连线 */
-inline constexpr int kGradientRadial = 1; /* 径向：以起点为圆心、两端点距离为半径 */
-inline constexpr int kGradientTypeCount = 2;
+inline constexpr int kGradientLinear = 0;    /* 线性：沿两端点连线 */
+inline constexpr int kGradientRadial = 1;    /* 径向：以起点为圆心、两端点距离为半径 */
+inline constexpr int kGradientAngle = 2;     /* 角度（锥形）：绕起点的方位角 / 360° */
+inline constexpr int kGradientReflected = 3; /* 对称：起点两侧镜像 */
+inline constexpr int kGradientDiamond = 4;   /* 菱形：|投影| + |横向| */
+inline constexpr int kGradientTypeCount = 5;
 
 inline const char* gradient_type_name(int type) {
   switch (type) {
     case kGradientLinear: return "Linear";
     case kGradientRadial: return "Radial";
+    case kGradientAngle: return "Angle";
+    case kGradientReflected: return "Reflected";
+    case kGradientDiamond: return "Diamond";
     default: return "?";
   }
 }
 
-/* G 键：已在该工具时在线性/径向之间切换；未知值收敛回线性，不产生第三态。 */
+/* G 键：已在该工具时循环五种类型；未知值收敛回线性，不产生第六态。 */
 inline int next_gradient_type(int type) {
-  return type == kGradientLinear ? kGradientRadial : kGradientLinear;
+  if (type < kGradientLinear || type >= kGradientTypeCount - 1) return kGradientLinear;
+  return type + 1;
+}
+
+/* ---------------------------------------------------------- 渐变预设（P1-7） */
+
+/*
+ * 外壳的多色标来源。引擎支持最多 32 个色标，但外壳只有前景色一个颜色模型，
+ * 没有「在渐变条上加/删/拖色标」的编辑器，所以这里给三张**只读预设表**：
+ * 让多色标与中点重映射从引擎/ABI 走到真实 UI，而不是只存在于测试里。
+ * 更完整的色标编辑器仍是 BACKLOG 里的剩余项。
+ */
+inline constexpr int kGradientPresetCount = 3;
+
+struct GradientPresetStop {
+  double position = 0.0;
+  double midpoint = 0.5;
+  uint8_t color[4] = {0, 0, 0, 255};
+};
+
+inline const char* gradient_preset_name(int preset) {
+  switch (preset) {
+    case 0: return "前景→透明";
+    case 1: return "黑→白";
+    case 2: return "彩虹";
+    default: return "?";
+  }
+}
+
+/* 预设 0 用前景色，其余预设是固定色标表（与前景色无关）。 */
+inline int gradient_preset_stop_count(int preset, int* out_is_foreground) {
+  if (out_is_foreground != nullptr) *out_is_foreground = preset == 0 ? 1 : 0;
+  return preset == 2 ? 5 : 2;
+}
+
+/*
+ * 展开预设到 `out[0..count)`，返回写入个数（capacity 不足返回 0，不写半张表）。
+ * `foreground` 是直通 RGBA（预设 0 的第一色标用它自己的 RGB + 不透明，第二色标
+ * 同 RGB + alpha 0）。`reverse` = 色标顺序整体翻转（与旧的两色标 Shift 反向同一语义）；
+ * 翻转时段中点也要跟着翻：反向段的中点 = 1 - 原段中点。
+ */
+inline int gradient_preset_stops(int preset, const uint8_t foreground[4], bool reverse,
+                                 GradientPresetStop* out, int capacity) {
+  if (out == nullptr) return 0;
+  const uint8_t black[4] = {0, 0, 0, 255};
+  const uint8_t white[4] = {255, 255, 255, 255};
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t yellow[4] = {255, 255, 0, 255};
+  const uint8_t green[4] = {0, 255, 0, 255};
+  const uint8_t cyan[4] = {0, 255, 255, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+  GradientPresetStop table[5];
+  int count = 0;
+  auto push = [&](double position, double midpoint, const uint8_t color[4]) {
+    GradientPresetStop& stop = table[count++];
+    stop.position = position;
+    stop.midpoint = midpoint;
+    for (int c = 0; c < 4; ++c) stop.color[c] = color[c];
+  };
+  if (preset == 2) {
+    /* 彩虹：五个等距色标，其中两段的中点刻意偏离 0.5（检验中点重映射真的生效）。 */
+    push(0.0, 0.6, red);
+    push(0.25, 0.5, yellow);
+    push(0.5, 0.4, green);
+    push(0.75, 0.5, cyan);
+    push(1.0, 0.5, blue);
+    count = 5;
+  } else if (preset == 1) {
+    push(0.0, 0.5, black);
+    push(1.0, 0.5, white);
+    count = 2;
+  } else {
+    uint8_t solid[4] = {0, 0, 0, 255};
+    uint8_t clear[4] = {0, 0, 0, 0};
+    if (foreground != nullptr) {
+      for (int c = 0; c < 3; ++c) {
+        solid[c] = foreground[c];
+        clear[c] = foreground[c];
+      }
+    }
+    push(0.0, 0.5, solid);
+    push(1.0, 0.5, clear);
+    count = 2;
+  }
+  if (count > capacity) return 0;
+  if (!reverse) {
+    for (int i = 0; i < count; ++i) out[i] = table[i];
+    return count;
+  }
+  for (int i = 0; i < count; ++i) {
+    const GradientPresetStop& source = table[count - 1 - i];
+    GradientPresetStop& target = out[i];
+    target.position = 1.0 - source.position;
+    /* 反向段 (i, i+1) ↔ 原段 (count-2-i, count-1-i)，中点取原段左端的中点。 */
+    target.midpoint = i + 1 < count ? 1.0 - table[count - 2 - i].midpoint : 0.5;
+    for (int c = 0; c < 4; ++c) target.color[c] = source.color[c];
+  }
+  return count;
 }
 
 /*
@@ -1755,6 +1929,55 @@ inline TypeBlockMetrics type_block_metrics(double font_size, double line_height,
   out.width = static_cast<double>(out.max_line_glyphs) * out.advance;
   out.height = size + static_cast<double>(out.line_count - 1) * size * lh;
   return out;
+}
+
+/*
+ * 段落框与对齐（P0-6 ③）。量纲是文档像素：
+ *   - 0 = 自动（点文字：不折行，框随内容）；
+ *   - > 0 = 段落框：框宽决定折行点，框高只负责裁切（超出的行不画）。
+ * 引擎允许到 1e6（那是给宿主渲染的量程），外壳只放到 8192：选项栏里按一下
+ * 涨 25%，再大的框在几十次点击内也到不了，收窄上限只是不让误触调到无意义的数。
+ *
+ * 从「自动」起跳给一个看得见折行的 128 px，之后乘性增长；向下退到最小值再
+ * 退一步就回到「自动」——与字号 Alt+[ / ] 的乘性手感一致。量化到 16 px 是
+ * 为了让读数是整数、也让面板/状态栏不需要显示小数。
+ */
+inline constexpr double kTypeBoxMax = 8192.0;
+inline constexpr double kTypeBoxMin = 16.0;
+inline constexpr double kTypeBoxStart = 128.0;
+inline constexpr double kTypeBoxStep = 16.0;
+
+inline double clamp_type_box(double value) {
+  if (!(value > 0.0)) return 0.0; /* NaN / 0 / 负数 = 自动 */
+  return std::min(std::max(value, kTypeBoxMin), kTypeBoxMax);
+}
+
+inline double step_type_box(double current, int direction) {
+  const double base = clamp_type_box(current);
+  if (direction > 0) {
+    if (base <= 0.0) return kTypeBoxStart;
+    return clamp_type_box(std::ceil(base * 1.25 / kTypeBoxStep) * kTypeBoxStep);
+  }
+  if (direction < 0) {
+    if (base <= kTypeBoxStart) return 0.0;
+    return clamp_type_box(std::floor(base / 1.25 / kTypeBoxStep) * kTypeBoxStep);
+  }
+  return base;
+}
+
+/* 对齐档位与引擎 comp_text_align 同值（0 左 / 1 居中 / 2 右）。 */
+inline constexpr int kTypeAlignLeft = 0;
+inline constexpr int kTypeAlignCenter = 1;
+inline constexpr int kTypeAlignRight = 2;
+inline constexpr int kTypeAlignCount = 3;
+
+inline const char* type_align_name(int align) {
+  switch (align) {
+    case kTypeAlignCenter: return "居中";
+    case kTypeAlignRight: return "右对齐";
+    case kTypeAlignLeft: return "左对齐";
+    default: return "左对齐"; /* 越界值按默认档显示，不制造第四种状态 */
+  }
 }
 
 /*
@@ -2295,8 +2518,10 @@ inline int clamp_selection_smooth(int value) {
  *
  *   - 行集合必须是纯函数（tool_option_count / tool_option），绘制与命中都从它
  *     取数——两边各写一份表是「点中的行和画出来的行不是同一行」的来源。
- *   - 不重复右栏已有的入口：文字（字号/行距）仍在右栏，缩放的显示比例仍在
- *     工具条右侧；这里只放「改了要立刻看见画布变化」的手感参数。
+ *   - 不重复右栏已有的入口：文字（字号/行距/字距/字体）仍在右栏，缩放的显示
+ *     比例仍在工具条右侧；这里只放「改了要立刻看见画布变化」的手感参数。
+ *     文字工具例外：右栏那四行是冻结的（kTypePanelRowCount == 4），段落框与
+ *     对齐没有别的位置，只能放在选项栏（P0-6③）。
  *   - 行数少的工具（0–4 行）刻意不做换行/滚动：一行放不下就整组不画，点击
  *     自然落到空处（命中测试先看命中矩形，空矩形永不命中）。
  */
@@ -2307,11 +2532,19 @@ enum class ToolOptionId : int {
   WandTolerance,
   SelectionFeather,
   GradientType,
+  GradientPreset, /* P1-7：多色标预设（只读表） */
+  GradientDither, /* P1-7：确定性抖动开关，压 8 位渐变带 */
   ShapeKind,
   ShapeStrokeWidth,
   CloneSample, /* 0 = 当前图层，1 = 整篇合成 */
   CloneAligned,
-  HealMode
+  HealMode,
+  TypeBoxWidth,  /* P0-6③：0 = 自动（点文字） */
+  TypeBoxHeight, /* P0-6③：0 = 自动；> 0 只裁切不折行 */
+  TypeAlign,     /* P0-6③：0 左 / 1 居中 / 2 右 */
+  BrushPreset,   /* P1-4：只读预设表下标；0 = 自定义（不覆盖当前值） */
+  BrushFlow,     /* P1-4：1..100 整数百分比；引擎侧是 0..1 的 double */
+  BrushPressure  /* P1-4：0 关 / 1 开；开时整笔取笔压平均，鼠标恒 1.0 */
 };
 
 enum class ToolOptionKind : int {
@@ -2343,9 +2576,22 @@ inline ToolOptionSpec tool_option(ToolId tool, int index) {
                             static_cast<int>(kMinBrushSize), static_cast<int>(kMaxBrushSize), 1, 0};
   const ToolOptionSpec hardness{ToolOptionId::BrushHardness, "硬度", ToolOptionKind::Stepper, 0,
                                 100, 10, 0};
+  /* P1-4：画笔/橡皮擦在「大小 / 硬度」之后追加三组（顺序是对外契约：
+   * 0/1 的下标被 visual_check 的 options_bar 与 tests 钉死，只能尾部追加）。 */
+  const ToolOptionSpec preset{ToolOptionId::BrushPreset, "预设", ToolOptionKind::Choice, 0,
+                              kBrushPresetCount - 1, 1, kBrushPresetCount};
+  const ToolOptionSpec flow{ToolOptionId::BrushFlow, "流量", ToolOptionKind::Stepper, 1, 100, 5, 0};
+  const ToolOptionSpec pressure{ToolOptionId::BrushPressure, "压感", ToolOptionKind::Choice, 0, 1, 1,
+                                2};
   switch (tool) {
     case ToolId::Brush:
     case ToolId::Eraser:
+      if (index == 0) return size;
+      if (index == 1) return hardness;
+      if (index == 2) return preset;
+      if (index == 3) return flow;
+      if (index == 4) return pressure;
+      break;
     case ToolId::Retouch:
     case ToolId::Tone:
     case ToolId::HistoryBrush:
@@ -2392,6 +2638,14 @@ inline ToolOptionSpec tool_option(ToolId tool, int index) {
         return ToolOptionSpec{ToolOptionId::GradientType, "类型", ToolOptionKind::Choice, 0,
                               kGradientTypeCount - 1, 1, kGradientTypeCount};
       }
+      if (index == 1) {
+        return ToolOptionSpec{ToolOptionId::GradientPreset, "色标", ToolOptionKind::Choice, 0,
+                              kGradientPresetCount - 1, 1, kGradientPresetCount};
+      }
+      if (index == 2) {
+        return ToolOptionSpec{ToolOptionId::GradientDither, "抖动", ToolOptionKind::Choice, 0, 1, 1,
+                              2};
+      }
       break;
     case ToolId::Shape:
       if (index == 0) {
@@ -2401,6 +2655,23 @@ inline ToolOptionSpec tool_option(ToolId tool, int index) {
       if (index == 1) {
         return ToolOptionSpec{ToolOptionId::ShapeStrokeWidth, "线宽", ToolOptionKind::Stepper, 1,
                               50, 1, 0};
+      }
+      break;
+    case ToolId::Type:
+      /* 字号/行距/字距/字体在右栏；这里只放右栏放不下的段落参数。 */
+      if (index == 0) {
+        return ToolOptionSpec{ToolOptionId::TypeBoxWidth, "框宽", ToolOptionKind::Stepper, 0,
+                              static_cast<int>(kTypeBoxMax),
+                              static_cast<int>(kTypeBoxStep), 0};
+      }
+      if (index == 1) {
+        return ToolOptionSpec{ToolOptionId::TypeBoxHeight, "框高", ToolOptionKind::Stepper, 0,
+                              static_cast<int>(kTypeBoxMax),
+                              static_cast<int>(kTypeBoxStep), 0};
+      }
+      if (index == 2) {
+        return ToolOptionSpec{ToolOptionId::TypeAlign, "对齐", ToolOptionKind::Choice, 0,
+                              kTypeAlignCount - 1, 1, kTypeAlignCount};
       }
       break;
     default:
@@ -2413,6 +2684,7 @@ inline int tool_option_count(ToolId tool) {
   switch (tool) {
     case ToolId::Brush:
     case ToolId::Eraser:
+      return 5; /* 大小 + 硬度 + 预设 + 流量 + 压感（P1-4） */
     case ToolId::Retouch:
     case ToolId::Tone:
     case ToolId::HistoryBrush:
@@ -2427,9 +2699,11 @@ inline int tool_option_count(ToolId tool) {
     case ToolId::Wand:
       return 2;
     case ToolId::Gradient:
-      return 1;
+      return 3; /* 类型 + 色标预设 + 抖动 */
     case ToolId::Shape:
       return 2; /* 形状 + 线宽 */
+    case ToolId::Type:
+      return 3; /* 框宽 + 框高 + 对齐 */
     default:
       return 0;
   }
@@ -3850,7 +4124,7 @@ struct LayerMenuEnabled {
   bool layer_step = false;    /* 选择上一/下一图层：至少两层才有换的意义 */
   bool move_up = false;       /* 上移一层 / 置于顶层 */
   bool move_down = false;     /* 下移一层 / 置于底层 */
-  bool effect_toggle = false; /* 效果 6 档：组只能通过多选批量跳过它 */
+  bool effect_toggle = false; /* 效果 kEffectKindCount（9）档：组只能通过多选批量跳过它 */
   bool effect_edit = false;
   bool effect_clear = false;
   bool mask_from_selection = false;
@@ -3899,10 +4173,10 @@ inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
 
 /*
  * 数值即 .comp 的 engineEffects[].effect，与 compositing/effect_eval.h 的
- * kEffectStroke..kEffectInnerGlow（0..5）逐字对应；顺序也是引擎的落笔判定顺序。
+ * kEffectStroke..kEffectGradientOverlay（0..8）逐字对应；顺序也是引擎的落笔判定顺序。
  * ui_core 不包含引擎头（纯几何/规则库，可脱壳编译），所以这里只镜像数值与名称。
  */
-inline constexpr int kEffectKindCount = 6;
+inline constexpr int kEffectKindCount = 9;
 
 inline int clamp_effect_kind(int kind) {
   if (kind < 0) return 0;
@@ -3918,6 +4192,9 @@ inline const char* effect_kind_name(int kind) {
     case 3: return "Inner Shadow";
     case 4: return "Outer Glow";
     case 5: return "Inner Glow";
+    case 6: return "Bevel & Emboss";
+    case 7: return "Satin";
+    case 8: return "Gradient Overlay";
     default: return "Stroke";
   }
 }

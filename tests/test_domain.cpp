@@ -101,6 +101,15 @@ COMP_TEST(document_layer_management) {
   Layer* layer_b = document.create_layer(desc, &b);
   COMP_CHECK(layer_b != nullptr && b != a);
 
+  /*
+   * 上面这次 create 往 state_.layers 尾部追加，可能触发向量重新分配：先前拿到的
+   * layer_a 已经指向被释放的旧块（ASan 在鸿蒙模拟器上抓到的 heap-use-after-free，
+   * 写位置在旧块 +144 的 ImageBuffer 成员）。图层指针不跨「增删图层」持有，
+   * 按 id 重取——这也是宿主侧该遵守的同一条规则（见 document.h 的 create_layer）。
+   */
+  layer_a = document.find(a);
+  COMP_CHECK(layer_a != nullptr);
+
   /* 新图层默认继承画布尺寸的像素缓冲（由 create_layer 保证），此处显式写入。 */
   layer_a->pixels = ImageBuffer::solid(16, 16, COMP_PIXEL_RGBA8, 255, 0, 0, 255);
   layer_b->pixels = ImageBuffer::solid(16, 16, COMP_PIXEL_RGBA8, 0, 0, 255, 255);

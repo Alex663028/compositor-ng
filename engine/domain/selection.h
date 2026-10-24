@@ -257,6 +257,35 @@ comp_result selection_apply_color_range(SelectionState* selection, int32_t canva
                                         int32_t fuzziness, int32_t invert, int32_t combine,
                                         bool* changed, std::string* error);
 
+/* --------------------------------------------------- 扩大 / 选取相似（P0-5） */
+
+/*
+ * 选择 > 扩大选取：以基础蒙版为种子做 4-连通扩散，候选像素与「它从哪个已选
+ * 像素扩散过来」的颜色（预乘 RGBA8 四通道 Chebyshev，alpha 参与）每通道差都
+ * <= tolerance 时并入，并继续向外扩（沿颜色梯度漫水）。
+ *
+ * 取样面是**整篇可见合成**的 8 位视图（与魔棒 merged / 色彩范围同源）。
+ * 没有选区、基础蒙版为空、或结果与旧蒙版逐字节相同时 changed = false。
+ * 成功合并时 feather 归 0（与形状 / 魔棒 / 色彩范围同口径）。
+ * 画布非法 / 容差越界 -> COMP_ERR_INVALID_ARGUMENT；蒙版尺寸与画布不一致 ->
+ * COMP_ERR_STATE；合成失败 -> COMP_ERR_INTERNAL。
+ */
+comp_result selection_grow(SelectionState* selection, int32_t canvas_width, int32_t canvas_height,
+                           const Document& document, int32_t tolerance, bool* changed,
+                           std::string* error);
+
+/*
+ * 选择 > 选取相似：**不要求连续**。像素颜色与当前选区中**某个**像素的颜色在
+ * 预乘 RGB8 上每通道差都 <= tolerance 即并入（alpha 不单独比较：占位表是三维，
+ * 4 维精确匹配需要 4 GiB；预乘面里 alpha = 0 恒为 RGB 0，详见头文件）。
+ *
+ * 实现是 256³ 颜色占位表的一次 Chebyshev 膨胀（严格等价于上面的定义，不做
+ * 量化近似）；tolerance = 255 等价全选。其余语义与 selection_grow 相同。
+ */
+comp_result selection_similar(SelectionState* selection, int32_t canvas_width,
+                              int32_t canvas_height, const Document& document, int32_t tolerance,
+                              bool* changed, std::string* error);
+
 /* 有效 coverage（画布分辨率，白 = 选中）：base 按 feather 高斯模糊。
  * selection 不活跃或基础蒙版为空时 out 清空（调用方必须先看 active）。 */
 void selection_effective_coverage(const SelectionState& selection, std::vector<uint8_t>* out);

@@ -22,6 +22,15 @@
  *   压在其上（否则被像素盖住），叠色类效果用 source-atop（保持 alpha，半透明像素
  *   完全吃到颜色）。
  *
+ * P1-1 追加的三种（斜面和浮雕 / 缎光 / 渐变叠加）都是 **inside 类**，全部以
+ * source-atop 落在图层自身 alpha 之内，落笔次序在既有 over 组之后（它们只改颜色、
+ * 不改 alpha，因此彼此与内发光/内阴影的先后不改变覆盖范围，只改变颜色叠加顺序）：
+ *   9. Bevel & Emboss —— 形状柔化后沿光向量取前后向差，亮面/暗面分别叠色；
+ *  10. Satin          —— 形状正反两个偏移副本之差的绝对值（或取反），柔化后叠色；
+ *  11. Gradient Overlay —— 沿 angle 方向的线性双色斜坡，按源形状 bbox 归一化。
+ * Bevel / Satin / Gradient Overlay 的边界只由源形状决定，不会外扩，因此
+ * effects_margin 对它们返回 0。
+ *
  * 实现取舍（与上游的已知差异，见 README §6.5）：
  *   - 上游用 Core Image 的 CIColorMatrix + GPU 路径做模糊/重着色；本引擎复用
  *     adjustment_eval 已有的高斯模糊（同三趟滑动窗口盒式近似），语义等价、
@@ -52,7 +61,11 @@ enum EffectKind : uint32_t {
   kEffectInnerShadow = 3,   /* 内阴影：angle / distance / blur / color / opacity */
   kEffectOuterGlow = 4,     /* 外发光：size / color / opacity */
   kEffectInnerGlow = 5,     /* 内发光：size / color / opacity */
-  kEffectKindCount = 6,
+  /* P1-1 尾部追加：斜面和浮雕 / 缎光 / 渐变叠加。数值只增不改。 */
+  kEffectBevel = 6,         /* 斜面和浮雕：angle / altitude / depth / size / soften / 双色 */
+  kEffectSatin = 7,         /* 缎光：angle / distance / blur / invert / color / opacity */
+  kEffectGradientOverlay = 8, /* 渐变叠加：angle / reverse / 双色 / opacity */
+  kEffectKindCount = 9,
 };
 
 struct EffectEvalResult {
@@ -100,7 +113,8 @@ bool effect_kind_is_evaluated(uint32_t effect);
  * `LayerEffectsRenderer.margin(for:)`）。
  *
  * outside 描边吃 size；投影吃 distance + blur*3；外发光吃 size*3；不足 1 的
- * 向上取整再加 2。inside 描边、叠色、内阴影、内发光都不外扩（它们只在形状内部）。
+ * 向上取整再加 2。inside 描边、叠色、内阴影、内发光、斜面和浮雕、缎光、渐变叠加
+ * 都不外扩（它们只在形状内部）。
  *
  * 返回 0 表示无需外扩。图层包围盒必须按它外扩，否则 outside 效果会被 bounds 裁掉。
  */

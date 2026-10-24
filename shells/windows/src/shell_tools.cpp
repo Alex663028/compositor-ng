@@ -121,8 +121,8 @@ void gradient_end(HWND window, ShellState& shell) {
   }
 
   /*
-   * Shift = 反向：色标顺序翻转成「透明 -> 前景色」。这是拖拽结束后才读的
-   * 修饰键（与框选/套索的 Shift=加选同口径：提交时才决定组合方式）。
+   * Shift = 反向：色标顺序整个翻转（单色标时就是「透明 -> 前景色」）。这是
+   * 拖拽结束后才读的修饰键（与框选/套索的 Shift=加选同口径：提交时才决定组合）。
    */
   const bool reverse = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
   comp_tool_op_desc desc{};
@@ -132,15 +132,36 @@ void gradient_end(HWND window, ShellState& shell) {
   desc.gradient.start_y = start.y;
   desc.gradient.end_x = end.x;
   desc.gradient.end_y = end.y;
-  const uint8_t solid[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
-  const uint8_t clear[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 0};
-  const uint8_t* color0 = reverse ? clear : solid;
-  const uint8_t* color1 = reverse ? solid : clear;
-  for (int i = 0; i < 4; ++i) {
-    desc.gradient.color0[i] = color0[i];
-    desc.gradient.color1[i] = color1[i];
+  const uint8_t foreground[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
+  /*
+   * P1-7：色标表来自选项栏的预设（只读表，见 ui_core::gradient_preset_stops）。
+   * 预设 0 展开成「前景 -> 透明」两个色标，与 P1-7 之前的两色标结果逐字节一致。
+   * 展开失败（不可能：容量 5 覆盖所有预设）时退回两色标旧路径。
+   */
+  comp_ui::GradientPresetStop preset_stops[5];
+  const int preset_count = comp_ui::gradient_preset_stops(
+      shell.gradient_preset, foreground, reverse, preset_stops, 5);
+  comp_gradient_stop stops[5]{};
+  if (preset_count >= 2) {
+    for (int i = 0; i < preset_count; ++i) {
+      stops[i].position = preset_stops[i].position;
+      stops[i].midpoint = preset_stops[i].midpoint;
+      for (int c = 0; c < 4; ++c) stops[i].color[c] = preset_stops[i].color[c];
+    }
+    desc.gradient_stops = stops;
+    desc.gradient_stop_count = static_cast<size_t>(preset_count);
+  } else {
+    const uint8_t solid[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
+    const uint8_t clear[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 0};
+    const uint8_t* color0 = reverse ? clear : solid;
+    const uint8_t* color1 = reverse ? solid : clear;
+    for (int i = 0; i < 4; ++i) {
+      desc.gradient.color0[i] = color0[i];
+      desc.gradient.color1[i] = color1[i];
+    }
   }
   desc.gradient.opacity = 1.0f;
+  desc.gradient_dither = shell.gradient_dither ? 1 : 0;
 
   char note[256] = {0};
   size_t note_size = 0;
@@ -154,14 +175,17 @@ void gradient_end(HWND window, ShellState& shell) {
     set_status(shell, buffer);
     return;
   }
+  const wchar_t* dither_text = shell.gradient_dither ? L" + 抖动" : L"";
   if (note[0] != '\0' && note_size > 1) {
-    wsprintfW(buffer, L"渐变 / %s：已应用｜%s",
+    wsprintfW(buffer, L"渐变 / %s / %s%s：已应用｜%s",
               widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str(),
-              widen_ascii(note).c_str());
+              widen_ascii(comp_ui::gradient_preset_name(shell.gradient_preset)).c_str(),
+              dither_text, widen_ascii(note).c_str());
   } else {
-    wsprintfW(buffer, L"渐变 / %s：已应用（%s）",
+    wsprintfW(buffer, L"渐变 / %s / %s%s%s：已应用（%d 个色标）",
               widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str(),
-              reverse ? L"透明 → 前景" : L"前景 → 透明");
+              widen_ascii(comp_ui::gradient_preset_name(shell.gradient_preset)).c_str(),
+              dither_text, reverse ? L" · 反向" : L"", preset_count >= 2 ? preset_count : 2);
   }
   refresh_history_status(shell, buffer);
 }
@@ -353,6 +377,8 @@ bool stroke_begin(ShellState& shell, int x, int y, const Layout& layout,
   const comp_ui::Point doc =
       shell.doc.view.screen_to_doc(x, y, layout.canvas, shell.doc.width, shell.doc.height);
   shell.doc.stroke_points.clear();
+  shell.doc.stroke_pressure_sum = 0.0;
+  shell.doc.stroke_pressure_samples = 0;
   /* 单击也要留下一记 dab：单点折线在 COMP_TOOL_STROKE 里就是一个圆形笔尖。 */
   shell.doc.stroke_points.push_back(static_cast<float>(doc.x));
   shell.doc.stroke_points.push_back(static_cast<float>(doc.y));
@@ -593,11 +619,20 @@ void paint_stroke_end(HWND window, ShellState& shell) {
   desc.kind = COMP_TOOL_STROKE;
   desc.brush.color[0] = shell.foreground.r;
   desc.brush.color[1] = shell.foreground.g;
-  desc.brush.color[2] = shell.foreground.b; /* 抹色不透明：不透明度由 flow 表达（固定 1） */
+  desc.brush.color[2] = shell.foreground.b; /* 抹色不透明：不透明度由 flow 表达 */
   desc.brush.diameter = static_cast<float>(shell.brush_size);
-  desc.brush.pressure = 1.0f; /* 鼠标无压感：按上游满笔压 */
+  /*
+   * P1-4：压感。ABI 只有整笔一个 pressure（不是逐点数组），所以取本笔
+   * WM_POINTER 采样的平均值；鼠标/不支持压感的笔一个采样都没有，平均值
+   * 兜底 1.0，与 P1-4 之前的像素**逐字节相同**。压感关掉时也走 1.0。
+   */
+  const double pressure =
+      shell.brush_pressure ? comp_ui::average_stroke_pressure(shell.doc.stroke_pressure_sum,
+                                                              shell.doc.stroke_pressure_samples)
+                           : 1.0;
+  desc.brush.pressure = static_cast<float>(pressure);
   desc.brush.hardness = static_cast<float>(shell.brush_hardness);
-  desc.brush.flow = 1.0f;
+  desc.brush.flow = static_cast<float>(comp_ui::clamp_brush_flow(shell.brush_flow));
   desc.brush.seed = 0; /* 圆头笔是解析式的；固定值守住「同参数同结果」 */
   desc.erase = erasing ? 1 : 0;
   desc.stroke_points = points.data();
@@ -618,15 +653,29 @@ void paint_stroke_end(HWND window, ShellState& shell) {
   }
   char hex[8] = {0};
   comp_ui::color_to_hex(shell.foreground, hex);
+  /*
+   * P1-4：只在**非默认**时追加后缀，默认路径（流量 100%、鼠标满笔压）的状态
+   * 文本与 P1-4 之前逐字相同——visual_check 的状态栏读数不因此改基线。
+   */
+  wchar_t suffix[96] = L"";
+  const int flow_percent = static_cast<int>(desc.brush.flow * 100.0 + 0.5);
+  if (flow_percent < 100) {
+    wsprintfW(suffix, L" · 流量 %d%%", flow_percent);
+  }
+  if (pressure < 0.999) {
+    wchar_t pressure_text[32];
+    wsprintfW(pressure_text, L" · 笔压 %d%%", static_cast<int>(pressure * 100.0 + 0.5));
+    lstrcatW(suffix, pressure_text);
+  }
   if (erasing) {
-    wsprintfW(buffer, L"橡皮擦：已擦除 %d 个折点（直径 %d px）", desc.stroke_point_count,
-              static_cast<int>(shell.brush_size + 0.5));
+    wsprintfW(buffer, L"橡皮擦：已擦除 %d 个折点（直径 %d px%s）", desc.stroke_point_count,
+              static_cast<int>(shell.brush_size + 0.5), suffix);
   } else if (note[0] != '\0' && note_size > 1) {
     wsprintfW(buffer, L"画笔：已落色 %d 个折点｜%s", desc.stroke_point_count,
               widen_ascii(note).c_str());
   } else {
-    wsprintfW(buffer, L"画笔：已落色 %d 个折点（%s · 直径 %d px）", desc.stroke_point_count,
-              widen_ascii(hex).c_str(), static_cast<int>(shell.brush_size + 0.5));
+    wsprintfW(buffer, L"画笔：已落色 %d 个折点（%s · 直径 %d px%s）", desc.stroke_point_count,
+              widen_ascii(hex).c_str(), static_cast<int>(shell.brush_size + 0.5), suffix);
   }
   refresh_history_status(shell, buffer);
 }

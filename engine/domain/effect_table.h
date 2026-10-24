@@ -52,10 +52,10 @@ struct EffectKindInfo {
 };
 
 /*
- * 已知 kind 总数（0..5 合法）。不叫 kEffectKindCount：effect_eval.h 的同名枚举
+ * 已知 kind 总数（0..8 合法）。不叫 kEffectKindCount：effect_eval.h 的同名枚举
  * 已在同一命名空间里，重名会在同时包含两者的翻译单元里直接冲突。
  */
-constexpr uint32_t kEffectParamKindCount = 6;
+constexpr uint32_t kEffectParamKindCount = 9;
 
 /* effect 非法（>= kEffectKindCount）时返回 nullptr。 */
 const EffectKindInfo* effect_kind_info(uint32_t effect);

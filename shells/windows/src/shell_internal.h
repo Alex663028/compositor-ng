@@ -364,6 +364,7 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void refresh_modify_input_status(ShellState& shell);
   void begin_modify_input(ShellState& shell, comp_selection_modify_op op);
   void commit_modify_input(ShellState& shell);
+  void grow_similar_selection(ShellState& shell, bool similar);
   void load_layer_pixels_selection(ShellState& shell);
   void color_range_status(ShellState& shell, const wchar_t* prefix);
   void color_range_restart_txn(ShellState& shell);
@@ -453,6 +454,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   bool type_available(const ShellState& shell);
   bool type_font_track(const ShellState& shell);
   comp_ui::TypeBlockMetrics type_metrics(const ShellState& shell);
+  /* P0-6③：声明了段落框就用框尺寸，未声明的维度才按内容度量。 */
+  comp_ui::TypeBlockMetrics type_preview_metrics(const ShellState& shell);
   void type_cancel(ShellState& shell);
   bool type_char_input(ShellState& shell, wchar_t unit);
   void type_refresh_status(ShellState& shell);

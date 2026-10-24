@@ -1635,6 +1635,365 @@ void adjust_threshold(uint8_t *rgba, size_t width, size_t height, size_t stride,
     } });
 }
 
+// Vibrance: the quiet colors take most of the boost and the already-loud ones very little, skin
+// hues take 45% less, and the flat Saturation term is then added on top of that factor.
+void adjust_vibrance(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                     double vibrance, double saturation) {
+    double v = (vibrance < -100 ? -100 : vibrance > 100 ? 100 : vibrance) / 100.0;
+    double s = (saturation < -100 ? -100 : saturation > 100 ? 100 : saturation) / 100.0;
+    if (v == 0 && s == 0) return;
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
+            double maxc = fmax(r, fmax(g, b)), minc = fmin(r, fmin(g, b));
+            double chroma = maxc - minc;
+            if (chroma < 1e-6) continue;
+            double sat = chroma / maxc;
+            double hue = pixel_hue_deg(r, g, b);
+            double skin = (hue >= 15.0 && hue <= 50.0) ? 0.55 : 1.0;
+            double factor = 1.0 + v * (1.0 - sat) * skin + s;
+            if (factor < 0) factor = 0;
+            double lum = rec709(r, g, b);
+            write_premultiplied(p, camera_clamp(lum + (r - lum) * factor),
+                                camera_clamp(lum + (g - lum) * factor),
+                                camera_clamp(lum + (b - lum) * factor), alpha);
+        }
+    } });
+}
+
+// Selective Color's nine ranges. The six color ranges are triangular around their hue and fade out
+// as the pixel loses chroma; whites, neutrals and blacks are three overlapping slices of lightness,
+// with the same low-chroma emphasis, as Photoshop weights them.
+static void selective_weights(double r, double g, double b, double *w) {
+    double maxc = fmax(r, fmax(g, b)), minc = fmin(r, fmin(g, b));
+    double chroma = maxc - minc;
+    double hue = pixel_hue_deg(r, g, b);
+    double colorful = fmin(1.0, chroma / 0.30);
+    for (int i = 0; i < 6; ++i) {
+        double d = fabs(hue - i * 60.0);
+        if (d > 180.0) d = 360.0 - d;
+        w[i] = d < 60.0 ? (1.0 - d / 60.0) * colorful : 0.0;
+    }
+    double l = rec709(r, g, b);
+    double quiet = 1.0 - colorful;
+    double white = l > 0.5 ? fmin(1.0, (l - 0.5) * 2.0) : 0.0;
+    double black = l < 0.5 ? fmin(1.0, (0.5 - l) * 2.0) : 0.0;
+    w[6] = white * quiet;
+    w[7] = (1.0 - fabs(l * 2.0 - 1.0)) * quiet;
+    w[8] = black * quiet;
+}
+
+void adjust_selective_color(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                            const float *ranges, int relative) {
+    int any = 0;
+    for (int i = 0; i < 36; ++i) if (fabs(ranges[i]) > 1e-6f) any = 1;
+    if (!any) return;
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
+            double w[9];
+            selective_weights(r, g, b, w);
+            double d[4] = {0, 0, 0, 0};
+            for (int i = 0; i < 9; ++i) {
+                if (w[i] == 0) continue;
+                for (int c = 0; c < 4; ++c) d[c] += w[i] * ranges[i * 4 + c];
+            }
+            // CMYK round trip: the ink that is already there, moved by the ranges' amounts.
+            double k = 1.0 - fmax(r, fmax(g, b));
+            double c = k < 1 ? (1.0 - r - k) / (1.0 - k) : 0.0;
+            double m = k < 1 ? (1.0 - g - k) / (1.0 - k) : 0.0;
+            double yl = k < 1 ? (1.0 - b - k) / (1.0 - k) : 0.0;
+            if (relative) {
+                c = camera_clamp(c + d[0] * c);
+                m = camera_clamp(m + d[1] * m);
+                yl = camera_clamp(yl + d[2] * yl);
+                k = camera_clamp(k + d[3] * k);
+            } else {
+                c = camera_clamp(c + d[0]);
+                m = camera_clamp(m + d[1]);
+                yl = camera_clamp(yl + d[2]);
+                k = camera_clamp(k + d[3]);
+            }
+            write_premultiplied(p, (1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - yl) * (1.0 - k), alpha);
+        }
+    } });
+}
+
+// Photo Filter: a colored filter in front of the lens. The filter transmits its own color, so the
+// pixel is multiplied by `(1 - density) + density × color`; Preserve Luminosity scales the result
+// back to the brightness it had, which leaves the tint and drops the exposure loss.
+void adjust_photo_filter(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                         double r, double g, double b, double density, int preserveLuminosity) {
+    double t = (density < 0 ? 0 : density > 100 ? 100 : density) / 100.0;
+    if (t <= 0) return;
+    double tr = 1 - t + t * camera_clamp(r);
+    double tg = 1 - t + t * camera_clamp(g);
+    double tb = 1 - t + t * camera_clamp(b);
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double pr = fmin(1.0, p[0] / alpha), pg = fmin(1.0, p[1] / alpha), pb = fmin(1.0, p[2] / alpha);
+            double lum = rec709(pr, pg, pb);
+            double nr = pr * tr, ng = pg * tg, nb = pb * tb;
+            if (preserveLuminosity) scale_luminance(&nr, &ng, &nb, lum);
+            write_premultiplied(p, camera_clamp(nr), camera_clamp(ng), camera_clamp(nb), alpha);
+        }
+    } });
+}
+
+// Channel Mixer: each output channel is a weighted sum of the three input channels plus a constant.
+// `matrix` is 12 values in row order (red, green, blue × red, green, blue, constant), −2…2.
+void adjust_channel_mixer(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                          const double *matrix) {
+    int identity = 1;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) identity &= fabs(matrix[row * 4 + col] - (row == col ? 1.0 : 0.0)) < 1e-9;
+        identity &= fabs(matrix[row * 4 + 3]) < 1e-9;
+    }
+    if (identity) return;
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double in[3] = {fmin(1.0, p[0] / alpha), fmin(1.0, p[1] / alpha), fmin(1.0, p[2] / alpha)};
+            double out[3];
+            for (int c = 0; c < 3; ++c) {
+                const double *m = matrix + c * 4;
+                out[c] = camera_clamp(m[0] * in[0] + m[1] * in[1] + m[2] * in[2] + m[3]);
+            }
+            write_premultiplied(p, out[0], out[1], out[2], alpha);
+        }
+    } });
+}
+
+// The built-in Color Lookup looks, each a plain analytic grade of straight sRGB.
+static void builtin_look(int look, double r, double g, double b, double *out) {
+    double l = rec709(r, g, b);
+    switch (look) {
+    case 0:  // Warm Film: warm lifted shadows, a touch less blue in the highlights.
+        out[0] = camera_clamp(r * 0.96 + 0.10 * (1 - l));
+        out[1] = camera_clamp(g * 0.98 + 0.04 * (1 - l));
+        out[2] = camera_clamp(b * 1.02 - 0.05 * (1 - l));
+        break;
+    case 1:  // Cool Film: the same shape, with the cast the other way.
+        out[0] = camera_clamp(r * 1.02 - 0.05 * (1 - l));
+        out[1] = camera_clamp(g * 0.99 + 0.01 * (1 - l));
+        out[2] = camera_clamp(b * 0.96 + 0.10 * (1 - l));
+        break;
+    case 2:  // Teal and Orange: teal in the darks, orange in the lights.
+        out[0] = camera_clamp(r - 0.06 * (1 - l) + 0.12 * l);
+        out[1] = camera_clamp(g + 0.03 * (1 - l) + 0.05 * l);
+        out[2] = camera_clamp(b + 0.10 * (1 - l) - 0.06 * l);
+        break;
+    case 3: {  // Mono Contrast: gray through an S-curve.
+        double x = camera_clamp((l - 0.5) * 1.25 + 0.5);
+        out[0] = out[1] = out[2] = x;
+        break;
+    }
+    default: {  // Vintage Fade: lifted blacks, dull whites, warm.
+        double x = camera_clamp(0.14 + l * 0.78);
+        out[0] = camera_clamp(x * 1.06);
+        out[1] = camera_clamp(x * 0.98);
+        out[2] = camera_clamp(x * 0.90);
+        break;
+    }
+    }
+}
+
+// Color Lookup with a built-in look. `.cube` files are not read: the look is analytic, so a partial
+// thumbnail and the full render agree exactly.
+void adjust_color_lookup(uint8_t *rgba, size_t width, size_t height, size_t stride, int look,
+                         double intensity) {
+    double t = (intensity < 0 ? 0 : intensity > 100 ? 100 : intensity) / 100.0;
+    if (t <= 0) return;
+    if (look < 0) look = 0;
+    if (look > 4) look = 4;
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
+            double looked[3];
+            builtin_look(look, r, g, b, looked);
+            write_premultiplied(p, r + (looked[0] - r) * t, g + (looked[1] - g) * t,
+                                b + (looked[2] - b) * t, alpha);
+        }
+    } });
+}
+
+// Shadows/Highlights. The local luminance comes from a blurred copy of the image, so a dark area
+// beside a bright one is judged on its own rather than on the frame's average. Shadows is added
+// where the local luminance is low (strongest in the darkest pixels), Highlights subtracted where it
+// is high, and each Tonal Width decides how far from pure black or white that reaches.
+void adjust_shadows_highlights(uint8_t *rgba, size_t width, size_t height, size_t stride,
+                               double shadows, double shadowWidth, double highlights,
+                               double highlightWidth, double radius) {
+    double aS = (shadows < -100 ? -100 : shadows > 100 ? 100 : shadows) / 100.0;
+    double aH = (highlights < -100 ? -100 : highlights > 100 ? 100 : highlights) / 100.0;
+    if ((aS == 0 && aH == 0) || width == 0 || height == 0) return;
+    size_t count = width * height;
+    float *luma = malloc(count * sizeof(float)), *blur = malloc(count * sizeof(float));
+    if (!luma || !blur) { free(luma); free(blur); return; }
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        const uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            const uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            luma[y * width + x] = alpha > 0
+                ? (float)rec709(fmin(1.0, p[0] / alpha), fmin(1.0, p[1] / alpha), fmin(1.0, p[2] / alpha))
+                : 0.0f;
+        }
+    } });
+    int r = (int)(radius < 1 ? 1 : radius > 100 ? 100 : radius);
+    if (!box_blur_plane(luma, blur, width, height, r)) { free(luma); free(blur); return; }
+    // Wider tonal widths reach further into the midtones; the exponents give the soft shoulder.
+    double sPow = 1.0 + 3.0 * fmin(1.0, fmax(0.0, shadowWidth / 100.0));
+    double hPow = 1.0 + 3.0 * fmin(1.0, fmax(0.0, highlightWidth / 100.0));
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            double local = blur[y * width + x];
+            double shadow = aS * pow(1.0 - local, sPow);
+            double highlight = aH * pow(local, hPow);
+            double r = fmin(1.0, p[0] / alpha), g = fmin(1.0, p[1] / alpha), b = fmin(1.0, p[2] / alpha);
+            double out[3] = {r, g, b};
+            for (int c = 0; c < 3; ++c) {
+                // A lift toward white in the shadows; a pull toward black in the highlights.
+                out[c] = camera_clamp(out[c] + shadow * (1.0 - out[c]) * (1.0 - out[c])
+                                               - highlight * out[c] * out[c]);
+            }
+            write_premultiplied(p, out[0], out[1], out[2], alpha);
+        }
+    } });
+    free(luma);
+    free(blur);
+}
+
+// Auto's histogram is per channel plus luminance, counting every pixel that is at all opaque.
+static void auto_histograms(const uint8_t *rgba, size_t width, size_t height, size_t stride,
+                            double *hist) {
+    memset(hist, 0, sizeof(double) * 4 * 256);
+    for (size_t y = 0; y < height; ++y) {
+        const uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            const uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            int r = (int)fmin(255.0, p[0] * 255.0 / alpha + 0.5);
+            int g = (int)fmin(255.0, p[1] * 255.0 / alpha + 0.5);
+            int b = (int)fmin(255.0, p[2] * 255.0 / alpha + 0.5);
+            int l = (int)(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+            hist[r] += 1;
+            hist[256 + g] += 1;
+            hist[512 + b] += 1;
+            hist[768 + l] += 1;
+        }
+    }
+}
+
+// The levels that leave `fraction` of the pixels outside, on each side. Photoshop clips a small
+// share (0.1% by default) so a few stray pixels cannot define the range.
+static void auto_levels(const double *hist, double total, double fraction, double *low, double *high) {
+    double clip = total * fraction, sum = 0;
+    int lo = 0, hi = 255;
+    for (; lo < 255; ++lo) { sum += hist[lo]; if (sum > clip) break; }
+    sum = 0;
+    for (; hi > 0; --hi) { sum += hist[hi]; if (sum > clip) break; }
+    *low = lo;
+    *high = hi;
+}
+
+static void auto_lut(double *lut, const double *hist, double total, double fraction) {
+    double lo, hi;
+    auto_levels(hist, total, fraction, &lo, &hi);
+    for (int i = 0; i < 256; ++i) {
+        double v = hi > lo ? (i - lo) * 255.0 / (hi - lo) : i;
+        lut[i] = fmin(255.0, fmax(0.0, v));
+    }
+}
+
+// Auto Tone/Contrast/Color. Tone stretches each channel on its own; Contrast stretches all three by
+// the luminance range, which leaves the colors as they were; Color adds a gray-world step so a cast
+// comes back to neutral. All three read only the image, so an eighth of the frame gives the same
+// correction as the whole.
+void adjust_auto(uint8_t *rgba, size_t width, size_t height, size_t stride, int mode) {
+    if (width == 0 || height == 0) return;
+    double *hist = malloc(sizeof(double) * 4 * 256);
+    if (!hist) return;
+    auto_histograms(rgba, width, height, stride, hist);
+    double total = 0;
+    for (int i = 0; i < 256; ++i) total += hist[i];
+    if (total <= 0) { free(hist); return; }
+    // Heap, not a stack array: the band block below captures the table, and a block cannot
+    // refer to an array-typed local (zig clang rejects that outright).
+    double *lut = malloc(sizeof(double) * 3 * 256);
+    if (!lut) { free(hist); return; }
+    if (mode == 1) {
+        // A shared range: the luminance percentiles become every channel's black and white points.
+        double lo, hi;
+        auto_levels(hist + 768, total, 0.001, &lo, &hi);
+        for (int c = 0; c < 3; ++c) {
+            for (int i = 0; i < 256; ++i) {
+                double v = hi > lo ? (i - lo) * 255.0 / (hi - lo) : i;
+                lut[c * 256 + i] = fmin(255.0, fmax(0.0, v));
+            }
+        }
+    } else {
+        for (int c = 0; c < 3; ++c) auto_lut(lut + c * 256, hist + c * 256, total, 0.001);
+        if (mode == 2) {
+            // Gray-world: bring each channel's mean to the mean of the three, with a gamma step.
+            double mean[3], target = 0;
+            for (int c = 0; c < 3; ++c) {
+                double sum = 0;
+                for (int i = 0; i < 256; ++i) sum += lut[c * 256 + i] * hist[c * 256 + i];
+                mean[c] = sum / total;
+                target += mean[c] / 3.0;
+            }
+            for (int c = 0; c < 3; ++c) {
+                if (mean[c] < 1.0 || target >= 254.0) continue;
+                double gamma = log(fmax(1.0, target) / 255.0) / log(fmax(1.0, mean[c]) / 255.0);
+                if (!(gamma > 0.25 && gamma < 4.0)) continue;
+                for (int i = 0; i < 256; ++i) {
+                    lut[c * 256 + i] = 255.0 * pow(lut[c * 256 + i] / 255.0, gamma);
+                }
+            }
+        }
+    }
+    free(hist);
+    in_bands(height, ^(size_t first, size_t last) { for (size_t y = first; y < last; ++y) {
+        uint8_t *row = rgba + y * stride;
+        for (size_t x = 0; x < width; ++x) {
+            uint8_t *p = row + x * 4;
+            double alpha = p[3];
+            if (!alpha) continue;
+            for (int c = 0; c < 3; ++c) {
+                int v = (int)fmin(255.0, p[c] * 255.0 / alpha + 0.5);
+                double out = lut[c * 256 + v];
+                p[c] = (uint8_t)fmin(alpha, fmax(0.0, floor(out * alpha / 255.0 + 0.5)));
+            }
+        }
+    } });
+    free(lut);
+}
+
 // Posterize: `levels` evenly spaced steps per channel. 255 levels is an identity, so it is skipped
 // rather than paid for.
 void adjust_posterize(uint8_t *rgba, size_t width, size_t height, size_t stride, int levels) {

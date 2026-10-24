@@ -153,8 +153,9 @@ class FontFace {
  *
  * 表带一把全局互斥锁；字体不是每像素热路径（一次文字操作栅格化一次），一次
  * 哈希查找的代价可以忽略。查询只哈希指针值本身，不解引用，所以野指针查询本身
- * 也是安全的。类型区分交给 magic：Engine/Document 指针即便撞进表里，也会被
- * kFontMagic 比较挡下。
+ * 也是安全的。表项带类型标签（LiveHandleKind::kFont）：Engine/Document 指针即便
+ * 撞进表里也会在解引用之前被否掉——不能等 kFontMagic 比较，因为按 FontFace 的
+ * 布局去读 magic 会越界（见 core/comp_live_handles.h 的 F2 说明）。
  */
 void register_live_font(FontFace* face) noexcept;
 void unregister_live_font(FontFace* face) noexcept;

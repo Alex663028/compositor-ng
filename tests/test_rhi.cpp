@@ -961,10 +961,12 @@ void build_layered_scene(Document& document, int32_t size) {
   Layer* pass_group =
       add_test_layer(document, "pass-through", COMP_BLEND_NORMAL, 0.8f, comp_rect{0, 0, 0, 0}, 0, true);
   COMP_CHECK(pass_group != nullptr);
+  /* id 先取出来：下面的 add_test_layer 会让 state_.layers 重新分配，pass_group 随后失效。 */
+  const comp_layer_id pass_group_id = pass_group->id;
   for (int32_t i = 0; i < 2; ++i) {
     Layer* child = add_test_layer(document, "pass-child",
                                   i == 0 ? COMP_BLEND_MULTIPLY : COMP_BLEND_NORMAL, 0.9f,
-                                  comp_rect{0, 0, size, size}, pass_group->id, false);
+                                  comp_rect{0, 0, size, size}, pass_group_id, false);
     COMP_CHECK(child != nullptr);
     child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
     fill_test_pattern(&child->pixels, 9 + i);
@@ -975,9 +977,10 @@ void build_layered_scene(Document& document, int32_t size) {
                                          comp_rect{0, 0, 0, 0}, 0, true);
   COMP_CHECK(isolated_group != nullptr);
   isolated_group->isolated = true;
+  const comp_layer_id isolated_group_id = isolated_group->id; /* 同上：先取 id，别留指针 */
   for (int32_t i = 0; i < 2; ++i) {
     Layer* child = add_test_layer(document, "iso-child", COMP_BLEND_NORMAL, 0.85f,
-                                  comp_rect{0, 0, size, size}, isolated_group->id, false);
+                                  comp_rect{0, 0, size, size}, isolated_group_id, false);
     COMP_CHECK(child != nullptr);
     child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
     fill_test_pattern(&child->pixels, 13 + i);
@@ -989,12 +992,13 @@ void build_layered_scene(Document& document, int32_t size) {
   COMP_CHECK(clip_base != nullptr);
   clip_base->pixels.resize(size, size, COMP_PIXEL_RGBA8);
   fill_test_pattern(&clip_base->pixels, 21);
+  const comp_layer_id clip_base_id = clip_base->id; /* 下面这次 create 会让 clip_base 失效 */
   Layer* clipped = add_test_layer(document, "clipped", COMP_BLEND_MULTIPLY, 1.0f,
                                   comp_rect{0, 0, size, size}, 0, false);
   COMP_CHECK(clipped != nullptr);
   clipped->pixels.resize(size, size, COMP_PIXEL_RGBA8);
   fill_test_pattern(&clipped->pixels, 23);
-  clipped->clipping_source = clip_base->id;
+  clipped->clipping_source = clip_base_id;
 }
 
 }  // namespace
@@ -1222,10 +1226,12 @@ COMP_TEST(rhi_gpu_renders_group_and_clipping_units_like_cpu) {
   Layer* pass_group =
       add_test_layer(document, "pass-through", COMP_BLEND_NORMAL, 0.8f, comp_rect{0, 0, 0, 0}, 0, true);
   COMP_CHECK(pass_group != nullptr);
+  /* id 先取出来：下面的 add_test_layer 会让 state_.layers 重新分配，pass_group 随后失效。 */
+  const comp_layer_id pass_group_id = pass_group->id;
   for (int32_t i = 0; i < 2; ++i) {
     Layer* child = add_test_layer(document, "pass-child",
                                   i == 0 ? COMP_BLEND_MULTIPLY : COMP_BLEND_NORMAL, 0.9f,
-                                  comp_rect{0, 0, size, size}, pass_group->id, false);
+                                  comp_rect{0, 0, size, size}, pass_group_id, false);
     COMP_CHECK(child != nullptr);
     child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
     fill_test_pattern(&child->pixels, 9 + i);
@@ -1235,9 +1241,10 @@ COMP_TEST(rhi_gpu_renders_group_and_clipping_units_like_cpu) {
                                          comp_rect{0, 0, 0, 0}, 0, true);
   COMP_CHECK(isolated_group != nullptr);
   isolated_group->isolated = true;
+  const comp_layer_id isolated_group_id = isolated_group->id; /* 同上：先取 id，别留指针 */
   for (int32_t i = 0; i < 2; ++i) {
     Layer* child = add_test_layer(document, "iso-child", COMP_BLEND_NORMAL, 0.85f,
-                                  comp_rect{0, 0, size, size}, isolated_group->id, false);
+                                  comp_rect{0, 0, size, size}, isolated_group_id, false);
     COMP_CHECK(child != nullptr);
     child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
     fill_test_pattern(&child->pixels, 13 + i);
@@ -1248,12 +1255,13 @@ COMP_TEST(rhi_gpu_renders_group_and_clipping_units_like_cpu) {
   COMP_CHECK(clip_base != nullptr);
   clip_base->pixels.resize(size, size, COMP_PIXEL_RGBA8);
   fill_test_pattern(&clip_base->pixels, 21);
+  const comp_layer_id clip_base_id = clip_base->id; /* 下面这次 create 会让 clip_base 失效 */
   Layer* clipped = add_test_layer(document, "clipped", COMP_BLEND_MULTIPLY, 1.0f,
                                   comp_rect{0, 0, size, size}, 0, false);
   COMP_CHECK(clipped != nullptr);
   clipped->pixels.resize(size, size, COMP_PIXEL_RGBA8);
   fill_test_pattern(&clipped->pixels, 23);
-  clipped->clipping_source = clip_base->id;
+  clipped->clipping_source = clip_base_id;
 
   std::string why;
   COMP_CHECK_MSG(gpu->can_render_document(document, &why), why.c_str());
@@ -1855,10 +1863,23 @@ COMP_TEST(gpu_bake_cache_invalidates_when_group_structure_changes) {
   COMP_CHECK(group != nullptr);
   if (group == nullptr) return;
   group->isolated = true;
-  Layer* first_child = add_test_layer(document, "child-a", COMP_BLEND_NORMAL, 1.0f,
-                                      comp_rect{0, 0, size, size}, group->id, false);
-  Layer* second_child = add_test_layer(document, "child-b", COMP_BLEND_NORMAL, 1.0f,
-                                       comp_rect{0, 0, size, size}, group->id, false);
+  /* 每次 add_test_layer 都可能让 state_.layers 重新分配：group 指针只用到这里，改持 id。 */
+  const comp_layer_id group_id = group->id;
+  Layer* created = add_test_layer(document, "child-a", COMP_BLEND_NORMAL, 1.0f,
+                                  comp_rect{0, 0, size, size}, group_id, false);
+  COMP_CHECK(created != nullptr);
+  if (created == nullptr) return;
+  const comp_layer_id child_a = created->id;
+  created = add_test_layer(document, "child-b", COMP_BLEND_NORMAL, 1.0f,
+                           comp_rect{0, 0, size, size}, group_id, false);
+  COMP_CHECK(created != nullptr);
+  if (created == nullptr) return;
+  const comp_layer_id child_b = created->id;
+
+  /* 两次 create 之后 state_.layers 可能已经重分配：上面两个返回值都不能再用，
+   * 按 id 重新查（ASan 在鸿蒙模拟器上报的就是这里对旧块的写入）。 */
+  Layer* first_child = document.find(child_a);
+  Layer* second_child = document.find(child_b);
   COMP_CHECK(first_child != nullptr && second_child != nullptr);
   if (first_child == nullptr || second_child == nullptr) return;
   first_child->pixels.resize(size, size, COMP_PIXEL_RGBA8);
@@ -1879,10 +1900,8 @@ COMP_TEST(gpu_bake_cache_invalidates_when_group_structure_changes) {
 
   /*
    * reorder_layer 会 erase/insert state_.layers，先前拿到的 Layer* 随即失效；
-   * 之后一律按 id 重新查，避免读悬垂指针。
+   * 之后一律按 id 重新查，避免读悬垂指针。修订号在重排之前先取好。
    */
-  const comp_layer_id child_a = first_child->id;
-  const comp_layer_id child_b = second_child->id;
   const uint64_t revision_a = first_child->content_revision;
   const uint64_t revision_b = second_child->content_revision;
   COMP_CHECK_MSG(document.reorder_layer(child_b, child_a), "reordering siblings must succeed");

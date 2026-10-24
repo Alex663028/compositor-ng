@@ -6,7 +6,9 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "domain/font_face.h"
 #include "domain/type_raster.h"
@@ -126,6 +128,17 @@ void text_layer_validate(const TextObject& text, TextLayerReport* report) {
     *report = make_report(TextLayerStatus::kBadArgument, "opacity must be in (0, 1]");
     return;
   }
+  if (!std::isfinite(text.box_width) || !std::isfinite(text.box_height) ||
+      text.box_width < 0.0 || text.box_height < 0.0 ||
+      text.box_width > kMaxTypeParagraphBox || text.box_height > kMaxTypeParagraphBox) {
+    *report = make_report(TextLayerStatus::kBadArgument,
+                          "paragraph box is not finite or out of range");
+    return;
+  }
+  if (text.align < kTypeAlignLeft || text.align >= kTypeAlignCount) {
+    *report = make_report(TextLayerStatus::kBadArgument, "paragraph alignment must be 0..2");
+    return;
+  }
   if (text.color[3] == 0) {
     *report = make_report(TextLayerStatus::kBadArgument, "text color is fully transparent");
     return;
@@ -211,16 +224,41 @@ TextLayerReport text_layer_render(const TextObject& text, int32_t canvas_width,
   style.letter_spacing = text.style.letter_spacing;
   style.antialias = text.style.antialias;
 
+  /*
+   * 段落模式（P0-6 ③）：三个字段任一非默认就按段落走；全默认时下面的代码与
+   * P0-6 之前的单次栅格化**逐字节相同**（不折行、逐行合成不进入老路径）。
+   */
+  const bool paragraph_mode =
+      text.box_width > 0.0 || text.box_height > 0.0 || text.align != kTypeAlignLeft;
+
   TypeMeasure measure;
-  const TypeRasterReport measured =
-      font != nullptr
-          ? type_measure_text_with_font(text.text.c_str(), text.text.size(), style, font.get(),
-                                        &measure)
-          : type_measure_text(text.text.c_str(), text.text.size(), style, &measure);
-  if (measured.status != TypeRasterStatus::kOk) {
-    return make_report(map_raster_status(measured.status),
-                       measured.message != nullptr ? measured.message : "");
+  TypeParagraphMetrics paragraph;
+  std::vector<TypeWrapLine> paragraph_lines;
+  if (paragraph_mode) {
+    const TypeRasterReport laid =
+        type_layout_paragraph(text.text.c_str(), text.text.size(), style, font.get(),
+                              text.box_width, text.align, &paragraph_lines, &paragraph);
+    if (laid.status != TypeRasterStatus::kOk) {
+      return make_report(map_raster_status(laid.status),
+                         laid.message != nullptr ? laid.message : "");
+    }
+  } else {
+    const TypeRasterReport measured =
+        font != nullptr
+            ? type_measure_text_with_font(text.text.c_str(), text.text.size(), style, font.get(),
+                                          &measure)
+            : type_measure_text(text.text.c_str(), text.text.size(), style, &measure);
+    if (measured.status != TypeRasterStatus::kOk) {
+      return make_report(map_raster_status(measured.status),
+                         measured.message != nullptr ? measured.message : "");
+    }
   }
+
+  const double content_width = paragraph_mode ? paragraph.content_width : measure.width;
+  const double content_height = paragraph_mode ? paragraph.content_height : measure.height;
+  /* 框宽/框高为 0 的那一维退回内容尺寸（= 点文字）；两维都给才是完整段落框。 */
+  const double box_width = text.box_width > 0.0 ? text.box_width : content_width;
+  const double box_height = text.box_height > 0.0 ? text.box_height : content_height;
 
   /*
    * 文本框 -> 图层矩形。原点取 floor，亚像素部分留给栅格化内核（它把 origin
@@ -232,8 +270,8 @@ TextLayerReport text_layer_render(const TextObject& text, int32_t canvas_width,
    */
   const double box_left = text.origin_x;
   const double box_top = text.origin_y;
-  const double box_right = box_left + measure.width;
-  const double box_bottom = box_top + measure.height;
+  const double box_right = box_left + box_width;
+  const double box_bottom = box_top + box_height;
   const int64_t left = static_cast<int64_t>(std::floor(box_left));
   const int64_t top = static_cast<int64_t>(std::floor(box_top));
   const int64_t right = static_cast<int64_t>(std::ceil(box_right));
@@ -259,20 +297,77 @@ TextLayerReport text_layer_render(const TextObject& text, int32_t canvas_width,
   buffer.clear_transparent();
 
   TypeCoverage coverage;
-  int64_t missing = 0;
-  const TypeRasterReport rastered =
-      font != nullptr
-          ? type_rasterize_with_font(text.text.c_str(), text.text.size(), style, font.get(),
-                                     text.origin_x - static_cast<double>(left),
-                                     text.origin_y - static_cast<double>(top), 0, 0,
-                                     buffer.width, buffer.height, &coverage, &missing)
-          : type_rasterize(text.text.c_str(), text.text.size(), style,
-                           text.origin_x - static_cast<double>(left),
-                           text.origin_y - static_cast<double>(top), 0, 0, buffer.width,
-                           buffer.height, &coverage);
-  if (rastered.status != TypeRasterStatus::kOk) {
-    return make_report(map_raster_status(rastered.status),
-                       rastered.message != nullptr ? rastered.message : "");
+  int64_t missing = paragraph_mode ? paragraph.missing_glyphs : 0;
+  if (!paragraph_mode) {
+    const TypeRasterReport rastered =
+        font != nullptr
+            ? type_rasterize_with_font(text.text.c_str(), text.text.size(), style, font.get(),
+                                       text.origin_x - static_cast<double>(left),
+                                       text.origin_y - static_cast<double>(top), 0, 0,
+                                       buffer.width, buffer.height, &coverage, &missing)
+            : type_rasterize(text.text.c_str(), text.text.size(), style,
+                             text.origin_x - static_cast<double>(left),
+                             text.origin_y - static_cast<double>(top), 0, 0, buffer.width,
+                             buffer.height, &coverage);
+    if (rastered.status != TypeRasterStatus::kOk) {
+      return make_report(map_raster_status(rastered.status),
+                         rastered.message != nullptr ? rastered.message : "");
+    }
+  } else {
+    /*
+     * 段落：逐视觉行栅格化，再按 max 合并到整层窗口。
+     *
+     * 为什么逐行调内核而不是改内核：每行的落点由折行结果决定（x_offset +
+     * 行序 × line_advance），内核的「一次排版一整段」不知道折行；逐行调用
+     * 复用的是同一条已验证的排版/栅格化路径，行与行只在像素上合成。max
+     * 合并与「字形重叠取最大覆盖率」同口径，行距 < 1 时也不会叠亮。
+     *
+     * 框高/框宽就是 buffer 尺寸，超出的行由内核的窗口裁剪自然掉——不需要
+     * 再写一段裁切逻辑。
+     */
+    std::vector<uint8_t> merged(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+    for (size_t line = 0; line < paragraph_lines.size(); ++line) {
+      const TypeWrapLine& wrap = paragraph_lines[line];
+      if (wrap.byte_end <= wrap.byte_begin) continue; /* 空行不落墨 */
+      const std::string slice =
+          text.text.substr(wrap.byte_begin, wrap.byte_end - wrap.byte_begin);
+      const double line_origin_x = text.origin_x + wrap.x_offset - static_cast<double>(left);
+      const double line_origin_y =
+          text.origin_y + static_cast<double>(line) * paragraph.line_advance -
+          static_cast<double>(top);
+      TypeCoverage line_coverage;
+      int64_t line_missing = 0;
+      const TypeRasterReport line_report =
+          font != nullptr
+              ? type_rasterize_with_font(slice.c_str(), slice.size(), style, font.get(),
+                                         line_origin_x, line_origin_y, 0, 0, buffer.width,
+                                         buffer.height, &line_coverage, &line_missing)
+              : type_rasterize(slice.c_str(), slice.size(), style, line_origin_x, line_origin_y,
+                               0, 0, buffer.width, buffer.height, &line_coverage);
+      if (line_report.status == TypeRasterStatus::kEmpty) continue;
+      if (line_report.status != TypeRasterStatus::kOk) {
+        return make_report(map_raster_status(line_report.status),
+                           line_report.message != nullptr ? line_report.message : "");
+      }
+      for (int32_t y = 0; y < line_coverage.h; ++y) {
+        const int32_t local_y = line_coverage.y + y;
+        if (local_y < 0 || local_y >= buffer.height) continue;
+        uint8_t* target = merged.data() + static_cast<size_t>(local_y) * static_cast<size_t>(width);
+        const uint8_t* source = line_coverage.coverage.data() +
+                                static_cast<size_t>(y) * static_cast<size_t>(line_coverage.w);
+        for (int32_t x = 0; x < line_coverage.w; ++x) {
+          const int32_t local_x = line_coverage.x + x;
+          if (local_x < 0 || local_x >= buffer.width) continue;
+          uint8_t& slot = target[local_x];
+          if (source[x] > slot) slot = source[x];
+        }
+      }
+    }
+    coverage.x = 0;
+    coverage.y = 0;
+    coverage.w = static_cast<int32_t>(width);
+    coverage.h = static_cast<int32_t>(height);
+    coverage.coverage = std::move(merged);
   }
   if (coverage.empty()) {
     /* 空文本框（纯空格）：成功但没有任何墨迹。图层保留为全透明，

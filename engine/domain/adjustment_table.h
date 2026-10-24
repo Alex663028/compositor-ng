@@ -49,14 +49,15 @@ struct AdjustmentKindInfo {
 };
 
 /*
- * kind 编码总数（0..15 合法）。
+ * kind 编码总数（0..24 合法）。
  *
  * 0..11 与上游 `AdjustmentKind` 的 CaseIterable 顺序一致（冻结，不得改动序号）；
  * 12..15 是本仓追加的破坏性调整（Brightness/Contrast、Desaturate、Threshold、
- * Posterize），追加在尾部，既不挪动既有 kind 的编码，也不影响 `.comp` 里
- * 既有的 `engineAdjustments[].kind`。
+ * Posterize），16..24 是补齐的 Photoshop「Image > Adjustments」其余条目
+ * （Vibrance … Auto Color）。全部追加在尾部，既不挪动既有 kind 的编码，也不影响
+ * `.comp` 里既有的 `engineAdjustments[].kind`。
  */
-constexpr uint32_t kAdjustmentKindCount = 16;
+constexpr uint32_t kAdjustmentKindCount = 25;
 
 /* 上游 `AdjustmentKind` 声明的种类数：0..11。追加 kind 从此之后开始编号。 */
 constexpr uint32_t kUpstreamAdjustmentKindCount = 12;

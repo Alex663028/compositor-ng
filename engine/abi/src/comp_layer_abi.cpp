@@ -69,6 +69,22 @@ bool text_desc_to_object(const comp_text_desc* desc, compositor::TextObject* out
     *error = "_reserved must be 0";
     return false;
   }
+  if (desc->_reserved2 != 0) {
+    *error = "_reserved2 must be 0";
+    return false;
+  }
+  /* 段落框的量程与 text_layer_validate 同一把尺子（这里是廉价闸，完整判定
+   * 仍由渲染路径给出）——非法值一旦入库会被 .comp 持久化。 */
+  if (!(desc->box_width >= 0.0) || !(desc->box_height >= 0.0) ||
+      desc->box_width > compositor::kMaxTypeParagraphBox ||
+      desc->box_height > compositor::kMaxTypeParagraphBox) {
+    *error = "paragraph box must be finite and within 0..1e6";
+    return false;
+  }
+  if (desc->align < compositor::kTypeAlignLeft || desc->align >= compositor::kTypeAlignCount) {
+    *error = "align must be 0..2";
+    return false;
+  }
   if (desc->font_face_index < 0) {
     *error = "font_face_index must be >= 0";
     return false;
@@ -86,6 +102,9 @@ bool text_desc_to_object(const comp_text_desc* desc, compositor::TextObject* out
   /* 内置点阵轨道只有一个面；把 face 归零可让同一个 desc（换字体轨道时）
    * 不会因残留的 face 号被误判成 kBadFaceIndex。 */
   out->font_face_index = out->font_path.empty() ? 0 : desc->font_face_index;
+  out->box_width = desc->box_width;
+  out->box_height = desc->box_height;
+  out->align = desc->align;
   return true;
 }
 
@@ -1445,6 +1464,30 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
     params.gradient.color1[i] = desc->gradient.color1[i];
   }
   params.gradient.opacity = desc->gradient.opacity;
+  /*
+   * P1-7：多色标。这里只做**结构性守卫**（空指针 / 超上限），位置的升序、
+   * midpoint 开区间、是否全透明交给域层参数闸——那里报错会回滚事务，这里
+   * 提前拒绝只是避免解引用空指针与巨量分配。
+   */
+  if (desc->kind == COMP_TOOL_GRADIENT && desc->gradient_stop_count != 0) {
+    if (desc->gradient_stops == nullptr) {
+      return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                   "gradient stops are null");
+    }
+    if (desc->gradient_stop_count > COMP_TOOL_GRADIENT_MAX_STOPS) {
+      return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                   "gradient stop count exceeds 32");
+    }
+    params.gradient.stops.resize(desc->gradient_stop_count);
+    for (size_t i = 0; i < desc->gradient_stop_count; ++i) {
+      const comp_gradient_stop& source = desc->gradient_stops[i];
+      compositor::GradientStop& stop = params.gradient.stops[i];
+      stop.position = source.position;
+      stop.midpoint = source.midpoint;
+      for (int c = 0; c < 4; ++c) stop.color[c] = source.color[c];
+    }
+  }
+  params.gradient.dither = desc->gradient_dither != 0;
 
   /*
    * S10：形状的路径段要从 ABI 的 float 布局转成域层/kernel 的 double 布局。
@@ -1977,6 +2020,10 @@ comp_result comp_layer_get_text(comp_document document, comp_layer_id id,
     out_desc->font_path_utf8 = text.font_path.empty() ? nullptr : text.font_path.c_str();
     out_desc->font_face_index = text.font_face_index;
     out_desc->_reserved = 0;
+    out_desc->box_width = text.box_width;
+    out_desc->box_height = text.box_height;
+    out_desc->align = text.align;
+    out_desc->_reserved2 = 0;
   }
   if (text_buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
   if (capacity < required) {

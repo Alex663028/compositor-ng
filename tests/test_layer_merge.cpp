@@ -663,8 +663,8 @@ COMP_TEST(abi_merge_down_error_paths) {
    * 叠加两层，下层挂引擎**不认识**的 effect 值 -> COMP_ERR_UNSUPPORTED。
    *
    * 区分两种情形（这是本用例的要点）：
-   *   - 引擎已知的 6 种效果：已由合成求值包含，烘入即正确，允许合并
-   *     （见 merge_down_bakes_adjustments_and_effects）；
+   *   - 引擎已知的效果（effect_kind_is_evaluated，当前 9 种）：已由合成求值包含，
+   *     烘入即正确，允许合并（见 merge_down_bakes_adjustments_and_effects）；
    *   - 未知的 kind（如 999）：本引擎既不求值也不绘制，烘入会静默丢弃，
    *     所以必须拒绝。
    * 早期版本用 kind=0（已知的描边）来测这条拒绝路径，那是在“效果只入库不求值”

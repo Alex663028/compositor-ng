@@ -319,9 +319,22 @@ typedef enum comp_adjustment_kind {
   COMP_ADJUSTMENT_DESATURATE = 13,
   COMP_ADJUSTMENT_THRESHOLD = 14,
   COMP_ADJUSTMENT_POSTERIZE = 15,
+  /*
+   * 16…24 同样是本仓追加，补齐 Photoshop「Image > Adjustments」的其余条目，
+   * 语义与 PS 同名调整一致（见 engine/imaging/AdjustPixels.h 的逐条说明）。
+   */
+  COMP_ADJUSTMENT_VIBRANCE = 16,
+  COMP_ADJUSTMENT_SELECTIVE_COLOR = 17,
+  COMP_ADJUSTMENT_PHOTO_FILTER = 18,
+  COMP_ADJUSTMENT_CHANNEL_MIXER = 19,
+  COMP_ADJUSTMENT_COLOR_LOOKUP = 20,
+  COMP_ADJUSTMENT_SHADOWS_HIGHLIGHTS = 21,
+  COMP_ADJUSTMENT_AUTO_TONE = 22,
+  COMP_ADJUSTMENT_AUTO_CONTRAST = 23,
+  COMP_ADJUSTMENT_AUTO_COLOR = 24,
 } comp_adjustment_kind;
 
-#define COMP_ADJUSTMENT_KIND_COUNT 16
+#define COMP_ADJUSTMENT_KIND_COUNT 25
 
 /* 参数类型。 */
 typedef enum comp_param_type {
@@ -652,6 +665,33 @@ typedef struct comp_tool_warp { float strength; } comp_tool_warp;
 typedef struct comp_tool_blur { float radius; } comp_tool_blur;
 
 /*
+ * 渐变种类（P1-7 尾部追加 2..4。0/1 的数值与像素语义不变）。
+ */
+typedef enum comp_gradient_type {
+  COMP_GRADIENT_LINEAR    = 0, /* 线性：沿端点方向的投影比例 */
+  COMP_GRADIENT_RADIAL    = 1, /* 径向：到起点的距离 / 端点距离 */
+  COMP_GRADIENT_ANGLE     = 2, /* 角度（锥形）：绕起点的方位角 / 360° */
+  COMP_GRADIENT_REFLECTED = 3, /* 对称：起点两侧镜像 |投影| */
+  COMP_GRADIENT_DIAMOND   = 4  /* 菱形：|投影| + |横向| */
+} comp_gradient_type;
+
+/*
+ * 多色标（P1-7 尾部追加）。`position` 是 0..1 的段位置，**必须严格升序**给出
+ * （引擎拒绝乱序而不是替宿主排序：静默排序会把「填错了顺序」变成「画面上颜色
+ * 不是我要的顺序」）；`midpoint` 是该色标到下一个色标之间的中点位置，取
+ * (0,1) 开区间，0.5 = 线性；`color` 是直通 sRGB + alpha（非预乘）。
+ *
+ * 一次渐变最多 `COMP_TOOL_GRADIENT_MAX_STOPS` 个色标。
+ */
+#define COMP_TOOL_GRADIENT_MAX_STOPS 32
+
+typedef struct comp_gradient_stop {
+  double  position;   /* 0..1，严格升序 */
+  double  midpoint;   /* (0,1)，0.5 = 线性 */
+  uint8_t color[4];   /* 直通 sRGB + alpha（0..255） */
+} comp_gradient_stop;
+
+/*
  * 渐变参数（上游 GradientTool 的「线性 / 径向 + 两个色标」子集）。
  *
  * 端点用**文档像素坐标**：`(start_x, start_y)` 是第一色标所在处，
@@ -665,9 +705,14 @@ typedef struct comp_tool_blur { float radius; } comp_tool_blur;
  *
  * 端点重合（线性方向长度为 0 / 径向半径 0）被参数闸拒绝：那不是一个可定义的
  * 渐变，静默画成纯色会让宿主以为方向生效了。
+ *
+ * P1-7：`type` 扩展为 0..4；多色标与抖动开关**不在本结构体里**，而是在
+ * `comp_tool_op_desc` 尾部追加（`gradient_stops` / `gradient_stop_count` /
+ * `gradient_dither`），这样 `color0/color1` 的偏移与旧宿主逐字节不变。
+ * 多色标非空时完全替代 `color0/color1`。
  */
 typedef struct comp_tool_gradient {
-  int32_t type;        /* 0 = 线性，1 = 径向 */
+  int32_t type;        /* comp_gradient_type：0 线性 / 1 径向 / 2 角度 / 3 对称 / 4 菱形 */
   double  start_x;     /* 第一色标，文档像素坐标 */
   double  start_y;
   double  end_x;       /* 第二色标（线性）/ 半径终点（径向） */
@@ -957,6 +1002,25 @@ typedef struct comp_tool_op_desc {
    * 句柄只在本调用期间被读取，引擎不接管它的生命周期（仍由宿主 comp_font_release）。
    */
   comp_font        type_font;
+  /*
+   * P1-7 尾部追加（既有字段布局不变；宿主需用同一版本头文件编译）。
+   *
+   * 仅 COMP_TOOL_GRADIENT 读取：多色标与抖动开关。放在本结构体尾部而不是
+   * `comp_tool_gradient` 里，是为了让 `comp_tool_op_desc` 里既有字段的偏移
+   * 一个字节都不动。
+   *   - `gradient_stops[0..gradient_stop_count)` 非空且 count >= 2 时，完全替代
+   *     `gradient.color0/color1`；count == 0 或指针为 NULL 时走两色标旧路径
+   *     （像素结果与追加前逐字节一致）；
+   *   - count > COMP_TOOL_GRADIENT_MAX_STOPS 或指针为 NULL 而 count 非 0
+   *     -> COMP_ERR_INVALID_ARGUMENT；
+   *   - `gradient_dither` 非 0 = 对 RGB 加 ±0.5 LSB 的**确定性**抖动（同一坐标
+   *     永远同一偏移，重复执行逐字节一致），用来压 8 位渐变带；0 = 旧行为。
+   *
+   * 色标缓冲只在本次调用期间被读取并拷贝进引擎，引擎不接管生命周期。
+   */
+  const comp_gradient_stop* gradient_stops;
+  size_t                    gradient_stop_count;
+  int32_t                   gradient_dither;
 } comp_tool_op_desc;
 
 /*
@@ -1087,12 +1151,12 @@ COMP_API comp_result comp_layer_duplicate(comp_document document,
 /* ------------------------------------------- 效果参数元数据（P0-2 尾部追加） */
 
 /*
- * 已知效果类型（与 compositing/effect_eval.h 的 kEffectStroke..kEffectInnerGlow
+ * 已知效果类型（与 compositing/effect_eval.h 的 kEffectStroke..kEffectGradientOverlay
  * 及 shell ui_core 的 kEffectKindCount 数值一致）。
  *
  * 注意：这组枚举只用于**参数面板**。`comp_layer_set_effect` 的 effect 参数仍然
  * 不做白名单校验（未知 kind 原样落盘、不参与求值），本组接口对未知 kind 返回
- * COMP_ERR_INVALID_ARGUMENT —— 面板只编辑内核认识的 6 种，其它效果如实不提供编辑。
+ * COMP_ERR_INVALID_ARGUMENT —— 面板只编辑内核认识的 9 种，其它效果如实不提供编辑。
  */
 typedef enum comp_effect_kind {
   COMP_EFFECT_STROKE = 0,
@@ -1101,9 +1165,13 @@ typedef enum comp_effect_kind {
   COMP_EFFECT_INNER_SHADOW = 3,
   COMP_EFFECT_OUTER_GLOW = 4,
   COMP_EFFECT_INNER_GLOW = 5,
+  /* P1-1 尾部追加。 */
+  COMP_EFFECT_BEVEL = 6,
+  COMP_EFFECT_SATIN = 7,
+  COMP_EFFECT_GRADIENT_OVERLAY = 8,
 } comp_effect_kind;
 
-#define COMP_EFFECT_KIND_COUNT 6
+#define COMP_EFFECT_KIND_COUNT 9
 
 /*
  * 单个可编辑效果参数的元数据。`json_path` 是 settings 对象的**顶层键**
@@ -1258,6 +1326,15 @@ COMP_API comp_result comp_layer_get_pixels(comp_document document,
 
 /* ------------------------------------------- 可编辑文字图层（P0-6 ① 尾部追加） */
 
+/* 段落对齐方式（P0-6 ③ 尾部追加）：0 = 左 / 1 = 居中 / 2 = 右。
+ * 以 comp_text_desc.box_width 为基准；框宽为 0 时三种落点相同。 */
+typedef enum comp_text_align {
+  COMP_TEXT_ALIGN_LEFT = 0,
+  COMP_TEXT_ALIGN_CENTER = 1,
+  COMP_TEXT_ALIGN_RIGHT = 2,
+  COMP_TEXT_ALIGN_COUNT = 3
+} comp_text_align;
+
 /*
  * 文字图层描述（语义见 domain/text_object.h）。
  *
@@ -1287,6 +1364,13 @@ COMP_API comp_result comp_layer_get_pixels(comp_document document,
  * 越界或非有限 / 原点非有限或绝对值 > 1e6 / 颜色 alpha 为 0 / opacity 不在
  * (0, 1] / `_reserved` 非 0。文本框与画布完全不相交 -> COMP_ERR_INVALID_ARGUMENT
  * （不会建出一张看不见的层）。文本框面积超过画布上限同量级 -> COMP_ERR_UNSUPPORTED。
+ *
+ * 段落框（P0-6 ③，**尾部追加**，布局不变）：`box_width == 0` 时是「点文字」，
+ * 按内容自动定宽（与 P0-6 之前逐字节一致）；`box_width > 0` 时按框宽贪心折行，
+ * 断点取空格之后或宽字符（CJK/全角/Emoji）边界，一整段不可断的词比框还宽时
+ * 按字符硬断。`box_height > 0` 只负责裁切（超出框底的行不画），不参与折行。
+ * `align` 以框宽为基准（没有框宽时三种对齐落点相同）。两个框值都按**文档像素**
+ * 计，量程 [0, 1e6]；框宽/框高只声明其中一维时，另一维仍按内容尺寸。
  */
 typedef struct comp_text_desc {
   const char* text;        /* UTF-8；'\n' 断行；上级轨道仅 0x20..0x7E */
@@ -1299,6 +1383,11 @@ typedef struct comp_text_desc {
   const char* font_path_utf8; /* NULL/空 = 内置 5×7 点阵 ASCII */
   int32_t font_face_index; /* .ttc 面序号，0 = 第一面；无字体时忽略 */
   int32_t _reserved;       /* 必须为 0 */
+  /* ---- P0-6 ③ 尾部追加：段落框 ---- */
+  double box_width;        /* 0 = 按内容自动（点文字）；> 0 = 折行框宽 */
+  double box_height;       /* 0 = 不裁切；> 0 = 框高，超出部分不落墨 */
+  int32_t align;           /* comp_text_align；以 box_width 为基准 */
+  int32_t _reserved2;      /* 必须为 0 */
 } comp_text_desc;
 
 /*

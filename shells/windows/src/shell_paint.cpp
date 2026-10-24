@@ -349,6 +349,10 @@ std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptio
       return buffer;
     case comp_ui::ToolOptionId::GradientType:
       return widen_ascii(comp_ui::gradient_type_name(shell.gradient_type));
+    case comp_ui::ToolOptionId::GradientPreset:
+      return widen_ascii(comp_ui::gradient_preset_name(shell.gradient_preset));
+    case comp_ui::ToolOptionId::GradientDither:
+      return shell.gradient_dither ? L"开" : L"关";
     case comp_ui::ToolOptionId::ShapeKind:
       return widen_ascii(comp_ui::shape_kind_name(shell.shape_kind));
     case comp_ui::ToolOptionId::ShapeStrokeWidth:
@@ -360,6 +364,26 @@ std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptio
       return shell.clone_aligned ? L"开" : L"关";
     case comp_ui::ToolOptionId::HealMode:
       return widen_ascii(comp_ui::heal_mode_name(shell.heal_mode));
+    case comp_ui::ToolOptionId::TypeBoxWidth:
+    case comp_ui::ToolOptionId::TypeBoxHeight: {
+      const double value = spec.id == comp_ui::ToolOptionId::TypeBoxWidth
+                               ? shell.doc.type_box_width
+                               : shell.doc.type_box_height;
+      if (value <= 0.0) return L"自动"; /* 0 = 按内容（点文字） */
+      wsprintfW(buffer, L"%d px", static_cast<int>(value + 0.5));
+      return buffer;
+    }
+    case comp_ui::ToolOptionId::TypeAlign:
+      return widen_ascii(comp_ui::type_align_name(shell.doc.type_align));
+    case comp_ui::ToolOptionId::BrushPreset:
+      return widen_ascii(comp_ui::brush_preset_name(shell.brush_preset));
+    case comp_ui::ToolOptionId::BrushFlow:
+      wsprintfW(buffer, L"%d%%", static_cast<int>(comp_ui::clamp_brush_flow(shell.brush_flow) *
+                                                      100.0 +
+                                                  0.5));
+      return buffer;
+    case comp_ui::ToolOptionId::BrushPressure:
+      return shell.brush_pressure ? L"开" : L"关";
     default:
       return L"";
   }
@@ -376,9 +400,33 @@ bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
   switch (id) {
     case comp_ui::ToolOptionId::BrushSize:
       shell.brush_size = comp_ui::step_brush_size(shell.brush_size, delta);
+      shell.brush_preset = 0; /* 手改任一参数即脱离预设（显示退回「自定义」） */
       break;
     case comp_ui::ToolOptionId::BrushHardness:
       shell.brush_hardness = comp_ui::step_brush_hardness(shell.brush_hardness, delta);
+      shell.brush_preset = 0;
+      break;
+    case comp_ui::ToolOptionId::BrushPreset:
+      shell.brush_preset =
+          comp_ui::option_cycle_choice(shell.brush_preset, comp_ui::kBrushPresetCount, delta);
+      /*
+       * 预设是一张只读表：选中就把三个值**写回** ShellState，之后与预设无关
+       * （没有预设对象、没有副本，所以不会出现「改了画笔但预设名还在」）。
+       * 0 号「自定义」不覆盖任何值。
+       */
+      if (!comp_ui::brush_preset_is_custom(shell.brush_preset)) {
+        const comp_ui::BrushPresetSpec spec = comp_ui::brush_preset_spec(shell.brush_preset);
+        shell.brush_size = comp_ui::clamp_brush_size(spec.size);
+        shell.brush_hardness = comp_ui::clamp_brush_hardness(spec.hardness);
+        shell.brush_flow = comp_ui::clamp_brush_flow(spec.flow);
+      }
+      break;
+    case comp_ui::ToolOptionId::BrushFlow:
+      shell.brush_flow = comp_ui::step_brush_flow(shell.brush_flow, delta);
+      shell.brush_preset = 0;
+      break;
+    case comp_ui::ToolOptionId::BrushPressure:
+      shell.brush_pressure = !shell.brush_pressure;
       break;
     case comp_ui::ToolOptionId::WandTolerance:
       shell.wand_tolerance = comp_ui::step_wand_tolerance(shell.wand_tolerance, delta);
@@ -389,6 +437,13 @@ bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
     case comp_ui::ToolOptionId::GradientType:
       shell.gradient_type =
           comp_ui::option_cycle_choice(shell.gradient_type, comp_ui::kGradientTypeCount, delta);
+      break;
+    case comp_ui::ToolOptionId::GradientPreset:
+      shell.gradient_preset =
+          comp_ui::option_cycle_choice(shell.gradient_preset, comp_ui::kGradientPresetCount, delta);
+      break;
+    case comp_ui::ToolOptionId::GradientDither:
+      shell.gradient_dither = !shell.gradient_dither;
       break;
     case comp_ui::ToolOptionId::ShapeKind:
       shell.shape_kind =
@@ -405,6 +460,16 @@ bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
       break;
     case comp_ui::ToolOptionId::HealMode:
       shell.heal_mode = comp_ui::option_cycle_choice(shell.heal_mode, comp_ui::kHealModeCount, delta);
+      break;
+    case comp_ui::ToolOptionId::TypeBoxWidth:
+      shell.doc.type_box_width = comp_ui::step_type_box(shell.doc.type_box_width, delta);
+      break;
+    case comp_ui::ToolOptionId::TypeBoxHeight:
+      shell.doc.type_box_height = comp_ui::step_type_box(shell.doc.type_box_height, delta);
+      break;
+    case comp_ui::ToolOptionId::TypeAlign:
+      shell.doc.type_align =
+          comp_ui::option_cycle_choice(shell.doc.type_align, comp_ui::kTypeAlignCount, delta);
       break;
     default:
       return false;
@@ -626,7 +691,7 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
      *   [] = 组且隔离   （filter_graph 按 node.isolated 定 child_backdrop）
      * S24 追加：
      *   H / V = 已水平 / 垂直翻转（flip_x / flip_y，合成时折进变换矩阵）
-     *   fx    = 带效果        （effect_eval 的 6 种效果参与像素求值）
+     *   fx    = 带效果        （effect_eval 的图层效果参与像素求值）
      * 不另开一列图标区：22px 行高 + 248px 栏宽已经排满，标号跟着层名走最省地方。
      */
     std::wstring marks;
@@ -2183,12 +2248,45 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
     const int by = static_cast<int>(std::lround(b.y));
     MoveToEx(dc, ax, ay, nullptr);
     LineTo(dc, bx, by);
-    if (shell.gradient_type == comp_ui::kGradientRadial) {
+    if (shell.gradient_type == comp_ui::kGradientRadial ||
+        shell.gradient_type == comp_ui::kGradientAngle) {
       const double dx = b.x - a.x;
       const double dy = b.y - a.y;
       const int radius = static_cast<int>(std::lround(std::sqrt(dx * dx + dy * dy)));
       SelectObject(dc, dashed);
       Ellipse(dc, ax - radius, ay - radius, ax + radius, ay + radius);
+      SelectObject(dc, solid);
+    } else if (shell.gradient_type == comp_ui::kGradientReflected) {
+      /* 对称：起点两侧镜像，把反方向那条等长线也画成虚线。 */
+      const int mx =
+          static_cast<int>(std::lround(a.x - (b.x - a.x)));
+      const int my =
+          static_cast<int>(std::lround(a.y - (b.y - a.y)));
+      SelectObject(dc, dashed);
+      MoveToEx(dc, ax, ay, nullptr);
+      LineTo(dc, mx, my);
+      SelectObject(dc, solid);
+    } else if (shell.gradient_type == comp_ui::kGradientDiamond) {
+      /* 菱形：t = 1 的等值线是以起点为中心、沿轴向半对角线 = 拖拽长度的菱形。 */
+      const double dx = b.x - a.x;
+      const double dy = b.y - a.y;
+      const double length = std::sqrt(dx * dx + dy * dy);
+      POINT corners[4];
+      const double ux = length > 0.0 ? dx / length : 1.0;
+      const double uy = length > 0.0 ? dy / length : 0.0;
+      const double offsets[4][2] = {{ux * length, uy * length},
+                                    {-uy * length, ux * length},
+                                    {-ux * length, -uy * length},
+                                    {uy * length, -ux * length}};
+      for (int i = 0; i < 4; ++i) {
+        const comp_ui::Point p =
+            shell.doc.view.doc_to_screen(a.x + offsets[i][0], a.y + offsets[i][1],
+                                         layout.canvas, shell.doc.width, shell.doc.height);
+        corners[i].x = static_cast<LONG>(std::lround(p.x));
+        corners[i].y = static_cast<LONG>(std::lround(p.y));
+      }
+      SelectObject(dc, dashed);
+      Polygon(dc, corners, 4);
       SelectObject(dc, solid);
     }
     /* 起点 = 空心方框（色标 0），终点 = 实心小方块（色标 1）。 */
@@ -2315,7 +2413,7 @@ void draw_canvas_overlays(HDC dc, const ShellState& shell, const Layout& layout)
    * 字体轨道是 em 估计值，框线只是提示，宽度在面板/状态栏都标了「≈」。
    */
   if (shell.doc.type_active) {
-    const comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
+    const comp_ui::TypeBlockMetrics metrics = type_preview_metrics(shell);
     const comp_ui::Point origin = shell.doc.view.doc_to_screen(
         shell.doc.type_origin.x, shell.doc.type_origin.y, layout.canvas, shell.doc.width, shell.doc.height);
     const comp_ui::Point corner = shell.doc.view.doc_to_screen(

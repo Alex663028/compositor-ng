@@ -316,16 +316,27 @@ COMP_TEST(ui_core_layout_respects_panel_width_prefs) {
 
 COMP_TEST(ui_core_tool_options_bar) {
   /* 行集合是纯函数：绘制与命中共用 tool_option_count / tool_option，不能两处各写一张表。 */
-  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Brush) == 2);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Brush) == 5);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Eraser) == 5);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Retouch) == 2);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Clone) == 4);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Heal) == 3);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Wand) == 2);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Marquee) == 1);
-  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Gradient) == 1);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Gradient) == 3);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Shape) == 2);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Hand) == 0);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Move) == 0);
-  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Type) == 0); /* 文字参数在右栏 */
+  /* 文字的字号/行距/字体在右栏；段落框与对齐在选项栏（P0-6③，右栏四行已冻结）。 */
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Type) == 3);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Type, 0).id ==
+             comp_ui::ToolOptionId::TypeBoxWidth);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Type, 1).id ==
+             comp_ui::ToolOptionId::TypeBoxHeight);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Type, 2).id ==
+             comp_ui::ToolOptionId::TypeAlign);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Type, 2).kind ==
+             comp_ui::ToolOptionKind::Choice);
   COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Hand, 0).id == comp_ui::ToolOptionId::None);
 
   const comp_ui::ToolOptionSpec size = comp_ui::tool_option(comp_ui::ToolId::Brush, 0);
@@ -334,11 +345,32 @@ COMP_TEST(ui_core_tool_options_bar) {
   COMP_CHECK(size.min == static_cast<int>(comp_ui::kMinBrushSize));
   COMP_CHECK(size.max == static_cast<int>(comp_ui::kMaxBrushSize));
 
+  /*
+   * P1-4：画笔在「大小 / 硬度」**之后**追加预设/流量/压感。0/1 的下标是对外
+   * 契约——visual_check 的 options_bar 场景与上面的 size 断言都按这个顺序取，
+   * 以后新增组也只能继续往尾部加。
+   */
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 1).id ==
+             comp_ui::ToolOptionId::BrushHardness);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 2).id ==
+             comp_ui::ToolOptionId::BrushPreset);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 3).id ==
+             comp_ui::ToolOptionId::BrushFlow);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 4).id ==
+             comp_ui::ToolOptionId::BrushPressure);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 2).kind ==
+             comp_ui::ToolOptionKind::Choice);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 3).kind ==
+             comp_ui::ToolOptionKind::Stepper);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Brush, 5).id == comp_ui::ToolOptionId::None);
+  COMP_CHECK(comp_ui::tool_option(comp_ui::ToolId::Retouch, 2).id == comp_ui::ToolOptionId::None);
+
   const comp_ui::ToolId with_options[] = {
       comp_ui::ToolId::Brush,   comp_ui::ToolId::Eraser, comp_ui::ToolId::Heal,
       comp_ui::ToolId::Clone,   comp_ui::ToolId::Retouch, comp_ui::ToolId::Tone,
       comp_ui::ToolId::Marquee, comp_ui::ToolId::Lasso,  comp_ui::ToolId::Wand,
-      comp_ui::ToolId::Gradient, comp_ui::ToolId::Shape, comp_ui::ToolId::HistoryBrush};
+      comp_ui::ToolId::Gradient, comp_ui::ToolId::Shape, comp_ui::ToolId::HistoryBrush,
+      comp_ui::ToolId::Type};
   for (comp_ui::ToolId tool : with_options) {
     const int count = comp_ui::tool_option_count(tool);
     COMP_CHECK_MSG(count > 0, "tool with options must expose at least one row");
@@ -1335,6 +1367,47 @@ COMP_TEST(ui_core_brush_tip_and_retouch_strength_are_bounded) {
   COMP_CHECK(near_value(strength, comp_ui::kMinRetouchStrength));
 }
 
+COMP_TEST(ui_core_brush_preset_flow_and_pen_pressure) {
+  /* 预设表只读：0 号是「自定义」，它不覆盖任何值，只当当前状态的显示名。 */
+  COMP_CHECK(comp_ui::kBrushPresetCount == 5);
+  COMP_CHECK(std::string(comp_ui::brush_preset_name(0)) == "自定义");
+  COMP_CHECK(comp_ui::brush_preset_is_custom(0));
+  COMP_CHECK(comp_ui::brush_preset_is_custom(-3));
+  COMP_CHECK(!comp_ui::brush_preset_is_custom(1));
+  for (int i = 0; i < comp_ui::kBrushPresetCount; ++i) {
+    const comp_ui::BrushPresetSpec spec = comp_ui::brush_preset_spec(i);
+    COMP_CHECK(spec.name != nullptr && spec.name[0] != '\0');
+    /* 预设值必须自身就在夹取范围内——否则点一下就得到一个引擎会拒的笔。 */
+    COMP_CHECK(spec.size >= comp_ui::kMinBrushSize && spec.size <= comp_ui::kMaxBrushSize);
+    COMP_CHECK(spec.hardness >= 0.0 && spec.hardness <= 1.0);
+    COMP_CHECK(spec.flow >= comp_ui::kMinBrushFlow && spec.flow <= comp_ui::kMaxBrushFlow);
+  }
+  /* 越界下标读 0 号，不读表外内存。 */
+  COMP_CHECK(std::string(comp_ui::brush_preset_name(99)) == "自定义");
+
+  /* 流量：0..1；0 与 NaN 都回落到下限（flow = 0 会让整笔一个像素都不落）。 */
+  COMP_CHECK(near_value(comp_ui::clamp_brush_flow(0.5), 0.5));
+  COMP_CHECK(near_value(comp_ui::clamp_brush_flow(0.0), comp_ui::kMinBrushFlow));
+  COMP_CHECK(near_value(comp_ui::clamp_brush_flow(-2.0), comp_ui::kMinBrushFlow));
+  COMP_CHECK(near_value(comp_ui::clamp_brush_flow(std::nan("")), comp_ui::kMinBrushFlow));
+  COMP_CHECK(near_value(comp_ui::clamp_brush_flow(7.5), comp_ui::kMaxBrushFlow));
+  COMP_CHECK(near_value(comp_ui::step_brush_flow(1.0, 1), comp_ui::kMaxBrushFlow));
+  COMP_CHECK(near_value(comp_ui::step_brush_flow(1.0, -1), 0.95));
+  COMP_CHECK(near_value(comp_ui::step_brush_flow(0.03, -1), comp_ui::kMinBrushFlow));
+  COMP_CHECK(near_value(comp_ui::step_brush_flow(0.5, 0), 0.5));
+
+  /* 笔压：0..1024 -> 0..1；没有 PEN_MASK_PRESSURE（鼠标）一律满笔压 1.0。 */
+  COMP_CHECK(near_value(comp_ui::pen_pressure_to_unit(1024, true), 1.0));
+  COMP_CHECK(near_value(comp_ui::pen_pressure_to_unit(512, true), 0.5));
+  COMP_CHECK(near_value(comp_ui::pen_pressure_to_unit(0, true), 0.0));
+  COMP_CHECK(near_value(comp_ui::pen_pressure_to_unit(700, false), 1.0));
+
+  /* 整笔取采样平均；没有采样（鼠标路径）必须回落到 1.0，像素才与 P1-4 前一致。 */
+  COMP_CHECK(near_value(comp_ui::average_stroke_pressure(0.0, 0), 1.0));
+  COMP_CHECK(near_value(comp_ui::average_stroke_pressure(1.5, 3), 0.5));
+  COMP_CHECK(near_value(comp_ui::average_stroke_pressure(-1.0, 2), 1.0));
+}
+
 COMP_TEST(ui_core_tone_states_map_to_abi_operators_and_modes) {
   /* O 键循环：Dodge 中间调 -> 阴影 -> 高光 -> Burn 三档 -> Sponge 两档 -> 回到起点。 */
   COMP_CHECK(comp_ui::kToneStateCount == 8);
@@ -1883,15 +1956,25 @@ COMP_TEST(ui_core_gradient_type_cycles_and_drag_has_a_minimum_length) {
   /* 数值是 ABI（comp_tool_gradient.type）：外壳的镜像不得漂移。 */
   COMP_CHECK(comp_ui::kGradientLinear == 0);
   COMP_CHECK(comp_ui::kGradientRadial == 1);
-  COMP_CHECK(comp_ui::kGradientTypeCount == 2);
+  COMP_CHECK(comp_ui::kGradientAngle == 2);
+  COMP_CHECK(comp_ui::kGradientReflected == 3);
+  COMP_CHECK(comp_ui::kGradientDiamond == 4);
+  COMP_CHECK(comp_ui::kGradientTypeCount == 5);
   COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientLinear)) == "Linear");
   COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientRadial)) == "Radial");
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientAngle)) == "Angle");
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientReflected)) == "Reflected");
+  COMP_CHECK(std::string(comp_ui::gradient_type_name(comp_ui::kGradientDiamond)) == "Diamond");
   /* 未知值如实报 "?"（不猜成 Linear，便于面板暴露状态错乱）。 */
   COMP_CHECK(std::string(comp_ui::gradient_type_name(7)) == "?");
 
-  /* G 键循环：任意未知值都收敛回合法类型，不产生第三态。 */
+  /* G 键循环：五种类型首尾相接；任意未知值都收敛回线性。 */
   COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientLinear) == comp_ui::kGradientRadial);
-  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientRadial) == comp_ui::kGradientLinear);
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientRadial) == comp_ui::kGradientAngle);
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientAngle) ==
+             comp_ui::kGradientReflected);
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientReflected) == comp_ui::kGradientDiamond);
+  COMP_CHECK(comp_ui::next_gradient_type(comp_ui::kGradientDiamond) == comp_ui::kGradientLinear);
   COMP_CHECK(comp_ui::next_gradient_type(7) == comp_ui::kGradientLinear);
   COMP_CHECK(comp_ui::next_gradient_type(-1) == comp_ui::kGradientLinear);
 
@@ -1905,6 +1988,52 @@ COMP_TEST(ui_core_gradient_type_cycles_and_drag_has_a_minimum_length) {
   COMP_CHECK(comp_ui::gradient_drag_is_usable(10.0, 10.0, 11.0, 10.0));
   COMP_CHECK(comp_ui::gradient_drag_is_usable(10.0, 10.0, 10.0, 11.0));
   COMP_CHECK(comp_ui::gradient_drag_is_usable(0.0, 0.0, 300.0, 400.0));
+}
+
+COMP_TEST(ui_core_gradient_presets_expand_to_ascending_stop_tables) {
+  /* 预设表是外壳喂给 ABI 的唯一多色标来源：位置必须严格升序、中点必须在 (0,1)。 */
+  const uint8_t foreground[4] = {10, 20, 30, 255};
+  comp_ui::GradientPresetStop stops[5];
+
+  COMP_CHECK(comp_ui::kGradientPresetCount == 3);
+  for (int preset = 0; preset < comp_ui::kGradientPresetCount; ++preset) {
+    int is_foreground = -1;
+    const int expected = comp_ui::gradient_preset_stop_count(preset, &is_foreground);
+    COMP_CHECK(expected >= 2 && expected <= 5);
+    COMP_CHECK(is_foreground == (preset == 0 ? 1 : 0));
+    const int count = comp_ui::gradient_preset_stops(preset, foreground, false, stops, 5);
+    COMP_CHECK(count == expected);
+    COMP_CHECK(stops[0].position == 0.0);
+    COMP_CHECK(stops[count - 1].position == 1.0);
+    for (int i = 0; i < count; ++i) {
+      COMP_CHECK(stops[i].midpoint > 0.0 && stops[i].midpoint < 1.0);
+      if (i > 0) COMP_CHECK(stops[i].position > stops[i - 1].position);
+    }
+  }
+
+  /* 预设 0 用前景色：首色标不透明、末色标全透明。 */
+  int foreground_flag = 0;
+  COMP_CHECK(comp_ui::gradient_preset_stop_count(0, &foreground_flag) == 2);
+  COMP_CHECK(comp_ui::gradient_preset_stops(0, foreground, false, stops, 5) == 2);
+  COMP_CHECK(stops[0].color[0] == 10 && stops[0].color[1] == 20 && stops[0].color[2] == 30);
+  COMP_CHECK(stops[0].color[3] == 255 && stops[1].color[3] == 0);
+
+  /* 反向：位置镜像、颜色顺序翻转，段中点也镜像（反向段中点 = 1 - 原段中点）。 */
+  comp_ui::GradientPresetStop forward[5];
+  COMP_CHECK(comp_ui::gradient_preset_stops(2, foreground, false, forward, 5) == 5);
+  COMP_CHECK(comp_ui::gradient_preset_stops(2, foreground, true, stops, 5) == 5);
+  for (int i = 0; i < 3; ++i) {
+    for (int c = 0; c < 4; ++c) {
+      COMP_CHECK(stops[i].color[c] == forward[4 - i].color[c]);
+    }
+  }
+  COMP_CHECK(stops[0].position == 0.0 && stops[4].position == 1.0);
+  COMP_CHECK(std::fabs(stops[0].midpoint - (1.0 - forward[3].midpoint)) < 1e-12);
+  COMP_CHECK(std::fabs(stops[1].midpoint - (1.0 - forward[2].midpoint)) < 1e-12);
+
+  /* 容量不足时返回 0，且不写半张表（调用方据此走两色标旧路径）。 */
+  comp_ui::GradientPresetStop small[2];
+  COMP_CHECK(comp_ui::gradient_preset_stops(2, foreground, false, small, 2) == 0);
 }
 
 COMP_TEST(ui_core_shape_kind_cycles_and_drag_box_matches_modifiers) {
@@ -2231,6 +2360,46 @@ COMP_TEST(ui_core_type_panel_rows_steps_and_hit_testing) {
   const comp_ui::Rect row_rect = comp_ui::type_param_row_rect(panel, 2);
   COMP_CHECK(row_rect.x == 1000 && row_rect.y == 46 + 54 + 2 * 20 && row_rect.w == 330 &&
              row_rect.h == 20);
+}
+
+/*
+ * P0-6③ 段落框：0 = 自动（点文字），从自动起跳给一个能看见折行的宽度，之后
+ * 乘性增长并量化到 16 px；向下退到最小值再退一步回自动。对齐三档与
+ * comp_text_align 同值。
+ */
+COMP_TEST(ui_core_type_paragraph_box_steps_and_alignment) {
+  /* 夹取：非正值 / NaN 一律 0（自动），上限 8192。 */
+  COMP_CHECK(comp_ui::clamp_type_box(0.0) == 0.0);
+  COMP_CHECK(comp_ui::clamp_type_box(-40.0) == 0.0);
+  COMP_CHECK(comp_ui::clamp_type_box(std::nan("")) == 0.0);
+  COMP_CHECK(comp_ui::clamp_type_box(1.0) == comp_ui::kTypeBoxMin);
+  COMP_CHECK(comp_ui::clamp_type_box(1e9) == comp_ui::kTypeBoxMax);
+
+  /* 从自动向上 = 128；之后 ×1.25 并向上量化到 16。 */
+  COMP_CHECK(comp_ui::step_type_box(0.0, 1) == comp_ui::kTypeBoxStart);
+  COMP_CHECK(comp_ui::step_type_box(comp_ui::kTypeBoxStart, 1) == 160.0);
+  COMP_CHECK(comp_ui::step_type_box(160.0, 1) == 208.0);
+  /* 向下：大于起点按 ÷1.25 向下量化；到起点再退一步回自动。 */
+  COMP_CHECK(comp_ui::step_type_box(160.0, -1) == 128.0);
+  COMP_CHECK(comp_ui::step_type_box(comp_ui::kTypeBoxStart, -1) == 0.0);
+  COMP_CHECK(comp_ui::step_type_box(0.0, -1) == 0.0);
+  /* 0 方向 = 原样夹取（不制造第四种状态）。 */
+  COMP_CHECK(comp_ui::step_type_box(0.0, 0) == 0.0);
+  COMP_CHECK(comp_ui::step_type_box(200.0, 0) == 200.0);
+  /* 上限封顶：再往上也不越过 8192。 */
+  COMP_CHECK(comp_ui::step_type_box(comp_ui::kTypeBoxMax, 1) == comp_ui::kTypeBoxMax);
+
+  /* 对齐：三档、与引擎枚举同值、循环走环。 */
+  COMP_CHECK(comp_ui::kTypeAlignLeft == 0 && comp_ui::kTypeAlignCenter == 1 &&
+             comp_ui::kTypeAlignRight == 2 && comp_ui::kTypeAlignCount == 3);
+  COMP_CHECK(std::string(comp_ui::type_align_name(comp_ui::kTypeAlignLeft)) == "左对齐");
+  COMP_CHECK(std::string(comp_ui::type_align_name(comp_ui::kTypeAlignCenter)) == "居中");
+  COMP_CHECK(std::string(comp_ui::type_align_name(comp_ui::kTypeAlignRight)) == "右对齐");
+  COMP_CHECK(std::string(comp_ui::type_align_name(99)) == "左对齐");
+  COMP_CHECK(comp_ui::option_cycle_choice(comp_ui::kTypeAlignLeft, comp_ui::kTypeAlignCount, 1) ==
+             comp_ui::kTypeAlignCenter);
+  COMP_CHECK(comp_ui::option_cycle_choice(comp_ui::kTypeAlignRight, comp_ui::kTypeAlignCount, 1) ==
+             comp_ui::kTypeAlignLeft);
 }
 
 /* ---------------------------------------------------------- 混合模式（S21） */
@@ -3057,14 +3226,15 @@ COMP_TEST(ui_core_layer_menu_rasterize_text_needs_text_layer) {
 /*
  * 效果档位表（S24）。
  *
- * 数值 0..5 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序
- * （effect_eval.cpp 的 kEffectStroke..kEffectInnerGlow）逐字一致：菜单 id 用
+ * 数值 0..8 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序
+ * （effect_eval.cpp 的 kEffectStroke..kEffectGradientOverlay）逐字一致：菜单 id 用
  * kCmdEffectBase + kind 拼出来，表错一位就是「点描边结果加了投影」。
  */
 COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
-  const char* expected[] = {"Stroke",  "Drop Shadow", "Color Overlay",
-                            "Inner Shadow", "Outer Glow", "Inner Glow"};
-  COMP_CHECK(comp_ui::kEffectKindCount == 6);
+  const char* expected[] = {"Stroke",     "Drop Shadow", "Color Overlay",
+                            "Inner Shadow", "Outer Glow", "Inner Glow",
+                            "Bevel & Emboss", "Satin",   "Gradient Overlay"};
+  COMP_CHECK(comp_ui::kEffectKindCount == 9);
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
     COMP_CHECK_MSG(std::string(comp_ui::effect_kind_name(kind)) == expected[kind],
                    "效果档位顺序必须与引擎一致");
@@ -3075,7 +3245,7 @@ COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
   COMP_CHECK(comp_ui::clamp_effect_kind(comp_ui::kEffectKindCount) ==
              comp_ui::kEffectKindCount - 1);
   COMP_CHECK(std::string(comp_ui::effect_kind_name(-1)) == "Stroke");
-  COMP_CHECK(std::string(comp_ui::effect_kind_name(99)) == "Inner Glow");
+  COMP_CHECK(std::string(comp_ui::effect_kind_name(99)) == "Gradient Overlay");
 
   /* 勾选判定：null / 空表必须 false，命中与未命中都要对。 */
   const uint32_t kinds[] = {2u, 5u};

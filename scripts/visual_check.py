@@ -97,9 +97,10 @@ CMD_ADJ_VALUE_UP = 1021
 # 面板动作号落在 1220 段：滤镜序号涨到 11 个（1200..1210）后，1210 已经是
 # Sharpen 的菜单项，旧的应用号会和它抢同一个 id（见 shell_state.h）。
 CMD_FILTER_APPLY = 1220
-# 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..15 是本仓追加的破坏性调整
-# （Brightness/Contrast、Desaturate、Threshold、Posterize），0..11 里只有逐像素可做的
-# 那几项才发号（见 shells/windows/src/shell_state.h::kImageAdjustKinds）。
+# 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..24 是本仓追加的破坏性调整
+# （亮度对比、去色、阈值、色调分离、自然饱和度、可选颜色、照片滤镜、通道混合器、
+# 颜色查找、阴影高光、自动三档），0..11 里只有逐像素可做的那几项才发号
+# （见 shells/windows/src/shell_state.h::kImageAdjustKinds）。
 CMD_IMAGE_ADJUST_BASE = 1590
 CMD_NEW_DOCUMENT_DIALOG = 1560
 CMD_SAVE_AS = 1561
@@ -2140,6 +2141,120 @@ def scene_options_bar(shell, checker):
                       "画布变化像素 %d" % pixel_diff(img_choice, img_shape, canvas, 24))
 
 
+def scene_brush_options(shell, checker):
+    """
+    P1-4 画笔选项：预设 / 流量 / 压感。
+
+    压感需要真实数位笔；本脚本只能合成鼠标消息（系统把笔提升成鼠标的路径上
+    恒为满笔压），所以这里不假装测压感，只测**它不改变鼠标像素**，外加两条
+    用户真能点的路：
+      1. 画笔选项栏有 5 组，第 2/3/4 组是预设/流量/压感（0/1 仍是大小/硬度）；
+      2. 流量 100% -> 50% 后，同一落点的橙色覆盖明显变少；
+      3. 点一次「预设」（硬边圆）把流量/硬度写回，覆盖回到满流量水平；
+      4. 压感开关能点（值文本 开 -> 关），画布一个像素都不动。
+    """
+    scene = "brush_options"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    cx, cy = (left + right) // 2, (top + bottom) // 2 - 80
+
+    # 先换前景色（Shift+X 十六进制键入），否则黑笔在空文档上看不见。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("brush")
+    shell.wait(0.2)
+
+    group4 = shell.option_group_rect(4)
+    checker.check(scene, "画笔选项栏排到第 5 组（0 大小 / 1 硬度 / 2 预设 / 3 流量 / 4 压感）",
+                  group4 is not None and group4[2] <= shell.layout["options"][2],
+                  "group4=%s bar=%s" % (group4, shell.layout["options"]))
+    preset_control = shell.option_control_rect(2)
+    flow_control = shell.option_control_rect(3)
+    pressure_control = shell.option_control_rect(4)
+    checker.check(scene, "预设/流量/压感三组控件盒都可见",
+                  preset_control is not None and flow_control is not None and
+                  pressure_control is not None,
+                  "preset=%s flow=%s pressure=%s" % (preset_control, flow_control,
+                                                     pressure_control))
+    if preset_control is None or flow_control is None or pressure_control is None:
+        return
+
+    box = (cx - 80, cy - 80, cx + 80, cy + 80)
+
+    def tint_count(shot):
+        """落点里「偏橙」的像素数：满流量是强橙，半流量是浅橙，都算画上了。"""
+        data = shot.crop(box).convert("RGB").tobytes()
+        count = 0
+        for index in range(0, len(data), 3):
+            if data[index] - data[index + 2] > 40:
+                count += 1
+        return count
+
+    def dot_shot(tag):
+        """同一落点画一点 -> 数橙色像素 -> 撤销（保证下一次从干净画布开始）。"""
+        shell.drag(cx - 2, cy, cx + 2, cy, steps=3)
+        shell.wait(0.2)
+        shot = shell.shot(tag)
+        strong = count_matching(shot, box, (255, 136, 0), 60)
+        tinted = tint_count(shot)
+        shell.press(ord("Z"), ctrl=True)
+        shell.wait(0.2)
+        return strong, tinted
+
+    full, full_tint = dot_shot("113_brush_options_full")
+    checker.check(scene, "满流量落点有橙色像素", full > 0 and full_tint > 0,
+                  "强橙 %d / 偏橙 %d" % (full, full_tint))
+
+    # 流量 100% -> 50%：每组单击 -5%，十下。
+    flow_before = shell.shot("114_brush_options_flow_before")
+    flow_arrow = (flow_control[0] + OPTION_ARROW_W // 2,
+                  (flow_control[1] + flow_control[3]) // 2)
+    for _ in range(10):
+        shell.click(flow_arrow[0], flow_arrow[1])
+        shell.wait(0.05)
+    shell.wait(0.2)
+    flow_after = shell.shot("115_brush_options_flow_50")
+    flow_text_diff = pixel_diff(flow_after, flow_before, flow_control, 24)
+    checker.check(scene, "流量箭头的值文本变化", flow_text_diff > 20,
+                  "值区变化像素 %d" % flow_text_diff)
+    low, low_tint = dot_shot("116_brush_options_flow_low")
+    checker.check(scene, "流量 50% 仍然落墨（浅橙），但强橙覆盖少于满流量",
+                  low_tint > 0 and low < full,
+                  "满 %d/%d -> 50%% 强橙 %d / 偏橙 %d" % (full, full_tint, low, low_tint))
+
+    # 点一次「预设」：下标 1 = 硬边圆（24 px / 硬度 100% / 流量 100%）。
+    preset_before = shell.shot("117_brush_options_preset_before")
+    shell.click((preset_control[0] + preset_control[2]) // 2,
+                (preset_control[1] + preset_control[3]) // 2)
+    shell.wait(0.3)
+    preset_after = shell.shot("118_brush_options_preset_after")
+    preset_text_diff = pixel_diff(preset_after, preset_before, preset_control, 24)
+    checker.check(scene, "点预设后值文本变化", preset_text_diff > 20,
+                  "值区变化像素 %d" % preset_text_diff)
+    restored, restored_tint = dot_shot("119_brush_options_preset_dot")
+    checker.check(scene, "预设把流量写回后强橙覆盖恢复", restored > low and restored > 0,
+                  "50%% %d -> 预设 %d（偏橙 %d）" % (low, restored, restored_tint))
+
+    # 压感开关：鼠标路径没有笔压，点一下只改显示。先把指针移出画布，免得两次
+    # 截图之间笔尖轮廓消失被算成「画布变了」。
+    canvas = shell.layout["canvas"]
+    bar = shell.layout["options"]
+    shell.click(bar[2] - 10, (bar[1] + bar[3]) // 2)
+    shell.wait(0.2)
+    pressure_before = shell.shot("120_brush_options_pressure_before")
+    shell.click((pressure_control[0] + pressure_control[2]) // 2,
+                (pressure_control[1] + pressure_control[3]) // 2)
+    shell.wait(0.3)
+    pressure_after = shell.shot("121_brush_options_pressure_off")
+    pressure_text_diff = pixel_diff(pressure_after, pressure_before, pressure_control, 24)
+    checker.check(scene, "压感开关的值文本变化（开 -> 关）", pressure_text_diff > 20,
+                  "值区变化像素 %d" % pressure_text_diff)
+    pressure_canvas_diff = pixel_diff(pressure_after, pressure_before, canvas, 24)
+    checker.check(scene, "压感开关不碰画布", pressure_canvas_diff == 0,
+                  "画布变化像素 %d" % pressure_canvas_diff)
+
+
 def long_bright_rows(img, xa, xb, y_from, y_to, min_px=60, threshold=150):
     """横跨整幅的蚂蚁线所在行（长亮行）。
 
@@ -2257,6 +2372,83 @@ def scene_selection_modify(shell, checker):
     checker.check(scene, "平滑撤销一步后回到矩形（角部虚线复原）",
                   rows_undo == [line_row] and v_undo >= 6 and h_undo >= 6,
                   "长亮行 %s、竖窗 %d、横窗 %d" % (rows_undo, v_undo, h_undo))
+
+
+def scene_selection_grow(shell, checker):
+    """
+    P0-5 收尾：选择 > 扩大选取 / 选取相似 的端到端链路。
+
+    失败方式各自单独量：
+      1. 菜单项没接上（WM_COMMAND 被吞）——选区原地不动，上边线不动；
+      2. 命令跑了但边界算错方向——旧上边线没消失，或新线不在矩形上边；
+      3. 命令真改了选区但没落撤销步——Ctrl+Z 回不到小矩形；
+      4. 「选取相似」在选区已经吃满同色区域后还硬塞一条撤销步——
+         一次 Ctrl+Z 退的是相似而不是扩大。
+
+    做法：形状工具画一块**实心**矩形（硬边、单色 0066cc，四周是画布黑），
+    在它内部拖一个小矩形选区；扩大选取（容差取壳上魔棒默认 32）应把选区
+    吃到整块矩形：上边线从矩形内部的 my0 外扩到矩形上边 y0；选取相似此时
+    已没有同色新像素，边界不动；一次 Ctrl+Z 退回小矩形选区。
+
+    用形状而不是画笔：画笔硬度 75% 的软边在容差 32 下会一路漫进黑底，
+    边界不在矩形边上，就量不到「停在颜色边界」这个承诺。填充色必须选
+    R 通道 < 150 的（这里是 0066cc）：long_bright_rows 数的是 R>=150 的
+    像素，亮橙色填充会把整块矩形都算成「长亮行」，蚂蚁线就淹没了。
+    """
+    scene = "selection_grow"
+    cmd_grow = 1060     # shell_state.h: kCmdSelectGrow
+    cmd_similar = 1061  # shell_state.h: kCmdSelectSimilar
+    left, top, right, bottom = shell.document_rect()
+    x0, y0 = left + 90, top + 90
+    x1, y1 = right - 90, bottom - 90
+
+    shell.press(ord("X"), shift=True)
+    shell.type_text("0066cc")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(x0, y0, x1, y1, steps=10)
+
+    shell.select_tool("marquee")
+    mx0, my0 = x0 + 70, y0 + 70
+    mx1, my1 = x1 - 70, y1 - 70
+    shell.drag(mx0, my0, mx1, my1, steps=10)
+    before = shell.shot("59_grow_marquee")
+    rows_before = long_bright_rows(before, mx0 + 40, mx1 - 40, my0 - 16, my0 + 16)
+    checker.check(scene, "前置：小矩形选区的上边是一条长亮行",
+                  len(rows_before) == 1, "长亮行 %s" % rows_before)
+    line_row = rows_before[0] if rows_before else my0
+
+    # 扩大选取：上边从 my0 外扩到矩形上边 y0，旧线必须消失。
+    shell.command(cmd_grow)
+    grown = shell.shot("60_grow_result")
+    old_rows = long_bright_rows(grown, mx0 + 40, mx1 - 40, my0 - 16, my0 + 16)
+    new_rows = long_bright_rows(grown, mx0 + 40, mx1 - 40, y0 - 16, y0 + 16)
+    checker.check(scene, "扩大选取：旧上边线消失、外扩到矩形上边",
+                  not old_rows and len(new_rows) == 1 and abs(new_rows[0] - y0) <= 2,
+                  "旧行 %s、新行 %s（矩形上边 %d）" % (old_rows, new_rows, y0))
+    status_grow = pixel_diff(grown, before, shell.layout["status"], 24)
+    checker.check(scene, "状态栏报告「已扩大选取」", status_grow > 20,
+                  "状态栏变化像素 %d" % status_grow)
+
+    # 选取相似：同色区域已选满 -> 边界不动（不新增撤销步）。
+    shell.command(cmd_similar)
+    similar = shell.shot("61_similar_result")
+    rows_similar = long_bright_rows(similar, mx0 + 40, mx1 - 40, y0 - 16, y0 + 16)
+    old_similar = long_bright_rows(similar, mx0 + 40, mx1 - 40, my0 - 16, my0 + 16)
+    checker.check(scene, "选取相似：同色区域已选满，边界不动",
+                  not old_similar and len(rows_similar) == 1 and
+                  abs(rows_similar[0] - y0) <= 2,
+                  "长亮行 %s（旧线窗口 %s）" % (rows_similar, old_similar))
+
+    # 一次 Ctrl+Z 必须退回小矩形：相似没有占撤销步。
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.3)
+    undone = shell.shot("62_grow_undo")
+    rows_undo = long_bright_rows(undone, mx0 + 40, mx1 - 40, my0 - 16, my0 + 16)
+    grown_undo = long_bright_rows(undone, mx0 + 40, mx1 - 40, y0 - 16, y0 + 16)
+    checker.check(scene, "Ctrl+Z 一步退回小矩形选区",
+                  len(rows_undo) == 1 and abs(rows_undo[0] - line_row) <= 1 and not grown_undo,
+                  "长亮行 %s（原线 %d）、矩形上边窗口 %s" % (rows_undo, line_row, grown_undo))
 
 
 def selftest_has_io_roundtrip():
@@ -2480,9 +2672,9 @@ def scene_destructive_adjust(shell, checker):
     """ROI #8：图像 > 调整 的破坏性落墨（命令号 1590 + kind）。
 
     与 `adjustment` / `curve_levels` 的分工：那两场验的是**调整图层**（非破坏、可再
-    编辑）；这里验的是同一批求值器的一次性落墨入口。四条断言对应四条契约：面板能
-    开（标题换字样，说明不是新增调整图层）、落墨真的改像素、一次 Ctrl+Z 能回去、
-    结果没变的那次落墨**不进历史**。
+    编辑）；这里验的是同一批求值器的一次性落墨入口。断言覆盖：面板能开（标题换字样，
+    说明不是新增调整图层）、落墨真的改像素、一次 Ctrl+Z 能回去、结果没变的那次落墨
+    **不进历史**、零参数 kind（自动色调）单击即落墨不进面板。
     """
     scene = "destructive_adjust"
     doc = shell.document_rect()
@@ -2583,12 +2775,43 @@ def scene_destructive_adjust(shell, checker):
                   "Posterize 后 %s 曲线后 %s" % (poster, curved))
 
     # 6) Esc 只退破坏性态：标题回到「调整（Adjustment）」，且像素不再被落墨。
+    #    必须紧跟在一段破坏性面板会话之后验——再开别的面板会换掉标题带基线。
     shell.press(VK_ESCAPE)
     shell.wait(0.2)
     img = shell.shot("109_escaped")
     checker.check(scene, "Esc 退出破坏性模式（标题回到 Adjustment）",
                   pixel_diff(idle_title, img, title_band) == 0,
                   "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
+
+    # 7) 1590+18 = Photo Filter：5 行参数，Tab 到 density（第 4 行）后 100% 加温。
+    #    这条同时验证「追加 kind 的参数表能经 ABI 送到外壳」——面板行数由
+    #    comp_layer_adjustment_param_count 决定，外壳没有第二张表。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 18)
+    img = shell.shot("110_photo_filter_panel")
+    checker.check(scene, "图像 > 调整 > Photo Filter 打开破坏性面板",
+                  pixel_diff(idle_title, img, title_band) > 20,
+                  "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
+    for _ in range(3):
+        shell.press(VK_TAB)
+    shell.type_text("100")
+    shell.press(VK_RETURN)
+    shell.press(ord("U"), ctrl=True, shift=True)
+    shell.wait(0.8)
+    img = shell.shot("111_photo_filter_applied")
+    warm = mean_rgb(img, region)
+    checker.check(scene, "加温滤镜 100% 把灰推成暖色（R 明显高于 B）",
+                  warm[0] - warm[2] > 30,
+                  "落墨后 %s" % (warm,))
+
+    # 8) 1590+22 = Auto Tone：无参数，必须**不进面板态**（标题带保持 Adjustment）。
+    #    若零参数 kind 误走面板路径，这里会看到标题换字样。
+    shell.command(CMD_IMAGE_ADJUST_BASE + 22)
+    shell.wait(0.6)
+    img = shell.shot("112_auto_tone")
+    checker.check(scene, "自动色调单击即落墨、不打开参数面板",
+                  pixel_diff(idle_title, img, title_band) == 0,
+                  "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
+
 
 
 SCENES = [    ("start", scene_start, ()),
@@ -2615,10 +2838,12 @@ SCENES = [    ("start", scene_start, ()),
     ("close_prompt", scene_close_prompt, ()),
     ("options_bar", scene_options_bar, ()),
     ("selection_modify", scene_selection_modify, ()),
+    ("selection_grow", scene_selection_grow, ()),
     ("text_layer", scene_text_layer, ()),
     ("font_picker", scene_font_picker, ()),
     ("guides", scene_guides, ()),
     ("destructive_adjust", scene_destructive_adjust, ()),
+    ("brush_options", scene_brush_options, ()),
 ]
 
 

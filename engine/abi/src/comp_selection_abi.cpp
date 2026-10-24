@@ -489,6 +489,63 @@ comp_result comp_selection_apply_color_range(comp_document document, const uint8
   COMP_ABI_CATCH(engine)
 }
 
+/* ------------------------------------------- 扩大 / 选取相似（P0-5） */
+
+comp_result comp_selection_grow(comp_document document, int32_t tolerance, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 轻量参数闸在 ImplicitTxn 之前：非法参数不留半成品、不进撤销栈。 */
+  if (tolerance < 0 || tolerance > 255) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "grow tolerance out of 0..255");
+  }
+
+  const compositor::DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, "Grow Selection");
+  bool changed = false;
+  std::string error;
+  const comp_result code = compositor::selection_grow(
+      &doc->selection(), state.width, state.height, *doc, tolerance, &changed, &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(engine, code,
+                                 error.empty() ? "grow selection failed" : error);
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_selection_similar(comp_document document, int32_t tolerance,
+                                   int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 轻量参数闸在 ImplicitTxn 之前：非法参数不留半成品、不进撤销栈。 */
+  if (tolerance < 0 || tolerance > 255) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "similar tolerance out of 0..255");
+  }
+
+  const compositor::DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, "Similar Selection");
+  bool changed = false;
+  std::string error;
+  const comp_result code = compositor::selection_similar(
+      &doc->selection(), state.width, state.height, *doc, tolerance, &changed, &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(engine, code,
+                                 error.empty() ? "similar selection failed" : error);
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
 /* ------------------------------------------------------- 手柄重采样（S46） */
 
 comp_result comp_selection_get_base_bounds(comp_document document, comp_rect* out_bounds) {

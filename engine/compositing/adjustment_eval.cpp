@@ -669,6 +669,117 @@ bool apply_posterize(uint8_t* buf, int32_t width, int32_t height, size_t stride,
   return true;
 }
 
+/* kind 16 — Vibrance（自然饱和度）。 */
+bool apply_vibrance(uint8_t* buf, int32_t width, int32_t height, size_t stride, const Settings& s) {
+  const double vibrance = s.clamp(s.number("vibranceSettings", "vibrance", 0.0), -100.0, 100.0);
+  const double saturation = s.clamp(s.number("vibranceSettings", "saturation", 0.0), -100.0, 100.0);
+  if (vibrance == 0.0 && saturation == 0.0) return false;
+  adjust_vibrance(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, vibrance,
+                  saturation);
+  return true;
+}
+
+/* kind 17 — Selective Color（可选颜色）。 */
+bool apply_selective_color(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                           const Settings& s) {
+  float ranges[9 * 4] = {0.0f};
+  bool any = false;
+  const JsonValue* node = s.root.find("selectiveColorSettings");
+  const JsonValue* list = node == nullptr ? nullptr : node->find("ranges");
+  if (list != nullptr && list->is_array()) {
+    const JsonValue::Array& arr = list->as_array();
+    for (size_t i = 0; i < arr.size() && i < 9; ++i) {
+      const JsonValue& entry = arr[i];
+      if (!entry.is_object()) continue;
+      const double cyan = std::clamp(entry.number_or("cyan", 0.0), -100.0, 100.0) / 100.0;
+      const double magenta = std::clamp(entry.number_or("magenta", 0.0), -100.0, 100.0) / 100.0;
+      const double yellow = std::clamp(entry.number_or("yellow", 0.0), -100.0, 100.0) / 100.0;
+      const double black = std::clamp(entry.number_or("black", 0.0), -100.0, 100.0) / 100.0;
+      ranges[i * 4 + 0] = static_cast<float>(cyan);
+      ranges[i * 4 + 1] = static_cast<float>(magenta);
+      ranges[i * 4 + 2] = static_cast<float>(yellow);
+      ranges[i * 4 + 3] = static_cast<float>(black);
+      any = any || cyan != 0.0 || magenta != 0.0 || yellow != 0.0 || black != 0.0;
+    }
+  }
+  if (!any) return false;
+  const bool relative = node != nullptr && node->bool_or("relative", false);
+  adjust_selective_color(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride,
+                         ranges, relative ? 1 : 0);
+  return true;
+}
+
+/* kind 18 — Photo Filter（照片滤镜）。 */
+bool apply_photo_filter(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                        const Settings& s) {
+  const double density = s.clamp(s.number("photoFilterSettings", "density", 25.0), 0.0, 100.0);
+  if (density <= 0.0) return false;
+  const double r = s.clamp(s.number("photoFilterSettings", "color", "red", 0.93), 0.0, 1.0);
+  const double g = s.clamp(s.number("photoFilterSettings", "color", "green", 0.66), 0.0, 1.0);
+  const double b = s.clamp(s.number("photoFilterSettings", "color", "blue", 0.35), 0.0, 1.0);
+  const JsonValue* node = s.root.find("photoFilterSettings");
+  const bool preserve = node == nullptr || node->bool_or("preserveLuminosity", true);
+  adjust_photo_filter(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, r, g, b,
+                      density, preserve ? 1 : 0);
+  return true;
+}
+
+/* kind 19 — Channel Mixer（通道混合器）。 */
+bool apply_channel_mixer(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                         const Settings& s) {
+  static const char* const kKeys[12] = {
+      "redRed", "redGreen", "redBlue", "redConstant",   "greenRed",   "greenGreen",
+      "greenBlue", "greenConstant", "blueRed",     "blueGreen", "blueBlue", "blueConstant",
+  };
+  const JsonValue* node = s.root.find("channelMixerSettings");
+  if (node == nullptr) return false;
+  double matrix[12];
+  double defaults[12] = {1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+  bool identity = true;
+  for (int i = 0; i < 12; ++i) {
+    matrix[i] = std::clamp(node->number_or(kKeys[i], defaults[i]), -2.0, 2.0);
+    if (std::fabs(matrix[i] - defaults[i]) > 1e-9) identity = false;
+  }
+  if (identity) return false;
+  adjust_channel_mixer(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, matrix);
+  return true;
+}
+
+/* kind 20 — Color Lookup（查找颜色），内置外观。 */
+bool apply_color_lookup(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                        const Settings& s) {
+  const double intensity = s.clamp(s.number("colorLookupSettings", "intensity", 100.0), 0.0, 100.0);
+  if (intensity <= 0.0) return false;
+  const int look = static_cast<int>(
+      std::lround(s.clamp(s.number("colorLookupSettings", "look", 0.0), 0.0, 4.0)));
+  adjust_color_lookup(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, look,
+                      intensity);
+  return true;
+}
+
+/* kind 21 — Shadows/Highlights（阴影/高光）。 */
+bool apply_shadows_highlights(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                              const Settings& s) {
+  const double shadows = s.clamp(s.number("shadowsHighlightsSettings", "shadows", 0.0), -100.0, 100.0);
+  const double highlights =
+      s.clamp(s.number("shadowsHighlightsSettings", "highlights", 0.0), -100.0, 100.0);
+  if (shadows == 0.0 && highlights == 0.0) return false;
+  const double shadowWidth =
+      s.clamp(s.number("shadowsHighlightsSettings", "shadowWidth", 50.0), 0.0, 100.0);
+  const double highlightWidth =
+      s.clamp(s.number("shadowsHighlightsSettings", "highlightWidth", 50.0), 0.0, 100.0);
+  const double radius = s.clamp(s.number("shadowsHighlightsSettings", "radius", 30.0), 1.0, 100.0);
+  adjust_shadows_highlights(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride,
+                            shadows, shadowWidth, highlights, highlightWidth, radius);
+  return true;
+}
+
+/* kind 22..24 — Auto Tone / Contrast / Color。参数为空，读图自算。 */
+bool apply_auto(uint8_t* buf, int32_t width, int32_t height, size_t stride, int mode) {
+  adjust_auto(buf, static_cast<size_t>(width), static_cast<size_t>(height), stride, mode);
+  return true;
+}
+
 /*
  * 单条调整的 8 位求值（kind 已确认被支持）。返回「是否真的改变了像素」。
  *
@@ -696,6 +807,15 @@ bool apply_adjustment_eight_bit(uint8_t* buf, int32_t width, int32_t height, siz
     case 13: return apply_desaturate(buf, width, height, stride, settings);
     case 14: return apply_threshold(buf, width, height, stride, settings);
     case 15: return apply_posterize(buf, width, height, stride, settings);
+    case 16: return apply_vibrance(buf, width, height, stride, settings);
+    case 17: return apply_selective_color(buf, width, height, stride, settings);
+    case 18: return apply_photo_filter(buf, width, height, stride, settings);
+    case 19: return apply_channel_mixer(buf, width, height, stride, settings);
+    case 20: return apply_color_lookup(buf, width, height, stride, settings);
+    case 21: return apply_shadows_highlights(buf, width, height, stride, settings);
+    case 22: return apply_auto(buf, width, height, stride, 0);
+    case 23: return apply_auto(buf, width, height, stride, 1);
+    case 24: return apply_auto(buf, width, height, stride, 2);
     default: return false;
   }
 }
@@ -848,7 +968,8 @@ bool apply_adjustments_hdr(const std::vector<Adjustment>& adjustments, uint16_t*
        * 渐变映射/黑白/色彩平衡的 8 位内核跨通道，用 mixesChannels 的 10 趟布局；
        * 逐通道的调整用 4 趟即可。模糊（7/8）也走这里——见头文件记录的能力边界。
        */
-      const bool mixes = adjustment.kind == 4 || adjustment.kind == 10 || adjustment.kind == 11;
+      const bool mixes = adjustment.kind == 4 || adjustment.kind == 10 || adjustment.kind == 11 ||
+                         (adjustment.kind >= 16 && adjustment.kind <= 21);
       bool op_changed = false;
       const DeepRoundTripOp op = [&](uint8_t* buf, size_t w, size_t h, size_t s) {
         op_changed = apply_adjustment_eight_bit(buf, static_cast<int32_t>(w),

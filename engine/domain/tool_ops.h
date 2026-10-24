@@ -282,6 +282,29 @@ struct HistoryBrushParams {
 enum GradientType {
   kGradientLinear = 0, /* 线性：t = 端点连线上的投影比例 */
   kGradientRadial = 1, /* 径向：t = 到起点的距离 / 两端点距离 */
+  /* P1-7 尾部追加：角度（锥形）/ 对称 / 菱形。0/1 的语义与像素不变。 */
+  kGradientAngle = 2,     /* 角度：t = 绕起点的方位角 / 360°（轴向由 end 决定 0°） */
+  kGradientReflected = 3, /* 对称：t = |投影|（起点两侧镜像） */
+  kGradientDiamond = 4,   /* 菱形：t = |投影| + |横向| */
+};
+
+/* 渐变色标的硬上限（与 ABI `COMP_TOOL_GRADIENT_MAX_STOPS` 一致，编译期对不上就报错）。 */
+constexpr int32_t kMaxGradientStops = 32;
+
+/*
+ * 渐变色标（P1-7 尾部追加）。
+ *
+ * `position` 是沿渐变轴的归一化位置 0..1；`midpoint` 是**本段**的混合中点：
+ * 与下一个色标之间 50% 颜色出现的位置在本段的比例（0.5 = 线性，越小越靠前）。
+ * 颜色是直通 sRGB + alpha（与 `color0/color1` 同口径）。
+ *
+ * 求值：`u' = u^(ln0.5 / ln midpoint)` 再在两色之间线性插值——正是「中点
+ * 落在 50% 处」的定义，midpoint = 0.5 时 `u' = u`，与两色标路径逐像素一致。
+ */
+struct GradientStop {
+  double position = 0.0;
+  double midpoint = 0.5;
+  uint8_t color[4] = {0, 0, 0, 255};
 };
 
 /*
@@ -293,10 +316,15 @@ enum GradientType {
  *     与 stroke/clone 同一套平移口径（缩放/旋转不做逆变换，如实记入边界）；
  *   - t 线性 = dot(p - start, end - start) / |end - start|²，径向 =
  *     |p - start| / |end - start|，两者都夹到 0..1；
- *   - 色标（直通 sRGB + alpha）按 t 线性插值，再按 source-over 预乘混合；
+ *   - 色标（直通 sRGB + alpha）按 t 插值，再按 source-over 预乘混合；
  *   - 选区活跃时覆盖率 = `selection_effective_coverage` 的逐像素值，
  *     为 0 的像素**逐字节不动**（与像素滤镜同一口径）；
  *   - `opacity` 0..1 再乘进覆盖率。
+ *
+ * P1-7 追加：`stops` 非空（≥2 个）时**取代** color0/color1，按 position 升序
+ * （引擎要求宿主给的就是升序，乱序显式拒绝而不是替用户排序——静默排序会让
+ * 宿主以为自己的顺序没写错）。`dither` 为真时逐像素加 ±0.5 LSB 的确定性噪声，
+ * 抑制长渐变在 8 位输出上的色带。
  *
  * 端点重合（线性方向长度 0 / 径向半径 0）在参数闸被拒绝：静默画成纯色会让
  * 宿主以为方向生效了。两个色标全透明同样是恒等操作，一并拒绝。
@@ -310,6 +338,8 @@ struct GradientParams {
   uint8_t color0[4] = {0, 0, 0, 255};
   uint8_t color1[4] = {0, 0, 0, 0};
   float opacity = 1.0f;
+  std::vector<GradientStop> stops; /* 空 = 沿用 color0/color1（两色标旧路径） */
+  bool dither = false;
 };
 
 /* ============================================================== 形状（S10） */

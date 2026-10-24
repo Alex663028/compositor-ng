@@ -45,6 +45,18 @@ comp_ui::TypeBlockMetrics type_metrics(const ShellState& shell) {
                                      shell.doc.type_letter_spacing, shell.doc.type_text.c_str());
 }
 
+/*
+ * 预览框尺寸：声明了段落框宽/框高就用声明值（与引擎写入的图层缓冲同口径，
+ * 框高只裁切），没声明的维度仍按内容度量。框内文字的折行位置是引擎的事，
+ * 预览不预演字形（S11 的既定口径），只给框。
+ */
+comp_ui::TypeBlockMetrics type_preview_metrics(const ShellState& shell) {
+  comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
+  if (shell.doc.type_box_width > 0.0) metrics.width = shell.doc.type_box_width;
+  if (shell.doc.type_box_height > 0.0) metrics.height = shell.doc.type_box_height;
+  return metrics;
+}
+
 void type_cancel(ShellState& shell) {
   shell.doc.type_active = false;
   shell.doc.type_text.clear();
@@ -88,7 +100,7 @@ bool type_char_input(ShellState& shell, wchar_t unit) {
 
 /* 状态栏：空缓冲时给快捷键提示，有内容时给行数/文本框尺寸/排版值。 */
 void type_refresh_status(ShellState& shell) {
-  const comp_ui::TypeBlockMetrics metrics = type_metrics(shell);
+  const comp_ui::TypeBlockMetrics metrics = type_preview_metrics(shell);
   const int size_px = static_cast<int>(shell.doc.type_font_size + 0.5);
   const int line_pct = static_cast<int>(shell.doc.type_line_height * 100.0 + 0.5);
   const int spacing_px = static_cast<int>(std::lround(shell.doc.type_letter_spacing));
@@ -97,15 +109,30 @@ void type_refresh_status(ShellState& shell) {
   const wchar_t* track = type_font_track(shell)
                              ? shell.type_font_label.c_str()
                              : L"5×7 点阵";
+  /* P0-6③：只在真的设了段落参数时才追加——默认的点文字状态栏一个字都不多。 */
+  wchar_t paragraph[96] = L"";
+  if (shell.doc.type_box_width > 0.0 || shell.doc.type_box_height > 0.0 ||
+      shell.doc.type_align != comp_ui::kTypeAlignLeft) {
+    wchar_t width_text[24] = L"自动";
+    wchar_t height_text[24] = L"自动";
+    if (shell.doc.type_box_width > 0.0) {
+      wsprintfW(width_text, L"%d", static_cast<int>(shell.doc.type_box_width + 0.5));
+    }
+    if (shell.doc.type_box_height > 0.0) {
+      wsprintfW(height_text, L"%d", static_cast<int>(shell.doc.type_box_height + 0.5));
+    }
+    wsprintfW(paragraph, L"｜段落框 %s×%s px，%s", width_text, height_text,
+              widen_ascii(comp_ui::type_align_name(shell.doc.type_align)).c_str());
+  }
   wchar_t buffer[384];
   if (shell.doc.type_text.empty()) {
     wsprintfW(buffer,
-              L"文字：插入点 (%d, %d)｜字体 %s，字号 %d px（%s），行距 %d%%，字距 %d px｜"
+              L"文字：插入点 (%d, %d)｜字体 %s，字号 %d px（%s），行距 %d%%，字距 %d px%s｜"
               L"直接键入（中文用输入法），Shift+Enter 换行，回车提交，Esc 取消；"
               L"[ / ] 字号，Shift+[ / ] 字距，Alt+[ / ] 行距",
               static_cast<int>(std::floor(shell.doc.type_origin.x)),
               static_cast<int>(std::floor(shell.doc.type_origin.y)), track, size_px,
-              type_font_track(shell) ? L"em 高" : L"点阵格高", line_pct, spacing_px);
+              type_font_track(shell) ? L"em 高" : L"点阵格高", line_pct, spacing_px, paragraph);
   } else {
     /* 状态栏是单行：把换行显示成 '|'，不把控制字符塞进窗口标题。 */
     std::string display;
@@ -113,15 +140,15 @@ void type_refresh_status(ShellState& shell) {
     for (char ch : shell.doc.type_text) display.push_back(ch == '\n' ? '|' : ch);
     /* 字体轨道的宽度是估计值：数字前面加「≈」，不让估计值冒充引擎结果。 */
     if (type_font_track(shell)) {
-      wsprintfW(buffer, L"文字：%s｜%d 行 ≈%d×%d px，字体 %s（em %d），行距 %d%%，字距 %d｜"
+      wsprintfW(buffer, L"文字：%s｜%d 行 ≈%d×%d px，字体 %s（em %d），行距 %d%%，字距 %d%s｜"
                         L"回车提交，Esc 取消",
                 widen_utf8(display).c_str(), metrics.line_count, width_px, height_px,
-                track, size_px, line_pct, spacing_px);
+                track, size_px, line_pct, spacing_px, paragraph);
     } else {
-      wsprintfW(buffer, L"文字：%s｜%d 行 %d×%d px，字号 %d，行距 %d%%，字距 %d｜"
+      wsprintfW(buffer, L"文字：%s｜%d 行 %d×%d px，字号 %d，行距 %d%%，字距 %d%s｜"
                         L"回车提交，Esc 取消",
                 widen_utf8(display).c_str(), metrics.line_count, width_px, height_px,
-                size_px, line_pct, spacing_px);
+                size_px, line_pct, spacing_px, paragraph);
     }
   }
   set_status(shell, buffer);
@@ -224,7 +251,15 @@ void type_commit(ShellState& shell) {
                                                                 : nullptr;
   /* 面号来自字体面板（.ttc 集合）；内置点阵轨道恒 0——ABI 本来也只在路径非空时采信。 */
   desc.font_face_index = type_font_track(shell) ? shell.type_face_index : 0;
+  /*
+   * P0-6③：段落框与对齐。三项全默认（0 / 0 / 左）时引擎走的是 P0-6② 之前
+   * 逐字节相同的单次栅格化路径，老工程的落墨位置不会有任何漂移。
+   */
+  desc.box_width = shell.doc.type_box_width;
+  desc.box_height = shell.doc.type_box_height;
+  desc.align = shell.doc.type_align;
   desc._reserved = 0;
+  desc._reserved2 = 0;
 
   const comp_layer_id selected = selected_layer_id(shell);
   const bool editing = layer_is_text(shell, selected) && type_origin_inside_layer(shell, selected);

@@ -124,6 +124,12 @@ void set_pixels(comp_document doc, comp_layer_id id, std::vector<uint8_t>& pixel
   COMP_CHECK(comp_layer_set_pixels(doc, id, &image) == COMP_OK);
 }
 
+/* 便利重载：允许直接传临时缓冲（set_pixels 需要可写缓冲才能取 data()）。 */
+void set_pixels(comp_document doc, comp_layer_id id, const std::vector<uint8_t>& pixels) {
+  std::vector<uint8_t> copy = pixels;
+  set_pixels(doc, id, copy);
+}
+
 std::vector<uint8_t> flatten(comp_document doc) {
   std::vector<uint8_t> out(static_cast<size_t>(kW) * kH * 4);
   COMP_CHECK(comp_render_flatten(doc, out.data(), COMP_PIXEL_RGBA8, kStride) == COMP_OK);
@@ -1228,6 +1234,283 @@ COMP_TEST(tool_ops_gradient_rejects_degenerate_or_invisible_parameters) {
   COMP_CHECK(apply(fx.doc, fx.layer, legal) == COMP_OK);
   COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
   COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal gradient undoes exactly");
+}
+
+/* ============================================ 7b. P1-7：多色标与渐变类型 */
+
+namespace {
+
+comp_gradient_stop gradient_stop_at(double position, double midpoint, const uint8_t color[4]) {
+  comp_gradient_stop stop{};
+  stop.position = position;
+  stop.midpoint = midpoint;
+  for (int c = 0; c < 4; ++c) stop.color[c] = color[c];
+  return stop;
+}
+
+}  // namespace
+
+COMP_TEST(tool_ops_gradient_multi_stop_places_each_stop_at_its_position) {
+  /* 上限是 ABI 常量：宿主按这个数字分配缓冲。 */
+  COMP_CHECK_MSG(COMP_TOOL_GRADIENT_MAX_STOPS == 32, "the stop ceiling stays at 32");
+
+  Fixture fx;
+  set_pixels(fx.doc, fx.layer, plain_pixels(0, 0, 0));
+
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t green[4] = {0, 255, 0, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+  comp_gradient_stop stops[3] = {gradient_stop_at(0.0, 0.5, red),
+                                 gradient_stop_at(0.5, 0.5, green),
+                                 gradient_stop_at(1.0, 0.5, blue)};
+
+  comp_tool_op_desc desc = linear_gradient(red, blue); /* 色标表会完全替代 color0/color1 */
+  desc.gradient_stops = stops;
+  desc.gradient_stop_count = 3;
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+
+  COMP_CHECK_MSG(red_at(after, 0, 7) == 255 && green_at(after, 0, 7) == 0,
+                 "the first stop lands on the gradient start");
+  COMP_CHECK_MSG(green_at(after, 7, 7) > 200 && blue_at(after, 7, 7) == 0,
+                 "the middle stop reaches its colour before the midpoint");
+  COMP_CHECK_MSG(green_at(after, 8, 7) > 200 && red_at(after, 8, 7) == 0,
+                 "the middle stop holds past the midpoint");
+  COMP_CHECK_MSG(blue_at(after, kW - 1, 7) == 255 && green_at(after, kW - 1, 7) == 0,
+                 "the last stop lands on the gradient end");
+
+  /* 单步撤销：多色标与两色标走同一条事务。 */
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == plain_pixels(0, 0, 0), "the multi-stop gradient undoes exactly");
+}
+
+COMP_TEST(tool_ops_gradient_midpoint_shifts_the_blend_inside_a_segment) {
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+
+  /* 基线：中点 0.5（线性）。 */
+  Fixture linear;
+  set_pixels(linear.doc, linear.layer, plain_pixels(0, 0, 0));
+  comp_gradient_stop flat[2] = {gradient_stop_at(0.0, 0.5, red), gradient_stop_at(1.0, 0.5, blue)};
+  comp_tool_op_desc base_desc = linear_gradient(red, blue);
+  base_desc.gradient_stops = flat;
+  base_desc.gradient_stop_count = 2;
+  COMP_CHECK(apply(linear.doc, linear.layer, base_desc) == COMP_OK);
+  const std::vector<uint8_t> linear_pixels = flatten(linear.doc);
+
+  /* 中点拖到 0.25 ⇒ 中点右侧的颜色应更靠后一色标（u^0.5 抬升）。 */
+  Fixture shifted;
+  set_pixels(shifted.doc, shifted.layer, plain_pixels(0, 0, 0));
+  comp_gradient_stop early[2] = {gradient_stop_at(0.0, 0.25, red),
+                                 gradient_stop_at(1.0, 0.5, blue)};
+  comp_tool_op_desc desc = linear_gradient(red, blue);
+  desc.gradient_stops = early;
+  desc.gradient_stop_count = 2;
+  COMP_CHECK(apply(shifted.doc, shifted.layer, desc) == COMP_OK);
+  const std::vector<uint8_t> shifted_pixels = flatten(shifted.doc);
+
+  COMP_CHECK_MSG(blue_at(shifted_pixels, 8, 7) > blue_at(linear_pixels, 8, 7) + 20,
+                 "midpoint 0.25 pushes the blend toward the second stop");
+  COMP_CHECK_MSG(red_at(shifted_pixels, 0, 7) == 255 && blue_at(shifted_pixels, kW - 1, 7) == 255,
+                 "midpoints do not move the stops themselves");
+
+  /* midpoint 拖到 0.75 是反方向：同一位置应更靠前一色标。 */
+  Fixture late;
+  set_pixels(late.doc, late.layer, plain_pixels(0, 0, 0));
+  comp_gradient_stop slow[2] = {gradient_stop_at(0.0, 0.75, red),
+                                gradient_stop_at(1.0, 0.5, blue)};
+  desc.gradient_stops = slow;
+  COMP_CHECK(apply(late.doc, late.layer, desc) == COMP_OK);
+  const std::vector<uint8_t> late_pixels = flatten(late.doc);
+  COMP_CHECK_MSG(blue_at(late_pixels, 8, 7) < blue_at(linear_pixels, 8, 7) - 20,
+                 "midpoint 0.75 pushes the blend toward the first stop");
+}
+
+COMP_TEST(tool_ops_gradient_reflected_diamond_and_angle_types) {
+  const uint8_t white[4] = {255, 255, 255, 255};
+  const uint8_t clear[4] = {255, 255, 255, 0};
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+
+  /* 对称（3）：以起点为中心镜像，两侧同距离处颜色相同。 */
+  Fixture mirrored;
+  set_pixels(mirrored.doc, mirrored.layer, plain_pixels(0, 0, 0));
+  comp_tool_op_desc reflected = linear_gradient(red, blue);
+  reflected.gradient.type = static_cast<int32_t>(COMP_GRADIENT_REFLECTED);
+  reflected.gradient.start_x = 8.0;
+  reflected.gradient.end_x = 15.0; /* 长度 7 */
+  COMP_CHECK(apply(mirrored.doc, mirrored.layer, reflected) == COMP_OK);
+  const std::vector<uint8_t> mirror_pixels = flatten(mirrored.doc);
+  COMP_CHECK_MSG(red_at(mirror_pixels, 8, 7) == 255, "reflected starts at the first stop");
+  COMP_CHECK_MSG(red_at(mirror_pixels, 4, 7) == red_at(mirror_pixels, 12, 7) &&
+                     blue_at(mirror_pixels, 4, 7) == blue_at(mirror_pixels, 12, 7),
+                 "reflected is symmetric about the start point");
+  COMP_CHECK_MSG(blue_at(mirror_pixels, 1, 7) == 255 && blue_at(mirror_pixels, 15, 7) == 255,
+                 "reflected clamps to the second stop beyond one length either side");
+
+  /* 菱形（4）：对角线比线性更靠后。 */
+  Fixture diamond;
+  set_pixels(diamond.doc, diamond.layer, plain_pixels(0, 0, 0));
+  comp_tool_op_desc diamond_desc = linear_gradient(red, blue);
+  diamond_desc.gradient.type = static_cast<int32_t>(COMP_GRADIENT_DIAMOND);
+  diamond_desc.gradient.start_x = 8.0;
+  diamond_desc.gradient.start_y = 8.0;
+  diamond_desc.gradient.end_x = 15.0;
+  diamond_desc.gradient.end_y = 8.0;
+  COMP_CHECK(apply(diamond.doc, diamond.layer, diamond_desc) == COMP_OK);
+  const std::vector<uint8_t> diamond_pixels = flatten(diamond.doc);
+  COMP_CHECK_MSG(blue_at(diamond_pixels, 12, 8) == blue_at(mirror_pixels, 12, 8),
+                 "diamond matches reflected on the gradient axis");
+  COMP_CHECK_MSG(blue_at(diamond_pixels, 12, 12) == 255,
+                 "diamond reaches the second stop on the diagonal");
+
+  /* 角度（2）：绕起点的方位角，0 在端点方向。 */
+  Fixture angular;
+  set_pixels(angular.doc, angular.layer, std::vector<uint8_t>(static_cast<size_t>(kW) * kH * 4, 0));
+  comp_tool_op_desc angle = linear_gradient(white, clear);
+  angle.gradient.type = static_cast<int32_t>(COMP_GRADIENT_ANGLE);
+  angle.gradient.start_x = 8.0;
+  angle.gradient.start_y = 8.0;
+  angle.gradient.end_x = 15.0;
+  angle.gradient.end_y = 8.0;
+  COMP_CHECK(apply(angular.doc, angular.layer, angle) == COMP_OK);
+  const std::vector<uint8_t> angle_pixels = flatten(angular.doc);
+  COMP_CHECK_MSG(alpha_at(angle_pixels, 15, 8) == 255,
+                 "angle 0 (the end direction) keeps the first stop");
+  COMP_CHECK_MSG(alpha_at(angle_pixels, 8, 15) > 150 && alpha_at(angle_pixels, 8, 15) < 220,
+                 "a quarter turn is halfway down the ramp");
+  COMP_CHECK_MSG(alpha_at(angle_pixels, 1, 8) > 100 && alpha_at(angle_pixels, 1, 8) < 160,
+                 "half a turn is the ramp midpoint");
+}
+
+COMP_TEST(tool_ops_gradient_dither_is_deterministic_and_reversible) {
+  const uint8_t red[4] = {255, 0, 0, 255};
+  const uint8_t blue[4] = {0, 0, 255, 255};
+
+  Fixture plain;
+  set_pixels(plain.doc, plain.layer, plain_pixels(0, 0, 0));
+  comp_tool_op_desc off = linear_gradient(red, blue);
+  /* 非整数跨度 ⇒ 过渡值是分数，抖动才有东西可打散（整数斜坡本来就无并列）。 */
+  off.gradient.end_x = 13.5;
+  COMP_CHECK(apply(plain.doc, plain.layer, off) == COMP_OK);
+  const std::vector<uint8_t> without_dither = flatten(plain.doc);
+
+  Fixture dithered;
+  set_pixels(dithered.doc, dithered.layer, plain_pixels(0, 0, 0));
+  comp_tool_op_desc on = linear_gradient(red, blue);
+  on.gradient.end_x = 13.5;
+  on.gradient_dither = 1;
+  COMP_CHECK(apply(dithered.doc, dithered.layer, on) == COMP_OK);
+  const std::vector<uint8_t> first = flatten(dithered.doc);
+
+  /* 抖动确实打散了四舍五入的并列（否则这个开关等于没接上）。 */
+  COMP_CHECK_MSG(first != without_dither, "dither changes the quantized ramp");
+
+  /* 同一操作执行两次逐字节一致：抖动是坐标的纯函数，不是随机数。 */
+  COMP_CHECK(comp_document_undo(dithered.doc) == COMP_OK);
+  COMP_CHECK(apply(dithered.doc, dithered.layer, on) == COMP_OK);
+  COMP_CHECK_MSG(flatten(dithered.doc) == first, "dither is deterministic across runs");
+
+  /* 端点仍是精确色标：抖动只影响中间过渡。 */
+  COMP_CHECK_MSG(red_at(first, 0, 7) >= 254 && blue_at(first, kW - 1, 7) >= 254,
+                 "dither does not move the stop colours");
+}
+
+COMP_TEST(tool_ops_gradient_rejects_malformed_stop_tables) {
+  Fixture fx;
+  set_pixels(fx.doc, fx.layer, plain_pixels(10, 20, 30));
+  const std::vector<uint8_t> before = flatten(fx.doc);
+  int32_t can_undo = 0;
+  COMP_CHECK(comp_document_can_undo(fx.doc, &can_undo) == COMP_OK);
+  const int32_t undo_before = can_undo;
+
+  const uint8_t opaque[4] = {255, 255, 255, 255};
+  const uint8_t clear[4] = {0, 0, 0, 0};
+
+  /* 一个色标不成段。 */
+  comp_gradient_stop single[1] = {gradient_stop_at(0.0, 0.5, opaque)};
+  comp_tool_op_desc one = linear_gradient(opaque, clear);
+  one.gradient_stops = single;
+  one.gradient_stop_count = 1;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, one) == COMP_ERR_INVALID_ARGUMENT,
+                 "a one-stop table is an argument error");
+
+  /* 乱序：引擎不替宿主排序（排序会把「填错顺序」变成难归因的画面问题）。 */
+  comp_gradient_stop unsorted[2] = {gradient_stop_at(0.75, 0.5, opaque),
+                                    gradient_stop_at(0.25, 0.5, clear)};
+  comp_tool_op_desc shuffled = linear_gradient(opaque, clear);
+  shuffled.gradient_stops = unsorted;
+  shuffled.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, shuffled) == COMP_ERR_INVALID_ARGUMENT,
+                 "descending stop positions are an argument error");
+
+  /* 位置重复：span 为 0 的段没有定义。 */
+  comp_gradient_stop duplicated[2] = {gradient_stop_at(0.5, 0.5, opaque),
+                                      gradient_stop_at(0.5, 0.5, clear)};
+  comp_tool_op_desc twins = linear_gradient(opaque, clear);
+  twins.gradient_stops = duplicated;
+  twins.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, twins) == COMP_ERR_INVALID_ARGUMENT,
+                 "duplicate stop positions are an argument error");
+
+  /* midpoint 必须在开区间内（0 或 1 会让段内出现硬边界）。 */
+  comp_gradient_stop bad_mid[2] = {gradient_stop_at(0.0, 0.0, opaque),
+                                   gradient_stop_at(1.0, 0.5, clear)};
+  comp_tool_op_desc midpoint = linear_gradient(opaque, clear);
+  midpoint.gradient_stops = bad_mid;
+  midpoint.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, midpoint) == COMP_ERR_INVALID_ARGUMENT,
+                 "midpoint 0 is an argument error");
+
+  /* 位置越界。 */
+  comp_gradient_stop outside[2] = {gradient_stop_at(0.0, 0.5, opaque),
+                                   gradient_stop_at(1.5, 0.5, clear)};
+  comp_tool_op_desc range = linear_gradient(opaque, clear);
+  range.gradient_stops = outside;
+  range.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, range) == COMP_ERR_INVALID_ARGUMENT,
+                 "stop positions outside 0..1 are an argument error");
+
+  /* 全透明色标表：与两色标路径同一口径，拒绝而不是记录一步空操作。 */
+  comp_gradient_stop invisible[2] = {gradient_stop_at(0.0, 0.5, clear),
+                                     gradient_stop_at(1.0, 0.5, clear)};
+  comp_tool_op_desc blank = linear_gradient(opaque, clear);
+  blank.gradient_stops = invisible;
+  blank.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, blank) == COMP_ERR_INVALID_ARGUMENT,
+                 "an all-transparent stop table is an argument error");
+
+  /* 结构性守卫：NULL 指针 + 非 0 计数、以及超过上限的计数。 */
+  comp_tool_op_desc null_stops = linear_gradient(opaque, clear);
+  null_stops.gradient_stops = nullptr;
+  null_stops.gradient_stop_count = 2;
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, null_stops) == COMP_ERR_INVALID_ARGUMENT,
+                 "a null stop pointer with a non-zero count is an argument error");
+
+  std::vector<comp_gradient_stop> too_many(COMP_TOOL_GRADIENT_MAX_STOPS + 1);
+  for (size_t i = 0; i < too_many.size(); ++i) {
+    too_many[i] = gradient_stop_at(static_cast<double>(i) / too_many.size(), 0.5, opaque);
+  }
+  comp_tool_op_desc overflow = linear_gradient(opaque, clear);
+  overflow.gradient_stops = too_many.data();
+  overflow.gradient_stop_count = too_many.size();
+  COMP_CHECK_MSG(apply(fx.doc, fx.layer, overflow) == COMP_ERR_INVALID_ARGUMENT,
+                 "more than 32 stops is an argument error");
+
+  /* 全部拒绝都不进撤销栈、不改像素。 */
+  COMP_CHECK(comp_document_can_undo(fx.doc, &can_undo) == COMP_OK);
+  COMP_CHECK_MSG(can_undo == undo_before, "rejected stop tables must not add an undo step");
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "rejected stop tables leave the render unchanged");
+
+  /* 合法多色标随后仍能成功——证明拒绝的是参数表而不是整条通路。 */
+  comp_gradient_stop legal[2] = {gradient_stop_at(0.0, 0.5, opaque),
+                                 gradient_stop_at(1.0, 0.5, clear)};
+  comp_tool_op_desc ok = linear_gradient(opaque, clear);
+  ok.gradient_stops = legal;
+  ok.gradient_stop_count = 2;
+  COMP_CHECK(apply(fx.doc, fx.layer, ok) == COMP_OK);
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal stop table undoes exactly");
 }
 
 namespace {

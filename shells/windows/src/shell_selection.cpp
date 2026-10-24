@@ -322,6 +322,38 @@ void commit_modify_input(ShellState& shell) {
 }
 
 /*
+ * 扩大选取 / 选取相似（P0-5 收尾）：容差直接用壳上的魔棒容差（shift+/ 可调），
+ * 两条命令都是「点菜单即落墨、一步撤销」。similar=true 走不连续的颜色匹配。
+ */
+void grow_similar_selection(ShellState& shell, bool similar) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"选区：还没有文档");
+    return;
+  }
+  if (!shell.doc.selection_active) {
+    set_status(shell, L"选区：先建立一个选区，再扩大选取/选取相似");
+    return;
+  }
+  const int tolerance = shell.wand_tolerance;
+  int32_t changed = 0;
+  const comp_result result =
+      similar ? comp_selection_similar(shell.doc.document, tolerance, &changed)
+              : comp_selection_grow(shell.doc.document, tolerance, &changed);
+  if (result != COMP_OK) {
+    set_status(shell, similar ? L"选取相似失败（合成不可用？）" : L"扩大选取失败（合成不可用？）");
+    return;
+  }
+
+  wchar_t buffer[224];
+  if (changed == 0) {
+    wsprintfW(buffer, L"%s（容差 %d）：无变化", similar ? L"选取相似" : L"扩大选取", tolerance);
+  } else {
+    wsprintfW(buffer, L"已%s（容差 %d，撤销一步）", similar ? L"选取相似" : L"扩大选取", tolerance);
+  }
+  finish_selection_command(shell, buffer);
+}
+
+/*
  * 按图层像素载入选区（P0-4）：threshold 是 alpha 下限，取 1 = 「任何有像素的
  * 地方都算选中」。取 0 会把全透明像素也算进去（等于全选），不是「按内容载入」
  * 的本意；面板将来给阈值时再放出来。

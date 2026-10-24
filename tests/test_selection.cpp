@@ -1102,6 +1102,23 @@ comp_result wand(comp_document document, comp_layer_id layer, comp_selection_wan
                                    combine, out_changed);
 }
 
+/* 全画布灰阶斜坡：列 x 的灰度 = x * 4（0..252），行内恒定。
+ * 用来验证「扩大选取沿梯度一路漫水」与「选取相似在颜色距离上全局匹配」。 */
+std::vector<uint8_t> full_ramp_pixels() {
+  std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4u, 0u);
+  for (int32_t y = 0; y < kHeight; ++y) {
+    for (int32_t x = 0; x < kWidth; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * kWidth + x) * 4u;
+      const uint8_t value = static_cast<uint8_t>(x * 4);
+      px[0] = value;
+      px[1] = value;
+      px[2] = value;
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
 }  // namespace
 
 COMP_TEST(selection_wand_selects_a_contiguous_region) {
@@ -1186,6 +1203,165 @@ COMP_TEST(selection_wand_tolerance_widens_the_match) {
   COMP_CHECK_MSG(at(mask, 11, 6) == 255, "tolerance 32 reaches the 32 grey column");
   COMP_CHECK_MSG(at(mask, 13, 6) == 255, "tolerance 32 reaches the 96 grey column");
   COMP_CHECK_MSG(at(mask, 14, 6) == 0, "tolerance 32 stops before the 128 grey column");
+}
+
+COMP_TEST(selection_grow_diffuses_along_the_colour_gradient) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, kWidth, kHeight});
+  std::vector<uint8_t> pixels = full_ramp_pixels();
+  set_layer_pixels(fixture.document, id, kWidth, kHeight, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 20.0f, 0.0f, 22.0f, static_cast<float>(kHeight),
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const size_t depth_before = undo_depth_of(fixture.document);
+  comp_rect before{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &before) == COMP_OK);
+
+  /* 相邻列差恰好 4：容差 4 能一路漫到两端，总色差 252 也挡不住。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 4, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "grow reports a change");
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 0, 5) == 255, "grow reaches the left edge");
+  COMP_CHECK_MSG(at(mask, kWidth - 1, 5) == 255, "grow reaches the right edge");
+  COMP_CHECK(mask_sum(mask) == static_cast<long>(kWidth) * kHeight * 255);
+  comp_rect after{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &after) == COMP_OK);
+  COMP_CHECK_MSG(after.x <= before.x && after.y <= before.y &&
+                     after.x + after.w >= before.x + before.w &&
+                     after.y + after.h >= before.y + before.h,
+                 "grown bounds contain the previous bounds");
+  COMP_CHECK_MSG(undo_depth_of(fixture.document) == depth_before + 1, "grow is one undo step");
+
+  /* 再长一次没有任何新像素：不进撤销栈。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 4, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "an idempotent grow reports no change");
+  COMP_CHECK_MSG(undo_depth_of(fixture.document) == depth_before + 1, "no undo step when nothing changes");
+}
+
+COMP_TEST(selection_grow_stops_at_the_tolerance_gap) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, kWidth, kHeight});
+  std::vector<uint8_t> pixels = full_ramp_pixels();
+  set_layer_pixels(fixture.document, id, kWidth, kHeight, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 20.0f, 0.0f, 22.0f, static_cast<float>(kHeight),
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  const size_t depth_before = undo_depth_of(fixture.document);
+
+  /* 容差 3 < 列间差 4：一格都过不去。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 3, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "grow cannot cross a gap wider than the tolerance");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 2L * kHeight * 255);
+  COMP_CHECK_MSG(undo_depth_of(fixture.document) == depth_before, "no undo step when the gap blocks");
+}
+
+COMP_TEST(selection_similar_matches_across_disjoint_regions) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8 + x) * 4u;
+      const bool grey = x < 2 || x >= 6;
+      px[0] = grey ? 200 : 0;
+      px[1] = grey ? 200 : 0;
+      px[2] = grey ? 200 : 0;
+      px[3] = 255;
+    }
+  }
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  int32_t changed = 0;
+  /* 只选左边那条灰带（文档 x 10..11）。 */
+  COMP_CHECK(rect(fixture.document, 10.0f, 6.0f, 12.0f, 12.0f, COMP_SELECTION_REPLACE, &changed) ==
+             COMP_OK);
+
+  /* Grow 是连通的：中间隔着黑带，走不到右边那条灰带。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "grow stays inside the connected band");
+  COMP_CHECK_MSG(at(coverage(fixture.document), 16, 6) == 0, "grow never jumps the black band");
+
+  /* Similar 不看连通性：右边那条同色灰带要选中，黑带与非画布区都不选。 */
+  COMP_CHECK(comp_selection_similar(fixture.document, 0, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "similar reaches a disjoint region");
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 10, 6) == 255, "the seed band stays selected");
+  COMP_CHECK_MSG(at(mask, 17, 6) == 255, "the right grey band is selected");
+  COMP_CHECK_MSG(at(mask, 13, 6) == 0, "the black band never matches");
+  COMP_CHECK_MSG(at(mask, 5, 5) == 0, "transparent canvas pixels never match");
+  COMP_CHECK_MSG(at(mask, 17, 11) == 255, "the whole band height matches");
+  COMP_CHECK_MSG(at(mask, 17, 12) == 0, "nothing below the layer matches");
+}
+
+COMP_TEST(selection_similar_uses_the_colour_distance) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, kWidth, kHeight});
+  std::vector<uint8_t> pixels = full_ramp_pixels();
+  set_layer_pixels(fixture.document, id, kWidth, kHeight, pixels);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 20.0f, 0.0f, 22.0f, static_cast<float>(kHeight),
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+
+  /* 种子列灰 80 / 84，容差 4：再吃掉 76 与 88，正好 19..22 四列。 */
+  COMP_CHECK(comp_selection_similar(fixture.document, 4, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK_MSG(at(mask, 19, 10) == 255, "one step below the seed still matches");
+  COMP_CHECK_MSG(at(mask, 22, 10) == 255, "one step above the seed still matches");
+  COMP_CHECK_MSG(at(mask, 18, 10) == 0, "two steps below is out of range");
+  COMP_CHECK_MSG(at(mask, 23, 10) == 0, "two steps above is out of range");
+  COMP_CHECK_MSG(mask_sum(mask) == 4L * kHeight * 255, "exactly four whole columns match");
+
+  /* 容差 255 直接全选。 */
+  COMP_CHECK(comp_selection_similar(fixture.document, 255, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "tolerance 255 selects everything");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == static_cast<long>(kWidth) * kHeight * 255);
+}
+
+COMP_TEST(selection_grow_similar_validate_and_reset_feather) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{0, 0, kWidth, kHeight});
+  std::vector<uint8_t> pixels = full_ramp_pixels();
+  set_layer_pixels(fixture.document, id, kWidth, kHeight, pixels);
+
+  int32_t changed = 1;
+  /* 没有选区：两条命令都只是空跑，不算一次改动。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 16, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "grow without a selection does nothing");
+  COMP_CHECK(comp_selection_similar(fixture.document, 16, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "similar without a selection does nothing");
+
+  COMP_CHECK(rect(fixture.document, 20.0f, 0.0f, 22.0f, static_cast<float>(kHeight),
+                  COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_set_feather(fixture.document, 10, &changed) == COMP_OK);
+  const size_t depth_before = undo_depth_of(fixture.document);
+  const long sum_before = mask_sum(coverage(fixture.document));
+
+  /* 越界容差：参数错误，选区与历史都不动。 */
+  COMP_CHECK_MSG(comp_selection_grow(fixture.document, -1, &changed) == COMP_ERR_INVALID_ARGUMENT,
+                 "negative grow tolerance is rejected");
+  COMP_CHECK_MSG(comp_selection_grow(fixture.document, 256, &changed) == COMP_ERR_INVALID_ARGUMENT,
+                 "grow tolerance above 255 is rejected");
+  COMP_CHECK_MSG(comp_selection_similar(fixture.document, -1, &changed) == COMP_ERR_INVALID_ARGUMENT,
+                 "negative similar tolerance is rejected");
+  COMP_CHECK_MSG(comp_selection_similar(fixture.document, 256, &changed) == COMP_ERR_INVALID_ARGUMENT,
+                 "similar tolerance above 255 is rejected");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == sum_before);
+  COMP_CHECK_MSG(undo_depth_of(fixture.document) == depth_before,
+                 "rejected arguments leave the undo stack alone");
+
+  /* 真长一次：羽化要按约定清零，out_changed 可以为空指针。 */
+  COMP_CHECK(comp_selection_grow(fixture.document, 4, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(feather_of(fixture.document) == 0.0f, "grow resets the feather");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == static_cast<long>(kWidth) * kHeight * 255);
 }
 
 COMP_TEST(selection_wand_merged_source_samples_the_composite) {

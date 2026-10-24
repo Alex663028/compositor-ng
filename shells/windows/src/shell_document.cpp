@@ -1424,6 +1424,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdSelectSmooth:
       begin_modify_input(shell, COMP_SELECTION_SMOOTH);
       break;
+    /* ---- P0-5 收尾：扩大选取 / 选取相似（容差 = 魔棒容差） ---- */
+    case kCmdSelectGrow:
+      grow_similar_selection(shell, false);
+      break;
+    case kCmdSelectSimilar:
+      grow_similar_selection(shell, true);
+      break;
     case kCmdSelectLoadPixels:
       load_layer_pixels_selection(shell);
       break;

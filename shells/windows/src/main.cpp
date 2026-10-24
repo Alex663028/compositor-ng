@@ -81,9 +81,30 @@ std::string number_text(double value) {
   return std::string(buffer);
 }
 
+/*
+ * 窄字符串 -> UTF-16。名字里的 ascii 是历史遗留：壳层所有窄字面量实际上都是
+ * UTF-8（选项栏标签 "大小"、枚举名 "前景→透明"、工具名 "Rectangle" 都在同一张
+ * 窄表里）。早先逐字节提升把三个 UTF-8 字节显示成三个拉丁字符（"å¤§å°"），
+ * 于是整条选项栏、部分枚举值、选项点击后的状态反馈全是乱码。
+ *
+ * 现在先按 UTF-8 严格解码（MB_ERR_INVALID_CHARS）；不是合法 UTF-8 的输入
+ * （引擎回传的本地编码片段、任意二进制）退回旧的逐字节路径。ASCII 在两条
+ * 路径上结果逐字符相同，所以纯 ASCII 调用的显示不变。
+ */
 std::wstring widen_ascii(const char* text) {
+  if (text == nullptr) return std::wstring();
+  const int size = static_cast<int>(std::strlen(text));
+  if (size > 0) {
+    const int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, size, nullptr, 0);
+    if (needed > 0) {
+      std::wstring wide(static_cast<size_t>(needed), L'\0');
+      if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, size, wide.data(), needed) ==
+          needed) {
+        return wide;
+      }
+    }
+  }
   std::wstring wide;
-  if (text == nullptr) return wide;
   for (const char* cursor = text; *cursor != '\0'; ++cursor) {
     wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*cursor)));
   }

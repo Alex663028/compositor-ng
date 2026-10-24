@@ -2,7 +2,7 @@
 #include "comp_live_handles.h"
 
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace compositor {
 namespace {
@@ -13,29 +13,32 @@ std::mutex& live_handles_mutex() {
   return mutex;
 }
 
-std::unordered_set<const void*>& live_handles() {
-  static std::unordered_set<const void*> handles;
+/* 指针 → 类型标签。键是对象地址，值是它是哪一类句柄。 */
+std::unordered_map<const void*, LiveHandleKind>& live_handles() {
+  static std::unordered_map<const void*, LiveHandleKind> handles;
   return handles;
 }
 
 }  // namespace
 
-void register_live_handle(const void* object) noexcept {
+void register_live_handle(const void* object, LiveHandleKind kind) noexcept {
   if (object == nullptr) return;
   std::lock_guard<std::mutex> lock(live_handles_mutex());
-  live_handles().insert(object);
+  live_handles()[object] = kind;
 }
 
-void unregister_live_handle(const void* object) noexcept {
+void unregister_live_handle(const void* object, LiveHandleKind kind) noexcept {
+  (void)kind; /* 注销按地址无条件删：留下悬空表项比删错更危险。 */
   if (object == nullptr) return;
   std::lock_guard<std::mutex> lock(live_handles_mutex());
   live_handles().erase(object);
 }
 
-bool is_live_handle(const void* object) noexcept {
+bool is_live_handle(const void* object, LiveHandleKind kind) noexcept {
   if (object == nullptr) return false;
   std::lock_guard<std::mutex> lock(live_handles_mutex());
-  return live_handles().count(object) > 0;
+  const auto found = live_handles().find(object);
+  return found != live_handles().end() && found->second == kind;
 }
 
 }  // namespace compositor

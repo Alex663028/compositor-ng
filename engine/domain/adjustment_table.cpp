@@ -164,6 +164,103 @@ const AdjustmentParam kPosterizeParams[] = {
     {"posterizeSettings.levels", "Levels", kAdjustmentParamNumber, 2.0, 255.0, 4.0},
 };
 
+/*
+ * 16..24：把 Photoshop「Image > Adjustments」的其余条目补齐。键名仍沿 `XxxSettings`
+ * 的命名风格自定，因此同样只在本仓内往返，不参与上游 kind 白名单互操作。
+ */
+
+/* 16 Vibrance（自然饱和度）。 */
+const AdjustmentParam kVibranceParams[] = {
+    {"vibranceSettings.vibrance", "Vibrance", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"vibranceSettings.saturation", "Saturation", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+};
+
+/*
+ * 17 Selective Color（可选颜色）：9 个色系 × 青/洋红/黄/黑。`relative` 与 PS 一样放在
+ * 首位；36 个滑块在面板里滚动显示（PS 用色系下拉，本仓面板没有下拉控件）。
+ */
+const AdjustmentParam kSelectiveColorParams[] = {
+    {"selectiveColorSettings.relative", "Relative", kAdjustmentParamBool, 0.0, 1.0, 0.0},
+    {"selectiveColorSettings.ranges.0.cyan", "Reds C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.0.magenta", "Reds M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.0.yellow", "Reds Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.0.black", "Reds K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.1.cyan", "Yellows C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.1.magenta", "Yellows M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.1.yellow", "Yellows Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.1.black", "Yellows K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.2.cyan", "Greens C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.2.magenta", "Greens M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.2.yellow", "Greens Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.2.black", "Greens K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.3.cyan", "Cyans C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.3.magenta", "Cyans M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.3.yellow", "Cyans Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.3.black", "Cyans K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.4.cyan", "Blues C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.4.magenta", "Blues M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.4.yellow", "Blues Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.4.black", "Blues K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.5.cyan", "Magentas C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.5.magenta", "Magentas M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.5.yellow", "Magentas Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.5.black", "Magentas K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.6.cyan", "Whites C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.6.magenta", "Whites M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.6.yellow", "Whites Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.6.black", "Whites K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.7.cyan", "Neutrals C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.7.magenta", "Neutrals M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.7.yellow", "Neutrals Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.7.black", "Neutrals K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.8.cyan", "Blacks C", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.8.magenta", "Blacks M", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.8.yellow", "Blacks Y", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"selectiveColorSettings.ranges.8.black", "Blacks K", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+};
+
+/* 18 Photo Filter（照片滤镜）。颜色分量 0…1，密度 0…100（PS 同量程）。 */
+const AdjustmentParam kPhotoFilterParams[] = {
+    {"photoFilterSettings.color.red", "Filter R", kAdjustmentParamNumber, 0.0, 1.0, 0.93},
+    {"photoFilterSettings.color.green", "Filter G", kAdjustmentParamNumber, 0.0, 1.0, 0.66},
+    {"photoFilterSettings.color.blue", "Filter B", kAdjustmentParamNumber, 0.0, 1.0, 0.35},
+    {"photoFilterSettings.density", "Density", kAdjustmentParamNumber, 0.0, 100.0, 25.0},
+    {"photoFilterSettings.preserveLuminosity", "Preserve Lum", kAdjustmentParamBool, 0.0, 1.0, 1.0},
+};
+
+/* 19 Channel Mixer（通道混合器）：3 个输出行 × (R, G, B, 常数)，PS 的 −200%…200%。 */
+const AdjustmentParam kChannelMixerParams[] = {
+    {"channelMixerSettings.redRed", "Red: R", kAdjustmentParamNumber, -2.0, 2.0, 1.0},
+    {"channelMixerSettings.redGreen", "Red: G", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.redBlue", "Red: B", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.redConstant", "Red: C", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.greenRed", "Green: R", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.greenGreen", "Green: G", kAdjustmentParamNumber, -2.0, 2.0, 1.0},
+    {"channelMixerSettings.greenBlue", "Green: B", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.greenConstant", "Green: C", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.blueRed", "Blue: R", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.blueGreen", "Blue: G", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+    {"channelMixerSettings.blueBlue", "Blue: B", kAdjustmentParamNumber, -2.0, 2.0, 1.0},
+    {"channelMixerSettings.blueConstant", "Blue: C", kAdjustmentParamNumber, -2.0, 2.0, 0.0},
+};
+
+/* 20 Color Lookup（查找颜色）：只做内置外观，`look` 是外观序号，`.cube` 文件不读。 */
+const AdjustmentParam kColorLookupParams[] = {
+    {"colorLookupSettings.look", "Look", kAdjustmentParamNumber, 0.0, 4.0, 0.0},
+    {"colorLookupSettings.intensity", "Intensity", kAdjustmentParamNumber, 0.0, 100.0, 100.0},
+};
+
+/* 21 Shadows/Highlights（阴影/高光）：两个量、两个色调宽度、一个半径。 */
+const AdjustmentParam kShadowsHighlightsParams[] = {
+    {"shadowsHighlightsSettings.shadows", "Shadows", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"shadowsHighlightsSettings.shadowWidth", "Shadow Width", kAdjustmentParamNumber, 0.0, 100.0, 50.0},
+    {"shadowsHighlightsSettings.highlights", "Highlights", kAdjustmentParamNumber, -100.0, 100.0, 0.0},
+    {"shadowsHighlightsSettings.highlightWidth", "Highlight Width", kAdjustmentParamNumber, 0.0, 100.0, 50.0},
+    {"shadowsHighlightsSettings.radius", "Radius", kAdjustmentParamNumber, 1.0, 100.0, 30.0},
+};
+
+/* 22..24 Auto Tone / Contrast / Color：读图自算，没有参数（与去色同一类「点即应用」）。 */
+
 /* kind 顺序必须与上游 `AdjustmentKind` 的 CaseIterable 声明顺序一致（.comp 的 kind 即序号）。 */
 const AdjustmentKindInfo kKinds[kAdjustmentKindCount] = {
     {0, "Hue/Saturation", "Hue, saturation and lightness shifts", kHsvParams,
@@ -196,6 +293,21 @@ const AdjustmentKindInfo kKinds[kAdjustmentKindCount] = {
      COMP_ARRAY_LEN(kThresholdParams), true, kNoRoots},
     {15, "Posterize", "Reduce the number of tonal levels per channel", kPosterizeParams,
      COMP_ARRAY_LEN(kPosterizeParams), true, kNoRoots},
+    {16, "Vibrance", "Saturation that favors the quiet colors", kVibranceParams,
+     COMP_ARRAY_LEN(kVibranceParams), true, kNoRoots},
+    {17, "Selective Color", "Cyan/magenta/yellow/black per color family", kSelectiveColorParams,
+     COMP_ARRAY_LEN(kSelectiveColorParams), true, kNoRoots},
+    {18, "Photo Filter", "A colored filter in front of the lens", kPhotoFilterParams,
+     COMP_ARRAY_LEN(kPhotoFilterParams), true, kNoRoots},
+    {19, "Channel Mixer", "Each output channel from a mix of the inputs", kChannelMixerParams,
+     COMP_ARRAY_LEN(kChannelMixerParams), true, kNoRoots},
+    {20, "Color Lookup", "One of the built-in looks, blended by intensity", kColorLookupParams,
+     COMP_ARRAY_LEN(kColorLookupParams), true, kNoRoots},
+    {21, "Shadows/Highlights", "Open the shadows and recover the highlights", kShadowsHighlightsParams,
+     COMP_ARRAY_LEN(kShadowsHighlightsParams), true, kNoRoots},
+    {22, "Auto Tone", "Stretch each channel on the image's own range", kNoParams, 0, false, kNoRoots},
+    {23, "Auto Contrast", "Stretch all channels on the luminance range", kNoParams, 0, false, kNoRoots},
+    {24, "Auto Color", "Auto Tone plus a gray-world cast removal", kNoParams, 0, false, kNoRoots},
 };
 
 /* 顶层键白名单 = 各参数路径的根段 + extra_roots。 */
@@ -359,6 +471,15 @@ bool adjustment_kind_is_destructive(uint32_t kind) {
     case 13:  /* Desaturate */
     case 14:  /* Threshold */
     case 15:  /* Posterize */
+    case 16:  /* Vibrance */
+    case 17:  /* Selective Color */
+    case 18:  /* Photo Filter */
+    case 19:  /* Channel Mixer */
+    case 20:  /* Color Lookup */
+    case 21:  /* Shadows/Highlights */
+    case 22:  /* Auto Tone */
+    case 23:  /* Auto Contrast */
+    case 24:  /* Auto Color */
       return true;
     default:
       /*

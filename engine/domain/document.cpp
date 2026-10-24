@@ -41,7 +41,7 @@ Document::Document(Engine* engine, int32_t width, int32_t height, float dpi,
   history_.set_live(&state_);
   /* 登记为存活对象：as_document 解引用前先查本表，野句柄被挡成错误码而不是段错误。
    * 放在构造体最后：此前任何抛异常的路径都不会留下「登记了却没对象」的脏表项。 */
-  register_live_handle(this);
+  register_live_handle(this, LiveHandleKind::kDocument);
 }
 
 Document::~Document() {
@@ -49,7 +49,7 @@ Document::~Document() {
    * 先从存活登记表注销：此后该指针被宿主误传进来时 is_live_handle 查不到，
    * as_document 不会解引用已释放的内存（与 ~FontFace / ~Engine 同一套约定）。
    */
-  unregister_live_handle(this);
+  unregister_live_handle(this, LiveHandleKind::kDocument);
   /*
    * 作废所有活跃事务句柄：句柄内持有的 document 裸指针即将失效，
    * 不清的话宿主在文档销毁后再 commit/abort 就是 use-after-free。
@@ -499,7 +499,7 @@ bool merge_subset_is_bakeable(const Document& doc,
        * 唯一的保留拒绝点：**引擎不认识的 effect 值**（engineEffects 里出现
        * 未来版本或第三方新增的 kind）。这类效果本引擎既不求值也不绘制，
        * 烘入合成结果会把它们静默丢弃——正是 AUDIT5 §7.4 记的那类「报成功但丢参数」。
-       * 引擎已知的 6 种（effect_kind_is_evaluated）此时已由合成结果包含，放行。
+       * 引擎已知的 kind（effect_kind_is_evaluated，当前 9 种）此时已由合成结果包含，放行。
        */
       bool all_known = true;
       for (const Effect& effect : layer->effects) {

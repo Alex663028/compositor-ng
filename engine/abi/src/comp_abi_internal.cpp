@@ -12,22 +12,33 @@ namespace abi {
 /*
  * 句柄校验（双闸门）：
  *   1. 先查「存活对象登记表」（is_live_handle）：表里只有构造成功过、且尚未
- *      析构的对象指针。查询只哈希指针值、不解引用，因此**完全野的句柄**
- *      （宿主传了个未映射地址）在这里就会被挡下来——直接解引用读 magic 的
- *      老做法在这一步就段错误了。
- *   2. 再读对象内置 magic：挡住销毁后使用（dtor 把 magic 改成 kHandlePoisoned）
- *      与类型混淆（把 comp_engine 当 comp_document 传，或拿字体句柄当引擎）。
+ *      析构的对象指针，**并带类型标签**。查询只哈希指针值、不解引用，因此
+ *      完全野的句柄（宿主传了个未映射地址）在这里就会被挡下来。
+ *      类型标签是 F2 的修复关键：magic 是各类对象的尾部成员，偏移随类型变化
+ *      （Document 的 handle_magic_ 在约 +472，而 Engine 对象总共才 160 字节）。
+ *      若只查「活着」再按 Document 布局读 magic，就是把 comp_engine 当一个
+ *      472+4 字节的对象读——Windows 上读进相邻堆块（侥幸返回错误码），
+ *      鸿蒙上可能读进未映射页（SIGSEGV / ASan heap-buffer-overflow）。
+ *      类型不对在这一步就返回，一次解引用都不会发生。
+ *   2. 再读对象内置 magic：挡住销毁后使用（dtor 把 magic 改成 kHandlePoisoned），
+ *      以及与登记表标签不一致的极端情形（JNI/宿主内存被踩坏等）。
  * 失败一律返回 nullptr，由调用方转成 COMP_ERR_INVALID_ARGUMENT。
  */
 Engine* as_engine(comp_engine handle) {
   Engine* engine = reinterpret_cast<Engine*>(handle);
-  if (engine == nullptr || !is_live_handle(engine) || !engine->is_alive()) return nullptr;
+  if (engine == nullptr || !is_live_handle(engine, LiveHandleKind::kEngine) ||
+      !engine->is_alive()) {
+    return nullptr;
+  }
   return engine;
 }
 
 Document* as_document(comp_document handle) {
   Document* document = reinterpret_cast<Document*>(handle);
-  if (document == nullptr || !is_live_handle(document) || !document->is_alive()) return nullptr;
+  if (document == nullptr || !is_live_handle(document, LiveHandleKind::kDocument) ||
+      !document->is_alive()) {
+    return nullptr;
+  }
   return document;
 }
 

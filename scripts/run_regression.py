@@ -249,6 +249,11 @@ def step_shared_dll(reg: Regression) -> bool:
     return reg.step("5. 共享构建 + ctypes 真实调用", fn)
 
 
+def ohos_arch() -> str:
+    """build_ohos.sh 的目标架构；默认 aarch64（真机），模拟器用 OHOS_ARCH=x86_64。"""
+    return os.environ.get("OHOS_ARCH", "aarch64")
+
+
 def step_ohos(reg: Regression, require: bool) -> bool:
     def fn():
         ndk = os.environ.get("OHOS_NDK", DEFAULT_OHOS_NDK)
@@ -262,7 +267,7 @@ def step_ohos(reg: Regression, require: bool) -> bool:
                 return "FAIL", f"{script} rc={proc.returncode}"
         return "PASS", "交叉编译 + NAPI 壳 rc=0"
 
-    return reg.step("6. 鸿蒙交叉编译（aarch64）", fn)
+    return reg.step(f"6. 鸿蒙交叉编译（{ohos_arch()}）", fn)
 
 
 def main() -> int:
@@ -309,7 +314,7 @@ def main() -> int:
     if not args.skip_ohos:
         step_ohos(reg, require=args.require_ohos)
     else:
-        reg.rows.append(("6. 鸿蒙交叉编译（aarch64）", "SKIP", 0.0, "--skip-ohos"))
+        reg.rows.append((f"6. 鸿蒙交叉编译（{ohos_arch()}）", "SKIP", 0.0, "--skip-ohos"))
 
     print("\n================ regression summary ================")
     for name, status, elapsed, detail in reg.rows:

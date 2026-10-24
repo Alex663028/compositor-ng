@@ -302,6 +302,10 @@ JsonValue text_to_json(const TextObject& text) {
     j.set("fontFaceIndex", JsonValue::integer(text.font_face_index));
   }
   if (!text.font_family.empty()) j.set("fontFamily", JsonValue::string(text.font_family));
+  /* 段落框（P0-6 ③）：只在非默认时写，老工程的 engineText 逐字节不变。 */
+  if (text.box_width > 0.0) j.set("boxWidth", JsonValue::number(text.box_width));
+  if (text.box_height > 0.0) j.set("boxHeight", JsonValue::number(text.box_height));
+  if (text.align != 0) j.set("align", JsonValue::integer(text.align));
   return j;
 }
 
@@ -335,6 +339,9 @@ bool text_from_json(const JsonValue& j, TextObject* out) {
   text.font_path = j.string_or("fontPath", "");
   text.font_face_index = static_cast<int32_t>(j.integer_or("fontFaceIndex", 0));
   text.font_family = j.string_or("fontFamily", "");
+  text.box_width = j.number_or("boxWidth", 0.0);
+  text.box_height = j.number_or("boxHeight", 0.0);
+  text.align = static_cast<int32_t>(j.integer_or("align", 0));
 
   TextLayerReport report;
   text_layer_validate(text, &report);

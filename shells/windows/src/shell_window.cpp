@@ -263,6 +263,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_enabled_recursive(menu, kCmdSelectContract, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectBorder, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectSmooth, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectGrow, enabled.selection_modify);
+  menu_set_enabled_recursive(menu, kCmdSelectSimilar, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectLoadPixels, enabled.selection_load_pixels);
   /* ROI #5：存通道需要当前有选区；通道面板本身随时可开（空列表也给提示）。 */
   menu_set_enabled_recursive(menu, kCmdSelectSaveChannel, enabled.selection_save_channel);
@@ -340,8 +342,10 @@ void set_tool(ShellState& shell, comp_ui::ToolId id) {
               shell.selection_feather);
   } else if (id == comp_ui::ToolId::Gradient) {
     wsprintfW(buffer,
-              L"工具：Gradient / %s（拖出方向与长度后松开；再按 G 切线性/径向；Shift 反向；色标 = 前景 → 透明）",
-              widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
+              L"工具：Gradient / %s / 色标 %s（拖出方向与长度后松开；G 切五种类型；"
+              L"Shift 反向；色标表与抖动在选项栏切换）",
+              widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str(),
+              widen_ascii(comp_ui::gradient_preset_name(shell.gradient_preset)).c_str());
   } else if (id == comp_ui::ToolId::Shape) {
     wsprintfW(buffer,
               L"工具：Shape / %s（拖出%s；Shift = 正方/正圆，Alt = 从中心；再按 U 切种类；"
@@ -440,6 +444,7 @@ void set_tone_state(ShellState& shell, int state) {
 
 void brush_step(ShellState& shell, int direction, bool hardness) {
   wchar_t buffer[96];
+  shell.brush_preset = 0; /* P1-4：快捷键手改参数同样脱离预设 */
   if (hardness) {
     shell.brush_hardness = comp_ui::step_brush_hardness(shell.brush_hardness, direction);
     wsprintfW(buffer, L"笔刷硬度 %d%%",
@@ -2167,11 +2172,11 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         break;
       }
       if (key == 'G' && !ctrl) {
-        /* 重复按 G 在同一工具内循环 Linear -> Radial（对齐上游的同类工具习惯）。 */
+        /* 重复按 G 在同一工具内循环五种渐变类型（对齐上游的同类工具习惯）。 */
         if (shell.tool == comp_ui::ToolId::Gradient) {
           shell.gradient_type = comp_ui::next_gradient_type(shell.gradient_type);
           wchar_t buffer[192];
-          wsprintfW(buffer, L"渐变类型：%s（再按 G 切换；Shift = 反向 前景↔透明）",
+          wsprintfW(buffer, L"渐变类型：%s（再按 G 切换；Shift = 反向色标）",
                     widen_ascii(comp_ui::gradient_type_name(shell.gradient_type)).c_str());
           set_status(shell, buffer);
         } else {
@@ -2254,6 +2259,49 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         }
       }
       break;
+  }
+}
+
+/* ------------------------------------------------ 笔压采样（P1-4） */
+
+using GetPointerTypeFn = BOOL(WINAPI*)(UINT32, POINTER_INPUT_TYPE*);
+using GetPointerPenInfoFn = BOOL(WINAPI*)(UINT32, POINTER_PEN_INFO*);
+
+/*
+ * WM_POINTER 只用来**读**笔压，随后一律交回 DefWindowProc：系统会把笔/触摸
+ * 消息提升成 WM_MOUSEMOVE / WM_LBUTTONDOWN，绘制仍走原来那条鼠标通路。
+ * 所以压感是一个纯增量——没有 WM_POINTER、没有 PEN_MASK_PRESSURE 位、远程
+ * 会话里全部回落 1.0，像素与 P1-4 之前逐字节相同。
+ *
+ * 两个 API 都在 user32 里，但只有 Win8+ 才有；与 shell_dpi.cpp 同一做法，
+ * 用 GetProcAddress 解析，老系统上是「没有压感」而不是「起不来」。
+ */
+void pen_sample_pressure(ShellState& shell, UINT32 pointer_id) {
+  static GetPointerTypeFn get_type = nullptr;
+  static GetPointerPenInfoFn get_pen_info = nullptr;
+  static bool resolved = false;
+  if (!resolved) {
+    resolved = true;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr) {
+      get_type = reinterpret_cast<GetPointerTypeFn>(GetProcAddress(user32, "GetPointerType"));
+      get_pen_info =
+          reinterpret_cast<GetPointerPenInfoFn>(GetProcAddress(user32, "GetPointerPenInfo"));
+    }
+  }
+  if (get_type == nullptr || get_pen_info == nullptr) return;
+  POINTER_INPUT_TYPE pointer_type = PT_POINTER;
+  /* 触摸与鼠标指针同样会发 WM_POINTER；只有笔带压力。 */
+  if (!get_type(pointer_id, &pointer_type) || pointer_type != PT_PEN) return;
+  POINTER_PEN_INFO info{};
+  if (!get_pen_info(pointer_id, &info)) return;
+  const bool has_pressure = (info.penMask & PEN_MASK_PRESSURE) != 0;
+  shell.pen_pressure = comp_ui::pen_pressure_to_unit(info.pressure, has_pressure);
+  shell.pen_pressure_active = has_pressure;
+  /* 一笔只有一个 brush.pressure（ABI 是常量），所以整笔取采样平均。 */
+  if (shell.doc.stroke_kind != comp_ui::StrokeKind::None) {
+    shell.doc.stroke_pressure_sum += shell.pen_pressure;
+    ++shell.doc.stroke_pressure_samples;
   }
 }
 
@@ -2408,6 +2456,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
+      break;
+    /*
+     * P1-4 笔压：只采样，不拦截派发——break 之后统一走 DefWindowProc，由系统
+     * 继续把笔消息提升成鼠标消息（绘制仍只有一条通路，压感不会另开一套）。
+     */
+    case WM_POINTERDOWN:
+    case WM_POINTERUPDATE:
+      if (shell != nullptr) pen_sample_pressure(*shell, GET_POINTERID_WPARAM(wparam));
       break;
     case WM_LBUTTONDOWN:
       if (shell != nullptr) {
@@ -4013,7 +4069,7 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlipHorizontal, L"水平翻转(&H)\tCtrl+Shift+H");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlipVertical, L"垂直翻转(&V)\tCtrl+Shift+F");
   /*
-   * S24 效果子菜单：6 种效果的开关（勾选 = 该层已启用），id = kCmdEffectBase + kind。
+   * S24 效果子菜单：每种效果的开关（勾选 = 该层已启用），id = kCmdEffectBase + kind。
    * 引擎侧效果早已参与像素求值（compositing/effect_eval.cpp），此前壳没有入口也没有
    * 回读口，用户只能手改 .comp 里的 engineEffects 才能加投影/描边。
    */
@@ -4130,6 +4186,9 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_STRING, kCmdSelectContract, L"收缩(&O)...");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectBorder, L"边界(&B)...");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectSmooth, L"平滑(&S)...");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectGrow, L"扩大选取(&G)");
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectSimilar, L"选取相似(&R)");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);

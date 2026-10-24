@@ -832,6 +832,9 @@ const wchar_t* effect_kind_label(int kind) {
     case 3: return L"内阴影";
     case 4: return L"外发光";
     case 5: return L"内发光";
+    case 6: return L"斜面和浮雕";
+    case 7: return L"缎光";
+    case 8: return L"渐变叠加";
     default: return L"描边";
   }
 }
@@ -975,7 +978,8 @@ void panel_toggle_flip(ShellState& shell, bool horizontal) {
 /*
  * 效果开关（S24）。
  *
- * 引擎侧 6 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光）早已参与像素求值，
+ * 引擎侧 9 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/
+ * 渐变叠加）早已参与像素求值，
  * 但 ABI 只有 set_effect / remove_effect，壳无法知道「这一层现在有哪些效果」。
  * 加了 effect_count / effect_at 之后，这里可以做**幂等切换**：勾选 = 已启用。
  *
@@ -2577,10 +2581,12 @@ void panel_begin_destructive(ShellState& shell, uint32_t kind) {
   /* Curves 没有参数表，点列走这条寄存串（其余 kind 不用它，进态时一律重置）。 */
   shell.doc.destructive_curve_settings = "{\"curves\":{}}";
   /*
-   * 去色没有可调参数（曲线同样 0 项，但曲线要在面板里拉点，不能提前落墨），
-   * 所以只对 Desaturate 走「点菜单即应用」，其余进面板态等 Ctrl+Shift+U。
+   * 没有可调参数的类型（去色、三种自动调整）点菜单即落墨：停在面板里没有滑杆可动，
+   * 只会多按一次 Ctrl+Shift+U。曲线同样 0 项，但要在面板里拉控制点，不能提前落墨。
    */
-  if (kind == COMP_ADJUSTMENT_DESATURATE) {
+  size_t param_count = 0;
+  if (comp_layer_adjustment_param_count(kind, &param_count) != COMP_OK) param_count = 0;
+  if (param_count == 0 && kind != COMP_ADJUSTMENT_CURVES) {
     shell.doc.adj_destructive = false; /* 一次性落墨，不进入面板态 */
     panel_apply_destructive(shell);
     return;

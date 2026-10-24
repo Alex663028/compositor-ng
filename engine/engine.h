@@ -7,11 +7,13 @@
  *
  * 句柄有效性（双闸门）：
  *   对象内置一枚构造期写入、析构期擦除的 magic；构造期还把自己登记进共享的
- *   「存活对象登记表」（core/comp_live_handles.h，构造登记 / 析构注销）。
- *   abi 层的 as_engine/as_document **先查表、再读 magic**——销毁后使用、
- *   类型混淆（拿引擎句柄当文档句柄）被 magic 挡住，完全野的指针（未映射
- *   地址）被登记表挡住，一律变成 COMP_ERR_INVALID_ARGUMENT 而不是段错误。
- *   ABI 类型与二进制布局均不变。
+ *   「存活对象登记表」（core/comp_live_handles.h，构造登记 / 析构注销，表项带
+ *   类型标签）。abi 层的 as_engine/as_document **先查表（含类型）、再读 magic**
+ *   ——销毁后使用、类型混淆（拿引擎句柄当文档句柄）、完全野的指针（未映射
+ *   地址）一律变成 COMP_ERR_INVALID_ARGUMENT 而不是段错误。
+ *   类型标签在解引用之前生效：magic 是尾部成员，按错误类型的布局去读会越界
+ *   （Document 的 magic 在约 +472，Engine 对象只有 160 字节），那是 F2 段错误的
+ *   来源，不能只靠 magic 比较兜着。ABI 类型与二进制布局均不变。
  */
 #ifndef COMPOSITOR_ENGINE_ENGINE_H
 #define COMPOSITOR_ENGINE_ENGINE_H

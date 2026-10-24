@@ -145,18 +145,20 @@ constexpr size_t kMaxFontBytes = 100u * 1024u * 1024u;
 
 }  // namespace
 
-/* 三个 font 侧入口都是共享存活登记表的薄转发：表键是 const void*，
- * Engine / Document / FontFace 共用一张表；类型区分仍交给各自对象的 magic。 */
+/* 三个 font 侧入口都是共享存活登记表的薄转发：Engine / Document / FontFace
+ * 共用一张表，但表项带类型标签（LiveHandleKind::kFont），类型不对的句柄在
+ * 解引用之前就被否掉——否则按 FontFace 布局读 magic 会越界读到别的类型对象
+ * 分配块之外（见 comp_live_handles.h 文件头的 F2 说明）。 */
 void register_live_font(FontFace* face) noexcept {
-  register_live_handle(face);
+  register_live_handle(face, LiveHandleKind::kFont);
 }
 
 void unregister_live_font(FontFace* face) noexcept {
-  unregister_live_handle(face);
+  unregister_live_handle(face, LiveHandleKind::kFont);
 }
 
 bool is_live_font(FontFace* face) noexcept {
-  return is_live_handle(face);
+  return is_live_handle(face, LiveHandleKind::kFont);
 }
 
 FontFace::FontFace() = default;

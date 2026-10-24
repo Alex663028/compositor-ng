@@ -1432,9 +1432,13 @@ Windows 侧推荐编译器仍是 clang-cl。
   GPU<->CPU <= 1 LSB，`vkCreateShaderModule` / `vkCreateComputePipelines` 真机返回码有效。
   但**引擎主渲染路径尚未接线到设备侧**，故 `caps().offscreen_compute` 仍**如实为 false**，
   `render_document` 明确返回 UNSUPPORTED，`AUTO` 回落 CPU（实机自检亦确认 `backend = CPU`）。
-- **鸿蒙壳仍无真机可验**：`libcompositor_ohos.so` 已构建，DevEco 工具链（`hvigor` / `node` /
-  `hdc`）在位，但 `hdc list targets` 实测返回 `[Empty]` —— **无鸿蒙真机/模拟器在线**，HAP 打包
-  与 ArkTS 页面未经设备联调；且当前 `.so` 为 `aarch64`，模拟器平台多为 `x86_64`，需另加交叉目标。
+- ~~**鸿蒙壳仍无真机可验**~~ → **2026-10-24 订正：模拟器已在线**。DevEco Studio 的
+  MateBook Pro 模拟机（`x86_64-linux-ohos`，`hdc list targets` → `127.0.0.1:5555`）已跑通
+  **引擎单测 705/705（rc=0）** 与 **ASan 构建 0 报告**；`scripts/build_ohos.sh` 支持
+  `OHOS_ARCH=x86_64`（默认仍是 aarch64 真机目标），本轮还补齐了 vendored 编解码的
+  include 路径，鸿蒙与宿主从此走同一套 PNG/JPEG/HDR/EXR 编解码（§6.101）。**仍未验证的**：
+  HAP 打包与 ArkTS 页面联调（`libcompositor_ohos.so` 只构建通过，没有在设备上被 Java/ArkTS
+  加载过），以及真机 aarch64 的同一轮跑测。
 - **D3D12 真实设备路径：SDK 已在位，仍未上主渲染路径**（2026-10-18 订正）。
   此前记录的「无 `d3d12.h`」是错的：Windows SDK 10.0.22621 / 10.0.26100 装在
   `E:\AMD\include\`，`engine/render/d3d12_backend.cpp` 加 `-DCOMP_HAS_D3D12` 已用 clang-cl
@@ -1471,7 +1475,8 @@ Windows 侧推荐编译器仍是 clang-cl。
 - `maskSourceID` 仅原样保真，不参与合成。
 
 **图层效果已参与合成（2026-10-16 起，见 `compositing/effect_eval.cpp`）**：
-`comp_layer_set_effect` 写入的 6 个 kind（描边 / 投影 / 颜色叠加 / 内阴影 / 外发光 / 内发光）
+`comp_layer_set_effect` 写入的 9 个 kind（描边 / 投影 / 颜色叠加 / 内阴影 / 外发光 / 内发光 /
+斜面和浮雕 / 缎光 / 渐变叠加，后三者见 §6.97）
 全部有像素实现，在图层的单元缓冲上就地求值，绘制次序对齐上游
 `LayerEffects.swift:388 render(_:mask:effects:)`：
 
@@ -1479,6 +1484,7 @@ Windows 侧推荐编译器仍是 clang-cl。
   图层像素；颜色叠加 / 内发光 / 内阴影 / inside 描边压在像素**之上**。
   叠色类（Color Overlay / 内发光 / 内阴影）走 **source-atop**——只落在已有 alpha 之内
   且**不改变 alpha**，半透明像素因此完全吃到颜色（这正是上游注释强调的语义）；
+  斜面和浮雕 / 缎光 / 渐变叠加同属「之上」（source-atop），因此 `effects_margin()` 对它们返回 0；
 - 效果以图层「呈现出来的形状」（变换与蒙版已烘进单元缓冲）为源，因此效果跟随实际形状；
 - 包围盒按 `effects_margin()` 外扩（outside 描边吃 size、投影吃 distance + blur×3、
   外发光吃 size×3），否则 outside 类效果会被图层 bounds 裁掉；
@@ -1488,7 +1494,7 @@ Windows 侧推荐编译器仍是 clang-cl。
   不可见参数（opacity=0 / size=0 / 距离与模糊同时为 0）逐字节无变化；坏 JSON 与键类型不对
   回落默认值而非跳过——注意上游默认值全都是**可见**的，早期把「回落默认值」当成
   「当作无效果跳过」会让实现与上游语义分道扬镳；
-- **引擎不认识的 effect kind**（`kind >= 6`，如未来版本或第三方扩展）既不求值也不绘制：
+- **引擎不认识的 effect kind**（`kind >= COMP_EFFECT_KIND_COUNT`，当前 9，如未来版本或第三方扩展）既不求值也不绘制：
   逐字节跳过，但**仍然阻止 flatten / merge_down**——烘入会静默丢弃它，正是 AUDIT5 §7.4
   记的那类「报成功但丢参数」；
 - 已知差异：上游用 Core Image 的高斯模糊与 GPU 路径，本引擎复用调整求值里同一套三趟
@@ -3836,7 +3842,8 @@ rotation/flip 直接把 invert 与全部滤镜打成不支持，功能退化且�
 `engine/domain/effect_table.{h,cpp}`，由 ABI 原样导出。
 
 **引擎表。** 六种 kind 的参数个数 **6 / 7 / 4 / 7 / 5 / 5**（Stroke、DropShadow、
-ColorOverlay、InnerShadow、OuterGlow、InnerGlow），键名就是 `effect_eval.cpp` 里
+ColorOverlay、InnerShadow、OuterGlow、InnerGlow；P1-1 已扩到 **9 种 / 12·8·9 项**，
+见 §6.97），键名就是 `effect_eval.cpp` 里
 `read_*` 用的扁平 JSON 键。`effect_read_value` 直接复用 `adjustment_read_value`——
 两者要的语义完全相同（点分路径取标量，缺失/中间段非对象/叶子非标量一律 `NOT_FOUND`），
 共用一份实现避免「同一条路径规则写两遍」。`effect_build_settings` 只做**合并**：空串 = 该项
@@ -5403,7 +5410,8 @@ FreeType）。
 
 1. 面板文字是**乱码**：`ui_core` 里的对话框标题/标签/提示是 UTF-8 中文，绘制却走
    `widen_ascii`（逐字节抬高），显示成 `å...ç...`。改用 `widen_utf8`——同仓 `widen_ascii`
-   只配给纯 ASCII 的引擎名字段用。
+   只配给纯 ASCII 的引擎名字段用。（P1-4 起 `widen_ascii` 自己也先按 UTF-8 严格
+   解码、非 UTF-8 才逐字节回退，见 §6.100 第 8 条；这句只描述当时的调用点约定。）
 2. **空格键到不了面板**：`WM_KEYDOWN` 里「空格 = 临时抓手」的判定在 `handle_key` **之前**，
    对话框的「空格翻开关」永远收不到。现在对话框打开时空格归面板（`dialog_owns_space`），
    抓手逻辑不受影响。
@@ -6567,3 +6575,619 @@ stock 字体未必是可缩放字体；这里用 `GetObjectW` 复制它的 `LOGF
   用法，但不破坏兼容——PS 只是不在图层面板里给这四个入口。壳侧的调整面板按
   `COMP_ADJUSTMENT_KIND_COUNT` 驱动，因此这四个也能在面板里建层；
 - 菜单项没有各自的快捷键（PS 也没有），统一走 `Ctrl+Shift+U` 落墨。
+
+### 6.95 调整族补全：Vibrance / Selective Color / Photo Filter / … / Auto Color（P1-6，2026-10-23，Claude）
+
+§6.94 把破坏性入口接上了，但新 kind 只有四个（亮度对比、去色、阈值、色调分离）。
+PS 的 `图像 > 调整` 里还有一整排日常会用到的条目——`自然饱和度`、`可选颜色`、
+`照片滤镜`、`通道混合器`、`颜色查找`、`阴影/高光`，以及三条「点一下就好」的
+`自动色调 / 自动对比度 / 自动颜色`。本轮把它们全部补齐，口径与 §6.94 完全一致：
+**同 kind 同像素**（调整层与破坏性落墨共用一个求值器）、**一步撤销**、
+**参数不变不进历史**。
+
+**ABI 零新增。** 数值全部走既有的 `kind + settings_json` 形态，导出仍是 164 个；
+`.comp` 的 `engineAdjustments` 数组本来就按 kind 号存取，新种类只是多几个合法值。
+
+**kind 16 → 25（尾部追加，0..15 一个没动）。** `COMP_ADJUSTMENT_KIND_COUNT = 25`。
+
+| kind | 名称 | 可编辑参数 | 求值要点 |
+|---|---|---|---|
+| 16 | Vibrance | `vibranceSettings.vibrance` / `.saturation` | `factor = 1 + vibrance·(1 − sat) + saturation`；肤色色相（15°…50°）权重降到 0.55，低饱和处加得多、已饱和处几乎不动 |
+| 17 | Selective Color | `selectiveColorSettings.relative` + `ranges.<0..8>.<channel>`（36 项；channel 取 cyan / magenta / yellow / black） | 先转 CMYK，按六个色相三角权重与白/中性/黑三档亮度权重加权；`relative` 决定按比例还是按绝对量累加 |
+| 18 | Photo Filter | `color.{red,green,blue}` / `density` / `preserveLuminosity` | 缺省即「加温滤镜 (85) 25%」；`1 − t + t·filter` 逐通道相乘，可选缩放回原亮度 |
+| 19 | Channel Mixer | 12 个系数（3×4 矩阵） | `out[c] = clamp(m0·r + m1·g + m2·b + m3)`，缺省即恒等矩阵 |
+| 20 | Color Lookup | `look`（0..4 内置外观）/ `intensity` | 5 张内置外观表 + 与原图的线性混合，不依赖外部 `.cube` |
+| 21 | Shadows/Highlights | `shadows` / `shadowWidth` / `highlights` / `highlightWidth` / `radius` | 先用盒式模糊副本求局部亮度，再逐通道 `c + shadow·(1−c)² − highlight·c²` |
+| 22 | Auto Tone | 无 | 三通道各自按 0.1% 分位拉伸（= 自动色阶） |
+| 23 | Auto Contrast | 无 | 三通道共用亮度分位拉伸，色相关系不变 |
+| 24 | Auto Color | 无 | 在 Auto Tone 上加灰度世界伽马，伽马越出 0.25…4 时放弃该通道修正 |
+
+**求值器只有一份。** 六个带参数的 applier 与一条 auto（内部按 tone/contrast/color 三档）都写在
+`engine/imaging/AdjustPixels.c`（预乘 RGBA8、`in_bands` 行块并行），
+`engine/compositing/adjustment_eval.cpp` 只做 kind → applier 的分发；16 位/HDR 路径
+照旧由 `deep_hdr_round_trip` 的 10 档布局 digest 锁住，所以「调整层」与
+「破坏性落墨」天然逐字节同源，不存在第二条公式。
+
+**外壳只认 ABI 参数表。** `图像 > 调整` 由 11 项扩到 **20 项**（追加 kind 16..24），
+菜单构建与命令分发仍共用 `shell_state.h::kImageAdjustKinds[]`；面板行数、标签、
+量程、缺省值全部来自 `comp_layer_adjustment_param_count/param_at`，外壳里没有第二
+张表——探针里 Photo Filter 用 `VK_TAB` 走到第 4 行 `density` 就是这条链路的实证。
+
+- **零参数 kind 点菜单即落墨**：`panel_begin_destructive` 见 `param_count == 0`
+  就直接提交一次，不进入面板态（`Auto Tone/Contrast/Color` 三档因此没有
+  「打开面板再 Ctrl+Shift+U」这一步）；`Curves` 是唯一的例外（要在面板里拉点）。
+- **Selective Color 的 36 个参数平铺**：`relative` 排表首，其余按 9 档色带 × CMYK
+  顺序逐行列出，面板可滚动；没有做色带分页——分页只属于 Levels。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | `comp_adjustment_kind` 尾部追加 9 个值；`COMP_ADJUSTMENT_KIND_COUNT` 16 → 25 |
+| `engine/domain/adjustment_table.cpp` | 9 个 kind 的名称/摘要/参数表；`adjustment_kind_is_destructive()` 纳入 12..24 |
+| `engine/imaging/AdjustPixels.c` | 八个像素 applier + 三张 auto 直方图/伽马；`adjust_auto` 的 LUT 用堆分配（zig clang 不允许行块捕获数组型局部变量） |
+| `engine/compositing/adjustment_eval.cpp` | 9 个 kind 的分发 |
+| `tests/test_adjustment.cpp` | 破坏性 kind 集合显式锁定 12..24；`adjustment_extended_kinds_round_trip_through_comp` 扩到 13 个追加 kind |
+| `tests/test_adjustment_eval.cpp` | `kEvaluatedKinds` 扩到 25 个 kind（每个都必须改像素）；16/17/19/21 的缺省值锁「逐字节恒等」 |
+| `shells/windows/src/shell_state.h` | `kImageAdjustKinds[]` 追加 9 项 |
+| `shells/windows/src/shell_layers.cpp` | `panel_begin_destructive` 对零参数 kind 直接落墨（Curves 例外） |
+| `shells/windows/src/shell_window.cpp` | 菜单第二段分隔线注释更新（追加项 4 → 13） |
+| `scripts/visual_check.py` | **追加** Photo Filter 面板/100% 加温、Auto Tone 零参数落墨两条探针（`destructive_adjust` 9 → 12 条） |
+| `docs/adjustment-json-keys.md` | kind 表追加 16..24、每种的键名/范围/默认值、破坏性白名单与已知边界 |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **683 例 / 0 失败**（扩的是既有用例，不新增编译单元） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线逐字节一致（本轮不加自检项） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **164**（零新增，纯 kind/settings 扩展） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **156 条 / 28 场景 / 0 失败**（`destructive_adjust` 12 条；既有阈值未动） |
+
+**已知边界：**
+
+- **12..24 不与上游互操作**：上游 `AdjustmentKind` 没有这些值，键名按上游
+  `*Settings` 风格自定；上游读不了、本仓也读不到上游的对应值。
+- **Color Lookup 只有 5 个内置外观**，不支持 `.cube` / `.3dl` 文件——本仓没有文件型
+  LUT 依赖，这一条是刻意的。
+- **Selective Color 的色相三角权重是硬编码近似**，不是 PS 的逐色相采样；没有吸管
+  自定义色带。
+- **Shadows/Highlights 的局部亮度用盒式模糊**（不是 PS 的高斯对数域分离），
+  `radius` 只是模糊半径；`shadowWidth`/`highlightWidth` 只改权重曲线指数。
+- **Auto Color 在偏色极端时可能放弃修正**（灰度世界伽马落在 0.25…4 之外），
+  这是为了避免把正常图拉爆，不是失败。
+
+### 6.96 扩大选取 / 选取相似：按颜色扩散与全局同色匹配（P0-5 收尾，2026-10-23，Claude）
+
+§6.92 补了通道、§5.50 补了边界/平滑之后，P0-5 的「修改」族只剩最后两条：
+`扩大选取`（Grow）与 `选取相似`（Similar）。BACKLOG 当时给的定性是「需新导出，
+按邻居颜色扩散」，验收口径是「Grow 后边界单调外扩」——本轮两条一起落地，
+**ABI 尾部追加 2 个导出，164 → 166**，没有改任何结构体、枚举或既有函数。
+
+**两条命令的语义差别只有一个字：连通性。**
+
+| | `comp_selection_grow` | `comp_selection_similar` |
+|---|---|---|
+| 扩散方式 | 4 连通（上下左右）BFS | 与连通性无关，全幅逐像素查询 |
+| 判定 | 候选像素与**父像素**的四通道 Chebyshev 距离 ≤ 容差 | 候选像素与**选区里任一**颜色的 Chebyshev 距离 ≤ 容差 |
+| 结果 | 沿颜色渐变一路走，遇台阶就停 | 同色/近色的所有区域一次收进来，跨不连通区 |
+| 极端值 | 容差 0 = 只吃逐字节相同的连通像素 | 容差 255 = 全选 |
+
+**取样都走合并后的 8 位合成表面。** 两条命令都用 `composite_document` 产出可见
+合成，再经 `wand_rgba8_view` 转成 8 位视图（RGBA8 直通、RGBA16F 走 `hdr_to_rgba8`、
+deep 走 `deep_to_rgba8`）——与魔棒、色彩范围同一条取样链，所以「图层可见性、
+组、蒙版、混合模式」对选区的影响与肉眼看到的一致。差别在**比几个通道**：
+
+- `grow` 逐像素比**预乘 RGBA 四通道**（与魔棒同一把尺子，alpha 参与）；
+- `similar` 的占位表是 **RGB 三维**，alpha 不单独比较。取样面仍是预乘合成，
+  alpha 已经折进 RGB（alpha = 0 恒为 RGB 0），所以「透明黑」与「预乘后同为
+  (0,0,0) 的不透明黑」在 similar 眼里是同一个颜色——4 维精确匹配要 4 GiB
+  占位表，不在预算内。这是两条命令唯一的口径差，已写进头文件。
+
+**Similar 的「精确」不是形容词。** 常见做法是把颜色量化成 32³ 或 64³ 的格子再比，
+那样容差边界会被格子吃掉（容差 1 也会选中一整个格子）。这里的实现是：
+把选区内像素的 RGB 铺进 `256³ = 16 MiB` 的占用体（一字节一格），在三条轴上
+各做一次 1D 二值滑窗 OR（窗口半径 = 容差，每行长 256，O(256³) 级别的三次扫描），
+膨胀后的占用体恰好等于「∃ 已选颜色在 Chebyshev 容差内」——然后逐像素查表。
+`kColorVolumeCells` 是编译期常量，代价是一次 16 MiB 的临时缓冲，跑完即释放；
+容差 255 直接短路成全选，不建表。
+
+**只加像素，结果可复现。** 两条命令都从 `selection->base` 拷贝出 `next`，只把
+新命中的像素置 255，**不动已选中的抗锯齿边缘**。于是：
+- 「无可加像素」时 `next` 与 `base` 逐字节相同，`masks_equal` 短路 →
+  `out_changed = 0`，**不进撤销栈**（反复点菜单不会堆一串空步）；
+- 真变化时经 `apply_coverage_mask(..., kSelectionReplace, ...)` 写回，羽化按既有
+  约定清零，一步撤销（`ImplicitTxn`）。
+- 没有选区 / 显式空选区 → `COMP_OK` + `out_changed = 0`；容差越界 →
+  `COMP_ERR_INVALID_ARGUMENT`（事务之前拒）；合成失败 → `COMP_ERR_INTERNAL`；
+  蒙版尺寸与画布不符 → `COMP_ERR_STATE`。
+
+**Grow 的「单调外扩」是可以证的**：BFS 只从已选像素出发、只往未选像素写，所以
+`base ⊆ next` 恒成立，包围盒只可能变大或不变（`comp_selection_get_bounds` 的
+单测直接锁了这条）。
+
+**外壳是纯接线。** `选择` 菜单在「平滑」下面加 `扩大选取(&G)` / `选取相似(&R)`，
+命令号 1060/1061；容差直接取壳上魔棒的当前值（`[` / `]` 调，默认 32）——PS 里
+这两条用的就是同一个容差值，多开一个旋钮只会让两个数打架。置灰规则沿用
+`enabled.selection_modify`（有选区才亮）。详见 `docs/shell-parity.md` §5.58。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_selection.h` | 尾部追加 `comp_selection_grow` / `comp_selection_similar` 两条导出与契约注释 |
+| `engine/domain/selection.h` / `selection.cpp` | `selection_grow`（4 连通 BFS + 父像素色差）、`selection_similar`（256³ 占用体 + 三轴 1D 膨胀）、`dilate_line` / `dilate_color_volume` / `color_key`、共用的 `grow_similar_prepare` |
+| `engine/abi/src/comp_selection_abi.cpp` | 两个 ABI 包装：guard → 容差范围检查 → `ImplicitTxn` → `finish(engine, &txn, changed, out_changed)` |
+| `tests/test_selection.cpp` | 5 例：灰阶斜坡漫到底（相邻差 4、总差 252）、台阶大于容差时一格不过、相似跨不连通同色带、相似的颜色距离边界正好 4 列、参数越界/无选区/羽化清零/`out_changed = NULL` |
+| `shells/windows/src/shell_state.h` | `kCmdSelectGrow = 1060` / `kCmdSelectSimilar = 1061` |
+| `shells/windows/src/shell_window.cpp` | 菜单两项 + 置灰规则 |
+| `shells/windows/src/shell_document.cpp` / `shell_selection.cpp` / `shell_internal.h` | 命令分发与 `grow_similar_selection`（状态栏三分支） |
+| `scripts/visual_check.py` | 追加 `selection_grow` 场景（5 条） |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **688 例 / 0 失败**（683 → 688，新增 5 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **166**（164 → 166，尾部追加两条，无重排） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **162 条 / 29 场景 / 0 失败**（新增 `selection_grow` 5 条；既有阈值一处未动） |
+
+**已知边界：**
+
+- **色差是逐通道 Chebyshev（预乘），不是 Lab ΔE**：与魔棒同口径，
+  「视觉上接近」不等于一定命中；想要感知均匀请先转 Lab（本仓无色彩管理）。
+  Grow 比四通道（alpha 参与），Similar 比预乘 RGB 三通道（alpha 折在颜色里）——
+  两者在纯透明区的结论可以不同，见上文取样段。
+- **Similar 的 alpha 不单独比较**：`(0,0,0,0)` 与预乘后同为 `(0,0,0)` 的不透明黑
+  在它眼里同色；4 维精确占位表要 4 GiB，是刻意的取舍。Grow 不受影响。
+- **Grow 是 4 连通**：斜角相邻的像素不会被走到，比 PS 的取样习惯保守一点。
+  这是刻意的——8 连通会让「只有斜角相接的细线」被整个吃掉，4 连通的结果更容易
+  预期，且与「沿渐变走」的直觉一致。
+- **容差 255 不做颜色计算**：直接全选（所有颜色距离都 ≤ 255），与 PS 一致。
+- **没有「选择并遮住」式的边缘细化**：长出来的边界就是硬边蒙版，要软边请再用
+  `选择 > 羽化`。Grow 会清零羽化，这是「先加像素再羽化」的顺序问题，见上。
+
+### 6.97 图层样式补全：斜面和浮雕 / 缎光 / 渐变叠加（P1-1，2026-10-23，Claude）
+
+**缺口。** 图层样式此前 6/10：缺斜面和浮雕、缎光、渐变叠加、图案叠加。本轮按**尾部追加**
+补进前三种（kind 6/7/8），图案叠加需要图案资源与缩放/对齐参数，仍然留空。
+
+**ABI（零新导出，166 不变）。** 只做两件事：`comp_effect_kind` 末尾追加
+`COMP_EFFECT_STROKE..COMP_EFFECT_GRADIENT_OVERLAY`（0..8），
+`COMP_EFFECT_KIND_COUNT` 由 6 改为 **9**。枚举值只增不改，既有 0..5 的像素结果逐字节不变。
+
+**引擎语义（`compositing/effect_eval.cpp`）。** 三者都读「呈现出来的形状」（变换与蒙版已烘进
+单元缓冲），都走 source-atop，都不改 alpha，`effects_margin()` 全为 0：
+
+| kind | 求值 | 缺省参数 |
+|---|---|---|
+| 6 Bevel & Emboss 斜面和浮雕 | 把 coverage 按 `size` 模糊得 `soft`；沿光向量（`angle` + `altitude`，y 向下，`dx = cos·reach·cos(alt)`、`dy = -sin·reach·cos(alt)`，`reach = max(1, size/2)`）取 `±(dx,dy)` 两个位移副本；`highlight = toward - away`、`shadow = away - toward`，可选 `soften` 再模糊；两者按 `depth/100 × opacity` 缩放后**先影后光**各自 source-atop 上色 | angle 120 / altitude 30 / depth 100 / size 10 / soften 0 / opacity .75，主色白、影色黑 |
+| 7 Satin 缎光 | 沿 `angle` 取两个反向位移副本求**绝对差**（`abs_difference`），`blur` 模糊，`invert` 反相，按 `opacity` source-atop 上色。只有方向与距离，**没有高度角**（用 altitude 90 会让 cos=0、位移归零，这正是首版踩到的坑） | angle 19 / distance 11 / blur 14 / invert false / opacity .5 / 黑 |
+| 8 Gradient Overlay 渐变叠加 | `shape_bounds` 取形状包围盒，把每个像素投影到 `u = (cos a, sin a)` 得归一化 `t`（90° = 上→下），`color → color2` 线性插值，`reverse` 翻转，按 `opacity` source-atop 上色 | angle 90 / reverse false / opacity 1 / 黑 → 白 |
+
+不可见参数的闸门沿用既有口径：opacity≤0、size≤0、depth≤0、distance≤0 一律 `DrawKind::kNone`，
+落笔与不启用逐字节相同。
+
+**参数表（`domain/effect_table.cpp`）。** 新增 12 / 8 / 9 行，键名就是求值侧 `read_*` 的扁平 JSON
+键；`kEffectParamKindCount` 6 → **9**。`default_value` 与 `read_*` 的缺省实参逐个对齐——
+这正是 `effect_table_defaults_match_evaluator` 的用途：两处数值一旦漂移，「面板显示 120°、
+落笔按 0° 算」不会编译报错，只会画错。
+
+**外壳是纯接线。** `ui_core.h` 的 `kEffectKindCount` 6 → 9 与三个显示名
+（Bevel & Emboss / Satin / Gradient Overlay），Layer→效果菜单按它循环自动多出三项；
+`shell_layers.cpp` 补 `斜面和浮雕` / `缎光` / `渐变叠加` 三个中文标签。**未加自检项**。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/compositing/effect_eval.h` | 枚举尾部追加 6/7/8，`kEffectKindCount = 9`，补三者的语义说明 |
+| `engine/compositing/effect_eval.cpp` | `EffectPlan` 尾部追加 altitude/depth/soften/invert/reverse/color2/shadow_color；新助手 `scaled` / `abs_difference` / `shape_bounds` / `wrap_degrees` / `light_vector` / `recolor_atop_gradient`；`plan_effect` 与 `draw_planned` 三例；`effects_margin` 归入 0 边距组 |
+| `engine/domain/effect_table.cpp` / `.h` | 三张参数表 12/8/9 行，`kEffectParamKindCount = 9` |
+| `engine/abi/include/compositor/comp_layer.h` | 追加三个枚举值，`COMP_EFFECT_KIND_COUNT` 6 → 9 |
+| `shells/windows/src/ui_core.h` | `kEffectKindCount = 9` + 三个显示名 |
+| `shells/windows/src/shell_layers.cpp` | 三个中文标签 |
+| `tests/test_effect_eval.cpp` | `kEvaluatedEffects` 补三行；新增 3 例（inside-only 不越界且 alpha 不变、渐变叠加按角度走、斜面的受光侧更亮） |
+| `tests/test_effect_table.cpp` | 参数个数期望 `{6,7,4,7,5,5,12,8,9}` |
+| `tests/test_ui_core.cpp` | 名字表与 `kEffectKindCount == 9`，越界取样改看 99 → `Gradient Overlay` |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **691 例 / 0 失败**（688 → 691，新增 3 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| OHOS 交叉编译 | `compile ok=118 fail=0` |
+| `^COMP_API` 导出 | **166**（本轮无新导出，只追加枚举值） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **图案叠加（kind 9）未做**：需要图案资源句柄与缩放/对齐参数，属另一条独立线。
+- **斜面的「轮廓 / 纹理 / 光泽等高线」未做**：只做线性角度 + 高度角 + 深度，没有
+  PS 的 ring/cone 轮廓与纹理叠加；高光/阴影的颜色是纯色，没有渐变映射。
+- **渐变叠加只有两色线性**：没有多色标（P1-7 的活）、没有径向/角度/菱形样式，
+  也没有 `color` 的混合模式（PS 的叠加渐变可带 blend mode）。
+- **渐变方向是包围盒投影**：形状不是矩形时（如圆形图层），渐变仍按矩形包围盒算，
+  与 PS「按图层边界」一致但不按形状本身弯曲。
+- 壳侧没有取色器/角度转盘，参数仍靠效果面板（`Ctrl+Shift+E`）步进与键入。
+
+### 6.98 渐变升级：五类型 + 多色标 + 中点 + 抖动（P1-7，2026-10-23，Claude）
+
+**缺口。** 渐变工具此前只有 `color0/color1` 两色与「线性 / 径向」两型
+（`comp_layer.h` 的 `comp_tool_gradient`）。PS 的渐变是**色标表**：任意多个色标、
+每个色标自带中点（决定与左邻色标的过渡曲率）、五种样式、可选抖动。本轮把引擎与
+ABI 做到位，壳侧给预设库与抖动开关，**可编辑色标表**仍未做（见已知边界）。
+
+**ABI（零新导出，166 不变）。** 新增 `comp_gradient_type` 枚举（0 线性 / 1 径向 /
+2 角度 / 3 对称 / 4 菱形，纯尾部追加）、`COMP_TOOL_GRADIENT_MAX_STOPS 32`、
+`comp_gradient_stop { position, midpoint, color[4] }`。三个新字段挂在这里要注意：
+
+| 放哪 | 后果 |
+|---|---|
+| `comp_tool_gradient` 尾部 | **错误**——它是 `comp_tool_op_desc` 的嵌套成员，追加会让其后的 `opacity`、`type_font` 等字段整体偏移，违反「既有宿主重编译后偏移不变」 |
+| `comp_tool_op_desc` 尾部（实际做法） | 正确——`gradient_stops` / `gradient_stop_count` / `gradient_dither` 追加在最外层结构末尾，既有字段偏移全部不变 |
+
+语义：`gradient_stop_count >= 2` 时以 `gradient_stops` 为准、`color0/color1` 被忽略；
+`count == 0` 且指针为 NULL 时走**旧的两色 lerp 路径**（旧宿主行为逐字节不变）；
+`count` 与指针不匹配、超过 32、位置非升序或重复、`midpoint` 不在 `(0,1)`、
+全部色标 alpha 为 0 → `COMP_INVALID_ARGUMENT`。
+
+**引擎语义（`domain/tool_ops.cpp`）。** 先按类型把像素映射成参数 `t ∈ [0,1]`，
+再在色标表上取样：
+
+| type | t 的定义（`L = |end - start|`，`p` 为相对起点的像素，`d` 为轴方向） |
+|---|---|
+| 0 Linear | `proj / L`，`proj = (p·d)` |
+| 1 Radial | `|p| / L`，起点为圆心 |
+| 2 Angle | `方位角(p) - 方位角(d)` 归一化到 `[0, 2π)` 后 `/ 2π` |
+| 3 Reflected | `|proj| / L`，正负两侧对称 |
+| 4 Diamond | `(|proj| + |perp|) / L`，`perp = (p × d) / L` |
+
+**中点重映射**走 `u' = u^(ln0.5 / ln midpoint)`，`midpoint == 0.5` 时是指数 1 的恒等
+（代码里显式短路，避免 `pow` 的浮点毛刺）。中点属于**该色标与它左邻色标**之间的那一段，
+与 PS 一致。色标表**不自动排序**：乱序或重复位置直接拒绝，因为静默排序会让宿主
+「传进去的值」与「画出来的值」不一致，而这类错误在像素层面极难归因。
+
+**抖动**是确定性哈希（`(x, y, channel)` 三次常数混合），偏移落在 `[-0.5, 0.5)` LSB，
+加在**预乘 RGB** 上再 `lround`，alpha 不动。同一文档、同一参数重复绘制逐字节相同，
+撤销/重做也不漂移——这正是不用 `rand()` 的原因。
+
+**外壳（只接线，未加自检项）。**
+
+- `ui_core.h`：`kGradientTypeCount = 5` 与五个显示名；`next_gradient_type` 五档回绕。
+- **预设库是只读表**：`gradient_preset_stops(preset, foreground, reverse, out, cap)`
+  展开三种预设——`前景→透明`、`黑→白`、`彩虹`（5 色标，中点 0.6/0.5/0.4/0.5/0.5，
+  故意给出非 0.5 的中点，让中点重映射在视觉上可验证）。`reverse` 把
+  `position` 镜像为 `1 - p`、`midpoint` 取对称段的表值，而不是简单倒序。
+- 选项栏 `G` 从 1 组变 **3 组**：类型 / 色标预设 / 抖动（开·关）。
+- 预览：径向与角度画圆、对称画虚线镜像轴、菱形画旋转 45° 的虚线方框。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/tool_ops.h` / `.cpp` | `GradientStop`、`kMaxGradientStops = 32`、五类型映射、中点重映射、确定性抖动、严格的色标表校验 |
+| `engine/abi/include/compositor/comp_layer.h` | 枚举 + 上限宏 + 色标结构体；`comp_tool_op_desc` **尾部**追加 3 个字段 |
+| `engine/abi/src/comp_layer_abi.cpp` | 结构体闸门 + 拷贝色标表 + `gradient_dither` |
+| `shells/windows/src/ui_core.h` | 五类型名/循环、三种预设表与 `gradient_preset_stops`、选项栏两行新增 |
+| `shells/windows/src/shell_state.h` | `gradient_preset`、`gradient_dither` |
+| `shells/windows/src/shell_tools.cpp` | 预设展开成 ABI 色标表；dither/type/preset 进状态栏 |
+| `shells/windows/src/shell_paint.cpp` | 选项栏回显、五种预览几何 |
+| `shells/windows/src/shell_window.cpp` | `G` 键提示与选项栏提示更新 |
+| `tests/test_tool_ops.cpp` | 5 例：多色标落位、中点改变段内曲率、对称/菱形/角度、抖动确定且可逆、非法色标表全拒 |
+| `tests/test_ui_core.cpp` | 五类型名字与循环、预设展开（升序/中点/反向/容量不足）、选项栏组数 1 → 3 |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **697 例 / 0 失败**（691 → 697，新增 6 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| `scripts/visual_check.py` | **162 条 / 0 失败**（既有阈值未动） |
+| `^COMP_API` 导出 | **166**（零新导出，只追加枚举与结构体尾字段） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **没有可编辑色标表**：壳上只能选三个预设，不能增删色标、改位置/颜色/中点。
+  这是本轮刻意收窄的范围——一个色标编辑器要拖拽、取色、增删与撤销，是独立的一批活。
+- **没有「不透明度中点」**：PS 的每个色标有颜色中点与不透明度中点两个；这里只有前者，
+  色标透明度是恒定的（走 `color[3]`）。
+- **渐变映射调整仍两色**：`kind == Gradient Map` 的调整层没有接多色标，与本轮的
+  画笔式渐变是两条路径，未合并。
+- **没有噪点渐变 / 杂色**：只有 ±0.5 LSB 的量化抖动，不生成 PS 的 Noise 渐变。
+- **插值空间固定 sRGB 直通**：不做 Lab / 线性光插值，暗部过渡与 PS 不完全一致。
+
+### 6.99 段落框与对齐：按框折行、框高裁切、三种对齐（P0-6 ③，2026-10-23，Claude）
+
+**缺口。** P0-6 ① 把文字做成了可编辑图层，② 接上了字体枚举，但 `comp_type_style`
+里只有字号/行距/字距/抗锯齿：一段长文案只能一行写下去，冲出画布也不会折；PS 的
+「段落文字」是**先画一个框、再在框里排**。本轮落地段落框与左/中/右对齐；竖排、
+文字变形、路径文字仍是后面的活。
+
+**ABI（零新导出，166 不变）。** `comp_text_align` 枚举（0 左 / 1 中 / 2 右 / 3 计数，
+纯尾部追加）与 `comp_text_desc` 尾部四个字段：
+
+| 放哪 | 后果 |
+|---|---|
+| `comp_type_style` 尾部 | **错误**——它是 `comp_text_desc` 的嵌套成员，追加会让其后的 `color[]`、`opacity`、`font_path_utf8` 等字段整体偏移 |
+| `comp_text_desc` 尾部（实际做法） | 正确——`box_width` / `box_height` / `align` / `_reserved2` 追加在最外层结构末尾，既有字段偏移全部不变，`_reserved2` 必须为 0 |
+
+语义：`box_width == 0` 是**点文字**，按内容自动定宽，走 P0-6 之前的栅格化路径
+（逐字节不变）；`box_width > 0` 按框宽贪心折行；`box_height > 0` **只裁切**，不参与
+折行；`align` 以 `box_width` 为基准。非有限值、负数、超过 `1e6`、`align` 越界、
+`_reserved2 != 0` → `COMP_ERR_INVALID_ARGUMENT`，且闸门在任何副作用之前（不建层、
+不进撤销栈）。
+
+**引擎语义（`domain/type_raster.cpp` 的 `type_layout_paragraph`）。** 折行是**贪心**
+且按字节切片：每行尽可能多放「整词」，词以空格与全角标点/宽码点（`is_wide_codepoint`）
+为界；一个词单独就超宽时按字符**硬断**（否则长 URL 会把框撑破且没有任何提示）。
+行内每一段都用现有的 `slice_width` 量宽，与单行路径同一套度量，所以「点文字的宽度」
+与「段落里同一串字的宽度」不会出现两套数字。
+
+对齐因子取 `(block_width - line_width) × {0, 0.5, 1.0}`，负值夹到 0——行比框宽
+（硬断失败或框比一个字符还窄）时不会往左甩出可见区。`block_width` = 有框宽时的
+`box_width`，否则内容宽度。
+
+渲染是**按视觉行分别栅格化、再 max 合并进整框累加器**：缓冲区尺寸取声明的框，
+因此框外像素由已有的内核窗口裁切自然挡掉，不需要另一套边界判断。空段落保留
+一个空行（`"A\n\nB"` 是 3 行 42 px），行距节奏与单行路径一致——这是「空行不落墨
+但占位」与 PS 对齐的行为。
+
+**外壳（只接线，未加自检项）。** 右栏文字面板**冻结在 4 行**（自检断言
+`kTypePanelRowCount == 4`），所以段落参数放在**选项栏**，新增 3 组：
+
+| 组 | 语义 |
+|---|---|
+| 框宽 | 步进：0 = 自动 → 128 px → ×1.25 向上取整到 16 的倍数；< ≤128 再往下 = 回到 0。夹取 16..8192 |
+| 框高 | 同上；只裁切 |
+| 对齐 | 左 → 中 → 右 循环 |
+
+步进值是**确定性整数**而不是原始 1.25 倍浮点，是为了让「点几下」与「存进 `.comp`
+的值」永远可复现，也保证壳侧永远产生不出引擎会拒绝的数（引擎上限 `1e6`，壳夹
+8192）。预览框用 `type_preview_metrics` 读声明的框宽/框高（框内文字的真实折行位置
+仍由引擎决定，预览不预演字形——沿用 S11 的既定口径）；状态栏只在段落参数非默认时
+追加「｜段落框 W×H px，对齐」，默认点文字的状态栏一个字都不多。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/type_raster.h` / `.cpp` | `kTypeAlign*`、`TypeWrapLine`、`TypeParagraphMetrics`、`type_layout_paragraph`（贪心折行 + 硬断 + 对齐偏移）；`decode_utf8` 增加可选的字节偏移表 |
+| `engine/domain/text_object.h` | 尾部 `box_width` / `box_height` / `align` |
+| `engine/domain/text_layer.cpp` | 校验段落参数；`paragraph_mode` 显式闸门，非段落路径的像素逐字节不变 |
+| `engine/abi/include/compositor/comp_layer.h` | 枚举 + 结构体尾部 4 字段 |
+| `engine/abi/src/comp_layer_abi.cpp` | 闸门 + 写回（`comp_layer_set_text` / `get_text` 双向） |
+| `engine/format/comp_file.cpp` | 非默认时写 `boxWidth` / `boxHeight` / `align`；缺键 = 点文字 |
+| `shells/windows/src/ui_core.h` | `clamp_type_box` / `step_type_box` / 对齐名；选项栏 Type 组 0 → 3 |
+| `shells/windows/src/shell_state.h` | 文档上下文的 `type_box_width` / `type_box_height` / `type_align` |
+| `shells/windows/src/shell_type.cpp` | `type_preview_metrics`、提交时写入三个字段、状态栏段落后缀 |
+| `shells/windows/src/shell_paint.cpp` | 选项栏回显与步进/循环；预览框读声明尺寸 |
+| `tests/test_text_layer.cpp` | 6 例：折行落在框内、三种对齐的墨迹位移、框高裁切不重排、空行占位、非法参数全拒、`.comp` 往返保留段落 |
+| `tests/test_ui_core.cpp` | 框宽/框高步进与夹取、对齐名与循环、Type 组数 0 → 3 |
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **703 例 / 0 失败**（697 → 703，新增 6 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| `scripts/visual_check.py` | **162 条 / 0 失败**（既有阈值未动；段落走的是同一套文字栅格化，既有 `text_layer` 场景像素不变） |
+| `^COMP_API` 导出 | **166**（零新导出） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **没有竖排与文字变形**：`align` 只有水平三档，没有垂直对齐、首行缩进、段前段后距。
+- **折行按空格与宽码点断词**：没有连字符规则、没有 CJK 的避头尾（禁则处理），
+  中文长句在行尾会按字符硬断而不是找语义边界。
+- **没有逐字符光标**：框内点击仍把插入点当作新的左上角，不支持「点在第 3 个字
+  中间插入」，这需要文字命中测试（P1 级）。
+- **段落参数不进文字面板**：面板冻结在 4 行是自检契约的一部分，段落控制只在选项栏。
+- **框高裁切不回报溢出**：裁掉的行没有任何「还有 N 行未显示」的提示。
+
+### 6.100 画笔预设 / 流量 / 压感：把闲置的 `pressure` / `flow` 接上（P1-4，2026-10-23，Claude）
+
+**缺口。** `comp_tool_op_desc.brush` 从上游起就有 `pressure`、`hardness`、`flow`、
+`grain`、`seed`，但外壳每一笔都写死 `pressure = 1.0f`、`flow = 1.0f`：选项栏只有
+「大小 / 硬度」，笔压接口在 Windows 壳里一行都没有，用户拿不到 PS 的两个核心手感
+旋钮（轻笔淡、重笔浓）与预设笔头。本项把这三件接通——**零新增导出、零结构体改动**
+（`^COMP_API` 仍 166）。
+
+**为什么是纯壳层。** 引擎早就按 `pressure × flow` 算峰值 coverage（`docs/tool-ops.md`
+§4.2），缺的只是「谁来填这两个数」。所以本轮没碰引擎、没加 ABI、没改枚举与结构体：
+字段本来就在正确的偏移上，加字段反而会破既有的 `desc.brush` 契约。
+
+**1. 预设是只读表，下标是状态。** `ui_core.h` 的 `brush_preset_spec()` 返回
+`{名字, 大小, 硬度, 流量}`：
+
+| 下标 | 名字 | 大小 | 硬度 | 流量 |
+|---|---|---|---|---|
+| 0 | 自定义 | — | — | —（不覆盖当前值） |
+| 1 | 硬边圆 | 24 | 100% | 100% |
+| 2 | 软边圆 | 80 | 0% | 100% |
+| 3 | 喷枪 | 160 | 25% | 35% |
+| 4 | 细节 | 5 | 100% | 100% |
+
+下标 0 是**无操作**而不是某个预设的副本：启动状态是「大小 24 / 硬度 0.75 / 流量
+1.0」，若 0 指向硬边圆（硬度 100%），选项栏第一帧就把 75% 显示成 100%——界面
+一开始就撒谎。任何手动改这三个值的入口（选项栏箭头、`[` `]` 快捷键）都把下标复位
+到 0，于是「自定义」的语义恒为「当前这组数不是任何预设给的」。表里每个值都在
+`clamp_brush_size / clamp_brush_hardness / clamp_brush_flow` 的范围内，点任何一档
+都不会产生引擎拒收的笔刷——预设表是壳层的**常量**，不参与 `.comp`、不进撤销。
+
+**2. 流量是唯一的覆盖旋钮。** `COMP_TOOL_STROKE` 不读顶层 `desc.opacity`，一笔的
+浓淡只能由 `brush.flow` 表达。壳里存 `0.01..1.0` 的 double，界面换算成 `1..100%`
+整数、步进 5%（`step_brush_flow`），`clamp_brush_flow()` 把 0 / 负数 / NaN 抬到
+`0.01`：下限不是审美，是「流量 0 什么都没画」在界面上没有任何反馈，用户会以为
+工具坏了。滚到底 `1%` 仍有一层极淡的墨，正是这个下限给出的可观察结果。
+
+**3. 压感：采样后把消息原样交回去。** `WM_POINTERDOWN` / `WM_POINTERUPDATE` 进来
+只做一件事：`GetPointerType()` 确认 `PT_PEN`，`GetPointerPenInfo()` 读
+`penMask & PEN_MASK_PRESSURE` 与 `pressure`（0..1024），存成 `0..1` 的
+`shell.pen_pressure`。**然后照常 `DefWindowProcW`**：系统把笔输入提升成
+`WM_MOUSEMOVE` / `WM_LBUTTONDOWN`，既有的鼠标绘制路径一行不改。不调
+`EnableMouseInPointer`、不独占 `WM_POINTER`——那等于接管整条鼠标路径，收益只是
+少两条消息。两个 API 用 `GetProcAddress` 从 `user32` 现取（与 `shell_dpi.cpp`
+同一写法），老系统取不到就只是「没有笔压」。
+
+**4. 整笔取平均，不是逐点变化。** 一次笔画在松手时合成**一个** op（整条折线只调用
+一次 `comp_tool_apply`），笔刷也只有一个 `pressure` 标量。所以 `stroke_begin` 清零
+累加器，笔消息里 `+=` 并计数，`paint_stroke_end` 用 `average_stroke_pressure()`
+求均值；`brush_pressure` 关掉、没有笔消息、消息不带 `PEN_MASK_PRESSURE` 时一律
+1.0。**这是本轮最重要的已知限制**：同一笔里由粗到细的压感渐变画不出来，逐点压感
+要等笔画分段/逐点 op 的引擎口径。另有一个小边界：`WM_POINTERDOWN` 比系统提升出的
+`WM_LBUTTONDOWN` 先到，那时 `stroke_kind` 还是 `None`，所以**落笔那一条采样不进
+均值**，均值只来自后续 `WM_POINTERUPDATE`。
+
+**5. 选项栏 2 组 → 5 组，只追加在尾部。** Brush / Eraser 现在依次是
+0 大小、1 硬度、2 预设（Choice 5 档）、3 流量（Stepper）、4 压感（Choice 开/关）。
+0/1 的位置是既有契约——`visual_check.py` 的 `options_bar` 场景按组 0 点 `+`，
+`test_ui_core.cpp` 断言组数与顺序——所以新组只能从下标 2 开始追加；不改任何既有
+断言的语义，只把组数 2 → 5。Retouch / Tone / HistoryBrush 保持 2 组：它们的落笔
+不读 `brush.flow` / `brush.pressure`，多给两组等于给假旋钮。窄窗口下放不下的组
+照旧不画也不可点。
+
+**6. 状态栏只在非默认时加尾巴。** 默认（流量 100%、笔压 100%）文案与以前逐字
+相同；否则追加「· 流量 50%」「· 笔压 62%」。既有的「不给默认路径加噪音」规矩，
+也是壳自检 263 项 SHA 能保持不变的原因之一——自检里那些画笔笔画走的仍是默认值。
+
+**7. 文件改动。**
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/ui_core.h` | `clamp_brush_flow` / `step_brush_flow` / `brush_preset_spec` / `brush_preset_name` / `brush_preset_is_custom` / `pen_pressure_to_unit` / `average_stroke_pressure`；枚举尾部追加 `BrushPreset` / `BrushFlow` / `BrushPressure`；Brush/Eraser 选项表 2 → 5 组 |
+| `shells/windows/src/shell_state.h` | 文档上下文 `stroke_pressure_sum` / `stroke_pressure_samples`；壳层 `brush_preset` / `brush_flow` / `brush_pressure` / `pen_pressure` / `pen_pressure_active` |
+| `shells/windows/src/shell_tools.cpp` | `stroke_begin` 清零累加器；`paint_stroke_end` 写真实的 `pressure` / `flow`，非默认时追加状态栏后缀；其它笔刷族算子保持 1.0 |
+| `shells/windows/src/shell_window.cpp` | `pen_sample_pressure`（`GetProcAddress` 解析 + `PT_PEN` 判定 + 累加）；`WM_POINTERDOWN` / `WM_POINTERUPDATE` 采样后落回 `DefWindowProc`；快捷键改值复位预设 |
+| `shells/windows/src/shell_paint.cpp` | 三个新选项的值文本（预设名 / `%` / 开·关）与 `apply_tool_option` 分支 |
+| `tests/test_ui_core.cpp` | 新增 `ui_core_brush_preset_flow_and_pen_pressure`；Brush/Eraser 组数 2 → 5，追加顺序与类型断言 |
+| `shells/windows/src/main.cpp` | `widen_ascii` 先按 UTF-8 严格解码、非 UTF-8 才回退逐字节（修第 8 条的乱码） |
+| `scripts/visual_check.py` | 追加 `brush_options` 场景 9 条（`SCENES` 末尾，既有阈值未动） |
+
+**8. 顺手修掉的乱码（既有缺陷，非本轮引入）。** 画完 `113_brush_options_full.png`
+一眼就能看出选项栏所有标签都是 `å...`：`tool_option()` 的标签（`"大小"`、`"硬度"`、
+`"预设"`…）、`brush_preset_name()`、`gradient_preset_name()`、`type_align_name()`
+返回的都是 UTF-8 窄字符串，绘制却统一走 `widen_ascii()`——逐字节抬成 `wchar_t`，
+三个 UTF-8 字节变成三个拉丁字形。点击选项后的状态反馈同病（`shell_window.cpp`
+用 `widen_ascii(spec.label)` 拼 `"流量：50%"`）。§5.49 引入选项栏时就是这样，
+只是此前的探针只量几何与像素数，没有一条读文字。
+
+修法放在 `widen_ascii()` 内部而不是改 20 多个调用点：先 `MultiByteToWideChar(CP_UTF8,
+MB_ERR_INVALID_CHARS)`，**不是合法 UTF-8 才退回旧的逐字节路径**。纯 ASCII 在两条
+路径上逐字符相同，所以引擎回传的 ASCII 名字段（`Brush` / `Normal` / `Exposure`）
+显示不变；引擎回传的非 UTF-8 片段也不会变成空串（`widen_utf8` 失败返回空，那是给
+已知 UTF-8 的数据用的）。修完选项栏读作「大小 24 px｜硬度 75%｜预设 自定义｜流量
+50%｜压感 开」，状态栏读作「… · 流量：50%」。**修完重跑全量**：`run_regression.py
+--require-ohos` 6/6 PASS（704 例、壳自检 263 项 SHA 未变、OHOS ok=118/fail=0），
+`visual_check.py --scene all` 171 条 / 30 场景 / 0 失败。
+
+**本轮验证基线（2026-10-23 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **704 例 / 0 失败**（703 → 704，新增 1 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| `scripts/visual_check.py --scene all` | **171 条 / 30 场景 / 0 失败**（162 → 171，只追加 `brush_options`） |
+| `^COMP_API` 导出 | **166**（零新导出） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **整笔平均笔压**：一笔只有一个 `pressure`，同一笔里轻重变化画不出来（见第 4 条）。
+- **预设不能存**：只有 5 个内置只读档，不能保存/删除/命名自己的笔头；预设不进
+  `.comp`，重开文档回到「自定义」。
+- **没有间距 / 圆度 / 角度 / 纹理 / 双重画笔 / 动态抖动**：这些是 P1-4 的其余部分。
+- **没有 WinTab**：只有 `WM_POINTER` 可用的机器才有笔压，老驱动/部分平板不覆盖。
+- **没有笔刷形状光标**：仍是系统箭头 + 既有笔尖轮廓（§5.49），不是 PS 那种随大小
+  缩放的圆环。
+- **`.comp` 不存流量**：流量与预设是壳侧工具状态，像素落盘后不再回溯。
+
+### 6.101 句柄类型闸门 + 鸿蒙编解码 include 收口：F1/F2 两根刺（2026-10-24，Claude）
+
+**现象（F2）。** 在 DevEco Studio 的 MateBook Pro 模拟机（`x86_64-linux-ohos`，`-O2`、无 `-g`、
+静态库链接）上跑单测，`handle_type_confusion_is_rejected` 直接 SIGSEGV；同一份代码在
+Windows 上跑得好好的。这不是模拟机的问题——是「Windows 上读到垃圾也能活」的越界读。
+
+**根因。** `handle_magic_` 是每种句柄对象的**最后一个成员**，所以它的偏移随类型变：
+`Engine` 约 `+156`（对象 160 字节）、`Document` 约 `+472`、`FontFace` 又是另一个值。
+而 `as_engine` / `as_document` / `as_font` 的「双闸门」此前只有第一道查**存活**（表里有没有
+这个地址），第二道才比 magic——**按目标类型的布局去读**。把 `comp_engine` 传给
+`comp_document_size` 时，第一道放行，第二道就去 160 字节对象上的 `+472` 处读 4 字节：
+Windows 恰好落在同页，读出来是个不相等的垃圾值，于是「正确地花了点运气拒绝」；
+鸿蒙模拟器上直接 `SIGSEGV`，ASan 下报 `heap-buffer-overflow`。**闸门的顺序错了。**
+
+**修法（F2）：把类型挪到第一道闸门。** 存活表的值从「在不在」升级为「是什么」：
+
+```cpp
+enum class LiveHandleKind : uint8_t { kEngine = 1, kDocument = 2, kFont = 3 };
+bool is_live_handle(const void* object, LiveHandleKind kind) noexcept;
+```
+
+`as_document(engine_handle)` 现在在**第一次解引用之前**就因为类型标签不匹配返回 `nullptr`，
+ABI 层据此返回 `COMP_ERR_INVALID_ARGUMENT`，magic 比较退化为「登记与 poison 之间的极端时序」
+的兜底。`unregister` 按地址无条件删（留悬空表项比删错更危险），所以「销毁后使用」也被挡住。
+
+没有选的两条路，以及原因：
+
+| 备选 | 为什么不选 |
+|---|---|
+| 把 `handle_magic_` 挪到对象头部 | 改对象布局，且 magic 的语义是「析构时 poison 成 `kHandlePoisoned`」，前置后 poison 与「构造中就绪」难区分；kill 掉现有 `is_alive()` 的零依赖性质 |
+| ABI 层不做类型校验、只靠宿主自律 | 与 F2 的事实相反：宿主传错句柄是**可枚举的误用**，不是未定义前提；`tests/test_abi.cpp` 里本来就有一条专门测它的用例 |
+
+**F1：鸿蒙编解码 include 收口。** `scripts/build_ohos.sh` 此前只给 `engine`、`abi/include`、
+`abi/src` 三个 `-I`，而 `find engine -name "*.c"` 是把 `third_party/{zlib,libpng,stb}` 的源码
+**编进了静态库**的。于是 `codec_lib.cpp` 的 `__has_include("png.h")` / `("stb_image.h")` 探测
+全部失败：PNG 静默回落到自研 `comp_png`，JPEG / HDR / EXR 在鸿蒙上根本不可用——**同一份
+代码在宿主与设备上不是同一套编解码**。补上与 `scripts/build.py` 的 `INCLUDE_DIRS` 同口径的
+三个 `-I`（目录存在才加，缺了打印一行提示，不假装成功）。鸿蒙 `compile ok=118 fail=0`。
+
+**顺带清掉的质量债：测试里的 `Layer*` 悬垂。** F2 一修好，ASan 就不再被 SIGSEGV 掩盖，
+开始逐个报出既有用例里的 `heap-use-after-free`——四处，全是同一个模式：`create_layer` 返回
+的是 `state_.layers` 向量里的**内部指针**，下一次 `create_layer` 触发重分配，先前那个指针
+立刻悬垂。修法一律是「先取 `id`，用完重新 `find`」。这类错误只在 ASan / 特定分配器布局下
+现形，正常 `-O2` 跑只是读写到已释放的堆块——这正是把 ASan 跑在模拟机上的价值。规则本身
+早已写在 `document.h` 的 `create_layer` 注释里，本轮把它补成可操作的措辞（不跨增删持指针），
+并在每处修复点留下指回该注释的一句话。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/core/comp_live_handles.h` / `.cpp` | `LiveHandleKind` 类型标签；`is_live_handle(obj, kind)` 同时校验存活与类型 |
+| `engine/abi/src/comp_abi_internal.cpp` | `as_engine` / `as_document` 先查带类型的活表，类型不符**零解引用**返回 |
+| `engine/abi/src/comp_font_abi.cpp`、`engine/domain/font_face.cpp` | 字体侧同步走 `kFont` 标签（`comp_font_release` 的重复释放仍是安全空操作） |
+| `engine/engine.cpp`、`engine/domain/document.cpp` | 构造/析构按类型登记与注销 |
+| `engine/engine.h`、`engine/domain/document.h`、`engine/domain/font_face.h`、`engine/abi/src/comp_abi_internal.h` | 注释改成「类型由登记表在解引用前校验」，并记下 F2 的偏移数字 |
+| `scripts/build_ohos.sh` | 补 `third_party/{zlib,libpng,stb}` 的 `-I`（F1，缺目录如实降级并提示） |
+| `scripts/run_regression.py` | 第 6 步标签跟随 `OHOS_ARCH`（此前写死 `aarch64`，模拟器 x86_64 构建也报 aarch64） |
+| `tests/test_abi.cpp` | `handle_type_confusion_is_rejected` 补反向（文档句柄当引擎句柄），并断言误用被拒后原对象仍可用 |
+| `tests/test_font.cpp` | 新增 `font_handle_type_confusion_is_rejected`：字体句柄当引擎/文档句柄必须被拒，且字体仍可用 |
+| `tests/test_domain.cpp` | `document_layer_management`：第二次 `create_layer` 后按 id 重取 `Layer*` |
+| `tests/test_rhi.cpp` | `build_layered_scene`（组/剪贴基底）、`gpu_bake_cache_invalidates_when_group_structure_changes`：先持 id，create 之后重新 `find` |
+
+**本轮验证基线（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **705 例 / 0 失败**（704 → 705，新增字体类型混淆 1 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS x86_64：`compile ok=118 fail=0`，NAPI 壳 rc=0） |
+| 鸿蒙模拟机 `compositor_tests_nog` | **705/705，rc=0**（就是此前 SIGSEGV 的那个 `-O2` 无 `-g` 二进制） |
+| 鸿蒙模拟机 `tests_asan`（`-fsanitize=address`） | **0 条报告**，`summary: 705 cases, 0 failed`，rc=0（修复前 4 条 UAF） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变 |
+| `scripts/visual_check.py --scene all` | **171 条 / 30 场景 / 0 失败** |
+| `^COMP_API` 导出 | **166**（零增删，ABI 与对象布局未变） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **只在模拟机（x86_64）上验证**：真机 aarch64 的构建通过（同一脚本、同一份源码），但
+  SIGSEGV/ASan 这一轮没有在真机上复跑。
+- **类型标签是进程内的**：活表是模块级 `unordered_map`，跨进程/跨模块不成立；这与句柄
+  本来就是「进程内不透明指针」的既有契约一致。
+- **`Layer*` 失效不是缺陷**：`create_layer` / `find` 返回内部指针，跨增删图层不复用是
+  API 契约（`document.h` 明确写了）；本轮修的是**测试**违反契约的用法，引擎侧没有改动。
+- **ASan 只跑了单测**：Windows 壳与 GPU 后端（D3D12）没有 ASan 构建；GPU 路径的悬垂风险
+  仍靠代码审读与既有用例覆盖。
+
+

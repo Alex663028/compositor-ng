@@ -25,8 +25,10 @@ namespace abi {
 
 /* 句柄 <-> 内部类型转换。
  * 三者同一套双闸门：先查「存活对象登记表」（core/comp_live_handles.h，
- * 构造登记 / 析构注销 / 查询只哈希指针值），命中才允许解引用读 magic——
- * 使完全野的句柄（未映射地址）也不会段错误，只能被挡成错误码。 */
+ * 构造登记 / 析构注销 / 查询只哈希指针值 + 类型标签），命中且类型匹配才允许
+ * 解引用读 magic——完全野的句柄（未映射地址）与类型混淆（引擎句柄当文档传）
+ * 都被挡在解引用之前，不会段错误，只能变成错误码。类型标签不可省：magic 是
+ * 尾部成员，按错误类型的布局读会越界（F2）。 */
 Engine* as_engine(comp_engine handle);
 Document* as_document(comp_document handle);
 FontFace* as_font(comp_font handle);

@@ -97,6 +97,9 @@ inline constexpr double kMaxTypeLineHeight = 8.0;
 /* |letter_spacing| 上限（文档像素）：4096 已远超任何可读排版。 */
 inline constexpr double kMaxTypeLetterSpacing = 4096.0;
 
+/* 段落框宽/高上限（文档像素）：与文本原点的 1e6 量程同源，再大属宿主误传。 */
+inline constexpr double kMaxTypeParagraphBox = 1e6;
+
 /*
  * 窗口：图层局部像素坐标；coverage 为 w×h 覆盖率（0..255），空 = 不画。
  * 与 ShapeCoverage 同款（单通道即可——文字只有一种颜色）。
@@ -174,6 +177,61 @@ TypeRasterReport type_rasterize_with_font(const char* text, size_t size,
                                           int32_t layer_y, int32_t layer_width,
                                           int32_t layer_height, TypeCoverage* out,
                                           int64_t* out_missing_glyphs);
+
+/* ============================================================== 段落排版（P0-6 ③） */
+
+/*
+ * 对齐方式（与 ABI `comp_text_align` 一一对应）。
+ *   - left：行首贴 origin_x；
+ *   - center / right：以**段落框宽**为基准，框宽为 0 时基准退化为最长行宽
+ *     （此时三种对齐的落点相同——没有框就没有可对齐的边）。
+ */
+inline constexpr int32_t kTypeAlignLeft = 0;
+inline constexpr int32_t kTypeAlignCenter = 1;
+inline constexpr int32_t kTypeAlignRight = 2;
+inline constexpr int32_t kTypeAlignCount = 3;
+
+/* 一条视觉行：原文中的字节区间 [byte_begin, byte_end) + 行宽 + 相对 origin_x 的偏移。
+ * 行尾空格不参与宽度（与 PS「右对齐不以行尾空白为基准」同口径），因此区间右端
+ * 已去掉尾随空格；纯空格行会得到 begin == end 的空行。 */
+struct TypeWrapLine {
+  size_t byte_begin = 0;
+  size_t byte_end = 0;
+  double width = 0.0;
+  double x_offset = 0.0;
+};
+
+/* 段落整体度量（文档像素）。height 是**内容高**（不是框高）：
+ * 首行高 + (行数-1) × line_advance；旧轨道首行高 = font_size，
+ * 字体轨道 = ascender - descender。 */
+struct TypeParagraphMetrics {
+  int32_t line_count = 0;
+  double line_advance = 0.0;
+  double content_width = 0.0;
+  double content_height = 0.0;
+  int64_t missing_glyphs = 0;
+};
+
+/*
+ * 按段落框宽折行并给出每一视觉行的落点（不落像素）。
+ *
+ * 折行规则（确定性，不做「尽力而为」的猜测）：
+ *   - 显式 '\n' 永远断行（空段落占一个空行）；
+ *   - `box_width == 0` 不折行，只按 '\n' 断行（此时对齐也无从生效，见上）；
+ *   - `box_width > 0` 时贪心装行，断点取「行内最后一个可断位置」：空格之后、
+ *     或宽字符（CJK/全角/emoji）边界；一整个不可断的词比框还宽时按字符硬断，
+ *     保证每行至少前进一个字形；
+ *   - 行首空格不占位，行尾空格不计宽（渲染时一并省略）。
+ *
+ * 失败语义与 measure/rasterize 一致（kBadText / kTooLong / kBadStyle / kFontError），
+ * 失败时 out 保持空状态。`font == nullptr` = 旧轨道（ASCII、常步进），
+ * 非空 = 字体轨道（UTF-8、逐字形步进）。
+ */
+TypeRasterReport type_layout_paragraph(const char* text, size_t size,
+                                       const TypeRasterStyle& style, FontFace* font,
+                                       double box_width, int32_t align,
+                                       std::vector<TypeWrapLine>* out_lines,
+                                       TypeParagraphMetrics* out_metrics);
 
 }  // namespace compositor
 

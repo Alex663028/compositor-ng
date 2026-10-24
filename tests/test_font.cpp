@@ -554,6 +554,34 @@ COMP_TEST(comp_tool_type_with_font_paints_cjk_and_undoes_in_one_step) {
 }
 
 /*
+ * 类型混淆：字体句柄当引擎 / 文档句柄传，必须在解引用之前被拒绝。
+ *
+ * magic 是各对象的**尾部成员**，偏移随类型变化：拿字体句柄按 Document 的布局
+ * 去读 handle_magic_ 会读进对象分配块之外（F2 段错误的同源问题）。存活登记表
+ * 现在带类型标签，类型不匹配在第一次解引用之前就返回 nullptr。
+ */
+COMP_TEST(font_handle_type_confusion_is_rejected) {
+  comp_font font = nullptr;
+  COMP_CHECK(comp_font_load_file(kFontPath, 0, &font) == COMP_OK);
+  if (font == nullptr) return;
+
+  comp_backend backend = COMP_BACKEND_CPU;
+  COMP_CHECK_MSG(comp_engine_backend(reinterpret_cast<comp_engine>(font), &backend) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "font handle used as engine handle is rejected");
+  comp_size size{};
+  COMP_CHECK_MSG(comp_document_size(reinterpret_cast<comp_document>(font), &size) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "font handle used as document handle is rejected");
+  comp_engine_destroy(reinterpret_cast<comp_engine>(font));    /* 无操作 */
+  comp_document_destroy(reinterpret_cast<comp_document>(font)); /* 无操作 */
+
+  /* 字体本身仍然可用：混淆调用没有破坏它。 */
+  COMP_CHECK(comp_font_name(font, COMP_FONT_NAME_FAMILY) != nullptr);
+  comp_font_release(font);
+}
+
+/*
  * 野句柄 / 已释放句柄不得崩溃（as_font 先查存活登记表再解引用）。
  *
  * 刻意用一个保证落在用户态寻址范围之外的地址（2^48，Windows 与 Linux x64 的

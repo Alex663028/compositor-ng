@@ -1351,6 +1351,274 @@ comp_result selection_apply_color_range(SelectionState* selection, int32_t canva
              : fail(COMP_ERR_INTERNAL, "color range could not merge the coverage");
 }
 
+/* ------------------------------------------------- 扩大 / 选取相似（P0-5） */
+
+namespace {
+
+/* 颜色空间占位表：每通道 0..255 一格，256³ = 16 MiB（只活在一次「选取相似」
+ * 调用里）。用它做精确的 Chebyshev 膨胀，而不是把颜色量化到 64 级近似——
+ * 选区的边界会直接体现在像素上，量化误差会被用户看见。 */
+constexpr int32_t kColorVolumeSide = 256;
+constexpr size_t kColorVolumeCells =
+    static_cast<size_t>(kColorVolumeSide) * kColorVolumeSide * kColorVolumeSide;
+
+/* 一维二值窗口最大值（半径 radius，越界截断），原地写回。
+ * line 是带步长的一条线：第 i 个元素在 base[i * stride]。 */
+void dilate_line(uint8_t* base, int32_t stride, int32_t length, int32_t radius,
+                 std::vector<uint8_t>* scratch) {
+  if (radius <= 0 || length <= 0) return;
+  scratch->resize(static_cast<size_t>(length));
+  uint8_t* source = scratch->data();
+  for (int32_t i = 0; i < length; ++i) source[i] = base[static_cast<size_t>(i) * stride];
+  int32_t count = 0;
+  const int32_t first_end = std::min(radius, length - 1);
+  for (int32_t i = 0; i <= first_end; ++i) count += source[i] != 0 ? 1 : 0;
+  for (int32_t i = 0; i < length; ++i) {
+    base[static_cast<size_t>(i) * stride] = count > 0 ? 1 : 0;
+    const int32_t add = i + 1 + radius;
+    const int32_t remove = i - radius;
+    if (add < length) count += source[add] != 0 ? 1 : 0;
+    if (remove >= 0) count -= source[remove] != 0 ? 1 : 0;
+  }
+}
+
+/* 256³ 占位表的三维 Chebyshev 膨胀 = 三次可分离的一维窗口最大值。
+ * 膨胀后 v[c] = 1 ⇔ 存在原来置位的颜色 s，使 |c - s| 每通道 <= radius。 */
+void dilate_color_volume(std::vector<uint8_t>* volume, int32_t radius) {
+  if (radius <= 0) return;
+  const int32_t side = kColorVolumeSide;
+  uint8_t* data = volume->data();
+  std::vector<uint8_t> scratch;
+  /* x 轴（步长 1） */
+  for (int32_t z = 0; z < side; ++z) {
+    for (int32_t y = 0; y < side; ++y) {
+      dilate_line(data + (static_cast<size_t>(z) * side + y) * side, 1, side, radius, &scratch);
+    }
+  }
+  /* y 轴（步长 side） */
+  for (int32_t z = 0; z < side; ++z) {
+    for (int32_t x = 0; x < side; ++x) {
+      dilate_line(data + static_cast<size_t>(z) * side * side + x, side, side, radius, &scratch);
+    }
+  }
+  /* z 轴（步长 side²） */
+  for (int32_t y = 0; y < side; ++y) {
+    for (int32_t x = 0; x < side; ++x) {
+      dilate_line(data + static_cast<size_t>(y) * side + x, side * side, side, radius, &scratch);
+    }
+  }
+}
+
+inline size_t color_key(const uint8_t* rgba) {
+  return (static_cast<size_t>(rgba[0]) << 16) | (static_cast<size_t>(rgba[1]) << 8) |
+         static_cast<size_t>(rgba[2]);
+}
+
+}  // namespace
+
+/* 两条命令共用的前半段：参数闸 + 基础蒙版尺寸校验 + 8 位合成视图。 */
+namespace {
+
+/* 返回 COMP_OK 且 *out_pixels / *out_stride 可用；否则返回错误码。
+ * *out_ready = false 表示「没有选区或蒙版为空」，调用方直接返回 COMP_OK。 */
+comp_result grow_similar_prepare(SelectionState* selection, int32_t canvas_width,
+                                 int32_t canvas_height, const Document& document,
+                                 int32_t tolerance, const char* command,
+                                 const std::vector<uint8_t>** out_pixels, size_t* out_stride,
+                                 ImageBuffer* composite, ImageBuffer* scratch, bool* out_ready,
+                                 std::string* error) {
+  const auto fail = [error](comp_result code, const std::string& text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+  *out_ready = false;
+  if (selection == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "selection is null");
+  if (canvas_width <= 0 || canvas_height <= 0) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, std::string(command) + " needs a non-empty canvas");
+  }
+  if (tolerance < 0 || tolerance > 255) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, std::string(command) + " tolerance out of 0..255");
+  }
+  if (!selection->active) return COMP_OK;
+
+  const size_t pixel_count =
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  if (selection->base.width != canvas_width || selection->base.height != canvas_height ||
+      selection->base.pixel_data().size() != pixel_count) {
+    return fail(COMP_ERR_STATE, "selection mask size does not match the canvas");
+  }
+
+  std::string compose_error;
+  if (!composite_document(document, composite, &compose_error)) {
+    return fail(COMP_ERR_INTERNAL, std::string(command) + " could not composite the document");
+  }
+  if (composite->width != canvas_width || composite->height != canvas_height) {
+    return fail(COMP_ERR_INTERNAL, std::string(command) + " composite size does not match canvas");
+  }
+  if (!wand_rgba8_view(*composite, scratch, out_pixels, out_stride)) {
+    return fail(COMP_ERR_INTERNAL, std::string(command) + " could not build an 8-bit composite");
+  }
+  *out_ready = true;
+  return COMP_OK;
+}
+
+}  // namespace
+
+comp_result selection_grow(SelectionState* selection, int32_t canvas_width, int32_t canvas_height,
+                           const Document& document, int32_t tolerance, bool* changed,
+                           std::string* error) {
+  if (changed != nullptr) *changed = false;
+  const auto fail = [error](comp_result code, const char* text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+
+  ImageBuffer composite;
+  ImageBuffer scratch;
+  const std::vector<uint8_t>* pixels = nullptr;
+  size_t stride = 0;
+  bool ready = false;
+  const comp_result code =
+      grow_similar_prepare(selection, canvas_width, canvas_height, document, tolerance, "grow",
+                           &pixels, &stride, &composite, &scratch, &ready, error);
+  if (code != COMP_OK) return code;
+  if (!ready) return COMP_OK;
+
+  const size_t pixel_count =
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  const std::vector<uint8_t>& base = selection->base.pixel_data();
+  /* 原有蒙版逐字节保留（抗锯齿边缘不被抹平），新并入的像素写 255。 */
+  std::vector<uint8_t> next(base);
+  /* 只按种子数预留：满幅大文档上 reserve(pixel_count) 会先吃掉「画布像素数
+   * × 4 字节」（8k × 8k 就是 256 MiB），而选区通常只占很小一块；BFS 追加的
+   * 元素走 vector 摊还增长，峰值仍然只与真实扩展量成正比。 */
+  size_t seeds = 0;
+  for (size_t i = 0; i < pixel_count; ++i) {
+    if (base[i] != 0) ++seeds;
+  }
+  /* 基础蒙版为空：没有种子，不改选区。 */
+  if (seeds == 0) return COMP_OK;
+
+  std::vector<int32_t> queue;
+  queue.reserve(seeds);
+  for (size_t i = 0; i < pixel_count; ++i) {
+    if (base[i] != 0) queue.push_back(static_cast<int32_t>(i));
+  }
+
+  size_t head = 0;
+  size_t added = 0;
+  const int32_t dx[4] = {-1, 1, 0, 0};
+  const int32_t dy[4] = {0, 0, -1, 1};
+  while (head < queue.size()) {
+    const int32_t index = queue[head++];
+    const int32_t x = index % canvas_width;
+    const int32_t y = index / canvas_width;
+    const uint8_t* center =
+        pixels->data() + static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
+    for (int k = 0; k < 4; ++k) {
+      const int32_t nx = x + dx[k];
+      const int32_t ny = y + dy[k];
+      if (nx < 0 || ny < 0 || nx >= canvas_width || ny >= canvas_height) continue;
+      const int32_t neighbor = ny * canvas_width + nx;
+      if (next[static_cast<size_t>(neighbor)] != 0) continue;
+      const uint8_t* cand = pixels->data() + static_cast<size_t>(ny) * stride +
+                            static_cast<size_t>(nx) * 4;
+      int32_t max_diff = 0;
+      for (int c = 0; c < 4; ++c) {
+        const int32_t diff = std::abs(static_cast<int32_t>(cand[c]) -
+                                      static_cast<int32_t>(center[c]));
+        if (diff > max_diff) max_diff = diff;
+      }
+      if (max_diff > tolerance) continue;
+      next[static_cast<size_t>(neighbor)] = 255;
+      ++added;
+      queue.push_back(neighbor);
+    }
+  }
+
+  if (added == 0) return COMP_OK;
+  if (!apply_coverage_mask(selection, canvas_width, canvas_height, std::move(next),
+                           kSelectionReplace, changed)) {
+    return fail(COMP_ERR_INTERNAL, "grow could not merge the coverage");
+  }
+  return COMP_OK;
+}
+
+comp_result selection_similar(SelectionState* selection, int32_t canvas_width,
+                              int32_t canvas_height, const Document& document, int32_t tolerance,
+                              bool* changed, std::string* error) {
+  if (changed != nullptr) *changed = false;
+  const auto fail = [error](comp_result code, const char* text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+
+  ImageBuffer composite;
+  ImageBuffer scratch;
+  const std::vector<uint8_t>* pixels = nullptr;
+  size_t stride = 0;
+  bool ready = false;
+  const comp_result code =
+      grow_similar_prepare(selection, canvas_width, canvas_height, document, tolerance, "similar",
+                           &pixels, &stride, &composite, &scratch, &ready, error);
+  if (code != COMP_OK) return code;
+  if (!ready) return COMP_OK;
+
+  const size_t pixel_count =
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height);
+  const std::vector<uint8_t>& base = selection->base.pixel_data();
+
+  std::vector<uint8_t> volume;
+  size_t seeds = 0;
+  /* tolerance = 255 时所有颜色都满足（RGB 每通道最大差恒 <= 255），可直接等价
+   * 全选，省掉 16 MiB 占位表与三次 3D 扫描。 */
+  if (tolerance < 255) {
+    volume.assign(kColorVolumeCells, 0);
+    for (int32_t y = 0; y < canvas_height; ++y) {
+      const uint8_t* row = pixels->data() + static_cast<size_t>(y) * stride;
+      const size_t row_offset = static_cast<size_t>(y) * static_cast<size_t>(canvas_width);
+      for (int32_t x = 0; x < canvas_width; ++x) {
+        if (base[row_offset + static_cast<size_t>(x)] == 0) continue;
+        volume[color_key(row + static_cast<size_t>(x) * 4)] = 1;
+        ++seeds;
+      }
+    }
+  } else {
+    for (size_t i = 0; i < pixel_count; ++i) {
+      if (base[i] != 0) {
+        ++seeds;
+        break;
+      }
+    }
+  }
+  if (seeds == 0) return COMP_OK;
+
+  if (tolerance < 255) dilate_color_volume(&volume, tolerance);
+
+  /* 原有蒙版逐字节保留（抗锯齿边缘不被抹平），新并入的像素写 255。 */
+  std::vector<uint8_t> next(base);
+  for (int32_t y = 0; y < canvas_height; ++y) {
+    const uint8_t* row = pixels->data() + static_cast<size_t>(y) * stride;
+    const size_t row_offset = static_cast<size_t>(y) * static_cast<size_t>(canvas_width);
+    for (int32_t x = 0; x < canvas_width; ++x) {
+      const size_t index = row_offset + static_cast<size_t>(x);
+      if (next[index] != 0) continue;
+      const bool match =
+          tolerance >= 255 || volume[color_key(row + static_cast<size_t>(x) * 4)] != 0;
+      if (match) next[index] = 255;
+    }
+  }
+
+  /* 逐字节相同就不落步（apply_coverage_mask 自己也会判一次，这里提前省掉
+   * 一次 16 MiB 的比较与羽化归零的副作用判断）。 */
+  if (masks_equal(next, base)) return COMP_OK;
+  if (!apply_coverage_mask(selection, canvas_width, canvas_height, std::move(next),
+                           kSelectionReplace, changed)) {
+    return fail(COMP_ERR_INTERNAL, "similar could not merge the coverage");
+  }
+  return COMP_OK;
+}
+
 void blend_through_selection(uint8_t* rgba, size_t stride, const uint8_t* original, int32_t width,
                              int32_t height, const std::vector<uint8_t>& coverage,
                              const Layer& layer, int32_t canvas_width, int32_t canvas_height) {

@@ -78,6 +78,72 @@ constexpr double kMaxShapeStrokeWidth = 4096.0;
 
 bool finite01(float v) { return std::isfinite(v) && v >= 0.0f && v <= 1.0f; }
 
+/*
+ * P1-7：色标段内的中点重映射。u 是段内线性比例，midpoint 是该段的中点位置
+ * （0.5 = 恒等）。上游的定义是「中点落在段内哪个位置」，等价于把 u 做一次幂
+ * 变换，使 u = 0.5 映射到 midpoint：
+ *     u' = 0.5^(log(u) / log(midpoint)) = u^(ln 0.5 / ln midpoint)
+ * midpoint = 0.5 时指数为 1（恒等）；midpoint → 0 或 1 时指数 → 0 或 ∞，
+ * 分别在段内产生硬边界，与上游色标中点拖到端点时的行为一致。校验已把
+ * midpoint 限制在 (0,1) 开区间，这里只防 0.5 附近的除法误差。
+ */
+double gradient_midpoint_remap(double u, double midpoint) {
+  if (u <= 0.0) return 0.0;
+  if (u >= 1.0) return 1.0;
+  if (std::fabs(midpoint - 0.5) < 1e-9) return u;
+  const double exponent = std::log(0.5) / std::log(midpoint);
+  return std::pow(u, exponent);
+}
+
+/* 在色标表里取 t 处的颜色（直通 sRGB + alpha，**未**乘权重/覆盖率）。 */
+void sample_gradient_at(const GradientParams& gradient, double t, double out[4]) {
+  if (gradient.stops.empty()) {
+    for (int c = 0; c < 4; ++c) {
+      out[c] = static_cast<double>(gradient.color0[c]) * (1.0 - t) +
+               static_cast<double>(gradient.color1[c]) * t;
+    }
+    return;
+  }
+  const std::vector<GradientStop>& stops = gradient.stops;
+  /* 校验保证 stops 非空且位置严格升序，lower_bound 的写法在这里是安全的。 */
+  auto it = std::lower_bound(
+      stops.begin(), stops.end(), t,
+      [](const GradientStop& stop, double value) { return stop.position < value; });
+  if (it == stops.begin()) {
+    for (int c = 0; c < 4; ++c) out[c] = static_cast<double>(it->color[c]);
+    return;
+  }
+  if (it == stops.end()) {
+    const GradientStop& last = stops.back();
+    for (int c = 0; c < 4; ++c) out[c] = static_cast<double>(last.color[c]);
+    return;
+  }
+  const GradientStop& low = *(it - 1);
+  const GradientStop& high = *it;
+  const double span = high.position - low.position;
+  double u = span > 0.0 ? (t - low.position) / span : 1.0;
+  u = gradient_midpoint_remap(u, low.midpoint);
+  for (int c = 0; c < 4; ++c) {
+    out[c] = static_cast<double>(low.color[c]) * (1.0 - u) +
+             static_cast<double>(high.color[c]) * u;
+  }
+}
+
+/*
+ * 抖动用的确定性哈希：同一 (x, y, 通道) 永远得到同一个偏移，重复执行同一
+ * 操作得到逐字节相同的像素（撤销/重做、回归基线都不会漂）。取 24 位小数
+ * 落在 [-0.5, 0.5) 个 LSB，只影响四舍五入的并列。
+ */
+double gradient_dither_offset(int32_t x, int32_t y, int32_t channel) {
+  uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B1u ^
+               static_cast<uint32_t>(y) * 0x85EBCA77u ^
+               static_cast<uint32_t>(channel) * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  h *= 0x2545F491u;
+  h ^= h >> 13;
+  return static_cast<double>(h & 0xFFFFFFu) / 16777216.0 - 0.5;
+}
+
 std::string label(uint32_t kind) {
   switch (kind) {
     case kToolOpSelect: return "select";
@@ -898,8 +964,9 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
 
     case kToolOpGradient: {
       const GradientParams& gradient = params.gradient;
-      if (gradient.type != kGradientLinear && gradient.type != kGradientRadial) {
-        return bad_arg("gradient type must be 0 (linear) or 1 (radial)");
+      if (gradient.type < kGradientLinear || gradient.type > kGradientDiamond) {
+        return bad_arg(
+            "gradient type must be 0..4 (linear / radial / angle / reflected / diamond)");
       }
       const double endpoints[4] = {gradient.start_x, gradient.start_y, gradient.end_x,
                                    gradient.end_y};
@@ -916,8 +983,36 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       if (!finite01(gradient.opacity) || gradient.opacity <= 0.0f) {
         return bad_arg("gradient opacity must be within 0..1 and non-zero");
       }
-      if (gradient.color0[3] == 0 && gradient.color1[3] == 0) {
-        return bad_arg("gradient has no visible color (both stops are fully transparent)");
+      /*
+       * P1-7：多色标。要求宿主给的就是升序——静默替宿主排序会让「我把顺序写错了」
+       * 变成「引擎接受了但颜色不是我填的顺序」，这类错误在画面上极难归因。
+       */
+      bool any_visible = gradient.color0[3] != 0 || gradient.color1[3] != 0;
+      if (!gradient.stops.empty()) {
+        if (gradient.stops.size() < 2) {
+          return bad_arg("a multi-stop gradient needs at least two stops");
+        }
+        if (static_cast<int32_t>(gradient.stops.size()) > kMaxGradientStops) {
+          return bad_arg("gradient stop count exceeds the engine limit (32)");
+        }
+        any_visible = false;
+        double previous = -1.0;
+        for (const GradientStop& stop : gradient.stops) {
+          if (!std::isfinite(stop.position) || stop.position < 0.0 || stop.position > 1.0) {
+            return bad_arg("gradient stop position must be within 0..1");
+          }
+          if (stop.position <= previous) {
+            return bad_arg("gradient stops must be given in strictly ascending position order");
+          }
+          if (!std::isfinite(stop.midpoint) || stop.midpoint <= 0.0 || stop.midpoint >= 1.0) {
+            return bad_arg("gradient stop midpoint must be strictly within 0..1");
+          }
+          previous = stop.position;
+          if (stop.color[3] != 0) any_visible = true;
+        }
+      }
+      if (!any_visible) {
+        return bad_arg("gradient has no visible color (all stops are fully transparent)");
       }
       break;
     }
@@ -1717,8 +1812,7 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       const size_t stride = target_layer->pixels.stride();
       const double dx = gradient.end_x - gradient.start_x;
       const double dy = gradient.end_y - gradient.start_y;
-      const double length_sq = dx * dx + dy * dy;
-      const double length = std::sqrt(length_sq);
+      const double length = std::sqrt(dx * dx + dy * dy);
       const double opacity = static_cast<double>(gradient.opacity);
 
       for (int32_t y = 0; y < target_layer->pixels.height; ++y) {
@@ -1726,14 +1820,40 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
         uint8_t* row = pixels + static_cast<size_t>(y) * stride;
         for (int32_t x = 0; x < target_layer->pixels.width; ++x) {
           const double document_x = static_cast<double>(b.x) + static_cast<double>(x);
+          const double px = document_x - gradient.start_x;
+          const double py = document_y - gradient.start_y;
+          /* 沿端点方向的投影长度（像素）与到起点的距离，五种类型都从这里派生。 */
+          const double projection = (px * dx + py * dy) / length;
           double t = 0.0;
-          if (gradient.type == kGradientLinear) {
-            t = ((document_x - gradient.start_x) * dx + (document_y - gradient.start_y) * dy) /
-                length_sq;
-          } else {
-            const double px = document_x - gradient.start_x;
-            const double py = document_y - gradient.start_y;
-            t = std::sqrt(px * px + py * py) / length;
+          switch (gradient.type) {
+            case kGradientLinear:
+              t = projection / length;
+              break;
+            case kGradientRadial:
+              t = std::sqrt(px * px + py * py) / length;
+              break;
+            case kGradientAngle: {
+              /*
+               * 角度（锥形）：绕起点的方位角，0 在端点方向，顺时针为正（文档
+               * y 轴向下），回到该方向时 t = 1。
+               */
+              const double base = std::atan2(dy, dx);
+              double angle = std::atan2(py, px) - base;
+              const double two_pi = 6.283185307179586476925286766559;
+              angle = std::fmod(angle, two_pi);
+              if (angle < 0.0) angle += two_pi;
+              t = angle / two_pi;
+              break;
+            }
+            case kGradientReflected:
+              /* 对称：起点两侧镜像，t = |投影| / 长度。 */
+              t = std::fabs(projection) / length;
+              break;
+            case kGradientDiamond:
+            default:
+              /* 菱形：|投影| + |横向|，沿端点方向的对角线等值线。 */
+              t = (std::fabs(projection) + std::fabs(px * dy - py * dx) / length) / length;
+              break;
           }
           if (t < 0.0) {
             t = 0.0;
@@ -1757,12 +1877,9 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
           }
           if (weight <= 0.0) continue;
 
-          /* 色标（直通 sRGB + alpha）按 t 线性插值，乘 weight 得到本像素 alpha。 */
+          /* 色标（直通 sRGB + alpha）按 t 采样（含中点重映射），乘 weight 得本像素 alpha。 */
           double color[4];
-          for (int c = 0; c < 4; ++c) {
-            color[c] = static_cast<double>(gradient.color0[c]) * (1.0 - t) +
-                       static_cast<double>(gradient.color1[c]) * t;
-          }
+          sample_gradient_at(gradient, t, color);
           const double alpha = (color[3] / 255.0) * weight;
           if (alpha <= 0.0) continue;
 
@@ -1770,7 +1887,8 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
           const double inverse = 1.0 - alpha;
           for (int c = 0; c < 3; ++c) {
             /* 图层像素是**预乘** RGBA8：源色先乘 alpha 再按 source-over 叠加。 */
-            const double blended = color[c] * alpha + static_cast<double>(pixel[c]) * inverse;
+            double blended = color[c] * alpha + static_cast<double>(pixel[c]) * inverse;
+            if (gradient.dither) blended += gradient_dither_offset(x, y, c);
             const long value = std::lround(blended);
             pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
           }

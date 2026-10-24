@@ -1,4 +1,4 @@
-// AI生成
+﻿// AI生成
 /*
  * test_effect_eval.cpp — 图层效果「像素求值」的回归护栏。
  *
@@ -8,7 +8,7 @@
  * `merge_down` 因为「无法烘入」直接拒绝带效果的图层。宿主只能写不能看。
  *
  * 冻结的行为要点：
- *   1. 6 种 kind 全部有像素实现，且在非恒等参数下逐字节改变渲染结果；
+ *   1. 9 种 kind 全部有像素实现，且在非恒等参数下逐字节改变渲染结果；
  *   2. 隐藏带效果的图层 ⇒ 渲染结果逐字节回到无效果状态；
  *   3. 不可见参数（opacity=0 / size=0 / 距离与模糊同时为 0）⇒ 逐字节不变；
  *   4. 坏 JSON / 未知 kind ⇒ 跳过而不是产出错误像素，更不会让整篇合成失败；
@@ -129,7 +129,7 @@ bool clear(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
   return alpha_at(buf, x, y) == 0;
 }
 
-/* 6 种 kind 的非恒等参数。键名逐字取自上游 LayerEffects.swift 的字段名。 */
+/* 9 种 kind 的非恒等参数。键名逐字取自上游 LayerEffects.swift 的字段名。 */
 struct EffectCase {
   uint32_t kind;
   const char* name;
@@ -149,11 +149,17 @@ const EffectCase kEvaluatedEffects[] = {
     {4, "outer-glow", R"({"size":3,"red":1,"green":0,"blue":0,"opacity":1})"},
     /* 内发光：柔化后取逆，只落形状内部。 */
     {5, "inner-glow", R"({"size":3,"red":1,"green":0,"blue":0,"opacity":1})"},
+    /* P1-1：斜面（左暗右亮，只落形状内部）。 */
+    {6, "bevel", R"({"angle":0,"altitude":0,"depth":100,"size":1,"soften":0,"opacity":1,"red":1,"green":1,"blue":1,"shadow_red":0,"shadow_green":0,"shadow_blue":0})"},
+    /* 缎光：正反两个偏移副本之差。 */
+    {7, "satin", R"({"angle":0,"distance":2,"blur":0,"opacity":1,"red":0,"green":1,"blue":0})"},
+    /* 渐变叠加：左黑右白。 */
+    {8, "gradient-overlay", R"({"angle":0,"opacity":1,"red":0,"green":0,"blue":0,"red2":1,"green2":1,"blue2":1})"},
 };
 
 }  // namespace
 
-/* 1. 6 种 kind 全部改变像素（此前它们全部是 no-op）。 */
+/* 1. 9 种 kind 全部改变像素（此前它们全部是 no-op）。 */
 COMP_TEST(effect_eval_every_kind_changes_pixels) {
   for (const EffectCase& c : kEvaluatedEffects) {
     Fixture fx;
@@ -419,7 +425,79 @@ COMP_TEST(effect_eval_inner_effects_stay_within_the_pixels) {
   }
 }
 
-/* 9. 外发光落在形状**之外**（柔化后扣掉内部）。 */
+/* 9. P1-1 追加的三种效果（斜面 / 缎光 / 渐变叠加）也只落在形状内部。 */
+COMP_TEST(effect_eval_p1_1_effects_stay_within_the_pixels) {
+  for (const EffectCase& c : {kEvaluatedEffects[6], kEvaluatedEffects[7], kEvaluatedEffects[8]}) {
+    Fixture fx;
+    const comp_layer_id id = add_square(fx.doc);
+    const std::vector<uint8_t> before = flatten(fx.doc);
+    COMP_CHECK(comp_layer_set_effect(fx.doc, id, c.kind, c.settings) == COMP_OK);
+    const std::vector<uint8_t> after = flatten(fx.doc);
+    COMP_CHECK_MSG(clear(after, 0, 0), std::string(c.name) + " must not paint outside");
+    COMP_CHECK_MSG(clear(after, 3, 3), std::string(c.name) + " must not paint outside");
+    /* 不改变图层 alpha（全部 source-atop）。 */
+    COMP_CHECK_MSG(alpha_at(after, 5, 5) == 255, std::string(c.name) + " must keep alpha");
+    bool any = false;
+    for (int32_t y = 4; y < 8 && !any; ++y) {
+      for (int32_t x = 4; x < 8 && !any; ++x) {
+        const size_t px = (static_cast<size_t>(y) * kW + x) * 4;
+        if (after[px] != before[px] || after[px + 1] != before[px + 1] ||
+            after[px + 2] != before[px + 2]) {
+          any = true;
+        }
+      }
+    }
+    COMP_CHECK_MSG(any, std::string(c.name) + " must actually alter the interior");
+  }
+}
+
+/* 10. 渐变叠加沿 angle 方向铺开：0° = 左起右终，90° = 上起下终。 */
+COMP_TEST(effect_eval_gradient_overlay_runs_along_angle) {
+  {
+    Fixture fx;
+    const comp_layer_id id = add_square(fx.doc);
+    COMP_CHECK(comp_layer_set_effect(
+                   fx.doc, id, 8,
+                   R"({"angle":0,"opacity":1,"red":0,"green":0,"blue":0,"red2":1,"green2":1,"blue2":1})") ==
+               COMP_OK);
+    const std::vector<uint8_t> after = flatten(fx.doc);
+    const uint8_t left = after[(static_cast<size_t>(6) * kW + 4) * 4];
+    const uint8_t right = after[(static_cast<size_t>(6) * kW + 7) * 4];
+    COMP_CHECK_MSG(left < right, "0 deg gradient must darken the left side first");
+    COMP_CHECK_MSG(left < 20, "0 deg gradient must start at the start color");
+    COMP_CHECK_MSG(right > 230, "0 deg gradient must end at the end color");
+  }
+  {
+    Fixture fx;
+    const comp_layer_id id = add_square(fx.doc);
+    COMP_CHECK(comp_layer_set_effect(
+                   fx.doc, id, 8,
+                   R"({"angle":90,"reverse":true,"opacity":1,"red":0,"green":0,"blue":0,"red2":1,"green2":1,"blue2":1})") ==
+               COMP_OK);
+    const std::vector<uint8_t> after = flatten(fx.doc);
+    /* 90° 自上而下，reverse 之后上边变成终点色（白）、下边是起点色（黑）。 */
+    const uint8_t top = after[(static_cast<size_t>(4) * kW + 5) * 4];
+    const uint8_t bottom = after[(static_cast<size_t>(7) * kW + 5) * 4];
+    COMP_CHECK_MSG(top > bottom, "90 deg + reverse must flip the vertical ramp");
+  }
+}
+
+/* 11. 斜面沿光向量分亮暗：angle=0 时光从右来 ⇒ 右边亮面、左边暗面。 */
+COMP_TEST(effect_eval_bevel_light_side_is_bright) {
+  Fixture fx;
+  const comp_layer_id id = add_square(fx.doc);
+  COMP_CHECK(comp_layer_set_effect(
+                 fx.doc, id, 6,
+                 R"({"angle":0,"altitude":0,"depth":100,"size":1,"soften":0,"opacity":1,"red":1,"green":1,"blue":1,"shadow_red":0,"shadow_green":0,"shadow_blue":0})") ==
+             COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  const size_t left = (static_cast<size_t>(6) * kW + 4) * 4;
+  const size_t right = (static_cast<size_t>(6) * kW + 7) * 4;
+  COMP_CHECK_MSG(after[right] > 200, "bevel must highlight the lit (right) edge");
+  COMP_CHECK_MSG(after[left] < 100, "bevel must shade the opposite (left) edge");
+}
+
+/* 12. 外发光落在形状**之外**（柔化后扣掉内部）。 */
 COMP_TEST(effect_eval_outer_glow_lies_beyond_the_pixels) {
   Fixture fx;
   const comp_layer_id id = add_square(fx.doc);
@@ -440,7 +518,7 @@ COMP_TEST(effect_eval_outer_glow_lies_beyond_the_pixels) {
   COMP_CHECK(clear(after, 0, 0));
 }
 
-/* 10. 投影落在形状**之外**，且不染色形状内部。 */
+/* 13. 投影落在形状**之外**，且不染色形状内部。 */
 COMP_TEST(effect_eval_drop_shadow_lies_beyond_the_pixels) {
   Fixture fx;
   const comp_layer_id id = add_square(fx.doc);
@@ -463,7 +541,7 @@ COMP_TEST(effect_eval_drop_shadow_lies_beyond_the_pixels) {
   COMP_CHECK_MSG(after[core_px] == before[core_px], "drop shadow must not tint the core");
 }
 
-/* 11. 效果不吃图层的混合模式与不透明度（在混合那一步才生效）。 */
+/* 14. 效果不吃图层的混合模式与不透明度（在混合那一步才生效）。 */
 COMP_TEST(effect_eval_is_applied_before_layer_blend) {
   Fixture fx;
   comp_layer_id below = 0;
@@ -504,7 +582,7 @@ COMP_TEST(effect_eval_is_applied_before_layer_blend) {
                  "glow must fade with the layer opacity");
 }
 
-/* 12. 引擎不认识的 effect kind 仍然阻止 flatten（否则烘入会静默丢弃）。 */
+/* 15. 引擎不认识的 effect kind 仍然阻止 flatten（否则烘入会静默丢弃）。 */
 COMP_TEST(effect_eval_unknown_kind_blocks_flatten) {
   Fixture fx;
   const comp_layer_id id = add_square(fx.doc);

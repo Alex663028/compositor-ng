@@ -59,6 +59,18 @@ struct TextObject {
    * 指向不同文件，拿它当键会在跨机打开时静默换字体）。
    */
   std::string font_family;
+
+  /*
+   * 段落框（P0-6 ③）：0 = 按内容自动（点文字），> 0 = 段落文字框。
+   *
+   * 只有 `box_width > 0` 才折行；`box_height > 0` 只负责裁切（超出的行不画）。
+   * 三个字段全为默认值时渲染走的是**与 P0-6 之前逐字节相同**的单次栅格化
+   * 路径——折行实现不碰老路径，老工程的像素不会有任何漂移。
+   */
+  double box_width = 0.0;
+  double box_height = 0.0;
+  /* 0 = 左 / 1 = 居中 / 2 = 右；以 box_width 为基准，没有框宽时三种落点相同。 */
+  int32_t align = 0;
 };
 
 }  // namespace compositor

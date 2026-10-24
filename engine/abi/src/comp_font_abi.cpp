@@ -20,12 +20,13 @@ namespace abi {
 FontFace* as_font(comp_font handle) {
   FontFace* font = reinterpret_cast<FontFace*>(handle);
   /*
-   * 先查存活登记表，命中才允许解引用读 magic：
+   * 先查存活登记表（带类型标签），命中且类型为 kFont 才允许解引用读 magic：
    *   - 完全野的句柄（如 0xDEADBEEF 落在未映射页）在表里查不到，直接判 nullptr，
    *     不会段错误；调用方据此返回 COMP_ERR_STATE / COMP_ERR_INVALID_ARGUMENT。
    *   - 已释放的句柄在 ~FontFace 里已注销，同样查不到。
-   *   - 表里命中的指针必然指向尚未析构的对象，读 magic 安全；再核对一次 magic
-   *     是为了挡类型混淆（别的类型对象恰好分配在同一地址）。
+   *   - 类型标签必须查：magic 是 FontFace 的尾部成员，按 FontFace 布局去读一个
+   *     Engine/Document 指针会越界（F2）。命中且类型对上，读 magic 才是安全的；
+   *     再核对 magic 是挡"注销与 poison 之间的极端时序"。
    * 查询只哈希指针值本身，不解引用，野指针查询本身也是安全的。
    */
   if (font == nullptr || !is_live_font(font)) return nullptr;

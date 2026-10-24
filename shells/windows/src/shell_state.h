@@ -172,6 +172,10 @@ constexpr UINT kCmdSelectContract = 1048;
 /* P0-5：边界/平滑复用一个键入选区半径的输入态（op 决定量程 1..500 / 1..100）。 */
 constexpr UINT kCmdSelectBorder = 1058;
 constexpr UINT kCmdSelectSmooth = 1059;
+/* P0-5 收尾：扩大选取 / 选取相似。容差直接取壳上的魔棒容差（shift+/ 调），
+ * 点菜单即落墨、一步撤销——两条都是「按颜色长选区」，没有可调面板。 */
+constexpr UINT kCmdSelectGrow = 1060;
+constexpr UINT kCmdSelectSimilar = 1061;
 constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
@@ -203,6 +207,11 @@ constexpr uint32_t kImageAdjustKinds[] = {
     COMP_ADJUSTMENT_BLACK_WHITE,    COMP_ADJUSTMENT_COLOR_BALANCE,
     COMP_ADJUSTMENT_BRIGHTNESS_CONTRAST, COMP_ADJUSTMENT_DESATURATE,
     COMP_ADJUSTMENT_THRESHOLD,      COMP_ADJUSTMENT_POSTERIZE,
+    COMP_ADJUSTMENT_VIBRANCE,       COMP_ADJUSTMENT_SELECTIVE_COLOR,
+    COMP_ADJUSTMENT_PHOTO_FILTER,   COMP_ADJUSTMENT_CHANNEL_MIXER,
+    COMP_ADJUSTMENT_COLOR_LOOKUP,   COMP_ADJUSTMENT_SHADOWS_HIGHLIGHTS,
+    COMP_ADJUSTMENT_AUTO_TONE,      COMP_ADJUSTMENT_AUTO_CONTRAST,
+    COMP_ADJUSTMENT_AUTO_COLOR,
 };
 constexpr size_t kImageAdjustKindCount = sizeof(kImageAdjustKinds) / sizeof(kImageAdjustKinds[0]);
 /*
@@ -467,6 +476,9 @@ struct DocumentContext {
   std::string effect_base_json;
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
+  /* P1-4：一笔内 WM_POINTER 笔压采样（整笔取平均；_begin 清零）。 */
+  double stroke_pressure_sum = 0.0;
+  int stroke_pressure_samples = 0;
   bool stroke_erase = false;
   bool move_active = false;
   comp_ui::Point move_start{};
@@ -534,6 +546,14 @@ struct DocumentContext {
   double type_font_size = comp_ui::kDefaultTypeFontSize;
   double type_line_height = comp_ui::kDefaultTypeLineHeight;
   double type_letter_spacing = 0.0;
+  /*
+   * P0-6③：段落框（文档像素）。0 = 自动（点文字），> 0 = 段落框；框高只裁切。
+   * 与字号/行距同属文档的键入状态（随文档重置），由选项栏改、提交时写进
+   * comp_text_desc 的尾部字段，随后随文字对象一起存进 .comp。
+   */
+  double type_box_width = 0.0;
+  double type_box_height = 0.0;
+  int type_align = comp_ui::kTypeAlignLeft;
   wchar_t type_pending_high = 0;
   bool type_skip_char = false;
   std::wstring type_input;
@@ -614,6 +634,15 @@ struct ShellState {
   comp_ui::ToolId tool = comp_ui::ToolId::Select;
   double brush_size = 24.0;
   double brush_hardness = 0.75;
+  int brush_preset = 0;       /* P1-4：只读预设表下标；0 = 自定义（不覆盖当前值） */
+  double brush_flow = 1.0;    /* P1-4：COMP_TOOL_STROKE 的每 dab 覆盖面峰值 */
+  bool brush_pressure = true; /* P1-4：压感开关；鼠标恒 1.0，关掉后笔也按 1.0 */
+  /*
+   * 最近一次 WM_POINTER 报告的笔压（0..1）与「是否来自笔」。这两个不是文档
+   * 状态、不进 .comp：它们是输入设备的即时读数，只喂下一笔与状态栏。
+   */
+  double pen_pressure = 1.0;
+  bool pen_pressure_active = false;
   int retouch_mode = comp_ui::kRetouchBlur;
   double blur_radius = 8.0;
   double retouch_strength = 0.5; /* Smudge / Liquify 的 warp.strength */
@@ -649,6 +678,9 @@ struct ShellState {
   bool wand_merged = false;
   int wand_radius = comp_ui::kDefaultWandRadius;
   int gradient_type = comp_ui::kGradientLinear;
+  /* P1-7：多色标预设（只读表）+ 抖动开关；都不是文档状态，换图层不重置。 */
+  int gradient_preset = 0;
+  bool gradient_dither = false;
   int shape_kind = comp_ui::kShapeRect;
   double shape_stroke_width = comp_ui::kDefaultShapeStrokeWidth;
   double shape_corner_radius = comp_ui::kDefaultShapeCornerRadius;

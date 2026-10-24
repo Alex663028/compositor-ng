@@ -76,6 +76,47 @@ const EffectParam kInnerGlowParams[] = {
     {"blue", "Blue (0-1)", kEffectParamNumber, 0.0, 1.0, 0.0},
 };
 
+/* Bevel & Emboss（P1-1）：角度 / 高度 / 深度 / 尺寸 / 柔化 / 不透明度 / 双色。 */
+const EffectParam kBevelParams[] = {
+    {"angle", "Angle (deg)", kEffectParamNumber, -360.0, 360.0, 120.0},
+    {"altitude", "Altitude (deg)", kEffectParamNumber, 0.0, 90.0, 30.0},
+    {"depth", "Depth (%)", kEffectParamNumber, 0.0, 1000.0, 100.0},
+    {"size", "Size (px)", kEffectParamNumber, 0.0, 500.0, 10.0},
+    {"soften", "Soften (px)", kEffectParamNumber, 0.0, 500.0, 0.0},
+    {"opacity", "Opacity (0-1)", kEffectParamNumber, 0.0, 1.0, 0.75},
+    {"red", "Highlight R", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"green", "Highlight G", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"blue", "Highlight B", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"shadow_red", "Shadow R", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"shadow_green", "Shadow G", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"shadow_blue", "Shadow B", kEffectParamNumber, 0.0, 1.0, 0.0},
+};
+
+/* Satin（P1-1）：角度 / 距离 / 模糊 / 取反 / 不透明度 / 颜色。 */
+const EffectParam kSatinParams[] = {
+    {"angle", "Angle (deg)", kEffectParamNumber, -360.0, 360.0, 19.0},
+    {"distance", "Distance (px)", kEffectParamNumber, 0.0, 5000.0, 11.0},
+    {"blur", "Blur (px)", kEffectParamNumber, 0.0, 500.0, 14.0},
+    {"invert", "Invert (0/1)", kEffectParamBool, 0.0, 1.0, 0.0},
+    {"opacity", "Opacity (0-1)", kEffectParamNumber, 0.0, 1.0, 0.5},
+    {"red", "Red (0-1)", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"green", "Green (0-1)", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"blue", "Blue (0-1)", kEffectParamNumber, 0.0, 1.0, 0.0},
+};
+
+/* Gradient Overlay（P1-1）：角度 / 反向 / 不透明度 / 起点色 / 终点色。 */
+const EffectParam kGradientOverlayParams[] = {
+    {"angle", "Angle (deg)", kEffectParamNumber, -360.0, 360.0, 90.0},
+    {"reverse", "Reverse (0/1)", kEffectParamBool, 0.0, 1.0, 0.0},
+    {"opacity", "Opacity (0-1)", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"red", "Start R", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"green", "Start G", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"blue", "Start B", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"red2", "End R", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"green2", "End G", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"blue2", "End B", kEffectParamNumber, 0.0, 1.0, 1.0},
+};
+
 #define COMP_EFFECT_PARAMS(array) array, sizeof(array) / sizeof((array)[0])
 
 /* 下标 = effect kind；顺序与 effect_eval.h 的枚举逐字对应。 */
@@ -86,6 +127,9 @@ const EffectKindInfo kKinds[kEffectParamKindCount] = {
     {3u, COMP_EFFECT_PARAMS(kInnerShadowParams)},
     {4u, COMP_EFFECT_PARAMS(kOuterGlowParams)},
     {5u, COMP_EFFECT_PARAMS(kInnerGlowParams)},
+    {6u, COMP_EFFECT_PARAMS(kBevelParams)},
+    {7u, COMP_EFFECT_PARAMS(kSatinParams)},
+    {8u, COMP_EFFECT_PARAMS(kGradientOverlayParams)},
 };
 
 #undef COMP_EFFECT_PARAMS

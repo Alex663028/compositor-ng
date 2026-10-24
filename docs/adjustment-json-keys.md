@@ -42,12 +42,21 @@
 | 13 | `Desaturate` | 无参数（**本仓追加**） |
 | 14 | `Threshold` | 是（**本仓追加**） |
 | 15 | `Posterize` | 是（**本仓追加**） |
+| 16 | `Vibrance` | 是（**本仓追加**） |
+| 17 | `Selective Color` | 是（**本仓追加**，37 个参数） |
+| 18 | `Photo Filter` | 是（**本仓追加**） |
+| 19 | `Channel Mixer` | 是（**本仓追加**） |
+| 20 | `Color Lookup` | 是（**本仓追加**，内置外观表） |
+| 21 | `Shadows/Highlights` | 是（**本仓追加**） |
+| 22 | `Auto Tone` | 无参数（**本仓追加**） |
+| 23 | `Auto Contrast` | 无参数（**本仓追加**） |
+| 24 | `Auto Color` | 无参数（**本仓追加**） |
 
-`COMP_ADJUSTMENT_KIND_COUNT = 16`；越界 kind 在 ABI 层直接返回 `COMP_ERR_INVALID_ARGUMENT`，
+`COMP_ADJUSTMENT_KIND_COUNT = 25`；越界 kind 在 ABI 层直接返回 `COMP_ERR_INVALID_ARGUMENT`，
 **不回落**到任何默认类型。
 
-12..15 是本仓在 S27 追加的**破坏性**调整（`Image > Adjustments`，README §6.94），
-上游 `AdjustmentKind` 没有这四种，所以**不参与与上游的 kind 互操作**；但作为调整图层
+12..24 是本仓追加的**破坏性**调整（`Image > Adjustments`，README §6.94 / §6.95），
+上游 `AdjustmentKind` 没有这些种类，所以**不参与与上游的 kind 互操作**；但作为调整图层
 写入 `.comp` 时同样合法（求值器只做逐像素映射），`tests/test_adjustment.cpp`
 的 `adjustment_extended_kinds_round_trip_through_comp` 锁着这条往返。
 
@@ -215,12 +224,97 @@ Rec.601 亮度（`0.299R + 0.587G + 0.114B`，先反预乘）≥ `level` 的像�
 
 每通道按 `levels` 级量化；`levels = 255` 即恒等。
 
+### kind 16 — Vibrance（本仓追加，`vibranceSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `vibranceSettings.vibrance` | number | -100 … 100 | 0 |
+| `vibranceSettings.saturation` | number | -100 … 100 | 0 |
+
+`factor = 1 + vibrance·(1 − sat) + saturation`，其中 `sat = chroma / maxChannel`，
+肤色色相（15°…50°）的 vibrance 权重降到 0.55——低饱和处加得多、已经饱和处几乎不动，
+这正是「自然饱和度」区别于普通饱和度的行为。两项都为 0 时整步跳过。
+
+### kind 17 — Selective Color（本仓追加，`selectiveColorSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `selectiveColorSettings.relative` | bool | — | false |
+| `selectiveColorSettings.ranges.<0..8>.<channel>` | number | -100 … 100 | 0 |
+
+其中 `<channel>` 取 `cyan` / `magenta` / `yellow` / `black` 四者之一。
+`ranges` 是**定长 9 项**数组，顺序固定：0 红、1 黄、2 绿、3 青、4 蓝、5 洋红、
+6 白、7 中性灰、8 黑。参数表按 `ranges.<i>.<cmyk>` 逐项列出（9 × 4 = 36 项），
+`relative` 排在表首（面板不滚动也能看到）。求值先把像素转到 CMYK，再按六个色相
+三角权重与白/中性/黑三档亮度权重加权累加各档的 CMYK 偏移；`relative = true` 时按
+比例缩放（`c += c·d`），否则按绝对量相加（`c += d`）。37 个参数全部为 0 时跳过。
+
+### kind 18 — Photo Filter（本仓追加，`photoFilterSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `photoFilterSettings.color.red` | number | 0 … 1 | 0.93 |
+| `photoFilterSettings.color.green` | number | 0 … 1 | 0.66 |
+| `photoFilterSettings.color.blue` | number | 0 … 1 | 0.35 |
+| `photoFilterSettings.density` | number | 0 … 100 | 25 |
+| `photoFilterSettings.preserveLuminosity` | bool | — | true |
+
+默认值即 Photoshop 的「加温滤镜 (85)」25%。`density` 换算成透过率
+`t = density/100`，按 `1 − t + t·filter` 逐通道相乘；`preserveLuminosity = true` 时
+再把结果缩放回原亮度。`density = 0` 即恒等，跳过。
+
+### kind 19 — Channel Mixer（本仓追加，`channelMixerSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `channelMixerSettings.redRed` / `redGreen` / `redBlue` / `redConstant` | number | -2 … 2 | 1 / 0 / 0 / 0 |
+| `channelMixerSettings.greenRed` / `greenGreen` / `greenBlue` / `greenConstant` | number | -2 … 2 | 0 / 1 / 0 / 0 |
+| `channelMixerSettings.blueRed` / `blueGreen` / `blueBlue` / `blueConstant` | number | -2 … 2 | 0 / 0 / 1 / 0 |
+
+12 个系数构成 3×4 矩阵：`out[c] = clamp(m0·r + m1·g + m2·b + m3)`。范围取自
+Photoshop 的 −200%…200%。缺省即恒等矩阵，此时整步跳过。
+
+### kind 20 — Color Lookup（本仓追加，`colorLookupSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `colorLookupSettings.look` | number | 0 … 4 | 0 |
+| `colorLookupSettings.intensity` | number | 0 … 100 | 100 |
+
+内置外观表（`look`）：0 暖调胶片、1 冷调胶片、2 青橙、3 单色强对比、4 复古褪色。
+不使用外部 `.cube` 文件——本仓没有文件型 LUT 依赖，`look` 只索引这 5 个内置表。
+`intensity` 是与原图的线性混合比例；`intensity = 0` 即恒等，跳过。
+
+### kind 21 — Shadows/Highlights（本仓追加，`shadowsHighlightsSettings` 对象）
+
+| 路径 | 类型 | 范围 | 默认 |
+|------|------|------|------|
+| `shadowsHighlightsSettings.shadows` | number | -100 … 100 | 0 |
+| `shadowsHighlightsSettings.shadowWidth` | number | 0 … 100 | 50 |
+| `shadowsHighlightsSettings.highlights` | number | -100 … 100 | 0 |
+| `shadowsHighlightsSettings.highlightWidth` | number | 0 … 100 | 50 |
+| `shadowsHighlightsSettings.radius` | number | 1 … 100 | 30 |
+
+先对亮度做一份盒式模糊副本（`radius` 是模糊半径），用它求局部亮度，再对每个通道施加
+`out = c + shadow·(1 − c)² − highlight·c²`；`shadowWidth`/`highlightWidth` 决定
+权重曲线的指数（宽度越大作用范围越窄）。两个强度都为 0 时跳过。
+
+### kind 22..24 — Auto Tone / Auto Contrast / Auto Color（本仓追加）
+
+无参数，`settings` 恒为 `{}`；`param_count = 0`、`editable = false`，壳侧菜单点即落墨。
+三种都读同一份 4×256 直方图（R/G/B + 亮度），各通道按 0.1% 分位裁剪后拉伸：
+
+- **Auto Tone（22）**：三个通道各自按自己的分位拉伸（等于自动色阶）。
+- **Auto Contrast（23）**：三通道共用亮度分位拉伸，色相关系保持不变。
+- **Auto Color（24）**：在 Auto Tone 之上加灰度世界（gray-world）伽马，把偏色拉回中性；
+  伽马落在 0.25…4 之外时放弃该通道的修正，避免把正常图拉爆。
+
 ## 4. 校验规则（ABI 写入时）
 
 `comp_layer_add_adjustment` / `comp_layer_update_adjustment` 在写入前调用
 `adjustment_validate_settings`，顺序如下：
 
-1. `kind` 必须 < 16；
+1. `kind` 必须 < 25；
 2. `settings` 必须是 JSON **对象**（空串按 `{}` 处理）；
 3. 顶层键必须在白名单内（= §3 各路径的根段，加上 kind 0 允许的包裹层 `hsvSettings`）——
    多余键直接拒绝，避免打错键名却静默无效；
@@ -253,7 +347,7 @@ Rec.601 亮度（`0.299R + 0.587G + 0.114B`，先反预乘）≥ `level` 的像�
 | `comp_layer_apply_adjustment(doc, id, kind, settings_json, &changed)` | **破坏性**一次落墨：把一条调整直接写进图层像素，不产生 `engineAdjustments` 条目（README §6.94） |
 
 `comp_layer_apply_adjustment` 的 `kind` 白名单比调整层窄：只接受逐像素可破坏的
-0/1/2/3/4/10/11/12/13/14/15；5..8（颗粒 / 噪点 / 高斯模糊 / 动感模糊）走
+0/1/2/3/4/10/11/12…24；5..8（颗粒 / 噪点 / 高斯模糊 / 动感模糊）走
 `comp_filter_apply`，9（反相）走 `comp_layer_invert`。settings 校验与
 `comp_layer_add_adjustment` 完全相同（同一张表、同一套范围），所以面板构造出的
 JSON 可以直接喂进来；结果与像素相同时不开事务、`changed = 0`。
@@ -276,6 +370,10 @@ JSON 可以直接喂进来；结果与像素相同时不开事务、`changed = 0
   的正确做法是改 `ranges.1.*`，而不是先点红通道再改第一页。
 - **删除调整已有接口**：`comp_layer_remove_adjustment`（面板 `Ctrl+Shift+D`）会从列表
   里移除一条并记一步撤销；但它不提供「停用调整层」（可见性开关）——要临时关掉只能删。
-- **本仓追加的 4 种 kind 不与上游互操作**：12..15 的键名按上游 `*Settings` 风格自定，
-  上游读不了、本仓读上游也不会遇到（上游没有这四个值）。
+- **本仓追加的 13 种 kind 不与上游互操作**：12..24 的键名按上游 `*Settings` 风格自定，
+  上游读不了、本仓读上游也不会遇到（上游没有这些值）。
+- **Selective Color 只有 9 档色带**：Photoshop 的 9 档（红/黄/绿/青/蓝/洋红/白/中性/黑）
+  是完整集合，但没有「吸管取色自定义色带」；色相三角权重是硬编码的近似，不是 PS 的
+  逐色相采样。
+- **Color Lookup 没有外部 LUT 文件**：只提供 5 个内置外观，不支持 `.cube`/`.3dl` 导入。
 - **上游对象型键不覆盖**：上游自有的 adjustment 表现形式不在本轮改写范围（见 README §6.3）。
