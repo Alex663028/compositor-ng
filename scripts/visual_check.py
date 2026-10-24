@@ -3140,6 +3140,98 @@ def scene_effect_pattern(shell, checker):
                   "实测 %s" % (back,))
 
 
+def scene_gradient_stops(shell, checker):
+    """
+    可编辑色标表（P1-7 收尾）：右栏改表 -> 回车应用 -> 落笔画布跟着变。
+
+    三种失败方式各量一项，全部走用户的真实操作路径，不直接读 ShellState：
+      1. 面板没画出来（布局/命中破了）——右栏标题区必须有字形；
+      2. 增删行只改显示、表没动——插入/删除后右栏文本必须各变一次；
+      3. 改的颜色只进草稿、没进落笔——渐变在 25% / 50% / 75% 三处采样：
+         50% 必须是改过的洋红，两侧的黄与青还在。两侧在，说明自定义表确实
+         是用「彩虹」播种的 5 个色标，而不是退化成两色或空表。
+    """
+    scene = "gradient_stops"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    y = (top + bottom) // 2
+    panel = shell.layout["adjust"]
+    title_rect = (panel[0] + 8, panel[1] + 8, panel[2] - 8, panel[1] + 96)
+
+    shell.select_tool("gradient")
+
+    # 预设是 Choice：整块都算「下一档」。0 -> 1 -> 2 -> 3（自定义），
+    # 踏进自定义时用刚离开的「彩虹」现展开一份 5 色标表当起点。
+    preset = shell.option_control_rect(1)
+    checker.check(scene, "渐变预设控件在选项栏上", preset is not None, "preset=%s" % (preset,))
+    if preset is None:
+        return
+    center = ((preset[0] + preset[2]) // 2, (preset[1] + preset[3]) // 2)
+    for _ in range(3):
+        shell.click(center[0], center[1])
+    shell.wait(0.3)
+
+    # 「色标表」是 Stepper：点在数值上不响应，只有右箭头吃点击（避免误触）。
+    edit = shell.option_control_rect(3)
+    checker.check(scene, "色标表控件在选项栏上", edit is not None, "edit=%s" % (edit,))
+    if edit is None:
+        return
+    shell.click(edit[2] - OPTION_ARROW_W // 2, (edit[1] + edit[3]) // 2)
+    shell.wait(0.3)
+    img_open = shell.shot("123_gradient_stops_panel")
+    bright = count_bright(img_open, title_rect, 150)
+    checker.check(scene, "色标表面板已绘制（右栏标题区有文字）", bright > 120,
+                  "右栏浅色像素 %d" % bright)
+
+    # 第 8 行是增删动作：Tab 7 次到它，→ 插入、← 删除。动作执行完立刻归零，
+    # 所以两次按键都在改表长度；选中项跟着变，行 1..5 的文本也一起变。
+    for _ in range(7):
+        shell.press(VK_TAB)
+    shell.press(VK_RIGHT)
+    img_insert = shell.shot("124_gradient_stops_insert")
+    grow = pixel_diff(img_insert, img_open, panel, 24)
+    checker.check(scene, "→ 插入后右栏文本变化（选中/总数）", grow > 20,
+                  "右栏变化像素 %d" % grow)
+    shell.press(VK_LEFT)
+    img_delete = shell.shot("125_gradient_stops_delete")
+    shrink = pixel_diff(img_delete, img_insert, panel, 24)
+    checker.check(scene, "← 删除后右栏文本再次变化", shrink > 20,
+                  "右栏变化像素 %d" % shrink)
+
+    # 回到第 1 行（Tab 绕圈）。删除后选中项停在索引 1（黄），→ 一次到
+    # 第 3 个色标（彩虹的绿），再 Tab 到 R/G/B 三行各键入一个数，
+    # 回车把整表写进「自定义」。
+    shell.press(VK_TAB)
+    shell.press(VK_RIGHT)
+    for _ in range(3):
+        shell.press(VK_TAB)
+    shell.type_text("255")
+    shell.press(VK_TAB)
+    shell.type_text("0")
+    shell.press(VK_TAB)
+    shell.type_text("255")
+    shell.press(VK_TAB)
+    shell.press(VK_RETURN)
+    shell.wait(0.3)
+
+    shell.drag(left + 10, y, right - 10, y, steps=20)
+    img = shell.shot("126_gradient_stops_applied")
+
+    def strip_mean(fx):
+        x = int(left + (right - left) * fx)
+        return mean_rgb(img, (x - 6, y - 6, x + 6, y + 6))
+
+    quarter = strip_mean(0.25)
+    middle = strip_mean(0.5)
+    three_quarter = strip_mean(0.75)
+    checker.check(scene, "50% 处是改过的洋红（颜色真的进了落笔）",
+                  near(middle, (255, 0, 255), 60), "实测 %s" % (middle,))
+    checker.check(scene, "25% 处仍是彩虹的黄（表是用彩虹播种的）",
+                  near(quarter, (255, 255, 0), 60), "实测 %s" % (quarter,))
+    checker.check(scene, "75% 处仍是彩虹的青", near(three_quarter, (0, 255, 255), 70),
+                  "实测 %s" % (three_quarter,))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3173,6 +3265,7 @@ SCENES = [    ("start", scene_start, ()),
     ("selection_transform", scene_selection_transform, ()),
     ("layer_transform_numeric", scene_layer_transform_numeric, ()),
     ("effect_pattern", scene_effect_pattern, ()),
+    ("gradient_stops", scene_gradient_stops, ()),
 ]
 
 

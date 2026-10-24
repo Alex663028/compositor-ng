@@ -491,6 +491,31 @@ void save_document_quick(HWND window, ShellState& shell) {
 /* ------------------------------------------------- 文档级对话框（P0 接线） */
 
 /*
+ * 可编辑色标表（P1-7）的面板辅助：表下标与 alpha/百分比换算。
+ * 选中项用 0 基存在 ShellState 里，面板第 0 行显示 1 基；表在面板开着时可能
+ * 因增删变短，所以每次读都夹一次，不假设「打开时是多少现在还是多少」。
+ */
+int gradient_dialog_stop_index(const ShellState& shell) {
+  const int count = static_cast<int>(shell.gradient_custom_stops.size());
+  if (count <= 0) return -1;
+  int index = shell.gradient_stop;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  return index;
+}
+
+/* alpha 0..255 <-> 不透明度百分比 0..100：四舍五入到最近整百分点。 */
+int gradient_alpha_percent(uint8_t alpha) {
+  return (static_cast<int>(alpha) * 100 + 127) / 255;
+}
+
+uint8_t gradient_percent_alpha(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  return static_cast<uint8_t>((percent * 255 + 50) / 100);
+}
+
+/*
  * 行 -> 值 / 值 -> 行：唯一映射点。行序必须与 ui_core::doc_dialog_row 完全相同
  * （单元测试 ui_core_doc_dialog_rows 钉住行数与行序）。所有写入都经
  * doc_dialog_set_row_value，夹取一次、联动一次，绘制与状态栏读的是同一份值。
@@ -549,6 +574,23 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
         case 2: return shell.doc.doc_dialog_angle;
         default: return 0;
       }
+    case comp_ui::DocDialogKind::GradientStops: {
+      if (row < 0 || row >= comp_ui::kGradientStopsRowCount) return 0;
+      const int index = gradient_dialog_stop_index(shell);
+      if (index < 0) return 0;
+      const comp_ui::GradientPresetStop& stop = shell.gradient_custom_stops[index];
+      switch (row) {
+        case 0: return index + 1;
+        case 1: return comp_ui::gradient_position_permille(stop.position);
+        case 2: return comp_ui::gradient_position_permille(stop.midpoint);
+        case 3:
+        case 4:
+        case 5: return stop.color[row - 3];
+        case 6: return gradient_alpha_percent(stop.color[3]);
+        case 7: return shell.gradient_stop_action;
+        default: return 0;
+      }
+    }
     default:
       return 0;
   }
@@ -678,6 +720,67 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         }
       }
       break;
+    case comp_ui::DocDialogKind::GradientStops: {
+      const int count = static_cast<int>(shell.gradient_custom_stops.size());
+      if (row < 0 || row >= comp_ui::kGradientStopsRowCount || count <= 0) break;
+      const int index = gradient_dialog_stop_index(shell);
+      if (index < 0) break;
+      comp_ui::GradientPresetStop* stops = shell.gradient_custom_stops.data();
+      switch (row) {
+        case 0:
+          if (value < 1) value = 1;
+          if (value > count) value = count;
+          shell.gradient_stop = value - 1;
+          break;
+        case 1:
+          comp_ui::gradient_set_stop_position_permille(stops, count, index, value);
+          break;
+        case 2:
+          comp_ui::gradient_set_stop_midpoint_permille(stops, count, index, value);
+          break;
+        case 3:
+        case 4:
+        case 5:
+          if (value < 0) value = 0;
+          if (value > 255) value = 255;
+          stops[index].color[row - 3] = static_cast<uint8_t>(value);
+          break;
+        case 6:
+          stops[index].color[3] = gradient_percent_alpha(value);
+          break;
+        case 7: {
+          /*
+           * 增删是**瞬时动作**，不是持久档位：执行完立刻归零，面板上永远显示
+           * 「→ 插入 · ← 删除」。这样同一颗键连按两次就是插两个，不会出现
+           * 「操作行停在删除，回车又删了一个」。
+           */
+          const int action = value < 0 ? 0 : (value > 2 ? 2 : value);
+          if (action == 1) {
+            if (count < comp_ui::kGradientMaxStops) {
+              shell.gradient_custom_stops.resize(count + 1);
+              const int added = comp_ui::gradient_insert_stop(
+                  shell.gradient_custom_stops.data(), count, index);
+              if (added > count) {
+                shell.gradient_stop = index < count - 1 ? index + 1 : count - 1;
+              } else {
+                shell.gradient_custom_stops.resize(count);
+              }
+            }
+          } else if (action == 2) {
+            const int removed = comp_ui::gradient_delete_stop(stops, count, index);
+            if (removed > 0) shell.gradient_custom_stops.resize(removed);
+          }
+          shell.gradient_stop_action = 0;
+          const int after = static_cast<int>(shell.gradient_custom_stops.size());
+          if (shell.gradient_stop >= after) shell.gradient_stop = after - 1;
+          if (shell.gradient_stop < 0) shell.gradient_stop = 0;
+          break;
+        }
+        default:
+          break;
+      }
+      break;
+    }
     default:
       break;
   }
@@ -697,6 +800,9 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
       }
       if (shell.doc.doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
         return widen_utf8(comp_ui::doc_close_action_name(value));
+      }
+      if (shell.doc.doc_dialog == comp_ui::DocDialogKind::GradientStops) {
+        return L"→ 插入 · ← 删除";
       }
       return widen_utf8(comp_ui::doc_anchor_name(value));
     case comp_ui::DocRowKind::Number:
@@ -741,6 +847,26 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
         wsprintfW(buffer, L"%d MiB", value);
       }
       return buffer;
+    case comp_ui::DocDialogKind::GradientStops:
+      switch (row) {
+        case 0: {
+          /* 选中项 + 总数一起显示，删完不会留下「第 6 个（共 4 个）」这种鬼话。 */
+          const int count = static_cast<int>(shell.gradient_custom_stops.size());
+          wsprintfW(buffer, L"%d / %d", value, count);
+          return buffer;
+        }
+        case 1:
+        case 2:
+          /* 千分位 -> 「50.0%」；wsprintfW 不支持 %f，整数拆两位拼。 */
+          wsprintfW(buffer, L"%d.%d%%", value / 10, value % 10);
+          return buffer;
+        case 6:
+          wsprintfW(buffer, L"%d%%", value);
+          return buffer;
+        default:
+          wsprintfW(buffer, L"%d", value);
+          return buffer;
+      }
     case comp_ui::DocDialogKind::CameraRaw: {
       /*
        * wsprintfW（user32）**不支持浮点格式**——P0-3 的曲线面板曾因此在 %f 上崩。
@@ -909,6 +1035,30 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       shell.doc.doc_dialog_angle_base = shell.doc.doc_dialog_angle;
       break;
     }
+    case comp_ui::DocDialogKind::GradientStops: {
+      /*
+       * 打开时把「当前档位」搬进草稿表：预设 0..2 现展开（预设 0 取前景色），
+       * 自定义则沿用已存的表——只要它仍然合法。这样面板一开就有一张能直接
+       * 回车的表；Esc 丢掉的是这一轮编辑，不是上一轮已应用的成果。
+       */
+      const uint8_t foreground[4] = {shell.foreground.r, shell.foreground.g,
+                                     shell.foreground.b, 255};
+      const int count = static_cast<int>(shell.gradient_custom_stops.size());
+      const bool reusable =
+          shell.gradient_preset == comp_ui::kGradientPresetCustom &&
+          comp_ui::gradient_stops_valid(shell.gradient_custom_stops.data(), count);
+      if (!reusable) {
+        int source = shell.gradient_preset;
+        if (source < 0 || source > 2) source = 0; /* 自定义但没有可用的表 */
+        comp_ui::GradientPresetStop table[comp_ui::kGradientMaxStops];
+        const int expanded = comp_ui::gradient_preset_stops(
+            source, foreground, false, table, comp_ui::kGradientMaxStops);
+        if (expanded >= 2) shell.gradient_custom_stops.assign(table, table + expanded);
+      }
+      shell.gradient_stop = 0;
+      shell.gradient_stop_action = 0;
+      break;
+    }
     default:
       break;
   }
@@ -943,6 +1093,33 @@ void doc_dialog_step(ShellState& shell, int direction) {
   const int row = shell.doc.doc_dialog_focus;
   const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc.doc_dialog, row);
   const int current = doc_dialog_row_value(shell, row);
+  /*
+   * 色标表的「增删」行是**动作**而不是持久值：执行后立刻归零，所以状态栏要按
+   * 表长度前后变化来报，而不是照抄「增删 = → 插入 · ← 删除」。失败时也要说清
+   * 是哪一种失败（满 32 / 只剩两个 / 首末固定），否则用户会反复按同一个键。
+   */
+  if (shell.doc.doc_dialog == comp_ui::DocDialogKind::GradientStops && row == 7) {
+    const int before = static_cast<int>(shell.gradient_custom_stops.size());
+    const int selected = shell.gradient_stop;
+    const int choices = 3;
+    const int action = ((current + direction) % choices + choices) % choices;
+    doc_dialog_set_row_value(shell, row, action);
+    const int after = static_cast<int>(shell.gradient_custom_stops.size());
+    wchar_t buffer[192];
+    if (after > before) {
+      wsprintfW(buffer, L"已插入色标（共 %d 个，选中第 %d 个）", after, shell.gradient_stop + 1);
+    } else if (after < before) {
+      wsprintfW(buffer, L"已删除色标（共 %d 个）", after);
+    } else if (action == 1) {
+      wsprintfW(buffer, L"不能插入：已达 %d 个色标上限", comp_ui::kGradientMaxStops);
+    } else if (before <= 2) {
+      wsprintfW(buffer, L"不能删除：至少要保留两个色标");
+    } else {
+      wsprintfW(buffer, L"不能删除：首末色标固定在 0%% / 100%%（选中第 %d 个）", selected + 1);
+    }
+    set_status(shell, buffer);
+    return;
+  }
   int next = current;
   if (spec.kind == comp_ui::DocRowKind::Number) {
     const long long raw = static_cast<long long>(current) +
@@ -971,6 +1148,15 @@ void doc_dialog_begin_input(ShellState& shell, wchar_t character) {
    * 其它位置直接忽略——若把 '-' 当噪声跳过，"-5" 会静默变成 +5，那是最坏的失败方式。
    */
   if (character == L'-' && (spec.min >= 0 || !shell.doc.doc_dialog_input.empty())) return;
+  /* 小数点只给色标表的位置/中点行：其它行是纯整数，收 '.' 会让回车落回同一个数。 */
+  if (character == L'.') {
+    const bool percent_row = shell.doc.doc_dialog == comp_ui::DocDialogKind::GradientStops &&
+                             (shell.doc.doc_dialog_focus == 1 || shell.doc.doc_dialog_focus == 2);
+    if (!percent_row || shell.doc.doc_dialog_input.empty() ||
+        shell.doc.doc_dialog_input.find(L'.') != std::wstring::npos) {
+      return;
+    }
+  }
   /* 30000 / 16384 / 10000 都是五位；六位只可能是误按，留着没意义。 */
   if (shell.doc.doc_dialog_input.size() >= 5) return;
   shell.doc.doc_dialog_input.push_back(character);
@@ -983,6 +1169,40 @@ void doc_dialog_commit_input(ShellState& shell) {
   if (shell.doc.doc_dialog_input.empty()) return;
   const int row = shell.doc.doc_dialog_focus;
   const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc.doc_dialog, row);
+  /*
+   * 色标表的位置/中点行收百分数，允许一位小数（「37.5」）。千分位是内部单位，
+   * 输入框里直接写 0.1% 更符合 PS 的读法；这里把「整数部分 / 十分位」拼成
+   * 千分位，后面的夹取与显示仍只认一个整数，不引入浮点状态。
+   */
+  if (shell.doc.doc_dialog == comp_ui::DocDialogKind::GradientStops && (row == 1 || row == 2) &&
+      shell.doc.doc_dialog_input.find(L'.') != std::wstring::npos) {
+    long long whole = 0;
+    int tenth = 0;
+    bool seen_dot = false;
+    for (wchar_t character : shell.doc.doc_dialog_input) {
+      if (character == L'.') {
+        seen_dot = true;
+        continue;
+      }
+      if (character < L'0' || character > L'9') continue;
+      if (!seen_dot) {
+        whole = whole * 10 + (character - L'0');
+        if (whole > 100000) whole = 100000;
+      } else if (tenth == 0) {
+        tenth = character - L'0';
+      }
+    }
+    long long permille = whole * 10 + tenth;
+    if (permille > spec.max) permille = spec.max;
+    if (permille < spec.min) permille = spec.min;
+    shell.doc.doc_dialog_input.clear();
+    doc_dialog_set_row_value(shell, row, static_cast<int>(permille));
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"%s = %s", widen_utf8(spec.label).c_str(),
+              doc_dialog_value_text(shell, row).c_str());
+    set_status(shell, buffer);
+    return;
+  }
   bool negative = false;
   size_t digits_from = 0;
   if (shell.doc.doc_dialog_input[0] == L'-') {
@@ -1091,6 +1311,26 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
 
   if (shell.doc.document == nullptr) {
     doc_dialog_close(shell, L"文档：还没有打开任何文档");
+    return;
+  }
+
+  /*
+   * 色标表（P1-7）：只改**工具状态**，不碰文档像素，因此不开事务、不落撤销步。
+   * 校验用与落笔同一份 gradient_stops_valid；不合法时保持面板打开，让用户改，
+   * 而不是关掉面板再把错误丢进状态栏。
+   */
+  if (kind == comp_ui::DocDialogKind::GradientStops) {
+    const int count = static_cast<int>(shell.gradient_custom_stops.size());
+    if (!comp_ui::gradient_stops_valid(shell.gradient_custom_stops.data(), count)) {
+      set_status(shell,
+                 L"色标表不合法：需要 2..32 个、位置严格升序、至少一个不透明色标（面板保留）");
+      return;
+    }
+    shell.gradient_preset = comp_ui::kGradientPresetCustom;
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"已应用 %d 个色标（自定义）：拖拽落笔，Shift 反向", count);
+    set_status(shell, buffer);
     return;
   }
 

@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **167**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **197 条 / 33 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **167**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **205 条 / 34 场景**；落地规则见 §6）。
 > 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
 > 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -93,6 +93,14 @@
 > source-atop 叠色，**不依赖 `.pat` 资源文件**；inside 类零外扩，effects_margin 返回 0；
 > 命令号 1519 恰好填满 1510..1519，`kCmdEffectClear`（1520）不动。
 > **图层样式至此 10/10**；P1-1 剩余：合并的图层样式对话框、全局光角度/高度。
+> **2026-10-24 第二十批**：P1-7 收尾之「可编辑渐变色标表」（**零 ABI 新增**，仍 167；
+> 引擎早已收 2..32 色标与每段中点，缺的只是 UI）。选项栏渐变 3 → 4 组（尾部追加
+> `GradientEdit`，Stepper，点右箭头开面板）；右栏复用 `DocDialogKind` 追加
+> `GradientStops`，8 行（选中/位置‰/中点‰/RGB/不透明度/增删），位置按相邻色标自动
+> 夹取保证严格升序，增删是**瞬时动作**（执行后归零）；进入自定义时用刚离开的预设
+> 播种，表不合法则在落笔前拒绝。单测 712 → **714 例**，视觉探针 197 → **205 条 /
+> 34 场景**，壳自检 263 项 SHA 未变，见 README §6.105。
+> P1-7 剩余：渐变拖拽手柄、不透明度中点、噪点渐变、Lab/线性光插值、渐变映射接多色标。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -490,14 +498,19 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 
 ### P1-7 渐变升级
 多色标（>2）、色标中点、不透明度中点、角度/对称/菱形、抖动、渐变预设库与编辑器；渐变映射调整同步支持多色标。
-- 现状：`comp_tool_gradient` 只有 `color0/color1`，类型 0=线性/1=径向（`comp_layer.h:660-669`）。
-- 性质：【ABI 追加】（新结构体 `comp_gradient_stops` 尾字段）+【引擎】M。
+- 现状：`comp_tool_gradient` 本身只有 `color0/color1`，类型 0..4；多色标/中点/抖动
+  挂在 `comp_tool_op_desc` **尾部**（见下）。
+- 性质：【ABI 追加】（新结构体 `comp_gradient_stop` 尾字段）+【引擎】M。
 - **已落地（2026-10-23，零新导出，README §6.98）**：类型 0..4（线性/径向/角度/对称/菱形）、
   最多 32 个色标（`comp_gradient_stop`：position + midpoint + RGBA）、每色标中点重映射
   `u^(ln0.5/ln mid)`、确定性 ±0.5 LSB 抖动。三个新字段挂在 **`comp_tool_op_desc` 尾部**
   （挂进嵌套的 `comp_tool_gradient` 会顶飞后续字段偏移）。壳侧给三种只读预设
   （前景→透明 / 黑→白 / 5 色标彩虹）+ 抖动开关 + 五类型预览几何。
-- **剩余**：可编辑色标表（增删/拖拽/取色/中点手柄）、不透明度中点、噪点渐变、
+- **可编辑色标表已落地（2026-10-24，零新导出，README §6.105）**：选项栏第 4 组
+  `色标表`（Stepper，点右箭头开面板）+ 右栏 8 行（选中 / 位置‰ / 中点‰ / RGB /
+  不透明度 / 增删），位置按相邻色标自动夹取保证严格升序；进入自定义时用刚离开的
+  预设播种；表是工具状态，不落撤销步、不写 `.comp`。
+- **剩余**：画布上的色标拖拽手柄 / 渐变条点击加色标、不透明度中点、噪点渐变、
   Lab/线性光插值；渐变映射调整层仍两色，未接多色标。
 
 ### P1-8 面板 / 工作区 / 首选项
@@ -605,7 +618,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 
 | 结论 | 证据 |
 |------|------|
-| 166 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-23 实测 166） |
+| 167 个导出 | `engine/abi/include/compositor/*.h`（`^COMP_API` 行计数，2026-10-24 实测 167） |
 | 新建固定参数 + 销毁旧文档 | `shells/windows/src/shell_state.h:52`（`kDefaultWidth/Height`）、`shell_document.cpp:302`（`create_document`）→ `shell_document.cpp:255/313`（`comp_document_destroy`） |
 | 无图像/画布大小菜单 | ~~`shells/windows/src/main.cpp:14859-14866`~~ → 2026-10-22 已接线，见 P0-2（`kCmdImageResize` 等） |
 | 单文档 | `ShellState` 内嵌**一个** `DocumentContext`（`shell_state.h`）；多文档仍是【架构】项，`main.cpp` 拆分不为它背书 |
@@ -613,7 +626,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 选区修改仅五种 | `engine/abi/include/compositor/comp_selection.h:52-58`（羽化/扩/缩/边界/平滑；Grow/Similar 仍无） |
 | 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767`（可编辑文字对象见同文件尾部 P0-6 ①） |
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
-| 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
+| ~~渐变仅两色标~~ → 多色标（2..32）与每段中点已支持 | `engine/abi/include/compositor/comp_layer.h:688-692`（`comp_gradient_stop`）、同文件 `comp_tool_op_desc` 尾部 `gradient_stops` / `gradient_stop_count` / `gradient_dither`；壳侧可编辑表见 README §6.105 |
 | 10 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 / §6.104 |
 | 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |

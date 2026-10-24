@@ -323,7 +323,7 @@ COMP_TEST(ui_core_tool_options_bar) {
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Heal) == 3);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Wand) == 2);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Marquee) == 1);
-  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Gradient) == 3);
+  COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Gradient) == 4);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Shape) == 2);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Hand) == 0);
   COMP_CHECK(comp_ui::tool_option_count(comp_ui::ToolId::Move) == 0);
@@ -1995,8 +1995,12 @@ COMP_TEST(ui_core_gradient_presets_expand_to_ascending_stop_tables) {
   const uint8_t foreground[4] = {10, 20, 30, 255};
   comp_ui::GradientPresetStop stops[5];
 
-  COMP_CHECK(comp_ui::kGradientPresetCount == 3);
-  for (int preset = 0; preset < comp_ui::kGradientPresetCount; ++preset) {
+  COMP_CHECK(comp_ui::kGradientPresetCount == 4);
+  /*
+   * 第 4 档「自定义」没有内置表：0..2 是预设，3 读 ShellState 里那张可编辑表
+   * （见下面的 ui_core_gradient_custom_stop_table_editing）。
+   */
+  for (int preset = 0; preset < comp_ui::kGradientPresetCustom; ++preset) {
     int is_foreground = -1;
     const int expected = comp_ui::gradient_preset_stop_count(preset, &is_foreground);
     COMP_CHECK(expected >= 2 && expected <= 5);
@@ -2034,6 +2038,165 @@ COMP_TEST(ui_core_gradient_presets_expand_to_ascending_stop_tables) {
   /* 容量不足时返回 0，且不写半张表（调用方据此走两色标旧路径）。 */
   comp_ui::GradientPresetStop small[2];
   COMP_CHECK(comp_ui::gradient_preset_stops(2, foreground, false, small, 2) == 0);
+
+  /* 「自定义」是空档：没有内置表，也不假装有一张（空 = 0 个色标）。 */
+  COMP_CHECK(comp_ui::kGradientPresetCustom == 3);
+  COMP_CHECK(comp_ui::kGradientMaxStops == 32);
+  COMP_CHECK(std::string(comp_ui::gradient_preset_name(comp_ui::kGradientPresetCustom)) == "自定义");
+  int custom_foreground = -1;
+  COMP_CHECK(comp_ui::gradient_preset_stop_count(comp_ui::kGradientPresetCustom,
+                                                 &custom_foreground) == 0);
+  COMP_CHECK(comp_ui::gradient_preset_stops(comp_ui::kGradientPresetCustom, foreground, false,
+                                            stops, 5) == 0);
+}
+
+COMP_TEST(ui_core_gradient_custom_stop_table_editing) {
+  /*
+   * P1-7 收尾：可编辑色标表的纯逻辑（ui_core）。面板只是这些函数的键鼠外壳，
+   * 所以数值边界全在这里钉死——首末固定、中间与邻居至少 1‰、增删只动中间项。
+   */
+  comp_ui::GradientPresetStop table[comp_ui::kGradientMaxStops];
+  for (int i = 0; i < 3; ++i) {
+    table[i].position = i * 0.5;
+    table[i].midpoint = 0.5;
+    table[i].color[0] = static_cast<uint8_t>(10 * (i + 1));
+    table[i].color[1] = static_cast<uint8_t>(20 * (i + 1));
+    table[i].color[2] = static_cast<uint8_t>(30 * (i + 1));
+    table[i].color[3] = 255;
+  }
+
+  /* 位置 -> 千分位：四舍五入、夹到 0..1000、非有限值按 0（面板不显示 NaN）。 */
+  COMP_CHECK(comp_ui::gradient_position_permille(0.0) == 0);
+  COMP_CHECK(comp_ui::gradient_position_permille(1.0) == 1000);
+  COMP_CHECK(comp_ui::gradient_position_permille(0.125) == 125);
+  COMP_CHECK(comp_ui::gradient_position_permille(0.1234) == 123);
+  COMP_CHECK(comp_ui::gradient_position_permille(0.9999) == 1000);
+  COMP_CHECK(comp_ui::gradient_position_permille(-0.5) == 0);
+  COMP_CHECK(comp_ui::gradient_position_permille(1.5) == 1000);
+  COMP_CHECK(comp_ui::gradient_position_permille(std::nan("")) == 0);
+
+  /* 可编辑区间：首 0、末 1000、中间是本邻居之间（各留 1‰ 保证严格升序）。 */
+  int low = -1;
+  int high = -1;
+  comp_ui::gradient_stop_position_bounds_permille(table, 3, 0, &low, &high);
+  COMP_CHECK(low == 0 && high == 0);
+  comp_ui::gradient_stop_position_bounds_permille(table, 3, 1, &low, &high);
+  COMP_CHECK(low == 1 && high == 999);
+  comp_ui::gradient_stop_position_bounds_permille(table, 3, 2, &low, &high);
+  COMP_CHECK(low == 1000 && high == 1000);
+  comp_ui::gradient_stop_position_bounds_permille(table, 3, 9, &low, &high);
+  COMP_CHECK(low == 0 && high == 1000); /* 越界下标：整段，调用方本来就不该写 */
+  comp_ui::gradient_stop_position_bounds_permille(nullptr, 3, 1, &low, &high);
+  COMP_CHECK(low == 0 && high == 1000);
+
+  /* 写位置：夹到区间；端点写别的值也不动。 */
+  comp_ui::gradient_set_stop_position_permille(table, 3, 1, 5);
+  COMP_CHECK(table[1].position == 0.005);
+  comp_ui::gradient_set_stop_position_permille(table, 3, 1, 5000);
+  COMP_CHECK(table[1].position == 0.999);
+  comp_ui::gradient_set_stop_position_permille(table, 3, 0, 700);
+  COMP_CHECK(table[0].position == 0.0);
+  comp_ui::gradient_set_stop_position_permille(table, 3, 2, 0);
+  COMP_CHECK(table[2].position == 1.0);
+  table[1].position = 0.5;
+
+  /* 中点只属于本段，夹到 (0,1) 开区间——引擎要求严格。 */
+  comp_ui::gradient_set_stop_midpoint_permille(table, 3, 1, 0);
+  COMP_CHECK(table[1].midpoint == 0.001);
+  comp_ui::gradient_set_stop_midpoint_permille(table, 3, 1, 1000);
+  COMP_CHECK(table[1].midpoint == 0.999);
+  comp_ui::gradient_set_stop_midpoint_permille(table, 3, 1, 420);
+  COMP_CHECK(table[1].midpoint == 0.42);
+  comp_ui::gradient_set_stop_midpoint_permille(table, 3, 7, 420); /* 越界：不改表 */
+  COMP_CHECK(table[1].midpoint == 0.42);
+
+  /* 插入：选中中间项 -> 与右邻居之间；颜色抄左端，段中点 0.5。 */
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 3, 1) == 4);
+  COMP_CHECK(table[2].position == 0.75);
+  COMP_CHECK(table[2].midpoint == 0.5);
+  COMP_CHECK(table[2].color[0] == table[1].color[0]);
+  COMP_CHECK(table[2].color[3] == 255);
+  COMP_CHECK(table[3].position == 1.0);
+  /* 选中末项 -> 用左边那段（插在它前面）。 */
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 4, 3) == 5);
+  COMP_CHECK(table[3].position == 0.875);
+  COMP_CHECK(table[4].position == 1.0);
+  /* 参数闸：越界/满表/退化段都不改表、返回 0。 */
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 5, -1) == 0);
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 5, 5) == 0);
+  COMP_CHECK(comp_ui::gradient_insert_stop(nullptr, 5, 0) == 0);
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 1, 0) == 0);
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, comp_ui::kGradientMaxStops, 0) == 0);
+  table[1].position = 0.5;
+  table[2].position = 0.5;
+  const double before = table[2].position;
+  COMP_CHECK(comp_ui::gradient_insert_stop(table, 3, 1) == 0);
+  COMP_CHECK(table[2].position == before);
+
+  /* 删除：只有中间项能删（引擎至少 2 个，首末固定 0% / 100%）。 */
+  for (int i = 0; i < 3; ++i) {
+    table[i].position = i * 0.5;
+    table[i].midpoint = 0.5;
+  }
+  COMP_CHECK(comp_ui::gradient_delete_stop(table, 3, 1) == 2);
+  COMP_CHECK(table[0].position == 0.0 && table[1].position == 1.0);
+  COMP_CHECK(comp_ui::gradient_delete_stop(table, 2, 0) == 0);
+  COMP_CHECK(comp_ui::gradient_delete_stop(table, 2, 1) == 0);
+  COMP_CHECK(comp_ui::gradient_delete_stop(table, 3, 0) == 0);
+  COMP_CHECK(comp_ui::gradient_delete_stop(table, 3, 2) == 0);
+  COMP_CHECK(comp_ui::gradient_delete_stop(nullptr, 3, 1) == 0);
+
+  /* 反向：整表镜像，颜色跟着走，反向段中点 = 1 - 原段左中点，末项写 0.5。 */
+  comp_ui::GradientPresetStop forward[4];
+  const double positions[4] = {0.0, 0.25, 0.6, 1.0};
+  const double midpoints[4] = {0.4, 0.3, 0.2, 0.5};
+  for (int i = 0; i < 4; ++i) {
+    forward[i].position = positions[i];
+    forward[i].midpoint = midpoints[i];
+    for (int c = 0; c < 4; ++c) forward[i].color[c] = static_cast<uint8_t>(i * 10 + c);
+  }
+  comp_ui::GradientPresetStop reversed[4];
+  COMP_CHECK(comp_ui::reverse_gradient_stops_copy(forward, 4, reversed, 4) == 4);
+  COMP_CHECK(reversed[0].position == 0.0 && reversed[3].position == 1.0);
+  COMP_CHECK(std::fabs(reversed[1].position - 0.4) < 1e-12);
+  COMP_CHECK(std::fabs(reversed[2].position - 0.75) < 1e-12);
+  COMP_CHECK(reversed[0].color[0] == forward[3].color[0]);
+  COMP_CHECK(reversed[3].color[0] == forward[0].color[0]);
+  COMP_CHECK(std::fabs(reversed[0].midpoint - (1.0 - forward[2].midpoint)) < 1e-12);
+  COMP_CHECK(reversed[3].midpoint == 0.5);
+  /* src == out：走栈上副本，偶/奇长度都不会读到被覆盖的元素。 */
+  comp_ui::GradientPresetStop alias[4];
+  for (int i = 0; i < 4; ++i) alias[i] = forward[i];
+  COMP_CHECK(comp_ui::reverse_gradient_stops_copy(alias, 4, alias, 4) == 4);
+  COMP_CHECK(alias[0].color[0] == forward[3].color[0]);
+  COMP_CHECK(std::fabs(alias[1].position - 0.4) < 1e-12);
+  COMP_CHECK(comp_ui::reverse_gradient_stops_copy(forward, 4, reversed, 3) == 0);
+  COMP_CHECK(comp_ui::reverse_gradient_stops_copy(nullptr, 4, reversed, 4) == 0);
+  COMP_CHECK(comp_ui::reverse_gradient_stops_copy(forward, 33, reversed, 33) == 0);
+
+  /* 整表校验：逐条对齐引擎，包括「至少一个不透明色标」。 */
+  for (int i = 0; i < 3; ++i) {
+    table[i].position = i * 0.5;
+    table[i].midpoint = 0.5;
+    table[i].color[3] = 255;
+  }
+  COMP_CHECK(comp_ui::gradient_stops_valid(table, 3));
+  COMP_CHECK(!comp_ui::gradient_stops_valid(table, 1));
+  COMP_CHECK(!comp_ui::gradient_stops_valid(nullptr, 3));
+  table[1].position = 0.0; /* 与首色标重合：不严格升序 */
+  COMP_CHECK(!comp_ui::gradient_stops_valid(table, 3));
+  table[1].position = 0.6;
+  COMP_CHECK(comp_ui::gradient_stops_valid(table, 3));
+  table[0].midpoint = 1.0;
+  COMP_CHECK(!comp_ui::gradient_stops_valid(table, 3));
+  table[0].midpoint = 0.5;
+  table[2].position = 1.2;
+  COMP_CHECK(!comp_ui::gradient_stops_valid(table, 3));
+  table[2].position = 1.0;
+  for (int i = 0; i < 3; ++i) table[i].color[3] = 0;
+  COMP_CHECK(!comp_ui::gradient_stops_valid(table, 3)); /* 全透明：引擎会拒，外壳先说 */
+  table[0].color[3] = 1;
+  COMP_CHECK(comp_ui::gradient_stops_valid(table, 3));
 }
 
 COMP_TEST(ui_core_shape_kind_cycles_and_drag_box_matches_modifiers) {
@@ -4286,6 +4449,48 @@ COMP_TEST(ui_core_doc_dialog_rows) {
   COMP_CHECK(comp_ui::doc_angle_from_rotation(540.0) == 180);
   COMP_CHECK(comp_ui::doc_angle_from_rotation(370.0) == 10);
   COMP_CHECK(comp_ui::doc_angle_from_rotation(-370.0) == -10);
+}
+
+/*
+ * P1-7 收尾：可编辑色标面板（DocDialogKind::GradientStops）。
+ *
+ * 行序是面板、键盘步进与 visual_check 共用的契约：0 = 选中第几个（1 基）、
+ * 1/2 = 位置/中点（‰）、3..5 = RGB、6 = 不透明度（%）、7 = 增删动作。
+ * 这里只钉几何与量程；取值换算在 shell_document.cpp，靠窗口/Selftest 覆盖。
+ */
+COMP_TEST(ui_core_gradient_stops_dialog_rows) {
+  using comp_ui::DocDialogKind;
+  using comp_ui::DocRowKind;
+
+  COMP_CHECK(comp_ui::kGradientStopsRowCount == 8);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::GradientStops) ==
+             comp_ui::kGradientStopsRowCount);
+  /* 追加在枚举尾部：对话框编号是外部契约，不能插到中间。 */
+  COMP_CHECK(static_cast<int>(DocDialogKind::GradientStops) >
+             static_cast<int>(DocDialogKind::TransformLayer));
+
+  const comp_ui::DocRowSpec index = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 0);
+  COMP_CHECK(index.kind == DocRowKind::Number);
+  COMP_CHECK(index.min == 1 && index.max == comp_ui::kGradientMaxStops);
+  const comp_ui::DocRowSpec position = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 1);
+  COMP_CHECK(position.kind == DocRowKind::Number && position.min == 0 && position.max == 1000);
+  const comp_ui::DocRowSpec midpoint = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 2);
+  COMP_CHECK(midpoint.kind == DocRowKind::Number && midpoint.min == 1 && midpoint.max == 999);
+  for (int row = 3; row <= 5; ++row) {
+    const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, row);
+    COMP_CHECK(spec.kind == DocRowKind::Number && spec.min == 0 && spec.max == 255);
+  }
+  const comp_ui::DocRowSpec alpha = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 6);
+  COMP_CHECK(alpha.kind == DocRowKind::Number && alpha.min == 0 && alpha.max == 100);
+  const comp_ui::DocRowSpec action = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 7);
+  COMP_CHECK(action.kind == DocRowKind::Choice);
+  COMP_CHECK(action.choice_count == 3 && action.min == 0 && action.max == 2);
+  /* 越界行返回空行（空 label），绘制循环据此停。 */
+  const comp_ui::DocRowSpec none = comp_ui::doc_dialog_row(DocDialogKind::GradientStops, 8);
+  COMP_CHECK(none.label != nullptr && none.label[0] == '\0');
+  COMP_CHECK(std::string(comp_ui::doc_dialog_title(DocDialogKind::GradientStops)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_subtitle(DocDialogKind::GradientStops)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_hint(DocDialogKind::GradientStops)).size() > 0);
 }
 
 /*

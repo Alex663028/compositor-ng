@@ -706,6 +706,14 @@ struct ShellState {
   /* P1-7：多色标预设（只读表）+ 抖动开关；都不是文档状态，换图层不重置。 */
   int gradient_preset = 0;
   bool gradient_dither = false;
+  /*
+   * P1-7 收尾：自定义色标表与面板里的选中项。同样是**工具状态**，不进 .comp、
+   * 不进撤销栈——与预设表一样，换图层/存盘不会把它带走。只有「自定义」档
+   * （kGradientPresetCustom）在落笔时读这张表；其余档位仍按预设现展开。
+   */
+  std::vector<comp_ui::GradientPresetStop> gradient_custom_stops;
+  int gradient_stop = 0;        /* 面板里选中的色标下标（0 基） */
+  int gradient_stop_action = 0; /* 增删行的瞬时动作；执行后立刻归零 */
   int shape_kind = comp_ui::kShapeRect;
   double shape_stroke_width = comp_ui::kDefaultShapeStrokeWidth;
   double shape_corner_radius = comp_ui::kDefaultShapeCornerRadius;

@@ -134,14 +134,34 @@ void gradient_end(HWND window, ShellState& shell) {
   desc.gradient.end_y = end.y;
   const uint8_t foreground[4] = {shell.foreground.r, shell.foreground.g, shell.foreground.b, 255};
   /*
-   * P1-7：色标表来自选项栏的预设（只读表，见 ui_core::gradient_preset_stops）。
+   * P1-7：色标表来自选项栏的预设（只读表，见 ui_core::gradient_preset_stops），
+   * 或第 4 档「自定义」——后者读 ShellState 里那张由色标表面板编辑过的表。
    * 预设 0 展开成「前景 -> 透明」两个色标，与 P1-7 之前的两色标结果逐字节一致。
-   * 展开失败（不可能：容量 5 覆盖所有预设）时退回两色标旧路径。
+   * 自定义表在落笔前再校验一次（引擎的参数闸仍是最终权威）；不合法就不提交，
+   * 免得把「表坏了」变成一次错误弹窗或半张渐变。
    */
-  comp_ui::GradientPresetStop preset_stops[5];
-  const int preset_count = comp_ui::gradient_preset_stops(
-      shell.gradient_preset, foreground, reverse, preset_stops, 5);
-  comp_gradient_stop stops[5]{};
+  const int custom_count = static_cast<int>(shell.gradient_custom_stops.size());
+  const bool custom = shell.gradient_preset == comp_ui::kGradientPresetCustom;
+  if (custom && !comp_ui::gradient_stops_valid(shell.gradient_custom_stops.data(), custom_count)) {
+    set_status(shell, L"渐变：自定义色标表不合法（渐变工具 > 色标表 里重新应用）");
+    return;
+  }
+  comp_ui::GradientPresetStop preset_stops[comp_ui::kGradientMaxStops];
+  int preset_count = 0;
+  if (custom) {
+    if (reverse) {
+      preset_count = comp_ui::reverse_gradient_stops_copy(
+          shell.gradient_custom_stops.data(), custom_count, preset_stops,
+          comp_ui::kGradientMaxStops);
+    } else {
+      for (int i = 0; i < custom_count; ++i) preset_stops[i] = shell.gradient_custom_stops[i];
+      preset_count = custom_count;
+    }
+  } else {
+    preset_count = comp_ui::gradient_preset_stops(shell.gradient_preset, foreground, reverse,
+                                                  preset_stops, comp_ui::kGradientMaxStops);
+  }
+  comp_gradient_stop stops[comp_ui::kGradientMaxStops]{};
   if (preset_count >= 2) {
     for (int i = 0; i < preset_count; ++i) {
       stops[i].position = preset_stops[i].position;

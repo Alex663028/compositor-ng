@@ -1071,6 +1071,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
         doc_dialog_begin_input(shell, L'-');
         return;
       }
+      /*
+       * 小数点（色标表的「位置/中点」两行）：输入框只收整数，.5 这种一位小数
+       * 由 doc_dialog_commit_input 拼成 %。其它行 doc_dialog_begin_input 会拒收。
+       */
+      if (key == VK_OEM_PERIOD || key == VK_DECIMAL) {
+        doc_dialog_begin_input(shell, L'.');
+        return;
+      }
       if (key >= '0' && key <= '9') {
         doc_dialog_begin_input(shell, static_cast<wchar_t>(key));
         return;

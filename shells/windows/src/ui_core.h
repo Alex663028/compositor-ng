@@ -1590,12 +1590,15 @@ inline int next_gradient_type(int type) {
 /* ---------------------------------------------------------- 渐变预设（P1-7） */
 
 /*
- * 外壳的多色标来源。引擎支持最多 32 个色标，但外壳只有前景色一个颜色模型，
- * 没有「在渐变条上加/删/拖色标」的编辑器，所以这里给三张**只读预设表**：
- * 让多色标与中点重映射从引擎/ABI 走到真实 UI，而不是只存在于测试里。
- * 更完整的色标编辑器仍是 BACKLOG 里的剩余项。
+ * 外壳的多色标来源。引擎支持最多 32 个色标；外壳给三张**只读预设表**，外加
+ * 第 4 档「自定义」——由 `DocDialogKind::GradientStops` 的数值面板编辑（增删、
+ * 位置、中点、RGBA）。预设表与自定义表共用 `GradientPresetStop` 这一种元素类型，
+ * 落笔时走同一条展开路径（见 shell_tools.cpp 的 gradient_end）。
  */
-inline constexpr int kGradientPresetCount = 3;
+inline constexpr int kGradientPresetCustom = 3;
+inline constexpr int kGradientPresetCount = 4;
+/* 与 ABI 的 COMP_TOOL_GRADIENT_MAX_STOPS 同值；引擎会拒绝超过它的表。 */
+inline constexpr int kGradientMaxStops = 32;
 
 struct GradientPresetStop {
   double position = 0.0;
@@ -1608,13 +1611,15 @@ inline const char* gradient_preset_name(int preset) {
     case 0: return "前景→透明";
     case 1: return "黑→白";
     case 2: return "彩虹";
+    case kGradientPresetCustom: return "自定义";
     default: return "?";
   }
 }
 
-/* 预设 0 用前景色，其余预设是固定色标表（与前景色无关）。 */
+/* 预设 0 用前景色，其余预设是固定色标表（与前景色无关）；自定义没有内置表。 */
 inline int gradient_preset_stop_count(int preset, int* out_is_foreground) {
   if (out_is_foreground != nullptr) *out_is_foreground = preset == 0 ? 1 : 0;
+  if (preset == kGradientPresetCustom) return 0;
   return preset == 2 ? 5 : 2;
 }
 
@@ -1627,6 +1632,8 @@ inline int gradient_preset_stop_count(int preset, int* out_is_foreground) {
 inline int gradient_preset_stops(int preset, const uint8_t foreground[4], bool reverse,
                                  GradientPresetStop* out, int capacity) {
   if (out == nullptr) return 0;
+  /* 自定义表不是预设：调用方必须走自己的色标数组（见 kGradientPresetCustom）。 */
+  if (preset < 0 || preset > 2) return 0;
   const uint8_t black[4] = {0, 0, 0, 255};
   const uint8_t white[4] = {255, 255, 255, 255};
   const uint8_t red[4] = {255, 0, 0, 255};
@@ -1681,6 +1688,147 @@ inline int gradient_preset_stops(int preset, const uint8_t foreground[4], bool r
     for (int c = 0; c < 4; ++c) target.color[c] = source.color[c];
   }
   return count;
+}
+
+/* ------------------------------------------------------ 可编辑色标表（P1-7） */
+
+/*
+ * 色标位置在面板里按**千分位整数（‰）**编辑，显示成「50.0%」。
+ * 为什么不用整数百分比：1% 在 1280 px 画布上是 12.8 px，定位太粗；千分位是
+ * PS 的 0.1% 档，足够精确，又不必让整数输入框学会浮点。
+ */
+inline int gradient_position_permille(double position) {
+  if (!std::isfinite(position)) return 0;
+  long value = std::lround(position * 1000.0);
+  if (value < 0) value = 0;
+  if (value > 1000) value = 1000;
+  return static_cast<int>(value);
+}
+
+/*
+ * 翻转一张任意色标表（2..32 个）。与 gradient_preset_stops 的 reverse 分支同一
+ * 语义：位置取 1 - p，反向段 (i, i+1) 的中点取原段左端的中点，末色标的中点没有
+ * 下一段，写回 0.5。表先整体拷进栈上副本再写出，允许 src == out。
+ */
+inline int reverse_gradient_stops_copy(const GradientPresetStop* src, int count,
+                                       GradientPresetStop* out, int capacity) {
+  if (src == nullptr || out == nullptr) return 0;
+  if (count < 0 || count > kGradientMaxStops || count > capacity) return 0;
+  GradientPresetStop table[kGradientMaxStops];
+  for (int i = 0; i < count; ++i) table[i] = src[i];
+  for (int i = 0; i < count; ++i) {
+    const GradientPresetStop& source = table[count - 1 - i];
+    GradientPresetStop& target = out[i];
+    target.position = 1.0 - source.position;
+    target.midpoint = i + 1 < count ? 1.0 - table[count - 2 - i].midpoint : 0.5;
+    for (int c = 0; c < 4; ++c) target.color[c] = source.color[c];
+  }
+  return count;
+}
+
+/*
+ * 第 index 个色标的可编辑位置区间（‰，闭区间）。首末色标钉在 0 / 1000：
+ * 引擎允许端点内缩，但面板若也允许，用户会把渐变拖成「左边一段纯色」——
+ * 那在画布上看起来像没生效。中间色标与邻居至少隔 1‰，保证严格升序。
+ */
+inline void gradient_stop_position_bounds_permille(const GradientPresetStop* stops, int count,
+                                                   int index, int* out_min, int* out_max) {
+  int low = 0;
+  int high = 1000;
+  if (stops != nullptr && count >= 2 && index >= 0 && index < count) {
+    if (index == 0) {
+      high = 0;
+    } else if (index == count - 1) {
+      low = 1000;
+    } else {
+      low = gradient_position_permille(stops[index - 1].position) + 1;
+      high = gradient_position_permille(stops[index + 1].position) - 1;
+    }
+  }
+  if (low > high) low = high;
+  if (out_min != nullptr) *out_min = low;
+  if (out_max != nullptr) *out_max = high;
+}
+
+inline void gradient_set_stop_position_permille(GradientPresetStop* stops, int count, int index,
+                                                int permille) {
+  if (stops == nullptr || count < 2 || index < 0 || index >= count) return;
+  int low = 0;
+  int high = 1000;
+  gradient_stop_position_bounds_permille(stops, count, index, &low, &high);
+  if (permille < low) permille = low;
+  if (permille > high) permille = high;
+  stops[index].position = permille / 1000.0;
+}
+
+/* 中点只属于本段，与邻居无关；引擎要求严格落在 (0,1)，所以夹到 1..999。 */
+inline void gradient_set_stop_midpoint_permille(GradientPresetStop* stops, int count, int index,
+                                                int permille) {
+  if (stops == nullptr || count <= 0 || index < 0 || index >= count) return;
+  if (permille < 1) permille = 1;
+  if (permille > 999) permille = 999;
+  stops[index].midpoint = permille / 1000.0;
+}
+
+/*
+ * 在第 selected 个色标旁边插入一个色标，位置取相邻两色标的中点，颜色复制左端
+ * 那个。selected 是末色标时用左侧那段（保证插进去的位置仍在它左边、表仍升序）。
+ * 返回新表长度；表满 32、位置退化或参数越界时不改表，返回 0。
+ */
+inline int gradient_insert_stop(GradientPresetStop* stops, int count, int selected) {
+  if (stops == nullptr || count < 2 || count >= kGradientMaxStops) return 0;
+  if (selected < 0 || selected >= count) return 0;
+  const int segment = selected < count - 1 ? selected : count - 2;
+  const double left = stops[segment].position;
+  const double right = stops[segment + 1].position;
+  const double position = (left + right) * 0.5;
+  if (!(position > left && position < right)) return 0;
+  for (int i = count; i > segment + 1; --i) stops[i] = stops[i - 1];
+  GradientPresetStop& added = stops[segment + 1];
+  added.position = position;
+  added.midpoint = 0.5;
+  for (int c = 0; c < 4; ++c) added.color[c] = stops[segment].color[c];
+  return count + 1;
+}
+
+/*
+ * 删除第 selected 个色标。首末固定在 0% / 100%，不能删；少于 3 个时也没有
+ * 可删的中间项（引擎至少要 2 个色标）。返回新表长度，未改动返回 0。
+ */
+inline int gradient_delete_stop(GradientPresetStop* stops, int count, int selected) {
+  if (stops == nullptr || count <= 2) return 0;
+  if (selected <= 0 || selected >= count - 1) return 0;
+  for (int i = selected; i + 1 < count; ++i) stops[i] = stops[i + 1];
+  return count - 1;
+}
+
+/*
+ * 落笔前的整表校验，逐条对齐引擎的参数闸（tool_ops.cpp）：
+ *   2..32 个、位置在 0..1 且严格升序、中点严格在 (0,1)、至少一个色标不透明。
+ * 外壳先拦一次，是为了把「引擎返回 -2」翻译成面板里能看懂的一句话；这不是
+ * 重复校验——引擎那一份仍是唯一权威，外壳只是提前给出可操作的原因。
+ */
+inline bool gradient_stops_valid(const GradientPresetStop* stops, int count) {
+  if (stops == nullptr || count < 2 || count > kGradientMaxStops) return false;
+  if (!std::isfinite(stops[0].position) || stops[0].position < 0.0 ||
+      stops[0].position > 1.0) {
+    return false;
+  }
+  bool any_visible = false;
+  double previous = -1.0;
+  for (int i = 0; i < count; ++i) {
+    const GradientPresetStop& stop = stops[i];
+    if (!std::isfinite(stop.position) || stop.position < 0.0 || stop.position > 1.0) {
+      return false;
+    }
+    if (stop.position <= previous) return false;
+    if (!std::isfinite(stop.midpoint) || stop.midpoint <= 0.0 || stop.midpoint >= 1.0) {
+      return false;
+    }
+    previous = stop.position;
+    if (stop.color[3] != 0) any_visible = true;
+  }
+  return any_visible;
 }
 
 /*
@@ -2532,8 +2680,9 @@ enum class ToolOptionId : int {
   WandTolerance,
   SelectionFeather,
   GradientType,
-  GradientPreset, /* P1-7：多色标预设（只读表） */
+  GradientPreset, /* P1-7：多色标预设（只读表）+ 第 4 档「自定义」 */
   GradientDither, /* P1-7：确定性抖动开关，压 8 位渐变带 */
+  GradientEdit,   /* P1-7：点开可编辑色标表（右栏面板，不是值） */
   ShapeKind,
   ShapeStrokeWidth,
   CloneSample, /* 0 = 当前图层，1 = 整篇合成 */
@@ -2646,6 +2795,15 @@ inline ToolOptionSpec tool_option(ToolId tool, int index) {
         return ToolOptionSpec{ToolOptionId::GradientDither, "抖动", ToolOptionKind::Choice, 0, 1, 1,
                               2};
       }
+      if (index == 3) {
+        /*
+         * 点一下打开色标表面板；值文本只做提示，不显示状态（表在右栏里）。
+         * 包成 Stepper 而不是 Choice：它不是枚举值，Choice 的两项下限也套不上；
+         * 左右箭头都落到同一个「打开」动作上，delta 被忽略。
+         */
+        return ToolOptionSpec{ToolOptionId::GradientEdit, "色标表", ToolOptionKind::Stepper, 0, 0, 1,
+                              0};
+      }
       break;
     case ToolId::Shape:
       if (index == 0) {
@@ -2699,7 +2857,7 @@ inline int tool_option_count(ToolId tool) {
     case ToolId::Wand:
       return 2;
     case ToolId::Gradient:
-      return 3; /* 类型 + 色标预设 + 抖动 */
+      return 4; /* 类型 + 色标预设 + 抖动 + 色标表 */
     case ToolId::Shape:
       return 2; /* 形状 + 线宽 */
     case ToolId::Type:
@@ -5129,8 +5287,22 @@ enum class DocDialogKind {
    *
    * 组与空图层没有可变换像素：打开即拒绝并说明原因，不画一个改了也没用的面板。
    */
-  TransformLayer
+  TransformLayer,
+  /*
+   * P1-7 收尾：可编辑色标表。引擎早就收 32 个色标 + 每段中点，外壳却只有三张
+   * 只读预设——「把彩虹的绿往左挪一点」在 UI 里没有入口。这里用同一套行模型
+   * 补一张**数值色标表**（选中 / 位置 / 中点 / RGB / 不透明度 / 增删），回车把
+   * 整表写进渐变工具的「自定义」档；零 ABI 新增，落笔仍走 comp_tool_apply 的
+   * `gradient_stops` 尾部字段。
+   *
+   * 刻意不做拖拽手柄：右栏只有两百多像素，拖拽精度不如 0.1% 的数值输入，而且
+   * 会与现有「面板内按下 = 点行」的命中规则打架。数值表是等价能力的更稳实现。
+   */
+  GradientStops
 };
+
+/* 可编辑色标面板的固定行序（下标是对外契约：测试与 visual_check 都按下标点）。 */
+inline constexpr int kGradientStopsRowCount = 8;
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
 
@@ -5242,6 +5414,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "变换选区（Transform Selection）";
     case DocDialogKind::TransformLayer:
       return "数值变换（Transform）";
+    case DocDialogKind::GradientStops:
+      return "可编辑色标（Gradient Stops）";
     default:
       return "";
   }
@@ -5265,6 +5439,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "中心固定为当前选区中心 · 角度顺时针为正";
     case DocDialogKind::TransformLayer:
       return "作用于选中图层 · 中心锚定 · Ctrl+Shift+T 再次变换";
+    case DocDialogKind::GradientStops:
+      return "改完回车应用为「自定义」色标表 · 首末固定在 0% / 100%";
     default:
       return "";
   }
@@ -5288,6 +5464,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
     case DocDialogKind::TransformLayer:
       return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
+    case DocDialogKind::GradientStops:
+      return "位置/中点按 % 值输入（可带 .5）· ←/→ = 5‰";
     default:
       return "";
   }
@@ -5311,6 +5489,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
       return 3; /* 宽 / 高 / 角度 */
     case DocDialogKind::TransformLayer:
       return 3; /* 宽 / 高 / 角度 */
+    case DocDialogKind::GradientStops:
+      return kGradientStopsRowCount;
     default:
       return 0;
   }
@@ -5400,6 +5580,25 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
         case 2:
           return DocRowSpec{"角度 (°)", DocRowKind::Number, kTransformAngleMin,
                             kTransformAngleMax, kTransformAngleStep, 0};
+        default: break;
+      }
+      break;
+    case DocDialogKind::GradientStops:
+      /*
+       * 顺序：选中的色标 / 位置 / 中点 / R G B / 不透明度 / 增删。
+       * 位置与中点按千分位存，输入框收百分数（可带一位小数），显示成 50.0%；
+       * ←/→ 一次走 5‰（= 0.5%），与 PS 的色标微调档同量级。
+       */
+      switch (row) {
+        case 0:
+          return DocRowSpec{"色标 (#)", DocRowKind::Number, 1, kGradientMaxStops, 1, 0};
+        case 1: return DocRowSpec{"位置 (%)", DocRowKind::Number, 0, 1000, 5, 0};
+        case 2: return DocRowSpec{"中点 (%)", DocRowKind::Number, 1, 999, 5, 0};
+        case 3: return DocRowSpec{"R", DocRowKind::Number, 0, 255, 1, 0};
+        case 4: return DocRowSpec{"G", DocRowKind::Number, 0, 255, 1, 0};
+        case 5: return DocRowSpec{"B", DocRowKind::Number, 0, 255, 1, 0};
+        case 6: return DocRowSpec{"不透明度 (%)", DocRowKind::Number, 0, 100, 1, 0};
+        case 7: return DocRowSpec{"增删", DocRowKind::Choice, 0, 2, 1, 3};
         default: break;
       }
       break;

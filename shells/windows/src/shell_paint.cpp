@@ -353,6 +353,15 @@ std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptio
       return widen_ascii(comp_ui::gradient_preset_name(shell.gradient_preset));
     case comp_ui::ToolOptionId::GradientDither:
       return shell.gradient_dither ? L"开" : L"关";
+    case comp_ui::ToolOptionId::GradientEdit: {
+      /* 只显示入口，当前选中第几个色标在面板标题里说。 */
+      const int count = static_cast<int>(shell.gradient_custom_stops.size());
+      if (shell.gradient_preset == comp_ui::kGradientPresetCustom && count >= 2) {
+        wsprintfW(buffer, L"编辑 %d…", count);
+        return buffer;
+      }
+      return L"编辑…";
+    }
     case comp_ui::ToolOptionId::ShapeKind:
       return widen_ascii(comp_ui::shape_kind_name(shell.shape_kind));
     case comp_ui::ToolOptionId::ShapeStrokeWidth:
@@ -438,12 +447,36 @@ bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
       shell.gradient_type =
           comp_ui::option_cycle_choice(shell.gradient_type, comp_ui::kGradientTypeCount, delta);
       break;
-    case comp_ui::ToolOptionId::GradientPreset:
+    case comp_ui::ToolOptionId::GradientPreset: {
+      const int previous = shell.gradient_preset;
       shell.gradient_preset =
           comp_ui::option_cycle_choice(shell.gradient_preset, comp_ui::kGradientPresetCount, delta);
+      /*
+       * 切到「自定义」时，如果手里还没有一张合法的自定义表（首次进来，或表被
+       * 编辑坏了），就拿**刚离开的那一档**预设现展开一份当起点。这样“从某个预设
+       * 改一改”是自然路径，也不会出现「选了自定义但落笔报错」的空档。
+       */
+      if (shell.gradient_preset == comp_ui::kGradientPresetCustom) {
+        comp_ui::GradientPresetStop table[comp_ui::kGradientMaxStops];
+        const int count = static_cast<int>(shell.gradient_custom_stops.size());
+        if (!comp_ui::gradient_stops_valid(shell.gradient_custom_stops.data(), count)) {
+          const uint8_t foreground[4] = {shell.foreground.r, shell.foreground.g,
+                                         shell.foreground.b, 255};
+          int source = previous < 0 ? 0 : previous;
+          if (source >= comp_ui::kGradientPresetCustom) source = 0;
+          const int expanded = comp_ui::gradient_preset_stops(source, foreground, false, table,
+                                                              comp_ui::kGradientMaxStops);
+          if (expanded >= 2) shell.gradient_custom_stops.assign(table, table + expanded);
+          shell.gradient_stop = 0;
+        }
+      }
       break;
+    }
     case comp_ui::ToolOptionId::GradientDither:
       shell.gradient_dither = !shell.gradient_dither;
+      break;
+    case comp_ui::ToolOptionId::GradientEdit:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::GradientStops);
       break;
     case comp_ui::ToolOptionId::ShapeKind:
       shell.shape_kind =
