@@ -187,6 +187,27 @@ void sync_menu_state(HWND window, ShellState& shell) {
                                kCmdBlendBase + static_cast<UINT>(comp_ui::kBlendCount) - 1,
                                kCmdBlendBase + static_cast<UINT>(checks.blend));
   }
+  /*
+   * P1-2：锁与颜色标签都是单选组。锁的位组合在 ABI 里合法、菜单只有五档，
+   * 用 panel_lock_menu_flag 归一到「最先命中的位」，与 panel_set_lock 的
+   * 点选口径完全一致（不会出现「勾的不是点下去会生效的那个」）。
+   */
+  if (row != nullptr) {
+    UINT lock_id = kCmdLayerLockNone;
+    switch (panel_lock_menu_flag(row->lock_flags)) {
+      case COMP_LAYER_LOCK_TRANSPARENT: lock_id = kCmdLayerLockTransparent; break;
+      case COMP_LAYER_LOCK_PIXELS: lock_id = kCmdLayerLockPixels; break;
+      case COMP_LAYER_LOCK_POSITION: lock_id = kCmdLayerLockPosition; break;
+      case COMP_LAYER_LOCK_ALL: lock_id = kCmdLayerLockAll; break;
+      default: break;
+    }
+    menu_radio_check_recursive(menu, kCmdLayerLockNone, kCmdLayerLockAll, lock_id);
+    const uint32_t label =
+        row->color_label < COMP_LAYER_COLOR_COUNT ? row->color_label : COMP_LAYER_COLOR_NONE;
+    menu_radio_check_recursive(menu, kCmdLayerColorBase,
+                               kCmdLayerColorBase + COMP_LAYER_COLOR_COUNT - 1,
+                               kCmdLayerColorBase + label);
+  }
   /* 效果项：kEffectKindCount 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
     const bool present =
@@ -252,6 +273,13 @@ void sync_menu_state(HWND window, ShellState& shell) {
   for (int mode = 0; mode < comp_ui::kSamplingCount; ++mode) {
     menu_set_enabled_recursive(menu, kCmdSamplingBase + static_cast<UINT>(mode),
                                enabled.layer_present);
+  }
+  /* P1-2：锁与颜色标签同属「有选中图层才可点」，与混合/采样同一把闸。 */
+  for (UINT id = kCmdLayerLockNone; id <= kCmdLayerLockAll; ++id) {
+    menu_set_enabled_recursive(menu, id, enabled.layer_present);
+  }
+  for (uint32_t label = 0; label < COMP_LAYER_COLOR_COUNT; ++label) {
+    menu_set_enabled_recursive(menu, kCmdLayerColorBase + label, enabled.layer_present);
   }
   menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
@@ -4148,6 +4176,33 @@ HMENU build_menu() {
     AppendMenuW(sampling_menu, MF_STRING, kCmdSamplingBase + static_cast<UINT>(mode), label);
   }
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sampling_menu), L"采样模式(&Q)");
+  /*
+   * P1-2 锁定子菜单：五档单选（无 / 透明像素 / 图像像素 / 位置 / 全部）。
+   * 引擎的锁位在 ABI 里可组合，但菜单只暴露 PS 那五种单值——组合态只可能来自
+   * 别的 ABI 调用方或 .comp，面板按最先命中的位显示，点一次即归一。
+   * 「无」单列一项，菜单里没有任何「不勾」的状态。
+   */
+  static const wchar_t* const kLockTexts[] = {L"无(&N)", L"透明像素(&T)", L"图像像素(&P)",
+                                              L"位置(&S)", L"全部(&A)"};
+  static const uint32_t kLockFlags[] = {COMP_LAYER_LOCK_NONE, COMP_LAYER_LOCK_TRANSPARENT,
+                                        COMP_LAYER_LOCK_PIXELS, COMP_LAYER_LOCK_POSITION,
+                                        COMP_LAYER_LOCK_ALL};
+  HMENU lock_menu = CreatePopupMenu();
+  for (size_t i = 0; i < sizeof(kLockFlags) / sizeof(kLockFlags[0]); ++i) {
+    AppendMenuW(lock_menu, MF_STRING, kCmdLayerLockNone + static_cast<UINT>(i), kLockTexts[i]);
+  }
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(lock_menu), L"锁定(&Z)");
+  /*
+   * P1-2 颜色标签子菜单：id = kCmdLayerColorBase + label（0 = 无，1..7 与 PS 色板同序）。
+   * 纯元数据，只驱动面板行配色；不参与合成，也不推进缓存。
+   */
+  static const wchar_t* const kColorTexts[] = {L"无(&N)", L"红(&R)", L"橙(&O)", L"黄(&Y)",
+                                               L"绿(&G)", L"蓝(&B)", L"紫(&V)", L"灰(&E)"};
+  HMENU color_menu = CreatePopupMenu();
+  for (uint32_t label = 0; label < COMP_LAYER_COLOR_COUNT; ++label) {
+    AppendMenuW(color_menu, MF_STRING, kCmdLayerColorBase + label, kColorTexts[label]);
+  }
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(color_menu), L"颜色标签(&J)");
   AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_menu), L"图层(&L)");
 
   /*

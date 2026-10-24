@@ -276,6 +276,24 @@ constexpr UINT kCmdViewClearGuides = 1584; /* 视图 > 清除参考线 */
  */
 constexpr UINT kCmdSelectChannels = 1585;    /* 选择 > 通道面板… */
 constexpr UINT kCmdSelectSaveChannel = 1586; /* 选择 > 存储选区到通道… */
+/*
+ * P1-2 命令号（1660 段）：图层锁与颜色标签。**不能落在 1590..1653**——
+ * 那是 kCmdImageAdjustBase + kind 的号段（kind 是 COMP_ADJUSTMENT_* 枚举值，
+ * 已用到 24，即 1590..1614），早先按「1600 空段」发号时 1610..1614 正好压住
+ * Color Lookup / Shadows-Highlights / 自动色调 / 自动对比度 / 自动颜色五项，
+ * 菜单点下去变成给图层上锁（视觉探针 Auto Tone 一条当场报红）。1660 起
+ * 在 64 宽宽容区间（1590..1653）之外，也不会被它的无条件 break 吞掉。
+ *
+ * 锁定用 5 个独立 id 而不是 kCmdLayerLockBase + 位号：菜单是 radio 组，
+ * 「无」不是位组合能表达的槽位，混在一个基址里会让 0 号位与「透明」撞车。
+ * 颜色标签用基址 + 序号（0..7）。
+ */
+constexpr UINT kCmdLayerLockNone = 1660;        /* 图层 > 锁定 > 无 */
+constexpr UINT kCmdLayerLockTransparent = 1661; /* 图层 > 锁定 > 透明像素 */
+constexpr UINT kCmdLayerLockPixels = 1662;      /* 图层 > 锁定 > 图像像素 */
+constexpr UINT kCmdLayerLockPosition = 1663;    /* 图层 > 锁定 > 位置 */
+constexpr UINT kCmdLayerLockAll = 1664;         /* 图层 > 锁定 > 全部 */
+constexpr UINT kCmdLayerColorBase = 1665;       /* 图层 > 颜色标签 > 无/红/橙/黄/绿/蓝/紫/灰 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -304,6 +322,15 @@ struct LayerRow {
   uint8_t is_group = 0;        /* 图层组 */
   uint8_t isolated = 0;        /* 组隔离开关；非组恒 0 */
   int32_t sampling = 0;        /* comp_sampling，0..2 */
+  /*
+   * P1-2：图层锁与颜色标签。两者同属「引擎已持久化、面板应该看得见」的属性：
+   *   - lock_flags 决定菜单标勾与行内标记（L/T/P/G），也是引擎拒绝写入口的依据；
+   *   - color_label 只影响面板配色（PS 同款），不参与合成。
+   * 依旧是只读快照——写路径一律回到 comp_layer_set_lock / set_color_label，
+   * 撤销、合并与 .comp 读回都不会让面板与文档漂移。
+   */
+  uint32_t lock_flags = 0;  /* comp_layer_lock 位组合 */
+  uint32_t color_label = 0; /* comp_layer_color_label，0 = 无 */
   /*
    * S23：父级 id（0 = 根级）。剪贴基底必须与自身**同父**才算合法——引擎
    * filter_graph 只把同一 siblings 序列里紧跟基底的那串成员收进剪贴栈。S22 只按

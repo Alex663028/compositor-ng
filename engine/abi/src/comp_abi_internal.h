@@ -14,6 +14,7 @@
 
 #include "compositor/comp_core.h"
 #include "compositor/comp_engine.h"
+#include "compositor/comp_layer.h" /* comp_layer_lock（P1-2 第一批的锁位） */
 #include "domain/document.h"
 #include "engine.h"
 
@@ -41,6 +42,30 @@ comp_result fail(Engine* engine, comp_result code, const std::string& message);
 
 /* 清空引擎最近错误并返回成功。 */
 comp_result ok(Engine* engine);
+
+/* ------------------------------------------------ 图层锁的写入口闸（P1-2 第一批）
+ *
+ * 锁是**宿主输入的闸**，不是合成参数：合成、缩略图、合并、拼合、撤销/重做、
+ * 读盘一律不看锁（见 domain/layer.h 的 Layer::lock_flags 注释）。闸只放在
+ * ABI 写入口，且必须在任何副作用（开事务、改像素、改几何）之前。
+ *
+ * 位 8（LOCK_ALL）是前三位的快捷方式：置位时透明/图像/位置全部视为锁定。
+ * 所以判定是 `flags & (bit | LOCK_ALL)`，而不是 `flags & bit`。
+ */
+inline bool lock_has(uint32_t flags, comp_layer_lock bit) {
+  return (flags & (static_cast<uint32_t>(bit) | static_cast<uint32_t>(COMP_LAYER_LOCK_ALL))) != 0u;
+}
+
+/* 返回 COMP_OK 表示放行；否则错误已写进引擎（COMP_ERR_STATE + 可读原因）。
+ * action 是给宿主看的动作名（"paint"、"move"），会拼进 last_error。 */
+inline comp_result lock_gate(Engine* engine, const Layer* layer, comp_layer_lock bit,
+                             const char* action) {
+  if (!lock_has(layer->lock_flags, bit)) return COMP_OK;
+  std::string message = "layer is locked (";
+  message += action;
+  message += ")";
+  return fail(engine, COMP_ERR_STATE, message);
+}
 
 /*
  * ABI 入口异常护栏（P1-1）。

@@ -734,6 +734,16 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
     return bad_state("layer is an editable text layer; rasterize it before running pixel tools");
   }
   if (!layer->has_pixels()) return bad_state("layer has no pixels");
+  /*
+   * 锁定透明像素（P1-2 第一批）：只在 RGBA8 上做 alpha 还原。16 位/HDR 的
+   * alpha 要按各自编码缩放（half 不能当整数乘），第一批如实拒绝而不是放过——
+   * 静默不锁比报错更危险。
+   */
+  const bool transparent_lock = params.lock_transparent != 0;
+  if (transparent_lock && layer->pixels.format != COMP_PIXEL_RGBA8) {
+    return bad_state(
+        "transparency lock is only enforced on RGBA8 layers in this build; use the image lock");
+  }
 
   const size_t width = static_cast<size_t>(layer->pixels.width);
   const size_t height = static_cast<size_t>(layer->pixels.height);
@@ -1277,6 +1287,14 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
     if (owns_txn) document->txn_abort(&txn_error);
     return fail(COMP_ERR_NOT_FOUND, "layer vanished after the parameter gate");
   }
+
+  /*
+   * 锁定透明像素：抓一份写入前的像素。ImageBuffer 的像素由 shared_ptr 共享，
+   * 写路径第一次 writable_pixels() 才 COW，所以这份快照**不复制**画布级缓冲
+   * （只在解锁透明像素时才会走到这里）。见 restore_transparent_lock。
+   */
+  ImageBuffer lock_before;
+  if (transparent_lock) lock_before = target_layer->pixels;
 
   /*
    * 落笔族在 16 位 / HDR 上保留深度（DeepPaintCopy）：先把原始深像素收好，
@@ -2452,6 +2470,27 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       return false;
     }
     target_layer->pixels = std::move(deep_paint.deep);
+  }
+  /*
+   * 锁定透明像素的还原必须落在 **touch_layer / commit 之前**：历史 after 快照
+   * 要带着还原后的像素，否则重做会把「透明区被画笔破开」的那一版恢复出来。
+   */
+  if (transparent_lock) {
+    bool changed = false;
+    if (!restore_transparent_lock(lock_before, &target_layer->pixels, &changed)) {
+      if (owns_txn) document->txn_abort(&txn_error);
+      return bad_state("transparency lock could not restore the original alpha");
+    }
+    if (!changed) {
+      /* 笔迹全部落在透明处（或只把已有像素擦成全透明又被还原）：与 noop 同口径，
+       * 整步撤回，撤销栈不增长。 */
+      if (note != nullptr) {
+        *note += "transparency is locked: no pixel kept a visible change; ";
+      }
+      if (owns_txn) document->txn_abort(&txn_error);
+      if (out_code != nullptr) *out_code = COMP_OK;
+      return true;
+    }
   }
   /* S18：像素真的被改过（noop 已在上面整步撤回）→ 换号；**在 commit 之前**。 */
   document->touch_layer(target);

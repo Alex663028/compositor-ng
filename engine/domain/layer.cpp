@@ -108,6 +108,65 @@ bool hdr_to_rgba8(const ImageBuffer& src, ImageBuffer* dst) {
   return true;
 }
 
+/*
+ * 锁定透明像素的还原口径（P1-2 第一批，见 Layer::lock_flags）。
+ *
+ * 绘画类内核是「整幅 8 位就地写」，没有逐笔的 alpha 栅栏；锁的语义在事后统一
+ * 落一遍，比让 20 个算子各自记得保住 alpha 更可靠：
+ *   1. 原 alpha 为 0 的像素：整份还原（落在透明处的笔迹被丢弃）；
+ *   2. 落笔把像素抹成全透明的：整份还原（锁透明时橡皮/擦除不生效）；
+ *   3. 其余像素：alpha 还原成原值，新 RGB 按 old_alpha / new_alpha 重新预乘
+ *      （缓冲区是**预乘** RGBA8，直接留 new RGB 会得到比 alpha 还亮的「过曝」
+ *      预乘值，过 extract/restore 或非 normal 混合时颜色整体偏亮）。
+ *
+ * `out_changed` 回传「最终像素是否与 before 有任何字节不同」——全部被还原时
+ * 调用方应整步撤回事务，不留空撤销步。
+ *
+ * 只支持 RGBA8：16 位/HDR 的 alpha 还原要按各自编码缩放（half 不能当整数乘），
+ * 那是后续批次的事；尺寸/格式不符返回 false（调用方应中止，而不是留下半成品）。
+ */
+bool restore_transparent_lock(const ImageBuffer& before, ImageBuffer* after, bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (after == nullptr) return false;
+  if (before.format != COMP_PIXEL_RGBA8 || after->format != COMP_PIXEL_RGBA8) return false;
+  if (before.width != after->width || before.height != after->height) return false;
+  if (before.empty() || after->empty()) return false;
+  /* 仍是同一份缓冲 = 期间一次 writable_pixels() 都没调过（没有任何写入），
+   * 没有可还原的东西，也避免读写同一块内存。 */
+  if (before.pixels == after->pixels) return true;
+
+  bool changed = false;
+  for (int32_t y = 0; y < after->height; ++y) {
+    const uint8_t* source = before.row(y);
+    uint8_t* target = after->writable_row(y);
+    for (int32_t x = 0; x < after->width; ++x) {
+      const size_t offset = static_cast<size_t>(x) * 4u;
+      const uint8_t old_alpha = source[offset + 3u];
+      const uint8_t new_alpha = target[offset + 3u];
+      if (old_alpha == 0u) {
+        /* 全透明处：笔迹丢弃，alpha 与可能的垃圾 RGB 一起还原。 */
+        std::memcpy(target + offset, source + offset, 4u);
+      } else if (new_alpha == 0u) {
+        /* 被抹成全透明：整份还原（锁透明时擦除不该删掉已有像素）。 */
+        std::memcpy(target + offset, source + offset, 4u);
+      } else {
+        if (new_alpha != old_alpha) {
+          for (size_t c = 0; c < 3u; ++c) {
+            const unsigned value = target[offset + c];
+            const unsigned scaled =
+                (value * static_cast<unsigned>(old_alpha) + new_alpha / 2u) / new_alpha;
+            target[offset + c] = static_cast<uint8_t>(scaled > 255u ? 255u : scaled);
+          }
+          target[offset + 3u] = old_alpha;
+        }
+      }
+      if (!changed && std::memcmp(target + offset, source + offset, 4u) != 0) changed = true;
+    }
+  }
+  if (out_changed != nullptr) *out_changed = changed;
+  return true;
+}
+
 bool rgba8_to_hdr(const ImageBuffer& src, ImageBuffer* dst) {
   if (dst == nullptr) return false;
   if (src.format != COMP_PIXEL_RGBA8 || src.empty()) return false;

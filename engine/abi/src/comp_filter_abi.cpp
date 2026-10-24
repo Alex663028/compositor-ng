@@ -111,6 +111,19 @@ comp_result comp_filter_apply(comp_document document_handle, comp_layer_id targe
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "filter desc is null");
   }
   const FilterSettings settings = to_domain(*desc);
+  /*
+   * 图像锁的闸（P1-2）：滤镜整幅改写像素，与画笔同属「图像像素」写入口。
+   * 闸放在领域调用之前——领域层自己开会提交事务，锁在这里拒绝就不会留下
+   * 任何历史步；锁定透明像素（位 1）不拦滤镜，它只约束 alpha 的变化面，
+   * 本轮滤镜不走那条还原路径（见 comp_layer.h 的能力边界）。
+   */
+  const compositor::Layer* target_layer = document->find(target);
+  if (target_layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  const comp_result locked =
+      compositor::abi::lock_gate(engine, target_layer, COMP_LAYER_LOCK_PIXELS, "apply a filter");
+  if (locked != COMP_OK) return locked;
   comp_result code = COMP_ERR_INTERNAL;
   bool changed = false;
   std::string note_text;

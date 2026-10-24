@@ -2065,6 +2065,22 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerFlipVertical:
       panel_toggle_flip(shell, false);
       break;
+    /* ---- P1-2：图层锁（菜单单选组）与颜色标签（基址 + 0..7） ---- */
+    case kCmdLayerLockNone:
+      panel_set_lock(shell, COMP_LAYER_LOCK_NONE);
+      break;
+    case kCmdLayerLockTransparent:
+      panel_set_lock(shell, COMP_LAYER_LOCK_TRANSPARENT);
+      break;
+    case kCmdLayerLockPixels:
+      panel_set_lock(shell, COMP_LAYER_LOCK_PIXELS);
+      break;
+    case kCmdLayerLockPosition:
+      panel_set_lock(shell, COMP_LAYER_LOCK_POSITION);
+      break;
+    case kCmdLayerLockAll:
+      panel_set_lock(shell, COMP_LAYER_LOCK_ALL);
+      break;
     case kCmdEffectClear:
       panel_clear_effects(shell);
       break;
@@ -2123,6 +2139,16 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       PostMessageW(window, WM_CLOSE, 0, 0);
       return;
     default:
+      /*
+       * 颜色标签菜单项（P1-2）：kCmdLayerColorBase + label 0..7，0 = 无。
+       * 号段在 1665..1672，已在图像调整的 64 宽宽容区间（1590..1653）之外；
+       * 仍排在调整之前只是防御性顺序，别把锁/标签挪回 1610 段——那里是
+       * COMP_ADJUSTMENT_* 枚举值 20..24 的号，会与自动三档等菜单项互相顶飞。
+       */
+      if (id >= kCmdLayerColorBase && id < kCmdLayerColorBase + COMP_LAYER_COLOR_COUNT) {
+        panel_set_color_label(shell, static_cast<uint32_t>(id - kCmdLayerColorBase));
+        break;
+      }
       /*
        * ROI #8 图像 > 调整：kCmdImageAdjustBase + kind。菜单只给 kImageAdjustKinds
        * 里的 kind 发号（表在 shell_state.h，与菜单构建共用），其余号一律忽略。

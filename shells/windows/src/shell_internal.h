@@ -231,6 +231,11 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void reset_effect_values(ShellState& shell, bool use_existing);
   void refresh_effects(ShellState& shell);
   void panel_toggle_flip(ShellState& shell, bool horizontal);
+  /* P1-2：图层锁 / 颜色标签。锁的写入口，也是菜单单选组的唯一事实来源。 */
+  void panel_set_lock(ShellState& shell, uint32_t flags);
+  void panel_set_color_label(ShellState& shell, uint32_t label);
+  uint32_t panel_lock_menu_flag(uint32_t flags);
+  const wchar_t* color_label_name(uint32_t label);
   bool layer_has_effect(ShellState& shell, comp_layer_id id, uint32_t kind);
   void panel_toggle_effect_multi(ShellState& shell, int clamped, const wchar_t* label);
   void panel_toggle_effect(ShellState& shell, int kind);

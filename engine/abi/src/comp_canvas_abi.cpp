@@ -111,6 +111,14 @@ comp_result comp_layer_invert(comp_document document, comp_layer_id layer, int32
     return COMP_ERR_INVALID_ARGUMENT;
   }
   COMP_ABI_TRY(engine)
+  /* 图像锁的闸（P1-2）：反相整幅改写图层像素。领域层自己开会提交事务，闸放它前面。 */
+  const compositor::Layer* target_layer = doc->find(layer);
+  if (target_layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  const comp_result locked =
+      compositor::abi::lock_gate(engine, target_layer, COMP_LAYER_LOCK_PIXELS, "invert pixels");
+  if (locked != COMP_OK) return locked;
   int32_t changed = 0;
   std::string error;
   const comp_result code = compositor::invert_layer(doc, layer, &changed, &error);
@@ -135,6 +143,19 @@ comp_result comp_layer_apply_adjustment(comp_document document, comp_layer_id la
    * ABI 只负责把 NULL 视作 "{}"——与 comp_layer_add_adjustment 的入参口径一致。
    */
   const std::string settings = settings_json_utf8 != nullptr ? std::string(settings_json_utf8) : std::string();
+  /*
+   * 图像锁的闸（P1-2）：烘死调整同样整幅改写图层像素。
+   * 注意这只拦「把调整烘进像素」；调整图层上的参数编辑走 add/update_adjustment，
+   * 那几条是 LOCK_ALL 的闸（见 comp_layer_abi.cpp）。
+   */
+  const compositor::Layer* target_layer = doc->find(layer);
+  if (target_layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  const comp_result locked = compositor::abi::lock_gate(engine, target_layer,
+                                                        COMP_LAYER_LOCK_PIXELS,
+                                                        "apply an adjustment");
+  if (locked != COMP_OK) return locked;
   int32_t changed = 0;
   std::string error;
   const comp_result code = compositor::apply_layer_adjustment(doc, layer, kind, settings, &changed, &error);

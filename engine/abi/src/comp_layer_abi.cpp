@@ -110,6 +110,14 @@ bool text_desc_to_object(const comp_text_desc* desc, compositor::TextObject* out
 
 /* TextLayerStatus -> comp_result。参数类错误一律 INVALID_ARGUMENT（与工具算子同一口径），
  * 字体错误按 FontLoadStatus 细分，宿主据此区分「路径错」与「文件不是字体」。 */
+/* ------------------------------------------------ 图层锁 / 颜色标签（P1-2 第一批） */
+
+/* 锁位白名单：未知位一律拒绝，不静默丢弃——宿主写 0x10 若得到「成功」，
+ * 会以为锁上了，而实际什么都没发生。 */
+bool valid_lock_flags(uint32_t flags) { return (flags & ~COMP_LAYER_LOCK_MASK) == 0u; }
+
+bool valid_color_label(uint32_t label) { return label < COMP_LAYER_COLOR_COUNT; }
+
 comp_result text_layer_result(const compositor::TextLayerReport& report) {
   using compositor::TextLayerStatus;
   switch (report.status) {
@@ -206,9 +214,14 @@ comp_result comp_layer_remove(comp_document document, comp_layer_id id) {
     return COMP_ERR_INVALID_ARGUMENT;
   }
   COMP_ABI_TRY(engine)
-  if (doc->find(id) == nullptr) {
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 锁定全部连删除也拦（PS 同口径：全锁的层不能被删）。 */
+  const comp_result locked =
+      compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "delete");
+  if (locked != COMP_OK) return locked;
 
   compositor::abi::ImplicitTxn txn(doc, "Remove Layer");
   if (!doc->remove_layer(id)) {
@@ -264,6 +277,15 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
                                  "layer is an editable text layer; rasterize it first "
                                  "(comp_layer_rasterize_text)");
   }
+  /* 锁定图像像素：整层像素写入是 PIXELS 明令禁止的入口（含「贴一张新像素」）。
+   * 锁定透明像素在这里也拒绝：整份替换无法按原 alpha 裁剪（尺寸/格式都可能变），
+   * 与其静默改掉透明区，不如让宿主先解锁或改用绘画类工具。 */
+  comp_result locked = compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_PIXELS,
+                                                  "whole-layer pixel write");
+  if (locked != COMP_OK) return locked;
+  locked = compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_TRANSPARENT,
+                                      "whole-layer pixel write");
+  if (locked != COMP_OK) return locked;
   /*
    * RGBA8 / RGBA16 / RGBA16F 均接受：RGBA8 走正常合成；RGBA16（预乘、native-endian）
    * 保留 16 位资产，合成侧按它的 8 位副本光栅化（domain/layer.h 的 deep_to_rgba8），
@@ -315,6 +337,11 @@ comp_result comp_layer_set_mask(comp_document document, comp_layer_id id, const 
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 蒙版不是「图像像素」：锁定图像像素/透明像素都不拦蒙版编辑（PS 同口径）。
+   * 锁定全部才拦（否则「全锁」形同虚设）。 */
+  const comp_result locked =
+      compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "edit the layer mask");
+  if (locked != COMP_OK) return locked;
 
   compositor::abi::ImplicitTxn txn(doc, "Set Layer Mask");
   if (mask == nullptr) {
@@ -483,6 +510,13 @@ comp_result comp_layer_set_transform(comp_document document, comp_layer_id id,
   Layer* layer = doc->find(id);
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /* 锁定位置：移动/缩放/旋转/翻转一律拒绝（堆叠次序不算位置，重排仍允许）。
+   * 闸在事务之前，失败的调用不留撤销步。 */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_POSITION, "transform");
+    if (locked != COMP_OK) return locked;
   }
   /* 与 comp_layer_add 同一把尺子：非法 transform 在入口就拒，不让文档进入
    * 「存得进、读得出、渲不了」的死状态。口径见 compositor::is_valid_transform
@@ -739,6 +773,12 @@ comp_result comp_layer_set_flip(comp_document document, comp_layer_id id, int32_
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 翻转是几何变换，归「锁定位置」管（PS 的 Free Transform 在全锁/位置锁下禁用）。 */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_POSITION, "flip");
+    if (locked != COMP_OK) return locked;
+  }
 
   /*
    * 规范化为 0/1：`Layer::flip_x` 是 bool，调用方传 -1 / 2 时若直接隐式转换，
@@ -796,6 +836,12 @@ comp_result comp_layer_add_adjustment(comp_document document, comp_layer_id targ
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 锁定全部的层不接受调整层的增删改（PS 同口径；锁图像像素不拦调整参数）。 */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "add an adjustment");
+    if (locked != COMP_OK) return locked;
+  }
 
   /* kind 与 settings 键名/取值范围都按键名表校验（键名逐字对齐上游 LayerAdjustment）。 */
   const char* settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
@@ -830,6 +876,11 @@ comp_result comp_layer_update_adjustment(comp_document document, comp_layer_id i
   if (layer->adjustments.empty()) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer has no adjustment");
   }
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "update the adjustment");
+    if (locked != COMP_OK) return locked;
+  }
 
   /* 沿用既有 kind，只换 settings（校验同 add）。 */
   const char* settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
@@ -862,6 +913,11 @@ comp_result comp_layer_update_adjustment_at(comp_document document, comp_layer_i
   if (index >= layer->adjustments.size()) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "adjustment index out of range");
   }
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "update the adjustment");
+    if (locked != COMP_OK) return locked;
+  }
 
   const char* settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
   std::string settings_error;
@@ -891,6 +947,11 @@ comp_result comp_layer_remove_adjustment(comp_document document, comp_layer_id i
   }
   if (index >= layer->adjustments.size()) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "adjustment index out of range");
+  }
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "remove the adjustment");
+    if (locked != COMP_OK) return locked;
   }
 
   compositor::abi::ImplicitTxn txn(doc, "Remove Adjustment");
@@ -1060,6 +1121,12 @@ comp_result comp_layer_set_effect(comp_document document, comp_layer_id id, uint
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 锁定全部：图层样式的增改拦掉（锁图像像素不拦样式参数）。 */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "change a layer style");
+    if (locked != COMP_OK) return locked;
+  }
 
   compositor::abi::ImplicitTxn txn(doc, "Set Layer Effect");
   const std::string settings = settings_json_utf8 != nullptr ? settings_json_utf8 : "{}";
@@ -1093,6 +1160,12 @@ comp_result comp_layer_remove_effect(comp_document document, comp_layer_id id, u
   Layer* layer = doc->find(id);
   if (layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "remove a layer style");
+    if (locked != COMP_OK) return locked;
   }
 
   compositor::abi::ImplicitTxn txn(doc, "Remove Layer Effect");
@@ -1318,9 +1391,14 @@ comp_result comp_layer_merge_down(comp_document document, comp_layer_id id) {
     return COMP_ERR_INVALID_ARGUMENT;
   }
   COMP_ABI_TRY(engine)
-  if (doc->find(id) == nullptr) {
+  const Layer* merge_layer = doc->find(id);
+  if (merge_layer == nullptr) {
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
+  /* 锁定全部连向下合并也拦（PS 同口径）：合并会把这一层并进下一层，属于「删改」。 */
+  const comp_result merge_locked =
+      compositor::abi::lock_gate(engine, merge_layer, COMP_LAYER_LOCK_ALL, "merge down");
+  if (merge_locked != COMP_OK) return merge_locked;
   /*
    * 不包 ImplicitTxn：域方法自行管理事务（加入调用方显式事务，或自开自提交），
    * 再包一层会双记历史。失败路径上域方法尚未改动任何状态（先算后改）。
@@ -1381,6 +1459,19 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
   /*
+   * 工具落墨的锁闸：
+   *   - 魔棒/色彩范围只写**蒙版**，归「锁定全部」管（PS 的图像锁不拦蒙版编辑）；
+   *   - 其余算子都改图层像素，归「锁定图像像素」；
+   *   - 锁定透明像素不在这里拒绝：绘画类算子由域层做 alpha 保真
+   *     （ToolOpParams::lock_transparent），锁定本身仍允许落笔。
+   */
+  const bool mask_only = desc->kind == COMP_TOOL_SELECT;
+  const comp_result tool_locked = compositor::abi::lock_gate(
+      engine, target_layer,
+      mask_only ? COMP_LAYER_LOCK_ALL : COMP_LAYER_LOCK_PIXELS,
+      mask_only ? "edit the layer mask" : "paint");
+  if (tool_locked != COMP_OK) return tool_locked;
+  /*
    * Heal 的行数闸（`heal_coverage_rows` 尾部追加，0 = 旧宿主按图层高信任）。
    *
    * 域层的 heal 闸只校验 stride：它拿不到宿主缓冲到底有多少行，而执行时按
@@ -1399,6 +1490,14 @@ comp_result comp_tool_apply(comp_document document, comp_layer_id target,
    */
   ToolOpParams params;
   params.kind = static_cast<compositor::ToolOpKind>(desc->kind);
+  /*
+   * 锁定透明像素只对**绘画类**算子有意义：SELECT 写蒙版、DEEP 换像素格式
+   * （alpha 语义随之改变），两者都不参与「保住原 alpha」的还原。
+   */
+  if (!mask_only && desc->kind != COMP_TOOL_DEEP &&
+      compositor::abi::lock_has(target_layer->lock_flags, COMP_LAYER_LOCK_TRANSPARENT)) {
+    params.lock_transparent = 1;
+  }
   params.use_color_range = desc->select.use_color_range;
   params.seed_x = desc->select.seed_x;
   params.seed_y = desc->select.seed_y;
@@ -1952,6 +2051,13 @@ comp_result comp_layer_set_text(comp_document document, comp_layer_id id,
         engine, COMP_ERR_STATE,
         "layer is not a text layer (use comp_layer_add_text to create one)");
   }
+  /* 改文本 = 重排版 = 重写整层像素缓存：归「锁定图像像素」管。
+   * （锁定全部经 lock_has 的蕴含规则同样命中。） */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_PIXELS, "edit the text");
+    if (locked != COMP_OK) return locked;
+  }
   compositor::TextObject object;
   std::string error;
   if (!text_desc_to_object(desc, &object, &error)) {
@@ -2048,10 +2154,106 @@ comp_result comp_layer_rasterize_text(comp_document document, comp_layer_id id) 
   }
   /* 幂等：普通图层已经是栅格，什么也不做、不记撤销步（宿主不必先判断类型）。 */
   if (!layer->has_text()) return compositor::abi::ok(engine);
+  /* 栅格化会丢掉文字对象（不可逆的可编辑性损失）：锁定全部连这一步也拦。 */
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "rasterize the text");
+    if (locked != COMP_OK) return locked;
+  }
   compositor::abi::ImplicitTxn txn(doc, "Rasterize Text");
   layer->text.reset();
   doc->touch_layer(id);
   txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/* --------------------------------------------- 图层锁 / 颜色标签（P1-2 第一批） */
+
+comp_result comp_layer_set_lock(comp_document document, comp_layer_id id, uint32_t flags) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 参数闸在事务之前：非法位不产生任何状态（也就不产生撤销步）。 */
+  if (!valid_lock_flags(flags)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "unknown lock bits (see COMP_LAYER_LOCK_MASK)");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  /* 幂等：同值不落撤销步（宿主可以无脑「设为当前勾选态」）。 */
+  if (layer->lock_flags == flags) return compositor::abi::ok(engine);
+  compositor::abi::ImplicitTxn txn(doc, "Set Layer Lock");
+  layer->lock_flags = flags;
+  /* 不 touch_layer：锁不参与像素求值，不该让合成/GPU 缓存失效。 */
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_lock(comp_document document, comp_layer_id id, uint32_t* out_flags) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_flags == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_flags is null");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_flags = layer->lock_flags;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_set_color_label(comp_document document, comp_layer_id id, uint32_t label) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (!valid_color_label(label)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "label must be 0..COMP_LAYER_COLOR_COUNT-1");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (layer->color_label == label) return compositor::abi::ok(engine);
+  compositor::abi::ImplicitTxn txn(doc, "Set Layer Color Label");
+  layer->color_label = label;
+  /* 与锁同理：纯 UI 元数据，不碰 content_revision。 */
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_color_label(comp_document document, comp_layer_id id, uint32_t* out_label) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_label == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_label is null");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_label = layer->color_label;
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }

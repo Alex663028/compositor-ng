@@ -90,6 +90,16 @@ comp_result comp_camera_raw_apply(comp_document document_handle, comp_layer_id t
   if (!compositor::camera_raw_settings_from_json(settings_json, &settings, &error)) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
   }
+  /* 图像锁的闸（P1-2）：camera raw 整幅改写像素，与滤镜同属「图像像素」写入口。
+   * 领域层自己开会提交事务，所以闸必须在这里、早于它。 */
+  const compositor::Layer* target_layer = document->find(target);
+  if (target_layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  const comp_result locked = compositor::abi::lock_gate(engine, target_layer,
+                                                        COMP_LAYER_LOCK_PIXELS,
+                                                        "apply camera raw");
+  if (locked != COMP_OK) return locked;
   comp_result code = COMP_ERR_INTERNAL;
   bool changed = false;
   std::string note_text;

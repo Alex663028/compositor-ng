@@ -7580,6 +7580,123 @@ NaN → 0、越界夹取）、插入/删除（段中点、颜色随左端、首�
 - **没有 Lab / 感知插值、没有噪点渐变**：插值仍在 sRGB 上线性进行（P1-7 剩余
   项：渐变拖拽手柄、透明度中点、噪点、Lab 插值、渐变映射多色标）。
 
+### 6.106 图层锁 + 颜色标签：把「锁」做成引擎闸、把「色」做成面板事实（P1-2 第一批，2026-10-24，Claude）
+
+**缺口。** PS 图层面板顶部那排锁（透明像素 / 图像像素 / 位置 / 全部）与右键
+颜色标签，在本壳里**完全不存在**：引擎没有这两个属性，`.comp` 里也没有对应
+字段，于是「锁住背景层再画」这条最基本的防误操作路径是断的。这一批从域模型
+一路补到菜单：**ABI 尾部追加 4 个导出（167 → 171）**。
+
+**锁是宿主输入的闸，不是合成参数。** 口径刻意写死在 `domain/layer.h`：
+
+```
+合成 / 缩略图 / 合并 / 拼合 / 撤销重做 / 读盘  一律不看锁
+所有写入口（ABI 层）                           一律先过锁闸
+```
+
+理由：锁若参与求值，「锁住导出」会静默改画面；锁若连域层内部也拦，撤销与
+拼合就永远无法把文档恢复到一个合法状态。因此闸只放在 ABI 的 18 个写入口：
+
+| 锁位 | 拦住什么 |
+|---|---|
+| `TRANSPARENT` (1) | 绘画类工具（画笔/橡皮/渐变/形状…，`comp_tool_apply` 传 `lock_transparent`）、`comp_layer_set_pixels` |
+| `PIXELS` (2) | 滤镜、camera raw、反相、把调整烘进像素（`apply_adjustment`）、改文字内容 |
+| `POSITION` (4) | `set_transform`、翻转 |
+| `ALL` (8) | 删除、改蒙版、调整层的增删改、效果增删、向下合并、栅格化文字 |
+
+`ALL` 是快捷位：判定一律 `flags & (bit | ALL)`，所以设了「全部」就不需要再
+按位补其余三位；`COMP_LAYER_LOCK_MASK = 0x0F` 之外的位由 setter 直接拒绝
+（不静默丢弃）。写入非法的锁/标签 → `COMP_ERR_INVALID_ARGUMENT` 且旧值不变；
+锁/标签本身**不推进内容修订号**（合成缓存、缩略图都不失效），但可撤销——
+和 `set_visible` 同口径。
+
+**透明锁不是「不落笔」，而是「落笔后还原 alpha」。** 画笔对透明像素落墨时，
+引擎会先算出新像素，再由 `restore_transparent_lock` 把每像素的 alpha 按原值
+还原；若整笔无像素保持可见变化，事务直接中止（不产生空撤销步），状态栏由
+域层回 note 说明原因。这条后处理只作用于 RGBA8（16 位/HDR 不经过它）。
+
+**`.comp` 往返。** 两个新键沿用「默认值不写」：`engineLock`（整数位掩码）与
+`engineColorLabel`（0..7）。旧 manifest 逐字节不变；读盘时越界值直接报
+`COMP_ERR_DECODE`（`layer <uuid>: unknown engineLock N`），不静默夹取——一份
+坏文件不该悄悄变成「没锁」。
+
+**壳层。** 命令号 1660..1672：
+
+- 图层 > **锁定**：无 / 透明像素 / 图像像素 / 位置 / 全部，五档单选；
+- 图层 > **颜色标签**：无 / 红 / 橙 / 黄 / 绿 / 蓝 / 紫 / 灰，`id = 1665 + label`；
+- 菜单按 `comp_layer_get_lock` / `get_color_label` 回读勾选，无选中图层时整组
+  置灰；点已勾选的那一项 = 解锁（不必先找「无」）；
+- 图层面板行内追加锁字母 `T/P/G/L`，行首 7px 画颜色色块（选中行也不整行染色，
+  否则深蓝底会把标签色压失真）；
+- 锁与标签都不置 `needs_render`——它们不改像素，只改面板与菜单。
+
+命令号最初发在 1610..1622，撞了 `kCmdImageAdjustBase + COMP_ADJUSTMENT_*`
+的 20..24（Color Lookup / 阴影高光 / 自动三档）——菜单点「自动色调」变成给图层
+上锁，视觉探针当场报红。现在整段搬到 1660 起，既不在调整号段内，也在那个
+64 宽宽容区间（1590..1653）之外。**新增 1600 段命令号前先看 `COMP_ADJUSTMENT_*`
+枚举值涨到几。**
+
+位组合（例如 `TRANSPARENT|POSITION`，只能来自别的 ABI 调用方或手改
+`.comp`）在单选菜单里按 `TRANSPARENT → PIXELS → POSITION → ALL` 的优先级
+归一显示，任何一次点选都会把它归一成单值。
+
+**测试钉的八件事**（`tests/test_layer_locks.cpp`，8 个 case）：
+默认无锁/无标签；四种锁的写入、读回与越界拒绝；`ALL` 蕴含其余三位；透明锁下
+绘画类工具与 `set_pixels` 被拒而反相**不被拒**（反相归 `PIXELS` 管）；图像锁
+下滤镜/反相被拒；位置锁下变换/翻转被拒；`ALL` 下删除/合并/蒙版/调整/效果全
+`COMP_ERR_STATE`，解锁后恢复；锁/标签一步撤销、不推进修订号；`.comp` 往返
+（含越界 `engineLock` 拒绝）；透明锁的「整笔被还原 → 不进历史」。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | `comp_layer_lock` / `comp_layer_color_label` 枚举、`COMP_LAYER_LOCK_MASK`、`COMP_LAYER_COLOR_COUNT`、4 个尾部导出 |
+| `engine/domain/layer.h`、`engine/domain/layer.cpp` | `Layer::lock_flags` / `color_label`、`restore_transparent_lock` |
+| `engine/abi/src/comp_abi_internal.h` | `lock_has` / `lock_gate`（统一错误文案与 `COMP_ERR_STATE`） |
+| `engine/abi/src/comp_layer_abi.cpp` | 既有两个 setter/getter + 18 个写入口的闸 + 透明锁后处理接线 |
+| `engine/abi/src/comp_canvas_abi.cpp`、`comp_filter_abi.cpp`、`comp_camera_raw_abi.cpp` | 反相 / 调整烘死 / 滤镜 / camera raw 的闸 |
+| `engine/domain/tool_ops.cpp` | `desc.lock_transparent` → `restore_transparent_lock`（事务中止时不进历史） |
+| `engine/format/comp_file.cpp` | `engineLock` / `engineColorLabel` 读写与越界拒绝 |
+| `tests/test_layer_locks.cpp` | 8 个新 case（714 → 722） |
+| `shells/windows/src/shell_state.h` | 命令号 1660..1672、`LayerRow::lock_flags/color_label` |
+| `shells/windows/src/shell_layers.cpp` | 回读、`panel_set_lock` / `panel_set_color_label`、单选归一 |
+| `shells/windows/src/shell_window.cpp` | 两个子菜单 + radio 勾选 + 置灰 |
+| `shells/windows/src/shell_document.cpp` | 5 个锁 case + 颜色标签区间 case（排在 1590 宽容区间之前，防御性顺序） |
+| `shells/windows/src/shell_paint.cpp` | 行内锁字母与颜色色块 |
+| `scripts/visual_check.py` | 追加 `layer_lock` 场景 9 条（`SCENES` 末尾，既有阈值未动） |
+
+**视觉探针实测：** 红标签 49px 色块、换灰后红残留 0、改「无」后色块消失；
+锁定后行内差异 244px；透明锁下整笔画布差异 **0**；解锁后同一笔差异 1066px；
+图像锁下 `Ctrl+I` 画布差异 **0**；「全部」锁的行内标记与「图像像素」锁不同
+（167px）——锁真的在引擎里生效，而不只是菜单状态变了。
+
+**命令号踩坑。** 第一版把锁发在 1610..1614，理由是「1600 段空号」；实际图像调整
+用的是 `1590 + COMP_ADJUSTMENT_*` 枚举值，`COLOR_LOOKUP`(20) 起正好占住
+1610..1614。锁是显式 `case` 标签先被匹配，于是「图像 > 调整 > 自动色调」等五项
+变成了给图层上锁。**只有 `destructive_adjust` 第 12 条测了出来**（自动色调不应
+打开参数面板，实测标题带 786px 差异），其余四项没被探针点到。整段改到 1660..1672
+后两类菜单各归各位；这条也写进了 `docs/shell-parity.md` §5.66。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **722 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **171**（167 → 171，尾部追加 4 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **214 条 / 35 场景 / 0 失败** |
+| `build_windows_shell.py` | 0 warning（`-Wall -Wextra`） |
+
+**已知边界：**
+
+- **没有「锁定位置」的拖动拦截以外的语义**：`POSITION` 只拦 `set_transform`/
+  翻转；选区移动、裁剪提交等批量路径仍以各自的写入口为准（它们走的是文档级
+  操作，PS 在锁定时也会询问）。
+- **锁只在 ABI 层生效**：直接改 `.comp` 仍能改锁住的图层——锁是宿主防误触，
+  不是文件加密。
+- **颜色标签不参与导出**：它不写 PSD/PNG，只在 `.comp` 与面板里存在。
+
 
 
 

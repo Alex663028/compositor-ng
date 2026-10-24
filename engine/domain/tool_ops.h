@@ -677,6 +677,17 @@ struct ToolOpParams {
 
   /* History Brush 用（笔迹折线复用 points，几何复用 brush，见 HistoryBrushParams）。 */
   HistoryBrushParams history_brush;
+
+  /*
+   * 锁定透明像素（P1-2 第一批）。非 0 时，执行完把图层的原 alpha 还原：
+   *   - 原本全透明的像素整份丢弃（落在透明处的笔迹不生效）；
+   *   - 原本有像素的 alpha 原样保留，新 RGB 按 old_alpha / new_alpha 重新预乘；
+   *   - 落笔把像素抹成全透明的（橡皮等），整份还原成原像素。
+   * 判定在 ABI 层做（锁是宿主输入的闸），这里只负责像素口径。只在 RGBA8 上
+   * 生效：16 位/HDR 的 alpha 还原会牵扯各自的颜色编码，第一批如实拒绝
+   * （见 run_tool_op 的参数闸）。
+   */
+  int32_t lock_transparent = 0;
 };
 
 /* ============================================================== 执行 */

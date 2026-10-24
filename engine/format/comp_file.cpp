@@ -434,6 +434,17 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
   if (layer.text) {
     j.set("engineText", text_to_json(*layer.text));
   }
+  /*
+   * 图层锁（engineLock）与颜色标签（engineColorLabel）：同一条「默认值不写」。
+   * 锁是整数字节掩码（comp_layer_lock），缺键 = 未锁；颜色标签 0 = 无。
+   * 两者都是纯文档状态：不进合成、不推进内容修订号，但随撤销/重做与工程往返。
+   */
+  if (layer.lock_flags != 0u) {
+    j.set("engineLock", JsonValue::integer(static_cast<long long>(layer.lock_flags)));
+  }
+  if (layer.color_label != 0u) {
+    j.set("engineColorLabel", JsonValue::integer(static_cast<long long>(layer.color_label)));
+  }
   return j;
 }
 
@@ -1061,6 +1072,30 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
           layer.effects.push_back(std::move(effect));
         }
       }
+
+      /*
+       * 图层锁 / 颜色标签（engineLock / engineColorLabel，见 layer_to_json）：
+       * 缺键 = 未锁 / 无标签。取值域外的值明确报错，不静默截断——把未知位当
+       * 「没锁」会让用户的图层突然可写，把 9 当灰色会把标签悄悄改名。
+       */
+      const long long lock_flags = entry.integer_or("engineLock", 0);
+      if (lock_flags < 0 ||
+          (static_cast<unsigned long long>(lock_flags) & ~static_cast<unsigned long long>(COMP_LAYER_LOCK_MASK)) != 0u) {
+        if (error != nullptr) {
+          *error = "layer " + uuid + ": unknown engineLock " + std::to_string(lock_flags);
+        }
+        return false;
+      }
+      layer.lock_flags = static_cast<uint32_t>(lock_flags);
+      const long long color_label = entry.integer_or("engineColorLabel", 0);
+      if (color_label < 0 || color_label >= static_cast<long long>(COMP_LAYER_COLOR_COUNT)) {
+        if (error != nullptr) {
+          *error =
+              "layer " + uuid + ": unknown engineColorLabel " + std::to_string(color_label);
+        }
+        return false;
+      }
+      layer.color_label = static_cast<uint32_t>(color_label);
 
       /* engineText：缺键 = 普通图层；解析出的对象不可渲染则整体忽略（像素照旧
        * 由 imageFile 读回，画面不变，只是失去可编辑性——好过让半个文字对象

@@ -299,6 +299,18 @@ void refresh_layers(ShellState& shell) {
       /* 单层效果数量极少（<256），int32_t 足够；超限按 255 封顶只影响标记显示。 */
       row.effect_count = effect_count > 255u ? 255 : static_cast<int32_t>(effect_count);
     }
+    /*
+     * P1-2：锁与颜色标签也走回读。这两项是引擎侧拒绝写入口的依据，面板必须显示
+     * 同一份事实——尤其是撤销（改锁本身可撤销）之后，缓存不留旧值。
+     */
+    uint32_t lock_flags = 0;
+    if (comp_layer_get_lock(shell.doc.document, id, &lock_flags) == COMP_OK) {
+      row.lock_flags = lock_flags & COMP_LAYER_LOCK_MASK;
+    }
+    uint32_t color_label = 0;
+    if (comp_layer_get_color_label(shell.doc.document, id, &color_label) == COMP_OK) {
+      row.color_label = color_label < COMP_LAYER_COLOR_COUNT ? color_label : 0u;
+    }
     shell.doc.layers.push_back(row);
   }
 
@@ -974,6 +986,112 @@ void panel_toggle_flip(ShellState& shell, bool horizontal) {
   } else {
     refresh_history_status(shell, next_y != 0 ? L"已垂直翻转图层" : L"已取消垂直翻转");
   }
+}
+
+/* ====================================== P1-2：图层锁 / 颜色标签 */
+
+/*
+ * 锁的中文名（P1-2）。位组合在引擎里是合法的，但本壳的菜单是**单选**：
+ * 一项 = 一份完整 flags。位组合只可能来自别的 ABI 调用方或 .comp 文件，
+ * 面板按「最先命中的位」显示（见 panel_lock_menu_flag），任何一次点选都会
+ * 把它归一成单选值——这正是用户能理解的口径。
+ */
+const wchar_t* lock_label(uint32_t flags) {
+  switch (flags) {
+    case COMP_LAYER_LOCK_TRANSPARENT: return L"透明像素";
+    case COMP_LAYER_LOCK_PIXELS: return L"图像像素";
+    case COMP_LAYER_LOCK_POSITION: return L"位置";
+    case COMP_LAYER_LOCK_ALL: return L"全部";
+    default: return L"无";
+  }
+}
+
+/*
+ * 面板 / 菜单上该标成哪一个 radio：单选组只能勾一项。顺序刻意与 PS 菜单一致
+ * （透明 / 图像 / 位置 / 全部），位组合时先命中的先报——例如
+ * TRANSPARENT|POSITION 显示「透明像素」，点它就落到纯 TRANSPARENT。
+ */
+uint32_t panel_lock_menu_flag(uint32_t flags) {
+  if ((flags & COMP_LAYER_LOCK_TRANSPARENT) != 0) return COMP_LAYER_LOCK_TRANSPARENT;
+  if ((flags & COMP_LAYER_LOCK_PIXELS) != 0) return COMP_LAYER_LOCK_PIXELS;
+  if ((flags & COMP_LAYER_LOCK_POSITION) != 0) return COMP_LAYER_LOCK_POSITION;
+  if ((flags & COMP_LAYER_LOCK_ALL) != 0) return COMP_LAYER_LOCK_ALL;
+  return COMP_LAYER_LOCK_NONE;
+}
+
+const wchar_t* color_label_name(uint32_t label) {
+  switch (label) {
+    case COMP_LAYER_COLOR_RED: return L"红";
+    case COMP_LAYER_COLOR_ORANGE: return L"橙";
+    case COMP_LAYER_COLOR_YELLOW: return L"黄";
+    case COMP_LAYER_COLOR_GREEN: return L"绿";
+    case COMP_LAYER_COLOR_BLUE: return L"蓝";
+    case COMP_LAYER_COLOR_VIOLET: return L"紫";
+    case COMP_LAYER_COLOR_GRAY: return L"灰";
+    default: return L"无";
+  }
+}
+
+/*
+ * 图层锁（P1-2）。
+ *
+ * 引擎的锁位一直在拒绝写入口（P1-2 前半段接的是 ABI 闸），壳此前既读不到也
+ * 设不了，于是「锁定图层」这个 PS 基础操作在本壳里不存在。这里做成 PS 同款
+ * 的**点选即切**：菜单是单选组，点已勾选的那一项 = 解锁；点别的 = 换成那一项。
+ * 不点「无」也能解锁，避免「想解锁却要先找无」这条反直觉路径。
+ *
+ * 锁不参与像素求值，所以不置 needs_render——只有面板标记与菜单勾选变化。
+ */
+void panel_set_lock(ShellState& shell, uint32_t flags) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  const comp_layer_id id = row->id;
+  uint32_t current = 0;
+  if (comp_layer_get_lock(shell.doc.document, id, &current) != COMP_OK) {
+    set_status(shell, L"读取图层锁失败");
+    return;
+  }
+  uint32_t next = flags & COMP_LAYER_LOCK_MASK;
+  /* 单选组语义：再点一次已生效的锁 = 解锁。 */
+  if (next != COMP_LAYER_LOCK_NONE && panel_lock_menu_flag(current) == next) {
+    next = COMP_LAYER_LOCK_NONE;
+  }
+  if (comp_layer_set_lock(shell.doc.document, id, next) != COMP_OK) {
+    set_status(shell, L"设置图层锁失败");
+    return;
+  }
+  refresh_layers(shell);
+  wchar_t buffer[128];
+  if (next == COMP_LAYER_LOCK_NONE) {
+    wsprintfW(buffer, L"已解锁图层：%s", lock_label(panel_lock_menu_flag(current)));
+  } else {
+    wsprintfW(buffer, L"图层已锁定：%s", lock_label(next));
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 颜色标签（P1-2）。纯元数据：只影响面板配色与行内色块，不参与合成、
+ * 不推进缓存——所以同样不置 needs_render。label 越界由 ABI 拒绝，这里先夹一次。
+ */
+void panel_set_color_label(ShellState& shell, uint32_t label) {
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  if (label >= COMP_LAYER_COLOR_COUNT) label = COMP_LAYER_COLOR_NONE;
+  if (comp_layer_set_color_label(shell.doc.document, row->id, label) != COMP_OK) {
+    set_status(shell, L"设置颜色标签失败");
+    return;
+  }
+  refresh_layers(shell);
+  wchar_t buffer[96];
+  wsprintfW(buffer, L"颜色标签：%s", color_label_name(label));
+  refresh_history_status(shell, buffer);
 }
 
 /*

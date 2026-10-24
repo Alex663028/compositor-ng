@@ -104,6 +104,7 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 | 14 | ~~变换选区（P0-5 收尾）~~ **已落地（2026-10-24，README §6.102）** | 【ABI 追加】+【引擎】S–M | 选区维 61% → **67%**（全功能面；日常口径 90% 不变——旋转选区不在「周内会用」的子集里） | 尾部追加 `comp_selection_transform` 1 个导出（166 → 167）：轴对齐手柄之外的**数值宽高 + 旋转**，中心固定为当前包围盒中心；角度 0 且宽高相等时走 `masks_equal` 短路，逐字节恒等、不落撤销步；单测 705 → 710，视觉探针新增 `selection_transform` 10 条 |
 | 15 | ~~数值变换 + 再次变换（P1-3 第一段）~~ **已落地（2026-10-24，README §6.103）** | 【壳层】M（**零 ABI**） | 变换维 55% → **73%**（条目 6 → 8；日常口径 85% 不变——精确尺寸与复读上一步属进阶需求） | `comp_layer_get_transform` / `set_transform` 早有，缺的是入口：`Ctrl+T` 三行数字（宽/高/角度，中心锚定），`Ctrl+Shift+T` 复读上一次的比例与角度增量。「有效变换」把隐式（宽高 0 = 用像素尺寸）与显式抹平，所以恒等回车不物化 transform、不落空撤销步；角度行没动过就写回原始 float，只改宽度不会把 22.5° 圆成 23°；旋转/缩放/手柄拖动提交成功都记一步，移动类刻意不记；视觉探针新增 `layer_transform_numeric` 11 条 |
 | 16 | ~~图案叠加（P1-1 第二段）~~ **已落地（2026-10-24，README §6.104）** | 【引擎】S（零新导出） | 图层维不单独加分（样式条目已命中），但**样式 9/10 → 10/10**——PS 的图层样式集合已逐项对齐 | 尾部追加 kind 9（`COMP_EFFECT_KIND_COUNT` 9 → 10）+ 12 行参数表；四种内置程序化图案（棋盘/网格/斜纹/圆点），按 scale/angle/offset 平铺后双色 source-atop 叠色，无资源文件、确定性可复现；效果面板零改动即可编辑（12 行与斜面和浮雕同高） |
+| 17 | ~~图层锁 + 颜色标签（P1-2 第一批）~~ **已落地（2026-10-24，README §6.106）** | 【ABI 追加】+【引擎】M（零算法） | 图层维 90% → **92%**（锁是 PS 图层面板的第一道防误触；「图层管理」条目从缺三件变成缺两件） | 尾部追加 4 个 `comp_layer_*_lock` / `color_label` 导出（167 → 171）；锁只做 ABI 写入口的闸（合成/合并/撤销/读盘不看锁），透明锁在绘画后按原 alpha 还原、整笔无变化则不进历史；`.comp` 新键 `engineLock`/`engineColorLabel`（缺省不写）；壳层 1660..1672 五档锁 + 八色标签、行内 `T/P/G/L` 与色块；单测 714 → 722，视觉探针新增 `layer_lock` 9 条 |
 
 不推荐现在做：色彩管理 / 打印 / 自动化 / 多文档 / 3D·视频。它们是独立子系统，
 在「日常路径」权重里合计不足 5%，投入产出比最差（BACKLOG §7 阶段 G）。
@@ -114,13 +115,13 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 
 | 项 | 结果 |
 |---|---|
-| `scripts/build.py` | **714 例 / 0 失败** |
-| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（714 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
+| `scripts/build.py` | **722 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（722 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
 | 壳自检 | **263 项 failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批；§6.94～§6.105 均未改自检项） |
 | OHOS 交叉编译 | `compile ok=118 fail=0` |
-| `^COMP_API` 导出 | **167**（152 → 158 → 163 → 164 → 166 → 167，尾部追加 6 个 `comp_guide_*`、5 个 `comp_selection_channel_*`、`comp_layer_apply_adjustment`、`comp_selection_grow`/`comp_selection_similar` 与 `comp_selection_transform`，无重排；§6.97/§6.104 只追加枚举值，§6.98 只追加枚举/结构体与 `comp_tool_op_desc` 尾字段） |
+| `^COMP_API` 导出 | **171**（152 → 158 → 163 → 164 → 166 → 167 → 171，尾部追加 6 个 `comp_guide_*`、5 个 `comp_selection_channel_*`、`comp_layer_apply_adjustment`、`comp_selection_grow`/`comp_selection_similar`、`comp_selection_transform` 与 4 个 `comp_layer_*_lock` / `color_label`，无重排；§6.97/§6.104 只追加枚举值，§6.98 只追加枚举/结构体与 `comp_tool_op_desc` 尾字段） |
 | `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
-| `scripts/visual_check.py --scene all` | **205 条 / 34 场景 / 0 失败**（追加过 `font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`，并扩了 `destructive_adjust` 的 Photo Filter / Auto Tone 两条；既有阈值未动） |
+| `scripts/visual_check.py --scene all` | **214 条 / 35 场景 / 0 失败**（追加过 `font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`，并扩了 `destructive_adjust` 的 Photo Filter / Auto Tone 两条；既有阈值未动） |
 | `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败**（psd-tools 独立实现，见 README §6.87） |
 | 进程 DPI 感知 | `Shcore!GetProcessDpiAwareness` = **2（per-monitor）**；`--dpi=96/144/192` 覆盖截图见 `report/assets/s15/dpi-check-*.png`（§6.93） |
 

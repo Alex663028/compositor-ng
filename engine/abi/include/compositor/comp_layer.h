@@ -1450,6 +1450,90 @@ COMP_API comp_result comp_layer_get_text(comp_document document,
  */
 COMP_API comp_result comp_layer_rasterize_text(comp_document document, comp_layer_id id);
 
+/* ------------------------------------------- 图层锁 / 颜色标签（P1-2 ① 尾部追加） */
+
+/*
+ * 图层锁位掩码。位可以组合（例如「锁定透明 + 锁定位置」），`COMP_LAYER_LOCK_ALL`
+ * 是「全部锁定」的显式位：判定时它**蕴含**另外三位，不需要调用方再或进去。
+ *
+ * 语义（与 Photoshop 的四个锁按钮一一对应）：
+ *   - `TRANSPARENT`：只允许改已有像素的颜色，alpha 通道被保住。落在全透明处的
+ *     笔迹被丢弃；已有像素的 alpha 原样保留，新颜色按原 alpha 重新预乘。
+ *     只管**绘画类工具**（画笔/橡皮/填充/渐变/涂抹/修饰等，即 `comp_tool_apply`
+ *     里除 SELECT 与 DEEP 之外的算子）；`comp_tool_select` 写的是蒙版、`comp_tool`
+ *     的 DEEP 系列换的是像素格式，两者都不受透明锁约束（受 `ALL` 约束的是前者）。
+ *     滤镜/反相/Camera Raw 不走事后 alpha 还原，所以也不受它约束（要拦它们用
+ *     `PIXELS`）。位深限制：本轮只在 RGBA8 上强制；RGBA16 / RGBA16F 图层带透明
+ *     锁调用工具会得到 COMP_ERR_STATE（16 位与 half 的 alpha 需要按各自编码缩放，
+ *     那是后续批次的事），不会静默忽略锁。
+ *   - `PIXELS`：禁止任何会改变图层像素的入口（工具落墨、滤镜、反相、破坏性调整、
+ *     Camera Raw、整层像素写入、文字重排版）。改锁、改混合/不透明度、改位置不受影响。
+ *   - `POSITION`：禁止几何变换——`comp_layer_set_transform` 与 `comp_layer_set_flip`。
+ *     图层面板里的**堆叠次序**不算位置：`comp_layer_move` 是树上的重挂（换父组/层序），
+ *     不是空间移动，锁位置后重排仍允许（PS 同口径：锁位置后仍可在面板里拖动层序）。
+ *   - `ALL`：上面三项全含，另外拒绝删除、向下合并、栅格化文字，以及调整层/效果
+ *     的增删改。
+ *
+ * 不参与合成的属性：锁与颜色标签都是**文档状态**，随撤销/重做回退、随 `.comp`
+ * 往返，但合成、缩略图、导出、合并、拼合一律不看锁——锁只会让「写」失败，
+ * 不会让画面悄悄变样。
+ */
+typedef enum comp_layer_lock {
+  COMP_LAYER_LOCK_NONE = 0,
+  COMP_LAYER_LOCK_TRANSPARENT = 1u << 0,
+  COMP_LAYER_LOCK_PIXELS = 1u << 1,
+  COMP_LAYER_LOCK_POSITION = 1u << 2,
+  COMP_LAYER_LOCK_ALL = 1u << 3
+} comp_layer_lock;
+
+/* 允许出现在 lock_flags 里的全部位（其余位一律拒绝，不静默丢弃）。 */
+#define COMP_LAYER_LOCK_MASK 0x0Fu
+
+/*
+ * 设置图层锁（整份覆盖，不是「或」进去）：`flags` 只接受
+ * `COMP_LAYER_LOCK_MASK` 内的位，其它位 -> COMP_ERR_INVALID_ARGUMENT 且不改旧值
+ * ——保留未知位会让宿主以为锁生效了，实际却没有对应语义。
+ *
+ * 一步撤销（加入调用方的显式事务，或自成一个隐式步）；与 set_visible 同一口径，
+ * 不推进内容修订号、不使合成缓存失效（锁不参与像素求值）。图层不存在 ->
+ * COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_set_lock(comp_document document, comp_layer_id id,
+                                         uint32_t flags);
+
+/* 读回图层锁；与 set_lock 成对，供面板勾选态与置灰回读。只读，不开事务。 */
+COMP_API comp_result comp_layer_get_lock(comp_document document, comp_layer_id id,
+                                         uint32_t* out_flags);
+
+/*
+ * 颜色标签取值。0 = 无标签；1..7 的顺序与 Photoshop 的面板色板一致
+ * （红 / 橙 / 黄 / 绿 / 蓝 / 紫 / 灰），只是**语义标签**，不参与合成。
+ */
+typedef enum comp_layer_color_label {
+  COMP_LAYER_COLOR_NONE = 0,
+  COMP_LAYER_COLOR_RED = 1,
+  COMP_LAYER_COLOR_ORANGE = 2,
+  COMP_LAYER_COLOR_YELLOW = 3,
+  COMP_LAYER_COLOR_GREEN = 4,
+  COMP_LAYER_COLOR_BLUE = 5,
+  COMP_LAYER_COLOR_VIOLET = 6,
+  COMP_LAYER_COLOR_GRAY = 7
+} comp_layer_color_label;
+
+#define COMP_LAYER_COLOR_COUNT 8
+
+/*
+ * 设置颜色标签。`label` 必须在 0..7（COMP_LAYER_COLOR_COUNT-1），越界 ->
+ * COMP_ERR_INVALID_ARGUMENT 且不改旧值。一步撤销；不推进修订号（纯元数据）。
+ * 图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_set_color_label(comp_document document, comp_layer_id id,
+                                                uint32_t label);
+
+/* 读回颜色标签（0..7）。只读，不开事务。 */
+COMP_API comp_result comp_layer_get_color_label(comp_document document, comp_layer_id id,
+                                                uint32_t* out_label);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

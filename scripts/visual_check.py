@@ -3232,6 +3232,102 @@ def scene_gradient_stops(shell, checker):
                   "实测 %s" % (three_quarter,))
 
 
+def scene_layer_lock(shell, checker):
+    """P1-2：图层锁 + 颜色标签（命令号 1660..1672）。
+
+    断言分两类，全部可算：
+      1. **颜色标签**是纯元数据：行首出现 7px 色块（红 / 灰），换「无」后消失；
+      2. **锁**真的拦写入口：透明锁下画笔落在完全透明的背景层上 → 画布
+         **逐像素不变**（restore_transparent_lock 把 alpha 还原，等于没落笔）；
+         解锁后同一笔必须改像素；图像像素锁下再次不变；Ctrl+I 反相也被拒绝。
+
+    锁本身不参与合成，所以全程画布只应在「解锁后那一笔」变化——其余每一步
+    都是 0 差异，这比「状态栏说了锁上了」强得多：前者证明闸在引擎里生效，
+    后者只证明壳发了命令。
+    """
+    scene = "layer_lock"
+    layer = shell.layout["layer"]
+    canvas = shell.layout["canvas"]
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+
+    # 第一行（背景层）的行矩形：面板顶 + 30px 标题，行高 22（ui_core）。
+    row_y = layer[1] + 30
+    row_band = (layer[0], row_y, layer[2], row_y + 22)
+    row_x0 = layer[0] + 1
+    row_slot = (row_x0, row_y, row_x0 + 11, row_y + 22)
+
+    shell.select_tool("brush")
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+
+    base = shell.shot("127_lock_base")
+    checker.check(scene, "默认无颜色标签（行首色块槽为空）",
+                  count_matching(base, row_slot, (0xE0, 0x52, 0x52), 20) == 0,
+                  "红色像素 %d" % count_matching(base, row_slot, (0xE0, 0x52, 0x52), 20))
+
+    # 1. 颜色标签：红 → 灰 → 无。1672 是最后一项（灰），1666 是红，1665 是无。
+    shell.command(1666)  # 图层 > 颜色标签 > 红
+    red_img = shell.shot("128_color_label_red")
+    red_px = count_matching(red_img, row_slot, (0xE0, 0x52, 0x52), 20)
+    checker.check(scene, "颜色标签=红：行首出现红色色块", red_px >= 20, "红色像素 %d" % red_px)
+
+    shell.command(1672)  # 灰
+    gray_img = shell.shot("129_color_label_gray")
+    gray_px = count_matching(gray_img, row_slot, (0x8C, 0x8C, 0x8C), 20)
+    red_left = count_matching(gray_img, row_slot, (0xE0, 0x52, 0x52), 20)
+    checker.check(scene, "换成灰标签：色块变色且没有红色残留",
+                  gray_px >= 20 and red_left == 0,
+                  "灰 %d / 红残留 %d" % (gray_px, red_left))
+
+    shell.command(1665)  # 无
+    none_img = shell.shot("130_color_label_none")
+    checker.check(scene, "颜色标签=无：色块消失",
+                  count_matching(none_img, row_slot, (0x8C, 0x8C, 0x8C), 20) == 0,
+                  "灰色像素 %d" % count_matching(none_img, row_slot, (0x8C, 0x8C, 0x8C), 20))
+
+    # 2. 透明锁：行内出现 T 标记，且画笔落笔对画布零影响。
+    before_lock = shell.shot("131_lock_transparent_on")
+    shell.command(1661)  # 锁定 > 透明像素
+    locked = shell.shot("132_lock_transparent_row")
+    marked = pixel_diff(locked, before_lock, row_band, 24)
+    checker.check(scene, "锁定后行内多出锁标记（行文本变化）", marked > 10,
+                  "行内变化像素 %d" % marked)
+
+    x = (left + right) // 2
+    y = (top + bottom) // 2
+    shell.drag(x - 40, y, x + 40, y, steps=12)
+    after_locked_stroke = shell.shot("133_transparent_lock_stroke")
+    blocked = pixel_diff(after_locked_stroke, locked, canvas, 24)
+    checker.check(scene, "透明锁下画笔改不了画布（整幅逐像素不变）", blocked == 0,
+                  "画布差异像素 %d" % blocked)
+
+    # 解锁后同一位置必须真的画上东西。
+    shell.command(1660)  # 锁定 > 无
+    shell.drag(x - 40, y, x + 40, y, steps=12)
+    unlocked_stroke = shell.shot("134_unlocked_stroke")
+    painted = pixel_diff(unlocked_stroke, after_locked_stroke, canvas, 24)
+    checker.check(scene, "解锁后同一笔改变画布（闸只拦锁定期）", painted > 50,
+                  "画布差异像素 %d" % painted)
+
+    # 3. 图像像素锁：画笔与反相都被拒绝（这里验反相，画笔路径上一步已验）。
+    shell.command(1662)  # 锁定 > 图像像素
+    locked_pixels = shell.shot("135_pixels_lock_before_invert")
+    shell.press(ord("I"), ctrl=True)  # 图层反相
+    inverted = shell.shot("136_pixels_lock_invert_blocked")
+    invert_delta = pixel_diff(inverted, locked_pixels, canvas, 24)
+    checker.check(scene, "图像像素锁下 Ctrl+I 反相被拒绝（画布不变）", invert_delta == 0,
+                  "画布差异像素 %d" % invert_delta)
+
+    # 全部锁：同样拒绝，且行内标记变成 L（与 T/P/G 区分）。
+    shell.command(1664)  # 锁定 > 全部
+    all_locked = shell.shot("137_lock_all_row")
+    all_mark = pixel_diff(all_locked, inverted, row_band, 24)
+    checker.check(scene, "全部锁的行内标记与图像像素锁不同", all_mark > 5,
+                  "行内变化像素 %d" % all_mark)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3266,6 +3362,7 @@ SCENES = [    ("start", scene_start, ()),
     ("layer_transform_numeric", scene_layer_transform_numeric, ()),
     ("effect_pattern", scene_effect_pattern, ()),
     ("gradient_stops", scene_gradient_stops, ()),
+    ("layer_lock", scene_layer_lock, ()),
 ]
 
 

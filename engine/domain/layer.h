@@ -164,6 +164,17 @@ inline bool is_hdr_format(comp_pixel_format fmt) {
  */
 bool wide_asset_from_linear(const float* rgba, int32_t width, int32_t height, ImageBuffer* out);
 
+/* ---------------------------------------------------------------------------
+ * 锁定透明像素的还原（P1-2 第一批）：before 是写入前的像素（共享持有即可，
+ * 写路径的 COW 会保住它），after 是写完的像素。语义见 layer.cpp 的实现注释：
+ * 全透明处整份还原、被抹成全透明的整份还原、其余只还原 alpha 并重新预乘。
+ *
+ * `out_changed` 回传「最终像素与 before 是否有任何字节不同」——全部被还原时
+ * 调用方应整步撤回事务（不留空撤销步）。只支持 RGBA8（16 位/HDR 各有一份
+ * 需要按自身编码缩放的 alpha 口径，本批如实拒绝）。尺寸/格式不符返回 false。
+ */
+bool restore_transparent_lock(const ImageBuffer& before, ImageBuffer* after, bool* out_changed);
+
 /* 8 位灰度蒙版：1 字节/像素，0 = 全透明，255 = 完全不透明。
  * 资产模型同 ImageBuffer（共享 + COW）。 */
 struct MaskBuffer {
@@ -233,6 +244,23 @@ struct Layer {
    * true = 隔离（子树先自合成一张缓冲，再作为一个单元与下层混合）。非组图层忽略。 */
   bool isolated = false;
   bool visible = true;
+  /*
+   * 图层锁（P1-2 第一批，位掩码，取值同 comp_layer_lock）：
+   *   1 = 锁定透明像素、2 = 锁定图像像素、4 = 锁定位置、8 = 锁定全部。
+   * 位 8 是「上述全部的快捷方式」，不是独立语义的一部分——判定时
+   * `LOCK_ALL` 同时蕴含前三位（见 abi/layer_lock_guard）。
+   *
+   * 语义口径：锁是**宿主输入的闸**，不是合成参数——合成、缩略图、合并、
+   * 拼合、撤销/重做、读盘一律不看锁（否则「锁住导出」会静默改画面）。
+   * 闸一律放在 ABI 写入口，域层内部操作（merge/flatten/undo）不受阻。
+   */
+  uint32_t lock_flags = 0;
+  /*
+   * 颜色标签（P1-2 第一批）：0 = 无，1..7 = 红/橙/黄/绿/蓝/紫/灰（PS 同一套）。
+   * 纯 UI 元数据：不进合成、不改像素；进 `.comp` 的 `engineColorLabel`
+   * （缺键 = 无），撤销/重做随快照回退。
+   */
+  uint32_t color_label = 0;
   comp_layer_id parent = 0;
   comp_layer_id clipping_source = 0;
   /* .comp 互通：上游 live-mask 的来源图层 UUID（manifest 键 maskSourceID）。

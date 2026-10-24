@@ -725,6 +725,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
      * S24 追加：
      *   H / V = 已水平 / 垂直翻转（flip_x / flip_y，合成时折进变换矩阵）
      *   fx    = 带效果        （effect_eval 的图层效果参与像素求值）
+     * P1-2 追加（锁，位可组合，所以逐位报）：
+     *   T = 锁透明像素  P = 锁图像像素  G = 锁位置  L = 锁全部
      * 不另开一列图标区：22px 行高 + 248px 栏宽已经排满，标号跟着层名走最省地方。
      */
     std::wstring marks;
@@ -734,6 +736,10 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     if (row.flip_x != 0) marks += L"H";
     if (row.flip_y != 0) marks += L"V";
     if (row.effect_count > 0) marks += L"fx";
+    if ((row.lock_flags & COMP_LAYER_LOCK_TRANSPARENT) != 0) marks += L"T";
+    if ((row.lock_flags & COMP_LAYER_LOCK_PIXELS) != 0) marks += L"P";
+    if ((row.lock_flags & COMP_LAYER_LOCK_POSITION) != 0) marks += L"G";
+    if ((row.lock_flags & COMP_LAYER_LOCK_ALL) != 0) marks += L"L";
     /*
      * P0-1：行内显示图层名（引擎是唯一真源，refresh_layers 回读）。
      * 名称为空（旧引擎 / 查询失败）时回落到 id，面板不至于变成空行。
@@ -757,6 +763,29 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
               static_cast<int>(row.opacity * 100.0f + 0.5f));
     TextOutW(dc, row_rect.x + 10 + indent + comp_ui::kLayerTreeMarker, row_rect.y + 3,
              line_text, lstrlenW(line_text));
+    /*
+     * P1-2：颜色标签色块。占行首 7px（可见性文字从 x+10 起，不压字）。
+     * 只画色块、不给整行染色：选中行底色是深蓝，整行染色会让标签色失真，
+     * 而标签的意义正是「一眼分组」，失真就白标了。色值与 PS 面板色板同序。
+     */
+    if (row.color_label != COMP_LAYER_COLOR_NONE) {
+      COLORREF label_color = RGB(140, 140, 140);
+      switch (row.color_label) {
+        case COMP_LAYER_COLOR_RED: label_color = RGB(0xE0, 0x52, 0x52); break;
+        case COMP_LAYER_COLOR_ORANGE: label_color = RGB(0xE0, 0x8C, 0x3C); break;
+        case COMP_LAYER_COLOR_YELLOW: label_color = RGB(0xD8, 0xC3, 0x3C); break;
+        case COMP_LAYER_COLOR_GREEN: label_color = RGB(0x4F, 0xA8, 0x5E); break;
+        case COMP_LAYER_COLOR_BLUE: label_color = RGB(0x4A, 0x7F, 0xD0); break;
+        case COMP_LAYER_COLOR_VIOLET: label_color = RGB(0x8A, 0x5F, 0xD0); break;
+        case COMP_LAYER_COLOR_GRAY: label_color = RGB(0x8C, 0x8C, 0x8C); break;
+        default: break;
+      }
+      const int swatch_y = row_rect.y + (row_rect.h - 7) / 2;
+      RECT swatch{row_rect.x + 2, swatch_y, row_rect.x + 9, swatch_y + 7};
+      HBRUSH brush = CreateSolidBrush(label_color);
+      FillRect(dc, &swatch, brush);
+      DeleteObject(brush);
+    }
   }
 
   /*
