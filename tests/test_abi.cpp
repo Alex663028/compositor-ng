@@ -1960,7 +1960,7 @@ COMP_TEST(abi_layer_flip_round_trip_and_undo) {
  * comp_layer_effect_count / comp_layer_effect_at（S24，ABI 尾部追加 117 -> 119）。
  *
  * 这一对是「写得出、读不回」的最后一块：comp_layer_set_effect 早在 ABI 里，效果
- * 也早已参与像素求值（effect_eval.cpp 的 6 个 kind），但壳无法枚举——画不出
+ * 也早已参与像素求值（effect_eval.cpp 的 10 个 kind），但壳无法枚举——画不出
  * 「这层有几个效果」，菜单也无法标出已启用项；.comp 读回后本地记账即失真。
  *
  * 钉五件事：空层 count=0 且 at(0) 越界拒绝；写入顺序即回读顺序；settings 串

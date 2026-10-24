@@ -4124,7 +4124,7 @@ struct LayerMenuEnabled {
   bool layer_step = false;    /* 选择上一/下一图层：至少两层才有换的意义 */
   bool move_up = false;       /* 上移一层 / 置于顶层 */
   bool move_down = false;     /* 下移一层 / 置于底层 */
-  bool effect_toggle = false; /* 效果 kEffectKindCount（9）档：组只能通过多选批量跳过它 */
+  bool effect_toggle = false; /* 效果 kEffectKindCount（10）档：组只能通过多选批量跳过它 */
   bool effect_edit = false;
   bool effect_clear = false;
   bool mask_from_selection = false;
@@ -4173,10 +4173,10 @@ inline LayerMenuEnabled layer_menu_enabled(const LayerMenuState& state) {
 
 /*
  * 数值即 .comp 的 engineEffects[].effect，与 compositing/effect_eval.h 的
- * kEffectStroke..kEffectGradientOverlay（0..8）逐字对应；顺序也是引擎的落笔判定顺序。
+ * kEffectStroke..kEffectPatternOverlay（0..9）逐字对应；顺序也是引擎的落笔判定顺序。
  * ui_core 不包含引擎头（纯几何/规则库，可脱壳编译），所以这里只镜像数值与名称。
  */
-inline constexpr int kEffectKindCount = 9;
+inline constexpr int kEffectKindCount = 10;
 
 inline int clamp_effect_kind(int kind) {
   if (kind < 0) return 0;
@@ -4195,6 +4195,7 @@ inline const char* effect_kind_name(int kind) {
     case 6: return "Bevel & Emboss";
     case 7: return "Satin";
     case 8: return "Gradient Overlay";
+    case 9: return "Pattern Overlay";
     default: return "Stroke";
   }
 }

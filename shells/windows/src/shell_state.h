@@ -116,7 +116,7 @@ constexpr UINT kCmdSamplingBase = 1410;             /* S22：+ 采样档位 0..2
  */
 constexpr UINT kCmdLayerFlipHorizontal = 1500; /* S24：水平镜像（ABI 尾部追加） */
 constexpr UINT kCmdLayerFlipVertical = 1501;   /* S24：垂直镜像 */
-constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..5，菜单勾选 = 已启用 */
+constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..9，菜单勾选 = 已启用 */
 constexpr UINT kCmdEffectClear = 1520;         /* S24：清除选中图层的全部效果 */
 constexpr UINT kCmdHistogramReset = 1521;      /* S24：直方图区间复位（双击同效） */
 constexpr UINT kCmdEffectEdit = 1522;          /* P0-2：打开效果参数面板（Ctrl+Shift+E） */

@@ -7383,5 +7383,106 @@ comp_result comp_selection_transform(comp_document document,
 - **文字/形状层要能被格栅化**：`comp_layer_get_pixels` 查得到资产的层都能变；
   纯矢量形状层若查询回 `0×0`，会被当成「没有可变换的像素」拒绝。
 
+### 6.104 图案叠加：把图层样式补到 10/10（P1-1 第二段，2026-10-24，Claude）
+
+**缺口。** 效果菜单此前有 9 项（描边/投影/内阴影/外发光/内发光/斜面和浮雕/缎光/
+颜色叠加/渐变叠加），PS 的十种图层样式只差图案叠加。这一项**零 ABI 新增**
+（167 个导出不变）：只是在 `comp_effect_kind` 尾部追加 `COMP_EFFECT_PATTERN_OVERLAY = 9`
+（`COMP_EFFECT_KIND_COUNT` 9 → 10）、在参数表尾部追加一行，`plan_effect` /
+`draw_planned` 各加一个分支。菜单项 id = `kCmdEffectBase + 9` = 1519，
+正好填满 1510..1519 的十年空档（`kCmdEffectClear` 仍是 1520），不撞任何既有命令。
+
+**图案从哪来：程序化，不用资源文件。** PS 的图案面板依赖 `.pat` 文件与图案预设，
+本仓没有这条资产链；为了不让效果「只有菜单、没有像素」，做了四种内置图案
+（`pattern` 0..3：棋盘 / 网格 / 斜纹 / 圆点），全部由坐标算术生成：
+
+```
+tile = max(1.0, 32.0 * scale / 100)     // 100% = 32px 周期
+u = x - offset_x, v = y - offset_y      // 偏移是图层局部像素
+ru = u*cos + v*sin, rv = -u*sin + v*cos // angle 旋转图案，不是旋转图层
+```
+
+- 棋盘：`floor(ru/tile) + floor(rv/tile)` 的奇偶决定前景色/背景色；
+- 网格：`wrap(ru, tile) < 1` 或 `wrap(rv, tile) < 1` 画 1px 线；
+- 斜纹：`wrap(ru + rv, 2*tile) < tile`；
+- 圆点：到单元格中心距离 `<= tile/4`。
+
+`wrap_period` 把负坐标折回 `[0, period)`，因此 offset 取负也不会出现「半边图案
+消失」的接缝。四种图案都只依赖整数/浮点运算，没有随机数与外部文件，同一份
+settings 在任何平台、任何次运行都逐字节一致——这也是引擎侧能拿它做「默认值漂移
+对拍」的前提。
+
+**取色边界沿用 inside 类。** 图案用 `recolor_atop_pattern`：先反预乘、按
+`pattern_covers` 选前景色或背景色、以 `opacity` 混合、再按原 alpha 预乘回去。
+`blend = source-atop` 意味着图案**只出现在源形状的 alpha 内**，不会外扩；
+`effects_margin()` 对 kind 9 返回 0，与前三种 inside 效果同组——投影/发光那类
+需要外扩包围盒的路径完全不经过这里。不透明度为 0 时 `plan_effect` 直接返回
+`DrawKind::kNone`，连一次全图扫描都不做。
+
+**参数表（12 行，面板零改动）。** `effect_table.cpp` 新增：
+
+| 键 | 标签 | 量程 | 缺省 |
+|---|---|---|---|
+| `pattern` | Pattern (0-3) | 0..3 | 0 |
+| `scale` | Scale (%) | 10..1000 | 100 |
+| `angle` | Angle (deg) | -360..360 | 0 |
+| `offset_x` / `offset_y` | Offset X/Y (px) | -5000..5000 | 0 |
+| `opacity` | Opacity (0-1) | 0..1 | 1 |
+| `red` / `green` / `blue` | Color R/G/B | 0..1 | 0（前景黑） |
+| `red2` / `green2` / `blue2` | Bg R/G/B | 0..1 | 1（背景白） |
+
+斜面和浮雕本来就是 12 行，所以 `draw_effect_panel` 的行循环、Tab 焦点、`-`/`=`
+步进与回车应用全部原样复用；壳里没有第二份「图案效果的默认 JSON」——添加效果仍
+写 `"{}"`，缺省值只存在于引擎的 `read_*` 与这张参数表里。
+
+**测试钉的两件事。** `tests/test_effect_eval.cpp` 加两个 case：
+`effect_eval_pattern_overlay_tiles_and_rotates` 用 10% 缩放（3.2px 周期）在 12×12
+图层上算出「(4,6) 是背景蓝、(7,6) 是前景红」，再把 angle 转 90° 断言两格互换
+（证明旋转真的进了坐标，而不是只存了个字段）；
+`effect_eval_pattern_overlay_kinds_and_limits` 两两比较四种图案的展平结果，
+并断言 `pattern=99` 夹到 3、`scale=0` 等价于 10、`angle=360` 等价于 0、
+`opacity=0` 逐字节不变。`tests/test_effect_table.cpp` 的期望行数表改为
+`{6,7,4,7,5,5,12,8,9,12}`，原有的「参数表缺省值 vs 引擎缺省值」逐 kind 对拍
+因此自动覆盖到 kind 9。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/compositing/effect_eval.h` | 枚举尾部 `kEffectPatternOverlay = 9`、`kEffectKindCount = 10`；注释补图案语义与「零外扩」 |
+| `engine/compositing/effect_eval.cpp` | `EffectPlan` 尾字段 `pattern/pattern_scale/offset_x/offset_y`；`wrap_period` / `pattern_covers` / `recolor_atop_pattern`；`plan_effect` 与 `draw_planned` 分支；`effects_margin` 归入 0 |
+| `engine/abi/include/compositor/comp_layer.h` | `COMP_EFFECT_PATTERN_OVERLAY = 9`、`COMP_EFFECT_KIND_COUNT 10`（纯枚举，导出数不变） |
+| `engine/domain/effect_table.{h,cpp}` | `kEffectParamKindCount = 10`、`kPatternOverlayParams[12]`、注册表 `{9u, …}` |
+| `shells/windows/src/{ui_core.h,shell_layers.cpp}` | `kEffectKindCount = 10`、`"Pattern Overlay"` / `L"图案叠加"`（菜单与参数面板自动多一行） |
+| `tests/test_effect_eval.cpp` | 两个新 case + 表驱动样例（10% 棋盘） |
+| `tests/test_effect_table.cpp` | 期望行数表追加 `12` |
+| `tests/test_ui_core.cpp` | 名字/档位断言扩到 10 |
+| `scripts/visual_check.py` | 追加 `effect_pattern` 场景 5 条（`SCENES` 末尾，既有阈值未动） |
+
+**本轮验证基线（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **712 例 / 0 失败**（710 + 2 个图案 case） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（含 OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（未加自检项） |
+| `scripts/visual_check.py --scene all` | **197 条 / 33 场景 / 0 失败**（192 → 197，只追加 `effect_pattern`） |
+| `^COMP_API` 导出 | **167**（零新增、零重排） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**视觉探针实测（#FF8800 矩形，缺省参数）：** 96×96 采样窗里白格 4101 px、
+黑格 4141 px，原橙色 0 px；右栏面板打开时差异 23387 px；再次点同一菜单项后
+中心回到 `(255,136,0)`。整条链路（命令号 1519 → 效果写入 → 参数表缺省值 →
+像素求值 → 移除）都有截图与阈值兜底。
+
+**已知边界：**
+
+- **只有四种内置图案**：没有 `.pat` 文件解析、没有图案预设库、没有「从当前图层
+  定义图案」。这是资产链缺口，不是求值缺口。
+- **图案始终对齐图层局部坐标**：没有 PS 的「与图层链接」选项；offset 的语义是
+  图层像素，图层移动时图案跟着走。
+- **缩放是百分比**：`scale=100` 对应 32px 周期，不能直接输入「每格多少像素」。
+- **没有「全局光」角度/高度**：斜面和浮雕、投影各有自己的角度参数，与 PS 的
+  全局光联动仍未做（P1-1 剩余项：合并的图层样式对话框 + 全局光）。
+
+
 
 

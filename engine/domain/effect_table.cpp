@@ -117,6 +117,22 @@ const EffectParam kGradientOverlayParams[] = {
     {"blue2", "End B", kEffectParamNumber, 0.0, 1.0, 1.0},
 };
 
+/* Pattern Overlay（P1-1 第二段）：图案 / 缩放 / 角度 / 偏移 / 不透明度 / 双色。 */
+const EffectParam kPatternOverlayParams[] = {
+    {"pattern", "Pattern (0-3)", kEffectParamNumber, 0.0, 3.0, 0.0},
+    {"scale", "Scale (%)", kEffectParamNumber, 10.0, 1000.0, 100.0},
+    {"angle", "Angle (deg)", kEffectParamNumber, -360.0, 360.0, 0.0},
+    {"offset_x", "Offset X (px)", kEffectParamNumber, -5000.0, 5000.0, 0.0},
+    {"offset_y", "Offset Y (px)", kEffectParamNumber, -5000.0, 5000.0, 0.0},
+    {"opacity", "Opacity (0-1)", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"red", "Color R", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"green", "Color G", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"blue", "Color B", kEffectParamNumber, 0.0, 1.0, 0.0},
+    {"red2", "Bg R", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"green2", "Bg G", kEffectParamNumber, 0.0, 1.0, 1.0},
+    {"blue2", "Bg B", kEffectParamNumber, 0.0, 1.0, 1.0},
+};
+
 #define COMP_EFFECT_PARAMS(array) array, sizeof(array) / sizeof((array)[0])
 
 /* 下标 = effect kind；顺序与 effect_eval.h 的枚举逐字对应。 */
@@ -130,6 +146,7 @@ const EffectKindInfo kKinds[kEffectParamKindCount] = {
     {6u, COMP_EFFECT_PARAMS(kBevelParams)},
     {7u, COMP_EFFECT_PARAMS(kSatinParams)},
     {8u, COMP_EFFECT_PARAMS(kGradientOverlayParams)},
+    {9u, COMP_EFFECT_PARAMS(kPatternOverlayParams)},
 };
 
 #undef COMP_EFFECT_PARAMS

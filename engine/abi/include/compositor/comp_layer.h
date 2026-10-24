@@ -220,17 +220,17 @@ COMP_API comp_result comp_layer_update_adjustment(comp_document document,
                                                   const char* settings_json_utf8);
 
 /*
- * 图层效果：effect 为效果枚举（描边/投影/内阴影/外发光/内发光 等），
- * settings 为 UTF-8 JSON 串。
+ * 图层效果：effect 为效果枚举（描边/投影/内阴影/外发光/内发光/斜面和浮雕/
+ * 颜色叠加/渐变叠加/图案叠加 等），settings 为 UTF-8 JSON 串。
  *
  * 契约说明（与 comp_layer_add_adjustment 的差别，勿混用）：
  *   - effect 是 .comp 格式的引擎扩展键（engineEffects[].effect），取值见
- *     compositing/effect_eval.h 的 kEffectStroke..kEffectInnerGlow（0..5，与格式
+ *     compositing/effect_eval.h 的 kEffectStroke..kEffectPatternOverlay（0..9，与格式
  *     规范一一对应）。内核**不做枚举白名单校验**，以免与 .comp 互通冲突——上游
  *     新增效果类型时旧内核仍应能原样保存与回传；未知 kind 不参与像素求值。
  *   - settings_json_utf8 同理不校验结构，按不透明字符串原样落盘。
  *   - **效果参与像素求值**（S22 记录的「纯元数据」结论已在 S24 复核时推翻）：
- *     6 个 kind 由 compositing/effect_eval.cpp 的 apply_effects 就地求值（单趟），
+ *     10 个 kind 由 compositing/effect_eval.cpp 的 apply_effects 就地求值（单趟），
  *     composite_ops.cpp 先用 effects_margin() 外扩包围盒再调用。回读见下方的
  *     comp_layer_effect_count / comp_layer_effect_at。
  */
@@ -1151,12 +1151,12 @@ COMP_API comp_result comp_layer_duplicate(comp_document document,
 /* ------------------------------------------- 效果参数元数据（P0-2 尾部追加） */
 
 /*
- * 已知效果类型（与 compositing/effect_eval.h 的 kEffectStroke..kEffectGradientOverlay
+ * 已知效果类型（与 compositing/effect_eval.h 的 kEffectStroke..kEffectPatternOverlay
  * 及 shell ui_core 的 kEffectKindCount 数值一致）。
  *
  * 注意：这组枚举只用于**参数面板**。`comp_layer_set_effect` 的 effect 参数仍然
  * 不做白名单校验（未知 kind 原样落盘、不参与求值），本组接口对未知 kind 返回
- * COMP_ERR_INVALID_ARGUMENT —— 面板只编辑内核认识的 9 种，其它效果如实不提供编辑。
+ * COMP_ERR_INVALID_ARGUMENT —— 面板只编辑内核认识的 10 种，其它效果如实不提供编辑。
  */
 typedef enum comp_effect_kind {
   COMP_EFFECT_STROKE = 0,
@@ -1169,9 +1169,11 @@ typedef enum comp_effect_kind {
   COMP_EFFECT_BEVEL = 6,
   COMP_EFFECT_SATIN = 7,
   COMP_EFFECT_GRADIENT_OVERLAY = 8,
+  /* P1-1 第二段尾部追加。 */
+  COMP_EFFECT_PATTERN_OVERLAY = 9,
 } comp_effect_kind;
 
-#define COMP_EFFECT_KIND_COUNT 9
+#define COMP_EFFECT_KIND_COUNT 10
 
 /*
  * 单个可编辑效果参数的元数据。`json_path` 是 settings 对象的**顶层键**

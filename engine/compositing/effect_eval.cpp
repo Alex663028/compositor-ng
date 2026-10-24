@@ -527,9 +527,93 @@ struct EffectPlan {
   double soften = 0.0;        /* 斜面的额外柔化（px） */
   bool invert = false;        /* 缎光取反 */
   bool reverse = false;       /* 渐变叠加反向 */
-  Rgb color2;                 /* 渐变终点色 */
+  Rgb color2;                 /* 渐变终点色 / 图案底色 */
   Rgb shadow_color;           /* 斜面暗面色 */
+  /* P1-1 第二段：图案叠加追加的字段。 */
+  int32_t pattern = 0;        /* 内置图案 0..3（棋盘/网格/斜纹/圆点） */
+  double pattern_scale = 100.0; /* 图案缩放百分比，100 = 32px 周期 */
+  double offset_x = 0.0;      /* 图案平移（文档像素） */
+  double offset_y = 0.0;
 };
+
+/*
+ * 图案叠加（P1-1 第二段）。
+ *
+ * 图案是**程序化内置**的：没有资源文件、没有随机数，坐标先平移、再按 angle
+ * 旋转、最后按 scale 缩放，以 32px 为 100% 基准周期平铺。四种图案：
+ *   0 棋盘   —— 格子坐标 (cu + cv) 的奇偶交替；
+ *   1 网格   —— 每格左边/上边各 1px 的线；
+ *   2 斜纹   —— (u + v) 方向的 45° 条带；
+ *   3 圆点   —— 每格中心一个半径 1/4 格的点。
+ * 与 PS 的「图案预设 + 自定义图案」不同，本仓暂不支持外部图案资源（见 BACKLOG
+ * P1-1 剩余项），因此这里只保证「内置图案可平铺、可旋转、可缩放、可偏移」。
+ */
+
+/* 把 value 环绕到 [0, period)；fmod 对负数保留符号，显式补齐。 */
+double wrap_period(double value, double period) {
+  double r = std::fmod(value, period);
+  if (r < 0.0) r += period;
+  return r;
+}
+
+/* ru/rv 是已经平移、旋转过的图案坐标；tile 是当前缩放下的图案周期。 */
+bool pattern_covers(int32_t pattern, double ru, double rv, double tile) {
+  switch (pattern) {
+    case 1: /* 网格：格子的左/上边界各 1px。 */
+      return wrap_period(ru, tile) < 1.0 || wrap_period(rv, tile) < 1.0;
+    case 2: /* 斜纹：沿 (1,1) 方向的半周期条带。 */
+      return wrap_period(ru + rv, tile * 2.0) < tile;
+    case 3: { /* 圆点：格心半径 1/4 格。 */
+      const double du = wrap_period(ru, tile) - tile * 0.5;
+      const double dv = wrap_period(rv, tile) - tile * 0.5;
+      return du * du + dv * dv <= tile * tile * 0.0625;
+    }
+    default: { /* 0 = 棋盘；越界值在解析处夹到 0..3，这里按 0 处理。 */
+      const double cu = std::floor(ru / tile);
+      const double cv = std::floor(rv / tile);
+      const long long parity =
+          static_cast<long long>(cu) + static_cast<long long>(cv);
+      return (parity % 2) != 0;
+    }
+  }
+}
+
+/*
+ * 以双色图案做 source-atop（图案叠加）。
+ *
+ * 与 recolor_atop / recolor_atop_gradient 同一套预乘与不改变 alpha 的规则；
+ * 区别只是每个像素按自己的图案坐标取前景色或底色。
+ */
+void recolor_atop_pattern(uint8_t* buf, int32_t width, int32_t height, size_t stride,
+                          const EffectPlan& plan, double alpha) {
+  if (alpha <= 0.0) return;
+  constexpr double kPi = 3.14159265358979323846;
+  const double radians = wrap_degrees(plan.angle) * kPi / 180.0;
+  const double c = std::cos(radians);
+  const double s = std::sin(radians);
+  const double tile = std::max(1.0, 32.0 * plan.pattern_scale / 100.0);
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = buf + static_cast<size_t>(y) * stride;
+    const double v = static_cast<double>(y) - plan.offset_y;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* px = row + static_cast<size_t>(x) * 4;
+      const uint8_t a = px[3];
+      if (a == 0) continue;
+      const double u = static_cast<double>(x) - plan.offset_x;
+      const double ru = u * c + v * s;
+      const double rv = -u * s + v * c;
+      const Rgb color = pattern_covers(plan.pattern, ru, rv, tile) ? plan.color : plan.color2;
+      const double a_denom = static_cast<double>(a);
+      for (int ch = 0; ch < 3; ++ch) {
+        const double base_straight = static_cast<double>(px[ch]) / a_denom;
+        const double src_channel = ch == 0 ? color.r : (ch == 1 ? color.g : color.b);
+        const double straight = base_straight * (1.0 - alpha) + src_channel * alpha;
+        const double clamped = straight < 0.0 ? 0.0 : (straight > 1.0 ? 1.0 : straight);
+        px[ch] = to_u8(clamped * a_denom);
+      }
+    }
+  }
+}
 
 /*
  * 规划一个效果。可见性门槛逐条对齐上游 render()：
@@ -644,6 +728,22 @@ DrawKind plan_effect(uint32_t effect, const Settings& s, EffectPlan* plan) {
       plan->reverse = s.boolean("reverse", false);
       plan->opacity = s.unit("opacity", 1.0);
       plan->color = read_color(s); /* 起点色，缺省黑 */
+      plan->color2 = Rgb{s.unit("red2", 1.0), s.unit("green2", 1.0), s.unit("blue2", 1.0)};
+      if (plan->opacity <= 0.0) return DrawKind::kNone;
+      plan->kind = DrawKind::kOver;
+      return plan->kind;
+    }
+
+    case kEffectPatternOverlay: {
+      /* 图案编号越界由 ranged 夹到 0..3（面板量程同值），再四舍五入成整数。 */
+      plan->pattern =
+          static_cast<int32_t>(std::lround(s.ranged("pattern", 0.0, 0.0, 3.0)));
+      plan->pattern_scale = s.ranged("scale", 100.0, 10.0, 1000.0);
+      plan->angle = s.ranged("angle", 0.0, -360.0, 360.0);
+      plan->offset_x = s.ranged("offset_x", 0.0, -5000.0, 5000.0);
+      plan->offset_y = s.ranged("offset_y", 0.0, -5000.0, 5000.0);
+      plan->opacity = s.unit("opacity", 1.0);
+      plan->color = read_color(s); /* 图案「有」的一格，缺省黑 */
       plan->color2 = Rgb{s.unit("red2", 1.0), s.unit("green2", 1.0), s.unit("blue2", 1.0)};
       if (plan->opacity <= 0.0) return DrawKind::kNone;
       plan->kind = DrawKind::kOver;
@@ -767,6 +867,9 @@ void draw_planned(const EffectPlan& plan, const GrayMap& shape, uint8_t* target,
       recolor_atop_gradient(target, width, height, stride, shape, plan.color, plan.color2,
                             plan.angle, plan.reverse, plan.opacity);
       break;
+    case kEffectPatternOverlay:
+      recolor_atop_pattern(target, width, height, stride, plan, plan.opacity);
+      break;
     default:
       break;
   }
@@ -811,6 +914,7 @@ int32_t effects_margin(const std::vector<Effect>& effects) {
       case kEffectBevel:
       case kEffectSatin:
       case kEffectGradientOverlay:
+      case kEffectPatternOverlay:
         break;
       default:
         break; /* 未知效果不预留空间（它也不会被绘制） */

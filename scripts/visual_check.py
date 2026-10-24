@@ -102,6 +102,8 @@ CMD_FILTER_APPLY = 1220
 # 颜色查找、阴影高光、自动三档），0..11 里只有逐像素可做的那几项才发号
 # （见 shells/windows/src/shell_state.h::kImageAdjustKinds）。
 CMD_IMAGE_ADJUST_BASE = 1590
+# 图层 > 效果：kCmdEffectBase(1510) + kind。kind 9 = Pattern Overlay（P1-1 第二段）。
+CMD_EFFECT_BASE = 1510
 CMD_NEW_DOCUMENT_DIALOG = 1560
 CMD_SAVE_AS = 1561
 CMD_IMAGE_SIZE = 1562
@@ -3076,6 +3078,68 @@ def scene_destructive_adjust(shell, checker):
 
 
 
+def scene_effect_pattern(shell, checker):
+    """
+    图案叠加（P1-1 第二段，kind 9）：纯程序化图案，不依赖任何资源文件。
+    缺省参数 = 100% 缩放（32px 周期）的黑白棋盘，因此「加效果」后矩形内部必须
+    同时出现接近纯黑与纯白的像素，且原来的橙色完全消失；再点一次同一菜单项
+    （勾选态 -> 移除）必须逐像素回到橙色。这条链路同时覆盖：
+    命令号 1519 的接线（菜单发号 = kCmdEffectBase + kind）、参数表缺省值真的
+    落到引擎（壳内不拼默认 JSON）、以及效果只在源形状内取色（不外扩）。
+    """
+    scene = "effect_pattern"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    width, height = right - left, bottom - top
+
+    # 一份纯色矩形当底：棋盘的两色都必须能和它区分开（橙 vs 黑/白）。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    x0, y0 = left + 20, top + 20
+    x1, y1 = right - 20, bottom - 20
+    shell.drag(x0, y0, x1, y1, steps=10)
+    img = shell.shot("113_effect_pattern_base")
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    base = mean_rgb(img, (cx - 6, cy - 6, cx + 6, cy + 6))
+    checker.check(scene, "底层纯色矩形", near(base, (255, 136, 0), 40), "实测 %s" % (base,))
+
+    adjust = shell.layout["adjust"]
+    panel_before = img  # 打开面板前的一帧（同一窗口、同一布局）
+    shell.command(CMD_EFFECT_BASE + 9)
+    shell.wait(0.6)
+    img = shell.shot("114_effect_pattern_panel")
+    checker.check(scene, "菜单勾选后右栏出现效果参数面板",
+                  pixel_diff(panel_before, img, (adjust[0], adjust[1], adjust[0] + adjust[2],
+                                                 adjust[1] + adjust[3])) > 40,
+                  "右栏差异像素 %d" % pixel_diff(panel_before, img,
+                                                (adjust[0], adjust[1], adjust[0] + adjust[2],
+                                                 adjust[1] + adjust[3])))
+
+    # Esc 只关面板，图层不动；画布上才是判定图案的主场。
+    shell.press(VK_ESCAPE)
+    shell.wait(0.5)
+    img = shell.shot("115_effect_pattern_checker")
+    # 96x96 的采样窗覆盖 3x3 个 32px 棋盘格，两色都必然出现。
+    probe = (cx - 48, cy - 48, cx + 48, cy + 48)
+    whites = count_matching(img, probe, (255, 255, 255), 10)
+    blacks = count_matching(img, probe, (0, 0, 0), 10)
+    checker.check(scene, "棋盘图案同时有黑格与白格", whites > 400 and blacks > 400,
+                  "白 %d 黑 %d" % (whites, blacks))
+    checker.check(scene, "图案完全盖住底色（橙色不再出现）",
+                  count_matching(img, probe, (255, 136, 0), 40) == 0,
+                  "橙色像素 %d" % count_matching(img, probe, (255, 136, 0), 40))
+
+    # 再点一次同一项 = 移除（面板不打开）；撤销栈由引擎事务负责，这里只验像素。
+    shell.command(CMD_EFFECT_BASE + 9)
+    shell.wait(0.5)
+    img = shell.shot("116_effect_pattern_off")
+    back = mean_rgb(img, (cx - 6, cy - 6, cx + 6, cy + 6))
+    checker.check(scene, "再次勾选移除效果后回到纯色", near(back, (255, 136, 0), 40),
+                  "实测 %s" % (back,))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3108,6 +3172,7 @@ SCENES = [    ("start", scene_start, ()),
     ("brush_options", scene_brush_options, ()),
     ("selection_transform", scene_selection_transform, ()),
     ("layer_transform_numeric", scene_layer_transform_numeric, ()),
+    ("effect_pattern", scene_effect_pattern, ()),
 ]
 
 

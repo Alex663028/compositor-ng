@@ -15,7 +15,7 @@
  * 转出它，外壳不再自持数值。
  *
  * 边界（刻意为之）：
- *   - 只描述**已知的 6 个 kind**；未知 kind 由 set_effect 原样落盘，不在这里拒绝
+ *   - 只描述**已知的 10 个 kind**；未知 kind 由 set_effect 原样落盘，不在这里拒绝
  *     （否则 `.comp` 与上游互通时会丢未知效果）。
  *   - 表里没有的键不会被 build_settings 删除：它只在既有 JSON 上做深合并，
  *     未知键原样保留（前向兼容）。
@@ -52,10 +52,10 @@ struct EffectKindInfo {
 };
 
 /*
- * 已知 kind 总数（0..8 合法）。不叫 kEffectKindCount：effect_eval.h 的同名枚举
+ * 已知 kind 总数（0..9 合法）。不叫 kEffectKindCount：effect_eval.h 的同名枚举
  * 已在同一命名空间里，重名会在同时包含两者的翻译单元里直接冲突。
  */
-constexpr uint32_t kEffectParamKindCount = 9;
+constexpr uint32_t kEffectParamKindCount = 10;
 
 /* effect 非法（>= kEffectKindCount）时返回 nullptr。 */
 const EffectKindInfo* effect_kind_info(uint32_t effect);

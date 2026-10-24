@@ -835,6 +835,7 @@ const wchar_t* effect_kind_label(int kind) {
     case 6: return L"斜面和浮雕";
     case 7: return L"缎光";
     case 8: return L"渐变叠加";
+    case 9: return L"图案叠加";
     default: return L"描边";
   }
 }
@@ -1206,7 +1207,7 @@ void close_effect_panel(ShellState& shell) {
   set_status(shell, L"已关闭效果参数面板");
 }
 
-/* `,` / `.`：在 6 个 kind 之间循环（不必先启用就能预览参数表；回车即添加）。 */
+/* `,` / `.`：在 10 个 kind 之间循环（不必先启用就能预览参数表；回车即添加）。 */
 void panel_effect_cycle_kind(ShellState& shell, int32_t delta) {
   if (selected_row(shell) == nullptr) {
     set_status(shell, L"无图层");

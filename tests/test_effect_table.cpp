@@ -142,7 +142,7 @@ std::vector<std::string> all_params_default_text(uint32_t effect, size_t* out_co
 }  // namespace
 
 COMP_TEST(effect_table_known_kinds_expose_params) {
-  const size_t expected[COMP_EFFECT_KIND_COUNT] = {6, 7, 4, 7, 5, 5, 12, 8, 9};
+  const size_t expected[COMP_EFFECT_KIND_COUNT] = {6, 7, 4, 7, 5, 5, 12, 8, 9, 12};
   for (uint32_t kind = 0; kind < COMP_EFFECT_KIND_COUNT; ++kind) {
     size_t count = 0;
     COMP_CHECK(comp_layer_effect_param_count(kind, &count) == COMP_OK);

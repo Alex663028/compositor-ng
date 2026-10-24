@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **167**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **192 条 / 32 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **167**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **197 条 / 33 场景**；落地规则见 §6）。
 > 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
 > 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -86,6 +86,13 @@
 > 只改宽度不会把 22.5° 圆成 23°；组/空图层在开面板前就拒。
 > P1-3 剩余：斜切/扭曲/透视/变形（Warp，需要新 ABI——现有 transform 只有 rect+rotation）、
 > 内容识别缩放。
+> **2026-10-24 第十九批**：P1-1 第二段「图案叠加」（**零新导出**，仍 167；
+> `COMP_EFFECT_KIND_COUNT` 9 → 10，参数表 9 → 10 张，单测 710 → **712 例**，
+> 视觉探针 192 → **197 条 / 33 场景**，壳自检 263 项 SHA 未变，见 README §6.104）。
+> 四种内置程序化图案（棋盘/网格/斜纹/圆点）按 scale/angle/offset 平铺、双色
+> source-atop 叠色，**不依赖 `.pat` 资源文件**；inside 类零外扩，effects_margin 返回 0；
+> 命令号 1519 恰好填满 1510..1519，`kCmdEffectClear`（1520）不动。
+> **图层样式至此 10/10**；P1-1 剩余：合并的图层样式对话框、全局光角度/高度。
 
 标签说明（用于排期与判断"能不能只改外壳"）：
 
@@ -107,7 +114,7 @@
 | 工具 | **20**（`ui_core.h` `tool_table()`） | 工具栏 60+（含嵌套变体） | 引擎算子多、工具少 |
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp:397-410` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **25**（`comp_layer.h`；前 12 种对齐上游，后 13 种为本仓追加） | 调整菜单 20+ | 破坏性 `Image > Adjustments` 已落地 20 种（§6.94～§6.95）；调整层与破坏性入口共用同一批 kind，仍缺 Camera Raw 之外的外部 LUT 文件与 RAW 解码 |
-| 图层样式 | **9**（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/渐变叠加） | 10 | 缺图案叠加；无合并的样式对话框与全局光角度设置 |
+| 图层样式 | **10**（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/渐变叠加/图案叠加） | 10 | 十种样式已齐；仍无合并的样式对话框与全局光角度设置，图案只有四种内置 |
 | 滤镜 | **11**（`comp_filter.h:39-51`） | 100+ | 无模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染；锐化（USM）与降噪已进 Filter 菜单 |
 | 可用格式 | 导入 PNG/JPEG/PSD/HDR/EXR；导出 PNG/JPEG/PSD/EXR + `.comp` | 20+ | PSD 只是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW（`docs/format-import-matrix.md:44-51`） |
 | 文档 | **单文档**、单个 `ShellState::document` | 多标签 | 新建会直接销毁旧文档（`shell_document.cpp:255/313`） |
@@ -396,11 +403,17 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   `COMP_EFFECT_KIND_COUNT` 6 → 9、参数表 9 张（12/8/9 行），外壳效果菜单自动多出三项
   （`kEffectKindCount = 9`，菜单按它循环），参数在既有 `Ctrl+Shift+E` 面板里可改。
   三者都是 inside 类（source-atop、不改 alpha、`effects_margin()=0`），壳自检 263 项 SHA 未变。
-- 剩余：图案叠加（需图案资源 + 缩放/对齐参数）、合并的图层样式对话框、全局光角度/高度
-  （现在斜面的角度/高度角是逐效果参数，不跟其它效果联动）。
+- **已落地（2026-10-24，README §6.104，零新导出）**：图案叠加（kind 9），
+  `COMP_EFFECT_KIND_COUNT` 9 → 10、参数表 10 张（12 行）；四种内置程序化图案
+  （棋盘/网格/斜纹/圆点）按 scale/angle/offset 平铺、双色 source-atop，无 `.pat`
+  资源依赖，inside 类零外扩。**十种图层样式至此全部齐备。**
+- 剩余：合并的图层样式对话框、全局光角度/高度
+  （现在斜面的角度/高度角是逐效果参数，不跟其它效果联动）；图案只有四种内置，
+  无图案预设库与「从图层定义图案」。
+- 性质：【引擎】M +【ABI 追加】（新 effect kind 追加到 `COMP_EFFECT_*` 尾部，值 6..9）。
+  —— kind 6..9 已全部落地（§6.97、§6.104），本条 ABI 部分关闭。
 - 组支持混合模式（现在 `comp_file.cpp:285` 对组强制 Normal）；Pass Through 应成为显式枚举而非仅 `isolated` 开关。
   —— 组混合模式与 `engineBlendMode`/`engineIsolated` 往返已于 2026-10-23 落地（§6.87），此处只剩语义校验。
-- 性质：【引擎】M +【ABI 追加】（新 effect kind 追加到 `COMP_EFFECT_*` 尾部，值 6..9）。
 
 ### P1-2 图层管理
 锁定（像素/位置/透明/全部）、图层链接、颜色标签、按类型/名称/颜色过滤、图层复合（Layer Comps）、智能对象与智能滤镜、栅格化、合并可见、反向排列、样式拷贝/粘贴、新建填充层（纯色/渐变/图案）。
@@ -601,7 +614,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 文字样式字段 | `engine/abi/include/compositor/comp_layer.h:762-767`（可编辑文字对象见同文件尾部 P0-6 ①） |
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | 渐变仅两色标 | `engine/abi/include/compositor/comp_layer.h:660-669` |
-| 9 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 |
+| 10 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 / §6.104 |
 | 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |

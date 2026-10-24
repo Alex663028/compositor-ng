@@ -1912,7 +1912,7 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
         panel_set_sampling(shell, static_cast<int>(id - kCmdSamplingBase));
         break;
       }
-      /* 效果菜单项（S24）：kCmdEffectBase + kind 0..5，勾选 = 已启用。 */
+      /* 效果菜单项（S24）：kCmdEffectBase + kind 0..9，勾选 = 已启用。 */
       if (id >= kCmdEffectBase && id < kCmdEffectBase + comp_ui::kEffectKindCount) {
         panel_toggle_effect(shell, static_cast<int>(id - kCmdEffectBase));
         break;

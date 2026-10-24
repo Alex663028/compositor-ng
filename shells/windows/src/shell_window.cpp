@@ -187,7 +187,7 @@ void sync_menu_state(HWND window, ShellState& shell) {
                                kCmdBlendBase + static_cast<UINT>(comp_ui::kBlendCount) - 1,
                                kCmdBlendBase + static_cast<UINT>(checks.blend));
   }
-  /* 效果项：6 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
+  /* 效果项：kEffectKindCount 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
     const bool present =
         comp_ui::effect_list_contains(shell.doc.effect_kinds.empty() ? nullptr : shell.doc.effect_kinds.data(),

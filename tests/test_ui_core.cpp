@@ -3226,15 +3226,16 @@ COMP_TEST(ui_core_layer_menu_rasterize_text_needs_text_layer) {
 /*
  * 效果档位表（S24）。
  *
- * 数值 0..8 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序
- * （effect_eval.cpp 的 kEffectStroke..kEffectGradientOverlay）逐字一致：菜单 id 用
+ * 数值 0..9 是 .comp 的 engineEffects[].effect，顺序必须与引擎落笔判定顺序
+ * （effect_eval.cpp 的 kEffectStroke..kEffectPatternOverlay）逐字一致：菜单 id 用
  * kCmdEffectBase + kind 拼出来，表错一位就是「点描边结果加了投影」。
  */
 COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
-  const char* expected[] = {"Stroke",     "Drop Shadow", "Color Overlay",
-                            "Inner Shadow", "Outer Glow", "Inner Glow",
-                            "Bevel & Emboss", "Satin",   "Gradient Overlay"};
-  COMP_CHECK(comp_ui::kEffectKindCount == 9);
+  const char* expected[] = {"Stroke",       "Drop Shadow",     "Color Overlay",
+                            "Inner Shadow", "Outer Glow",      "Inner Glow",
+                            "Bevel & Emboss", "Satin",         "Gradient Overlay",
+                            "Pattern Overlay"};
+  COMP_CHECK(comp_ui::kEffectKindCount == 10);
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
     COMP_CHECK_MSG(std::string(comp_ui::effect_kind_name(kind)) == expected[kind],
                    "效果档位顺序必须与引擎一致");
@@ -3245,7 +3246,7 @@ COMP_TEST(ui_core_effect_kind_table_matches_engine_order) {
   COMP_CHECK(comp_ui::clamp_effect_kind(comp_ui::kEffectKindCount) ==
              comp_ui::kEffectKindCount - 1);
   COMP_CHECK(std::string(comp_ui::effect_kind_name(-1)) == "Stroke");
-  COMP_CHECK(std::string(comp_ui::effect_kind_name(99)) == "Gradient Overlay");
+  COMP_CHECK(std::string(comp_ui::effect_kind_name(99)) == "Pattern Overlay");
 
   /* 勾选判定：null / 空表必须 false，命中与未命中都要对。 */
   const uint32_t kinds[] = {2u, 5u};

@@ -8,7 +8,7 @@
  * `merge_down` 因为「无法烘入」直接拒绝带效果的图层。宿主只能写不能看。
  *
  * 冻结的行为要点：
- *   1. 9 种 kind 全部有像素实现，且在非恒等参数下逐字节改变渲染结果；
+ *   1. 10 种 kind 全部有像素实现，且在非恒等参数下逐字节改变渲染结果；
  *   2. 隐藏带效果的图层 ⇒ 渲染结果逐字节回到无效果状态；
  *   3. 不可见参数（opacity=0 / size=0 / 距离与模糊同时为 0）⇒ 逐字节不变；
  *   4. 坏 JSON / 未知 kind ⇒ 跳过而不是产出错误像素，更不会让整篇合成失败；
@@ -129,7 +129,7 @@ bool clear(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
   return alpha_at(buf, x, y) == 0;
 }
 
-/* 9 种 kind 的非恒等参数。键名逐字取自上游 LayerEffects.swift 的字段名。 */
+/* 10 种 kind 的非恒等参数。键名逐字取自上游 LayerEffects.swift 的字段名。 */
 struct EffectCase {
   uint32_t kind;
   const char* name;
@@ -155,11 +155,13 @@ const EffectCase kEvaluatedEffects[] = {
     {7, "satin", R"({"angle":0,"distance":2,"blur":0,"opacity":1,"red":0,"green":1,"blue":0})"},
     /* 渐变叠加：左黑右白。 */
     {8, "gradient-overlay", R"({"angle":0,"opacity":1,"red":0,"green":0,"blue":0,"red2":1,"green2":1,"blue2":1})"},
+    /* 图案叠加：10% 缩放的棋盘（周期 3.2px，方块内部会跨格）。 */
+    {9, "pattern-overlay", R"({"pattern":0,"scale":10,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})"},
 };
 
 }  // namespace
 
-/* 1. 9 种 kind 全部改变像素（此前它们全部是 no-op）。 */
+/* 1. 10 种 kind 全部改变像素（此前它们全部是 no-op）。 */
 COMP_TEST(effect_eval_every_kind_changes_pixels) {
   for (const EffectCase& c : kEvaluatedEffects) {
     Fixture fx;
@@ -595,4 +597,94 @@ COMP_TEST(effect_eval_unknown_kind_blocks_flatten) {
                  "unknown effect must not crash the render path");
   /* comp_document_flatten 走域路径，应明确拒绝。 */
   COMP_CHECK(comp_document_flatten(fx.doc) == COMP_ERR_UNSUPPORTED);
+}
+
+/*
+ * 16. 图案叠加：棋盘按 scale 平铺、按 angle 旋转，且 source-atop 不越界。
+ *
+ * 方块是 (4..8, 4..8)；scale=10% 让周期变成 3.2px，方块内部会跨格：
+ *   (4,6) 的格子坐标 (1,1) 为偶 => 底色蓝；(7,6) 为 (2,1) 奇 => 前景红。
+ * 90° 旋转把 (u,v) 换成 (v,-u)，(cu+cv) 的奇偶整体翻转 => 两点颜色互换。
+ */
+COMP_TEST(effect_eval_pattern_overlay_tiles_and_rotates) {
+  const char* kChecker0 =
+      R"({"pattern":0,"scale":10,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})";
+  const char* kChecker90 =
+      R"({"pattern":0,"scale":10,"angle":90,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})";
+  const size_t cell_bg = (static_cast<size_t>(6) * kW + 4) * 4; /* 蓝色格 */
+  const size_t cell_fg = (static_cast<size_t>(6) * kW + 7) * 4; /* 红色格 */
+
+  Fixture fx;
+  const comp_layer_id id = add_square(fx.doc);
+  COMP_CHECK(comp_layer_set_effect(fx.doc, id, 9, kChecker0) == COMP_OK);
+  const std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(after[cell_bg + 2] > 200 && after[cell_bg + 0] < 40,
+                 "pattern background cell must take the second color");
+  COMP_CHECK_MSG(after[cell_fg + 0] > 200 && after[cell_fg + 2] < 40,
+                 "pattern foreground cell must take the first color");
+  /* source-atop：图层 alpha 不变，方块之外一个像素都不碰。 */
+  COMP_CHECK(alpha_at(after, 4, 6) == 255);
+  COMP_CHECK(clear(after, 0, 0));
+  COMP_CHECK(clear(after, 11, 7));
+
+  Fixture rotated;
+  const comp_layer_id rid = add_square(rotated.doc);
+  COMP_CHECK(comp_layer_set_effect(rotated.doc, rid, 9, kChecker90) == COMP_OK);
+  const std::vector<uint8_t> turned = flatten(rotated.doc);
+  COMP_CHECK_MSG(turned[cell_bg + 0] > 200 && turned[cell_bg + 2] < 40,
+                 "90 deg must rotate the checker (cell parity flips)");
+  COMP_CHECK_MSG(turned[cell_fg + 2] > 200 && turned[cell_fg + 0] < 40,
+                 "90 deg must rotate the checker on the other cell too");
+}
+
+/*
+ * 17. 图案叠加的四种内置图案互不相同；越界参数被夹取；opacity=0 逐字节不变。
+ *
+ * 「互不相同」是防止四种 pattern 值最后都落到同一条分支——只测一种的话，
+ * 复制粘贴写错 case 号不会有任何信号。
+ */
+COMP_TEST(effect_eval_pattern_overlay_kinds_and_limits) {
+  auto render = [](const char* settings) {
+    Fixture fx;
+    const comp_layer_id id = add_square(fx.doc);
+    COMP_CHECK(comp_layer_set_effect(fx.doc, id, 9, settings) == COMP_OK);
+    return flatten(fx.doc);
+  };
+  const char* kHead = R"({"scale":10,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1,"pattern":)";
+  auto with_pattern = [&](int pattern) {
+    std::string json(kHead);
+    json += std::to_string(pattern);
+    json += "}";
+    return render(json.c_str());
+  };
+
+  const std::vector<uint8_t> checker = with_pattern(0);
+  const std::vector<uint8_t> grid = with_pattern(1);
+  const std::vector<uint8_t> stripes = with_pattern(2);
+  const std::vector<uint8_t> dots = with_pattern(3);
+  COMP_CHECK_MSG(checker != grid, "checker and grid must differ");
+  COMP_CHECK_MSG(checker != stripes, "checker and stripes must differ");
+  COMP_CHECK_MSG(checker != dots, "checker and dots must differ");
+  COMP_CHECK_MSG(grid != stripes, "grid and stripes must differ");
+  COMP_CHECK_MSG(grid != dots, "grid and dots must differ");
+  COMP_CHECK_MSG(stripes != dots, "stripes and dots must differ");
+
+  /* ranged 夹取：pattern 99 -> 3，scale 0 -> 10，angle 360 与 0 同义。 */
+  COMP_CHECK_MSG(with_pattern(99) == dots, "out-of-range pattern must clamp to 3");
+  COMP_CHECK_MSG(render(R"({"pattern":1,"scale":0,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})") ==
+                     render(R"({"pattern":1,"scale":10,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})"),
+                 "scale below 10% must clamp");
+  COMP_CHECK_MSG(render(R"({"pattern":1,"scale":10,"angle":360,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})") ==
+                     render(R"({"pattern":1,"scale":10,"angle":0,"opacity":1,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})"),
+                 "angle 360 must be identical to 0");
+
+  /* opacity = 0 是合法的「不可见」：逐字节回到没有效果的状态。 */
+  Fixture fx;
+  const comp_layer_id id = add_square(fx.doc);
+  const std::vector<uint8_t> plain = flatten(fx.doc);
+  COMP_CHECK(comp_layer_set_effect(
+                 fx.doc, id, 9,
+                 R"({"pattern":0,"scale":10,"angle":0,"opacity":0,"red":1,"green":0,"blue":0,"red2":0,"green2":0,"blue2":1})") ==
+             COMP_OK);
+  COMP_CHECK_MSG(flatten(fx.doc) == plain, "opacity 0 must leave pixels byte-identical");
 }
