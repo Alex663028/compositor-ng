@@ -5111,7 +5111,14 @@ enum class DocDialogKind {
    * 没退就补一个键」，系统模态弹窗既不吃注入的键、又会把每次目视跑拖成超时。
    * 放进右栏面板后它和别的文档级对话框共用同一套键位与命中，脚本按 D 即可。
    */
-  ClosePrompt
+  ClosePrompt,
+  /*
+   * P0-5 收尾：变换选区（Select > Transform Selection 的数值/旋转部分）。
+   * 选区手柄只能做轴对齐缩放；这里补上「宽 / 高 / 角度」三行数值输入，
+   * 回车走 comp_selection_transform（ABI 尾部第 167 项）。中心点固定为
+   * 当前基础蒙版的包围盒中心，一次命令内可预期；Esc 不改文档。
+   */
+  TransformSelection
 };
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
@@ -5141,6 +5148,12 @@ inline constexpr int kDocHistoryBudgetMaxMb = 16384;
  */
 inline constexpr int kCameraRawRowCount = 12;
 inline constexpr int kCameraRawExposureMax = 500;
+
+/* 变换选区的角度：-180..180 度（顺时针为正），←/→ 以 15° 为步长；
+ * 数字键入不受步长限制，-180 这类值按行首负号输入。 */
+inline constexpr int kTransformAngleMin = -180;
+inline constexpr int kTransformAngleMax = 180;
+inline constexpr int kTransformAngleStep = 15;
 
 /*
  * 关闭提示的三个动作。行值直接就是这三个常量：面板显示、状态栏、执行分支读同
@@ -5197,6 +5210,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "Camera Raw 滤镜（Camera Raw Filter）";
     case DocDialogKind::ClosePrompt:
       return "关闭文档（Close）";
+    case DocDialogKind::TransformSelection:
+      return "变换选区（Transform Selection）";
     default:
       return "";
   }
@@ -5216,6 +5231,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "对选中图层整层写入（Basic 组；一步撤销）";
     case DocDialogKind::ClosePrompt:
       return "文档有未保存的修改 · 关闭前请选择";
+    case DocDialogKind::TransformSelection:
+      return "中心固定为当前选区中心 · 角度顺时针为正";
     default:
       return "";
   }
@@ -5235,6 +5252,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "Tab 切行 · 负值用 - 开头 · 回车应用";
     case DocDialogKind::ClosePrompt:
       return "不保存 = 这次修改连同撤销栈一起丢弃";
+    case DocDialogKind::TransformSelection:
+      return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
     default:
       return "";
   }
@@ -5254,6 +5273,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
       return kCameraRawRowCount;
     case DocDialogKind::ClosePrompt:
       return 1; /* 动作 */
+    case DocDialogKind::TransformSelection:
+      return 3; /* 宽 / 高 / 角度 */
     default:
       return 0;
   }
@@ -5321,6 +5342,16 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
     case DocDialogKind::ClosePrompt:
       if (row == 0) {
         return DocRowSpec{"动作", DocRowKind::Choice, 0, 2, 1, 3};
+      }
+      break;
+    case DocDialogKind::TransformSelection:
+      switch (row) {
+        case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};
+        case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};
+        case 2:
+          return DocRowSpec{"角度 (°)", DocRowKind::Number, kTransformAngleMin,
+                            kTransformAngleMax, kTransformAngleStep, 0};
+        default: break;
       }
       break;
     default:

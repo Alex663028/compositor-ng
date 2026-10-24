@@ -526,6 +526,13 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
     case comp_ui::DocDialogKind::ClosePrompt:
       if (row != 0) return 0;
       return shell.doc.doc_dialog_close_action;
+    case comp_ui::DocDialogKind::TransformSelection:
+      switch (row) {
+        case 0: return shell.doc.doc_dialog_width;
+        case 1: return shell.doc.doc_dialog_height;
+        case 2: return shell.doc.doc_dialog_angle;
+        default: return 0;
+      }
     default:
       return 0;
   }
@@ -624,6 +631,22 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
       if (value > comp_ui::kCloseActionCancel) value = comp_ui::kCloseActionCancel;
       shell.doc.doc_dialog_close_action = value;
       break;
+    case comp_ui::DocDialogKind::TransformSelection:
+      /* 夹取区间同样取自行规格（宽/高 = 文档尺寸量程，角度 = ±180）。
+       * 宽/高允许到 1，退化到 0 由「收成空选区」分支处理，所以这里不额外抬。 */
+      {
+        const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc.doc_dialog, row);
+        int clamped = value;
+        if (clamped < spec.min) clamped = spec.min;
+        if (clamped > spec.max) clamped = spec.max;
+        switch (row) {
+          case 0: shell.doc.doc_dialog_width = clamped; break;
+          case 1: shell.doc.doc_dialog_height = clamped; break;
+          case 2: shell.doc.doc_dialog_angle = clamped; break;
+          default: break;
+        }
+      }
+      break;
     default:
       break;
   }
@@ -665,6 +688,13 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
       return buffer;
     case comp_ui::DocDialogKind::CanvasSize:
       wsprintfW(buffer, L"%d px", value);
+      return buffer;
+    case comp_ui::DocDialogKind::TransformSelection:
+      if (row == 2) {
+        wsprintfW(buffer, L"%d 度", value);
+      } else {
+        wsprintfW(buffer, L"%d px", value);
+      }
       return buffer;
     case comp_ui::DocDialogKind::HistoryLimit:
       if (row == 0) {
@@ -719,6 +749,16 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
     }
     if (!shell.camera_raw_tables_loaded) {
       set_status(shell, L"Camera Raw：色彩表未加载（缺 resources/camera_raw_tables.bin）");
+      return;
+    }
+  }
+  if (kind == comp_ui::DocDialogKind::TransformSelection) {
+    /*
+     * 变换选区要有一张真的能变换的蒙版：selection_active 对**显式空选区**也为真，
+     * 所以这里看基础蒙版的紧包围盒——没有可变换的几何就直接回退，不开空面板。
+     */
+    if (shell.doc.selection_base.w <= 0 || shell.doc.selection_base.h <= 0) {
+      set_status(shell, L"变换选区：请先建立一个选区");
       return;
     }
   }
@@ -780,6 +820,16 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
     case comp_ui::DocDialogKind::ClosePrompt:
       /* 缺省落在「保存」：回车是安全动作，误触不会丢像素。 */
       shell.doc.doc_dialog_close_action = comp_ui::kCloseActionSave;
+      break;
+    case comp_ui::DocDialogKind::TransformSelection:
+      /*
+       * 起点 = 当前基础蒙版的紧包围盒、角度 0：不填任何数直接回车就是**恒等变换**
+       * （引擎 masks_equal 短路由，changed = 0，不落撤销步）。中心点不另存：
+       * 应用时现取包围盒中心，避免面板开着时选区被别的命令改动后中心漂移。
+       */
+      shell.doc.doc_dialog_width = comp_ui::clamp_doc_size(shell.doc.selection_base.w);
+      shell.doc.doc_dialog_height = comp_ui::clamp_doc_size(shell.doc.selection_base.h);
+      shell.doc.doc_dialog_angle = 0;
       break;
     default:
       break;
@@ -1125,6 +1175,42 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
     refresh_history_status(shell, buffer);
     return;
   }
+
+  if (kind == comp_ui::DocDialogKind::TransformSelection) {
+    /*
+     * 中心点现算而不是打开面板时缓存：面板开着期间选区可能被撤销/重做换掉
+     * （undo 会刷新 selection_base），缓存中心会把它转到一个不存在的位置上。
+     */
+    const comp_ui::Rect base = shell.doc.selection_base;
+    if (base.w <= 0 || base.h <= 0) {
+      doc_dialog_close(shell, L"变换选区：选区已不存在（未改动）");
+      return;
+    }
+    comp_selection_transform_desc transform{};
+    transform.center_x = static_cast<double>(base.x) + base.w * 0.5;
+    transform.center_y = static_cast<double>(base.y) + base.h * 0.5;
+    transform.width = shell.doc.doc_dialog_width;
+    transform.height = shell.doc.doc_dialog_height;
+    transform.angle_degrees = shell.doc.doc_dialog_angle;
+    int32_t changed = 0;
+    const comp_result result = comp_selection_transform(shell.doc.document, transform, &changed);
+    if (result != COMP_OK) {
+      /* 面板留着，用户填的数不丢；引擎在事务之前就拒了，没有半成品。 */
+      set_status(shell, L"变换选区：应用失败（文档未改动）");
+      return;
+    }
+    if (changed == 0) {
+      /* 恒等（角度 0 且尺寸等于当前包围盒）：引擎没动蒙版，也就不该落撤销步。 */
+      set_status(shell, L"变换选区：选区未变化（未产生撤销步）");
+      return;
+    }
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[224];
+    wsprintfW(buffer, L"变换选区：%d×%d · %d 度（撤销一步）", shell.doc.doc_dialog_width,
+              shell.doc.doc_dialog_height, shell.doc.doc_dialog_angle);
+    finish_selection_command(shell, buffer);
+    return;
+  }
 }
 
 /*
@@ -1430,6 +1516,10 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdSelectSimilar:
       grow_similar_selection(shell, true);
+      break;
+    /* ---- P0-5 收尾：变换选区（宽 / 高 / 角度数值输入） ---- */
+    case kCmdSelectTransform:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::TransformSelection);
       break;
     case kCmdSelectLoadPixels:
       load_layer_pixels_selection(shell);

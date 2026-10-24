@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 当时只读（2026-10-23 起改为树内自研的分层读写，见 §6.87）；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **654 用例 0 失败**；Windows 外壳实机自检 **263 项全 OK**（与仓内基线逐字节一致）。
+  全量 **710 用例 0 失败**；Windows 外壳实机自检 **263 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -7189,5 +7189,103 @@ ABI 层据此返回 `COMP_ERR_INVALID_ARGUMENT`，magic 比较退化为「登记
   API 契约（`document.h` 明确写了）；本轮修的是**测试**违反契约的用法，引擎侧没有改动。
 - **ASan 只跑了单测**：Windows 壳与 GPU 后端（D3D12）没有 ASan 构建；GPU 路径的悬垂风险
   仍靠代码审读与既有用例覆盖。
+
+### 6.102 变换选区：数值宽高 + 旋转（P0-5 收尾，2026-10-24，Claude）
+
+**缺口。** 选区手柄（§5.44）早就能拖，但只能拖**轴对齐矩形**：没有「变换选区」命令，
+没有数值输入，也没有旋转。PS 的 `选择 > 变换选区` 恰恰是这三件事叠在一起——把蚂蚁线
+当成一个可变换的矩形，用键盘给准确的宽高和角度。本项补齐这条命令，
+**ABI 尾部追加 1 个导出，166 → 167**，没有改任何既有函数、结构体或枚举。
+
+**ABI。** `comp_selection_transform_desc`（中心、宽、高、角度）+ 一个函数：
+
+```c
+comp_result comp_selection_transform(comp_document document,
+                                     comp_selection_transform_desc transform,
+                                     int32_t* out_changed);
+```
+
+契约（都写进了 `comp_selection.h`）：
+
+| 输入 | 行为 |
+|---|---|
+| 角度 0 且宽高等于 `comp_selection_get_base_bounds` | **逐字节恒等**，`out_changed = 0`，不落空撤销步 |
+| 角度按 y 向下、顺时针为正 | 先对 360 取模；`90` 与 `-270` 等价 |
+| `width` / `height` ≤ 0 | 显式空选区（`active` 仍为 1），与退化手柄同口径 |
+| 目标越出画布 | 取旋转矩形的**轴对齐包围盒**，越界部分裁掉 |
+| 没有选区 | 无操作，`out_changed = 0` |
+| `feather` | 原样保留（半径不是被变换的几何） |
+| NaN / Inf，或 \|center\|、宽、高 > 1e6 | `COMP_ERR_INVALID_ARGUMENT`，**事务之前**拒绝 |
+
+**引擎：逆仿射 + 双线性，角度 0 直接委托。** `selection_transform_rotated` 只做一件事：
+遍历目标矩形包围盒的每个像素中心，逆旋转回「未旋转矩形」的坐标系，映射到源包围盒内
+取双线性样本。这里有三个刻意的选择：
+
+1. **角度 0 不另写一条路径**，直接调既有的 `selection_transform_bounds`。恒等性因此
+   与手柄缩放共用同一份代码：目标矩形与源包围盒相等时，双线性权重恰好全落在原像素上，
+   `masks_equal` 再兜一层，`next` 与 `base` 逐字节相同 → 不写回、不落步。
+2. **`span` 先夹再转 `int64`**：`floor/ceil` 的结果可能落在 `[0, limit]` 之外（贴着画布
+   边、或数值巨大），先夹到 `[0, width]` / `[0, height]` 再转整型，避免浮点转整型的
+   未定义行为。
+3. **NaN 闸在引擎和 ABI 各有一道**：引擎侧返回 `false`（调用方映射成 `COMP_ERR_STATE`），
+   ABI 侧在 `ImplicitTxn` 之前就返回 `COMP_ERR_INVALID_ARGUMENT`——所以「被拒」一定
+   **没有半成品、没有历史条目**。1e6 那个上限只是挡「有限但会让 `lround` 溢出」的数，
+   不是业务约束（画布上限 30000）。
+
+**「转 90° 就是交换宽高」是可证的。** 目标矩形先按 `width × height` 画好，再绕中心旋转
+`θ`；它的轴对齐包围盒是 `(w|cosθ| + h|sinθ|) × (w|sinθ| + h|cosθ|)`。θ = 90° 时恰为
+`h × w`，且中心不动。视觉探针直接量这四个边：转前 240×120 屏幕像素，转后 244 高 ×
+124 宽，中心 `(592, 357)` 前后完全相同——这条断言能同时挡住「没转」和「转 45°」。
+
+**外壳：复用 `doc_dialog` 框架，三行数字。** 没有新面板类：`DocDialogKind::TransformSelection`
+就是宽 / 高 / 角度三行，标题、副标题、提示、Tab/数字/回车/Esc 全部走 §5.44 之外的
+既有 `doc_dialog` 机制（`draw_doc_dialog` 一行未改）。细节：
+
+- **打开前看真几何**：`selection_active` 对显式空选区也为真，所以闸门看
+  `selection_base` 的宽高（正是被变换的那张蒙版），`<= 0` 就不开面板。
+- **起点 = 当前包围盒、角度 0**：直接回车是恒等；`changed == 0` 时**面板不关**，
+  状态栏写「选区未变化（未产生撤销步）」，用户填的数不丢。
+- **中心点现取**：面板开着时撤销/重做会换掉选区，打开时缓存中心会把它转到一个
+  已经不存在的位置上；应用时用当前 `selection_base` 现算。
+- **角度行量程来自 `DocRowSpec`**：−180..180、步进 15°；既有输入态只对
+  `spec.min < 0` 的行接受行首 `-`、缓冲上限 5 字符，−180 放得下，不为它开特例。
+- 命令号 **1062**，菜单项 `变换选区(&T)...`，置灰沿用 `enabled.selection_modify`。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_selection.h` | 尾部追加 `comp_selection_transform_desc` 与 `comp_selection_transform`（+ 契约注释） |
+| `engine/domain/selection.h` / `selection.cpp` | `SelectionTransformRect`、`selection_transform_rotated`（逆仿射 + 双线性 + 包围盒裁剪 + 恒等委托） |
+| `engine/abi/src/comp_selection_abi.cpp` | ABI 包装：guard → NaN/量级闸（事务前）→ `ImplicitTxn` → `finish(...)` |
+| `shells/windows/src/ui_core.h` | `DocDialogKind::TransformSelection`、三行 `DocRowSpec`、标题/副标题/提示、角度量程常量 |
+| `shells/windows/src/shell_state.h` | `kCmdSelectTransform = 1062`、`doc_dialog_angle` |
+| `shells/windows/src/shell_document.cpp` | 行值 get/set/文本、打开闸门与起点、应用分支、命令分发 |
+| `shells/windows/src/shell_window.cpp` | 菜单项 + 置灰 |
+| `tests/test_selection.cpp` | 5 例：逐字节恒等、90° 绕中心、退化宽高、无选区 no-op、NaN/Inf/超限在事务前拒绝 |
+| `tests/test_ui_core.cpp` | 面板三行的行数/量程/步进/标题断言 |
+| `scripts/visual_check.py` | 追加 `selection_transform` 场景 10 条（`SCENES` 末尾，既有阈值未动） |
+
+**本轮验证基线（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **710 例 / 0 失败**（705 → 710，新增 5 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（本轮不加自检项） |
+| `scripts/visual_check.py --scene all` | **181 条 / 31 场景 / 0 失败**（171 → 181，只追加 `selection_transform`） |
+| `^COMP_API` 导出 | **167**（166 → 167，尾部追加一条，无重排） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**已知边界：**
+
+- **只变换选区，不动像素**：这与 PS 的 `变换选区` 一致；要连像素一起变，走既有的
+  `自由变换` 族（P1-3 的斜切/扭曲/透视仍未做）。
+- **中心固定**：取包围盒几何中心，不能像 PS 那样拖中心点或改用某个角为轴。
+- **整数角度**：面板只收整数度（`wsprintfW` 没有浮点格式）；引擎侧接受 `double`，
+  宿主可以给 `22.5`，但壳上填不进去。
+- **没有实时预览**：回车才落墨，面板开着时蚂蚁线仍是原矩形。
+- **旋转后的大矩形退化**：`angle = 90` 且宽高相等的正方形是恒等（`masks_equal` 短路），
+  不落步——这与「用户以为转了一下」的直觉不同，但逐字节结果确实没变。
+- **重开面板回显包围盒**：旋转后的紧包围盒仍轴对齐，所以再次打开看到的是包围盒，
+  不是上一轮那个旋转矩形的宽高/角度（头文件已写明）。
 
 

@@ -183,6 +183,33 @@ bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool
  */
 bool selection_transform_bounds(SelectionState* selection, comp_rect target, bool* changed);
 
+/*
+ * 变换选区（带旋转，P0-5 收尾）：把基础蒙版重采样到「以 (center_x, center_y)
+ * 为中心、width × height、顺时针旋转 angle_degrees」的矩形。
+ *
+ * 与 selection_transform_bounds 的关系：
+ *   - angle = 0 时直接转调它：同中心同尺寸 ⇒ 逐字节恒等、changed = false；
+ *   - 非零角度：目标区域取旋转矩形的**轴对齐包围盒**并按画布裁剪；目标像素
+ *     中心先逆旋转回「未旋转矩形」坐标系，再走同一把双线性采样尺子。
+ *     角度按 y 向下的顺时针为正，先取模 360；
+ *   - width / height <= 0 等价于「把选区收成空」（显式空选区，active 保持 1）；
+ *   - 没有选区 / 基础蒙版为空时无操作（changed = false）；
+ *   - feather 半径原样保留（羽化是选区参数，不是几何的一部分）。
+ *
+ * 参数必须全部有限（NaN / Inf -> false，ABI 在事务之前拦）；画布尺寸与蒙版
+ * 缓冲不一致（损坏状态）返回 false。
+ */
+struct SelectionTransformRect {
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double width = 0.0;
+  double height = 0.0;
+  double angle_degrees = 0.0;
+};
+
+bool selection_transform_rotated(SelectionState* selection,
+                                 const SelectionTransformRect& transform, bool* changed);
+
 /* 基础蒙版的紧包围盒（含任何非零像素，**不含**羽化外扩）。
  * 没有选区或显式空选区返回 {0, 0, 0, 0}——手柄据此决定画不画。 */
 comp_rect selection_base_bounds(const SelectionState& selection);

@@ -4228,6 +4228,28 @@ COMP_TEST(ui_core_doc_dialog_rows) {
   COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 4, panel.x + 10.0, panel.y + 10.0) == -1);
   COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 4, panel.x - 5.0, first_y) == -1);
   COMP_CHECK(comp_ui::doc_dialog_row_at(panel, 0, panel.x + 10.0, first_y) == -1);
+
+  /* 5. P0-5 收尾：变换选区（宽 / 高 / 角度）。行数 3，角度行独占负值量程。 */
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::TransformSelection) == 3);
+  const comp_ui::DocRowSpec transform_w =
+      comp_ui::doc_dialog_row(DocDialogKind::TransformSelection, 0);
+  const comp_ui::DocRowSpec transform_h =
+      comp_ui::doc_dialog_row(DocDialogKind::TransformSelection, 1);
+  const comp_ui::DocRowSpec transform_a =
+      comp_ui::doc_dialog_row(DocDialogKind::TransformSelection, 2);
+  COMP_CHECK(transform_w.kind == DocRowKind::Number && transform_h.kind == DocRowKind::Number);
+  /* 宽高同量程（与「图像大小」同界），否则面板能把选区拖到引擎拒绝的尺寸上。 */
+  COMP_CHECK(transform_w.min == comp_ui::kDocSizeMin && transform_w.max == comp_ui::kDocSizeMax);
+  COMP_CHECK(transform_h.min == transform_w.min && transform_h.max == transform_w.max);
+  COMP_CHECK(transform_a.kind == DocRowKind::Number);
+  COMP_CHECK(transform_a.min == -180 && transform_a.max == 180);
+  /* 角度必须允许负号（doc_dialog_begin_input 只在 min < 0 的行收 '-'）。 */
+  COMP_CHECK(transform_a.min < 0);
+  COMP_CHECK(transform_a.step == 15);
+  /* 标题/副标题/提示三处都必须有字，否则面板顶上是一片空白。 */
+  COMP_CHECK(std::string(comp_ui::doc_dialog_title(DocDialogKind::TransformSelection)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_subtitle(DocDialogKind::TransformSelection)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_hint(DocDialogKind::TransformSelection)).size() > 0);
 }
 
 /*

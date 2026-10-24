@@ -1258,6 +1258,128 @@ bool selection_transform_bounds(SelectionState* selection, comp_rect target, boo
   return true;
 }
 
+bool selection_transform_rotated(SelectionState* selection,
+                                 const SelectionTransformRect& transform, bool* changed) {
+  if (changed != nullptr) *changed = false;
+  if (selection == nullptr) return false;
+
+  /* 参数闸：非有限值不进蒙版；否则 NaN 会静默变成「全 0」或未定义行为。 */
+  if (!std::isfinite(transform.center_x) || !std::isfinite(transform.center_y) ||
+      !std::isfinite(transform.width) || !std::isfinite(transform.height) ||
+      !std::isfinite(transform.angle_degrees)) {
+    return false;
+  }
+  if (!selection->active) return true;
+
+  const int32_t width = selection->base.width;
+  const int32_t height = selection->base.height;
+  if (width <= 0 || height <= 0) return false;
+  const std::vector<uint8_t>& base = selection->base.pixel_data();
+  const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  if (base.size() != pixel_count) return false;
+
+  /* 退化尺寸 = 收成空选区：与 selection_transform_bounds 的退化分支同口径。 */
+  if (transform.width <= 0.0 || transform.height <= 0.0) {
+    const comp_rect empty{0, 0, 0, 0};
+    return selection_transform_bounds(selection, empty, changed);
+  }
+
+  const comp_rect source = selection_base_bounds(*selection);
+  if (source.w <= 0 || source.h <= 0) return true; /* 显式空选区：无操作 */
+
+  double angle = std::fmod(transform.angle_degrees, 360.0);
+  if (angle < 0.0) angle += 360.0;
+
+  const double half_w = transform.width * 0.5;
+  const double half_h = transform.height * 0.5;
+  const double left = transform.center_x - half_w;
+  const double top = transform.center_y - half_h;
+
+  if (angle == 0.0) {
+    /* 轴对齐：交给既有重采样，保证「同中心同尺寸」是逐字节恒等。 */
+    comp_rect target{};
+    target.x = static_cast<int32_t>(std::lround(left));
+    target.y = static_cast<int32_t>(std::lround(top));
+    target.w = static_cast<int32_t>(std::lround(transform.width));
+    target.h = static_cast<int32_t>(std::lround(transform.height));
+    return selection_transform_bounds(selection, target, changed);
+  }
+
+  constexpr double kPi = 3.14159265358979323846;
+  const double radians = angle * kPi / 180.0;
+  const double cos_a = std::cos(radians);
+  const double sin_a = std::sin(radians);
+  const double scale_x = static_cast<double>(source.w) / transform.width;
+  const double scale_y = static_cast<double>(source.h) / transform.height;
+
+  /* 目标区域 = 旋转后四个角点的轴对齐包围盒。 */
+  const double unrotated_x[4] = {left, left + transform.width, left + transform.width, left};
+  const double unrotated_y[4] = {top, top, top + transform.height, top + transform.height};
+  double min_x = 0.0;
+  double max_x = 0.0;
+  double min_y = 0.0;
+  double max_y = 0.0;
+  for (int index = 0; index < 4; ++index) {
+    const double dx = unrotated_x[index] - transform.center_x;
+    const double dy = unrotated_y[index] - transform.center_y;
+    const double rotated_x = transform.center_x + dx * cos_a - dy * sin_a;
+    const double rotated_y = transform.center_y + dx * sin_a + dy * cos_a;
+    if (index == 0) {
+      min_x = max_x = rotated_x;
+      min_y = max_y = rotated_y;
+    } else {
+      min_x = std::min(min_x, rotated_x);
+      max_x = std::max(max_x, rotated_x);
+      min_y = std::min(min_y, rotated_y);
+      max_y = std::max(max_y, rotated_y);
+    }
+  }
+
+  /* 先夹到画布再转 int64：非有限值（理论上已被上面的闸拦下）按 0 处理。 */
+  auto span = [](double low, double high, int64_t limit, int64_t* begin, int64_t* end) {
+    double first = std::floor(low);
+    double last = std::ceil(high);
+    if (!(first > 0.0)) first = 0.0;
+    if (!(last < static_cast<double>(limit))) last = static_cast<double>(limit);
+    if (!(last > first)) {
+      *begin = 0;
+      *end = 0;
+      return;
+    }
+    *begin = static_cast<int64_t>(first);
+    *end = static_cast<int64_t>(last);
+  };
+  int64_t x_begin = 0;
+  int64_t x_end = 0;
+  int64_t y_begin = 0;
+  int64_t y_end = 0;
+  span(min_x, max_x, width, &x_begin, &x_end);
+  span(min_y, max_y, height, &y_begin, &y_end);
+
+  std::vector<uint8_t> next(pixel_count, 0);
+  for (int64_t y = y_begin; y < y_end; ++y) {
+    const double dy = static_cast<double>(y) + 0.5 - transform.center_y;
+    uint8_t* row = next.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int64_t x = x_begin; x < x_end; ++x) {
+      const double dx = static_cast<double>(x) + 0.5 - transform.center_x;
+      /* 逆旋转回未旋转矩形坐标系（y 向下、顺时针为正 => 逆变换取 -θ）。 */
+      const double qx = transform.center_x + dx * cos_a + dy * sin_a;
+      const double qy = transform.center_y - dx * sin_a + dy * cos_a;
+      const double sx = (qx - left) * scale_x + static_cast<double>(source.x) - 0.5;
+      const double sy = (qy - top) * scale_y + static_cast<double>(source.y) - 0.5;
+      long rounded = std::lround(sample_mask_bilinear(base, width, height, sx, sy));
+      if (rounded < 0) rounded = 0;
+      if (rounded > 255) rounded = 255;
+      row[static_cast<size_t>(x)] = static_cast<uint8_t>(rounded);
+    }
+  }
+
+  if (masks_equal(next, base)) return true; /* 例如 360° 或空选区 */
+  store_base(selection, width, height, std::move(next));
+  if (changed != nullptr) *changed = true;
+  return true;
+}
+
 comp_result selection_apply_color_range(SelectionState* selection, int32_t canvas_width,
                                         int32_t canvas_height, const Document& document,
                                         const uint8_t* include, size_t include_count,

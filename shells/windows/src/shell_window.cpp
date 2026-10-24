@@ -265,6 +265,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_enabled_recursive(menu, kCmdSelectSmooth, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectGrow, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectSimilar, enabled.selection_modify);
+  /* 变换选区需要一张可变换的基础蒙版；selection_modify 是同一把闸。 */
+  menu_set_enabled_recursive(menu, kCmdSelectTransform, enabled.selection_modify);
   menu_set_enabled_recursive(menu, kCmdSelectLoadPixels, enabled.selection_load_pixels);
   /* ROI #5：存通道需要当前有选区；通道面板本身随时可开（空列表也给提示）。 */
   menu_set_enabled_recursive(menu, kCmdSelectSaveChannel, enabled.selection_save_channel);
@@ -4189,6 +4191,8 @@ HMENU build_menu() {
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectGrow, L"扩大选取(&G)");
   AppendMenuW(select_menu, MF_STRING, kCmdSelectSimilar, L"选取相似(&R)");
+  AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(select_menu, MF_STRING, kCmdSelectTransform, L"变换选区(&T)...");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(select_menu, MF_STRING, kCmdSelectLoadPixels, L"按图层像素载入选区(&P)");
   AppendMenuW(select_menu, MF_SEPARATOR, 0, nullptr);

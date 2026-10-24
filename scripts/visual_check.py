@@ -2451,6 +2451,138 @@ def scene_selection_grow(shell, checker):
                   "长亮行 %s（原线 %d）、矩形上边窗口 %s" % (rows_undo, line_row, grown_undo))
 
 
+def scene_selection_transform(shell, checker):
+    """
+    P0-5 收尾：选择 > 变换选区（宽 / 高 / 角度数值输入）的端到端链路。
+
+    轴对齐手柄本来就能缩放，这条命令多出来的是**数值输入 + 旋转**。失败方式
+    各自单独量：
+      1. 菜单项没接上——面板不出现，选区不动；
+      2. 恒等回车（角度 0、宽高等于当前包围盒）硬塞一条空撤销步——引擎没改
+         蒙版却落了历史，一次 Ctrl+Z 会退掉看不见的东西；
+      3. 角度没生效或转反——包围盒不交换；
+      4. 改了选区却没落撤销步（或落了不止一步）——Ctrl+Z 回不到原矩形。
+
+    做法：在空文档上拖一个 **宽高不等**（屏幕 240×120）的矩形选区。量蚂蚁线
+    用「沿中线扫描」：横边穿过中线那一列，竖边穿过中线那一行；各取 ±5 px 的
+    窗口，任何一行/列只要有白像素就算边线所在——蚂蚁线 4 亮 4 暗逐帧走动，
+    窗口宽度盖住一个周期，所以与相位无关。转 90° 后包围盒必然变成 120×240，
+    这个交换是方向性断言：镜像实现（角度取反）也测不出来，但「没转」一定能测出。
+
+    宽高取 240×120 而不是更大：默认文档 1280×720 适合窗口后高约 353 屏幕
+    像素，转完高 240 仍留得下边距，扫描窗口不会碰到画布外。
+    """
+    scene = "selection_transform"
+    cmd_transform = 1062  # shell_state.h: kCmdSelectTransform
+    panel = shell.layout["adjust"]
+    title_rect = (panel[0] + 8, panel[1] + 8, panel[2] - 8, panel[1] + 96)
+
+    def span_rows(img, x_center, y_from, y_to, half=5):
+        """x_center 附近哪些行有白像素：横边穿过这一列，返回上/下边行号。"""
+        rows = []
+        for row in range(int(y_from), int(y_to)):
+            if count_bright(img, (int(x_center) - half, row,
+                                  int(x_center) + half, row + 1), 150) > 0:
+                rows.append(row)
+        return rows
+
+    def span_cols(img, y_center, x_from, x_to, half=5):
+        """y_center 附近哪些列有白像素：竖边穿过这一行，返回左/右边列号。"""
+        cols = []
+        for col in range(int(x_from), int(x_to)):
+            if count_bright(img, (col, int(y_center) - half,
+                                  col + 1, int(y_center) + half), 150) > 0:
+                cols.append(col)
+        return cols
+
+    left, top, right, bottom = shell.document_rect()
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    half_w, half_h = 120, 60
+    scan_x = half_w + 30  # 扫描窗半宽：盖住转后的高（240）还留 30 px 余量
+
+    shell.select_tool("marquee")
+    shell.drag(cx - half_w, cy - half_h, cx + half_w, cy + half_h, steps=10)
+    base = shell.shot("63_transform_base")
+    base_rows = span_rows(base, cx, cy - scan_x, cy + scan_x)
+    base_cols = span_cols(base, cy, cx - scan_x, cx + scan_x)
+    base_h = (max(base_rows) - min(base_rows)) if base_rows else -1
+    base_w = (max(base_cols) - min(base_cols)) if base_cols else -1
+    checker.check(scene, "前置：矩形选区的蚂蚁线可量（约 240×120 屏幕像素）",
+                  len(base_rows) >= 2 and len(base_cols) >= 2 and
+                  abs(base_w - 2 * half_w) <= 6 and abs(base_h - 2 * half_h) <= 6,
+                  "行 %s、列 %s（高 %d / 宽 %d）" %
+                  (base_rows, base_cols, base_h, base_w))
+
+    # 1) 面板必须真的画在右栏（菜单 -> doc_dialog_begin 全链路）。
+    shell.command(cmd_transform)
+    opened = shell.shot("64_transform_dialog")
+    bright_open = count_bright(opened, title_rect, 150)
+    checker.check(scene, "变换选区面板已绘制（右栏标题区有文字）", bright_open > 120,
+                  "右栏浅色像素 %d" % bright_open)
+
+    # 2) 恒等：什么都不改直接回车。宽高等于当前包围盒、角度 0，引擎 masks_equal
+    #    短路由 -> changed = 0：选区不动、**不落撤销步**，面板留着不吞输入。
+    shell.press(VK_RETURN)
+    shell.wait(0.3)
+    identity = shell.shot("65_transform_identity")
+    ident_rows = span_rows(identity, cx, cy - scan_x, cy + scan_x)
+    ident_cols = span_cols(identity, cy, cx - scan_x, cx + scan_x)
+    checker.check(scene, "恒等等于当前包围盒：选区纹丝不动",
+                  ident_rows == base_rows and ident_cols == base_cols,
+                  "行 %s->%s、列 %s->%s" %
+                  (base_rows, ident_rows, base_cols, ident_cols))
+    checker.check(scene, "恒等不落撤销步：面板保持打开（输入不丢）",
+                  count_bright(identity, title_rect, 150) > 120,
+                  "回车后右栏浅色像素 %d" % count_bright(identity, title_rect, 150))
+    status_identity = pixel_diff(identity, opened, shell.layout["status"], 24)
+    checker.check(scene, "状态栏说明「选区未变化」", status_identity > 20,
+                  "状态栏变化像素 %d" % status_identity)
+
+    # 收起面板（第一次 Esc 撤键入态、第二次关面板）。
+    shell.press(VK_ESCAPE)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.3)
+    closed = shell.shot("66_transform_closed")
+    checker.check(scene, "Esc 收回变换选区面板（右栏像素变化）",
+                  pixel_diff(opened, closed, title_rect, 24) > 20,
+                  "右栏标题带变化像素 %d" % pixel_diff(opened, closed, title_rect, 24))
+
+    # 3) 转 90°：Tab 两次到角度行，键入 90 回车。包围盒必须交换 240×120 ->
+    #    120×240（顺时针在屏幕坐标里同样是 90°，宽高互换与方向无关，但「没转」
+    #    和「转 45°」都会被这一条挡住）。
+    shell.command(cmd_transform)
+    shell.press(VK_TAB)
+    shell.press(VK_TAB)
+    shell.type_text("90")
+    shell.press(VK_RETURN)
+    shell.wait(0.5)
+    rotated = shell.shot("67_transform_rot90")
+    rot_rows = span_rows(rotated, cx, cy - scan_x, cy + scan_x)
+    rot_cols = span_cols(rotated, cy, cx - scan_x, cx + scan_x)
+    rot_h = (max(rot_rows) - min(rot_rows)) if rot_rows else -1
+    rot_w = (max(rot_cols) - min(rot_cols)) if rot_cols else -1
+    checker.check(scene, "角度 90°：包围盒交换（高 120 -> 240、宽 240 -> 120）",
+                  abs(rot_h - 2 * half_w) <= 6 and abs(rot_w - 2 * half_h) <= 6,
+                  "行 %s、列 %s（高 %d / 宽 %d）" % (rot_rows, rot_cols, rot_h, rot_w))
+    checker.check(scene, "应用成功后面板自动关闭",
+                  pixel_diff(opened, rotated, title_rect, 24) > 20,
+                  "右栏标题带变化像素 %d" % pixel_diff(opened, rotated, title_rect, 24))
+    status_rot = pixel_diff(rotated, identity, shell.layout["status"], 24)
+    checker.check(scene, "状态栏报告变换结果（撤销一步）", status_rot > 20,
+                  "状态栏变化像素 %d" % status_rot)
+
+    # 4) 一次 Ctrl+Z 必须回到原矩形（变换恰好占一步，不多不少）。
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.3)
+    undone = shell.shot("68_transform_undo")
+    undo_rows = span_rows(undone, cx, cy - scan_x, cy + scan_x)
+    undo_cols = span_cols(undone, cy, cx - scan_x, cx + scan_x)
+    checker.check(scene, "Ctrl+Z 一步回到原矩形选区",
+                  undo_rows == base_rows and undo_cols == base_cols,
+                  "行 %s->%s、列 %s->%s" %
+                  (base_rows, undo_rows, base_cols, undo_cols))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -2844,6 +2976,7 @@ SCENES = [    ("start", scene_start, ()),
     ("guides", scene_guides, ()),
     ("destructive_adjust", scene_destructive_adjust, ()),
     ("brush_options", scene_brush_options, ()),
+    ("selection_transform", scene_selection_transform, ()),
 ]
 
 

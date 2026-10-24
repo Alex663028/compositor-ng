@@ -431,6 +431,40 @@ COMP_API comp_result comp_selection_grow(comp_document document, int32_t toleran
 COMP_API comp_result comp_selection_similar(comp_document document, int32_t tolerance,
                                             int32_t* out_changed);
 
+/* ------------------------------------------- 变换选区（P0-5 收尾，尾部追加） */
+
+/*
+ * 选择 > 变换选区（PS Select > Transform Selection 的数值/旋转部分）。
+ *
+ * 把基础蒙版重采样到「以 (center_x, center_y) 为中心、width × height、
+ * 顺时针旋转 angle_degrees」的矩形：
+ *   - angle_degrees = 0 且矩形等于 `comp_selection_get_base_bounds` 时是**恒等**：
+ *     逐字节不变、out_changed = 0，不产生空撤销步（与 comp_selection_set_bounds
+ *     同一把尺子，只是把手柄的鼠标拖拽补成键盘可输入的数值）；
+ *   - 角度按 y 向下的顺时针为正，先对 360 取模；
+ *   - width / height <= 0 -> 显式空选区（active 仍为 1），与退化手柄同口径；
+ *   - 目标区域取旋转矩形的**轴对齐包围盒**，越出画布的部分直接丢弃；
+ *   - 没有选区时无操作（out_changed = 0）；feather 半径原样保留；
+ *   - 参数必须全部有限（NaN / Inf），且 |center|、width、height 不超过 1e6，
+ *     否则 COMP_ERR_INVALID_ARGUMENT（在事务之前拒绝，不留半成品、不落历史）；
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）；
+ *     out_changed 可为 NULL。
+ *
+ * 注意：旋转后的紧包围盒仍是轴对齐的，因此再次打开面板时回显的是**包围盒**
+ * 而不是上一轮的旋转矩形——一次命令内输入的宽高/角度可预期。
+ */
+typedef struct comp_selection_transform_desc {
+  double center_x;      /* 未旋转矩形的中心，文档像素 */
+  double center_y;
+  double width;         /* 未旋转矩形的宽 / 高 */
+  double height;
+  double angle_degrees; /* 顺时针为正，y 向下 */
+} comp_selection_transform_desc;
+
+COMP_API comp_result comp_selection_transform(comp_document document,
+                                              comp_selection_transform_desc transform,
+                                              int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

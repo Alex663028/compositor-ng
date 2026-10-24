@@ -13,6 +13,7 @@
  */
 #include "compositor/comp_selection.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -706,6 +707,49 @@ comp_result comp_selection_channel_remove(comp_document document, size_t index,
   bool changed = false;
   if (!compositor::selection_channel_remove(&doc->state(), index, &changed)) {
     return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "selection channel remove failed");
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
+/* ------------------------------------------------- 变换选区（P0-5 收尾） */
+
+comp_result comp_selection_transform(comp_document document,
+                                     comp_selection_transform_desc transform,
+                                     int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /*
+   * 轻量参数闸在 ImplicitTxn 之前：NaN / Inf 与离谱的量级都在这里拦下。
+   * 量级上限 1e6 远大于任何画布（30000）与手柄能拖到的位置，只用来挡住
+   * 「有限但会让 floor/lround 溢出的数」，不是业务约束。
+   */
+  constexpr double kTransformLimit = 1.0e6;
+  const bool finite = std::isfinite(transform.center_x) && std::isfinite(transform.center_y) &&
+                      std::isfinite(transform.width) && std::isfinite(transform.height) &&
+                      std::isfinite(transform.angle_degrees);
+  if (!finite || std::fabs(transform.center_x) > kTransformLimit ||
+      std::fabs(transform.center_y) > kTransformLimit ||
+      transform.width > kTransformLimit || transform.height > kTransformLimit) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "selection transform is not finite or out of range");
+  }
+
+  compositor::SelectionTransformRect request;
+  request.center_x = transform.center_x;
+  request.center_y = transform.center_y;
+  request.width = transform.width;
+  request.height = transform.height;
+  request.angle_degrees = transform.angle_degrees;
+
+  compositor::abi::ImplicitTxn txn(doc, "Transform Selection");
+  bool changed = false;
+  if (!compositor::selection_transform_rotated(&doc->selection(), request, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "selection mask is corrupt");
   }
   return finish(engine, &txn, changed, out_changed);
   COMP_ABI_CATCH(engine)

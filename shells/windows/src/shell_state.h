@@ -176,6 +176,8 @@ constexpr UINT kCmdSelectSmooth = 1059;
  * 点菜单即落墨、一步撤销——两条都是「按颜色长选区」，没有可调面板。 */
 constexpr UINT kCmdSelectGrow = 1060;
 constexpr UINT kCmdSelectSimilar = 1061;
+/* P0-5 收尾：变换选区（宽 / 高 / 角度数值输入；手柄只做轴对齐缩放）。 */
+constexpr UINT kCmdSelectTransform = 1062;
 constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
@@ -450,6 +452,8 @@ struct DocumentContext {
   int doc_dialog_close_action = comp_ui::kCloseActionSave;
   int doc_dialog_base_width = kDefaultWidth;
   int doc_dialog_base_height = kDefaultHeight;
+  /* 变换选区：第三行是角度（度，顺时针为正）；宽/高复用上面两个字段。 */
+  int doc_dialog_angle = 0;
   std::wstring doc_dialog_input;
   int camera_raw_values[comp_ui::kCameraRawRowCount] = {};
   std::string document_path;

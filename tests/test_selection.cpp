@@ -1755,3 +1755,184 @@ COMP_TEST(selection_transform_bounds_collapses_to_an_explicit_empty_selection) {
   COMP_CHECK(clipped_bounds.x == 0 && clipped_bounds.y == 0);
   COMP_CHECK(clipped_bounds.w == kWidth && clipped_bounds.h == kHeight);
 }
+
+/* ------------------------------------------------- 变换选区（P0-5 收尾） */
+
+/*
+ * 面板的种子值（宽/高 = 当前紧包围盒、角度 0）必须是**恒等**：
+ * 逐字节不变、changed = 0、不落撤销步。这是「打开面板直接回车不该弄脏历史」
+ * 的前提，也是把旋转矩形退回轴对齐路径时靠 masks_equal 短路的那一条。
+ */
+COMP_TEST(selection_transform_identity_is_byte_identical) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  /* 抗锯齿椭圆 + 羽化：恒等必须原样保留半透明像素与羽化半径。 */
+  const float ellipse[4] = {10.3f, 11.7f, 21.4f, 18.2f};
+  COMP_CHECK(comp_selection_apply_shape(fixture.document, COMP_SELECTION_ELLIPSE, ellipse, 2,
+                                        COMP_SELECTION_ADD, 1, &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_modify(fixture.document, COMP_SELECTION_FEATHER, 3, &changed) == COMP_OK);
+
+  comp_rect base{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  const std::vector<uint8_t> before = coverage(fixture.document);
+
+  comp_selection_transform_desc transform{};
+  transform.center_x = static_cast<double>(base.x) + base.w * 0.5;
+  transform.center_y = static_cast<double>(base.y) + base.h * 0.5;
+  transform.width = base.w;
+  transform.height = base.h;
+  transform.angle_degrees = 0.0;
+
+  const size_t depth = undo_depth_of(fixture.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_transform(fixture.document, transform, &changed) == COMP_OK);
+  COMP_CHECK_MSG(changed == 0, "an unrotated box at the current bounds is the identity");
+  COMP_CHECK(undo_depth_of(fixture.document) == depth);
+  COMP_CHECK_MSG(feather_of(fixture.document) == 3.0f, "transform keeps the feather radius");
+
+  const std::vector<uint8_t> after = coverage(fixture.document);
+  COMP_CHECK(after.size() == before.size() &&
+             std::equal(before.begin(), before.end(), after.begin()));
+}
+
+/*
+ * 90° 顺时针：16×12 的矩形绕自己中心转四分之一圈 -> 12×16，包围盒从
+ * {8,8,16,12} 变成 {10,6,12,16}（中心 (16,14) 不动）。这一步钉死的是
+ * 「先逆旋转目标像素中心、再走同一把双线性尺子」的方向——转反了会得到镜像。
+ */
+COMP_TEST(selection_transform_rotates_a_quarter_turn) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  comp_rect base{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 8 && base.y == 8 && base.w == 16 && base.h == 12);
+
+  comp_selection_transform_desc transform{};
+  transform.center_x = 16.0;
+  transform.center_y = 14.0;
+  transform.width = 16.0;
+  transform.height = 12.0;
+  transform.angle_degrees = 90.0;
+
+  const size_t depth = undo_depth_of(fixture.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_transform(fixture.document, transform, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+  COMP_CHECK(active_of(fixture.document) == 1);
+
+  comp_rect rotated{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &rotated) == COMP_OK);
+  COMP_CHECK_MSG(rotated.x == 10 && rotated.y == 6 && rotated.w == 12 && rotated.h == 16,
+                 "a quarter turn swaps the sides around the fixed centre");
+
+  const std::vector<uint8_t> mask = coverage(fixture.document);
+  COMP_CHECK(at(mask, 16, 14) == 255);
+  COMP_CHECK_MSG(at(mask, 16, 7) == 255, "the long side now stands up");
+  COMP_CHECK_MSG(at(mask, 8, 8) == 0, "the old top-left corner is gone");
+  COMP_CHECK(at(mask, 24, 24) == 0);
+
+  /* 一步撤销：回到原来的 16×12。 */
+  COMP_CHECK(comp_document_undo(fixture.document) == COMP_OK);
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &base) == COMP_OK);
+  COMP_CHECK(base.x == 8 && base.y == 8 && base.w == 16 && base.h == 12);
+}
+
+/* 宽或高 <= 0 = 把选区收成**显式空选区**（active 仍为 1），与退化手柄同口径。 */
+COMP_TEST(selection_transform_degenerate_size_collapses_to_empty) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+
+  comp_selection_transform_desc transform{};
+  transform.center_x = 16.0;
+  transform.center_y = 14.0;
+  transform.width = 0.0;
+  transform.height = 12.0;
+  transform.angle_degrees = 30.0;
+
+  const size_t depth = undo_depth_of(fixture.document);
+  changed = -1;
+  COMP_CHECK(comp_selection_transform(fixture.document, transform, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth + 1);
+  COMP_CHECK_MSG(active_of(fixture.document) == 1, "collapsing keeps an explicit empty selection");
+  COMP_CHECK(mask_sum(coverage(fixture.document)) == 0);
+}
+
+/* 没有选区 = 无操作：不建事务、不落撤销步、active 仍是 0。 */
+COMP_TEST(selection_transform_without_a_selection_is_a_noop) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  comp_selection_transform_desc transform{};
+  transform.center_x = 16.0;
+  transform.center_y = 14.0;
+  transform.width = 8.0;
+  transform.height = 8.0;
+  transform.angle_degrees = 45.0;
+
+  const size_t depth = undo_depth_of(fixture.document);
+  int32_t changed = -1;
+  COMP_CHECK(comp_selection_transform(fixture.document, transform, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+  COMP_CHECK(undo_depth_of(fixture.document) == depth);
+  COMP_CHECK(active_of(fixture.document) == 0);
+}
+
+/* 参数闸在事务之前：NaN / Inf / 超范围一律拒绝，且不弄脏历史、不动蒙版。 */
+COMP_TEST(selection_transform_rejects_non_finite_and_out_of_range) {
+  Fixture fixture;
+  COMP_CHECK(fixture.document != nullptr);
+
+  int32_t changed = 0;
+  COMP_CHECK(rect(fixture.document, 8, 8, 24, 20, COMP_SELECTION_REPLACE, &changed) == COMP_OK);
+  comp_rect before{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &before) == COMP_OK);
+
+  comp_selection_transform_desc transform{};
+  transform.center_x = 16.0;
+  transform.center_y = 14.0;
+  transform.width = 16.0;
+  transform.height = 12.0;
+  transform.angle_degrees = 90.0;
+
+  const size_t depth = undo_depth_of(fixture.document);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  comp_selection_transform_desc bad = transform;
+  bad.center_x = nan;
+  COMP_CHECK(comp_selection_transform(fixture.document, bad, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  bad = transform;
+  bad.center_y = inf;
+  COMP_CHECK(comp_selection_transform(fixture.document, bad, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  bad = transform;
+  bad.angle_degrees = nan;
+  COMP_CHECK(comp_selection_transform(fixture.document, bad, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  /* 1e6 是上限：2e6 的宽度在 int 之外的几何上是无意义的，直接拒。 */
+  bad = transform;
+  bad.width = 2.0e6;
+  COMP_CHECK(comp_selection_transform(fixture.document, bad, &changed) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  COMP_CHECK(undo_depth_of(fixture.document) == depth);
+  comp_rect after{};
+  COMP_CHECK(comp_selection_get_base_bounds(fixture.document, &after) == COMP_OK);
+  COMP_CHECK(after.x == before.x && after.y == before.y && after.w == before.w &&
+             after.h == before.h);
+
+  /* 无效文档句柄也不崩。 */
+  COMP_CHECK(comp_selection_transform(nullptr, transform, &changed) == COMP_ERR_INVALID_ARGUMENT);
+}
