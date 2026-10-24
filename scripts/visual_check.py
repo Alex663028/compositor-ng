@@ -2583,6 +2583,136 @@ def scene_selection_transform(shell, checker):
                   (base_rows, undo_rows, base_cols, undo_cols))
 
 
+def scene_layer_transform_numeric(shell, checker):
+    """
+    P1-3：图层 > 数值变换（Ctrl+T）+ 再次变换（Ctrl+Shift+T）的端到端链路。
+
+    各自量一种失败方式：
+      1. 命令没接线——面板不出现，图层不动；
+      2. 面板打开就回车被当成一次变换——隐式 transform 被物化，多落一条空撤销步；
+      3. 宽度没写进去 / 写错了轴——跨度不变，或竖跨度跟着变；
+      4. 再次变换没复读上一次的比例——第二次执行形状不动；
+      5. 两次变换各占一步撤销：Ctrl+Z×2 必须回到原尺寸。
+
+    度量口径：形状工具画一个**以画布中心对称**的矩形，数值变换是中心锚定，
+    所以「宽度减半、高度不变」两条互相独立的断言，再配中心位置不变，能同时
+    挡住「没变」「缩错了轴」「缩了但跑偏」。绝对像素数不可靠（画布按窗口
+    缩放），因此只比**跨度比例**。
+    """
+    scene = "layer_transform_numeric"
+    cmd_numeric = 1063  # shell_state.h: kCmdLayerTransformNumeric
+    panel = shell.layout["adjust"]
+    title_rect = (panel[0] + 8, panel[1] + 8, panel[2] - 8, panel[1] + 96)
+    ref = (255, 136, 0)
+
+    left, top, right, bottom = shell.document_rect()
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    half_w, half_h = 120, 60
+
+    def span_x(img, y):
+        lo = hi = None
+        for x in range(int(left) + 1, int(right) - 1, 2):
+            if near(pixel(img, x, int(y)), ref, 45):
+                if lo is None:
+                    lo = x
+                hi = x
+        return (lo, hi)
+
+    def span_y(img, x):
+        lo = hi = None
+        for y in range(int(top) + 1, int(bottom) - 1, 2):
+            if near(pixel(img, int(x), y), ref, 45):
+                if lo is None:
+                    lo = y
+                hi = y
+        return (lo, hi)
+
+    def width_of(span):
+        return (span[1] - span[0]) if span[0] is not None else -1
+
+    def center_of(span):
+        return ((span[0] + span[1]) / 2.0) if span[0] is not None else -1.0
+
+    # 前景色 + 居中矩形（宽高比 2:1，缩一半后仍可量）。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(cx - half_w, cy - half_h, cx + half_w, cy + half_h, steps=8)
+    before = shell.shot("69_layer_xform_base")
+    base_x = span_x(before, cy)
+    base_y = span_y(before, cx)
+    base_w, base_h = width_of(base_x), width_of(base_y)
+    checker.check(scene, "前置：居中矩形的横/竖跨度都可量",
+                  base_w > 60 and base_h > 30 and abs(center_of(base_x) - cx) <= 6,
+                  "横 %s、竖 %s（宽 %d / 高 %d / 中心 %.1f）" %
+                  (base_x, base_y, base_w, base_h, center_of(base_x)))
+
+    # 1) 面板必须真的画出来。
+    shell.command(cmd_numeric)
+    opened = shell.shot("70_layer_xform_dialog")
+    checker.check(scene, "数值变换面板已绘制（右栏标题区有文字）",
+                  count_bright(opened, title_rect, 150) > 120,
+                  "右栏浅色像素 %d" % count_bright(opened, title_rect, 150))
+
+    # 2) 恒等回车：宽高/角度都取自当前图层，不该改动像素，也不该落撤销步。
+    shell.press(VK_RETURN)
+    shell.wait(0.3)
+    identity = shell.shot("71_layer_xform_identity")
+    id_x, id_y = span_x(identity, cy), span_y(identity, cx)
+    checker.check(scene, "恒等回车：图层尺寸纹丝不动",
+                  abs(width_of(id_x) - base_w) <= 4 and abs(width_of(id_y) - base_h) <= 4,
+                  "横 %d（原 %d）、竖 %d（原 %d）" %
+                  (width_of(id_x), base_w, width_of(id_y), base_h))
+    checker.check(scene, "恒等不落撤销步：面板保持打开（输入不丢）",
+                  count_bright(identity, title_rect, 150) > 120,
+                  "回车后右栏浅色像素 %d" % count_bright(identity, title_rect, 150))
+
+    # 3) 宽度改成 640（默认文档 1280 => 横向缩一半）：竖跨度必须不变。
+    shell.type_text("640")
+    shell.press(VK_RETURN)
+    shell.wait(0.5)
+    scaled = shell.shot("72_layer_xform_width")
+    sc_x, sc_y = span_x(scaled, cy), span_y(scaled, cx)
+    sc_w, sc_h = width_of(sc_x), width_of(sc_y)
+    checker.check(scene, "宽度 640：横跨度约减半",
+                  0 < sc_w <= base_w * 0.75,
+                  "横跨度 %d（原 %d，比例 %.2f）" % (sc_w, base_w, sc_w / base_w if base_w else -1))
+    checker.check(scene, "高度未填：竖跨度保持不变（没缩错轴）",
+                  abs(sc_h - base_h) <= 8,
+                  "竖跨度 %d（原 %d）" % (sc_h, base_h))
+    checker.check(scene, "中心锚定：缩小后中心没有跑偏",
+                  abs(center_of(sc_x) - cx) <= 8,
+                  "中心 x %.1f（画布中心 %d）" % (center_of(sc_x), cx))
+    checker.check(scene, "应用成功后面板自动关闭",
+                  pixel_diff(opened, scaled, title_rect, 24) > 20,
+                  "右栏标题带变化像素 %d" % pixel_diff(opened, scaled, title_rect, 24))
+
+    # 4) 再次变换：复读上一步的 0.5 倍横缩，横跨度必须再减半。
+    shell.press(ord("T"), ctrl=True, shift=True)
+    shell.wait(0.5)
+    again = shell.shot("73_layer_xform_again")
+    ag_x, ag_y = span_x(again, cy), span_y(again, cx)
+    ag_w = width_of(ag_x)
+    checker.check(scene, "Ctrl+Shift+T 再次变换：横跨度再减半",
+                  0 < ag_w <= sc_w * 0.75,
+                  "横跨度 %d（上一次 %d，比例 %.2f）" % (ag_w, sc_w, ag_w / sc_w if sc_w else -1))
+    checker.check(scene, "再次变换不再缩竖轴（上一步的竖比例是 1）",
+                  abs(width_of(ag_y) - base_h) <= 8,
+                  "竖跨度 %d（原 %d）" % (width_of(ag_y), base_h))
+
+    # 5) 两次变换 = 两步撤销：撤两次必须回到原尺寸。
+    shell.press(ord("Z"), ctrl=True)
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.3)
+    undone = shell.shot("74_layer_xform_undo")
+    un_x, un_y = span_x(undone, cy), span_y(undone, cx)
+    checker.check(scene, "Ctrl+Z×2 回到原尺寸",
+                  abs(width_of(un_x) - base_w) <= 6 and abs(width_of(un_y) - base_h) <= 6,
+                  "横 %d（原 %d）、竖 %d（原 %d）" %
+                  (width_of(un_x), base_w, width_of(un_y), base_h))
+
+
 def selftest_has_io_roundtrip():
     """壳自检报告里必须出现 comp_io 导出/导入往返断言。"""
     # 壳自检从仓库根跑（它要用相对路径 build/import_probe.png），报告落根目录；
@@ -2977,6 +3107,7 @@ SCENES = [    ("start", scene_start, ()),
     ("destructive_adjust", scene_destructive_adjust, ()),
     ("brush_options", scene_brush_options, ()),
     ("selection_transform", scene_selection_transform, ()),
+    ("layer_transform_numeric", scene_layer_transform_numeric, ()),
 ]
 
 

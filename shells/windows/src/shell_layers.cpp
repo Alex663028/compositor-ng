@@ -1688,6 +1688,9 @@ void panel_move_layer(ShellState& shell, int dx, int dy) {
  * 图层旋转（S21）：在既有角度上累加——必须先读现值，理由同 panel_move_layer。
  * 步进量与夹取口径全在 ui_core（layer_transform_rotate_step），壳不重算。
  */
+/* P1-3 的步进记录在这两个命令里也要用；实现在本节末尾（面板变换段）。 */
+static double rotation_delta_degrees(double from, double to);
+
 void panel_rotate_layer(ShellState& shell, bool forward) {
   const LayerRow* row = selected_row(shell);
   if (row == nullptr) {
@@ -1719,6 +1722,8 @@ void panel_rotate_layer(ShellState& shell, bool forward) {
   wsprintfW(buffer, L"图层旋转：%d°（Ctrl+左右）",
             static_cast<int>(next + 0.5));
   refresh_history_status(shell, buffer);
+  /* P1-3：记下这一步的实际角度增量（可能不是 ±15——旋转命令按档位累加）。 */
+  record_transform_step(shell, 1.0, 1.0, rotation_delta_degrees(rotation, next));
 }
 
 /*
@@ -1757,6 +1762,143 @@ void panel_scale_layer(ShellState& shell, int direction) {
   shell.doc.needs_render = true;
   wchar_t buffer[192];
   wsprintfW(buffer, L"图层尺寸：%d×%d（Alt+[ ]，中心锚定）", w, h);
+  refresh_history_status(shell, buffer);
+  record_transform_step(shell, static_cast<double>(w) / transform.w,
+                        static_cast<double>(h) / transform.h, 0.0);
+}
+
+/* -------------------------------------------------------- P1-3 数值变换 */
+
+/*
+ * 角度差归一到 (-180, 180]：再次变换复读的是「这一步转了多少」，不是绝对角度。
+ * 例：图层当前 350°（与 -10° 等价），目标 5° -> 复读 +15°，而不是 +355°。
+ */
+static double rotation_delta_degrees(double from, double to) {
+  double delta = to - from;
+  while (delta > 180.0) delta -= 360.0;
+  while (delta <= -180.0) delta += 360.0;
+  return delta;
+}
+
+void record_transform_step(ShellState& shell, double scale_x, double scale_y,
+                           double angle_delta) {
+  if (!std::isfinite(scale_x) || !std::isfinite(scale_y) || !std::isfinite(angle_delta)) return;
+  if (scale_x <= 0.0 || scale_y <= 0.0) return;
+  const double delta = rotation_delta_degrees(0.0, angle_delta);
+  /* 纯恒等的一步不值得复读：拖了又拖回原位的松手不该顶掉上一次真变换。 */
+  if (std::fabs(scale_x - 1.0) < 1e-9 && std::fabs(scale_y - 1.0) < 1e-9 &&
+      std::fabs(delta) < 1e-9) {
+    return;
+  }
+  shell.doc.transform_step_valid = true;
+  shell.doc.transform_step_scale_x = scale_x;
+  shell.doc.transform_step_scale_y = scale_y;
+  shell.doc.transform_step_angle = delta;
+}
+
+bool layer_effective_transform(ShellState& shell, comp_layer_id id, comp_rect* out_rect,
+                               double* out_rotation) {
+  if (out_rect == nullptr || id == 0 || shell.doc.document == nullptr) return false;
+  comp_rect rect{};
+  float rotation = 0.0f;
+  if (comp_layer_get_transform(shell.doc.document, id, &rect, &rotation) != COMP_OK) return false;
+  if (rect.w <= 0 || rect.h <= 0) {
+    /*
+     * 没显式给过变换：有效包围盒 = 原点 + 图层像素尺寸（与引擎 effective_bounds
+     * 同口径）。组与真正的空层在查询模式下报 0×0——那是「没有可变换的像素」，
+     * 不是「尺寸为零的变换」；交回调用方拒绝，绝不写一个 0×0 的 transform 进去。
+     */
+    int32_t width = 0;
+    int32_t height = 0;
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    if (comp_layer_get_pixels(shell.doc.document, id, nullptr, 0, &width, &height, &format) !=
+        COMP_OK) {
+      return false;
+    }
+    if (width <= 0 || height <= 0) return false;
+    rect.x = 0;
+    rect.y = 0;
+    rect.w = width;
+    rect.h = height;
+  }
+  *out_rect = rect;
+  if (out_rotation != nullptr) *out_rotation = static_cast<double>(rotation);
+  return true;
+}
+
+int panel_apply_layer_transform(ShellState& shell, comp_layer_id id, int width, int height,
+                                double angle, bool keep_rotation) {
+  if (shell.doc.document == nullptr || id == 0) return -1;
+  comp_rect current{};
+  double current_rotation = 0.0;
+  if (!layer_effective_transform(shell, id, &current, &current_rotation)) return -1;
+  width = comp_ui::clamp_doc_size(width);
+  height = comp_ui::clamp_doc_size(height);
+  const double next_rotation = keep_rotation ? current_rotation : angle;
+  if (!std::isfinite(next_rotation)) return -1;
+  /*
+   * 恒等（宽高与角度都没变）不写、不落撤销步：面板留着让用户接着改，与变换
+   * 选区的恒等短路由同一约定。未显式变换的图层「按原尺寸 + 0°」回车也走这里，
+   * 不会平白把隐式变换物化成一条 transform。
+   */
+  if (width == current.w && height == current.h &&
+      std::fabs(next_rotation - current_rotation) < 1e-6) {
+    return 0;
+  }
+  /* 中心锚定：新矩形以旧矩形的中心为中心，和面板副标题的承诺一致。 */
+  const double center_x = static_cast<double>(current.x) + current.w * 0.5;
+  const double center_y = static_cast<double>(current.y) + current.h * 0.5;
+  const comp_rect next{static_cast<int32_t>(std::lround(center_x - width * 0.5)),
+                       static_cast<int32_t>(std::lround(center_y - height * 0.5)), width, height};
+  if (comp_layer_set_transform(shell.doc.document, id, next, static_cast<float>(next_rotation)) !=
+      COMP_OK) {
+    return -1;
+  }
+  record_transform_step(shell, static_cast<double>(width) / static_cast<double>(current.w),
+                        static_cast<double>(height) / static_cast<double>(current.h),
+                        rotation_delta_degrees(current_rotation, next_rotation));
+  shell.doc.needs_render = true;
+  return 1;
+}
+
+/*
+ * 再次变换：把上一次（旋转 / 缩放 / 数值变换 / 手柄拖动）的比例与角度增量
+ * 原样再套一遍。每一次执行都会覆盖「上一次」，所以连按 Ctrl+Shift+T 是
+ * 等比/等角累加，和 PS 一致。移动刻意不记录：它走 nudge 事务，与矩形不是
+ * 同一个量（见 shell_state.h 的字段注释）。
+ */
+void panel_transform_again(ShellState& shell) {
+  if (!shell.doc.transform_step_valid) {
+    set_status(shell, L"再次变换：还没有可复读的变换（先旋转 / 缩放 / 数值变换一次）");
+    return;
+  }
+  const LayerRow* row = selected_row(shell);
+  if (row == nullptr) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  comp_rect current{};
+  double rotation = 0.0;
+  if (!layer_effective_transform(shell, row->id, &current, &rotation)) {
+    set_status(shell, L"再次变换：该图层没有可变换的像素（组或空图层）");
+    return;
+  }
+  const int width = comp_ui::clamp_doc_size(static_cast<int>(
+      std::lround(static_cast<double>(current.w) * shell.doc.transform_step_scale_x)));
+  const int height = comp_ui::clamp_doc_size(static_cast<int>(
+      std::lround(static_cast<double>(current.h) * shell.doc.transform_step_scale_y)));
+  const int angle = comp_ui::doc_angle_from_rotation(rotation + shell.doc.transform_step_angle);
+  const int applied = panel_apply_layer_transform(shell, row->id, width, height, angle, false);
+  if (applied < 0) {
+    set_status(shell, L"再次变换：写入图层变换失败");
+    return;
+  }
+  if (applied == 0) {
+    set_status(shell, L"再次变换：尺寸已到 1..30000 边界且角度未变（未产生撤销步）");
+    return;
+  }
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"再次变换：%d×%d · %d°（Ctrl+Shift+T）", width, height, angle);
   refresh_history_status(shell, buffer);
 }
 

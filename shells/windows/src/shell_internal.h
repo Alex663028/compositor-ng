@@ -262,6 +262,22 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_move_layer(ShellState& shell, int dx, int dy);
   void panel_rotate_layer(ShellState& shell, bool forward);
   void panel_scale_layer(ShellState& shell, int direction);
+  /*
+   * P1-3 数值变换 / 再次变换。三条都在 shell_layers.cpp，共用一套几何口径：
+   *   - layer_effective_transform：读图层「有效」矩形（未显式变换 = 原点 + 像素
+   *     尺寸）；组 / 空图层（0×0）返回 false，调用方据此拒绝，不画空面板；
+   *   - panel_apply_layer_transform：中心锚定写入新宽高 + 角度，并把
+   *     「比例 + 角度增量」记成下一次「再次变换」要复读的一步；
+   *   - panel_transform_again：把记下的那一步再套一遍。
+   */
+  bool layer_effective_transform(ShellState& shell, comp_layer_id id, comp_rect* out_rect,
+                                 double* out_rotation);
+  int panel_apply_layer_transform(ShellState& shell, comp_layer_id id, int width, int height,
+                                  double angle, bool keep_rotation);
+  void panel_transform_again(ShellState& shell);
+  /* 记下「刚才这一步」的比例与角度增量（供再次变换复读）。无效参数直接忽略。 */
+  void record_transform_step(ShellState& shell, double scale_x, double scale_y,
+                             double angle_delta);
   void panel_add_layer(ShellState& shell);
   bool panel_selection_contains(const ShellState& shell, comp_layer_id id);
   std::vector<comp_layer_id> panel_selection_ids(const ShellState& shell, bool drop_covered);

@@ -5118,7 +5118,17 @@ enum class DocDialogKind {
    * 回车走 comp_selection_transform（ABI 尾部第 167 项）。中心点固定为
    * 当前基础蒙版的包围盒中心，一次命令内可预期；Esc 不改文档。
    */
-  TransformSelection
+  TransformSelection,
+  /*
+   * P1-3：数值变换（图层级）。选中图层已经能按 Ctrl+T 手柄缩放、按 15° 步进
+   * 旋转，但**没有地方输入确定数**——「把它变成正好 512 px 宽」只能靠拖，
+   * 拖完还得看状态栏猜。这里补「宽 / 高 / 角度」三行，中心锚定，回车走既有的
+   * comp_layer_set_transform（零 ABI 新增）；再次变换（Ctrl+Shift+T）复读上
+   * 一次的比例与角度增量。
+   *
+   * 组与空图层没有可变换像素：打开即拒绝并说明原因，不画一个改了也没用的面板。
+   */
+  TransformLayer
 };
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
@@ -5196,6 +5206,23 @@ inline int clamp_history_budget_mb(int value) {
   return value;
 }
 
+/*
+ * 图层旋转角 -> 面板角度行：先归一到 (-180, 180] 再四舍五入取整。
+ * 用半开区间而不是 [-180, 180]，与旋转命令的 (-360, 360] 归一化同思路：
+ * 端点只取一侧，lround 之后不会漂到域外。旋转角本身可能带小数（手柄拖动），
+ * 这里只负责显示；数值变换在角度行没被改动时会原样写回带小数的角度
+ * （见 shell_document.cpp 的 TransformLayer 分支），所以取整不会改坏图层。
+ */
+inline int doc_angle_from_rotation(double degrees) {
+  if (!std::isfinite(degrees)) return 0;
+  while (degrees <= -180.0) degrees += 360.0;
+  while (degrees > 180.0) degrees -= 360.0;
+  int value = static_cast<int>(std::lround(degrees));
+  if (value < kTransformAngleMin) value = kTransformAngleMin;
+  if (value > kTransformAngleMax) value = kTransformAngleMax;
+  return value;
+}
+
 inline const char* doc_dialog_title(DocDialogKind kind) {
   switch (kind) {
     case DocDialogKind::NewDocument:
@@ -5212,6 +5239,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "关闭文档（Close）";
     case DocDialogKind::TransformSelection:
       return "变换选区（Transform Selection）";
+    case DocDialogKind::TransformLayer:
+      return "数值变换（Transform）";
     default:
       return "";
   }
@@ -5233,6 +5262,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "文档有未保存的修改 · 关闭前请选择";
     case DocDialogKind::TransformSelection:
       return "中心固定为当前选区中心 · 角度顺时针为正";
+    case DocDialogKind::TransformLayer:
+      return "作用于选中图层 · 中心锚定 · Ctrl+Shift+T 再次变换";
     default:
       return "";
   }
@@ -5254,6 +5285,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "不保存 = 这次修改连同撤销栈一起丢弃";
     case DocDialogKind::TransformSelection:
       return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
+    case DocDialogKind::TransformLayer:
+      return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
     default:
       return "";
   }
@@ -5274,6 +5307,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
     case DocDialogKind::ClosePrompt:
       return 1; /* 动作 */
     case DocDialogKind::TransformSelection:
+      return 3; /* 宽 / 高 / 角度 */
+    case DocDialogKind::TransformLayer:
       return 3; /* 宽 / 高 / 角度 */
     default:
       return 0;
@@ -5345,6 +5380,19 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
       }
       break;
     case DocDialogKind::TransformSelection:
+      switch (row) {
+        case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};
+        case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};
+        case 2:
+          return DocRowSpec{"角度 (°)", DocRowKind::Number, kTransformAngleMin,
+                            kTransformAngleMax, kTransformAngleStep, 0};
+        default: break;
+      }
+      break;
+    case DocDialogKind::TransformLayer:
+      /* 与选区那条同量程：宽度 1..30000（图层像素尺寸上限与文档同口径），
+       * 角度 -180..180、步进 15°——和 图层 > 逆/顺时针旋转 15° 是同一个档位，
+       * 键盘与菜单对同一图层给出可预期的相同结果。 */
       switch (row) {
         case 0: return DocRowSpec{"宽度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};
         case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 8, 0};

@@ -178,6 +178,11 @@ constexpr UINT kCmdSelectGrow = 1060;
 constexpr UINT kCmdSelectSimilar = 1061;
 /* P0-5 收尾：变换选区（宽 / 高 / 角度数值输入；手柄只做轴对齐缩放）。 */
 constexpr UINT kCmdSelectTransform = 1062;
+/* P1-3：数值变换 / 再次变换。前者是右栏三行面板（Ctrl+T），后者复读上一次
+ * 的比例与角度增量（Ctrl+Shift+T）——两者都只调 comp_layer_set_transform，
+ * 零 ABI 新增；再次变换的「上一次」按文档记录，换文档即失效。 */
+constexpr UINT kCmdLayerTransformNumeric = 1063;
+constexpr UINT kCmdLayerTransformAgain = 1064;
 constexpr UINT kCmdSelectLoadPixels = 1049;
 /* P0-4 第二批：色彩范围面板（打开即进预览事务）。 */
 constexpr UINT kCmdSelectColorRange = 1050;
@@ -454,6 +459,22 @@ struct DocumentContext {
   int doc_dialog_base_height = kDefaultHeight;
   /* 变换选区：第三行是角度（度，顺时针为正）；宽/高复用上面两个字段。 */
   int doc_dialog_angle = 0;
+  /*
+   * P1-3：数值变换面板打开时的角度行原值。应用时若角度行没被改过
+   * （doc_dialog_angle == doc_dialog_angle_base），写回**当前**的浮点角度而不是
+   * 取整后的显示值——只改宽高不该把 22.5° 悄悄变成 23°。
+   */
+  int doc_dialog_angle_base = 0;
+  /*
+   * P1-3：再次变换复读的「上一次」——比例与角度增量（度）。按文档记录，换文档
+   * 即清零（见 forget_color_range）。移动/箭头微调刻意不记录：它们走的是 nudge
+   * 事务，与 set_transform 的矩形不是同一个量；PS 的 Transform Again 也复读
+   * 移动，但这里没有「拖动变换」这个可复读的步。
+   */
+  bool transform_step_valid = false;
+  double transform_step_scale_x = 1.0;
+  double transform_step_scale_y = 1.0;
+  double transform_step_angle = 0.0;
   std::wstring doc_dialog_input;
   int camera_raw_values[comp_ui::kCameraRawRowCount] = {};
   std::string document_path;

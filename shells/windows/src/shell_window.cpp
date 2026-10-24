@@ -225,6 +225,7 @@ void sync_menu_state(HWND window, ShellState& shell) {
       kCmdLayerMoveRight,     kCmdLayerMoveUp,        kCmdLayerMoveDown,
       kCmdLayerRotateLeft,    kCmdLayerRotateRight,   kCmdLayerScaleDown,
       kCmdLayerScaleUp,
+      kCmdLayerTransformNumeric, kCmdLayerTransformAgain,
   };
   for (UINT id : layer_present_items) {
     menu_set_enabled_recursive(menu, id, enabled.layer_present);
@@ -1895,6 +1896,14 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       case 'S':
         /* Ctrl+Shift+S 另存为位图，Ctrl+S 保存 .comp。 */
         run_shell_command(window, shell, shift ? kCmdExportImage : kCmdSave);
+        return;
+      /*
+       * P1-3 变换：Ctrl+T 数值变换（上游 ⌘T 的对位），Ctrl+Shift+T 再次变换。
+       * 文字工具没有占用 T 之前的 Ctrl 组合，这两个键此前都空着。
+       */
+      case 'T':
+        run_shell_command(window, shell,
+                          shift ? kCmdLayerTransformAgain : kCmdLayerTransformNumeric);
         return;
       case 'V':
         /*
@@ -4098,6 +4107,8 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRotateRight, L"顺旋转 15°(&])	Ctrl+Shift+→");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerScaleDown, L"缩小(&-)	Alt+,");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerScaleUp, L"放大(&+)	Alt+.");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerTransformNumeric, L"数值变换…(&T)	Ctrl+T");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerTransformAgain, L"再次变换(&A)	Ctrl+Shift+T");
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerBlendPrev, L"上一个混合模式(&P)\tShift+B");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerBlendNext, L"下一个混合模式(&X)\tShift+N");

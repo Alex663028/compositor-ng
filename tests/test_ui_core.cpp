@@ -4250,6 +4250,41 @@ COMP_TEST(ui_core_doc_dialog_rows) {
   COMP_CHECK(std::string(comp_ui::doc_dialog_title(DocDialogKind::TransformSelection)).size() > 0);
   COMP_CHECK(std::string(comp_ui::doc_dialog_subtitle(DocDialogKind::TransformSelection)).size() > 0);
   COMP_CHECK(std::string(comp_ui::doc_dialog_hint(DocDialogKind::TransformSelection)).size() > 0);
+
+  /*
+   * 6. P1-3：数值变换（图层级）。行序与选区那条一致（宽 / 高 / 角度），量程也必须
+   * 一致——两套面板用同一个 kTransformAngle*，否则「同一个角度」在两边能填的数不同。
+   */
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::TransformLayer) == 3);
+  const comp_ui::DocRowSpec layer_w = comp_ui::doc_dialog_row(DocDialogKind::TransformLayer, 0);
+  const comp_ui::DocRowSpec layer_h = comp_ui::doc_dialog_row(DocDialogKind::TransformLayer, 1);
+  const comp_ui::DocRowSpec layer_a = comp_ui::doc_dialog_row(DocDialogKind::TransformLayer, 2);
+  COMP_CHECK(layer_w.kind == DocRowKind::Number && layer_h.kind == DocRowKind::Number);
+  COMP_CHECK(layer_a.kind == DocRowKind::Number);
+  COMP_CHECK(layer_w.min == comp_ui::kDocSizeMin && layer_w.max == comp_ui::kDocSizeMax);
+  COMP_CHECK(layer_h.min == layer_w.min && layer_h.max == layer_w.max);
+  COMP_CHECK(layer_a.min == comp_ui::kTransformAngleMin);
+  COMP_CHECK(layer_a.max == comp_ui::kTransformAngleMax);
+  COMP_CHECK(layer_a.step == comp_ui::kTransformAngleStep);
+  /* 宽高的步进不能是 1：几千像素的图层按一次改 1px 是没法用的。 */
+  COMP_CHECK(layer_w.step > 1);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_title(DocDialogKind::TransformLayer)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_subtitle(DocDialogKind::TransformLayer)).size() > 0);
+  COMP_CHECK(std::string(comp_ui::doc_dialog_hint(DocDialogKind::TransformLayer)).size() > 0);
+  /*
+   * 角度回显：引擎给的是 float，面板只有整数行。归一化到 (-180, 180]，四舍五入，
+   * 并夹在行量程内——否则 `%d 度` 会显示一个填不回去的数（-180.4 → -180 尚可，
+   * 181 → 181 就越界了）。
+   */
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(0.0) == 0);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(22.4) == 22);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(22.5) == 23);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(-22.5) == -23);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(180.0) == 180);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(-180.0) == 180);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(540.0) == 180);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(370.0) == 10);
+  COMP_CHECK(comp_ui::doc_angle_from_rotation(-370.0) == -10);
 }
 
 /*

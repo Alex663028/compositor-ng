@@ -1443,6 +1443,9 @@ void layer_handle_end(HWND window, ShellState& shell) {
   const bool rotating = shell.doc.layer_handle_kind == comp_ui::kTransformHandleRotate;
   const comp_rect current = shell.doc.layer_handle_current;
   const float rotation = shell.doc.layer_handle_current_rotation;
+  /* 基数在按下时快照，清除之后就拿不到了——「再次变换」要靠它算这一步的增量。 */
+  const comp_rect base = shell.doc.layer_handle_base;
+  const float base_rotation = shell.doc.layer_handle_base_rotation;
   layer_handle_clear(shell);
   ReleaseCapture();
 
@@ -1457,6 +1460,11 @@ void layer_handle_end(HWND window, ShellState& shell) {
     return;
   }
   shell.doc.needs_render = true;
+  if (base.w > 0 && base.h > 0) {
+    record_transform_step(shell, static_cast<double>(current.w) / static_cast<double>(base.w),
+                          static_cast<double>(current.h) / static_cast<double>(base.h),
+                          static_cast<double>(rotation) - static_cast<double>(base_rotation));
+  }
   wchar_t buffer[192];
   if (rotating) {
     wsprintfW(buffer, L"已旋转图层：%d°（一步撤销）", static_cast<int>(std::lround(rotation)));

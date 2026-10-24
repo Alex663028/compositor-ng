@@ -250,6 +250,15 @@ void forget_color_range(ShellState& shell) {
   shell.doc.show_guides = true;
   shell.doc.show_grid = false;
   shell.doc.snap_enabled = true;
+  /*
+   * P1-3：「再次变换」复读的是**这张文档**上一步的几何变换。换文档后旧比例/
+   * 角度对新图层没有意义（尺寸基准都不一定同类），一并作废，免得 Ctrl+Shift+T
+   * 在刚打开的图上套一个看不见来源的缩放。
+   */
+  shell.doc.transform_step_valid = false;
+  shell.doc.transform_step_scale_x = 1.0;
+  shell.doc.transform_step_scale_y = 1.0;
+  shell.doc.transform_step_angle = 0.0;
 }
 
 bool create_document_with(ShellState& shell, int width, int height, int dpi, int background) {
@@ -533,6 +542,13 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
         case 2: return shell.doc.doc_dialog_angle;
         default: return 0;
       }
+    case comp_ui::DocDialogKind::TransformLayer:
+      switch (row) {
+        case 0: return shell.doc.doc_dialog_width;
+        case 1: return shell.doc.doc_dialog_height;
+        case 2: return shell.doc.doc_dialog_angle;
+        default: return 0;
+      }
     default:
       return 0;
   }
@@ -647,6 +663,21 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         }
       }
       break;
+    case comp_ui::DocDialogKind::TransformLayer:
+      /* 与选区那条共用同一组行规格（1..30000 / ±180），夹取来源只有一处。 */
+      {
+        const comp_ui::DocRowSpec spec = comp_ui::doc_dialog_row(shell.doc.doc_dialog, row);
+        int clamped = value;
+        if (clamped < spec.min) clamped = spec.min;
+        if (clamped > spec.max) clamped = spec.max;
+        switch (row) {
+          case 0: shell.doc.doc_dialog_width = clamped; break;
+          case 1: shell.doc.doc_dialog_height = clamped; break;
+          case 2: shell.doc.doc_dialog_angle = clamped; break;
+          default: break;
+        }
+      }
+      break;
     default:
       break;
   }
@@ -690,6 +721,13 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
       wsprintfW(buffer, L"%d px", value);
       return buffer;
     case comp_ui::DocDialogKind::TransformSelection:
+      if (row == 2) {
+        wsprintfW(buffer, L"%d 度", value);
+      } else {
+        wsprintfW(buffer, L"%d px", value);
+      }
+      return buffer;
+    case comp_ui::DocDialogKind::TransformLayer:
       if (row == 2) {
         wsprintfW(buffer, L"%d 度", value);
       } else {
@@ -762,6 +800,23 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       return;
     }
   }
+  if (kind == comp_ui::DocDialogKind::TransformLayer) {
+    /*
+     * 组与空图层没有可变换的像素：layer_effective_transform 在 0×0 时回 false。
+     * 在这里就拒（而不是让用户填完数才失败），也避免画出一块「改了也没用」的面板。
+     */
+    const comp_layer_id target = selected_layer_id(shell);
+    if (target == 0) {
+      set_status(shell, L"数值变换：请先在图层面板选中一个图层");
+      return;
+    }
+    comp_rect rect{};
+    double rotation = 0.0;
+    if (!layer_effective_transform(shell, target, &rect, &rotation)) {
+      set_status(shell, L"数值变换：组或空图层没有可变换的像素");
+      return;
+    }
+  }
   /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围互斥）。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
   shell.doc.filter_open = false;
@@ -831,6 +886,29 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       shell.doc.doc_dialog_height = comp_ui::clamp_doc_size(shell.doc.selection_base.h);
       shell.doc.doc_dialog_angle = 0;
       break;
+    case comp_ui::DocDialogKind::TransformLayer: {
+      /*
+       * 起点 = 图层的**有效**变换（隐式变换回落到像素尺寸），角度 = 当前旋转：
+       * 什么都不填直接回车就是恒等变换（panel_apply_layer_transform 短路，不落撤销步）。
+       *
+       * doc_dialog_angle_base 记住打开时的取整角度，应用时用它判断「角度行有没有被
+       * 动过」：没动就写回**原始 float**，否则改个宽度会把 22.5° 悄悄圆成 23°。
+       */
+      comp_rect rect{};
+      double rotation = 0.0;
+      if (layer_effective_transform(shell, selected_layer_id(shell), &rect, &rotation)) {
+        shell.doc.doc_dialog_width = comp_ui::clamp_doc_size(static_cast<int>(rect.w));
+        shell.doc.doc_dialog_height = comp_ui::clamp_doc_size(static_cast<int>(rect.h));
+        shell.doc.doc_dialog_angle = comp_ui::doc_angle_from_rotation(rotation);
+      } else {
+        /* 判空已在上面做过；走到这里说明面板开着期间图层没了，给一个自洽的 1×1。 */
+        shell.doc.doc_dialog_width = 1;
+        shell.doc.doc_dialog_height = 1;
+        shell.doc.doc_dialog_angle = 0;
+      }
+      shell.doc.doc_dialog_angle_base = shell.doc.doc_dialog_angle;
+      break;
+    }
     default:
       break;
   }
@@ -1209,6 +1287,37 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
     wsprintfW(buffer, L"变换选区：%d×%d · %d 度（撤销一步）", shell.doc.doc_dialog_width,
               shell.doc.doc_dialog_height, shell.doc.doc_dialog_angle);
     finish_selection_command(shell, buffer);
+    return;
+  }
+
+  if (kind == comp_ui::DocDialogKind::TransformLayer) {
+    const comp_layer_id target = selected_layer_id(shell);
+    if (target == 0) {
+      doc_dialog_close(shell, L"数值变换：目标图层已不存在（未改动）");
+      return;
+    }
+    /*
+     * 角度行没动过就写回原始 float：用户只想改宽高时，不该因为面板按整数显示
+     * 就把 22.5° 圆成 23°。判据是「显示值仍等于打开时的取整值」。
+     */
+    const bool keep_rotation = shell.doc.doc_dialog_angle == shell.doc.doc_dialog_angle_base;
+    const int applied = panel_apply_layer_transform(
+        shell, target, shell.doc.doc_dialog_width, shell.doc.doc_dialog_height,
+        static_cast<double>(shell.doc.doc_dialog_angle), keep_rotation);
+    if (applied < 0) {
+      /* 面板留着，用户填的数不丢；引擎在事务之前就拒了，没有半成品。 */
+      set_status(shell, L"数值变换：应用失败（图层未改动）");
+      return;
+    }
+    if (applied == 0) {
+      set_status(shell, L"数值变换：尺寸与角度未变（未产生撤销步）");
+      return;
+    }
+    doc_dialog_close(shell, nullptr);
+    wchar_t buffer[224];
+    wsprintfW(buffer, L"数值变换：%d×%d · %d 度（撤销一步）", shell.doc.doc_dialog_width,
+              shell.doc.doc_dialog_height, shell.doc.doc_dialog_angle);
+    refresh_history_status(shell, buffer);
     return;
   }
 }
@@ -1663,6 +1772,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdLayerScaleUp:
       panel_scale_layer(shell, 1);
+      break;
+    /* ---- P1-3：数值变换 / 再次变换 ---- */
+    case kCmdLayerTransformNumeric:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::TransformLayer);
+      break;
+    case kCmdLayerTransformAgain:
+      panel_transform_again(shell);
       break;
     /* ---- S22：引擎早已实现、壳此前未接线的像素级图层能力 ---- */
     case kCmdLayerMaskFromSelection:

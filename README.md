@@ -7288,4 +7288,100 @@ comp_result comp_selection_transform(comp_document document,
 - **重开面板回显包围盒**：旋转后的紧包围盒仍轴对齐，所以再次打开看到的是包围盒，
   不是上一轮那个旋转矩形的宽高/角度（头文件已写明）。
 
+### 6.103 数值变换 + 再次变换：把「拖手柄」换成三个数字（P1-3，2026-10-24，Claude）
+
+**缺口。** 图层变换此前只有两条路：拖变换手柄（§5.44，像素精确但对不准），或者
+`Ctrl+←/→` 转 15°、`Alt+,/.` 缩 8 级（§5.44 的步进命令）。没有「输入宽高」，
+也没有 PS 里最省事的那一步：`Ctrl+Shift+T` 再次变换——把上一次的比例与角度增量
+原样复读。本项补齐这两条，**零 ABI 新增**：`comp_layer_get_transform` /
+`comp_layer_set_transform` 早已在 ABI 里（167 个导出不变），缺的只是壳侧入口。
+
+**「有效变换」：隐式变换与显式变换用同一把尺。** 图层没有显式 transform 时，
+`comp_layer_get_transform` 报出的宽高是 0——那是「用像素尺寸」的隐式含义，不是
+「零大小」。面板不能把 0 填进宽高行，否则一按回车就把图层缩成 1×1。于是先做一次
+归一化（`layer_effective_transform`）：宽高 `<= 0` 时用 `comp_layer_get_pixels`
+的查询模式（`pixels == nullptr`）取资产尺寸；查询回 `0×0` 的（组、空图层）视为
+「没有可变换的像素」。**同一把尺也用在恒等判断上**：未变换过的图层打开面板后
+什么都不改直接回车，比的是「有效矩形」，所以既不写 transform、也不落空撤销步。
+
+**三行数字，中心锚定。** 面板复用 `doc_dialog` 框架（`DocDialogKind::TransformLayer`，
+`draw_doc_dialog` 一行未改）：宽 / 高 / 角度，量程与「变换选区」共用
+`kDocSizeMin..Max` 与 `kTransformAngle±180`（步进 8 px / 15°）。应用时的矩形取
+`中心 ± 新尺寸/2`（`lround` 落整），与副标题「中心锚定」的承诺一致；旋转用
+`comp_layer_set_transform` 的 `rotation` 参数，不经过像素。
+
+**角度不能被整数行悄悄圆掉。** 面板只有整数行（`wsprintfW` 没有浮点格式），但引擎
+的 rotation 是 `float`。若把读回的 `22.5°` 显示成 `23°` 再原样写回，用户只改了一下
+宽度，旋转就被改了。做法是打开面板时多记一个 `doc_dialog_angle_base`：应用时若
+角度行**仍等于打开时的取整值**，就写回原始 float（`keep_rotation`）；只有用户真的
+动过角度行才用面板上的整数。这条判断是「改动前 vs 改动后」的比较，不是「有没有
+碰过键盘」，所以 Tab 穿过角度行、或键入后又删回去，都不会误伤。
+
+**「再次变换」记得上一次是什么。** `record_transform_step` 在任何一次变换**成功
+之后**记下 `(scale_x, scale_y, angle_delta)`，`panel_transform_again` 拿它去乘当前
+尺寸、加当前角度，再走同一个 `panel_apply_layer_transform`。三条来源都接上了：
+
+| 来源 | 记录的比例/角度 |
+|---|---|
+| 数值变换（本项） | `新宽/旧宽`、`新高/旧高`、角度差 |
+| 旋转 15°（`Ctrl+←/→`） | `1:1`、实际角度差（最后一次可能不足 15°） |
+| 缩放（`Alt+,/.`） | 实际尺寸比、`0` |
+| 手柄拖动（松手提交成功后） | 实际尺寸比、实际角度差 |
+
+四条共同的克制：**移动 / 方向键微调刻意不记录**——它走的是 nudge 事务，位移和
+矩形不是同一个量，混进来会让「再次变换」突然把图层挪走；**恒等步不入账**——把
+上一次的真变换保住，而不是被一次「拖回原位」覆盖成空；记录只在事务提交**成功
+之后**发生，所以失败路径不会留下一条假的「上一步」。
+
+**外壳接线的两个细节。**
+
+- `Ctrl+T` / `Ctrl+Shift+T` 走 `WM_KEYDOWN` 的 `if (ctrl)` 分支。右栏面板打开时
+  模态键处理（`shell_window.cpp:1040` 一带）只在 `!ctrl` 时吞键，所以这两个
+  组合键在**任何面板开着**都能到达命令处理——这是有意的：变换面板开着时再按
+  `Ctrl+Shift+T` 不会静默失效。
+- 组与空图层在**打开面板之前**就拒（`0×0` 判据），状态栏写「组或空图层没有可变换
+  的像素」。不画一块改了也没用的面板，也不让用户填完三个数字才发现无目标。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/ui_core.h` | `DocDialogKind::TransformLayer`、三行 `DocRowSpec`、标题/副标题/提示、`doc_angle_from_rotation` |
+| `shells/windows/src/shell_state.h` | `kCmdLayerTransformNumeric = 1063`、`kCmdLayerTransformAgain = 1064`、`doc_dialog_angle_base`、`transform_step_*` 四个字段 |
+| `shells/windows/src/shell_layers.cpp` | `layer_effective_transform`、`panel_apply_layer_transform`、`panel_transform_again`、`record_transform_step`、`rotation_delta_degrees`；旋转/缩放成功后记录 |
+| `shells/windows/src/shell_document.cpp` | 行值 get/set/文本、打开闸门与起点、应用分支、命令分发、`forget_color_range` 复位 |
+| `shells/windows/src/shell_window.cpp` | 两个菜单项 + 置灰 + `Ctrl+T` / `Ctrl+Shift+T` |
+| `shells/windows/src/shell_tools.cpp` | 手柄拖动提交成功后记录这一步的比例/角度（基数在 `layer_handle_clear` 之前快照） |
+| `tests/test_ui_core.cpp` | 行数/量程/步进/标题断言 + `doc_angle_from_rotation` 归一化 9 例 |
+| `scripts/visual_check.py` | 追加 `layer_transform_numeric` 场景 11 条（`SCENES` 末尾，既有阈值未动） |
+
+**本轮验证基线（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **710 例 / 0 失败**（本轮只加断言，不加 case） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS** |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 逐字节不变（不加自检项） |
+| `scripts/visual_check.py --scene all` | **192 条 / 32 场景 / 0 失败**（181 → 192，只追加 `layer_transform_numeric`） |
+| `^COMP_API` 导出 | **167**（零新增、零重排） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+
+**视觉探针的实测数（同一个形状矩形）：** 横跨度 `238 → 116 → 56` 屏幕像素，
+两次都约为一半；竖跨度三次都是 `118`（没填高度，也就不该动）；中心 `592.0 → 591.0`；
+`Ctrl+Z×2` 后回到 `238 / 118`。恒等回车时两张截图逐像素一致，且面板留着没关。
+
+**已知边界：**
+
+- **只有仿射的平移/缩放/旋转**：没有斜切、扭曲、透视、自由变形（Warp）——
+  这些在 P1-3 的第二段，需要新的 ABI（`comp_layer_set_transform` 只有
+  `rect + rotation` 六个自由度）。
+- **中心固定为矩形中心**：不能像 PS 那样把参考点换到某个角或边中点。
+- **整数角度**：面板只收整数度；引擎侧接受 `float`，「未改角度」时保留原始 float
+  小数（见上），但改过的角度只能是整数。
+- **「再次变换」是单步记忆**：只记最后一次变换的增量，不记「上一次命令」本身；
+  连"再按一次"是累乘（与 PS 一致），撤销后仍然按同一个增量复读。
+- **移动不在记录范围内**：`Ctrl+←/→` 之外的平移（含方向键微调、拖图层）都不会成为
+  「上一次变换」，所以 `Ctrl+Shift+T` 不会把图层挪走——这是刻意的取舍，见上表。
+- **文字/形状层要能被格栅化**：`comp_layer_get_pixels` 查得到资产的层都能变；
+  纯矢量形状层若查询回 `0×0`，会被当成「没有可变换的像素」拒绝。
+
+
 
