@@ -94,8 +94,9 @@ CMD_ADJ_KIND_PREV = 1014
 CMD_ADJ_ADD = 1022
 CMD_ADJ_APPLY = 1023
 CMD_ADJ_VALUE_UP = 1021
-# 面板动作号落在 1220 段：滤镜序号涨到 11 个（1200..1210）后，1210 已经是
-# Sharpen 的菜单项，旧的应用号会和它抢同一个 id（见 shell_state.h）。
+# 面板动作号落在 1220 段：滤镜序号涨到 15 个（1200..1214）后，1210 已经是
+# Sharpen、1211..1214 是 High Pass / Minimum / Maximum / Offset 的菜单项，旧的应用号
+# 会和菜单项抢同一个 id（见 shell_state.h）。面板动作号 1220..1222。
 CMD_FILTER_APPLY = 1220
 # 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..24 是本仓追加的破坏性调整
 # （亮度对比、去色、阈值、色调分离、自然饱和度、可选颜色、照片滤镜、通道混合器、
@@ -1371,6 +1372,66 @@ def scene_sharpen_denoise(shell, checker):
     checker.check(scene, "Sharpen 拉大局部方差（噪声更硬）",
                   sharpened > denoised * 1.5,
                   "σ %.1f -> %.1f" % (denoised, sharpened))
+
+
+def scene_filter_other(shell, checker):
+    """High Pass(1211) / Minimum(1212) / Maximum(1213) / Offset(1214) 的入口与像素方向。
+
+    这一场钉的是**命令号区间**：1200..1210 已被前 11 个滤镜占满，面板动作号顺延到
+    1220..1222（见 CMD_FILTER_APPLY 的注释），1211..1214 必须是新滤镜、不能被面板
+    动作抢走。四张面板截图各证一个 id 能打开对应面板；像素口径用一块**平坦纯色场**
+    量 High Pass——没有细节就没有偏移，整幅必须落 128 中灰，撤销一步原色回来。
+    """
+    scene = "filter_other"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("8899aa")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left, top, right, bottom, steps=8)
+    shell.wait(0.4)
+    img = shell.shot("95_other_flat_field")
+    probe = (left + 20, top + 20, left + 80, top + 80)
+    before = mean_rgb(img, probe)
+    checker.check(scene, "铺一块平坦纯色场（下面用它量中灰）",
+                  before[2] - before[0] > 20, "实测 %s" % (before,))
+
+    adjust = shell.layout["adjust"]
+    row1 = (adjust[0] + 6, adjust[1] + 53, adjust[2] - 8, adjust[1] + 73)
+
+    # High Pass 走 1211，radius 默认 0 = 恒等，键入 4 后回车一次落值并应用。
+    shell.command(CMD_FILTER_BASE + 11)
+    img = shell.shot("96_high_pass_panel")
+    checker.check(scene, "High Pass 面板打开且第一参数高亮",
+                  count_matching(img, row1, COL_HIGHLIGHT, 12) > 100,
+                  "高亮像素 %d" % count_matching(img, row1, COL_HIGHLIGHT, 12))
+    shell.type_text("4")
+    shell.press(VK_RETURN)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.8)
+    img = shell.shot("97_high_pass_applied")
+    flat = mean_rgb(img, probe)
+    checker.check(scene, "High Pass 把平坦区整幅压到 128 中灰",
+                  abs(brightness(flat) - 128) <= 10 and max(flat) - min(flat) < 12,
+                  "实测 %s 亮度 %d" % (flat, brightness(flat)))
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.8)
+    img = shell.shot("98_high_pass_undone")
+    restored = mean_rgb(img, probe)
+    checker.check(scene, "撤销一步回到原色（且只落了一步）",
+                  near(restored, before, 12), "原 %s 现 %s" % (before, restored))
+
+    # 另外三个 id 只验「面板能打开」：1212 / 1213 / 1214 都必须是新滤镜。
+    for command_id, name, file_name in ((12, "Minimum", "99_minimum_panel"),
+                                        (13, "Maximum", "9a_maximum_panel"),
+                                        (14, "Offset", "9b_offset_panel")):
+        shell.command(CMD_FILTER_BASE + command_id)
+        img = shell.shot(file_name)
+        checker.check(scene, "%s 面板打开且第一参数高亮" % name,
+                      count_matching(img, row1, COL_HIGHLIGHT, 12) > 100,
+                      "高亮像素 %d" % count_matching(img, row1, COL_HIGHLIGHT, 12))
+        shell.press(VK_ESCAPE)
 
 
 def scene_adjustment(shell, checker):
@@ -3632,6 +3693,7 @@ SCENES = [    ("start", scene_start, ()),
     ("merge_visible", scene_merge_visible, ()),
     ("layer_link", scene_layer_link, ()),
     ("layer_style_paste", scene_layer_style_paste, ()),
+    ("filter_other", scene_filter_other, ()),
 ]
 
 

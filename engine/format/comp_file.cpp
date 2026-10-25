@@ -462,6 +462,25 @@ JsonValue filter_settings_to_json(const FilterSettings& settings) {
       s.set("reduceColorNoise", JsonValue::number(v.reduce_color_noise));
       break;
     }
+    case kFilterHighPass: {
+      s.set("radius", JsonValue::number(settings.high_pass.radius));
+      break;
+    }
+    case kFilterMinimum: {
+      s.set("radius", JsonValue::number(settings.minimum.radius));
+      break;
+    }
+    case kFilterMaximum: {
+      s.set("radius", JsonValue::number(settings.maximum.radius));
+      break;
+    }
+    case kFilterOffset: {
+      const OffsetSettings& v = settings.offset;
+      s.set("horizontal", JsonValue::number(v.horizontal));
+      s.set("vertical", JsonValue::number(v.vertical));
+      s.set("wrap", JsonValue::integer(static_cast<long long>(v.wrap)));
+      break;
+    }
   }
   return s;
 }
@@ -1009,7 +1028,7 @@ bool read_layer_mask(const JsonValue& entry, const fs::path& root, Layer* layer,
 bool filter_settings_from_json(const JsonValue& j, FilterSettings* out) {
   const long long kind = j.integer_or("kind", -1);
   if (kind < static_cast<long long>(kFilterVignette) ||
-      kind > static_cast<long long>(kFilterReduceNoise)) {
+      kind > static_cast<long long>(kFilterOffset)) {
     return false;
   }
   const JsonValue* settings = j.find("settings");
@@ -1108,6 +1127,27 @@ bool filter_settings_from_json(const JsonValue& j, FilterSettings* out) {
       v.strength = settings->number_or("strength", v.strength);
       v.preserve_details = settings->number_or("preserveDetails", v.preserve_details);
       v.reduce_color_noise = settings->number_or("reduceColorNoise", v.reduce_color_noise);
+      break;
+    }
+    case kFilterHighPass: {
+      s.high_pass.radius = settings->number_or("radius", s.high_pass.radius);
+      break;
+    }
+    case kFilterMinimum: {
+      s.minimum.radius = settings->number_or("radius", s.minimum.radius);
+      break;
+    }
+    case kFilterMaximum: {
+      s.maximum.radius = settings->number_or("radius", s.maximum.radius);
+      break;
+    }
+    case kFilterOffset: {
+      OffsetSettings& v = s.offset;
+      v.horizontal = settings->number_or("horizontal", v.horizontal);
+      v.vertical = settings->number_or("vertical", v.vertical);
+      const long long wrap = settings->integer_or("wrap", static_cast<long long>(v.wrap));
+      if (wrap < 0 || wrap > 2) return false;
+      v.wrap = static_cast<int32_t>(wrap);
       break;
     }
   }

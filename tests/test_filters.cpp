@@ -238,7 +238,8 @@ COMP_TEST(filters_new_kinds_are_identity_at_zero_initialisation) {
 
   const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain,
                               kFilterMotionBlur, kFilterProgressiveBlur, kFilterSharpen,
-                              kFilterReduceNoise};
+                              kFilterReduceNoise, kFilterHighPass, kFilterMinimum,
+                              kFilterMaximum, kFilterOffset};
   for (FilterKind kind : kinds) {
     FilterSettings settings;
     settings.kind = kind; /* 其余字段零初始化：radius / amount 为 0 = 恒等 */
@@ -455,6 +456,68 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
     s.reduce_noise.strength = 3.0;
     s.reduce_noise.reduce_color_noise = -0.5;
     cases.push_back({"reduce noise color noise below 0", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterHighPass;
+    s.high_pass.radius = 0.05; /* (0, 0.1) 越界，与 Gaussian Blur 同规矩 */
+    cases.push_back({"high pass radius between 0 and 0.1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterHighPass;
+    s.high_pass.radius = 250.5;
+    cases.push_back({"high pass radius above 250", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMinimum;
+    s.minimum.radius = 0.5; /* (0, 1) 越界：零半径无意义，不静默夹到 1 */
+    cases.push_back({"minimum radius between 0 and 1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMinimum;
+    s.minimum.radius = 100.5;
+    cases.push_back({"minimum radius above 100", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMaximum;
+    s.maximum.radius = 0.5;
+    cases.push_back({"maximum radius between 0 and 1", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterMaximum;
+    s.maximum.radius = 100.5;
+    cases.push_back({"maximum radius above 100", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterOffset;
+    s.offset.horizontal = -10000.5;
+    cases.push_back({"offset horizontal below -10000", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterOffset;
+    s.offset.vertical = 10000.5;
+    cases.push_back({"offset vertical above 10000", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterOffset;
+    s.offset.horizontal = 4.0;
+    s.offset.wrap = 3;
+    cases.push_back({"offset wrap above 2", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterOffset;
+    s.offset.vertical = -4.0;
+    s.offset.wrap = -1;
+    cases.push_back({"offset wrap below 0", s});
   }
 
   for (const Case& item : cases) {
@@ -1886,5 +1949,370 @@ COMP_TEST(filters_abi_maps_the_sharpen_and_reduce_noise_fields) {
   denoise.reduce_noise.strength = 6.0;
   denoise.reduce_noise.preserve_details = 101.0;
   COMP_CHECK(comp_filter_apply(as_document_handle(&noisy), noisy_id, &denoise, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+/* ================================================== 2d. P1-5 其他组：高通 / 最小 / 最大 / 位移 */
+
+namespace {
+
+/* 透明底上一个 8x8 的白色实心方块（居中）：形态学的窗口边界与 alpha 形状都可观察。 */
+std::vector<uint8_t> square_on_transparent(int32_t width, int32_t height) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+  for (int32_t y = height / 2 - 4; y < height / 2 + 4; ++y) {
+    for (int32_t x = width / 2 - 4; x < width / 2 + 4; ++x) {
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                 static_cast<size_t>(x)) * 4u;
+      p[0] = p[1] = p[2] = p[3] = 255;
+    }
+  }
+  return out;
+}
+
+size_t opaque_pixels(const std::vector<uint8_t>& rgba) {
+  size_t count = 0;
+  for (size_t i = 3; i < rgba.size(); i += 4) {
+    if (rgba[i] != 0) ++count;
+  }
+  return count;
+}
+
+/* 透明底上的三个单像素标记：左上绿 (0,0)、近左上白 (2,2)、右下红 (w-3,h-3)。
+ * 一次 (+3,+3) 位移就能同时读出三种露出处理：露出的 (0,0) 在 wrap 0 下透明、
+ * wrap 1 下取到绿（边缘延展）、wrap 2 下取到红（环绕）。 */
+std::vector<uint8_t> offset_markers(int32_t width, int32_t height) {
+  std::vector<uint8_t> out(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0);
+  const auto mark = [&out, width](int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b) {
+    uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                               static_cast<size_t>(x)) * 4u;
+    p[0] = r;
+    p[1] = g;
+    p[2] = b;
+    p[3] = 255;
+  };
+  mark(0, 0, 0, 255, 0);
+  mark(2, 2, 255, 255, 255);
+  mark(width - 3, height - 3, 255, 0, 0);
+  return out;
+}
+
+bool pixel_is(const std::vector<uint8_t>& rgba, int32_t width, int32_t x, int32_t y, uint8_t r,
+              uint8_t g, uint8_t b, uint8_t a) {
+  const size_t offset = (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                         static_cast<size_t>(x)) * 4u;
+  return rgba[offset] == r && rgba[offset + 1] == g && rgba[offset + 2] == b &&
+         rgba[offset + 3] == a;
+}
+
+}  // namespace
+
+COMP_TEST(filters_high_pass_flattens_a_flat_field_to_mid_grey) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 100, 100, 100);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = undo_depth(document);
+
+  FilterSettings settings;
+  settings.kind = kFilterHighPass;
+  settings.high_pass.radius = 4.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "high pass is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "one high pass is exactly one undo step");
+  COMP_CHECK_MSG(note.find("High Pass applied") != std::string::npos,
+                 "the note names the high pass");
+  COMP_CHECK_MSG(note.find("mid-grey") != std::string::npos,
+                 "the note records the mid-grey convention");
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(changed_pixels(after, before) > 0, "high pass actually moves pixels");
+  COMP_CHECK_MSG(alpha_channel_identical(after, before), "high pass leaves alpha byte-identical");
+  /* 常量场没有细节：src - blur = 0，整幅都落 128（不透明层预乘 == 直通）。 */
+  COMP_CHECK(pixel_is(after, size, 0, 0, 128, 128, 128, 255));
+  COMP_CHECK(pixel_is(after, size, size - 1, size - 1, 128, 128, 128, 255));
+
+  document.undo();
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "one undo restores the source");
+}
+
+COMP_TEST(filters_high_pass_flips_sign_across_a_hard_edge) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 48;
+  const std::vector<uint8_t> pattern = hard_edge(size, size);
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+
+  FilterSettings settings;
+  settings.kind = kFilterHighPass;
+  settings.high_pass.radius = 4.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                 "high pass on a hard edge runs");
+  COMP_CHECK(code == COMP_OK);
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(alpha_channel_identical(after, pattern), "high pass keeps the opaque outline");
+  /* 远离边界的平坦区仍然是 128（模糊窗口完全落在同色区）。 */
+  COMP_CHECK_MSG(std::fabs(luma_at(after, size, 2, size / 2) - 128.0) < 0.5,
+                 "far-from-edge flat area still lands on 128");
+  /* 边两侧符号相反：暗侧被模糊抬高 -> 低于 128；亮侧被拉低 -> 高于 128。 */
+  COMP_CHECK_MSG(luma_at(after, size, size / 2 - 1, size / 2) < 123.0,
+                 "the dark side of the edge goes below mid-grey (negative detail)");
+  COMP_CHECK_MSG(luma_at(after, size, size / 2, size / 2) > 133.0,
+                 "the bright side of the edge goes above mid-grey (positive detail)");
+}
+
+COMP_TEST(filters_minimum_erodes_and_maximum_dilates_including_alpha) {
+  const int32_t size = 32;
+  const std::vector<uint8_t> pattern = square_on_transparent(size, size);
+  COMP_CHECK_MSG(opaque_pixels(pattern) == 64, "the fixture is an 8x8 opaque square");
+
+  Engine engine(test_engine_desc());
+  Document eroded(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id eroded_id = add_layer_with(&eroded, pattern, comp_rect{0, 0, size, size});
+  const size_t undo_before = undo_depth(eroded);
+
+  FilterSettings settings;
+  settings.kind = kFilterMinimum;
+  settings.minimum.radius = 2.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK_MSG(filter_apply(&eroded, eroded_id, settings, 1.0, &code, &changed, &note, &error),
+                 "minimum is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(note.find("Minimum applied") != std::string::npos, "the note names the minimum");
+  COMP_CHECK_MSG(note.find("erosion") != std::string::npos,
+                 "the note records the erosion formulation");
+  COMP_CHECK_MSG(undo_depth(eroded) == undo_before + 1,
+                 "one minimum is exactly one undo step");
+
+  const std::vector<uint8_t> shrunk = pixels_of(eroded, eroded_id);
+  /* 半径 2 的方形腐蚀把 8x8 缩成 4x4：alpha 跟着形状一起收缩。 */
+  COMP_CHECK_MSG(opaque_pixels(shrunk) == 16, "minimum shrinks the opaque square by 2 px per side");
+  COMP_CHECK_MSG(channel_at(shrunk, size, 15, 16, 3) == 255,
+                 "the interior of the eroded square keeps its alpha");
+  COMP_CHECK_MSG(channel_at(shrunk, size, 13, 16, 3) == 0,
+                 "the two outer rings lose their alpha (window sees transparent pixels)");
+  COMP_CHECK_MSG(channel_at(shrunk, size, 15, 16, 0) == 255,
+                 "the surviving pixels keep the source colour");
+
+  eroded.undo();
+  COMP_CHECK_MSG(pixels_of(eroded, eroded_id) == pattern, "one undo restores the source");
+
+  Document dilated(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id dilated_id = add_layer_with(&dilated, pattern, comp_rect{0, 0, size, size});
+  settings.kind = kFilterMaximum;
+  settings.maximum.radius = 2.0;
+  COMP_CHECK_MSG(filter_apply(&dilated, dilated_id, settings, 1.0, &code, &changed, &note, &error),
+                 "maximum is a real product path");
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  COMP_CHECK_MSG(note.find("dilation") != std::string::npos,
+                 "the note records the dilation formulation");
+
+  const std::vector<uint8_t> grown = pixels_of(dilated, dilated_id);
+  /* 半径 2 的方形膨胀把 8x8 长成 12x12：alpha 同样跟着形状扩张。 */
+  COMP_CHECK_MSG(opaque_pixels(grown) == 144, "maximum grows the opaque square by 2 px per side");
+  COMP_CHECK_MSG(channel_at(grown, size, 10, 16, 3) == 255,
+                 "the grown ring gains alpha from the square");
+  COMP_CHECK_MSG(channel_at(grown, size, 9, 16, 3) == 0,
+                 "pixels beyond the window stay transparent");
+  COMP_CHECK_MSG(channel_at(grown, size, 10, 16, 0) == 255,
+                 "the grown ring carries the source colour");
+}
+
+COMP_TEST(filters_offset_shift_is_integer_and_honours_each_wrap_mode) {
+  const int32_t size = 32;
+  const std::vector<uint8_t> pattern = offset_markers(size, size);
+  Engine engine(test_engine_desc());
+
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+
+  /* wrap 0：露出区域透明，移出图层的内容直接丢失。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+    const size_t undo_before = undo_depth(document);
+    FilterSettings settings;
+    settings.kind = kFilterOffset;
+    settings.offset.horizontal = 3.0;
+    settings.offset.vertical = 3.0;
+    settings.offset.wrap = 0;
+    COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                   "offset wrap 0 is a real product path");
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK(changed);
+    COMP_CHECK_MSG(note.find("transparent uncovered areas") != std::string::npos,
+                   "the note records the transparent fill");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before + 1,
+                   "one offset is exactly one undo step");
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    COMP_CHECK_MSG(pixel_is(after, size, 3, 3, 0, 255, 0, 255), "the green marker moves by (3,3)");
+    COMP_CHECK_MSG(pixel_is(after, size, 5, 5, 255, 255, 255, 255),
+                   "the white marker moves by (3,3)");
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 0, 0, 0, 0),
+                   "the uncovered corner is fully transparent");
+    COMP_CHECK_MSG(opaque_pixels(after) == 2, "content shifted out of the layer is dropped");
+    document.undo();
+    COMP_CHECK_MSG(pixels_of(document, id) == pattern, "one undo restores the source");
+  }
+
+  /* wrap 1：露出区域用最外一圈像素延展。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+    FilterSettings settings;
+    settings.kind = kFilterOffset;
+    settings.offset.horizontal = 3.0;
+    settings.offset.vertical = 3.0;
+    settings.offset.wrap = 1;
+    COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                   "offset wrap 1 is a real product path");
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(note.find("edge extension") != std::string::npos,
+                   "the note records the edge extension");
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    /* 每轴各自 clamp：目标 x<=3 且 y<=3 的 4x4 角块都读到源 (0,0) 的绿色，
+     * 于是露出带被同一个边缘像素铺满（这正是「边缘延展」而不是「留空」）。 */
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 0, 255, 0, 255),
+                   "the uncovered corner repeats the nearest edge pixel (green)");
+    COMP_CHECK_MSG(pixel_is(after, size, 2, 2, 0, 255, 0, 255),
+                   "edge extension fills the whole uncovered corner band");
+    COMP_CHECK_MSG(pixel_is(after, size, 3, 3, 0, 255, 0, 255), "the green marker still moves");
+    COMP_CHECK_MSG(opaque_pixels(after) == 17,
+                   "edge extension fills the 4x4 corner band and keeps the moved white marker");
+    COMP_CHECK_MSG(!pixel_is(after, size, size - 3, size - 3, 255, 0, 0, 255),
+                   "the marker shifted out of the layer is still dropped by edge extension");
+  }
+
+  /* wrap 2：移出去的像素从对侧卷回来，位移是逐字节可逆的置换。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+    FilterSettings settings;
+    settings.kind = kFilterOffset;
+    settings.offset.horizontal = 3.0;
+    settings.offset.vertical = 3.0;
+    settings.offset.wrap = 2;
+    COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                   "offset wrap 2 is a real product path");
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(note.find("wrap-around") != std::string::npos,
+                   "the note records the wrap-around");
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 255, 0, 0, 255),
+                   "the red marker wraps from the far side into the uncovered corner");
+    COMP_CHECK_MSG(opaque_pixels(after) == 3, "wrap-around preserves every marker");
+    COMP_CHECK_MSG(changed_pixels(after, pattern) > 0, "the shift actually moves pixels");
+
+    settings.offset.horizontal = -3.0;
+    settings.offset.vertical = -3.0;
+    COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                   "the inverse offset runs");
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(pixels_of(document, id) == pattern,
+                   "an integer shift under wrap-around is byte-reversible");
+  }
+}
+
+COMP_TEST(filters_abi_maps_the_other_group_fields) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 32;
+  const std::vector<uint8_t> edge = hard_edge(size, size);
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, edge, comp_rect{0, 0, size, size});
+
+  char note[512] = {0};
+  size_t note_size = 0;
+  int32_t changed = 0;
+
+  /* High Pass：radius 过 ABI。 */
+  comp_filter_desc high_pass{};
+  high_pass.kind = COMP_FILTER_HIGH_PASS;
+  high_pass.high_pass.radius = 4.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &high_pass, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the high pass desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(std::string(note).find("High Pass applied") != std::string::npos,
+                 "the note names the high pass");
+
+  comp_filter_desc high_pass_identity{};
+  high_pass_identity.kind = COMP_FILTER_HIGH_PASS;
+  changed = -1;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &high_pass_identity, 1.0,
+                                   &changed, note, sizeof(note), &note_size) == COMP_OK,
+                 "radius 0 is the high pass identity");
+  COMP_CHECK_MSG(changed == 0, "the identity high pass reports out_changed = 0");
+
+  high_pass.high_pass.radius = 0.05;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &high_pass, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* Minimum / Maximum：radius 过 ABI，且 alpha 真的跟着形状走。 */
+  Document morph(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id morph_id = add_layer_with(&morph, square_on_transparent(size, size),
+                                                comp_rect{0, 0, size, size});
+  comp_filter_desc minimum{};
+  minimum.kind = COMP_FILTER_MINIMUM;
+  minimum.minimum.radius = 2.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&morph), morph_id, &minimum, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the minimum desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(opaque_pixels(pixels_of(morph, morph_id)) == 16,
+                 "the ABI minimum erodes the opaque square");
+
+  morph.undo();
+  comp_filter_desc maximum{};
+  maximum.kind = COMP_FILTER_MAXIMUM;
+  maximum.maximum.radius = 2.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&morph), morph_id, &maximum, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the maximum desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(opaque_pixels(pixels_of(morph, morph_id)) == 144,
+                 "the ABI maximum dilates the opaque square");
+
+  maximum.maximum.radius = 0.5;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&morph), morph_id, &maximum, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* Offset：horizontal / vertical / wrap 三个字段都过 ABI。 */
+  Document shifted(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id shifted_id = add_layer_with(&shifted, offset_markers(size, size),
+                                                  comp_rect{0, 0, size, size});
+  comp_filter_desc offset{};
+  offset.kind = COMP_FILTER_OFFSET;
+  offset.offset.horizontal = 3.0;
+  offset.offset.vertical = 3.0;
+  offset.offset.wrap = COMP_OFFSET_WRAP;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&shifted), shifted_id, &offset, 1.0,
+                                   &changed, note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the offset desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(pixel_is(pixels_of(shifted, shifted_id), size, 0, 0, 255, 0, 0, 255),
+                 "the ABI wrap mode wraps the far marker into the uncovered corner");
+  COMP_CHECK_MSG(std::string(note).find("wrap-around") != std::string::npos,
+                 "the note records the wrap-around mode");
+
+  offset.offset.wrap = 3;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&shifted), shifted_id, &offset, 1.0, &changed,
                                nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }

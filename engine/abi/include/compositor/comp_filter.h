@@ -2,10 +2,10 @@
 /*
  * comp_filter.h — Filter 菜单的 C ABI（P1 滤镜批次）。
  *
- * 语义唯一真源见 `domain/filters.h` 的文件头：十一个算子（Vignette / Tonal
+ * 语义唯一真源见 `domain/filters.h` 的文件头：十五个算子（Vignette / Tonal
  * Contrast / Bloom / Lens Correction / Gaussian Blur / Add Noise / Grain /
- * Motion Blur / Progressive Blur / Sharpen / Reduce Noise）的像素口径、选区混合
- * 与能力边界都写在那里。
+ * Motion Blur / Progressive Blur / Sharpen / Reduce Noise / High Pass /
+ * Minimum / Maximum / Offset）的像素口径、选区混合与能力边界都写在那里。
  *
  * 本头文件只暴露一件事：一次「整层」滤镜调用。
  *
@@ -47,7 +47,11 @@ typedef enum comp_filter_kind {
   COMP_FILTER_MOTION_BLUR     = 7,
   COMP_FILTER_PROGRESSIVE_BLUR = 8,
   COMP_FILTER_SHARPEN          = 9,
-  COMP_FILTER_REDUCE_NOISE     = 10
+  COMP_FILTER_REDUCE_NOISE     = 10,
+  COMP_FILTER_HIGH_PASS        = 11,
+  COMP_FILTER_MINIMUM          = 12,
+  COMP_FILTER_MAXIMUM          = 13,
+  COMP_FILTER_OFFSET           = 14
 } comp_filter_kind;
 
 /*
@@ -196,11 +200,58 @@ typedef struct comp_filter_reduce_noise {
 } comp_filter_reduce_noise;
 
 /*
+ * High Pass（上游 Filter > Other > High Pass）。
+ *   radius  0 = 恒等；否则 0.1..250（图层像素，预览再乘 scale）
+ *
+ * 口径 = `128 + (src - blur(src))`（直通色），alpha 不变：平坦区域变中灰，
+ * 细节以中灰为轴上下偏移。模糊与 Sharpen / Gaussian Blur 同一实现。
+ */
+typedef struct comp_filter_high_pass {
+  double radius;
+} comp_filter_high_pass;
+
+/*
+ * Minimum / Maximum（上游 Filter > Other > Minimum / Maximum）。
+ *   radius  0 = 恒等；否则 1..100（方形窗口半径，整数像素；预览再乘 scale）
+ *
+ * 四个通道一起做（alpha 参与），半透明轮廓会跟着形状收缩 / 扩张；
+ * 窗口在图层边界处裁剪，不复制边缘像素。
+ */
+typedef struct comp_filter_minimum {
+  double radius;
+} comp_filter_minimum;
+
+typedef struct comp_filter_maximum {
+  double radius;
+} comp_filter_maximum;
+
+/* Offset 的露出区域处理方式（数值即域层 `OffsetSettings.wrap`）。 */
+typedef enum comp_offset_wrap {
+  COMP_OFFSET_TRANSPARENT = 0, /* 露出部分留空（不环绕） */
+  COMP_OFFSET_EDGE        = 1, /* 用最外一圈像素填满露出区域 */
+  COMP_OFFSET_WRAP        = 2  /* 移出去的内容从对侧卷回来 */
+} comp_offset_wrap;
+
+/*
+ * Offset（上游 Filter > Other > Offset）。
+ *   horizontal / vertical  -10000..10000（图层像素，四舍五入到整像素）
+ *   wrap                   comp_offset_wrap；取整后位移都为 0 = 恒等
+ *
+ * 整像素平移、不重采样；位移为整数时逐字节可逆。
+ */
+typedef struct comp_filter_offset {
+  double horizontal;
+  double vertical;
+  int32_t wrap;
+} comp_filter_offset;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
  *
- * `sharpen` / `reduce_noise` 是尾部追加（kind 9 / 10）：旧宿主按旧头文件
- * 编译时描述符更小，**新宿主必须用同一份头文件**——本仓两端同源构建，
+ * `sharpen` / `reduce_noise` 是尾部追加（kind 9 / 10），`high_pass` /
+ * `minimum` / `maximum` / `offset` 是再一批尾部追加（kind 11..14）：旧宿主按
+ * 旧头文件编译时描述符更小，**新宿主必须用同一份头文件**——本仓两端同源构建，
  * 不提供跨版本结构体协商（导出符号表仍只做尾部追加）。
  */
 typedef struct comp_filter_desc {
@@ -216,14 +267,19 @@ typedef struct comp_filter_desc {
   comp_filter_progressive_blur progressive_blur;
   comp_filter_sharpen          sharpen;
   comp_filter_reduce_noise     reduce_noise;
+  comp_filter_high_pass        high_pass;
+  comp_filter_minimum          minimum;
+  comp_filter_maximum          maximum;
+  comp_filter_offset           offset;
 } comp_filter_desc;
 
 /*
  * 对目标图层跑一次滤镜。成功返回 COMP_OK。
  *
- * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响以像素为单位的半径
- * （Tonal Contrast / Bloom / Gaussian Blur / Motion Blur / Progressive Blur），
- * 让降采样预览看起来与全尺寸一致。
+ * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响以像素为单位的半径与位移
+ * （Tonal Contrast / Bloom / Gaussian Blur / Motion Blur / Progressive Blur /
+ * Sharpen / High Pass / Minimum / Maximum / Offset），让降采样预览看起来与
+ * 全尺寸一致。
  *
  * 错误码：
  *   参数越界 / 非有限 / desc 为 NULL -> COMP_ERR_INVALID_ARGUMENT

@@ -3,7 +3,7 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **208**）；回归 6/6、壳自检 267 项 SHA、视觉探针不得因新增功能而破（当前 **233 条 / 38 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **211**）；回归 6/6、壳自检 267 项 SHA、视觉探针不得因新增功能而破（当前 **240 条 / 39 场景**；落地规则见 §6）。
 > 自检基线：**267 项 / SHA256 `cae180809eed3ba4…`**（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
 > 在末尾追加 4 项断言——面板过滤、图层复合、智能对象、填充层，其余逐字节未动；263 项那次是 2026-10-23 一次**显式审批**的
 > 附录式变更，见 README §6.88）。
@@ -558,7 +558,16 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   色度平滑），滤镜 9 → 11 种。面板动作号随之从 1210 让到 1220..1222
   （1210 现在是 Sharpen 的菜单项，见 `docs/filters.md` §8）。
   探针：`sharpen_denoise` 场景 4 条（两个面板能打开 + 方差一降一升）。
-- 新增：智能锐化、模糊画廊（场景/光圈/倾斜偏移/旋转/路径）、其他（高反差保留/最小值/最大值/位移/自定）、液化独立对话框（现有 Push 仅笔刷）、扭曲/像素化/风格化/渲染各族、消失点。
+- **已落地（2026-10-25，README §6.116，零 ABI 新增）**：`Filter > Other` 组的
+  **High Pass / Minimum / Maximum / Offset**（kind 11..14，滤镜 11 → 15 种，
+  菜单项 1200..1214，面板动作号 1220..1222 未搬）。High Pass = `128 + (src - blur)`
+  在直通色上算、平坦区落 128；Minimum / Maximum = 方形窗口四通道腐蚀 / 膨胀（单调队列，
+  与半径无关，alpha 跟着形状走）；Offset = 整像素平移 + 三种露出处理（透明 / 边缘延展 /
+  环绕）。`.comp` 复用 `filter_settings_to_json`，`wrap` 存整数并校验 0..2。
+  探针：`filter_other` 场景 7 条（平坦场铺色、四个面板按 1211..1214 打开、High Pass
+  落 128 中灰、一步撤销还原）。**自定（Custom）仍未做**——它要一张可编辑卷积核表格。
+- 新增：智能锐化、模糊画廊（场景/光圈/倾斜偏移/旋转/路径）、其他组的**自定（Custom）**、
+  液化独立对话框（现有 Push 仅笔刷）、扭曲/像素化/风格化/渲染各族、消失点。
 - 性质：复用 `engine/imaging` 内核的部分为 M；全新滤镜族 L。
 
 ### P1-6 调整补全
@@ -688,7 +697,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   5 个 `comp_selection_channel_*` 选区通道导出、`comp_layer_apply_adjustment` 破坏性调整导出
   与 `comp_selection_grow` / `comp_selection_similar` / `comp_selection_transform`；
   滤镜 / 调整 / 效果枚举另追加 2 / 13 / 3 个 kind，不增导出）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **267 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，2026-10-25 §6.110～§6.113 再追加 4 项）、视觉探针 **233 条 / 38 场景**（2026-10-22/23/24/25 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste` 后；§6.110～§6.113 未加场景；原 80 条含 IME 6/6）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **267 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，2026-10-25 §6.110～§6.113 再追加 4 项）、视觉探针 **240 条 / 39 场景**（2026-10-22/23/24/25 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other` 后；§6.110～§6.113 未加场景，§6.116 只追加 `filter_other`；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
   2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
   与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。
@@ -712,7 +721,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | ~~渐变仅两色标~~ → 多色标（2..32）与每段中点已支持 | `engine/abi/include/compositor/comp_layer.h:688-692`（`comp_gradient_stop`）、同文件 `comp_tool_op_desc` 尾部 `gradient_stops` / `gradient_stop_count` / `gradient_dither`；壳侧可编辑表见 README §6.105 |
 | 10 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 / §6.104 |
-| 11 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
+| 15 种滤镜 | `engine/abi/include/compositor/comp_filter.h:39-51` |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
 | 组 blendMode 仍写 Normal | `engine/format/comp_file.cpp:364-365`（上游兼容）；组自己的模式走 `engineBlendMode` / `engineIsolated`（同文件 :416-421、:990-1002，2026-10-23 §6.87 已支持） |
@@ -720,4 +729,4 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **267 项** failures=0、SHA256 `cae18080…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **233/233 / 38 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`） |
+| 壳自检/视觉探针基线 | 壳自检 **267 项** failures=0、SHA256 `cae18080…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **240/240 / 39 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`） |

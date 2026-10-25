@@ -216,6 +216,20 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
       desc.reduce_noise.preserve_details = panel.value(1);
       desc.reduce_noise.reduce_color_noise = panel.value(2);
       break;
+    case comp_ui::FilterId::HighPass:
+      desc.high_pass.radius = panel.value(0);
+      break;
+    case comp_ui::FilterId::Minimum:
+      desc.minimum.radius = panel.value(0);
+      break;
+    case comp_ui::FilterId::Maximum:
+      desc.maximum.radius = panel.value(0);
+      break;
+    case comp_ui::FilterId::Offset:
+      desc.offset.horizontal = panel.value(0);
+      desc.offset.vertical = panel.value(1);
+      desc.offset.wrap = static_cast<int32_t>(std::llround(panel.value(2)));
+      break;
     default:
       break;
   }
@@ -316,6 +330,20 @@ void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& des
       panel.set_value(0, desc.reduce_noise.strength);
       panel.set_value(1, desc.reduce_noise.preserve_details);
       panel.set_value(2, desc.reduce_noise.reduce_color_noise);
+      break;
+    case COMP_FILTER_HIGH_PASS:
+      panel.set_value(0, desc.high_pass.radius);
+      break;
+    case COMP_FILTER_MINIMUM:
+      panel.set_value(0, desc.minimum.radius);
+      break;
+    case COMP_FILTER_MAXIMUM:
+      panel.set_value(0, desc.maximum.radius);
+      break;
+    case COMP_FILTER_OFFSET:
+      panel.set_value(0, desc.offset.horizontal);
+      panel.set_value(1, desc.offset.vertical);
+      panel.set_value(2, static_cast<double>(desc.offset.wrap));
       break;
     default:
       break;

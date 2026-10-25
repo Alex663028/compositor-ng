@@ -26,6 +26,10 @@ Motion Blur 在上游走 Core Image 的 `CIMotionBlur`、Progressive Blur 走
 | Progressive Blur | 本文件 `progressive_blur_pixels`（8 档 `blur_rgba8_copy` 三角混合，见 §3.9） | `progressive*`（Core Image `CIMaskedVariableBlur`） |
 | Sharpen | `blur_rgba8_copy` + 本文件 `sharpen_pixels`（经典 USM，见 §3.10） | Filter > Sharpen > Unsharp Mask |
 | Reduce Noise | 本文件 `reduce_noise_pixels`（YCoCg 双边 + 色度平滑，见 §3.11） | Filter > Noise > Reduce Noise |
+| High Pass | `blur_rgba8_copy` + 本文件 `high_pass_pixels`（见 §3.12） | Filter > Other > High Pass |
+| Minimum | 本文件 `morphology_pixels`（方形窗口腐蚀，单调队列，见 §3.13） | Filter > Other > Minimum |
+| Maximum | 本文件 `morphology_pixels`（方形窗口膨胀，单调队列，见 §3.14） | Filter > Other > Maximum |
+| Offset | 本文件 `offset_pixels`（整像素平移，三种露出处理，见 §3.15） | Filter > Other > Offset |
 
 与工具层（[`docs/tool-ops.md`](tool-ops.md)）的分工：
 
@@ -247,6 +251,72 @@ alpha。因此 alpha 通道逐字节不变，轮廓不向外扩散，透明邻�
 - 上游对话框第四行 `sharpen_details` 不在本结构里：锐化已有独立滤镜
   （§3.10），不把两条锐化通路塞进同一个算子。
 
+### 3.12 High Pass（`COMP_FILTER_HIGH_PASS`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `radius` | 0 = 恒等；否则 0.1..250 | 0 | 模糊半径（图层像素；预览再乘 `scale`） |
+
+- 口径 = `128 + (src - blur(src))`：模糊复用共享的 `blur_rgba8_copy`
+  （与 Gaussian Blur / Sharpen 同一实现），`sigma = max(0.1, radius * scale)`，
+  不另起一套高斯。
+- **平坦区域落 128 中灰**（无细节即无偏移），细节以中灰为轴上下偏移；
+  这正是「常被拿去叠加 / 柔光混合回原图」的那种底图。
+- `src` 与 `blur(src)` 都按**直通**色（`color / alpha`，夹到 255）比较，
+  结果再乘回**原** alpha：半透明边缘按自身 coverage 归一，不会被透明邻域拉暗。
+- alpha 逐字节不变；`alpha == 0` 的像素逐字节不动。模糊后 alpha 为 0 的邻域
+  没有颜色可比，该项按 128 写（差值 0）。
+- 逐通道夹到 `0..255` 后预乘回写并夹到 `rgb <= alpha`（预乘不变式）。
+- `(0, 0.1)` 与 `radius` 越界显式拒绝，不静默夹到端点；恒等判据只看 `radius`。
+
+### 3.13 Minimum（`COMP_FILTER_MINIMUM`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `radius` | 0 = 恒等；否则 1..100 | 0 | 方形窗口半径（整数像素；预览再乘 `scale` 后取整，至少 1） |
+
+### 3.14 Maximum（`COMP_FILTER_MAXIMUM`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `radius` | 0 = 恒等；否则 1..100 | 0 | 方形窗口半径（整数像素；预览再乘 `scale` 后取整，至少 1） |
+
+Minimum / Maximum 共用一份实现（`morphology_pixels(..., dilate)`），只差取极值方向：
+
+- 窗口 = 边长 `2r + 1` 的正方形，**四个通道一起**在窗口内取最小 / 最大值；
+  因此 alpha 也参与：透明底上的形状会随 Minimum 收缩（腐蚀）、Maximum 扩张
+  （膨胀），与上游在透明图层上的可观察行为一致。
+- 两趟一维滑动窗口（横向写临时缓冲、纵向写回图层），每趟都用单调队列，
+  整体 O(w·h)，**与半径无关**——半径 100 与半径 1 同价。
+- 作用在**预乘**像素上是安全的：颜色 ≤ alpha ⇒ 窗口内的颜色极值 ≤ alpha 极值，
+  结果仍是合法预乘像素，不会出现「颜色越界」。
+- 窗口在图层边界处**裁剪**（不复制边缘像素），与共享盒式模糊同一口径：
+  贴边的窗口只看落在图层内的样本。
+- 半径先 `llround(radius * scale)` 且至少 1，再按轴夹到 `维度 - 1`：
+  窗口大于图即等价于覆盖全图，不会越界读。
+- note 分别写明 `square-window erosion` / `dilation over all four channels`。
+
+### 3.15 Offset（`COMP_FILTER_OFFSET`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `horizontal` | -10000..10000 | 0 | 水平位移（图层像素，四舍五入到整像素） |
+| `vertical` | -10000..10000 | 0 | 垂直位移（同上） |
+| `wrap` | 0 / 1 / 2 | 0 | 露出区域：0 透明、1 边缘延展、2 环绕 |
+
+- **整像素平移**：目标像素读源 `(x - dx, y - dy)`，`dx = llround(horizontal * scale)`，
+  不做重采样，因此不引入插值模糊。先整份拷出源像素再写回，重叠区域不互相污染。
+- 恒等：两轴取整后都为 0（`horizontal = 0.4` 在 `scale = 1` 下也是恒等）。
+- 三种露出处理（数值与 ABI `comp_offset_wrap` 一致，其余值越界拒绝）：
+
+  | `wrap` | 露出区域 | 后果 |
+  |---|---|---|
+  | 0 `COMP_OFFSET_TRANSPARENT` | 写 `(0, 0, 0, 0)` | 移出图层的像素丢失；反向量位移可逐字节还原 |
+  | 1 `COMP_OFFSET_EDGE` | 越界坐标**逐轴**夹到图层边界 | 角上会取到角落像素，因此露出的角带被角落像素填满；移出图层的内容仍然丢失，反向量**不**能还原 |
+  | 2 `COMP_OFFSET_WRAP` | 按图层宽高取模（负值补到正区间） | 移出的内容从对侧卷回；反向量位移逐字节还原 |
+
+- 环绕范围是**图层像素矩形**，不是画布（见 §5 第 13 条）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -285,7 +355,8 @@ note 写明 `document selection is empty`。
    方向与长度两条可观察口径一致，形状不声称逐像素等同，note 写明
    `CIMotionBlur's radius is the equivalent standard deviation`。
 7. **其余算子同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur /
-   Progressive Blur / Sharpen / Reduce Noise 都跑在 8 位工作副本上（见 §6），HDR 拒绝。
+   Progressive Blur / Sharpen / Reduce Noise / High Pass / Minimum / Maximum / Offset
+   都跑在 8 位工作副本上（见 §6），HDR 拒绝。
 8. **Progressive Blur 是 8 档混合，不是逐像素半径**。上游 `CIMaskedVariableBlur`
    逐像素连续变化半径；本仓把 `[from, to]` 切成 8 档、逐档均匀模糊后按三角权重
    混合（见 §3.9）。可观察口径一致：两端半径、渐变方向、`radial` / `inverted`
@@ -299,6 +370,17 @@ note 写明 `document selection is empty`。
 10. **Reduce Noise 是多尺度算法的单尺度近似**。上游内部不公开；本仓用 5×5 双边
     + YCoCg 色度平滑，只保证「噪声方差下降、边沿对比保留、色噪按键平滑」
    三条可观察口径，note 写明 `a 5x5 bilateral on luma with chroma smoothing`。
+11. **High Pass 的模糊是盒式近似**。上游在 Core Image 的高斯上做差值；本仓复用
+   共享的三遍盒式模糊，`sigma = max(0.1, radius * scale)`。保证「平坦区落 128、
+   边沿两侧上下分离、alpha 不变」三条可观察口径，halo 形状不声称逐像素等同；
+   note 写明 `128 + (src - blurred) over the shared box-blur approximation`。
+12. **Minimum / Maximum 的窗口在边界裁剪，不做边缘延展**。上游的边界处理不公开；
+   本仓与共享盒式模糊取同一口径——贴边窗口只看落在图层内的样本。另外上游对话框
+   有「方形 / 圆角」一类形状选项，本层只做方形窗口（半径 1..100），不承载形状参数。
+13. **Offset 在图层像素矩形内卷绕，不是画布**。上游以画布为参照、只处理与画布重叠的
+   部分；域层没有画布上下文，因此 `wrap = 2` 按图层宽高取模、`wrap = 1` 逐轴夹到
+   图层边界（角带由角落像素填满）。note 分开写明三种露出处理，宿主可据 note 判断
+   与上游的差异是否影响自己的合成。
 
 ## 6. 16 位与 HDR
 
@@ -312,13 +394,14 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（27 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（32 例，ABI + 域层混合视角）钉住：
 
 - 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增七个 kind 的零初始化）；
-- 越界参数在事务之前拒绝（29 组，含 NaN scale / 轴端点；覆盖 blur radius、
+- 越界参数在事务之前拒绝（39 组，含 NaN scale / 轴端点；覆盖 blur radius、
   noise amount、grain size / roughness、motion blur angle / distance、
   progressive blur from / to、sharpen amount / radius / threshold、
-  reduce noise strength / preserve details / color noise 的边界内外）；
+  reduce noise strength / preserve details / color noise、high pass radius、
+  minimum / maximum radius、offset horizontal / vertical / wrap 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -345,7 +428,16 @@ note 写明 `document selection is empty`。
   alpha 不变、note 含 `bilateral`、一步撤销；
   `reduce_color_noise = 0` 时平均 `|r - b|` 基本不动，= 100 时明显收窄（只动色度）；
 - ABI 正确搬运五个新 kind 的字段（含布尔与 `explicit_axis` 的反相映射），
-  以及 Sharpen / Reduce Noise 的六个字段，越界值在 ABI 边界同样被拒。
+  以及 Sharpen / Reduce Noise 的六个字段与 Other 组四个 kind 的六个字段
+  （`radius` ×3、`horizontal` / `vertical` / `wrap`），越界值在 ABI 边界同样被拒；
+- High Pass 把平坦场均压到 128（逐字节）、硬边两侧一个向暗一个向亮地分离、
+  alpha 逐字节不变、note 含 `mid-grey`、一步撤销；
+- Minimum / Maximum 在透明底的 8×8 方块上把不透明像素数 64 → 16 / 64 → 144，
+  窗口外的 alpha 归 0、方块内颜色逐字节保留、note 含 `erosion` / `dilation`、
+  一步撤销逐字节还原；
+- Offset 三种 `wrap` 各验一遍：透明留空（露出区逐字节 0）、边缘延展（角带被角落
+  像素填满、移出内容仍丢失）、环绕（从对侧卷回、反向量逐字节还原）、
+  每种都是一步撤销。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -354,6 +446,8 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 
 「滤镜(&F)」菜单的条目由 `shells/windows/src/ui_core.h` 的 `filter_table()` 动态生成，
 右侧面板的每一行也来自同一张表——**菜单、面板、值映射不各写一份清单**。
+Other 组四个滤镜印证了这条：它们只在表的尾部追加四条，菜单项、面板行、
+`build_filter_desc` / `filter_load_values` 的分支随之生效，`shell_window.cpp` 一行没改。
 
 | 面板行 | ABI 字段 | 面板缺省 |
 |--------|---------|---------|
@@ -368,12 +462,18 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 | Progressive Blur 0..3 | `progressive_blur.from/to/radial/inverted` | 0 / 20 / 0 / 0 |
 | Sharpen 0..2 | `sharpen.amount/radius/threshold` | 0 / 1 / 0 |
 | Reduce Noise 0..2 | `reduce_noise.strength/preserve_details/reduce_color_noise` | 0 / 50 / 25 |
+| High Pass 0 | `high_pass.radius` | 0 |
+| Minimum 0 | `minimum.radius` | 0 |
+| Maximum 0 | `maximum.radius` | 0 |
+| Offset 0..2 | `offset.horizontal/vertical/wrap` | 0 / 0 / 0 |
 | （渐变轴） | `progressive_blur.start_x/start_y/end_x/end_y` + `explicit_axis = 1` | 画布拖拽定轴；未拖拽时 `explicit_axis = 0` 用缺省中线 |
 
-- **命令号**：菜单项 = `kCmdFilterBase(1200) + 滤镜序号`，当前 1200..1210。
-  面板动作（应用 / 重置 / 关闭）**不在**这段里：滤镜涨到 11 个之后 1210 是
-  Sharpen，原先放在 1210..1212 的应用/重置/关闭会与它抢同一个 id（Sharpen 菜单
-  变成「应用」、面板打不开）。动作号现落在 1220..1222，见 `shell_state.h`。
+- **命令号**：菜单项 = `kCmdFilterBase(1200) + 滤镜序号`，当前 **1200..1214**
+  （0..14 共 15 个滤镜，Other 组的 High Pass / Minimum / Maximum / Offset 占
+  1211..1214）。面板动作（应用 / 重置 / 关闭）**不在**这段里：滤镜涨到 11 个之后
+  1210 是 Sharpen，原先放在 1210..1212 的应用/重置/关闭会与它抢同一个 id（Sharpen
+  菜单变成「应用」、面板打不开）。动作号现落在 **1220..1222**，当初留出的
+  1211..1219 余量正好装下 Other 组，动作号不用再搬，见 `shell_state.h`。
 - **面板夹取、ABI 拒绝**：`clamp_filter_param` 只作用于键入/步进，保证壳不会把越界
   值送进 ABI；ABI 的规矩仍是 §2 的「越界拒绝」。
 - **一次调用**：壳用固定 512 字节 note 缓冲调用一次 `comp_filter_apply`，不做

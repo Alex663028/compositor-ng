@@ -774,10 +774,10 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
 COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   size_t count = 0;
   const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
-  COMP_CHECK(count == 11);
+  COMP_CHECK(count == 15);
   COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
 
-  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..10 一一对齐（main.cpp 里也有 static_assert）。 */
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..14 一一对齐（main.cpp 里也有 static_assert）。 */
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
@@ -789,10 +789,14 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::ProgressiveBlur) == 8);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Sharpen) == 9);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::ReduceNoise) == 10);
-  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 11);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::HighPass) == 11);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Minimum) == 12);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Maximum) == 13);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Offset) == 14);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 15);
 
   /* 面板行数：docs/filters.md §3 各表的数据行数。 */
-  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4, 3, 3};
+  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4, 3, 3, 1, 1, 1, 3};
   for (size_t i = 0; i < count; ++i) {
     COMP_CHECK_MSG(table[i].param_count == row_counts[i], "panel row count");
     COMP_CHECK_MSG(table[i].param_count > 0 &&
@@ -912,6 +916,42 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(near_value(denoise->params[2].min_value, 0.0)); /* Color noise */
   COMP_CHECK(near_value(denoise->params[2].max_value, 100.0));
   COMP_CHECK(near_value(denoise->params[2].default_value, 25.0));
+
+  const comp_ui::FilterSpec* high_pass = comp_ui::filter_spec(comp_ui::FilterId::HighPass);
+  COMP_CHECK(high_pass != nullptr && std::string(high_pass->name) == "High Pass");
+  COMP_CHECK(high_pass->param_count == 1);
+  COMP_CHECK(near_value(high_pass->params[0].min_value, 0.0));  /* Radius：0 = 恒等 */
+  COMP_CHECK(near_value(high_pass->params[0].max_value, 250.0));
+  COMP_CHECK(near_value(high_pass->params[0].step, 0.5));
+  COMP_CHECK(near_value(high_pass->params[0].default_value, 0.0));
+
+  const comp_ui::FilterSpec* minimum = comp_ui::filter_spec(comp_ui::FilterId::Minimum);
+  COMP_CHECK(minimum != nullptr && std::string(minimum->name) == "Minimum");
+  COMP_CHECK(minimum->param_count == 1);
+  COMP_CHECK(near_value(minimum->params[0].min_value, 0.0)); /* Radius：0 = 恒等 */
+  COMP_CHECK(near_value(minimum->params[0].max_value, 100.0));
+  COMP_CHECK(near_value(minimum->params[0].default_value, 0.0));
+
+  const comp_ui::FilterSpec* maximum = comp_ui::filter_spec(comp_ui::FilterId::Maximum);
+  COMP_CHECK(maximum != nullptr && std::string(maximum->name) == "Maximum");
+  COMP_CHECK(maximum->param_count == 1);
+  COMP_CHECK(near_value(maximum->params[0].min_value, 0.0)); /* Radius：0 = 恒等 */
+  COMP_CHECK(near_value(maximum->params[0].max_value, 100.0));
+  COMP_CHECK(near_value(maximum->params[0].default_value, 0.0));
+
+  const comp_ui::FilterSpec* offset = comp_ui::filter_spec(comp_ui::FilterId::Offset);
+  COMP_CHECK(offset != nullptr && std::string(offset->name) == "Offset");
+  COMP_CHECK(offset->param_count == 3);
+  COMP_CHECK(near_value(offset->params[0].min_value, -10000.0)); /* Horizontal */
+  COMP_CHECK(near_value(offset->params[0].max_value, 10000.0));
+  COMP_CHECK(near_value(offset->params[0].default_value, 0.0));
+  COMP_CHECK(near_value(offset->params[1].min_value, -10000.0)); /* Vertical */
+  COMP_CHECK(near_value(offset->params[1].max_value, 10000.0));
+  COMP_CHECK(near_value(offset->params[1].default_value, 0.0));
+  COMP_CHECK(near_value(offset->params[2].min_value, 0.0)); /* Wrap：0/1/2 */
+  COMP_CHECK(near_value(offset->params[2].max_value, 2.0));
+  COMP_CHECK(near_value(offset->params[2].step, 1.0));
+  COMP_CHECK(near_value(offset->params[2].default_value, 0.0));
 
   COMP_CHECK(comp_ui::filter_spec_at(-1) == nullptr);
   COMP_CHECK(comp_ui::filter_spec_at(static_cast<int>(count)) == nullptr);

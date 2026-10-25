@@ -32,6 +32,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 智能滤镜栈面板（P1-2 第九批） | 「图层 → 智能对象 → 智能滤镜面板…」+ 右侧列表（↑↓ 选、空格开关、回车/双击改参数、Del 删除、滚轮翻页） | （未接 UI） | `comp_layer_smart_filter_count` / `_at` / `_set` / `_remove`（本批无新增导出） | **已达成（Windows）**（§5.74）：开关 / 删除各一步撤销；改参数复用滤镜面板，参数与开关都没变时不落撤销步；面板每帧现问引擎，撤销后自动同步 |
 | 智能滤镜调序与改名（P1-2 收尾 ⑩） | 栈面板内 Alt+↑/↓、拖动行重排、F2 / 菜单重命名、行显示自定义名 | （未接 UI） | `comp_layer_smart_filter_move` / `_set_name` / `_name`（尾部追加，208 → 211） | **已达成（Windows）**（§5.75）：调序整栈重求值 = 一步撤销，锁像素的层拒绝调序；改名是纯元数据（不重求值、锁像素也能改、同值不落步），空名回退类型名 |
+| 滤镜 Other 组（P1-5，2026-10-25） | 「滤镜」菜单尾部四项 + 同一套参数面板 | （未接 UI） | `comp_filter_apply`（零新增导出，只追加 4 个 kind） | **已达成（Windows）**（§5.3）：菜单与面板由 `filter_table()` 自动派生，`shell_window.cpp` 零改动；命令号 1211..1214，面板动作仍 1220..1222 |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 减淡 / 加深 / 海绵（P1） | `O` 循环 8 档，画布折线 → 一次 `COMP_TOOL_DODGE` / `_BURN` / `_SPONGE` | （未接 UI） | `comp_tool_apply` | **已达成**（§5.19）：`Alt+[ / ]` 调强度，受选区约束 |
@@ -166,14 +167,18 @@ compositor-ng 是「同引擎、两壳」结构：
   探长度会把滤镜应用两遍；壳用固定 512 字节缓冲一次调用。
 - **面板夹取，ABI 拒绝**：键入手输先用 `clamp_filter_param` 夹到量程内，
   ABI 侧仍是越界拒绝（不静默 clamp）。
-- **十一个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
+- **十五个滤镜、一张表**：菜单、面板、值映射都从 `filter_table()` 派生
   （Vignette / Tonal Contrast / Bloom / Lens Correction / Gaussian Blur /
-  Add Noise / Grain / Motion Blur / Progressive Blur / Sharpen / Reduce Noise）。
-  滤镜序号涨到 11 个后菜单号占满 1200..1210，面板的应用 / 重置 / 关闭动作
-  挪到 1220..1222（见 `shell_state.h`，`filters.md` §8）。布尔项（`Preserve` /
+  Add Noise / Grain / Motion Blur / Progressive Blur / Sharpen / Reduce Noise /
+  High Pass / Minimum / Maximum / Offset）。滤镜序号涨到 15 个后菜单号占
+  1200..1214，面板的应用 / 重置 / 关闭动作仍在 1220..1222（§6.90 搬家时留出的
+  1211..1219 余量正好装下 Other 组，没有一个 id 需要再搬；见 `shell_state.h`、
+  `filters.md` §8）。布尔项（`Preserve` /
   `Gaussian` / `Mono` / `Radial` / `Inverted`）在面板上是
   0/1 行，`build_filter_desc` 用 `>= 0.5` 转成 ABI 的 int32；`Seed` 用
   `llround` 转 `uint32`（面板量程 0..4294967295，正好是 uint32 全域）。
+  Offset 的 `Wrap 0/1/2` 同样是数值行，`build_filter_desc` 用 `llround` 转 int32
+  （越界值由 ABI 拒绝：`0/1/2` 之外没有「静默当 0」的余地）。
 - **Gaussian Blur 的面板量程含 0**（恒等）；步进从 0 直达 1，键入手输
   `(0, 0.1)` 里的值会被 ABI 拒绝——这是有意的严格口径，不是壳的遗漏。
   Motion Blur 的 `Distance` 同理：0 = 恒等，步进从 0 到 1，`(0, 1)` 被拒。

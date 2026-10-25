@@ -388,12 +388,14 @@ constexpr UINT kCmdLayerSmartPanelRename = 1724;   /* 重命名当前条…（F2
 constexpr UINT kCmdLayerSmartPanelMoveUp = 1725;   /* 当前条上移一位（Alt+↑） */
 constexpr UINT kCmdLayerSmartPanelMoveDown = 1726; /* 当前条下移一位（Alt+↓） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
-constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
+constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..14（1200..1214） */
 /*
  * 面板动作号落在 1220 段：滤镜档位从 9 个涨到 11 个（尾追加 Sharpen /
  * Reduce Noise）后，1200..1210 已被档位占满，原先放在 1210..1212 的
  * 应用/重置/关闭会与 Sharpen 抢同一个 id（菜单项永远打不开锐化）。
  * 1220 起给档位留下 1211..1219 的余量，后续再加滤镜不需要再搬家。
+ * 现在档位用到 14（Filter > Other 组追加 High Pass / Minimum / Maximum /
+ * Offset），仍在余量内，动作号不动。
  */
 constexpr UINT kCmdFilterApply = 1220;
 constexpr UINT kCmdFilterReset = 1221;

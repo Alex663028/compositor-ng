@@ -15,6 +15,10 @@
  *                   progressive_blur_pixels：分档三角混合逼近逐像素半径）
  *   Sharpen         adjustment_eval.h blur_rgba8_copy + 本文件 sharpen_pixels（USM）
  *   Reduce Noise    本文件 reduce_noise_pixels（YCoCg 双边 + 色度平滑）
+ *   High Pass       adjustment_eval.h blur_rgba8_copy + 本文件 high_pass_pixels
+ *   Minimum        本文件 morphology_pixels（方形窗口腐蚀，单调队列）
+ *   Maximum        本文件 morphology_pixels（方形窗口膨胀，单调队列）
+ *   Offset         本文件 offset_pixels（整像素平移，三种露出处理）
  *
  * 本文件只做「校验 -> 装配 -> 调用 -> 选区混合 -> 事务」，不重新定义内核语义。
  */
@@ -195,6 +199,42 @@ bool reduce_noise_valid(const ReduceNoiseSettings& s, std::string* error) {
   }
   if (!in_range(s.reduce_color_noise, 0.0, 100.0)) {
     return set_error(error, "reduce noise color noise out of 0..100");
+  }
+  return true;
+}
+
+bool high_pass_valid(const HighPassSettings& s, std::string* error) {
+  /* 0 = 恒等；>0 时按上游量程 0.1..250。中间那段 (0, 0.1) 显式拒绝。 */
+  if (s.radius != 0.0 && !in_range(s.radius, 0.1, 250.0)) {
+    return set_error(error, "high pass radius must be 0 or in 0.1..250");
+  }
+  return true;
+}
+
+bool minimum_valid(const MinimumSettings& s, std::string* error) {
+  /* 0 = 恒等；>0 时按上游量程 1..100。中间那段 (0, 1) 显式拒绝（零半径无意义）。 */
+  if (s.radius != 0.0 && !in_range(s.radius, 1.0, 100.0)) {
+    return set_error(error, "minimum radius must be 0 or in 1..100");
+  }
+  return true;
+}
+
+bool maximum_valid(const MaximumSettings& s, std::string* error) {
+  if (s.radius != 0.0 && !in_range(s.radius, 1.0, 100.0)) {
+    return set_error(error, "maximum radius must be 0 or in 1..100");
+  }
+  return true;
+}
+
+bool offset_valid(const OffsetSettings& s, std::string* error) {
+  if (!in_range(s.horizontal, -10000.0, 10000.0)) {
+    return set_error(error, "offset horizontal out of -10000..10000");
+  }
+  if (!in_range(s.vertical, -10000.0, 10000.0)) {
+    return set_error(error, "offset vertical out of -10000..10000");
+  }
+  if (s.wrap < 0 || s.wrap > 2) {
+    return set_error(error, "offset wrap must be 0 (transparent), 1 (edge) or 2 (wrap-around)");
   }
   return true;
 }
@@ -612,6 +652,51 @@ comp_result sharpen_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t 
   return COMP_OK;
 }
 
+/*
+ * High Pass：`128 + (src - blur(src))`，直通色上算、乘回**原** alpha。
+ *
+ * 与 Sharpen / Gaussian Blur 共用 blur_rgba8_copy（sigma = radius * scale），
+ * 不另起一套高斯。上游 High Pass 的结果就是「中灰 + 细节」，之后通常靠叠加 /
+ * 柔光混合回原图，所以三条可观察口径是：
+ *   - 平坦区域落 128（无细节即无偏移）；
+ *   - alpha 逐字节不变（图层轮廓不因滤镜扩散）；
+ *   - 半透明边缘按直通色比较，不会被透明邻域拉暗。
+ * 模糊后 alpha 为 0 的邻域没有颜色可比，按 128 写（差值 0）。
+ */
+comp_result high_pass_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                             const HighPassSettings& s, double scale) {
+  if (s.radius <= 0.0) return COMP_OK;
+  const double sigma = std::max(0.1, s.radius * scale);
+  std::vector<uint8_t> blurred;
+  if (!blur_rgba8_copy(rgba, width, height, stride, static_cast<float>(sigma), &blurred)) {
+    return COMP_ERR_OUT_OF_MEMORY;
+  }
+  const size_t blurred_stride = static_cast<size_t>(width) * 4u;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* soft = blurred.data() + static_cast<size_t>(y) * blurred_stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4;
+      const double alpha = p[3];
+      if (alpha == 0.0) continue;
+      const uint8_t* b = soft + static_cast<size_t>(x) * 4;
+      for (int c = 0; c < 3; ++c) {
+        double value = 128.0;
+        if (b[3] != 0) {
+          const double straight = std::min(255.0, static_cast<double>(p[c]) * 255.0 / alpha);
+          const double soft_straight = std::min(
+              255.0, static_cast<double>(b[c]) * 255.0 / static_cast<double>(b[3]));
+          value = 128.0 + (straight - soft_straight);
+        }
+        const double clamped = value < 0.0 ? 0.0 : (value > 255.0 ? 255.0 : value);
+        const double premultiplied = std::lround(clamped * alpha / 255.0);
+        p[c] = static_cast<uint8_t>(std::min(premultiplied, alpha));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 /* YCoCg：亮度与两个色度轴。用它做降噪的理由是「亮度边沿保留、色噪单独平滑」
  * 天然正交——RGB 逐通道双边在强色边两侧会把分量拉成灰边。 */
 struct YCoCg {
@@ -735,6 +820,142 @@ comp_result reduce_noise_pixels(uint8_t* rgba, int32_t width, int32_t height, si
   return COMP_OK;
 }
 
+/*
+ * 一维滑动窗口极值（单调队列，O(n)）。窗口是 [i - r, i + r] 裁到 [0, count-1]：
+ * 与共享盒式模糊的边界口径一致——不做边缘复制，窗口只看落在图层内的样本。
+ */
+void morphology_line(const uint8_t* values, int32_t count, int32_t radius, bool dilate,
+                     uint8_t* out) {
+  if (count <= 0) return;
+  std::vector<int32_t> deque(static_cast<size_t>(count));
+  int32_t head = 0;
+  int32_t tail = 0; /* [head, tail) 是单调队列里的下标 */
+  int32_t next = 0; /* 下一个待入队下标 */
+  for (int32_t i = 0; i < count; ++i) {
+    const int32_t high = std::min(count - 1, i + radius);
+    while (next <= high) {
+      const uint8_t value = values[next];
+      while (tail > head) {
+        const uint8_t back = values[deque[tail - 1]];
+        /* 求最小值时丢掉不小于新值的尾部；求最大值时丢掉不大于新值的尾部。 */
+        const bool drop = dilate ? back <= value : back >= value;
+        if (!drop) break;
+        --tail;
+      }
+      deque[tail++] = next;
+      ++next;
+    }
+    const int32_t low = i - radius;
+    while (tail > head && deque[head] < low) ++head;
+    out[i] = values[deque[head]];
+  }
+}
+
+/*
+ * Minimum / Maximum：方形窗口的形态学腐蚀 / 膨胀，四个通道一起做。
+ *
+ * 作用在**预乘** RGBA8 上是安全的：逐像素颜色不超过 alpha（预乘不变式），
+ * 于是窗口内颜色最大值不会超过 alpha 最大值、最小值不会小于 alpha 最小值——
+ * 结果仍是合法预乘像素，不会出现「颜色越界」。
+ *
+ * 半径从图层像素换成预览像素（radius * scale，四舍五入，至少 1）；窗口大于
+ * 图像时等价于覆盖全图，因此每轴再裁到 (维度 - 1)。横向一趟写进临时缓冲，
+ * 纵向一趟写回图层，两趟都是 O(w * h)，不随半径变慢。
+ */
+comp_result morphology_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                              double radius, double scale, bool dilate) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  int64_t requested = static_cast<int64_t>(std::llround(radius * scale));
+  if (requested < 1) requested = 1;
+  const int32_t row_bytes = width * 4;
+  const int32_t rx = static_cast<int32_t>(std::min<int64_t>(requested, width - 1));
+  const int32_t ry = static_cast<int32_t>(std::min<int64_t>(requested, height - 1));
+  const size_t longest = static_cast<size_t>(std::max(width, height));
+  std::vector<uint8_t> line_in(longest);
+  std::vector<uint8_t> line_out(longest);
+  std::vector<uint8_t> temp(static_cast<size_t>(row_bytes) * static_cast<size_t>(height));
+
+  for (int32_t y = 0; y < height; ++y) {
+    const uint8_t* src = rgba + static_cast<size_t>(y) * stride;
+    uint8_t* dst = temp.data() + static_cast<size_t>(y) * static_cast<size_t>(row_bytes);
+    for (int c = 0; c < 4; ++c) {
+      for (int32_t x = 0; x < width; ++x) {
+        line_in[static_cast<size_t>(x)] = src[static_cast<size_t>(x) * 4u + c];
+      }
+      morphology_line(line_in.data(), width, rx, dilate, line_out.data());
+      for (int32_t x = 0; x < width; ++x) {
+        dst[static_cast<size_t>(x) * 4u + c] = line_out[static_cast<size_t>(x)];
+      }
+    }
+  }
+
+  for (int32_t x = 0; x < width; ++x) {
+    const size_t column = static_cast<size_t>(x) * 4u;
+    for (int c = 0; c < 4; ++c) {
+      for (int32_t y = 0; y < height; ++y) {
+        line_in[static_cast<size_t>(y)] =
+            temp[static_cast<size_t>(y) * static_cast<size_t>(row_bytes) + column + c];
+      }
+      morphology_line(line_in.data(), height, ry, dilate, line_out.data());
+      for (int32_t y = 0; y < height; ++y) {
+        rgba[static_cast<size_t>(y) * stride + column + c] = line_out[static_cast<size_t>(y)];
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/*
+ * Offset：整像素平移，目标像素读源 `(x - dx, y - dy)`，不重采样。
+ *
+ * 位移按**图层像素**设定，预览再乘 scale 后四舍五入（与其它半径同一口径：
+ * 降采样预览的观感与全尺寸一致）。wrap 三种露出处理（数值见 filters.h）：
+ * 0 透明、1 边缘延展、2 环绕。先整份拷出源像素再写回，源与目标重叠不会互相污染。
+ */
+comp_result offset_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          const OffsetSettings& s, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const int64_t dx = std::llround(s.horizontal * scale);
+  const int64_t dy = std::llround(s.vertical * scale);
+  if (dx == 0 && dy == 0) return COMP_OK;
+
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+
+  const int32_t last_x = width - 1;
+  const int32_t last_y = height - 1;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      int64_t sx = static_cast<int64_t>(x) - dx;
+      int64_t sy = static_cast<int64_t>(y) - dy;
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      if (sx < 0 || sx >= width || sy < 0 || sy >= height) {
+        if (s.wrap == 0) {
+          p[0] = p[1] = p[2] = p[3] = 0;
+          continue;
+        }
+        if (s.wrap == 1) {
+          sx = std::min<int64_t>(std::max<int64_t>(sx, 0), last_x);
+          sy = std::min<int64_t>(std::max<int64_t>(sy, 0), last_y);
+        } else {
+          sx %= width;
+          if (sx < 0) sx += width;
+          sy %= height;
+          if (sy < 0) sy += height;
+        }
+      }
+      std::memcpy(p, source.data() + static_cast<size_t>(sy) * row_bytes +
+                         static_cast<size_t>(sx) * 4u, 4u);
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -763,6 +984,14 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return sharpen_pixels(rgba, width, height, stride, settings.sharpen, scale);
     case kFilterReduceNoise:
       return reduce_noise_pixels(rgba, width, height, stride, settings.reduce_noise);
+    case kFilterHighPass:
+      return high_pass_pixels(rgba, width, height, stride, settings.high_pass, scale);
+    case kFilterMinimum:
+      return morphology_pixels(rgba, width, height, stride, settings.minimum.radius, scale, false);
+    case kFilterMaximum:
+      return morphology_pixels(rgba, width, height, stride, settings.maximum.radius, scale, true);
+    case kFilterOffset:
+      return offset_pixels(rgba, width, height, stride, settings.offset, scale);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -792,6 +1021,10 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterProgressiveBlur: return progressive_blur_valid(settings.progressive_blur, error);
     case kFilterSharpen: return sharpen_valid(settings.sharpen, error);
     case kFilterReduceNoise: return reduce_noise_valid(settings.reduce_noise, error);
+    case kFilterHighPass: return high_pass_valid(settings.high_pass, error);
+    case kFilterMinimum: return minimum_valid(settings.minimum, error);
+    case kFilterMaximum: return maximum_valid(settings.maximum, error);
+    case kFilterOffset: return offset_valid(settings.offset, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -814,6 +1047,12 @@ bool filter_settings_identity(const FilterSettings& settings) {
       return std::max(settings.progressive_blur.from, settings.progressive_blur.to) <= 0.0;
     case kFilterSharpen: return settings.sharpen.amount == 0.0;
     case kFilterReduceNoise: return settings.reduce_noise.strength == 0.0;
+    case kFilterHighPass: return settings.high_pass.radius == 0.0;
+    case kFilterMinimum: return settings.minimum.radius == 0.0;
+    case kFilterMaximum: return settings.maximum.radius == 0.0;
+    case kFilterOffset:
+      return std::llround(settings.offset.horizontal) == 0 &&
+             std::llround(settings.offset.vertical) == 0;
   }
   return true;
 }
@@ -866,6 +1105,12 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
       return a.reduce_noise.strength == b.reduce_noise.strength &&
              a.reduce_noise.preserve_details == b.reduce_noise.preserve_details &&
              a.reduce_noise.reduce_color_noise == b.reduce_noise.reduce_color_noise;
+    case kFilterHighPass: return a.high_pass.radius == b.high_pass.radius;
+    case kFilterMinimum: return a.minimum.radius == b.minimum.radius;
+    case kFilterMaximum: return a.maximum.radius == b.maximum.radius;
+    case kFilterOffset:
+      return a.offset.horizontal == b.offset.horizontal &&
+             a.offset.vertical == b.offset.vertical && a.offset.wrap == b.offset.wrap;
   }
   return false;
 }
@@ -883,6 +1128,10 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterProgressiveBlur: return "Progressive Blur";
     case kFilterSharpen: return "Sharpen";
     case kFilterReduceNoise: return "Reduce Noise";
+    case kFilterHighPass: return "High Pass";
+    case kFilterMinimum: return "Minimum";
+    case kFilterMaximum: return "Maximum";
+    case kFilterOffset: return "Offset";
   }
   return "filter";
 }
@@ -1059,6 +1308,23 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     if (settings.kind == kFilterReduceNoise) {
       *note += " as a 5x5 bilateral on luma with chroma smoothing (alpha untouched; the upstream "
                "multi-scale algorithm is not public)";
+    }
+    if (settings.kind == kFilterHighPass) {
+      *note += " as 128 + (src - blurred) over the shared box-blur approximation (sigma = radius * "
+               "scale; alpha untouched, flat areas become mid-grey)";
+    }
+    if (settings.kind == kFilterMinimum || settings.kind == kFilterMaximum) {
+      *note += settings.kind == kFilterMinimum
+                   ? " as a square-window erosion over all four channels (windows clipped at the "
+                     "layer edge, so alpha follows the shrinking shape)"
+                   : " as a square-window dilation over all four channels (windows clipped at the "
+                     "layer edge, so alpha follows the growing shape)";
+    }
+    if (settings.kind == kFilterOffset) {
+      *note += " as an integer-pixel shift with ";
+      *note += settings.offset.wrap == 0   ? "transparent uncovered areas"
+               : settings.offset.wrap == 1 ? "edge extension in the uncovered areas"
+                                           : "wrap-around in the uncovered areas";
     }
     if (clip) *note += ", clipped to the document selection";
   }

@@ -8467,6 +8467,116 @@ out_required)`：`buffer = NULL` 或 `capacity = 0` 只回报所需长度（含 
 调序，也没有 Alt+拖动复制；名字只做展示，不参与图层面板的搜索 / 过滤，也不影响 `.comp`
 里滤镜的类型与参数；关闭的条目仍可编辑参数、写回后保持关闭（PS 语义，同 §6.114）。
 
+### 6.116 滤镜 Other 组：High Pass / Minimum / Maximum / Offset（P1-5，2026-10-25，Claude）
+
+**缺口。** 滤镜菜单到 §6.90 为止是 11 种，上游 `Filter > Other` 组整组缺席，而这四项
+恰好都是「日常小动作、没有替代路径」：
+
+- **High Pass**：做锐化 / 限定范围的**高频底图**，靠叠加 / 柔光混回原图；
+- **Minimum / Maximum**：去掉细小杂点（亮部收缩）或吃掉暗部细缝（亮部扩张），
+  比用阈值 + 蒙版快得多；
+- **Offset**：把图案挪半格，做「无缝贴图」与接缝检查。
+
+四个里三个能直接复用共享件（`blur_rgba8_copy` 与邻域扫描），真正缺的是**参数契约 +
+产品入口**。本批**零 ABI 新增**（导出数仍 211）：只在枚举与描述符尾部追加。
+
+**引擎：四条口径，各有一条可观察判据。** kind 11..14 尾部追加，零初始化仍是恒等
+（不动像素、不开事务、`out_changed = 0`）：
+
+| kind | 口径 | 关键判据 |
+|---|---|---|
+| `kFilterHighPass` | `128 + (src - blur(src))`，在**直通**色上算、乘回原 alpha | 平坦区整幅落 128；alpha 逐字节不变 |
+| `kFilterMinimum` | 方形窗口 `2r+1`、四通道取最小（腐蚀） | 透明底方块的不透明像素数按窗口收缩 |
+| `kFilterMaximum` | 同窗口取最大（膨胀） | 方块向外长，颜色与 alpha 同步 |
+| `kFilterOffset` | 整像素平移，三种露出处理 | wrap 0/2 的位移逐字节可逆 |
+
+细节与容易写错的地方：
+
+- **High Pass 必须先除 alpha 再比**。预乘像素直接相减，半透明边缘会被「模糊后更小的
+  预乘值」拉成暗边；本仓取 `src / alpha` 与 `blur_src / blur_alpha` 比较，再乘回**原**
+  alpha，因此半透明轮廓与不透明区的同一处细节给出同一个符号。模糊后 alpha 为 0 的邻域
+  没有颜色可比，该项按 128 写（差值 0）。`alpha == 0` 的像素逐字节不动。
+- **形态学在预乘像素上是安全的**。逐像素 `rgb <= a`，所以窗口内颜色极值 ≤ alpha 极值，
+  结果仍是合法预乘像素；反过来说，如果先除 alpha 再做，透明区会被当成「纯黑」，
+  Minimum 就会把轮廓吃掉一圈。四个通道一起做，alpha 跟着形状收缩 / 扩张。
+- **窗口边界是裁剪，不是复制**。与共享盒式模糊同一口径：贴边窗口只看落在图层内的样本。
+- **单调队列让半径免费**。横向一趟写临时缓冲、纵向一趟写回，每趟 O(n)，整体 O(w·h)，
+  半径 100 与半径 1 同价——否则 250×250 窗口逐像素扫就是几十倍开销。
+- **半径换算两处取整**：`llround(radius * scale)`（预览口径）且至少 1，再按轴夹到
+  `维度 - 1`（窗口大于图 = 覆盖全图，不会越界读）。
+- **Offset 先拷源再写**，重叠区不互相污染；`dx = llround(horizontal * scale)`，
+  两轴取整后都为 0 即恒等（`0.4` 在 `scale = 1` 下是恒等，不是「四舍五入失败」）。
+  wrap 1 **逐轴**夹到图层边界，所以露出的角带被角落像素填满——这一点测试里专门钉了
+  17 个不透明像素（4×4 角带 + 挪进来的标记），第一版按「只填两条边」写断言是错的。
+
+**ABI 只追加，不新增导出。** 4 个枚举值（`COMP_FILTER_HIGH_PASS = 11` …
+`COMP_FILTER_OFFSET = 14`）、4 个描述符结构（`comp_filter_high_pass` /
+`comp_filter_minimum` / `comp_filter_maximum` / `comp_filter_offset`）、1 个露出处理
+枚举（`comp_offset_wrap`：`COMP_OFFSET_TRANSPARENT` / `_EDGE` / `_WRAP`），全部挂在
+`comp_filter_desc` 尾部。`^COMP_API` 仍是 **211**——滤镜家族一直走「尾追加枚举 + 子结构」
+这条路，不为一组参数新开导出。
+
+**壳层：一行菜单代码都没改。** 菜单项由 `filter_table()` 动态生成，面板行也从同一张表
+来；本批只在表尾追加四条（High Pass `Radius 0..250 step 0.5`、Minimum / Maximum
+`Radius 0..100 step 1`、Offset `Horizontal / Vertical / Wrap 0/1/2`），再补
+`build_filter_desc` / `filter_load_values` 的分支和 `shell_internal.h` 的四条
+`static_assert`。`shell_window.cpp` 的滤镜菜单那段保持原样——这正是 §6.90 建表时
+想要的效果。
+
+**命令号**：菜单项 1200..**1214**。面板动作（应用 / 重置 / 关闭）仍是 **1220..1222**：
+§6.90 搬家时特意在 1211..1219 留了余量，Other 组正好装进去，**没有一个 id 需要搬**。
+
+**持久化。** `.comp` 的 `engineSmart.filters[]` 直接复用 `FilterSettings` 的
+`filter_settings_to_json` / `from_json`：三个 `radius` 是数字、Offset 三个字段里
+`wrap` 存整数并在读回时校验 0..2（坏值让整条滤镜作废，而不是静默成 0）。
+`test_smart_objects.cpp` 的往返用例把四个 kind 的 4.5 / 3.0 / 5.0 与 (-7, 11, wrap=2)
+写盘再读回，逐字段比对。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/filters.h` | `HighPassSettings` / `MinimumSettings` / `MaximumSettings` / `OffsetSettings`、kind 11..14、`FilterSettings` 四个成员 |
+| `engine/domain/filters.cpp` | `high_pass_pixels`、`morphology_line` / `morphology_pixels`、`offset_pixels`、四个 `*_valid`、identity / equal / label / note、dispatch |
+| `engine/abi/include/compositor/comp_filter.h` | 4 个 enum 值、4 个结构、`comp_offset_wrap`（尾部追加，零新导出） |
+| `engine/abi/src/comp_filter_abi.cpp` | `to_domain` / `from_domain` 四个分支 |
+| `engine/format/comp_file.cpp` | `filter_settings_to_json` / `from_json` 四个 kind + `wrap` 校验 |
+| `shells/windows/src/ui_core.h` | `FilterId` 11..14、`filter_table()` 四条 |
+| `shells/windows/src/shell_filter.cpp` | `build_filter_desc` / `filter_load_values` 分支（`wrap` 取整） |
+| `shells/windows/src/shell_internal.h` | 四条 `static_assert`（`FilterId` ↔ `comp_filter_kind`） |
+| `shells/windows/src/shell_state.h` | `kCmdFilterBase` 注释：0..14 / 1200..1214 |
+| `tests/test_filters.cpp` | 5 例：平坦场 → 128、硬边正负分离、腐蚀 / 膨胀含 alpha、三种 wrap、ABI 字段搬运 |
+| `tests/test_smart_objects.cpp` | 1 例：Other 组四 kind 的 `.comp` 往返 |
+| `tests/test_ui_core.cpp` | 表长 11 → 15、行数 `{…,1,1,1,3}`、四组量程 / 步长断言 |
+| `scripts/visual_check.py` | 追加 `filter_other` 场景 7 条；命令段注释更新到 1200..1214 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **778 例 / 0 失败**（772 → 778：新增 6 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（778 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（本批不加自检项） |
+| `scripts/visual_check.py --scene all` | **240 项 / 39 场景 / 0 失败**（233 → 240：只追加 `filter_other`，既有阈值与命令号一处未动） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（四个 kind 都落在既有翻译单元里，TU 数不变） |
+| `^COMP_API` 导出 | **211**（本批零新增，只尾追加枚举与结构） |
+| `scripts/check_tool_table.py` | **20 个工具 PASS**（未动工具表） |
+
+`filter_other` 场景量的是「命令号没被抢 + 像素方向」：先铺一块 `#8899aa` 的平坦场，
+`1211` 打开 High Pass 面板（第一参数高亮）、键入 4 回车应用，探测区整幅变
+**(128, 128, 128)**，Ctrl+Z 一步回到 `(136, 153, 170)`；随后 `1212` / `1213` / `1214`
+各打开一次面板确认 id 落位（截图 `96_high_pass_panel` … `9b_offset_panel`）。
+
+**已知边界：**
+
+- High Pass 的模糊是共享盒式近似（同 Gaussian Blur / Sharpen），halo 形状不声称与
+  Core Image 逐像素一致；
+- Minimum / Maximum 只做方形窗口，没有上游对话框里的圆角 / 形状选项，边界按裁剪处理，
+  半径上限 100；
+- Offset 的环绕范围是**图层像素矩形**，不是画布；`wrap = 1` 会丢掉移出图层的内容
+  （反向位移不能完全还原，另两种可以）；
+- 滤镜面板仍是「回车即应用、没有取消预览」，参数步进会逐帧出全分辨率预览（同 §6.114）；
+- 上游 `Filter > Other` 里的 **Custom（自定）** 仍未做：它要的是一张可编辑的卷积核
+  表格，属于下一轮的面板模型扩展，不在本批。
+
 
 
 

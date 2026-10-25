@@ -17,6 +17,10 @@
  * Reduce Noise（双边滤波）是本文件新增的边沿保留平滑。两者同样受下面三条
  * 口径与 8 位工作副本边界约束。
  *
+ * 尾部再追加（kind 11..14，Filter > Other 组）：High Pass / Minimum / Maximum /
+ * Offset。前三个复用共享的模糊与邻域极值，Offset 是整像素平移；它们同样受
+ * 三条口径约束，且都不改图层几何（变换/边框/alpha 的语义各自见结构体注释）。
+ *
  * 与工具层（tool_ops.h）的分工：
  *   - 工具层按「笔迹 / coverage」工作，一次调用通常落一笔；
  *   - 本层按「整层一次」工作，参数是面板上的滤镜设置，语义对齐上游
@@ -264,6 +268,62 @@ struct ReduceNoiseSettings {
   double reduce_color_noise = 25.0;
 };
 
+/*
+ * High Pass（上游 Filter > Other > High Pass）。
+ *
+ * `radius` 0.1..250 是模糊半径（图层像素，预览再乘 scale）；**0 = 恒等**。
+ * (0, 0.1) 与越界值显式拒绝，不静默夹到 0.1（与 Gaussian Blur / Sharpen 同规矩）。
+ *
+ * 口径 = `128 + (src - blur(src))`，在**直通（unpremultiply 后）**颜色上算，
+ * 再乘回原 alpha；模糊复用共享的 `blur_rgba8_copy`（与 Gaussian Blur / Sharpen
+ * 同一实现）。结果是「中灰底的边缘图」：平坦区域落 128，alpha 逐字节不变——
+ * High Pass 常被用作叠加/柔光混合的底图，轮廓不能因为滤镜自己扩散。
+ */
+struct HighPassSettings {
+  double radius = 0.0;
+};
+
+/*
+ * Minimum / Maximum（上游 Filter > Other > Minimum / Maximum）。
+ *
+ * `radius` 是方形窗口半径（整数像素，1..100；预览再乘 scale 后取整，至少 1）；
+ * **0 = 恒等**。窗口边长 = 2 * r + 1，逐通道在窗口内取最小 / 最大，等效于对
+ * 亮部做**腐蚀 / 膨胀**：Minimum 让亮细节收缩、暗部扩张，Maximum 反之。
+ *
+ * 四个通道一起做（alpha 也参与），所以半透明轮廓会跟着形状一起收缩/扩张——
+ * 与 Photoshop 在透明图层上的可观察行为一致；不做「只改颜色不动 alpha」的
+ * 特殊处理。窗口在图层边界处裁剪（不复制边缘像素），与共享盒式模糊的边界口径
+ * 相同：贴边的窗口只看落在图层内的像素。
+ */
+struct MinimumSettings {
+  double radius = 0.0;
+};
+
+struct MaximumSettings {
+  double radius = 0.0;
+};
+
+/*
+ * Offset（上游 Filter > Other > Offset）。
+ *
+ * `horizontal` / `vertical` 是图层像素的整数位移（-10000..10000），四舍五入到
+ * 整像素；两者取整后都为 0 = 恒等。
+ *
+ * `wrap` 是露出区域的处理方式（数值与 ABI `comp_offset_wrap` 一致）：
+ *   0 = 透明（露出部分留空，图层内容不环绕）；
+ *   1 = 边缘延展（用最外一圈像素填满露出区域）；
+ *   2 = 环绕（移出去的内容从对侧卷回来）。
+ * 其余值越界拒绝，不静默当成 0。
+ *
+ * 实现是**整像素平移**：目标像素读源 `(x - dx, y - dy)`，不做重采样，
+ * 因此位移为整数时逐字节可逆，不引入插值模糊。
+ */
+struct OffsetSettings {
+  double horizontal = 0.0;
+  double vertical = 0.0;
+  int32_t wrap = 0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -277,6 +337,10 @@ enum FilterKind {
   kFilterProgressiveBlur = 8,
   kFilterSharpen = 9,
   kFilterReduceNoise = 10,
+  kFilterHighPass = 11,
+  kFilterMinimum = 12,
+  kFilterMaximum = 13,
+  kFilterOffset = 14,
 };
 
 /*
@@ -296,6 +360,10 @@ struct FilterSettings {
   ProgressiveBlurSettings progressive_blur;
   SharpenSettings sharpen;
   ReduceNoiseSettings reduce_noise;
+  HighPassSettings high_pass;
+  MinimumSettings minimum;
+  MaximumSettings maximum;
+  OffsetSettings offset;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

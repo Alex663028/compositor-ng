@@ -608,7 +608,60 @@ COMP_TEST(smart_object_comp_round_trip) {
   comp_document_destroy(loaded);
 }
 
-/* 没有智能对象的工程不写 engineSmart（缺键 = 普通图层），落盘结果与旧版一致。 */
+/* P1-5 其他组（High Pass / Minimum / Maximum / Offset）的落盘字段：
+ * radius 与 offset 的三个字段一起走 engineSmart 的 settings 对象，
+ * 尤其 wrap 是整数，读写两侧的收窄/校验都要在往返后保持原值。 */
+COMP_TEST(smart_filter_other_group_survives_comp_round_trip) {
+  SmartFixture fx;
+  COMP_CHECK(fx.build());
+
+  comp_filter_desc high_pass{};
+  high_pass.kind = COMP_FILTER_HIGH_PASS;
+  high_pass.high_pass.radius = 4.5;
+  comp_filter_desc minimum{};
+  minimum.kind = COMP_FILTER_MINIMUM;
+  minimum.minimum.radius = 3.0;
+  comp_filter_desc maximum{};
+  maximum.kind = COMP_FILTER_MAXIMUM;
+  maximum.maximum.radius = 5.0;
+  comp_filter_desc offset{};
+  offset.kind = COMP_FILTER_OFFSET;
+  offset.offset.horizontal = -7.0;
+  offset.offset.vertical = 11.0;
+  offset.offset.wrap = COMP_OFFSET_WRAP;
+
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &high_pass) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &minimum) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &maximum) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &offset) == COMP_OK);
+
+  const std::string path = work_path("other_group.comp");
+  std::error_code ec;
+  std::filesystem::remove_all(path, ec);
+  COMP_CHECK(comp_io_save_project(fx.document, path.c_str()) == COMP_OK);
+
+  comp_document loaded = nullptr;
+  COMP_CHECK(comp_io_load_project(fx.engine, path.c_str(), &loaded) == COMP_OK);
+  const comp_layer_id loaded_layer = bottom_layer(loaded);
+  COMP_CHECK(filter_count(loaded, loaded_layer) == 4);
+
+  comp_filter_desc read{};
+  COMP_CHECK(comp_layer_smart_filter_at(loaded, loaded_layer, 0, &read, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(read.kind == COMP_FILTER_HIGH_PASS && read.high_pass.radius == 4.5,
+                 "the high pass radius survives save/load");
+  COMP_CHECK(comp_layer_smart_filter_at(loaded, loaded_layer, 1, &read, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(read.kind == COMP_FILTER_MINIMUM && read.minimum.radius == 3.0,
+                 "the minimum radius survives save/load");
+  COMP_CHECK(comp_layer_smart_filter_at(loaded, loaded_layer, 2, &read, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(read.kind == COMP_FILTER_MAXIMUM && read.maximum.radius == 5.0,
+                 "the maximum radius survives save/load");
+  COMP_CHECK(comp_layer_smart_filter_at(loaded, loaded_layer, 3, &read, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(read.kind == COMP_FILTER_OFFSET && read.offset.horizontal == -7.0 &&
+                     read.offset.vertical == 11.0 && read.offset.wrap == COMP_OFFSET_WRAP,
+                 "the offset shift and integer wrap mode survive save/load");
+
+  comp_document_destroy(loaded);
+}
 COMP_TEST(plain_project_has_no_smart_keys) {
   comp_engine_desc desc = engine_desc_make();
   comp_engine engine = nullptr;

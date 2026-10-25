@@ -102,6 +102,15 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.reduce_noise.strength = desc.reduce_noise.strength;
   settings.reduce_noise.preserve_details = desc.reduce_noise.preserve_details;
   settings.reduce_noise.reduce_color_noise = desc.reduce_noise.reduce_color_noise;
+
+  settings.high_pass.radius = desc.high_pass.radius;
+
+  settings.minimum.radius = desc.minimum.radius;
+  settings.maximum.radius = desc.maximum.radius;
+
+  settings.offset.horizontal = desc.offset.horizontal;
+  settings.offset.vertical = desc.offset.vertical;
+  settings.offset.wrap = desc.offset.wrap;
   return settings;
 }
 
@@ -217,6 +226,15 @@ comp_filter_desc from_domain(const FilterSettings& s) {
   desc.reduce_noise.strength = s.reduce_noise.strength;
   desc.reduce_noise.preserve_details = s.reduce_noise.preserve_details;
   desc.reduce_noise.reduce_color_noise = s.reduce_noise.reduce_color_noise;
+
+  desc.high_pass.radius = s.high_pass.radius;
+
+  desc.minimum.radius = s.minimum.radius;
+  desc.maximum.radius = s.maximum.radius;
+
+  desc.offset.horizontal = s.offset.horizontal;
+  desc.offset.vertical = s.offset.vertical;
+  desc.offset.wrap = s.offset.wrap;
   return desc;
 }
 

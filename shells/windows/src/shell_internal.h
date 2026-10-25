@@ -193,6 +193,14 @@ static_assert(static_cast<int>(comp_ui::FilterId::Sharpen) == COMP_FILTER_SHARPE
               "FilterId::Sharpen must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_REDUCE_NOISE,
               "FilterId::ReduceNoise must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::HighPass) == COMP_FILTER_HIGH_PASS,
+              "FilterId::HighPass must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Minimum) == COMP_FILTER_MINIMUM,
+              "FilterId::Minimum must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Maximum) == COMP_FILTER_MAXIMUM,
+              "FilterId::Maximum must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Offset) == COMP_FILTER_OFFSET,
+              "FilterId::Offset must match comp_filter_kind");
 /* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
  * 按真实面板矩形夹滚动位置。 */
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：
