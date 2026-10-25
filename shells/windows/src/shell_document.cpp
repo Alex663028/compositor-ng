@@ -1951,6 +1951,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerPasteStyle:
       panel_paste_layer_style(shell);
       break;
+    /* ---- P1-2 收尾：图层面板过滤（视图态） ---- */
+    case kCmdLayerFilterName:
+      panel_begin_filter_name(shell);
+      break;
+    case kCmdLayerFilterClear:
+      panel_clear_filter(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);
@@ -2157,6 +2164,26 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       PostMessageW(window, WM_CLOSE, 0, 0);
       return;
     default:
+      /*
+       * 面板过滤（P1-2 收尾）：类型基址 + 0..6、颜色三段（全部 / 无标签 / 基址 +
+       * 0..6）。号段在 1680..1698，与锁/标签的 1660..1672 相邻但不重叠。
+       */
+      if (id >= kCmdLayerFilterKindBase && id <= kCmdLayerFilterKindBase + 6) {
+        panel_set_filter_kind(shell, static_cast<int>(id - kCmdLayerFilterKindBase));
+        break;
+      }
+      if (id == kCmdLayerFilterColorAll) {
+        panel_set_filter_color(shell, -1);
+        break;
+      }
+      if (id == kCmdLayerFilterColorNone) {
+        panel_set_filter_color(shell, 0);
+        break;
+      }
+      if (id >= kCmdLayerFilterColorBase && id < kCmdLayerFilterColorBase + 7) {
+        panel_set_filter_color(shell, static_cast<int>(id - kCmdLayerFilterColorBase) + 1);
+        break;
+      }
       /*
        * 颜色标签菜单项（P1-2）：kCmdLayerColorBase + label 0..7，0 = 无。
        * 号段在 1665..1672，已在图像调整的 64 宽宽容区间（1590..1653）之外；

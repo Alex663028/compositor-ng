@@ -309,6 +309,21 @@ constexpr UINT kCmdLayerLinkToggle = 1675;   /* 图层 > 链接图层 */
  */
 constexpr UINT kCmdLayerCopyStyle = 1676;  /* 图层 > 图层样式 > 拷贝图层样式 */
 constexpr UINT kCmdLayerPasteStyle = 1677; /* 图层 > 图层样式 > 粘贴图层样式 */
+/*
+ * P1-2 收尾：图层面板过滤（1680 段）。过滤是**纯视图态**：不改文档、不进撤销、
+ * 不落 .comp，只决定面板上列出哪些行。三种维度（类型 / 名称 / 颜色标签）可以
+ * 叠加，菜单里的勾选态直接读这三个字段。
+ *
+ * 类型用基址 + 枚举（0 全部 / 1 像素 / 2 文字 / 3 组 / 4 调整 / 5 填充 / 6 智能）；
+ * 颜色分「全部」「无标签」「红..灰」三段——PS 的「无颜色」是独立槽位，不是
+ * 颜色枚举里的 0，混在基址里会与「全部」撞车。
+ */
+constexpr UINT kCmdLayerFilterKindBase = 1680;   /* +0..6 */
+constexpr UINT kCmdLayerFilterColorAll = 1690;  /* 图层 > 过滤 > 颜色 > 全部 */
+constexpr UINT kCmdLayerFilterColorNone = 1691; /* 图层 > 过滤 > 颜色 > 无标签 */
+constexpr UINT kCmdLayerFilterColorBase = 1692; /* +0..6 = 红/橙/黄/绿/蓝/紫/灰 */
+constexpr UINT kCmdLayerFilterName = 1699;      /* 图层 > 过滤 > 按名称… */
+constexpr UINT kCmdLayerFilterClear = 1700;     /* 图层 > 过滤 > 清除过滤 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -809,6 +824,18 @@ struct ShellState {
    * 自己持有；放会话态而非文档态，拷贝后换文档仍能粘贴。
    */
   std::string layer_style_clipboard;
+  /*
+   * P1-2 收尾：图层面板过滤（视图态）。三项叠加生效：
+   *   - layer_filter_kind：0 全部 / 1 像素 / 2 文字 / 3 组 / 4 调整 / 5 填充 / 6 智能；
+   *   - layer_filter_color：-1 全部 / 0 无标签 / 1..7 红..灰；
+   *   - layer_filter_name：UTF-16 子串（不分大小写），空串 = 不过滤。
+   * 三者都不进文档、不进撤销、不落 .comp，换文档时保持——这是「看的方式」，
+   * 不是文档属性（与折叠集合同一类）。
+   */
+  int layer_filter_kind = 0;
+  int layer_filter_color = -1;
+  std::wstring layer_filter_name;
+
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;

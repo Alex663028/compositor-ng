@@ -210,6 +210,26 @@ void sync_menu_state(HWND window, ShellState& shell) {
     /* 链接是勾选项（不是单选组）：主选中层在组里就勾上，点一次解/加。 */
     menu_set_checked_recursive(menu, kCmdLayerLinkToggle, row->link_group != 0);
   }
+  /*
+   * P1-2 收尾：面板过滤是视图态单选组，勾选态直接读 shell 的三个字段——它不随
+   * 选中的图层变化，所以放在 row 判空之外。
+   */
+  menu_radio_check_recursive(menu, kCmdLayerFilterKindBase,
+                             kCmdLayerFilterKindBase + 6,
+                             kCmdLayerFilterKindBase +
+                                 static_cast<UINT>(shell.layer_filter_kind < 0
+                                                       ? 0
+                                                       : shell.layer_filter_kind));
+  {
+    UINT color_id = kCmdLayerFilterColorAll;
+    if (shell.layer_filter_color == 0) {
+      color_id = kCmdLayerFilterColorNone;
+    } else if (shell.layer_filter_color > 0 && shell.layer_filter_color <= 7) {
+      color_id = kCmdLayerFilterColorBase +
+                 static_cast<UINT>(shell.layer_filter_color - 1);
+    }
+    menu_radio_check_recursive(menu, kCmdLayerFilterColorAll, kCmdLayerFilterColorBase + 6,
+                               color_id);
   }
   /* 效果项：kEffectKindCount 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
@@ -4097,6 +4117,32 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerReverse, L"反向排列(&R)");
   /* P1-2 ③：链接图层（多选后点一次连上，再点一次解开）。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerLinkToggle, L"链接图层(&K)");
+  /*
+   * P1-2 收尾：按类型 / 名称 / 颜色过滤面板（纯视图态，不写文档）。PS 把这三条
+   * 放在图层面板顶部的下拉里；本壳没有面板顶栏，收进「图层 > 过滤」子菜单。
+   */
+  HMENU layer_filter_menu = CreatePopupMenu();
+  const wchar_t* filter_kind_labels[] = {L"全部类型", L"像素图层", L"文字图层",
+                                         L"图层组",   L"调整图层", L"填充图层",
+                                         L"智能对象"};
+  for (UINT i = 0; i < 7; ++i) {
+    AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterKindBase + i, filter_kind_labels[i]);
+  }
+  HMENU layer_filter_color_menu = CreatePopupMenu();
+  AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorAll, L"全部颜色");
+  AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorNone, L"无标签");
+  const wchar_t* filter_color_labels[] = {L"红", L"橙", L"黄", L"绿", L"蓝", L"紫", L"灰"};
+  for (UINT i = 0; i < 7; ++i) {
+    AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorBase + i,
+                filter_color_labels[i]);
+  }
+  AppendMenuW(layer_filter_menu, MF_POPUP,
+              reinterpret_cast<UINT_PTR>(layer_filter_color_menu), L"颜色标签(&C)");
+  AppendMenuW(layer_filter_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterName, L"按名称过滤…(&N)");
+  AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterClear, L"清除过滤(&X)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_filter_menu),
+              L"过滤图层(&F)");
   /*
    * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
    * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。
