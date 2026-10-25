@@ -2788,4 +2788,328 @@ comp_result comp_layer_import_style(comp_document document, comp_layer_id id,
   COMP_ABI_CATCH(engine)
 }
 
+/* ------------------------------------------- 图层复合（P1-2 收尾 ⑤） */
+
+namespace {
+
+/* 本文件的实现体整体位于 extern "C" 区段内，匿名命名空间的辅助函数默认也会
+ * 拿到 C 链接——返回 std::string / vector 的辅助函数会被 -Wreturn-type-c-linkage
+ * 点名。这里显式回到 C++ 链接（与上面样式块同一写法）。 */
+extern "C++" {
+
+compositor::LayerComp* find_layer_comp(compositor::DocumentState& state, uint32_t id) {
+  for (compositor::LayerComp& comp : state.layer_comps) {
+    if (comp.id == id) return &comp;
+  }
+  return nullptr;
+}
+
+/*
+ * 从 C 字符串取复合名。与 comp_layer_set_name 的读法一致：不信「内存里一定有
+ * NUL」，先按上界扫，再校验编码与单行。长度**含 NUL 之外**的字节数判定。
+ */
+bool read_layer_comp_name(const char* utf8, std::string* out) {
+  if (utf8 == nullptr || out == nullptr) return false;
+  size_t length = 0;
+  while (length <= compositor::kMaxLayerCompNameBytes && utf8[length] != '\0') ++length;
+  if (length == 0 || length > compositor::kMaxLayerCompNameBytes) return false;
+  std::string name(utf8, length);
+  if (!compositor::utf8_is_valid(name) || !compositor::utf8_is_single_line(name)) return false;
+  *out = std::move(name);
+  return true;
+}
+
+/* 当前状态 -> 快照条目（顺序 = 文档堆叠序，与面板自上而下的读法相反，但与
+ * state.layers 一致；.comp 落盘同样按这个序，往返不需要重排）。 */
+std::vector<compositor::LayerCompEntry> snapshot_layer_comp(
+    const compositor::DocumentState& state) {
+  std::vector<compositor::LayerCompEntry> entries;
+  entries.reserve(state.layers.size());
+  for (const compositor::Layer& layer : state.layers) {
+    compositor::LayerCompEntry entry;
+    entry.layer = layer.id;
+    entry.visible = layer.visible ? 1u : 0u;
+    entry.opacity = layer.opacity;
+    entries.push_back(entry);
+  }
+  return entries;
+}
+
+bool same_layer_comp_entries(const std::vector<compositor::LayerCompEntry>& a,
+                             const std::vector<compositor::LayerCompEntry>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].layer != b[i].layer || a[i].visible != b[i].visible ||
+        a[i].opacity != b[i].opacity) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  /* extern "C++" */
+
+}  // namespace
+
+comp_result comp_layer_comp_count(comp_document document, size_t* out_count) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_count == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_count is null");
+  }
+  *out_count = doc->state().layer_comps.size();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_id_at(comp_document document, size_t index,
+                                  comp_layer_comp_id* out_id) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_id == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_id is null");
+  }
+  const compositor::DocumentState& state = doc->state();
+  if (index >= state.layer_comps.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "layer comp index out of range");
+  }
+  *out_id = state.layer_comps[index].id;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_name(comp_document document, comp_layer_comp_id comp, char* buffer,
+                                 size_t capacity, size_t* out_required) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  const compositor::LayerComp* found = find_layer_comp(doc->state(), static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  const size_t required = found->name.size() + 1;
+  *out_required = required;
+  if (buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "name buffer is too small (see out_required)");
+  }
+  std::memcpy(buffer, found->name.c_str(), required);
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_capture(comp_document document, const char* name_utf8,
+                                    comp_layer_comp_id* out_id) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_id != nullptr) *out_id = 0;
+  std::string name;
+  if (!read_layer_comp_name(name_utf8, &name)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "layer comp name must be non-empty single-line UTF-8 within "
+                                 "COMP_LAYER_COMP_NAME_MAX_BYTES bytes");
+  }
+  compositor::DocumentState& state = doc->state();
+  if (state.layer_comps.size() >= compositor::kMaxLayerComps) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, "too many layer comps");
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Capture Layer Comp");
+  compositor::LayerComp comp;
+  comp.id = state.next_layer_comp_id++;
+  comp.name = std::move(name);
+  comp.entries = snapshot_layer_comp(state);
+  const uint32_t captured_id = comp.id;
+  state.layer_comps.push_back(std::move(comp));
+  txn.commit();
+  if (out_id != nullptr) *out_id = static_cast<comp_layer_comp_id>(captured_id);
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_apply(comp_document document, comp_layer_comp_id comp,
+                                  int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_changed != nullptr) *out_changed = 0;
+  const compositor::LayerComp* found =
+      find_layer_comp(doc->state(), static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  /* 先判幂等再开事务：全都一样时不该落撤销步，也不该推进修订号。 */
+  bool changed = false;
+  for (const compositor::LayerCompEntry& entry : found->entries) {
+    const Layer* layer = doc->find(entry.layer);
+    if (layer == nullptr) continue;
+    if ((layer->visible ? 1u : 0u) != entry.visible || layer->opacity != entry.opacity) {
+      changed = true;
+      break;
+    }
+  }
+  if (!changed) return compositor::abi::ok(engine);
+
+  /* 事务期间不跨结构变更（不改 state.layers，但仍按条重新 find 一次：
+   * 保持「不缓存图层指针」这条规矩）。 */
+  compositor::abi::ImplicitTxn txn(doc, "Apply Layer Comp");
+  for (const compositor::LayerCompEntry& entry : found->entries) {
+    Layer* layer = doc->find(entry.layer);
+    if (layer == nullptr) continue;
+    const bool visible = entry.visible != 0;
+    if (layer->visible == visible && layer->opacity == entry.opacity) continue;
+    layer->visible = visible;
+    layer->opacity = entry.opacity;
+    /* 可见性与不透明度都参与合成求值：这两层缓存必须一起失效。 */
+    doc->touch_layer(entry.layer);
+  }
+  txn.commit();
+  if (out_changed != nullptr) *out_changed = 1;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_update(comp_document document, comp_layer_comp_id comp) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  compositor::DocumentState& state = doc->state();
+  compositor::LayerComp* found = find_layer_comp(state, static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  std::vector<compositor::LayerCompEntry> entries = snapshot_layer_comp(state);
+  if (same_layer_comp_entries(found->entries, entries)) return compositor::abi::ok(engine);
+  compositor::abi::ImplicitTxn txn(doc, "Update Layer Comp");
+  found->entries = std::move(entries);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_rename(comp_document document, comp_layer_comp_id comp,
+                                   const char* name_utf8) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  std::string name;
+  if (!read_layer_comp_name(name_utf8, &name)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "layer comp name must be non-empty single-line UTF-8 within "
+                                 "COMP_LAYER_COMP_NAME_MAX_BYTES bytes");
+  }
+  compositor::DocumentState& state = doc->state();
+  compositor::LayerComp* found = find_layer_comp(state, static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  if (found->name == name) return compositor::abi::ok(engine);
+  compositor::abi::ImplicitTxn txn(doc, "Rename Layer Comp");
+  found->name = std::move(name);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_delete(comp_document document, comp_layer_comp_id comp) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  compositor::DocumentState& state = doc->state();
+  const uint32_t id = static_cast<uint32_t>(comp);
+  size_t index = state.layer_comps.size();
+  for (size_t i = 0; i < state.layer_comps.size(); ++i) {
+    if (state.layer_comps[i].id == id) {
+      index = i;
+      break;
+    }
+  }
+  if (index >= state.layer_comps.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Delete Layer Comp");
+  state.layer_comps.erase(state.layer_comps.begin() + static_cast<std::ptrdiff_t>(index));
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_entry_count(comp_document document, comp_layer_comp_id comp,
+                                        size_t* out_count) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_count == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_count is null");
+  }
+  const compositor::LayerComp* found =
+      find_layer_comp(doc->state(), static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  *out_count = found->entries.size();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_comp_entry(comp_document document, comp_layer_comp_id comp, size_t index,
+                                  comp_layer_id* out_layer, uint8_t* out_visible,
+                                  float* out_opacity) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  const compositor::LayerComp* found =
+      find_layer_comp(doc->state(), static_cast<uint32_t>(comp));
+  if (found == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer comp not found");
+  }
+  if (index >= found->entries.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "layer comp entry index out of range");
+  }
+  const compositor::LayerCompEntry& entry = found->entries[index];
+  if (out_layer != nullptr) *out_layer = entry.layer;
+  if (out_visible != nullptr) *out_visible = entry.visible;
+  if (out_opacity != nullptr) *out_opacity = entry.opacity;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 } /* extern "C" */

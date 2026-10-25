@@ -271,6 +271,7 @@
 [OK] flattened comp_io_export(PSD) is still rejected
 [OK] shell open_path_as_document(.psd) takes the layered path
 [OK] layer panel filter narrows by type / color / name without touching the document
+[OK] layer comp captures / applies / is idempotent without touching the layer stack
 [OK] shell open_path_as_document(.png) still opens one flattened layer
 
 [summary] failures = 0

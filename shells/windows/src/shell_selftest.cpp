@@ -2346,6 +2346,53 @@ int run_selftest(const wchar_t* out_path) {
              "layer panel filter narrows by type / color / name without touching the document");
     }
 
+    /*
+     * P1-2 收尾：图层复合。捕获 -> 改可见性/不透明度 -> 应用 -> 回读；
+     * 第二次应用必须幂等（changed == 0），文档层数不受影响。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      size_t comps_before = 0;
+      comp_layer_comp_count(doc, &comps_before);
+      comp_layer_comp_id comp = 0;
+      const bool capture_ok = comp_layer_comp_capture(doc, "selftest-comp", &comp) == COMP_OK;
+      size_t comps_after = 0;
+      comp_layer_comp_count(doc, &comps_after);
+      size_t layer_count = 0;
+      comp_layer_count(doc, &layer_count);
+      std::vector<comp_layer_id> layer_ids(layer_count, 0);
+      size_t listed = 0;
+      const bool listed_ok =
+          layer_count > 0 &&
+          comp_layer_list(doc, layer_ids.data(), layer_ids.size(), &listed) == COMP_OK &&
+          listed == layer_count;
+      bool restored = false;
+      int32_t applied_changed = -1;
+      int32_t applied_again = -1;
+      if (capture_ok && listed_ok) {
+        int32_t visible = 1;
+        float opacity = 1.0f;
+        comp_layer_get_visible(doc, layer_ids[0], &visible);
+        comp_layer_get_opacity(doc, layer_ids[0], &opacity);
+        const bool mutated =
+            comp_layer_set_visible(doc, layer_ids[0], visible != 0 ? 0 : 1) == COMP_OK &&
+            comp_layer_set_opacity(doc, layer_ids[0], 0.25f) == COMP_OK;
+        const bool applied = comp_layer_comp_apply(doc, comp, &applied_changed) == COMP_OK;
+        if (applied) comp_layer_comp_apply(doc, comp, &applied_again);
+        int32_t restored_visible = -1;
+        float restored_opacity = 0.0f;
+        comp_layer_get_visible(doc, layer_ids[0], &restored_visible);
+        comp_layer_get_opacity(doc, layer_ids[0], &restored_opacity);
+        restored = mutated && restored_visible == visible && restored_opacity == opacity;
+      }
+      size_t layer_count_after = 0;
+      comp_layer_count(doc, &layer_count_after);
+      verify(comps_before == 0 && capture_ok && comp != 0 && comps_after == comps_before + 1 &&
+                 restored && applied_changed > 0 && applied_again == 0 &&
+                 layer_count_after == layer_count,
+             "layer comp captures / applies / is idempotent without touching the layer stack");
+    }
+
     /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
     if (probe_png_exists(probe_path)) {
       open_path_as_document(shell, probe_path);

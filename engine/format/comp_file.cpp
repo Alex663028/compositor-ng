@@ -14,10 +14,12 @@
 #include "compositing/resample.h"
 #include "core/comp_geometry.h"
 #include "domain/document.h"
+#include "domain/filters.h"
 #include "domain/guide.h"
 #include "domain/selection.h"
 #include "domain/selection_channel.h"
 #include "domain/text_layer.h"
+#include "domain/utf8_text.h"
 #include "engine.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
@@ -634,6 +636,41 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
     layers.push(layer_to_json(layer, uuid, layer_uuid));
   }
   manifest.set("layers", std::move(layers));
+  /*
+   * 图层复合（engineLayerComps）：空表不写键——没有复合的工程落盘结果与旧版
+   * 逐字节一致（同 engineGuides / engineChannels / engineText 的规矩）。
+   *
+   * 每条 entry 的图层引用用 **UUID 文本**而不是 engineLayerID：manifest 里所有
+   * 跨图层引用（parentID / engineClippingSourceID / maskSourceID）都是 UUID，
+   * 只有它才是上游也认得的稳定身份；engineLayerID 是本引擎的会话内 id，换个
+   * 生成方就可能变。
+   *
+   * visible / opacity 一律写出（不按「默认值不写」省略）：复合记的是「捕获那
+   * 一刻所有存在图层」的完整快照，缺省省略会让「捕获时可见、之后被隐藏」的层
+   * 在读回后无从区分于「捕获时还不存在的层」。
+   */
+  if (!state.layer_comps.empty()) {
+    JsonValue comps = JsonValue::array({});
+    for (const LayerComp& comp : state.layer_comps) {
+      JsonValue item = JsonValue::object({});
+      item.set("id", JsonValue::integer(static_cast<long long>(comp.id)));
+      item.set("name", JsonValue::string(comp.name));
+      JsonValue entries = JsonValue::array({});
+      for (const LayerCompEntry& entry : comp.entries) {
+        const auto it = layer_uuid.find(entry.layer);
+        if (it == layer_uuid.end()) continue; /* 已被删除的层：跳过，不留空洞记录 */
+        JsonValue e = JsonValue::object({});
+        e.set("layer", JsonValue::string(it->second));
+        e.set("visible", JsonValue::boolean(entry.visible != 0));
+        e.set("opacity", JsonValue::number(std::min(1.0, std::max(0.0, static_cast<double>(entry.opacity)))));
+        entries.push(std::move(e));
+      }
+      item.set("entries", std::move(entries));
+      comps.push(std::move(item));
+    }
+    manifest.set("engineLayerComps", std::move(comps));
+  }
+
   manifest.set("engineVersion", JsonValue::string("1.0.0"));
 
   const std::string text = json_dump(manifest, 2) + "\n";
@@ -951,7 +988,10 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
     }
   }
 
-    std::unordered_map<std::string, comp_layer_id> uuid_to_id;
+  /* UUID -> 内部 id 的解析表。声明在图层块之外：图层复合（engineLayerComps）
+   * 在图层之后解析，也要用它把 entry 里的 UUID 换回内部 id。 */
+  std::unordered_map<std::string, comp_layer_id> uuid_to_id;
+
   const JsonValue* layers = manifest.find("layers");
   if (layers != nullptr && layers->is_array()) {
     if (static_cast<int64_t>(layers->as_array().size()) > kMaxLayers) {
@@ -1153,6 +1193,93 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       const auto it = uuid_to_id.find(active);
       if (it != uuid_to_id.end()) state.active_layer = it->second;
     }
+  }
+
+  /*
+   * 图层复合（engineLayerComps，见 comp_file.cpp 的写侧）。缺键 = 没有复合；
+   * 键存在则严格读（与 engineGuides / engineChannels 同一条规矩）：
+   *   - 名字必须是**合法**的复合名（非空、单行、UTF-8、≤ 上界）；
+   *   - id 必须是正整数且互不重复——id 是宿主（面板/撤销）认复合的唯一把手；
+   *   - visible / opacity 必须显式给出且在取值域内。
+   * 唯一宽容处是 entry 的 layer：指向一个 manifest 里不存在的 UUID 时**跳过**
+   * 该条而不是整篇失败——这与 apply 的「已删除的层跳过」是同一语义，也让
+   * 「手改过 manifest 删了一层」不至于让整份工程打不开。
+   */
+  const JsonValue* comp_entries = manifest.find("engineLayerComps");
+  if (comp_entries != nullptr && !comp_entries->is_null()) {
+    if (!comp_entries->is_array()) {
+      if (error != nullptr) *error = "engineLayerComps must be an array";
+      return false;
+    }
+    if (comp_entries->as_array().size() > kMaxLayerComps) {
+      if (error != nullptr) *error = "too many layer comps in manifest";
+      return false;
+    }
+    uint32_t max_comp_id = 0;
+    for (const JsonValue& item : comp_entries->as_array()) {
+      if (!item.is_object()) {
+        if (error != nullptr) *error = "engineLayerComps must contain objects";
+        return false;
+      }
+      LayerComp comp;
+      const long long comp_id = item.integer_or("id", 0);
+      if (comp_id <= 0 || comp_id > 4294967295LL) {
+        if (error != nullptr) *error = "layer comp id is out of range";
+        return false;
+      }
+      comp.id = static_cast<uint32_t>(comp_id);
+      comp.name = item.string_or("name", "");
+      if (comp.name.empty() || comp.name.size() > kMaxLayerCompNameBytes ||
+          !utf8_is_valid(comp.name) || !utf8_is_single_line(comp.name)) {
+        if (error != nullptr) *error = "layer comp has an invalid name";
+        return false;
+      }
+      const JsonValue* entries = item.find("entries");
+      if (entries == nullptr || !entries->is_array()) {
+        if (error != nullptr) *error = "layer comp must carry an entries array";
+        return false;
+      }
+      for (const JsonValue& e : entries->as_array()) {
+        if (!e.is_object()) {
+          if (error != nullptr) *error = "layer comp entries must be objects";
+          return false;
+        }
+        const JsonValue* visible = e.find("visible");
+        const JsonValue* opacity = e.find("opacity");
+        if (visible == nullptr || !visible->is_bool() || opacity == nullptr ||
+            !opacity->is_number()) {
+          if (error != nullptr) {
+            *error = "layer comp entry must carry boolean visible and numeric opacity";
+          }
+          return false;
+        }
+        const std::string layer_uuid_text = e.string_or("layer", "");
+        const auto it = uuid_to_id.find(layer_uuid_text);
+        if (it == uuid_to_id.end()) continue; /* 已删除的层 */
+        const double opacity_value = opacity->as_number();
+        if (!(opacity_value >= 0.0) || opacity_value > 1.0) {
+          if (error != nullptr) *error = "layer comp entry opacity is out of range";
+          return false;
+        }
+        LayerCompEntry entry;
+        entry.layer = it->second;
+        entry.visible = visible->as_bool() ? 1u : 0u;
+        entry.opacity = static_cast<float>(opacity_value);
+        comp.entries.push_back(entry);
+      }
+      /* 同一层只能出现一次：重复项会让 apply 的结果取决于遍历顺序。 */
+      std::unordered_set<comp_layer_id> seen_layers;
+      for (const LayerCompEntry& entry : comp.entries) {
+        if (!seen_layers.insert(entry.layer).second) {
+          if (error != nullptr) *error = "layer comp lists the same layer twice";
+          return false;
+        }
+      }
+      if (comp.id > max_comp_id) max_comp_id = comp.id;
+      state.layer_comps.push_back(std::move(comp));
+    }
+    /* id 分配器与图层 id 同规：取 max+1，删除留下的空洞不复用。 */
+    state.next_layer_comp_id = max_comp_id + 1;
   }
 
   /* 重建组-子关系。 */
