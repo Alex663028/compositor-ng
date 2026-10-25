@@ -296,6 +296,7 @@ bool create_document_with(ShellState& shell, int width, int height, int dpi, int
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell); /* 旧文档的预览帧绝不能留在新文档的画布上 */
+  smart_panel_reset(shell);     /* 智能滤镜栈面板绑定的是旧文档的图层 id */
   shell.doc.filter.select(comp_ui::FilterId::Vignette);
   /* Progressive Blur 的渐变轴端点是旧文档坐标，换文档后一并作废。 */
   shell.doc.progressive_axis_set = false;
@@ -350,6 +351,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);
+  smart_panel_reset(shell);
   shell.doc.filter.select(comp_ui::FilterId::Vignette);
   shell.doc.progressive_axis_set = false;
   shell.doc.progressive_axis_dragging = false;
@@ -943,8 +945,9 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       return;
     }
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围互斥）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围/智能滤镜栈互斥）。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);
@@ -1621,6 +1624,7 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
     shell.doc.filter_open = false;
     shell.doc.filter_input.clear();
     filter_preview_forget(shell);
+    smart_panel_reset(shell);
     clone_reset_source(shell);
     stroke_cancel(shell);
     move_cancel(shell);
@@ -2002,6 +2006,23 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdLayerSmartStatus:
       panel_smart_status(shell);
+      break;
+    /* ---- P1-2 收尾 ⑨：智能滤镜栈面板（1720 段） ---- */
+    case kCmdLayerSmartPanel:
+      if (shell.doc.smart_open) {
+        close_smart_panel(shell);
+      } else {
+        open_smart_panel(shell);
+      }
+      break;
+    case kCmdLayerSmartPanelToggle:
+      smart_panel_toggle_entry(shell);
+      break;
+    case kCmdLayerSmartPanelEdit:
+      smart_panel_edit_entry(shell);
+      break;
+    case kCmdLayerSmartPanelRemove:
+      smart_panel_remove_entry(shell);
       break;
     /* ---- P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案） ---- */
     case kCmdLayerFillSolid:

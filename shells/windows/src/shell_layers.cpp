@@ -804,6 +804,13 @@ void panel_smart_clear_filters(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------- P1-2 收尾 ⑨：智能滤镜栈面板（1720 段） */
+
+/*
+ * 「这一层现在能不能编辑滤镜栈」的唯一判定：绘制、动作、菜单闸同源。
+ * 面板跟随选中层（与 PS 一致）；选到非智能层时面板还留着，但只显示一条提示，
+ * 不会把动作打到上一层的栈上。
+ */
 comp_layer_id smart_panel_target(const ShellState& shell) {
   if (shell.doc.document == nullptr) return 0;
   const comp_layer_id id = selected_layer_id(shell);
@@ -815,6 +822,83 @@ comp_layer_id smart_panel_target(const ShellState& shell) {
   return id;
 }
 
+int smart_panel_count(const ShellState& shell) {
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) return 0;
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) return 0;
+  return static_cast<int>(count);
+}
+
+bool smart_panel_visible(const ShellState& shell) { return shell.doc.smart_open; }
+
+/* 让位给别的右栏面板：不清焦点、不清绑定，下次打开还停在原处。 */
+void smart_panel_dismiss(ShellState& shell) { shell.doc.smart_open = false; }
+
+/* 换文档：面板状态整体归零（绑定一起清，别把上篇文档的条目带过来）。 */
+void smart_panel_reset(ShellState& shell) {
+  shell.doc.smart_open = false;
+  shell.doc.smart_focus = 0;
+  shell.doc.smart_scroll = 0;
+  shell.doc.smart_layer = 0;
+  filter_smart_edit_clear(shell);
+}
+
+std::wstring filter_kind_name(comp_filter_kind kind) {
+  const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(static_cast<int>(kind));
+  return widen_ascii(spec != nullptr ? spec->name : "?");
+}
+
+/* 一行面板文字能装下的名字字数：引擎上限是 256 字节，整段塞进 22 px 的行里
+ * 会把参数摘要挤出面板。截断只影响显示，写回引擎的永远是完整名字。 */
+static constexpr size_t kSmartNameChars = 16;
+
+/* 按 wchar 截断并补省略号；不劈开代理对（半个代理在 GDI 里是乱码）。 */
+static std::wstring smart_clip_text(const std::wstring& text, size_t max_chars) {
+  if (text.size() <= max_chars) return text;
+  std::wstring clipped = text.substr(0, max_chars - 1);
+  if (!clipped.empty()) {
+    const wchar_t last = clipped.back();
+    if (last >= 0xD800 && last <= 0xDBFF) clipped.pop_back();
+  }
+  clipped += L'…';
+  return clipped;
+}
+
+static void smart_scroll_to_focus(ShellState& shell) {
+  Layout layout{};
+  if (!client_layout(shell, &layout) || layout.adjust_panel.w <= 0) return;
+  shell.doc.smart_scroll = comp_ui::smart_ensure_visible(
+      layout.adjust_panel, smart_panel_count(shell), shell.doc.smart_focus,
+      shell.doc.smart_scroll);
+}
+
+/*
+ * 收敛：选中层变了就换绑定并回到第 1 条；条数缩了就把焦点与滚动夹回去。
+ * 只挂在 refresh_layers（选中层 / 撤销 / 重做的唯一汇聚点）里；绘制与动作
+ * 都现读引擎，所以这里不缓存任何 desc，撤销后列表不会与文档漂移。
+ */
+void refresh_smart_panel(ShellState& shell) {
+  if (!shell.doc.smart_open) return;
+  const comp_layer_id target = smart_panel_target(shell);
+  if (target != shell.doc.smart_layer) {
+    shell.doc.smart_layer = target;
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+    return;
+  }
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+    return;
+  }
+  if (shell.doc.smart_focus >= count) shell.doc.smart_focus = count - 1;
+  if (shell.doc.smart_focus < 0) shell.doc.smart_focus = 0;
+  smart_scroll_to_focus(shell);
+}
+
+/* 焦点位置 + 当前条的一句话状态（列表为空 / 非智能层时也各有实话）。 */
 void smart_panel_status(ShellState& shell) {
   if (shell.doc.document == nullptr) {
     set_status(shell, L"无文档");
@@ -857,6 +941,23 @@ void smart_panel_status(ShellState& shell) {
             smart_entry_name(shell.doc.document, id, index, desc).c_str(),
             enabled != 0 ? L"启用" : L"关闭", smart_entry_summary(desc).c_str());
   set_status(shell, buffer);
+}
+
+void smart_panel_focus_row(ShellState& shell, int32_t row) {
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    smart_panel_status(shell);
+    return;
+  }
+  if (row < 0) row = 0;
+  if (row >= count) row = count - 1;
+  shell.doc.smart_focus = row;
+  smart_scroll_to_focus(shell);
+  smart_panel_status(shell);
+}
+
+void smart_panel_move(ShellState& shell, int32_t delta) {
+  smart_panel_focus_row(shell, shell.doc.smart_focus + delta);
 }
 
 void smart_panel_move_entry(ShellState& shell, int32_t delta) {
@@ -942,6 +1043,44 @@ void smart_panel_drop(ShellState& shell, int32_t from, int32_t to) {
   refresh_history_status(shell, buffer);
 }
 
+void open_smart_panel(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板：与滤镜 / 填充 / 效果 / 修边 / 路径 / 历史 / 通道 / 色彩范围互斥。 */
+  if (shell.doc.color_range_open) color_range_cancel(shell);
+  if (shell.doc.fill_open) close_fill_panel(shell);
+  shell.doc.filter_open = false;
+  shell.doc.filter_input.clear();
+  filter_preview_forget(shell); /* 滤镜预览帧不能留在这个面板底下 */
+  filter_smart_edit_clear(shell);
+  shell.doc.effect_open = false;
+  shell.doc.effect_input.clear();
+  shell.doc.trim_open = false;
+  shell.doc.trim_input.clear();
+  shell.doc.path_open = false;
+  shell.doc.history_open = false;
+  channel_panel_close(shell);
+
+  const comp_layer_id target = smart_panel_target(shell);
+  if (target != shell.doc.smart_layer) {
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+  }
+  shell.doc.smart_layer = target;
+  shell.doc.smart_open = true;
+  smart_scroll_to_focus(shell);
+  smart_panel_status(shell);
+}
+
+void close_smart_panel(ShellState& shell) {
+  if (!shell.doc.smart_open) return;
+  shell.doc.smart_open = false;
+  set_status(shell, L"已关闭智能滤镜面板（滤镜栈未改动）");
+}
+
+/* 空格：同参翻转 enabled（引擎 _set 幂等：设置没变、只有开关变 → 一步撤销）。 */
 void smart_panel_toggle_entry(ShellState& shell) {
   if (shell.doc.document == nullptr) {
     set_status(shell, L"无文档");
@@ -981,6 +1120,19 @@ void smart_panel_toggle_entry(ShellState& shell) {
 }
 
 /* 回车：进滤镜面板的「编辑该条」模式（面板排版与键盘完全复用普通滤镜面板）。 */
+void smart_panel_edit_entry(ShellState& shell) {
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    smart_panel_status(shell);
+    return;
+  }
+  int32_t index = shell.doc.smart_focus;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  open_smart_filter_editor(shell, static_cast<size_t>(index));
+}
+
+/* Del：删掉当前条（一步撤销；删到空栈画面回到 source）。 */
 void smart_panel_remove_entry(ShellState& shell) {
   if (shell.doc.document == nullptr) {
     set_status(shell, L"无文档");
@@ -1012,6 +1164,34 @@ void smart_panel_remove_entry(ShellState& shell) {
   }
   shell.doc.needs_render = true;
   refresh_layers(shell);
+  /* 焦点留在原位（删的是最后一条就往前挪一格）。 */
+  if (count > 1 && index >= count - 1) index = count - 2;
+  shell.doc.smart_focus = static_cast<int32_t>(count > 1 ? index : 0);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"已删除第 %d 条 %s（一步撤销 · 剩 %d 条）", static_cast<int>(index + 1),
+            label.c_str(), static_cast<int>(count - 1));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 从「编辑某条」回到栈列表。层在编辑期间被撤销掉 / 不再是智能对象时，不硬开
+ * 一个空面板——只把面板收起来，状态行由调用方（回车 / Esc 两条路径）写实话。
+ */
+void smart_panel_reopen_after_edit(ShellState& shell, int focus_index) {
+  const comp_layer_id target = smart_panel_target(shell);
+  if (shell.doc.document == nullptr || target == 0) {
+    shell.doc.smart_open = false;
+    return;
+  }
+  shell.doc.smart_layer = target;
+  const int count = smart_panel_count(shell);
+  int focus = focus_index;
+  if (focus < 0) focus = 0;
+  if (count > 0 && focus >= count) focus = count - 1;
+  shell.doc.smart_focus = focus;
+  shell.doc.smart_open = true;
+  smart_scroll_to_focus(shell);
 }
 
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
@@ -1212,6 +1392,8 @@ void refresh_layers(ShellState& shell) {
   refresh_effects(shell);
   /* P1-2 收尾 ⑧：填充面板同理——选中层换了，绑定的填充层（或新建态）跟着换。 */
   refresh_fill(shell);
+  /* P1-2 收尾 ⑨：智能滤镜栈面板跟随选中层；撤销 / 重做后条目由绘制现读，不会漂移。 */
+  refresh_smart_panel(shell);
   /*
    * S22：直方图随后同步。挂在这里而不是每个写入口各调一次，是因为
    * refresh_layers 已经是全部变更路径（滤镜 / 工具 / 撤销 / 合并 / 打开文档）
@@ -2367,6 +2549,7 @@ void open_effect_panel(ShellState& shell, int kind) {
     return;
   }
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   /* 右栏一次只挂一个面板：滤镜、路径、历史与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();

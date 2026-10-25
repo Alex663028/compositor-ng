@@ -30,6 +30,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 路径面板最小版（P0-4 可选） | 「选择 → 路径面板…」+ 右侧列表（已提交钢笔路径 / ↑↓ 选行 / 回车或双击转选区 / Del 删除） | （未接 UI） | 无（纯外壳；引擎无路径实体，转选区走 `comp_selection_apply_path`） | **已达成**（§5.17）：转选区 = 一步撤销；入列与删除只动壳侧列表，不落撤销步 |
 | 历史记录面板（P1） | 「编辑 → 历史记录…」+ 右侧列表（状态 0..N / 点行、↑↓、Home/End 回跳） | （未接 UI） | `comp_document_history_step_count` / `_step_label` / `_jump`（ABI 尾部追加，135 → 138） | **已达成**（§5.18）：回跳不新增撤销步；高亮 = 引擎 `current_index`，壳侧无第二份真相 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
+| 智能滤镜栈面板（P1-2 第九批） | 「图层 → 智能对象 → 智能滤镜面板…」+ 右侧列表（↑↓ 选、空格开关、回车/双击改参数、Del 删除、滚轮翻页） | （未接 UI） | `comp_layer_smart_filter_count` / `_at` / `_set` / `_remove`（本批无新增导出） | **已达成（Windows）**（§5.74）：开关 / 删除各一步撤销；改参数复用滤镜面板，参数与开关都没变时不落撤销步；面板每帧现问引擎，撤销后自动同步 |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 减淡 / 加深 / 海绵（P1） | `O` 循环 8 档，画布折线 → 一次 `COMP_TOOL_DODGE` / `_BURN` / `_SPONGE` | （未接 UI） | `comp_tool_apply` | **已达成**（§5.19）：`Alt+[ / ]` 调强度，受选区约束 |
@@ -3666,7 +3667,11 @@ kCmdLayerPasteStyle, enabled.layer_present && !shell.layer_style_clipboard.empty
 定义图案」、没有图案预设库；没有图层缩略图预览（面板只有参数行）。
 
 
+### 5.74 智能滤镜栈面板：逐条列出 / 开关 / 改参数 / 删除（P1-2 第九批，2026-10-25）
+
 **1. 入口。** `图层 > 智能对象(&S)` 新增四条：`智能滤镜面板…`(1720)、
+`开关当前条`(1721)、`编辑当前参数…`(1722)、`删除当前条`(1723)。面板开关只要
+当前层是智能对象就可点（面板开着时也允许关掉）；后三条还要求栈里至少一条——
 条数现问 `comp_layer_smart_filter_count`，撤销掉「叠加」后立刻跟着置灰。
 
 **2. 面板 = 选中层滤镜栈的只读投影。** 壳层**不缓存**滤镜栈：标题摘要的条数、
@@ -3682,6 +3687,9 @@ kCmdLayerPasteStyle, enabled.layer_present && !shell.layer_style_clipboard.empty
 **4. 键盘与鼠标。** 面板打开时 `↑ / ↓`（或 `Home/End`）移动焦点、`空格` 开关当前
 条、`回车` 或**双击行**进编辑、`Del` 删除、`Esc` 关闭。鼠标单击行 = 聚焦（不写
 文档），滚轮 = 翻列表（一格 3 行，不移动焦点）；行几何与命中全部来自 ui_core 的
+`smart_row_rect` / `smart_row_at`（行高 22、列表从 y+64 起、底栏 96 = 5 行提示），
+绘制与 `WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK` / `WM_MOUSEWHEEL` 读同一组常量。
+
 **5. 开关 = 先读再写回。** `空格` 走 `comp_layer_smart_filter_at` 取整条 desc，
 翻转 `enabled` 后 `comp_layer_smart_filter_set(..., &desc, 新开关)`——参数原样带过去，
 只改开关。引擎的 `_set` 幂等（设置与开关都没变才不落步），这里设置必然相同、开关
@@ -3689,12 +3697,35 @@ kCmdLayerPasteStyle, enabled.layer_present && !shell.layer_style_clipboard.empty
 
 **6. 编辑复用滤镜面板，不新造一套控件。** `open_smart_filter_editor` 读该条 desc →
 按 `filter_spec_at(kind)` 打开既有的滤镜参数面板（同一份行几何、同一套步进/输入/
+预览）→ `filter_load_values` 把值灌进面板 → 再装上 `smart_edit_layer/index/enabled/base`
+绑定。绑定必须在 `open_filter_panel` **之后**装：那个函数自己会清绑定（新叠加态）。
+
+**7. 编辑态的预览与写回。** `filter_preview_render` 在编辑态改为
 `comp_layer_smart_filter_set`（仍包在事务里、取帧后 `abort`），所以预览看到的就是
 「这一条改完之后」的画面，而文档停在预览前。回车 `apply_filter` 走同一条 `_set`；
 参数与开关都没变时引擎不落撤销步，状态栏只说「已写回第 N 条」而**不承诺**一步撤销。
 Esc / 切工具 = 丢弃缓冲回到列表，状态栏明说「本次编辑未写回」，不产生撤销步。
 
 **8. 面板行表达不了的字段按原值带回。** `vignette.color` 与 `progressive_blur` 的
+显式轴在参数面板里没有行。编辑时 `build_filter_desc_patched` 先从 `smart_edit_base`
+（打开时的原 desc，同 kind 才采信）复制这些字段，再用面板值覆盖**面板控制的**字段；
+用户这次拖了轴（`progressive_axis_set`）则轴取拖拽值。否则「双击改个半径」会把
+暗角颜色清零、把显式轴悄悄丢掉。
+
+**9. 互斥与生命周期。** 打开栈面板会收起颜色范围 / 填充 / 滤镜 / 效果 / 修边 / 路径 /
+历史 / 通道，反之每个面板打开时都 `smart_panel_dismiss`；字体面板与文字属性面板的
+`*_panel_visible` 也把 `smart_open` 纳入让位条件（右栏同一时刻只有一个面板）。
+换文档（新建 / 打开 / 载入分层 PSD）调 `smart_panel_reset` 把开关、焦点、滚动与
+编辑绑定一起清零。焦点与滚动在 `refresh_layers`（选中层 / 撤销 / 重做的汇聚点）
+里收敛：选中层变了就换绑定回第 1 条，条数缩了就夹回去。
+
+**10. 已知边界。** 引擎没有「调整顺序 / 移动某条」的导出，所以列表只读顺序、不能
+拖动排序；也没有重命名。关闭的条目仍可编辑参数，写回后仍保持关闭（状态栏明说
+「该条仍为关闭，画面不变」）。`_set` 每次真实写入是一步撤销，但 `add` 与 `remove`
+的位置语义（序号）不会在壳层重新解释——删除后焦点落到下一条，删到空栈时列表回到
+空态提示。（前两条已在 §5.75 补齐；第三条是 PS 语义。）
+
+
 `evaluate_stack`，失败直接返回（像素与历史都干净），成功才开 `ImplicitTxn("Reorder
 Smart Filters")`、写 `filters` 与 `pixels`、`touch_layer`、`commit`——成功即**恰好一步
 撤销**。
@@ -3710,4 +3741,16 @@ Smart Filters")`、写 `filters` 与 `pixels`、`touch_layer`、`commit`——�
 
 **6. 持久化。** `.comp` 的 `engineSmart` 每条多一个 `name`；载入时不合规的名字（超长 /
 非法 UTF-8 / 含换行）当没写、回退类型名——坏字段只丢一个展示名，不连累整条滤镜或整层。
+
+**9. 几何微调。** `kSmartPanelFooter` 96 → 98，提示 4 行 → 5 行（Alt 调序 / F2 改名 /
+拖动重排各占一行）。行几何仍由 `smart_row_rect` / `smart_row_at` 单一口径提供。
+
+**10. 验证。** 772 例 / 0 失败；壳自检 267 项 SHA256 与基线一致；视觉 233 / 0（面板不在
+场景里）；OHOS `ok=121 fail=0`；导出 211；工具表 20 PASS。
+
+**11. 已知边界。** 拖动不自动滚动；无多选 / 批量调序、无 Alt+拖动复制；名字不参与图层
+面板过滤；关闭的条目改参数后仍关闭（PS 语义）。
+
+
+
 

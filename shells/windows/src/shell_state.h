@@ -365,6 +365,19 @@ constexpr UINT kCmdLayerFillPattern = 1716;   /* 图层 > 新建填充图层 > �
 constexpr UINT kCmdLayerFillEdit = 1717;      /* 编辑当前填充层的参数 */
 constexpr UINT kCmdLayerFillRasterize = 1718; /* 栅格化填充层 */
 constexpr UINT kCmdLayerFillStatus = 1719;    /* 状态栏报填充层种类/参数 */
+/*
+ * P1-2 收尾 ⑨：智能滤镜栈面板（1720 段）。
+ *
+ * ⑦ 只把「叠加一条 / 整栈清除」接到 UI；单条参数编辑与单条开关当时只有引擎导出。
+ * 这一段把 comp_layer_smart_filter_at / _set / _remove 接上：面板逐条列出滤镜栈，
+ * 空格开关、回车改参数（滤镜面板进入「编辑该条」模式，回车走 _set）、Del 删除。
+ * 命令号取自 1719 之后的空段，避开 1590..1653 的调整段与 1660..1719 的已用段。
+ */
+constexpr UINT kCmdLayerSmartPanel = 1720;        /* 图层 > 智能对象 > 智能滤镜面板… */
+constexpr UINT kCmdLayerSmartPanelToggle = 1721;  /* 开/关当前条（不改参数） */
+constexpr UINT kCmdLayerSmartPanelEdit = 1722;    /* 编辑当前条参数（滤镜面板） */
+constexpr UINT kCmdLayerSmartPanelRemove = 1723;  /* 删除当前条 */
+constexpr UINT kCmdLayerSmartPanelRename = 1724;   /* 重命名当前条…（F2） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -627,6 +640,21 @@ struct DocumentContext {
   comp_txn fill_drag_txn = nullptr;
   bool fill_drag_dirty = false;
   int32_t fill_scroll = 0;
+  /*
+   * P1-2 收尾 ⑨：智能滤镜栈面板。列表每次绘制都从引擎现读（count / _at），壳里
+   * 不缓存滤镜参数，撤销 / 重做后不会出现「面板还停在旧栈」。
+   * smart_edit_* 是「滤镜面板改成编辑某一条」的那层绑定：smart_edit_base 保存读回
+   * 的那条 desc，写回时只覆盖面板行承载的字段——Vignette 的边缘色、Progressive
+   * Blur 的显式轴不在面板行里，必须原样带回，否则一次回车就把它们悄悄清零。
+   */
+  bool smart_open = false;
+  int32_t smart_focus = 0;
+  int32_t smart_scroll = 0;
+  comp_layer_id smart_layer = 0;      /* 面板绑定的层；refresh 时与选中层同步 */
+  comp_layer_id smart_edit_layer = 0; /* 非 0 = 滤镜面板正编辑该层的某一条 */
+  size_t smart_edit_index = 0;
+  int32_t smart_edit_enabled = 1;
+  comp_filter_desc smart_edit_base{};
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
   /* P1-4：一笔内 WM_POINTER 笔压采样（整笔取平均；_begin 清零）。 */

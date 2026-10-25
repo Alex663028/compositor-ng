@@ -4642,6 +4642,45 @@ inline int channel_row_at(const Rect& panel, int count, int scroll, double x, do
                      kChannelRowHeight);
 }
 
+/* ----------------------------------- 智能滤镜栈面板（P1-2 收尾 ⑨，2026-10-25） */
+
+/*
+ * 与路径 / 历史 / 通道同一套右栏列表排版：标题（8+22）之后一行摘要，列表从
+ * y+64 起，底部留 5 行提示（选择+调序+改名 / 开关+编辑 / 拖动+删除 / 撤销+只改名 /
+ * 关闭+同步）。一行 = 引擎里的一条智能滤镜；壳里不缓存 desc，画一行就问一次
+ * comp_layer_smart_filter_at，撤销 / 重做之后列表不会与文档漂移。
+ */
+inline constexpr int kSmartRowHeight = 22;
+inline constexpr int kSmartRowsTop = 64;
+inline constexpr int kSmartPanelFooter = 98; /* 5 行提示（90）+ 8 px 留白 */
+
+inline int smart_visible_rows(const Rect& panel) {
+  return list_visible_rows(panel, kSmartRowsTop, kSmartPanelFooter, kSmartRowHeight);
+}
+
+inline int smart_max_scroll(const Rect& panel, int count) {
+  return list_max_scroll(panel, count, kSmartRowsTop, kSmartPanelFooter, kSmartRowHeight);
+}
+
+inline int smart_clamp_scroll(const Rect& panel, int count, int scroll) {
+  return list_clamp_scroll(panel, count, scroll, kSmartRowsTop, kSmartPanelFooter,
+                           kSmartRowHeight);
+}
+
+inline int smart_ensure_visible(const Rect& panel, int count, int index, int scroll) {
+  return list_ensure_visible(panel, count, index, scroll, kSmartRowsTop, kSmartPanelFooter,
+                             kSmartRowHeight);
+}
+
+inline Rect smart_row_rect(const Rect& panel, int row) {
+  return list_row_rect(panel, row, kSmartRowsTop, kSmartRowHeight);
+}
+
+inline int smart_row_at(const Rect& panel, int count, int scroll, double x, double y) {
+  return list_row_at(panel, count, scroll, x, y, kSmartRowsTop, kSmartPanelFooter,
+                     kSmartRowHeight);
+}
+
 /* ---------------------------------------------- 字体面板（P0-6②，S45） */
 
 /*

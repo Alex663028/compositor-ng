@@ -1820,6 +1820,39 @@ COMP_TEST(ui_core_path_panel_rows_hit_what_they_paint) {
 }
 
 /*
+ * 智能滤镜栈面板（P1-2 收尾 ⑨）：列表行绘制与命中同源。几何与路径/历史/通道
+ * 共用 list_* 家族，这里钉住标题（64）+ 页脚（5 行提示 96）之后的可用行数、
+ * 行高 22、滚动夹取和「只认画得出来的行」——面板绘制与 WM_LBUTTONDOWN 都读这组
+ * 函数，任何一侧改常量另一侧必须一起变。
+ */
+COMP_TEST(ui_core_smart_panel_rows_hit_what_they_paint) {
+  const comp_ui::Rect panel{724, 46, 330, 560};
+  /* 560 - 64（标题 + 摘要）- 96（5 行提示）= 400，每行 22 => 18 行。 */
+  COMP_CHECK(comp_ui::smart_visible_rows(panel) == 18);
+  COMP_CHECK(comp_ui::smart_visible_rows(comp_ui::Rect{724, 46, 330, 150}) == 0);
+
+  const comp_ui::Rect first = comp_ui::smart_row_rect(panel, 0);
+  COMP_CHECK(first.x == 724 && first.y == 110 && first.w == 330 && first.h == 22);
+  COMP_CHECK(comp_ui::smart_row_rect(panel, 17).y == 110 + 17 * 22);
+
+  COMP_CHECK(comp_ui::smart_row_at(panel, 1, 0, 800.0, 111.0) == 0);
+  COMP_CHECK(comp_ui::smart_row_at(panel, 2, 0, 800.0, 132.0) == 1);
+  COMP_CHECK(comp_ui::smart_row_at(panel, 2, 0, 800.0, 154.0) == -1); /* 行号超出条数 */
+  COMP_CHECK(comp_ui::smart_row_at(panel, 2, 0, 800.0, 109.0) == -1); /* 标题/摘要区 */
+  COMP_CHECK(comp_ui::smart_row_at(panel, 2, 0, 100.0, 111.0) == -1); /* 面板外 */
+
+  COMP_CHECK(comp_ui::smart_max_scroll(panel, 3) == 0);
+  COMP_CHECK(comp_ui::smart_max_scroll(panel, 30) == 12);
+  COMP_CHECK(comp_ui::smart_clamp_scroll(panel, 30, -1) == 0);
+  COMP_CHECK(comp_ui::smart_clamp_scroll(panel, 30, 99) == 12);
+  COMP_CHECK(comp_ui::smart_clamp_scroll(panel, 30, 4) == 4);
+
+  COMP_CHECK(comp_ui::smart_ensure_visible(panel, 30, 3, 5) == 3);
+  COMP_CHECK(comp_ui::smart_ensure_visible(panel, 30, 25, 5) == 8);
+  COMP_CHECK(comp_ui::smart_ensure_visible(panel, 30, 25, 99) == 12);
+}
+
+/*
  * P1 历史面板：与路径面板共用 list_* 几何，但指数的是「状态数」——index 0 是最初
  * 状态，所以行数 = 步数 + 1。这里只验几何（绘制与命中同源），跳转语义在 ABI 用例里。
  */

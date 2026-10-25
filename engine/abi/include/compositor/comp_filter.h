@@ -312,6 +312,12 @@ COMP_API comp_result comp_layer_smart_filter_set(comp_document document, comp_la
 COMP_API comp_result comp_layer_smart_filter_remove(comp_document document, comp_layer_id id,
                                                     size_t index);
 
+/* ========================================= 智能滤镜栈顺序与命名（P1-2 收尾 ⑩）
+ *
+ * 尾部追加（P1-2 第九批之后）：栈序就是求值顺序（自下而上，索引 0 先跑），
+ * 改名只是面板展示名、不参与求值。两者都随快照进撤销栈与 `.comp`。
+ */
+
 /*
  * 取第 index 条的展示名（两段式，口径同 comp_layer_comp_name）：`out_required`
  * 写含 '\0' 的所需长度；`buffer == NULL` 或 `capacity == 0` 为查询模式。
