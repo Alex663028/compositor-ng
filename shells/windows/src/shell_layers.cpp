@@ -58,7 +58,119 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 }
 
 /*
+ * P1-2 收尾：图层面板过滤（视图态，见 shell_state.h 的字段说明）。
+ *
+ * 判定只用 LayerRow 的只读快照，不调引擎、不开事务。三个维度是「与」关系：
+ * 类型、颜色、名称同时满足才显示。名称比较按 UTF-16 折叠大小写后做子串匹配，
+ * 中文不受影响（只折叠 ASCII / 拉丁）。
+ *
+ * 祖先保留：命中行的父组即使自己没命中也要显示，否则组消失后子行会以
+ * 「凭空出现的缩进」出现，层级看起来像坏了。祖先行按命中处理（可选中、可操作）。
+ */
+bool layer_filter_active(const ShellState& shell) {
+  return shell.layer_filter_kind != 0 || shell.layer_filter_color >= 0 ||
+         !shell.layer_filter_name.empty();
+}
+
+namespace {
+
+wchar_t fold_case(wchar_t ch) {
+  if (ch >= L'A' && ch <= L'Z') return static_cast<wchar_t>(ch - L'A' + L'a');
+  return ch;
+}
+
+bool name_contains(const std::wstring& haystack, const std::wstring& needle) {
+  if (needle.empty()) return true;
+  if (needle.size() > haystack.size()) return false;
+  const size_t last = haystack.size() - needle.size();
+  for (size_t start = 0; start <= last; ++start) {
+    size_t i = 0;
+    while (i < needle.size() && fold_case(haystack[start + i]) == fold_case(needle[i])) ++i;
+    if (i == needle.size()) return true;
+  }
+  return false;
+}
+
+bool row_matches_filter(const ShellState& shell, const LayerRow& row) {
+  switch (shell.layer_filter_kind) {
+    case 0:
+      break;
+    case 1: /* 像素层：不是组、不是文字、不是调整层、不是填充层、不是智能对象 */
+      if (row.is_group != 0 || row.is_text != 0 || row.adjustment_count > 0 ||
+          row.fill_kind != 0 || row.is_smart != 0) {
+        return false;
+      }
+      break;
+    case 2:
+      if (row.is_text == 0) return false;
+      break;
+    case 3:
+      if (row.is_group == 0) return false;
+      break;
+    case 4:
+      if (row.adjustment_count <= 0) return false;
+      break;
+    case 5:
+      if (row.fill_kind == 0) return false;
+      break;
+    case 6:
+      if (row.is_smart == 0) return false;
+      break;
+    default:
+      break;
+  }
+  if (shell.layer_filter_color >= 0 &&
+      static_cast<int>(row.color_label) != shell.layer_filter_color) {
+    return false;
+  }
+  if (!shell.layer_filter_name.empty() &&
+      !name_contains(widen_utf8(row.name), shell.layer_filter_name)) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+/*
+ * 过滤后的显示序：命中行 + 其全部祖先。返回的是 `shell.doc.layers` 的下标
+ * （升序，与数组序一致）。无过滤时返回全量。
+ */
+std::vector<int32_t> filtered_layer_indices(const ShellState& shell) {
   const int32_t count = static_cast<int32_t>(shell.doc.layers.size());
+  std::vector<int32_t> indices;
+  indices.reserve(static_cast<size_t>(count));
+  if (!layer_filter_active(shell)) {
+    for (int32_t i = 0; i < count; ++i) indices.push_back(i);
+    return indices;
+  }
+  std::vector<uint8_t> keep(static_cast<size_t>(count), 0);
+  for (int32_t i = 0; i < count; ++i) {
+    const LayerRow& row = shell.doc.layers[static_cast<size_t>(i)];
+    if (!row_matches_filter(shell, row)) continue;
+    /* 自身 + 沿 parent 链上溯（含防御性上限：脏数据里的环不能把这里挂死）。 */
+    int32_t cursor = i;
+    for (int32_t guard = 0; cursor >= 0 && guard <= count; ++guard) {
+      if (keep[static_cast<size_t>(cursor)] != 0) break;
+      keep[static_cast<size_t>(cursor)] = 1;
+      const comp_layer_id parent = shell.doc.layers[static_cast<size_t>(cursor)].parent;
+      if (parent == 0) break;
+      cursor = -1;
+      for (int32_t j = 0; j < count; ++j) {
+        if (shell.doc.layers[static_cast<size_t>(j)].id == parent) {
+          cursor = j;
+          break;
+        }
+      }
+    }
+  }
+  for (int32_t i = 0; i < count; ++i) {
+    if (keep[static_cast<size_t>(i)] != 0) indices.push_back(i);
+  }
+  return indices;
+}
+
+/*
  * S44：重建树形显示序（组行在上、子层缩进在下、折叠的组不展开）。
  *
  * layers 变了（换文档 / 撤销 / 增删层）或折叠状态变了都要调。折叠集合先按「仍是组」
@@ -80,10 +192,13 @@ void rebuild_layer_display(ShellState& shell) {
     shell.doc.collapsed_groups.swap(alive);
   }
 
-  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
-  std::vector<uint8_t> collapsed(static_cast<size_t>(count), 0);
-  for (int32_t i = 0; i < count; ++i) {
-    const LayerRow& row = shell.doc.layers[static_cast<size_t>(i)];
+  /* P1-2 收尾：先算可见子集，再把它当成一个紧凑数组交给树形排布。 */
+  const std::vector<int32_t> indices = filtered_layer_indices(shell);
+  const int32_t visible = static_cast<int32_t>(indices.size());
+  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(visible));
+  std::vector<uint8_t> collapsed(static_cast<size_t>(visible), 0);
+  for (int32_t i = 0; i < visible; ++i) {
+    const LayerRow& row = shell.doc.layers[static_cast<size_t>(indices[static_cast<size_t>(i)])];
     entries[static_cast<size_t>(i)] = comp_ui::LayerStackEntry{
         static_cast<int64_t>(row.id), static_cast<int64_t>(row.parent),
         static_cast<int64_t>(row.clipping)};
@@ -94,13 +209,18 @@ void rebuild_layer_display(ShellState& shell) {
       }
     }
   }
-  shell.doc.layer_display.assign(static_cast<size_t>(count), 0);
-  shell.doc.layer_depth.assign(static_cast<size_t>(count), 0);
+  shell.doc.layer_display.assign(static_cast<size_t>(visible), 0);
+  shell.doc.layer_depth.assign(static_cast<size_t>(visible), 0);
   const int32_t rows = comp_ui::build_layer_display(
-      entries.data(), count, collapsed.data(), shell.doc.layer_display.data(),
-      shell.doc.layer_depth.data(), count);
+      entries.data(), visible, collapsed.data(), shell.doc.layer_display.data(),
+      shell.doc.layer_depth.data(), visible);
   shell.doc.layer_display.resize(static_cast<size_t>(rows));
   shell.doc.layer_depth.resize(static_cast<size_t>(rows));
+  /* display 里存的是紧凑下标；投影回 layers 的真实下标。 */
+  for (int32_t& index : shell.doc.layer_display) {
+    const int32_t compact = index;
+    index = (compact >= 0 && compact < visible) ? indices[static_cast<size_t>(compact)] : -1;
+  }
 }
 
 /* 面板显示行数（折叠之后可能少于图层数）。 */
@@ -185,6 +305,86 @@ void panel_toggle_group_collapsed(ShellState& shell, comp_layer_id id) {
     }
     shell.doc.extra_selection.swap(visible);
   }
+}
+
+/* ------------------------------------------------ 面板过滤（P1-2 收尾） */
+
+/*
+ * 过滤条件变化后的统一收尾：重建显示序，把选中行夹回范围，并让多选集合只
+ * 保留仍可见的层——否则「已选中 N 个」的计数会包含面板上根本看不见的行。
+ */
+void panel_refresh_after_filter(ShellState& shell) {
+  const LayerRow* selected_before = selected_row(shell);
+  const comp_layer_id selected_id = selected_before != nullptr ? selected_before->id : 0;
+
+  rebuild_layer_display(shell);
+  const int32_t rows = panel_row_count(shell);
+  if (shell.doc.selected_layer < 0) shell.doc.selected_layer = 0;
+  if (rows <= 0) {
+    shell.doc.selected_layer = 0;
+  } else if (shell.doc.selected_layer >= rows) {
+    shell.doc.selected_layer = rows - 1;
+  }
+  /* 原选中层若被过滤掉，落到离它最近的可见行（面板非空时至少能继续操作）。 */
+  if (selected_id != 0 && panel_row_of_id(shell, selected_id) < 0 && rows > 0) {
+    if (shell.doc.selected_layer >= rows) shell.doc.selected_layer = rows - 1;
+  }
+  if (!shell.doc.extra_selection.empty()) {
+    std::vector<comp_layer_id> visible;
+    visible.reserve(shell.doc.extra_selection.size());
+    for (comp_layer_id extra : shell.doc.extra_selection) {
+      if (panel_row_of_id(shell, extra) >= 0) visible.push_back(extra);
+    }
+    shell.doc.extra_selection.swap(visible);
+  }
+
+  wchar_t buffer[224];
+  if (!layer_filter_active(shell)) {
+    wsprintfW(buffer, L"过滤已清除（%d 行）", static_cast<int>(rows));
+  } else {
+    const wchar_t* kind = L"全部";
+    switch (shell.layer_filter_kind) {
+      case 1: kind = L"像素"; break;
+      case 2: kind = L"文字"; break;
+      case 3: kind = L"组"; break;
+      case 4: kind = L"调整"; break;
+      case 5: kind = L"填充"; break;
+      case 6: kind = L"智能对象"; break;
+      default: break;
+    }
+    wsprintfW(buffer, L"过滤：类型=%s 颜色=%d 名称=%s（%d 行）", kind,
+              shell.layer_filter_color, shell.layer_filter_name.c_str(),
+              static_cast<int>(rows));
+  }
+  set_status(shell, buffer);
+}
+
+void panel_set_filter_kind(ShellState& shell, int kind) {
+  if (kind < 0 || kind > 6) return;
+  shell.layer_filter_kind = kind;
+  panel_refresh_after_filter(shell);
+}
+
+void panel_set_filter_color(ShellState& shell, int color) {
+  if (color < -1 || color > 7) return;
+  shell.layer_filter_color = color;
+  panel_refresh_after_filter(shell);
+}
+
+void panel_begin_filter_name(ShellState& shell) {
+  shell.doc.layer_input = LayerInput::FilterName;
+  shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_text = shell.layer_filter_name;
+  refresh_layer_input_status(shell);
+}
+
+void panel_clear_filter(ShellState& shell) {
+  shell.layer_filter_kind = 0;
+  shell.layer_filter_color = -1;
+  shell.layer_filter_name.clear();
+  panel_refresh_after_filter(shell);
+}
+
 }
 
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
@@ -2546,6 +2746,13 @@ void panel_layer_input_backspace(ShellState& shell) {
 /* 提交键入：改名走 comp_layer_set_name（严格 UTF-8），不透明度走批量设置。 */
 void panel_commit_layer_input(ShellState& shell) {
   if (shell.doc.layer_input == LayerInput::None) return;
+  /* 过滤词不属于文档：没有文档也能改（清空过滤后状态栏照常回报行数）。 */
+  if (shell.doc.layer_input == LayerInput::FilterName) {
+    shell.layer_filter_name = shell.doc.layer_input_text;
+    panel_cancel_layer_input(shell);
+    panel_refresh_after_filter(shell);
+    return;
+  }
   if (shell.doc.document == nullptr) {
     panel_cancel_layer_input(shell);
     set_status(shell, L"无文档");

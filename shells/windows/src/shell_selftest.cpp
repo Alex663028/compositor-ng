@@ -2311,6 +2311,41 @@ int run_selftest(const wchar_t* out_path) {
                           shell_count == 2;
     verify(shell_ok, "shell open_path_as_document(.psd) takes the layered path");
 
+    /*
+     * P1-2 收尾：图层面板过滤。纯视图态——只改显示序，层数组与文档层数都不变，
+     * 也不产生撤销步；类型 / 颜色 / 名称三维是「与」关系。用刚打开的两层做探针。
+     */
+    {
+      refresh_layers(shell);
+      const int32_t all_rows = panel_row_count(shell);
+      const int32_t doc_layers = static_cast<int32_t>(shell.doc.layers.size());
+      panel_set_filter_kind(shell, 1); /* 像素图层 */
+      const int32_t pixel_rows = panel_row_count(shell);
+      panel_set_filter_kind(shell, 3); /* 图层组：这份文档没有组 */
+      const int32_t group_rows = panel_row_count(shell);
+      panel_set_filter_kind(shell, 0);
+      shell.layer_filter_name = L"psd-top";
+      panel_refresh_after_filter(shell);
+      const int32_t name_rows = panel_row_count(shell);
+      bool name_ok = name_rows > 0;
+      for (int32_t row = 0; row < name_rows; ++row) {
+        const LayerRow* shown = layer_row_at(shell, row);
+        if (shown == nullptr || shown->name.find("psd-top") == std::string::npos) {
+          name_ok = false;
+        }
+      }
+      panel_set_filter_color(shell, 7); /* 灰色标签：两层都没有标签 */
+      const int32_t gray_rows = panel_row_count(shell);
+      panel_clear_filter(shell);
+      size_t layers_after = 0;
+      verify(all_rows == doc_layers && all_rows > 1 && pixel_rows == all_rows &&
+                 group_rows == 0 && name_ok && name_rows < all_rows && gray_rows == 0 &&
+                 panel_row_count(shell) == all_rows &&
+                 comp_layer_count(shell.doc.document, &layers_after) == COMP_OK &&
+                 static_cast<int32_t>(layers_after) == doc_layers,
+             "layer panel filter narrows by type / color / name without touching the document");
+    }
+
     /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
     if (probe_png_exists(probe_path)) {
       open_path_as_document(shell, probe_path);

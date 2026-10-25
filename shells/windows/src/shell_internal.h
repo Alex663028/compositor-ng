@@ -211,6 +211,13 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   int32_t panel_row_of_id(const ShellState& shell, comp_layer_id id);
   bool layer_group_collapsed(const ShellState& shell, comp_layer_id id);
   void panel_toggle_group_collapsed(ShellState& shell, comp_layer_id id);
+  /* P1-2 收尾：图层面板过滤（纯视图态，见 shell_state.h）。 */
+  bool layer_filter_active(const ShellState& shell);
+  void panel_refresh_after_filter(ShellState& shell);
+  void panel_set_filter_kind(ShellState& shell, int kind);
+  void panel_set_filter_color(ShellState& shell, int color);
+  void panel_begin_filter_name(ShellState& shell);
+  void panel_clear_filter(ShellState& shell);
   void refresh_layers(ShellState& shell);
   const LayerRow* selected_row(const ShellState& shell);
   void panel_move_selection(ShellState& shell, int32_t delta);
