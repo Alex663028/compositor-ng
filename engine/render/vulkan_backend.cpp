@@ -790,10 +790,20 @@ bool ComputeKernel::init(std::string* error) {
     if (error != nullptr) *error = "no Vulkan physical device";
     return false;
   }
-  if (api.enumerate_devices(instance_, &device_count, &physical_) != kVkSuccess) {
+  /*
+   * 第二次调用只取第一块设备。接收缓冲的容量是 1（&physical_ 是单槽成员），
+   * 规范语义是驱动写入 min(传入 count, 设备总数) 个句柄——若把 device_count
+   * （设备总数）原样传回，多 GPU 机器（核显 + 独显）会把第二个句柄写进
+   * 相邻内存。单 GPU 恰好不炸，双 GPU 必踩（越界写）。
+   */
+  VkPhysicalDeviceLocal first_device = nullptr;
+  uint32_t written = 1;
+  if (api.enumerate_devices(instance_, &written, &first_device) != kVkSuccess || written == 0 ||
+      first_device == nullptr) {
     if (error != nullptr) *error = "vkEnumeratePhysicalDevices failed";
     return false;
   }
+  physical_ = first_device;
   if (!create_device(error)) return false;
   if (!create_pipeline(error)) return false;
   if (error != nullptr) error->clear();

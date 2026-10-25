@@ -9,9 +9,32 @@
 #include <string>
 
 #include "comp_abi_internal.h"
+#include "core/comp_handle_magic.h"
+#include "core/comp_live_handles.h"
 
 using compositor::Document;
 using compositor::Engine;
+
+namespace {
+
+/*
+ * 事务句柄的唯一回收口：槽位注销 -> 置失活 -> poison magic -> 登记表注销 -> delete。
+ * commit / abort 的全部出口（正常路径与三类异常）都走这里，保证两件事：
+ *   1. 登记表永远不会留下已 delete 的悬空表项（否则地址复用后 as_txn 会放行野句柄）；
+ *   2. 首次 commit/abort 之后再用同一句柄，as_txn 查表即失败——double-commit
+ *      从 use-after-free 读变成 COMP_ERR_INVALID_ARGUMENT。
+ */
+void retire_txn(comp_txn_handle* txn) {
+  if (txn->document != nullptr) {
+    txn->document->unregister_txn_slot(&txn->document);
+  }
+  txn->active = false;
+  txn->handle_magic_ = compositor::kHandlePoisoned;
+  compositor::unregister_live_handle(txn, compositor::LiveHandleKind::kTxn);
+  delete txn;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -43,19 +66,37 @@ comp_result comp_txn_begin(comp_document document, const char* label_utf8, comp_
   txn->document = doc;
   txn->label = label;
   txn->active = true;
-  /* 登记槽位：文档先于句柄销毁时，~Document 会把 document 置空使其失效。 */
+  /* 登记槽位：文档先于句柄销毁时，~Document 会把 document 置空使其失效。
+   * 先槽位后登记表：register_txn_slot 可能抛 bad_alloc（vector 扩容），
+   * 抛了则句柄未入表、由 COMP_ABI_CATCH 返回 OOM（与旧行为一致，仅句柄泄漏）；
+   * 若顺序反过来，抛异常会留下「已入表却已泄漏」的表项——地址复用后
+   * as_txn 会放行野句柄。register_live_handle 自身 noexcept，放最后安全。 */
   doc->register_txn_slot(&txn->document);
+  compositor::register_live_handle(txn, compositor::LiveHandleKind::kTxn);
   *out_txn = txn;
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }
 
 comp_result comp_txn_commit(comp_txn txn) {
-  if (txn == nullptr || !txn->active || txn->document == nullptr) {
-    /* document 为空 = 宿主已销毁文档（~Document 作废），此时不得解引用。 */
+  comp_txn_handle* handle = compositor::abi::as_txn(txn);
+  if (handle == nullptr) {
+    /* 表未命中：野句柄 / 类型混淆 / double-commit（已 delete 且表项已注销）。 */
     return COMP_ERR_INVALID_ARGUMENT;
   }
-  Document* doc = txn->document;
+  if (handle->document == nullptr) {
+    /* document 为空 = 宿主已销毁文档（~Document 经槽位作废），不得解引用。
+     * 句柄本身可以安全回收——槽位列表随文档一起消失，无需再注销。 */
+    handle->active = false;
+    handle->handle_magic_ = compositor::kHandlePoisoned;
+    compositor::unregister_live_handle(handle, compositor::LiveHandleKind::kTxn);
+    delete handle;
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (!handle->active) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  Document* doc = handle->document;
   Engine* engine = doc->engine();
   std::string error;
   comp_result result = COMP_OK;
@@ -64,33 +105,36 @@ comp_result comp_txn_commit(comp_txn txn) {
   try {
     result = doc->txn_commit(&error);
   } catch (const std::bad_alloc&) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_OUT_OF_MEMORY, "out of memory");
   } catch (const std::exception& ex) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_INTERNAL, ex.what());
   } catch (...) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "unexpected exception");
   }
-  doc->unregister_txn_slot(&txn->document);
-  txn->active = false;
-  delete txn;
+  retire_txn(handle);
   if (result != COMP_OK) return compositor::abi::fail(engine, result, error);
   return compositor::abi::ok(engine);
 }
 
 comp_result comp_txn_abort(comp_txn txn) {
-  if (txn == nullptr || !txn->active || txn->document == nullptr) {
+  comp_txn_handle* handle = compositor::abi::as_txn(txn);
+  if (handle == nullptr) {
     return COMP_ERR_INVALID_ARGUMENT;
   }
-  Document* doc = txn->document;
+  if (handle->document == nullptr) {
+    handle->active = false;
+    handle->handle_magic_ = compositor::kHandlePoisoned;
+    compositor::unregister_live_handle(handle, compositor::LiveHandleKind::kTxn);
+    delete handle;
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (!handle->active) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  Document* doc = handle->document;
   Engine* engine = doc->engine();
   std::string error;
   comp_result result = COMP_OK;
@@ -98,24 +142,16 @@ comp_result comp_txn_abort(comp_txn txn) {
   try {
     result = doc->txn_abort(&error);
   } catch (const std::bad_alloc&) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_OUT_OF_MEMORY, "out of memory");
   } catch (const std::exception& ex) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_INTERNAL, ex.what());
   } catch (...) {
-    doc->unregister_txn_slot(&txn->document);
-    txn->active = false;
-    delete txn;
+    retire_txn(handle);
     return compositor::abi::fail(engine, COMP_ERR_INTERNAL, "unexpected exception");
   }
-  doc->unregister_txn_slot(&txn->document);
-  txn->active = false;
-  delete txn;
+  retire_txn(handle);
   if (result != COMP_OK) return compositor::abi::fail(engine, result, error);
   return compositor::abi::ok(engine);
 }

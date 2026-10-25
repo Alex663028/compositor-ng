@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -78,8 +79,17 @@ class Engine {
    *
    * ABI 约定宿主应先销毁文档再销毁引擎；现实中常见反序。Engine 记住自己
    * 创建的文档，析构时统一销毁，避免「引擎先走、文档变野指针」。
+   *
+   * 多线程：错误槽已是线程局部（见下），多线程共用一个引擎是明示支持的
+   * 用法；此前 documents_ 的 push_back/erase 却无锁——两个线程同时建文档
+   * 即数据竞争（UB）。attach/detach/析构兜底现共持 state_mutex_。
+   * 注意锁只保护**登记结构本身**：文档内容的事务一致性仍要求宿主对同一
+   * 文档串行调用（comp_engine.h 的同步调用模型不变）。
    */
-  void attach_document(Document* document) { documents_.push_back(document); }
+  void attach_document(Document* document) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    documents_.push_back(document);
+  }
   void detach_document(Document* document);
 
   /*
@@ -105,11 +115,19 @@ class Engine {
    * Camera Raw 实测表：一个引擎加载一次，所有文档共享（`CameraRawTableSet` 不可变，
    * 解码后由 shared_ptr<const> 挂号）。ABI 层 `comp_engine_load_camera_raw_tables`
    * 解析 CRT4 后交给这里；引擎销毁前表一直有效。
+   *
+   * 并发：set/get 同持 state_mutex_，挡住「加载期间并发使用」对 shared_ptr
+   * 引用计数的竞争。锁不改变指针语义——表按约定是 load-once 的不可变数据，
+   * 宿主不应在并发使用滤镜的同时重新加载。
    */
   void set_camera_raw_tables(std::shared_ptr<const CameraRawTableSet> tables) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     camera_raw_tables_ = std::move(tables);
   }
-  const CameraRawTableSet* camera_raw_tables() const noexcept { return camera_raw_tables_.get(); }
+  const CameraRawTableSet* camera_raw_tables() const noexcept {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return camera_raw_tables_.get();
+  }
   /* 定义在 engine.cpp：`valid()` 需要完整类型。 */
   bool camera_raw_tables_loaded() const noexcept;
 
@@ -127,6 +145,9 @@ class Engine {
   std::string app_name_ = "compositor";
   std::string app_version_;
   uint32_t handle_magic_ = kEngineMagic;
+  /* 护 documents_ 与 camera_raw_tables_（见各自注释）。mutable：camera_raw_tables()
+   * 是 const 成员。锁在 noexcept 接口中使用的理论与 is_live_handle 相同。 */
+  mutable std::mutex state_mutex_;
   std::vector<Document*> documents_{};
   std::shared_ptr<const CameraRawTableSet> camera_raw_tables_{};
 };

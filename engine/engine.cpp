@@ -12,6 +12,7 @@
 namespace compositor {
 
 bool Engine::camera_raw_tables_loaded() const noexcept {
+  std::lock_guard<std::mutex> lock(state_mutex_);
   return camera_raw_tables_ != nullptr && camera_raw_tables_->valid();
 }
 
@@ -66,12 +67,16 @@ Engine::~Engine() {
   unregister_live_handle(this, LiveHandleKind::kEngine);
   /*
    * 兜底清理：宿主若先销毁引擎（反序），在册文档一并销毁。
-   * 先 swap 摘掉列表再逐个 delete——Document 析构会回调 detach_document，
-   * 迭代中修改容器是未定义行为。poison 放在最后：清理期间引擎对自身
+   * 先在锁内 swap 摘掉列表再逐个 delete——Document 析构会回调 detach_document
+   * （它也要拿 state_mutex_），迭代中修改容器也是未定义行为；锁内只做 swap，
+   * 销毁在锁外进行，不会自锁。poison 放在最后：清理期间引擎对自身
    * 析构路径仍然「活着」。
    */
   std::vector<Document*> pending;
-  pending.swap(documents_);
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    pending.swap(documents_);
+  }
   for (Document* document : pending) {
     /* 必须走 Document::destroy（placement new 的手动析构 + 分配器归还），
      * 默认 delete 会把定制分配器出来的块交给全局 operator delete。 */
@@ -81,6 +86,7 @@ Engine::~Engine() {
 }
 
 void Engine::detach_document(Document* document) {
+  std::lock_guard<std::mutex> lock(state_mutex_);
   for (auto it = documents_.begin(); it != documents_.end(); ++it) {
     if (*it == document) {
       documents_.erase(it);

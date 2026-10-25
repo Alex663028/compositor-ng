@@ -71,16 +71,28 @@ class Regression:
         self.rows: list[tuple[str, str, float, str]] = []
 
     def run_cmd(self, cmd: list[str], *, shell: bool = False,
-                capture: bool = False) -> subprocess.CompletedProcess:
+                capture: bool = False, timeout: float = 1800.0) -> subprocess.CompletedProcess:
+        """执行一条子命令。
+
+        timeout：挂死兜底。此前任何一步若死循环（如单测卡死、壳等待输入），
+        整个回归会无限期挂起且无任何诊断，只能人工杀进程。超时后
+        subprocess.run 会 kill 子进程并抛 TimeoutExpired——step() 把它记成
+        该步 FAIL，回归得以收口。默认 1800s 对最慢的 --clean 全量构建
+        （实测约 133s）有充分余量。
+        """
         printable = cmd if shell else " ".join(cmd)
         print(f"    $ {printable}", flush=True)
-        if capture:
-            proc = subprocess.run(cmd, cwd=ROOT, shell=shell,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, errors="replace")
-            sys.stdout.write(proc.stdout or "")
-            return proc
-        return subprocess.run(cmd, cwd=ROOT, shell=shell)
+        try:
+            if capture:
+                proc = subprocess.run(cmd, cwd=ROOT, shell=shell, timeout=timeout,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, errors="replace")
+                sys.stdout.write(proc.stdout or "")
+                return proc
+            return subprocess.run(cmd, cwd=ROOT, shell=shell, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"    [TIMEOUT] 超过 {timeout:.0f}s 已杀掉: {printable}", flush=True)
+            raise
 
     def step(self, name: str, fn) -> bool:
         """执行一个步骤；返回是否通过（SKIP 也视为通过）。"""

@@ -42,6 +42,15 @@ Document* as_document(comp_document handle) {
   return document;
 }
 
+comp_txn_handle* as_txn(comp_txn handle) {
+  comp_txn_handle* txn = reinterpret_cast<comp_txn_handle*>(handle);
+  if (txn == nullptr || !is_live_handle(txn, LiveHandleKind::kTxn) ||
+      txn->handle_magic_ != kTxnMagic) {
+    return nullptr;
+  }
+  return txn;
+}
+
 comp_result guard_document(comp_document handle, Document** out_document, Engine** out_engine) {
   Document* document = as_document(handle);
   if (document == nullptr) {

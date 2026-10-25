@@ -2,7 +2,7 @@
 /*
  * comp_live_handles.h — 存活对象登记表（ABI 句柄安全的第二道闸门）。
  *
- * 背景：comp_engine / comp_document / comp_font 句柄都是内部 C++ 对象指针的
+ * 背景：comp_engine / comp_document / comp_font / comp_txn 句柄都是内部 C++ 对象指针的
  * reinterpret_cast，靠对象内置 magic 校验。但**完全野的**句柄（宿主传了个
  * 0xDEADBEEF 之类的未映射地址）在解引用读 magic 那一刻就段错误了，根本走不到
  * 比较。本表记录**当前存活**的对象指针（构造成功时登记、析构时注销），句柄转换
@@ -30,11 +30,14 @@
 
 namespace compositor {
 
-/* 句柄种类：与引擎内部三类可被宿主持有的对象一一对应。 */
+/* 句柄种类：与引擎内部可被宿主持有的对象类型一一对应。comp_txn 指向
+ * ABI 内部的 comp_txn_handle（comp_abi_internal.h），不是独立 C++ 类，
+ * 但走同一张表、同一套双闸门。 */
 enum class LiveHandleKind : uint8_t {
   kEngine = 1,
   kDocument = 2,
   kFont = 3,
+  kTxn = 4,
 };
 
 /* 构造成功后调用（对象已可用）。nullptr 安全空操作。 */

@@ -5,6 +5,7 @@
  * 这一组测试即「壳的视角」：只使用 comp_*.h 中的 C 符号，不接触任何 C++ 内部类型。
  * 三端外壳（Windows / HarmonyOS / macOS）的集成路径与此完全一致。
  */
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1005,6 +1006,103 @@ COMP_TEST(wild_engine_document_handles_never_crash) {
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);
+}
+
+/*
+ * 事务句柄的野指针 / 类型混淆 / double-commit / 文档先亡：
+ * 全部必须变成错误码，不得段错误或 use-after-free。
+ *
+ * comp_txn 此前是双闸门体系（登记表 + magic）的漏网入口：commit/abort 第一行
+ * 就解引用裸句柄——野句柄直接 SIGSEGV；double-commit（首次 commit 已 delete）
+ * 是 UAF 读。现在 txn 走与 engine/document/font 同构的 as_txn 双闸门，
+ * 回收统一经 retire_txn（表项注销先于 delete）。与 F2 修复同构。
+ */
+COMP_TEST(txn_wild_released_and_confused_handles_never_crash) {
+  const comp_txn kWild = reinterpret_cast<comp_txn>(0x1000000000000ULL);
+  COMP_CHECK(comp_txn_commit(kWild) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_abort(kWild) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_commit(nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_abort(nullptr) == COMP_ERR_INVALID_ARGUMENT);
+
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  /* 类型混淆：文档 / 引擎句柄当事务句柄传，登记表类型标签挡下。 */
+  COMP_CHECK(comp_txn_commit(reinterpret_cast<comp_txn>(document)) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_abort(reinterpret_cast<comp_txn>(engine)) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* 正常事务 + double-commit：第二次 commit 查表即失败（句柄已注销），不是 UAF。 */
+  comp_txn txn = nullptr;
+  COMP_CHECK(comp_txn_begin(document, "wild-check", &txn) == COMP_OK);
+  COMP_CHECK(txn != nullptr);
+  COMP_CHECK(comp_txn_commit(txn) == COMP_OK);
+  COMP_CHECK(comp_txn_commit(txn) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_abort(txn) == COMP_ERR_INVALID_ARGUMENT);
+
+  /* 文档先于事务销毁：~Document 经槽位把 document 置空；commit/abort 不得
+   * 解引用文档，且句柄在此路径被回收（不再泄漏）。 */
+  comp_txn dangling = nullptr;
+  COMP_CHECK(comp_txn_begin(document, "dangling", &dangling) == COMP_OK);
+  comp_document_destroy(document);
+  COMP_CHECK(comp_txn_commit(dangling) == COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_txn_abort(dangling) == COMP_ERR_INVALID_ARGUMENT);
+
+  comp_engine_destroy(engine);
+}
+
+/*
+ * 多线程并发创建/销毁文档：Engine 的文档登记（attach/detach 的 vector
+ * push_back/erase）此前无锁——两个宿主线程同时 comp_document_create 即数据
+ * 竞争（UB）。错误槽线程局部化只解决了报错，没解决登记本身；现在两侧共持
+ * state_mutex_。TSan 下本用例是真竞争检测器；无 TSan 时至少钉住行为契约：
+ * 并发开关文档全部成功，结束后引擎照常可用，反序销毁走 ~Engine 兜底。
+ */
+COMP_TEST(engine_concurrent_document_create_destroy_is_safe) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  const int kThreads = 4;
+  const int kDocsPerThread = 8;
+  std::atomic<int> create_failures(0);
+  std::vector<std::thread> workers;
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&]() {
+      for (int i = 0; i < kDocsPerThread; ++i) {
+        comp_document_desc document_desc{};
+        document_desc.width = 4;
+        document_desc.height = 4;
+        comp_document document = nullptr;
+        if (comp_document_create(engine, &document_desc, &document) != COMP_OK ||
+            document == nullptr) {
+          ++create_failures;
+          continue;
+        }
+        comp_document_destroy(document);
+      }
+    });
+  }
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+  COMP_CHECK_MSG(create_failures.load() == 0, "concurrent create/destroy all succeed");
+
+  /* 引擎仍然可用；最后留一个在册文档，用「引擎先走」的反序销毁检验
+   * ~Engine 的兜底清理路径（swap 出列表后逐个 Document::destroy）。 */
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+  comp_engine_destroy(engine);
+  /* 引擎销毁已把在册文档一并回收；再 destroy 一次文档句柄应是无操作（表已注销）。 */
+  comp_document_destroy(document);
 }
 
 /* 命令列表：desc 模式必须提供文档（enabled 按文档状态求值）；

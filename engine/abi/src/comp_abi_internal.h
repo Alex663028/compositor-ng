@@ -15,6 +15,8 @@
 #include "compositor/comp_core.h"
 #include "compositor/comp_engine.h"
 #include "compositor/comp_layer.h" /* comp_layer_lock（P1-2 第一批的锁位） */
+#include "compositor/comp_undo.h"  /* comp_txn（as_txn 的入参类型） */
+#include "core/comp_handle_magic.h"
 #include "domain/document.h"
 #include "engine.h"
 
@@ -33,6 +35,10 @@ namespace abi {
 Engine* as_engine(comp_engine handle);
 Document* as_document(comp_document handle);
 FontFace* as_font(comp_font handle);
+/* 事务句柄同构的双闸门（见 comp_undo_abi.cpp 的 retire_txn）：野句柄、
+ * double-commit（首次 commit 已 delete 并注销表项）、类型混淆都在
+ * 解引用之前被挡成 nullptr。 */
+comp_txn_handle* as_txn(comp_txn handle);
 
 /* 校验句柄；失败返回 COMP_ERR_INVALID_ARGUMENT。 */
 comp_result guard_document(comp_document handle, Document** out_document, Engine** out_engine);
@@ -127,11 +133,14 @@ class ImplicitTxn {
 }  // namespace abi
 }  // namespace compositor
 
-/* 事务句柄的内部定义（C 侧只看到不透明 comp_txn）。 */
+/* 事务句柄的内部定义（C 侧只看到不透明 comp_txn）。
+ * handle_magic_ 保持「尾部成员」惯例：as_txn 查登记表（类型标签 kTxn）命中后
+ * 再核对它；delete 前由 retire_txn 置 kHandlePoisoned。 */
 struct comp_txn_handle {
   compositor::Document* document = nullptr;
   std::string label;
   bool active = false;
+  uint32_t handle_magic_ = compositor::kTxnMagic;
 };
 
 #endif /* COMPOSITOR_ABI_SRC_COMP_ABI_INTERNAL_H */

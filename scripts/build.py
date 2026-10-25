@@ -16,6 +16,8 @@ clang 完成真实编译与测试运行；仅依赖 Python 3 与 pip。
     python scripts/build.py --driver msvc   # 显式使用 cl.exe（需已安装 VS 环境）
     python scripts/build.py --driver cc     # 使用 PATH 中的 cc/c++（gcc/clang）
     python scripts/build.py --gpu           # 编入 D3D12 后端（-DCOMP_HAS_D3D12），AUTO 才可能走 GPU
+    python scripts/build.py --asan          # AddressSanitizer 构建（-fsanitize=address，
+                                             #  变体前缀 asan_ 隔离对象；详见 compile_all 注释）
 
 重要：`--driver msvc` 只对 C++ 源可用。engine/imaging/*.c 沿用原 macOS 工程的
 clang block 语法（^），cl.exe 没有 blocks 扩展，会直接以 C2059 报错；
@@ -171,8 +173,8 @@ def run(cmd: list[str], env: dict | None = None) -> None:
     subprocess.run(cmd, check=True, cwd=ROOT, env=env or child_env())
 
 
-def obj_variant_prefix(shared: bool, gpu: bool) -> str:
-    """目标文件的变体前缀（S23）：把「是否共享」「是否编入 D3D12」都编进文件名。
+def obj_variant_prefix(shared: bool, gpu: bool, asan: bool = False) -> str:
+    """目标文件的变体前缀（S23）：把「是否共享」「是否编入 D3D12」「是否 ASan」都编进文件名。
 
     之前只用 `shared_` 区分，GPU 与非 GPU 变体共用同一个 .o 路径，于是「先构建
     --gpu、再构建默认」会**复用上一次的 GPU 对象**，反之则静默降级到 CPU 桩
@@ -184,27 +186,32 @@ def obj_variant_prefix(shared: bool, gpu: bool) -> str:
         parts.append("gpu")
     if shared:
         parts.append("shared")
+    if asan:
+        parts.append("asan")
     return "_".join(parts) + "_" if parts else ""
 
 
-def obj_path(source: str, driver: str, shared: bool = False, gpu: bool = False) -> str:
+def obj_path(source: str, driver: str, shared: bool = False, gpu: bool = False,
+             asan: bool = False) -> str:
     rel = os.path.relpath(source, ROOT).replace("..", "_").replace("/", "_").replace("\\", "_")
     ext = ".obj" if driver == "msvc" else ".o"
-    return os.path.join(BUILD, obj_variant_prefix(shared, gpu) + os.path.splitext(rel)[0] + ext)
+    return os.path.join(BUILD, obj_variant_prefix(shared, gpu, asan) +
+                        os.path.splitext(rel)[0] + ext)
 
 
-def engine_object_paths(driver: str, shared: bool = False, gpu: bool = False) -> list[str]:
+def engine_object_paths(driver: str, shared: bool = False, gpu: bool = False,
+                        asan: bool = False) -> list[str]:
     """本变体下引擎全部目标文件的**预期**路径（壳构建脚本用它，而不是 glob）。
 
     glob `build/engine_*.o` 会把任意一次历史构建剩下的对象都当成本次输入——这正是
-    静默降级的另一半原因。按变体算出确定路径，缺一个就报错，不给「凑巧能链上」的
-    机会。
+    静默降级的另一半原因。按变体算出确定路径，缺一个就报错，不给「凑巧能链上」
+    的机会。
     """
     c_sources, cxx_sources, _ = collect_sources()
-    return [obj_path(source, driver, shared, gpu) for source in c_sources + cxx_sources]
+    return [obj_path(source, driver, shared, gpu, asan) for source in c_sources + cxx_sources]
 
 
-def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
+def compile_all(driver: str, shared: bool, gpu: bool = False, asan: bool = False) -> list[str]:
     cc, cxx, linker = resolve_toolchain(driver)
     os.makedirs(BUILD, exist_ok=True)
 
@@ -228,12 +235,21 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
     if gpu:
         defines.append("-DCOMP_HAS_D3D12")
         msvc_defines.append("/DCOMP_HAS_D3D12")
+    # ASan（OPT-13）：把 2026-10-24 鸿蒙模拟器上的一次性 ASan 实验（README §6.101，
+    # 实测抓出 4 条测试侧 UAF）沉淀为可重复构建。变体前缀隔离对象，防止与普通
+    # 构建混链。注意两点边界：a) Windows + zig 的 asan 运行库可用性未证实，链接或
+    # 运行失败会如实报错（ohos/Linux 路径是已验证可用的）；b) msvc 驱动不支持。
+    if asan:
+        if driver == "msvc":
+            raise SystemExit("--asan 需要 clang 系驱动（zig/clang/cc）；cl.exe 请加 /INFERASANFLAGS 自行构建")
+        defines.extend(["-fsanitize=address", "-fno-omit-frame-pointer"])
+    link_sanitize = ["-fsanitize=address"] if asan else []
 
     objects: list[str] = []
     msvc = driver == "msvc"
 
     for source in c_sources:
-        obj = obj_path(source, driver, shared, gpu)
+        obj = obj_path(source, driver, shared, gpu, asan)
         # FreeType 的 fterrors.h 在未定义 FT2_BUILD_LIBRARY 时会 #undef FT_ERR_PREFIX，
         # 于是库内部 FT_ERR(x) 拼不出 FT_Err_ 前缀（上游 autotools 正是靠这个宏编库）。
         extra = ["-DFT2_BUILD_LIBRARY"] if _is_freetype_source(source) else []
@@ -250,7 +266,7 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
     # 共享构建不编译单测：单测必须静态链进引擎，与「导出符号的库」是两种产物。
     translation_units = list(cxx_sources) + ([] if shared else list(test_sources))
     for source in translation_units:
-        obj = obj_path(source, driver, shared, gpu)
+        obj = obj_path(source, driver, shared, gpu, asan)
         if msvc:
             cmd = cxx + ["/nologo", "/c", "/O2", "/utf-8", "/EHsc", "/TP", source, f"/Fo{obj}"] + \
                   [f"/I{path}" for path in INCLUDE_DIRS] + msvc_defines
@@ -265,7 +281,7 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
         if msvc:
             link = linker + ["/nologo", "/DLL", "/Fe:" + lib] + objects
         else:
-            link = linker + objects + ["-shared", "-o", lib]
+            link = linker + objects + link_sanitize + ["-shared", "-o", lib]
             if os.name != "nt":
                 link.append("-pthread")
         run(link)
@@ -281,7 +297,7 @@ def compile_all(driver: str, shared: bool, gpu: bool = False) -> list[str]:
         if os.name == "nt":
             link.append("user32.lib")
     else:
-        link = linker + objects + ["-o", binary, "-pthread"]
+        link = linker + objects + link_sanitize + ["-o", binary, "-pthread"]
         # 同上：Windows 上补 user32 供 CreateWindowExW/DestroyWindow。
         if os.name == "nt":
             link.append("-luser32")
@@ -302,13 +318,16 @@ def main() -> int:
     parser.add_argument("--gpu", action="store_true",
                         help="compile the D3D12 backend (-DCOMP_HAS_D3D12); "
                              "without it AUTO resolves to CPU")
+    parser.add_argument("--asan", action="store_true",
+                        help="build with AddressSanitizer (-fsanitize=address, "
+                             "asan_ variant prefix); clang-family drivers only")
     parser.add_argument("--clean", action="store_true", help="remove build/ before building")
     args = parser.parse_args()
 
     if args.clean and os.path.isdir(BUILD):
         shutil.rmtree(BUILD)
 
-    binaries = compile_all(args.driver, args.shared, args.gpu)
+    binaries = compile_all(args.driver, args.shared, args.gpu, args.asan)
     if args.no_run:
         return 0
 
