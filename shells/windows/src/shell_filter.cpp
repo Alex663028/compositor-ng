@@ -44,6 +44,12 @@ void close_filter_panel(ShellState& shell) {
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell); /* 预览帧作废：Document 从未改动，重画即回真状态 */
+    /* 从「编辑某条」出来：右栏回到滤镜栈列表，焦点停在该条。 */
+    smart_panel_reopen_after_edit(shell, static_cast<int>(edit_index));
+    set_status(shell, had_preview ? L"已返回智能滤镜列表（本次编辑未写回，预览已丢弃）"
+                                  : L"已返回智能滤镜列表（本次编辑未写回）");
+    return;
+  }
   set_status(shell, had_preview ? L"已关闭滤镜面板（预览已丢弃，图层未改动）"
                                 : L"已关闭滤镜面板");
 }
@@ -236,8 +242,19 @@ bool filter_preview_render(ShellState& shell, const wchar_t* lead) {
   int32_t changed = 0;
   char note[512] = {0};
   size_t note_size = 0;
-  const comp_result result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
-                                               sizeof(note), &note_size);
+  int32_t smart = 0;
+  const bool smart_layer =
+      comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK && smart != 0;
+  comp_result result = COMP_OK;
+  if (editing) {
+    /* 智能图层：预览 = 在事务里往栈尾加一条，取帧后 abort。整条栈都从 source 重算，
+     * 所以看到的就是「真应用后」的画面；abort 把像素与栈一起回滚，文档不动。 */
+    changed = 1;
+    result = comp_layer_smart_filter_add(shell.doc.document, id, &desc);
+  } else {
+    result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
+                               sizeof(note), &note_size);
+  }
   bool drawn = false;
   if (result == COMP_OK && changed != 0) {
     drawn = render_canvas(shell); /* 必须在 abort 之前取帧：此时像素还是「应用后」 */
@@ -272,37 +289,65 @@ void apply_filter(ShellState& shell) {
     set_status(shell, L"无文档");
     return;
   }
-  const comp_layer_id id = selected_layer_id(shell);
   if (id == 0) {
     set_status(shell, L"请先用 ↑↓ 选择一个图层");
     return;
   }
-  const comp_ui::FilterSpec* spec = shell.doc.filter.spec();
-  if (spec == nullptr) return;
 
   comp_filter_desc desc{};
-  build_filter_desc(shell, &desc);
 
   int32_t changed = 0;
   char note[512] = {0};
   size_t note_size = 0;
-  /* 全分辨率渲染，scale = 1：高斯半径不缩放。 */
-  const comp_result result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
-                                               sizeof(note), &note_size);
+    /* 单条编辑：把面板值写回第 edit_index 条。引擎幂等——设置与启用状态都没变时
+     * COMP_OK 且不落撤销步，所以状态行不能承诺「一步撤销」。 */
+    result = comp_layer_smart_filter_set(shell.doc.document, id, edit_index, &desc, edit_enabled);
+  } else if (smart_layer) {
+    /*
+     * P1-2 收尾 ⑦：智能图层的像素是求值缓存，comp_filter_apply 会（正确地）拒绝。
+     * 同一条路径在这里改走「往栈里加一条」——与 PS 一样：同一个面板、同一次回车，
+     * 普通层是破坏性应用，智能层是叠加一条可随时删掉的智能滤镜。
+     * changed 记 1：栈确实变了（恒等参数也照常入栈，便于之后调参数）。
+     */
+    changed = 1;
+    result = comp_layer_smart_filter_add(shell.doc.document, id, &desc);
+  } else {
+    /* 全分辨率渲染，scale = 1：高斯半径不缩放。 */
+    result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
+                               sizeof(note), &note_size);
+  }
   shell.doc.needs_render = true;
   shell.doc.filter_preview_pending = false; /* 真应用已落文档：画面重画即真状态 */
 
   wchar_t buffer[768];
   const std::wstring name = widen_ascii(spec->name);
   if (result != COMP_OK) {
-    wsprintfW(buffer, L"%s 失败", name.c_str());
+    if (editing) {
+      /* 绑定留着：用户还能改参数重试，或 Esc 退出（退出时同样回到栈列表）。 */
+      wsprintfW(buffer, L"%s：写回第 %d 条失败（未改动）", name.c_str(),
+                static_cast<int>(edit_index + 1));
+    } else {
+      wsprintfW(buffer, L"%s 失败", name.c_str());
+    }
     set_status(shell, buffer);
+    return;
+  }
+  if (editing) {
     return;
   }
   if (changed == 0) {
     /* 恒等（例如 Amount 仍为 0）：引擎不碰像素、不开事务，这里如实回报。 */
     wsprintfW(buffer, L"%s：参数为恒等，未改动", name.c_str());
     set_status(shell, buffer);
+    return;
+  }
+  if (smart_layer) {
+    size_t count = 0;
+    if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) count = 0;
+    refresh_layers(shell); /* 行内 S 标记与滤镜条数同源，立即反映 */
+    wsprintfW(buffer, L"%s：已添加为智能滤镜（共 %d 条 · 一步撤销 · 图层 > 智能对象 可清除）",
+              name.c_str(), static_cast<int>(count));
+    refresh_history_status(shell, buffer);
     return;
   }
   if (note[0] != '\0' && note_size > 1) {

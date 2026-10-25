@@ -384,6 +384,13 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
                                  "layer is an editable text layer; rasterize it first "
                                  "(comp_layer_rasterize_text)");
   }
+  /* 智能对象同理：pixels 是 source + 智能滤镜栈的求值缓存。要改画面就改滤镜栈
+   * （comp_layer_smart_filter_*），要整份换像素就先 rasterize（丢掉可编辑性）。 */
+  if (layer->has_smart_object()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "layer is a smart object; rasterize it first "
+                                 "(comp_layer_smart_object_rasterize)");
+  }
   /* 锁定图像像素：整层像素写入是 PIXELS 明令禁止的入口（含「贴一张新像素」）。
    * 锁定透明像素在这里也拒绝：整份替换无法按原 alpha 裁剪（尺寸/格式都可能变），
    * 与其静默改掉透明区，不如让宿主先解锁或改用绘画类工具。 */

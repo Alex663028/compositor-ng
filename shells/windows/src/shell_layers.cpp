@@ -657,6 +657,361 @@ void panel_layer_comp_delete(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/* ------------------------------------------- P1-2 收尾 ⑦：智能对象 / 智能滤镜 */
+
+/*
+ * 状态栏报智能滤镜条数。菜单里的「清除全部智能滤镜」是否可点由同一个查询决定
+ * （见 shell_window.cpp 的菜单闸），此处只负责把「几条、哪几条」说清楚。
+ */
+void panel_smart_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) != COMP_OK ||
+      smart == 0) {
+    set_status(shell, L"智能对象：当前图层不是智能对象");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"智能对象：读取滤镜栈失败");
+    return;
+  }
+  wchar_t buffer[192];
+  if (count == 0) {
+    wsprintfW(buffer, L"智能对象：暂无智能滤镜（用「滤镜 > 应用」叠加）");
+  } else {
+    wsprintfW(buffer, L"智能对象：%d 条智能滤镜（图层 > 智能对象 > 清除全部智能滤镜）",
+              static_cast<int>(count));
+  }
+  set_status(shell, buffer);
+}
+
+/*
+ * 转换为智能对象。此刻的像素成为不可变 source，画面逐字节不变——所以只需要重画
+ * 一帧（实际没有像素变化）与刷新面板标记，不需要 finish_canvas_command。
+ * 幂等：已经是智能对象时引擎回 changed = 0、不落撤销步，这里如实回报。
+ */
+void panel_smart_convert(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  int32_t changed = 0;
+  const comp_result result = comp_layer_smart_object_create(shell.doc.document, id, &changed);
+  if (result == COMP_ERR_STATE) {
+    /* 引擎不细说原因（组 / 无像素 / 文字 / HDR / 锁定共用 STATE），状态栏一次列全，
+     * 免得用户逐个猜。真正的判定仍在引擎：这里只说「可能是哪几种」。 */
+    set_status(shell,
+               L"转换为智能对象失败：组图层、无像素、文字图层、HDR 或已锁定（未改动）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"转换为智能对象失败（未改动）");
+    return;
+  }
+  refresh_layers(shell);
+  if (changed == 0) {
+    set_status(shell, L"该图层已经是智能对象（未产生撤销步）");
+    return;
+  }
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已转换为智能对象（像素成为不可变源，滤镜改为非破坏）");
+}
+
+/* 栅格化：丢掉 source 与滤镜栈，保留当前渲染出的像素（可编辑性不可逆地丢失）。 */
+void panel_smart_rasterize(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"栅格化：请先选择一个图层");
+    return;
+  }
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK &&
+      smart == 0) {
+    set_status(shell, L"栅格化：当前图层不是智能对象");
+    return;
+  }
+  if (comp_layer_smart_object_rasterize(shell.doc.document, id) != COMP_OK) {
+    set_status(shell, L"栅格化智能对象失败");
+    return;
+  }
+  refresh_layers(shell);
+  refresh_history_status(shell, L"已栅格化智能对象（滤镜烘进像素，可编辑性已丢弃）");
+}
+
+/*
+ * 清空滤镜栈：逐条删除会各落一步撤销，所以先开一个显式事务，让整次清除成为
+ * 一步（ABI 的 remove 会加入调用方已开的事务）。删到空栈时画面回到 source。
+ */
+void panel_smart_clear_filters(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"清除智能滤镜：当前图层不是智能对象");
+    return;
+  }
+  if (count == 0) {
+    set_status(shell, L"清除智能滤镜：本来就没有（未产生撤销步）");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document, "Clear Smart Filters", &txn) != COMP_OK) {
+    set_status(shell, L"清除智能滤镜：无法开启事务（未改动）");
+    return;
+  }
+  bool ok = true;
+  for (size_t remaining = count; remaining > 0; --remaining) {
+    if (comp_layer_smart_filter_remove(shell.doc.document, id, 0) != COMP_OK) {
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    comp_txn_abort(txn);
+    set_status(shell, L"清除智能滤镜失败（已回滚，未改动）");
+    return;
+  }
+  comp_txn_commit(txn);
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已清除 %d 条智能滤镜（画面回到原始像素）", static_cast<int>(count));
+  refresh_history_status(shell, buffer);
+}
+
+comp_layer_id smart_panel_target(const ShellState& shell) {
+  if (shell.doc.document == nullptr) return 0;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) return 0;
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) != COMP_OK || smart == 0) {
+    return 0;
+  }
+  return id;
+}
+
+void smart_panel_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  if (selected_layer_id(shell) == 0) {
+    set_status(shell, L"智能滤镜：请先选择一个图层");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（转换为智能对象后才能叠加滤镜）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取滤镜栈失败");
+    return;
+  }
+  if (count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（用「滤镜 > 任一项」叠加，回车应用）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  shell.doc.smart_focus = static_cast<int32_t>(index);
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"智能滤镜：%d 条（读取当前条失败）", static_cast<int>(count));
+    set_status(shell, buffer);
+    return;
+  }
+  wchar_t buffer[288];
+  wsprintfW(buffer,
+            L"智能滤镜 %d/%d：%s · %s｜%s（空格 开关 · 回车 改参数 · F2 重命名 · "
+            L"Alt+↑↓ 调序 · Del 删除）",
+            static_cast<int>(index + 1), static_cast<int>(count),
+            smart_entry_name(shell.doc.document, id, index, desc).c_str(),
+            enabled != 0 ? L"启用" : L"关闭", smart_entry_summary(desc).c_str());
+  set_status(shell, buffer);
+}
+
+void smart_panel_move_entry(ShellState& shell, int32_t delta) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  if (delta < 0 && index == 0) {
+    set_status(shell, L"智能滤镜：已经是第 1 条，不能再上移（未改动）");
+    return;
+  }
+  if (delta > 0 && index + 1 >= count) {
+    set_status(shell, L"智能滤镜：已经是最后一条，不能再下移（未改动）");
+    return;
+  }
+  /* 夹到 ±1：调用方只该传一个方向，传大了按「换一位」处理，不让它跳格。 */
+  const size_t target = delta < 0 ? index - 1 : index + 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const std::wstring label = smart_entry_name(shell.doc.document, id, index, desc);
+  if (comp_layer_smart_filter_move(shell.doc.document, id, index, target) != COMP_OK) {
+    set_status(shell, L"调整智能滤镜顺序失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = static_cast<int32_t>(target);
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：已%s到第 %d 条（一步撤销）", label.c_str(),
+            delta < 0 ? L"上移" : L"下移", static_cast<int>(target + 1));
+  refresh_history_status(shell, buffer);
+}
+
+void smart_panel_drop(ShellState& shell, int32_t from, int32_t to) {
+  if (shell.doc.document == nullptr) return;
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) return;
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) return;
+  if (from == to) return;
+  if (from < 0 || to < 0 || static_cast<size_t>(from) >= count ||
+      static_cast<size_t>(to) >= count) {
+    set_status(shell, L"智能滤镜：拖拽落点已失效（未改动）");
+    return;
+  }
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, static_cast<size_t>(from), &desc,
+                                 &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const std::wstring label =
+      smart_entry_name(shell.doc.document, id, static_cast<size_t>(from), desc);
+  if (comp_layer_smart_filter_move(shell.doc.document, id, static_cast<size_t>(from),
+                                   static_cast<size_t>(to)) != COMP_OK) {
+    set_status(shell, L"调整智能滤镜顺序失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = to;
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：已移到第 %d 条（一步撤销）", label.c_str(), to + 1);
+  refresh_history_status(shell, buffer);
+}
+
+void smart_panel_toggle_entry(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const int32_t flipped = enabled != 0 ? 0 : 1;
+  if (comp_layer_smart_filter_set(shell.doc.document, id, index, &desc, flipped) != COMP_OK) {
+    set_status(shell, L"智能滤镜：开关失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = static_cast<int32_t>(index);
+  shell.doc.needs_render = true;
+  refresh_layers(shell); /* 行内 S 标记 / 条数 / 栈面板同源收敛 */
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：第 %d 条已%s（一步撤销）",
+            smart_entry_name(shell.doc.document, id, index, desc).c_str(),
+            static_cast<int>(index + 1), flipped != 0 ? L"启用" : L"关闭");
+  refresh_history_status(shell, buffer);
+}
+
+/* 回车：进滤镜面板的「编辑该条」模式（面板排版与键盘完全复用普通滤镜面板）。 */
+void smart_panel_remove_entry(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  /* 名字要在删除**之前**读：删掉之后这个下标已经指向下一条了。 */
+  const std::wstring label = smart_entry_name(shell.doc.document, id, index, desc);
+  if (comp_layer_smart_filter_remove(shell.doc.document, id, index) != COMP_OK) {
+    set_status(shell, L"智能滤镜：删除失败（未改动）");
+    return;
+  }
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
 }
 
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
@@ -801,6 +1156,14 @@ void refresh_layers(ShellState& shell) {
     if (comp_layer_adjustment_count(shell.doc.document, id, &adjustment_count) == COMP_OK) {
       row.adjustment_count =
           adjustment_count > 255u ? 255 : static_cast<int32_t>(adjustment_count);
+    }
+    /*
+     * P1-2 收尾 ⑦：智能对象标记。只读查询（is_smart 不开事务），用于过滤「智能对象」
+     * 与行内 S 标记；写路径仍全部回到 comp_layer_smart_*。
+     */
+    int32_t smart = 0;
+    if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK) {
+      row.is_smart = smart != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
     }
     shell.doc.layers.push_back(row);
   }
@@ -3049,6 +3412,25 @@ void panel_commit_layer_input(ShellState& shell) {
   const LayerInput mode = shell.doc.layer_input;
   const comp_layer_id id = shell.doc.layer_input_id;
   const std::wstring text = shell.doc.layer_input_text;
+      /* 引擎 last_error 已由 set_status 附上（坏编码 / 下标越界 / 层已不是智能对象）。 */
+      set_status(shell, L"重命名智能滤镜失败");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    panel_cancel_layer_input(shell);
+    refresh_layers(shell);
+    wchar_t buffer[192];
+    if (name.empty()) {
+      wsprintfW(buffer, L"第 %d 条智能滤镜已改用类型名", static_cast<int>(index + 1));
+    } else {
+      wsprintfW(buffer, L"已重命名第 %d 条智能滤镜", static_cast<int>(index + 1));
+    }
+    refresh_history_status(shell, buffer);
+    return;
+  }
+  if (mode == LayerInput::CompName) {
+    const std::string name = narrow_utf8(text);
+    if (name.empty()) {
       /* 无名复合在状态栏与菜单里都没法指认；拒绝并保持输入态。 */
       set_status(shell, L"图层复合名不能为空");
       refresh_layer_input_status(shell);

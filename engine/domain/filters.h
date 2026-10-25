@@ -42,6 +42,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
@@ -49,6 +50,10 @@
 namespace compositor {
 
 class Document;
+
+/* 只需要声明：`filter_render_stack` 的两个像素参数都是引用/指针（实现在
+ * filters.cpp，完整类型见 domain/layer.h）。 */
+struct ImageBuffer;
 
 /* ------------------------------------------------------------ 设置 */
 
@@ -299,6 +304,10 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error);
 /* 恒等判据（不碰像素、不开事务）。 */
 bool filter_settings_identity(const FilterSettings& settings);
 
+/* 同值判据（只比较 `kind` 对应的那个子结构）。
+ * 用途：智能滤镜「同参数重设」不落撤销步（P1-2 收尾 ⑦）。 */
+bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b);
+
 /* 滤镜的稳定名字（事务标签 / note 用）；未知 kind 返回 "filter"。 */
 const char* filter_kind_label(FilterKind kind);
 
@@ -325,6 +334,28 @@ const char* filter_kind_label(FilterKind kind);
 bool filter_apply(Document* document, comp_layer_id target, const FilterSettings& settings,
                   double scale, comp_result* out_code, bool* out_changed, std::string* note,
                   std::string* error);
+
+/* ==================================================== 智能滤镜栈求值 */
+
+/*
+ * 把一整个滤镜栈跑在**独立的像素缓冲**上，结果写 `out`（P1-2 收尾 ⑦）。
+ *
+ * 与 `filter_apply` 的差别（这是智能对象语义要求的，不是简化）：
+ *   - 不碰文档、不开事务、不读选区：智能滤镜的结果不能因为「当前有选区」而变；
+ *   - 恒等条目跳过；越界参数整栈失败（不写 out，一个字节都不动）；
+ *   - 坐标口径是**对象像素空间**：Add Noise 的锚点取 (0,0)，Progressive Blur 的
+ *     显式轴端点直接按对象像素坐标解释。图层之后被移动/缩放/旋转，同一份
+ *     `source + filters` 仍渲出逐字节相同的结果；
+ *   - 16 位 source 先落 8 位工作副本（`deep_to_rgba8`，与 filter_apply 同一条）；
+ *     HDR（RGBA16F）拒绝——8 位内核没有它的通路。
+ *
+ * 错误码：out 为空 / scale 非有限 / 任一设置越界 -> COMP_ERR_INVALID_ARGUMENT；
+ * source 为空 / HDR -> COMP_ERR_STATE；分配失败 -> COMP_ERR_OUT_OF_MEMORY。
+ * 成功时 `out` 是**独占**缓冲（不会与 source 共享像素）。
+ */
+bool filter_render_stack(const ImageBuffer& source, const std::vector<FilterSettings>& stack,
+                         double scale, ImageBuffer* out, comp_result* out_code,
+                         std::string* error);
 
 }  // namespace compositor
 

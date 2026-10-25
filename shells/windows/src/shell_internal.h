@@ -227,6 +227,11 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_layer_comp_apply(ShellState& shell);
   void panel_layer_comp_update(ShellState& shell);
   void panel_layer_comp_delete(ShellState& shell);
+  /* P1-2 收尾 ⑦：智能对象 / 智能滤镜（真源在引擎，壳只提供三个动作 + 状态查询）。 */
+  void panel_smart_status(ShellState& shell);
+  void panel_smart_convert(ShellState& shell);
+  void panel_smart_rasterize(ShellState& shell);
+  void panel_smart_clear_filters(ShellState& shell);
   void refresh_layers(ShellState& shell);
   const LayerRow* selected_row(const ShellState& shell);
   void panel_move_selection(ShellState& shell, int32_t delta);

@@ -8096,6 +8096,79 @@ parent 环不能把面板挂死。
 | `shells/windows/src/shell_layers.cpp` | `panel_layer_comp_*`（应用/更新/删除/切换 + 当前复合重定位） |
 | `shells/windows/src/shell_document.cpp`、`shell_window.cpp` | case 分派、「图层复合」子菜单 + 可用性、名称输入复用图层重命名槽 |
 
+### 6.112 智能对象 / 智能滤镜：把滤镜做成「参数」而不是「烘过的像素」（P1-2 第七批，2026-10-25，Claude）
+
+**缺口。** 滤镜一路是破坏性的：`comp_filter_apply` 直接改像素，同样的高斯压在缩放
+过的图上，结果与压在原图上再缩放不同。智能对象把「原始像素 + 一条可编辑的滤镜栈」
+存成参数，像素只是求值缓存——本项目「参数是真源」的第三次应用。**ABI 尾部追加 8 个
+导出（188 → 196）**：`comp_layer_smart_object_create` / `_is_smart` / `_rasterize`、
+`comp_layer_smart_filter_count` / `_at` / `_add` / `_set` / `_remove`（都在
+`comp_filter.h` 的智能对象块）。
+
+**对象空间求值。** 整条栈在**对象像素空间**（原点 `0,0`、不读选区）里跑，再把结果按
+图层的变换贴回画布。所以「移动 / 缩放 / 旋转到哪，同一条滤镜都渲出逐字节相同的结果」，
+这也是智能滤镜与破坏性滤镜的可观察差别。
+
+**闸门。** 转换拒绝文字层（先栅格化文字）、组层、无像素层、HDR 层
+（`COMP_ERR_STATE`）；16 位层先落 8 位工作副本（与滤镜同一约定，之后该层就是 RGBA8）。
+转换本身的像素**逐字节不变**（此刻像素成为不可变 source，滤镜栈为空）。已是智能
+对象 → `COMP_OK + changed = 0`，不进历史。
+
+**像素写入口一律拒绝。** `comp_layer_set_pixels`、工具算子、`comp_filter_apply` 对
+智能层返回 `COMP_ERR_STATE`，文案要求先栅格化。理由和文字层/填充层一致：像素是缓存，
+直接写会产生「参数说 A、画面是 B」的中间态。栅格化丢掉 source 与整条栈、**保留当前
+渲染出的像素**，一步撤销；对普通层是幂等的 no-op（不落撤销步）。
+
+**滤镜栈的编辑。** `add` 恒等参数也照常入栈（画面不变，但栈变了，之后可改参数）；
+`set` 的 `(settings, enabled)` 与当前条目完全相同 → 不落撤销步；`enabled = 0` 保留
+参数、停止求值（`smart_filter_disabled_keeps_parameters_and_stops_evaluating`）；
+`remove` 删到空栈时画面回到 source。每次写操作一步撤销，参数闸与求值失败都在开事务
+之前——失败不留撤销步、不动像素。
+
+**`.comp`：`engineSmart` + `sourceFile`。** 逐层键 `engineSmart`
+`{ "sourceFile": <uuid>, "filters": [ { "kind": 4, "enabled": true, "settings": {...} } ] }`；
+`settings` 只写当前 kind **真正被读取**的那份子结构（一条高斯不会顺带写入整份暗角
+参数），键名 camelCase、布尔按布尔存。原始像素单独落在 `sourceFile` 指向的文件里，
+**先于**图层块写。缺键 = 普通图层；解析失败整份丢弃、图层退回普通像素层（与
+`engineText` 同一策略：格式层不替渲染层做语义判断）。
+
+**壳层。** 命令号 **1710..1713**（转换为智能对象 / 栅格化 / 清除全部智能滤镜 /
+状态），菜单在 **图层 > 智能对象**；层行带 `S` 标记，转换与栅格化都走一步撤销。
+| `engine/format/comp_file.cpp` | `engineSmart` 读写、`sourceFile` 原图落盘与回收 |
+| `tests/test_smart_objects.cpp` | 10 个 case（转换幂等/拒绝/16→8 位、add/set/remove 各一步、停用保留参数、对象空间求值、像素写拒绝、栅格化保留渲染、`.comp` 往返、普通工程无智能键） |
+| `shells/windows/src/shell_layers.cpp` | `panel_smart_convert` / `rasterize` / `clear_filters` / `status` |
+| `shells/windows/src/shell_window.cpp`、`shell_document.cpp` | 「智能对象」子菜单 + 可用性、case 分派 |
+
+图层；kind 越界、settings 过不了参数表、或与 `engineText` / `engineSmart` / 组同时
+出现 → 整块丢弃，读方看到的仍是普通像素层。
+
+整栈清除 / 状态」四个命令：引擎的 `comp_layer_smart_filter_at` / `_set` / `_remove`
+一条都没接 UI，用户想改某一条的半径、临时关掉某一条、删掉中间那条，只能整栈清除再
+重加。本批把这三件事补上——**ABI 与引擎一行未改**（208 个导出不变），只加壳层
+**编辑复用滤镜参数面板。** `open_smart_filter_editor(index)` 读该条 desc → 按
+`filter_spec_at(kind)` 打开既有的滤镜面板（同一份行几何、步进、键入、预览）→
+| `shells/windows/src/shell_filter.cpp` | `filter_load_values`、`build_filter_desc_patched`、`open_smart_filter_editor`、`filter_preview_render` / `apply_filter` 的编辑态分支 |
+顺序改动会改画面（滤镜不可交换），所以**整条栈从头重跑**：先在事务外 `evaluate_stack`，
+失败直接返回、像素与历史都干净；成功后 `ImplicitTxn("Reorder Smart Filters")` +
+`touch_layer` + `commit`，因此成功即**恰好一步撤销**。这里和 `_set` 的区别值得记住：
+`_set` 改的是参数、可幂等；`move` 改的是求值顺序，幂等只体现在 `from == to`。
+
+index, name_utf8)` 只写 `SmartFilter::name`：
+
+- 同值重设 = `COMP_OK` 且不落步（宿主可以每帧把输入框内容写回来）；
+- **不重新求值、不过像素锁闸**——名字与画面无关，锁「图像像素」的图层照样能改名（与
+  色标改造、图层链接同一口径）；仍进快照，所以撤销会退回旧名字；
+- 空串合法 = 「回到类型名」：引擎只存空，展示层回退到 `filter_kind_name(kind)`，**不**
+  把 "Gaussian Blur" 抄成自定义名（否则以后改类型名就断了）；
+**持久化。** `.comp` 的 `engineSmart` 每条多一个 `name` 字符串字段；载入时不合规的名字
+（超长 / 非法 UTF-8 / 含换行制表符）一律当没写、回退类型名——坏字段只能丢一个展示名，
+不能连累整条滤镜或整层。往返测试同时覆盖「乱序 + 自定义名」。
+
+**壳层三条入口，一套落点。**
+
+| `engine/domain/layer.h` | `SmartFilter::name`、`kMaxSmartFilterNameBytes` |
+| `engine/format/comp_file.cpp` | `engineSmart.filters[].name` 写读 + 不合规丢弃 |
+| `tests/test_smart_objects.cpp` | 3 例：`move_reorders_and_reevaluates` / `name_validates_undoes_and_persists` / `names_and_order_survive_comp_round_trip` |
 
 
 

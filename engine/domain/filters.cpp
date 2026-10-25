@@ -818,6 +818,58 @@ bool filter_settings_identity(const FilterSettings& settings) {
   return true;
 }
 
+bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
+  if (a.kind != b.kind) return false;
+  switch (a.kind) {
+    case kFilterVignette: {
+      const VignetteSettings& x = a.vignette;
+      const VignetteSettings& y = b.vignette;
+      return x.amount == y.amount && x.midpoint == y.midpoint && x.roundness == y.roundness &&
+             x.feather == y.feather && x.highlights == y.highlights && x.color[0] == y.color[0] &&
+             x.color[1] == y.color[1] && x.color[2] == y.color[2];
+    }
+    case kFilterTonalContrast: {
+      const TonalContrastSettings& x = a.tonal_contrast;
+      const TonalContrastSettings& y = b.tonal_contrast;
+      return x.amount == y.amount && x.radius == y.radius && x.shadows == y.shadows &&
+             x.midtones == y.midtones && x.highlights == y.highlights;
+    }
+    case kFilterBloom:
+      return a.bloom.amount == b.bloom.amount && a.bloom.radius == b.bloom.radius;
+    case kFilterLensCorrection:
+      return a.lens_correction.distortion == b.lens_correction.distortion;
+    case kFilterGaussianBlur:
+      return a.gaussian_blur.radius == b.gaussian_blur.radius &&
+             a.gaussian_blur.preserve_transparency == b.gaussian_blur.preserve_transparency;
+    case kFilterAddNoise:
+      return a.add_noise.amount == b.add_noise.amount &&
+             a.add_noise.gaussian == b.add_noise.gaussian &&
+             a.add_noise.monochromatic == b.add_noise.monochromatic &&
+             a.add_noise.seed == b.add_noise.seed;
+    case kFilterGrain:
+      return a.grain.amount == b.grain.amount && a.grain.size == b.grain.size &&
+             a.grain.roughness == b.grain.roughness && a.grain.seed == b.grain.seed;
+    case kFilterMotionBlur:
+      return a.motion_blur.angle == b.motion_blur.angle &&
+             a.motion_blur.distance == b.motion_blur.distance;
+    case kFilterProgressiveBlur: {
+      const ProgressiveBlurSettings& x = a.progressive_blur;
+      const ProgressiveBlurSettings& y = b.progressive_blur;
+      return x.from == y.from && x.to == y.to && x.start_x == y.start_x && x.start_y == y.start_y &&
+             x.end_x == y.end_x && x.end_y == y.end_y && x.radial == y.radial &&
+             x.inverted == y.inverted && x.auto_axis == y.auto_axis;
+    }
+    case kFilterSharpen:
+      return a.sharpen.amount == b.sharpen.amount && a.sharpen.radius == b.sharpen.radius &&
+             a.sharpen.threshold == b.sharpen.threshold;
+    case kFilterReduceNoise:
+      return a.reduce_noise.strength == b.reduce_noise.strength &&
+             a.reduce_noise.preserve_details == b.reduce_noise.preserve_details &&
+             a.reduce_noise.reduce_color_noise == b.reduce_noise.reduce_color_noise;
+  }
+  return false;
+}
+
 const char* filter_kind_label(FilterKind kind) {
   switch (kind) {
     case kFilterVignette: return "Vignette";
@@ -863,6 +915,12 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
   Layer* layer = document->find(target);
   if (layer == nullptr) return fail(COMP_ERR_NOT_FOUND, "filter target layer was not found");
   if (layer->is_group) return fail(COMP_ERR_STATE, "filter cannot run on a group layer");
+  /* 智能图层的像素是 source + 滤镜栈的求值缓存：直接烤进去会在下一次求值时
+   * 整份丢掉（同文字图层的手绘像素）。要走 comp_layer_smart_filter_add。 */
+  if (layer->has_smart_object()) {
+    return fail(COMP_ERR_STATE,
+                "layer is a smart object; add the filter to its smart filter stack instead");
+  }
   if (!layer->has_pixels()) return fail(COMP_ERR_STATE, "filter layer has no pixels");
 
   const SelectionState& selection = document->state().selection;
@@ -998,6 +1056,87 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     }
     if (clip) *note += ", clipped to the document selection";
   }
+  return true;
+}
+
+/* ==================================================== 智能滤镜栈求值 */
+
+namespace {
+
+/* 对象像素空间里的 Progressive Blur 轴（见 filters.h 的坐标口径）：
+ * auto_axis 取对象自身像素矩形中线、自顶向下；显式轴直接按对象像素坐标解释
+ * ——不走 Layer::document_to_pixel_continuous，因为这里的「对象空间」就是
+ * 像素空间，求值不依赖图层当前落在文档的哪里。 */
+ProgressiveLine object_space_line(const FilterSettings& settings, int32_t width, int32_t height) {
+  ProgressiveLine line;
+  if (settings.kind != kFilterProgressiveBlur) return line;
+  if (width <= 0 || height <= 0) return line;
+  const ProgressiveBlurSettings& p = settings.progressive_blur;
+  line.valid = true;
+  if (p.auto_axis) {
+    line.x0 = line.x1 = (static_cast<double>(width) - 1.0) * 0.5;
+    line.y0 = 0.0;
+    line.y1 = static_cast<double>(height) - 1.0;
+  } else {
+    line.x0 = p.start_x;
+    line.y0 = p.start_y;
+    line.x1 = p.end_x;
+    line.y1 = p.end_y;
+  }
+  return line;
+}
+
+}  // namespace
+
+bool filter_render_stack(const ImageBuffer& source, const std::vector<FilterSettings>& stack,
+                         double scale, ImageBuffer* out, comp_result* out_code,
+                         std::string* error) {
+  auto fail = [&](comp_result code, const std::string& message) {
+    if (error != nullptr) *error = message;
+    if (out_code != nullptr) *out_code = code;
+    return false;
+  };
+  if (out == nullptr) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "smart object render needs an output buffer");
+  }
+  if (!finite(scale)) return fail(COMP_ERR_INVALID_ARGUMENT, "filter scale must be finite");
+  if (source.empty()) return fail(COMP_ERR_STATE, "smart object source has no pixels");
+  /* 整栈参数闸在写任何缓冲之前：一条越界就整栈失败（不产生半成品）。 */
+  for (const FilterSettings& settings : stack) {
+    std::string why;
+    if (!filter_settings_valid(settings, &why)) return fail(COMP_ERR_INVALID_ARGUMENT, why);
+  }
+  const double effective_scale = scale > 0.0 ? scale : 1.0;
+
+  ImageBuffer working = source;
+  if (working.format == COMP_PIXEL_RGBA16) {
+    ImageBuffer eight;
+    if (!deep_to_rgba8(working, &eight)) {
+      return fail(COMP_ERR_OUT_OF_MEMORY, "smart object could not build the 8-bit working copy");
+    }
+    working = std::move(eight);
+  } else if (working.format != COMP_PIXEL_RGBA8) {
+    return fail(COMP_ERR_STATE,
+                "smart filters need an 8-bit or 16-bit source (an HDR source has no 8-bit path)");
+  }
+
+  /* 独占一份缓冲再落笔：source 可能被历史快照或其它图层共享（COW 在这里生效）。 */
+  std::vector<uint8_t>& bytes = working.writable_pixels();
+  const int32_t width = working.width;
+  const int32_t height = working.height;
+  const size_t stride = working.stride();
+  for (const FilterSettings& settings : stack) {
+    if (filter_settings_identity(settings)) continue;
+    const comp_result status =
+        apply_pixels(bytes.data(), width, height, stride, settings, effective_scale, 0, 0,
+                     object_space_line(settings, width, height));
+    if (status != COMP_OK) {
+      return fail(status, std::string(filter_kind_label(settings.kind)) +
+                              ": smart filter could not be evaluated");
+    }
+  }
+  *out = std::move(working);
+  if (out_code != nullptr) *out_code = COMP_OK;
   return true;
 }
 

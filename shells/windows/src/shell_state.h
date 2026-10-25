@@ -340,6 +340,18 @@ constexpr UINT kCmdLayerCompPrev = 1705;    /* 选择上一个复合 */
 constexpr UINT kCmdLayerCompNext = 1706;    /* 选择下一个复合 */
 constexpr UINT kCmdLayerCompRename = 1707;  /* 重命名当前复合… */
 constexpr UINT kCmdLayerCompStatus = 1708;  /* 状态栏报当前复合（菜单项不用，快捷键用） */
+/*
+ * P1-2 收尾 ⑦：智能对象 / 智能滤镜（1710 段）。
+ *
+ * 「像素是 source + 滤镜栈的求值缓存」这件事由引擎持有；壳只暴露三个动作：
+ * 转换、栅格化、清空滤镜栈。滤镜的**添加**不走这里——选中智能图层时
+ * 「滤镜 > 应用」本身就是添加一条智能滤镜（见 shell_filter.cpp 的 apply_filter），
+ * 与 PS 同一条路：同一个面板、同一次回车，普通层是破坏性应用，智能层是叠加。
+ */
+constexpr UINT kCmdLayerSmartConvert = 1710;   /* 图层 > 智能对象 > 转换为智能对象 */
+constexpr UINT kCmdLayerSmartRasterize = 1711; /* 图层 > 智能对象 > 栅格化 */
+constexpr UINT kCmdLayerSmartClear = 1712;     /* 图层 > 智能对象 > 清除全部智能滤镜 */
+constexpr UINT kCmdLayerSmartStatus = 1713;    /* 状态栏报智能滤镜条数 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*

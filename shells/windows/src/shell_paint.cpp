@@ -743,6 +743,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     if ((row.lock_flags & COMP_LAYER_LOCK_POSITION) != 0) marks += L"G";
     if ((row.lock_flags & COMP_LAYER_LOCK_ALL) != 0) marks += L"L";
     if (row.link_group != 0) marks += L"~";
+    /* P1-2 收尾 ⑦：S = 智能对象（像素只是 source + 滤镜栈的求值缓存）。 */
+    if (row.is_smart != 0) marks += L"S";
     /*
      * P0-1：行内显示图层名（引擎是唯一真源，refresh_layers 回读）。
      * 名称为空（旧引擎 / 查询失败）时回落到 id，面板不至于变成空行。
