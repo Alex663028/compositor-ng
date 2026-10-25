@@ -1958,6 +1958,31 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerFilterClear:
       panel_clear_filter(shell);
       break;
+    /* ---- P1-2 收尾：图层复合（可见性 + 不透明度的具名快照） ---- */
+    case kCmdLayerCompCapture:
+      panel_layer_comp_capture_begin(shell);
+      break;
+    case kCmdLayerCompApply:
+      panel_layer_comp_apply(shell);
+      break;
+    case kCmdLayerCompUpdate:
+      panel_layer_comp_update(shell);
+      break;
+    case kCmdLayerCompRename:
+      panel_layer_comp_rename_begin(shell);
+      break;
+    case kCmdLayerCompDelete:
+      panel_layer_comp_delete(shell);
+      break;
+    case kCmdLayerCompPrev:
+      panel_layer_comp_select(shell, -1);
+      break;
+    case kCmdLayerCompNext:
+      panel_layer_comp_select(shell, 1);
+      break;
+    case kCmdLayerCompStatus:
+      panel_layer_comp_status(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);

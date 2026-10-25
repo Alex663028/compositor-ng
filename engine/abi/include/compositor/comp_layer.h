@@ -1672,6 +1672,89 @@ COMP_API comp_result comp_layer_import_style(comp_document document, comp_layer_
                                              const char* style_json_utf8,
                                              int32_t* out_changed);
 
+/* -------------------------------------- 图层复合（P1-2 收尾 ⑤ 尾部追加） */
+
+/*
+ * 图层复合 = 「某一刻全部图层的可见性与不透明度」的快照（对齐 Photoshop 的
+ * Layer Comp；只做 Visibility + Appearance，不做 Position，理由见
+ * domain/domain_state.h 的 LayerComp）。
+ *
+ * 生命周期：capture 建新、apply 套用、update 用当前状态覆盖、rename / delete
+ * 改名字与删除。全部**一步撤销**（加入调用方的显式事务，或自成一个隐式步），
+ * 复合表因此随撤销快照一起进退——「建了复合又撤销」不会留下孤儿。
+ *
+ * 复合 id 单调递增、删除后不复用；索引型入口（_id_at / _entry）只接受
+ * [0, count) 内的下标，越界 -> COMP_ERR_INVALID_ARGUMENT。
+ */
+typedef uint64_t comp_layer_comp_id;
+
+/* 复合名的字节上界（含于 ABI 契约：超长 -> INVALID_ARGUMENT，不截断）。 */
+#define COMP_LAYER_COMP_NAME_MAX_BYTES 1024
+
+/* 复合数量。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_count(comp_document document, size_t* out_count);
+
+/* 按存储序（= 创建序）取第 index 个复合的 id。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_id_at(comp_document document, size_t index,
+                                           comp_layer_comp_id* out_id);
+
+/*
+ * 读复合名（UTF-8，含结尾 NUL），两段式：`buffer == NULL` 或 `capacity == 0`
+ * 只回所需字节数（含 NUL）；缓冲不够 -> COMP_ERR_INVALID_ARGUMENT，不截断。
+ * 只读，不开事务。复合不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_comp_name(comp_document document, comp_layer_comp_id comp,
+                                          char* buffer, size_t capacity, size_t* out_required);
+
+/*
+ * 捕获当前状态为新复合：记录**每个现存图层**的 visible 与 opacity（顺序为
+ * 文档堆叠序）。`name_utf8` 必须非空、严格合法 UTF-8、单行、≤ 1024 字节，否则
+ * COMP_ERR_INVALID_ARGUMENT 且不建复合；重名允许（与上游一致）。
+ * 复合数达到上限 -> COMP_ERR_STATE。
+ *
+ * 文档没有任何图层时仍可捕获（空 entries 的复合是合法的，应用它不做任何事）。
+ * `out_id` 可空；非空时写新复合 id。一步撤销。
+ */
+COMP_API comp_result comp_layer_comp_capture(comp_document document, const char* name_utf8,
+                                             comp_layer_comp_id* out_id);
+
+/*
+ * 应用复合：对表中每个**仍存在**的图层写回 visible 与 opacity；表里没有的图层
+ * （捕获之后才建的）保持原样，已被删除的条目跳过。
+ *
+ * 幂等：所有目标层当前值都与快照相同 -> COMP_OK、`*out_changed = 0`，不落撤销步；
+ * 否则一步撤销，改动过的层推进内容修订号（可见性/不透明度参与合成求值）。
+ * `out_changed` 可空。复合不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_comp_apply(comp_document document, comp_layer_comp_id comp,
+                                           int32_t* out_changed);
+
+/*
+ * 用当前状态覆盖复合的 entries（id 与名字不变）。内容未变 -> 不落撤销步。
+ * 复合不存在 -> COMP_ERR_NOT_FOUND。一步撤销。
+ */
+COMP_API comp_result comp_layer_comp_update(comp_document document, comp_layer_comp_id comp);
+
+/* 改名；校验口径与 capture 相同，同名 -> 空操作（不落撤销步）。一步撤销。 */
+COMP_API comp_result comp_layer_comp_rename(comp_document document, comp_layer_comp_id comp,
+                                            const char* name_utf8);
+
+/* 删除复合；不存在的 id -> COMP_ERR_NOT_FOUND（删除不幂等，便于宿主发现 stale id）。 */
+COMP_API comp_result comp_layer_comp_delete(comp_document document, comp_layer_comp_id comp);
+
+/* 复合表的条目数（捕获时的图层数，之后删层不缩减）。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_entry_count(comp_document document,
+                                                 comp_layer_comp_id comp, size_t* out_count);
+
+/*
+ * 取第 index 条快照：图层 id、可见性（0/1）与不透明度（0..1）。三个出参可空，
+ * 便于宿主只取需要的那一项。只读，不开事务。
+ * 复合不存在 -> NOT_FOUND；index 越界 -> INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_layer_comp_entry(comp_document document, comp_layer_comp_id comp,
+                                           size_t index, comp_layer_id* out_layer,
+                                           uint8_t* out_visible, float* out_opacity);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

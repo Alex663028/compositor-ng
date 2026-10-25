@@ -8058,6 +8058,44 @@ parent 环不能把面板挂死。
 | `shells/windows/src/shell_window.cpp` | 「过滤图层」子菜单 + 单选勾选态（`menu_radio_check_recursive`） |
 | `shells/windows/src/shell_selftest.cpp` | 面板过滤自检：三种维度各自收窄、祖先保留、文档与历史零改动 |
 
+### 6.111 图层复合：把「一组显隐 + 不透明度」存成可应用快照（P1-2 第六批，2026-10-25，Claude）
+
+**缺口。** PS 的 Layer Comps 面板：把「哪些层可见、各自多不透明」存成一组命名快照，
+一键切回。此前壳层只能手工重摆可见性。**ABI 尾部追加 10 个导出（178 → 188）**：
+`comp_layer_comp_count` / `comp_layer_comp_id_at` / `comp_layer_comp_name` /
+`comp_layer_comp_capture` / `comp_layer_comp_apply` / `comp_layer_comp_update` /
+`comp_layer_comp_rename` / `comp_layer_comp_delete` /
+`comp_layer_comp_entry_count` / `comp_layer_comp_entry`。
+
+**快照记什么。** 每个**现存**图层一条 `{ layer, visible, opacity }`，顺序 = 堆叠序。
+只记这两项，是因为它们正是 PS Layer Comps 的语义：混合模式、效果、蒙版、填充参数
+属于「内容」，改内容不该被一次「应用复合」吞掉。名副其实比覆盖面广更重要。
+
+**快照在文档里、进撤销栈。** 复合存在 `Document::state().layer_comps`，捕获 / 更新 /
+重命名 / 删除各自一步撤销；`apply` 有改动才落步（`changed` 出参），没改动
+`COMP_OK + changed = 0` 不进历史——壳层可以无脑循环应用。撤销捕获之后复合整个消失，
+撤销删除后又回来（同一 id）；**id 单调递增、空洞不复用**，所以「面板上选中的那个
+复合」不会在一次删除 + 捕获之后悄悄指向另一个对象。
+
+**上限与校验。** 最多 **128** 个复合（`kMaxLayerComps`）；名字非空、单行、UTF-8
+≤ **1024** 字节（`COMP_LAYER_COMP_NAME_MAX_BYTES`）；重名拒绝。`entry` 的图层在
+应用时可能已被删——**跳过它，其余照常应用**（整体失败会让一份只过时一个条目的快照
+完全不可用）。
+
+**壳层：当前复合只是视图态。** 命令号 **1701..1708**（捕获 / 应用 / 更新 / 重命名 /
+删除 / 上一个 / 下一个 / 状态），菜单在 **图层 > 图层复合**。`ShellState::layer_comp_current`
+不进文档：撤销、重开文档后按 id 重新定位，找不到就回落到第一个复合——「选中项」
+永远是视图态。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 10 个导出（含上限 / 幂等 / 跳过已删条目的契约注释） |
+| `engine/domain/document.cpp`、`domain_state.h` | `LayerComp` / `LayerCompEntry` 状态与增删改查、上限校验 |
+| `engine/format/comp_file.cpp` | manifest 顶层 `engineLayerComps`（空表不写键；读侧形状错误整份拒绝） |
+| `tests/test_layer_comps.cpp` | 5 个 case（捕获/校验、应用/幂等、更新/重命名/删除/id 不复用、数量上界、`.comp` 往返） |
+| `shells/windows/src/shell_layers.cpp` | `panel_layer_comp_*`（应用/更新/删除/切换 + 当前复合重定位） |
+| `shells/windows/src/shell_document.cpp`、`shell_window.cpp` | case 分派、「图层复合」子菜单 + 可用性、名称输入复用图层重命名槽 |
+
 
 
 

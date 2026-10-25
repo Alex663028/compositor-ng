@@ -313,6 +313,24 @@ void sync_menu_state(HWND window, ShellState& shell) {
   for (uint32_t label = 0; label < COMP_LAYER_COLOR_COUNT; ++label) {
     menu_set_enabled_recursive(menu, kCmdLayerColorBase + label, enabled.layer_present);
   }
+  /*
+   * P1-2 收尾：图层复合。捕获只要有文档就能点（空文档的复合也合法）；其余六条
+   * 都要求复合表非空——直接问引擎，不用壳侧缓存，撤销到「还没有复合」时菜单
+   * 会立刻跟着置灰。
+   */
+  size_t layer_comp_count = 0;
+  if (shell.doc.document == nullptr ||
+      comp_layer_comp_count(shell.doc.document, &layer_comp_count) != COMP_OK) {
+    layer_comp_count = 0;
+  }
+  const bool layer_comp_present = layer_comp_count > 0;
+  menu_set_enabled_recursive(menu, kCmdLayerCompCapture, shell.doc.document != nullptr);
+  const UINT layer_comp_items[] = {kCmdLayerCompApply,  kCmdLayerCompUpdate,
+                                   kCmdLayerCompRename, kCmdLayerCompDelete,
+                                   kCmdLayerCompPrev,   kCmdLayerCompNext};
+  for (UINT id : layer_comp_items) {
+    menu_set_enabled_recursive(menu, id, layer_comp_present);
+  }
   menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskRemove, enabled.mask_remove);
@@ -4143,6 +4161,22 @@ HMENU build_menu() {
   AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterClear, L"清除过滤(&X)");
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_filter_menu),
               L"过滤图层(&F)");
+  /*
+   * P1-2 收尾：图层复合（PS 的 Layer Comps 面板）。复合记「每个现存图层的可见性 +
+   * 不透明度」，存进文档、进撤销栈、随 .comp 落盘；「当前复合」只是视图态。
+   * 上游的面板用缩略图列表，本壳没有该面板，改成子菜单 + 上一个/下一个循环切换。
+   */
+  HMENU layer_comp_menu = CreatePopupMenu();
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompCapture, L"捕获为新复合…(&C)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompApply, L"应用当前复合(&A)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompUpdate, L"用当前状态更新(&U)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompRename, L"重命名当前复合…(&N)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompDelete, L"删除当前复合(&D)");
+  AppendMenuW(layer_comp_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompPrev, L"上一个复合(&P)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompNext, L"下一个复合(&X)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_comp_menu),
+              L"图层复合(&O)");
   /*
    * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
    * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。

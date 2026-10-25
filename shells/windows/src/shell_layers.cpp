@@ -385,6 +385,278 @@ void panel_clear_filter(ShellState& shell) {
   panel_refresh_after_filter(shell);
 }
 
+/* ------------------------------------------------ 图层复合（P1-2 收尾 ⑥） */
+
+/*
+ * 图层复合 = 「每个现存图层可见不可见 + 不透明度多少」的一份具名快照。
+ *
+ * 与 PS 一致的口径：只记可见性与不透明度，不记位置/几何（那是变换的事）；
+ * 捕获之后才建的层不受复合管辖，应用时已被删除层按 id 找不到就跳过。
+ *
+ * 与 PS 的差异：复合表存在**文档里**（进撤销栈、随 .comp 落盘），壳只额外记
+ * 一个「当前复合」的视图态 id（ShellState::layer_comp_current）。撤销/重开文档
+ * 后该 id 可能失效，因此每次读取都用引擎现状校验一次，失效就退回第一个复合，
+ * 不靠壳侧缓存与引擎对齐。
+ */
+
+namespace {
+
+/* 复合是否还存在：按 id_at 线性枚举，不依赖引擎内部的查找接口。 */
+bool layer_comp_exists(comp_document document, comp_layer_comp_id comp) {
+  if (document == nullptr || comp == 0) return false;
+  size_t count = 0;
+  if (comp_layer_comp_count(document, &count) != COMP_OK) return false;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_comp_id id = 0;
+    if (comp_layer_comp_id_at(document, i, &id) != COMP_OK) return false;
+    if (id == comp) return true;
+  }
+  return false;
+}
+
+/* 复合名（两段式读取，UTF-8 -> UTF-16）。失败回空串，状态栏据此降级显示。 */
+std::wstring layer_comp_display_name(comp_document document, comp_layer_comp_id comp) {
+  size_t required = 0;
+  if (comp_layer_comp_name(document, comp, nullptr, 0, &required) != COMP_OK || required == 0) {
+    return std::wstring();
+  }
+  std::vector<char> buffer(required, '\0');
+  if (comp_layer_comp_name(document, comp, buffer.data(), buffer.size(), &required) != COMP_OK) {
+    return std::wstring();
+  }
+  return widen_utf8(std::string(buffer.data()));
+}
+
+/*
+ * 复合是否与文档当前状态一致（口径与引擎的 update 幂等判定相同：逐条比可见性
+ * 与不透明度，已删除的层跳过）。不用撤销深度去猜——栈满被截断后深度不涨，
+ * 那样会把「其实记了一步」误报成「未记入撤销」。
+ */
+bool layer_comp_matches_current(comp_document document, comp_layer_comp_id comp) {
+  size_t count = 0;
+  if (comp_layer_comp_entry_count(document, comp, &count) != COMP_OK) return false;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_id layer = 0;
+    uint8_t visible = 0;
+    float opacity = 0.0f;
+    if (comp_layer_comp_entry(document, comp, i, &layer, &visible, &opacity) != COMP_OK) {
+      return false;
+    }
+    int32_t current_visible = 0;
+    float current_opacity = 0.0f;
+    if (comp_layer_get_visible(document, layer, &current_visible) != COMP_OK) continue;
+    if (comp_layer_get_opacity(document, layer, &current_opacity) != COMP_OK) continue;
+    if ((current_visible != 0 ? 1 : 0) != (visible != 0 ? 1 : 0)) return false;
+    if (current_opacity != opacity) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+comp_layer_comp_id panel_current_layer_comp(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    shell.layer_comp_current = 0;
+    return 0;
+  }
+  if (layer_comp_exists(shell.doc.document, shell.layer_comp_current)) {
+    return shell.layer_comp_current;
+  }
+  comp_layer_comp_id first = 0;
+  if (comp_layer_comp_id_at(shell.doc.document, 0, &first) != COMP_OK) first = 0;
+  shell.layer_comp_current = first;
+  return first;
+}
+
+/* 状态栏报「当前复合」的位置与条目数（条目数 = 捕获时的图层数）。 */
+void panel_layer_comp_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  if (count == 0) {
+    set_status(shell, L"还没有图层复合（图层 > 图层复合 > 捕获为新复合）");
+    return;
+  }
+  const comp_layer_comp_id current = panel_current_layer_comp(shell);
+  size_t index = 0;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_comp_id id = 0;
+    if (comp_layer_comp_id_at(shell.doc.document, i, &id) == COMP_OK && id == current) {
+      index = i;
+      break;
+    }
+  }
+  size_t entries = 0;
+  if (comp_layer_comp_entry_count(shell.doc.document, current, &entries) != COMP_OK) entries = 0;
+  const std::wstring name = layer_comp_display_name(shell.doc.document, current);
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"图层复合 %u/%u：%s（%u 个图层）", static_cast<unsigned>(index + 1),
+            static_cast<unsigned>(count), name.c_str(), static_cast<unsigned>(entries));
+  set_status(shell, buffer);
+}
+
+/* 上一个 / 下一个复合（循环）。只改视图态 id，不碰文档、不落撤销步。 */
+void panel_layer_comp_select(ShellState& shell, int delta) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  if (count == 0) {
+    shell.layer_comp_current = 0;
+    set_status(shell, L"还没有图层复合（图层 > 图层复合 > 捕获为新复合）");
+    return;
+  }
+  std::vector<comp_layer_comp_id> ids(count, 0);
+  for (size_t i = 0; i < count; ++i) {
+    if (comp_layer_comp_id_at(shell.doc.document, i, &ids[i]) != COMP_OK) {
+      set_status(shell, L"读取图层复合列表失败");
+      return;
+    }
+  }
+  const comp_layer_comp_id current = panel_current_layer_comp(shell);
+  size_t index = 0;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] == current) {
+      index = i;
+      break;
+    }
+  }
+  const long long total = static_cast<long long>(ids.size());
+  long long next = static_cast<long long>(index) + static_cast<long long>(delta);
+  next %= total;
+  if (next < 0) next += total;
+  shell.layer_comp_current = ids[static_cast<size_t>(next)];
+  panel_layer_comp_status(shell);
+}
+
+/*
+ * 捕获/改名共用一条文本输入通道：layer_input_id == 0 表示捕获新复合，
+ * 非 0 表示改这个复合的名字。默认名「复合 N」按当前数量 +1 起，重名引擎允许
+ * （与上游一致），名字只用来给人看。
+ */
+void panel_layer_comp_capture_begin(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  wchar_t buffer[64];
+  wsprintfW(buffer, L"复合 %d", static_cast<int>(count + 1));
+  shell.doc.layer_input = LayerInput::CompName;
+  shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_text = buffer;
+  refresh_layer_input_status(shell);
+}
+
+void panel_layer_comp_rename_begin(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  shell.doc.layer_input = LayerInput::CompName;
+  shell.doc.layer_input_id = comp;
+  shell.doc.layer_input_text = layer_comp_display_name(shell.doc.document, comp);
+  refresh_layer_input_status(shell);
+}
+
+/*
+ * 应用复合。幂等由引擎判定：全表都已是快照状态 -> changed == 0，不落撤销步，
+ * 壳也就别推进缓存、别置 needs_render（否则每按一次都像改了什么）。
+ */
+void panel_layer_comp_apply(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_layer_comp_apply(shell.doc.document, comp, &changed) != COMP_OK) {
+    set_status(shell, L"应用图层复合失败");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(shell.doc.document, comp);
+  refresh_layers(shell);
+  wchar_t buffer[192];
+  if (changed == 0) {
+    wsprintfW(buffer, L"复合「%s」已是当前状态（0 处改动）", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  shell.doc.needs_render = true;
+  wsprintfW(buffer, L"已应用复合「%s」（%d 个图层被改动）", name.c_str(),
+            static_cast<int>(changed));
+  refresh_history_status(shell, buffer);
+}
+
+/* 用当前状态覆盖复合。内容未变时引擎不落步，状态栏照实说「无变化」。 */
+void panel_layer_comp_update(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  comp_document document = shell.doc.document;
+  const bool unchanged = layer_comp_matches_current(document, comp);
+  if (comp_layer_comp_update(document, comp) != COMP_OK) {
+    set_status(shell, L"更新图层复合失败");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(document, comp);
+  wchar_t buffer[192];
+  if (unchanged) {
+    wsprintfW(buffer, L"复合「%s」内容未变，未记入撤销", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已用当前状态更新复合「%s」", name.c_str());
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 删除当前复合。引擎对不存在的 id 返回 NOT_FOUND（删除故意不幂等），所以先从
+ * 视图态里退一个仍然存在的复合，避免删完还指着孤儿 id。删除不影响像素。
+ */
+void panel_layer_comp_delete(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(shell.doc.document, comp);
+  if (comp_layer_comp_delete(shell.doc.document, comp) != COMP_OK) {
+    set_status(shell, L"删除图层复合失败");
+    return;
+  }
+  shell.layer_comp_current = 0;
+  panel_current_layer_comp(shell);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已删除复合「%s」", name.c_str());
+  refresh_history_status(shell, buffer);
+}
+
 }
 
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
@@ -2667,11 +2939,27 @@ void panel_duplicate_layer(ShellState& shell) {
 /* ------------------------------------------------- 图层名 / 不透明度键入 */
 
 void refresh_layer_input_status(ShellState& shell) {
-  wchar_t buffer[224];
+  wchar_t buffer[240];
   if (shell.doc.layer_input == LayerInput::Rename) {
     wsprintfW(buffer, L"重命名图层 #%I64u：%s（回车确认 / Esc 取消）",
               static_cast<unsigned long long>(shell.doc.layer_input_id),
               shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::SmartFilterName) {
+    wsprintfW(buffer, L"智能滤镜第 %d 条：%s（回车确认 / Esc 取消，空 = 用类型名）",
+              static_cast<int>(shell.doc.layer_input_slot + 1),
+              shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::FilterName) {
+    wsprintfW(buffer, L"按名称过滤图层：%s（回车应用 / Esc 取消，空 = 不过滤）",
+              shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::CompName) {
+    if (shell.doc.layer_input_id != 0) {
+      wsprintfW(buffer, L"重命名图层复合 #%I64u：%s（回车确认 / Esc 取消）",
+                static_cast<unsigned long long>(shell.doc.layer_input_id),
+                shell.doc.layer_input_text.c_str());
+    } else {
+      wsprintfW(buffer, L"新建图层复合：%s（回车捕获当前可见性 + 不透明度 / Esc 取消）",
+                shell.doc.layer_input_text.c_str());
+    }
   } else {
     wsprintfW(buffer, L"图层不透明度：%s%%（回车应用 / Esc 取消，0..100）",
               shell.doc.layer_input_text.c_str());
@@ -2761,6 +3049,36 @@ void panel_commit_layer_input(ShellState& shell) {
   const LayerInput mode = shell.doc.layer_input;
   const comp_layer_id id = shell.doc.layer_input_id;
   const std::wstring text = shell.doc.layer_input_text;
+      /* 无名复合在状态栏与菜单里都没法指认；拒绝并保持输入态。 */
+      set_status(shell, L"图层复合名不能为空");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    wchar_t buffer[192];
+    if (id == 0) {
+      comp_layer_comp_id created = 0;
+      if (comp_layer_comp_capture(shell.doc.document, name.c_str(), &created) != COMP_OK) {
+        /* 引擎 last_error 已由 set_status 附上（空名/坏编码/超长/达到上限）。 */
+        set_status(shell, L"捕获图层复合失败");
+        refresh_layer_input_status(shell);
+        return;
+      }
+      panel_cancel_layer_input(shell);
+      shell.layer_comp_current = created;
+      wsprintfW(buffer, L"已捕获图层复合「%s」", text.c_str());
+      refresh_history_status(shell, buffer);
+      return;
+    }
+    if (comp_layer_comp_rename(shell.doc.document, id, name.c_str()) != COMP_OK) {
+      set_status(shell, L"重命名图层复合失败");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    panel_cancel_layer_input(shell);
+    wsprintfW(buffer, L"已重命名图层复合「%s」", text.c_str());
+    refresh_history_status(shell, buffer);
+    return;
+  }
   if (mode == LayerInput::Rename) {
     const std::string name = narrow_utf8(text);
     if (name.empty()) {

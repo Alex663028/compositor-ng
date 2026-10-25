@@ -218,6 +218,15 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_set_filter_color(ShellState& shell, int color);
   void panel_begin_filter_name(ShellState& shell);
   void panel_clear_filter(ShellState& shell);
+  /* P1-2 收尾：图层复合（文档态，见 engine LayerComp；当前选中是视图态）。 */
+  comp_layer_comp_id panel_current_layer_comp(ShellState& shell);
+  void panel_layer_comp_status(ShellState& shell);
+  void panel_layer_comp_select(ShellState& shell, int delta);
+  void panel_layer_comp_capture_begin(ShellState& shell);
+  void panel_layer_comp_rename_begin(ShellState& shell);
+  void panel_layer_comp_apply(ShellState& shell);
+  void panel_layer_comp_update(ShellState& shell);
+  void panel_layer_comp_delete(ShellState& shell);
   void refresh_layers(ShellState& shell);
   const LayerRow* selected_row(const ShellState& shell);
   void panel_move_selection(ShellState& shell, int32_t delta);

@@ -83,6 +83,38 @@ struct SelectionChannel {
   MaskBuffer mask;
 };
 
+/* ---------------------------------------------------------------------------
+ * 图层复合（对齐 Photoshop 的 Layer Comp）。
+ *
+ * 一张复合记录的是「某一刻所有图层的可见性与不透明度」——即上游 Layer Comp
+ * 面板里勾了 Visibility 与 Appearance 时的两组属性；位置（Position）不在其中：
+ * 本引擎的几何是 transform 矩阵，把它塞进复合会让「移动图层后应用旧复合」
+ * 把用户的位移悄悄改回去，代价与收益不成比例，故明确不做。
+ *
+ * 存储是**快照数组**而不是「按 id 查表」：数组序就是捕获时的堆叠序，面板按
+ * 顺序列出时不需要再排序；查找在这一规模上线性扫描足够。
+ *
+ * entries 只记录捕获时**存在**的图层：之后新建的层不在表里，应用时保持原样
+ * （上游同款语义——复合并不知道未来会出现什么层）；被删掉的层在应用时跳过。
+ */
+struct LayerCompEntry {
+  comp_layer_id layer = 0;
+  uint8_t visible = 0;
+  float opacity = 1.0f;
+};
+
+struct LayerComp {
+  uint32_t id = 0;
+  /* UTF-8、单行、非空，≤ kMaxLayerCompNameBytes（见 comp_layer.h 的 ABI 契约）。 */
+  std::string name;
+  std::vector<LayerCompEntry> entries;
+};
+
+/* 单篇文档的复合数量上界：面板是人工管理的清单，128 已远超实用规模，同时又
+ * 给 manifest 的 4 MiB 上界留足余量。 */
+constexpr size_t kMaxLayerComps = 128;
+constexpr size_t kMaxLayerCompNameBytes = 1024;
+
 struct DocumentState {
   int32_t width = 0;
   int32_t height = 0;
@@ -109,6 +141,13 @@ struct DocumentState {
   /* 存储的选区通道（见 SelectionChannel）。空向量 = 没有通道；落盘为
    * manifest 的 engineChannels，蒙版在 images/<documentID>.channel<N>.png。 */
   std::vector<SelectionChannel> channels;
+
+  /* 图层复合（见 LayerComp）。空向量 = 没有复合；落盘为 manifest 的
+   * engineLayerComps（空表不写键，旧 manifest 逐字节不变）。 */
+  std::vector<LayerComp> layer_comps;
+  /* 复合 id 分配器：与图层 id 一样单调递增，删除后不复用空洞（否则撤销/重做
+   * 与宿主持有的旧 id 会指到另一份复合上）。 */
+  uint32_t next_layer_comp_id = 1;
 };
 
 }  // namespace compositor

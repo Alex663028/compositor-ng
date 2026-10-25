@@ -241,6 +241,13 @@ COMP_API comp_result comp_filter_apply(comp_document document, comp_layer_id tar
                                        int32_t* out_changed, char* note, size_t note_capacity,
                                        size_t* out_note_size);
 
+/*
+ * 取第 index 条的展示名（两段式，口径同 comp_layer_comp_name）：`out_required`
+ * 写含 '\0' 的所需长度；`buffer == NULL` 或 `capacity == 0` 为查询模式。
+ * 名字为空（未命名）时长度为 1（只有 '\0'）。缓冲区不足 ->
+ * COMP_ERR_INVALID_ARGUMENT，不截断。index 越界 -> COMP_ERR_INVALID_ARGUMENT；
+ * 不是智能对象 -> COMP_ERR_STATE。只读，不开事务。
+ */
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -324,6 +324,22 @@ constexpr UINT kCmdLayerFilterColorNone = 1691; /* 图层 > 过滤 > 颜色 > �
 constexpr UINT kCmdLayerFilterColorBase = 1692; /* +0..6 = 红/橙/黄/绿/蓝/紫/灰 */
 constexpr UINT kCmdLayerFilterName = 1699;      /* 图层 > 过滤 > 按名称… */
 constexpr UINT kCmdLayerFilterClear = 1700;     /* 图层 > 过滤 > 清除过滤 */
+/*
+ * P1-2 收尾 ⑤：图层复合（1701 段）。
+ *
+ * 复合本身是**文档状态**（进 `.comp`、随撤销/重做），壳里只多一条视图态：
+ * 「当前选中的复合 id」。菜单里没有展开的动态列表——面板/菜单每次都从引擎现读
+ * （comp_layer_comp_count / _id_at / _name），壳不缓存名字，也就不会与撤销后的
+ * 文档漂移。捕获需要一个名字，走与「重命名图层」同一套键入态（LayerInput）。
+ */
+constexpr UINT kCmdLayerCompCapture = 1701; /* 图层 > 图层复合 > 捕获为新复合… */
+constexpr UINT kCmdLayerCompApply = 1702;   /* 应用当前复合 */
+constexpr UINT kCmdLayerCompUpdate = 1703;  /* 用当前状态更新当前复合 */
+constexpr UINT kCmdLayerCompDelete = 1704;  /* 删除当前复合 */
+constexpr UINT kCmdLayerCompPrev = 1705;    /* 选择上一个复合 */
+constexpr UINT kCmdLayerCompNext = 1706;    /* 选择下一个复合 */
+constexpr UINT kCmdLayerCompRename = 1707;  /* 重命名当前复合… */
+constexpr UINT kCmdLayerCompStatus = 1708;  /* 状态栏报当前复合（菜单项不用，快捷键用） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -836,6 +852,13 @@ struct ShellState {
   int layer_filter_color = -1;
   std::wstring layer_filter_name;
 
+  /*
+   * 当前选中的图层复合 id（0 = 尚未选）。纯视图态：复合数据在文档里，这里只记
+   * 「菜单上的应用/更新/删除指向哪一个」。文档里已不存在该 id 时（撤销、换文档）
+   * 由 panel_current_layer_comp() 退回到第一个复合，不在这里做失效清理——
+   * 撤销栈随时会把它变回来。
+   */
+  comp_layer_comp_id layer_comp_current = 0;
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;
