@@ -118,14 +118,28 @@ class ImplicitTxn {
   }
 
   void commit() {
-    if (owns_) document_->commit_implicit(label_, before_);
+    if (owns_) {
+      document_->commit_implicit(label_, before_);
+      committed_ = true;
+    }
   }
 
   bool owns() const { return owns_; }
 
+  /*
+   * OPT-4：未 commit 即析构 = 修改中途失败（典型：commit_implicit 里整篇快照
+   * 拷贝抛 bad_alloc）。此前状态已改、撤销栈无记录、dirty 未置——宿主按
+   * 「失败即无副作用」继续用甚至 save，会把不可撤销的中间态写盘。这里把
+   * 构造时拷出的 before_ 快照恢复回去（move 赋值，本身不再分配）。
+   */
+  ~ImplicitTxn() {
+    if (owns_ && !committed_) document_->restore_state(std::move(before_));
+  }
+
  private:
   Document* document_ = nullptr;
   bool owns_ = false;
+  bool committed_ = false;
   std::string label_;
   DocumentState before_{};
 };

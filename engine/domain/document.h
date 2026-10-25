@@ -49,6 +49,10 @@ class Document {
   DocumentState& state() noexcept { return state_; }
   const DocumentState& state() const noexcept { return state_; }
 
+  /* OPT-4：整体恢复到快照（ImplicitTxn 失败回滚用）。不写历史、不标脏——
+   * 语义是「这批修改从未发生过」，与 txn_abort（一步可撤销的显式回滚）不同。 */
+  void restore_state(DocumentState&& snapshot) noexcept { state_ = std::move(snapshot); }
+
   /* 选区是文档状态的一部分（见 SelectionState）：事务快照、撤销/重做与
    * 回滚都自动覆盖它。这里只做转发，不另存一份。 */
   SelectionState& selection() noexcept { return state_.selection; }

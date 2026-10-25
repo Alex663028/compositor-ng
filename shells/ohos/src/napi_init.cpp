@@ -106,11 +106,7 @@ void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
   g_configured_height = 0;
 }
 
-void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
-  // 输入层未接线（OPT-23）：触摸事件暂不上报引擎。
-  (void)component;
-  (void)window;
-}
+
 
 napi_value MakeInt32(napi_env env, int32_t value) {
   napi_value out = nullptr;
@@ -503,6 +499,98 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
   rc = OH_NativeWindow_NativeWindowFlushBuffer(window, buffer, fence_fd, damage);
   LOGI("flush rc=%{public}d", rc);
   return rc == 0 ? 0 : 6;
+}
+
+// ---------------------------------------------------------------------------
+// 触摸画笔（OPT-23）：按下开显式事务、滑动逐段落笔、抬起 commit——
+// 整笔一笔 = 一个撤销步（comp_txn 的产品语义）。落点用组件坐标（= 表面原生
+// 像素 = 文档像素，三方同尺寸，零换算）。抬起后自动投递一帧上屏。
+// ---------------------------------------------------------------------------
+
+float g_stroke_color[3] = {255.0f, 220.0f, 40.0f};  /* 黄色，深底上醒目 */
+bool g_stroke_active = false;
+float g_stroke_last_x = 0.0f;
+float g_stroke_last_y = 0.0f;
+comp_txn g_stroke_txn = nullptr;
+
+void PaintSegment(float x0, float y0, float x1, float y1) {
+  if (g_document == nullptr || g_top_layer == 0) return;
+  float points[4] = {x0, y0, x1, y1};
+  comp_tool_op_desc op;
+  std::memset(&op, 0, sizeof(op));
+  op.kind = COMP_TOOL_STROKE;  /* 冻结表 2：笔刷落笔到图层像素 */
+  op.brush.color[0] = (uint8_t)g_stroke_color[0];
+  op.brush.color[1] = (uint8_t)g_stroke_color[1];
+  op.brush.color[2] = (uint8_t)g_stroke_color[2];
+  op.brush.diameter = 70.0f;
+  op.brush.pressure = 1.0f;
+  op.brush.hardness = 0.85f;
+  op.brush.flow = 1.0f;
+  op.brush.seed = 1;
+  op.stroke_points = points;
+  op.stroke_point_count = 2;
+  comp_tool_apply(g_document, g_top_layer, &op, nullptr, 0, nullptr);
+}
+
+void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
+  if (component == nullptr || window == nullptr || g_document == nullptr) return;
+  OH_NativeXComponent_TouchEvent event;
+  if (OH_NativeXComponent_GetTouchEvent(component, window, &event) != 0) return;
+  if (event.numPoints == 0) return;
+  const float x = static_cast<float>(event.touchPoints[0].x);
+  const float y = static_cast<float>(event.touchPoints[0].y);
+
+  switch (event.type) {
+    case OH_NATIVEXCOMPONENT_DOWN:
+      if (g_stroke_txn != nullptr) return;  /* 上一笔未收尾，防重入 */
+      if (comp_txn_begin(g_document, "Stroke", &g_stroke_txn) == 0 && g_stroke_txn != nullptr) {
+        g_stroke_active = true;
+        g_stroke_last_x = x;
+        g_stroke_last_y = y;
+        PaintSegment(x, y, x, y);  /* 单点也出一个圆头笔触 */
+        LOGI("stroke begin (%{public}.0f,%{public}.0f)", x, y);
+      }
+      break;
+    case OH_NATIVEXCOMPONENT_MOVE:
+      if (!g_stroke_active) break;
+      PaintSegment(g_stroke_last_x, g_stroke_last_y, x, y);
+      g_stroke_last_x = x;
+      g_stroke_last_y = y;
+      break;
+    case OH_NATIVEXCOMPONENT_UP:
+    case OH_NATIVEXCOMPONENT_CANCEL:
+      if (!g_stroke_active) break;
+      if (event.type == OH_NATIVEXCOMPONENT_UP) {
+        PaintSegment(g_stroke_last_x, g_stroke_last_y, x, y);
+      }
+      comp_txn_commit(g_stroke_txn);  /* 一笔 = 一个撤销步 */
+      g_stroke_txn = nullptr;
+      g_stroke_active = false;
+      LOGI("stroke end, committed");
+      /* 抬笔即刷屏：复用 JsPresent 的投递路径（从 JS 侧调它最省事，但这里在
+       * 回调线程——直接把 present 也丢给工作线程）。 */
+      {
+        std::lock_guard<std::mutex> lock(g_present_mutex);
+        if (!g_present_running) {
+          g_present_running = true;
+          OHNativeWindow* w = g_native_window;
+          comp_document doc = g_document;
+          const uint32_t dw = g_doc_width;
+          const uint32_t dh = g_doc_height;
+          const uint64_t gen = g_surface_generation.load();
+          std::thread worker([w, doc, dw, dh, gen] {
+            const int32_t rc = DoPresent(w, doc, dw, dh, gen);
+            g_present_last_rc.store(rc);
+            std::lock_guard<std::mutex> lock2(g_present_mutex);
+            g_present_running = false;
+          });
+          worker.detach();
+        }
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 napi_value JsPresent(napi_env env, napi_callback_info info) {
