@@ -32,3 +32,5 @@
   改动清单、编译清单与线程安全注意事项见 `engine/third_party/freetype/VENDOR-NOTES.md`。
   裁剪**不影响**许可证义务：被删掉的只是未使用的驱动源码，署名要求照旧。
 - zlib / libpng / stb 为原样 vendored，未做本地修改。
+
+- `third_party/vulkan-headers/`：Khronos 官方 Vulkan 头（Apache-2.0，自 OHOS NDK sysroot 拷贝）。仅用于 `tools/vulkan_decl_check.cpp` 的声明漂移检查，不参与运行时构建（见其 VENDOR-NOTES.md）。
