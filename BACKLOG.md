@@ -614,7 +614,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   5 个 `comp_selection_channel_*` 选区通道导出、`comp_layer_apply_adjustment` 破坏性调整导出
   与 `comp_selection_grow` / `comp_selection_similar` / `comp_selection_transform`；
   滤镜 / 调整 / 效果枚举另追加 2 / 13 / 3 个 kind，不增导出）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **171 条 / 30 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options` 后；原 80 条含 IME 6/6）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **267 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，2026-10-25 §6.110～§6.113 再追加 4 项）、视觉探针 **233 条 / 38 场景**（2026-10-22/23/24/25 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste` 后；§6.110～§6.113 未加场景；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
   2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
   与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。

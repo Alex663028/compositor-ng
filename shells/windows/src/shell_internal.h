@@ -307,6 +307,9 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_reverse_layers(ShellState& shell);
   /* P1-2 ③：链接/解除链接选中图层（组图层跳过；少于两层拒绝）。 */
   void panel_toggle_link(ShellState& shell);
+  /* P1-2 ④：图层样式的拷贝/粘贴（整份替换；多选粘贴 = 一步撤销）。 */
+  void panel_copy_layer_style(ShellState& shell);
+  void panel_paste_layer_style(ShellState& shell);
   std::string number_text(double value);
   std::wstring widen_ascii(const char* text);
   std::wstring widen_utf8(const std::string& text);

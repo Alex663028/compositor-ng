@@ -302,6 +302,13 @@ constexpr UINT kCmdLayerMergeVisible = 1673; /* 图层 > 合并可见（Ctrl+Alt
 constexpr UINT kCmdLayerReverse = 1674;      /* 图层 > 反向排列 */
 /* P1-2 第三批（1675）：链接图层开关（同组一起移动/缩放/旋转）。 */
 constexpr UINT kCmdLayerLinkToggle = 1675;   /* 图层 > 链接图层 */
+/*
+ * P1-2 第四批（1676 段）：图层样式的拷贝 / 粘贴。
+ * 上游的 Ctrl+Alt+C / Ctrl+Alt+V 在本壳已分别是「画布大小…」与「贴入选区」，
+ * 所以这两条只做菜单入口，不抢既有按键（面板里会把旧命令的提示写清楚）。
+ */
+constexpr UINT kCmdLayerCopyStyle = 1676;  /* 图层 > 图层样式 > 拷贝图层样式 */
+constexpr UINT kCmdLayerPasteStyle = 1677; /* 图层 > 图层样式 > 粘贴图层样式 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -796,6 +803,12 @@ struct ShellState {
    * 只有窗口尺寸、位图尺寸与鼠标坐标需要在这两个坐标系之间换算。
    */
   int dpi = 96;
+  /*
+   * P1-2 ④：图层样式剪贴板（引擎导出的整份报文，空串 = 尚未拷贝）。
+   * 与位图剪贴板不同，样式报文很小、也不需要和系统剪贴板互通，所以由外壳
+   * 自己持有；放会话态而非文档态，拷贝后换文档仍能粘贴。
+   */
+  std::string layer_style_clipboard;
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;

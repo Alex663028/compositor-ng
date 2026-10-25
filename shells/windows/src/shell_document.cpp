@@ -1944,6 +1944,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerLinkToggle:
       panel_toggle_link(shell);
       break;
+    /* ---- P1-2 第四批：图层样式拷贝 / 粘贴（剪贴板由外壳持有） ---- */
+    case kCmdLayerCopyStyle:
+      panel_copy_layer_style(shell);
+      break;
+    case kCmdLayerPasteStyle:
+      panel_paste_layer_style(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);

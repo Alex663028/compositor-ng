@@ -3443,3 +3443,56 @@ kCmdLayerLinkToggle, row->link_group != 0)`——`row` 是 `selected_layer` 指�
 效果与蒙版；组图层不能入链；`.comp` 的组号只在本文档内有意义，粘贴/导入一律
 按未链接处理。
 
+### 5.69 图层样式拷贝/粘贴：剪贴板归外壳，整批粘贴一个撤销步（P1-2 第四批，2026-10-24）
+
+引擎侧的报文格式、两段式缓冲与整份替换语义见 README §6.109。这一节只记壳层：
+剪贴板放哪、为什么没有快捷键、多选粘贴怎么保证「一次撤销」。
+
+**1. 两个命令，挂在「图层样式」子菜单下。** `kCmdLayerCopyStyle = 1676`、
+`kCmdLayerPasteStyle = 1677`，`图层 > 图层样式(&Y) > 拷贝图层样式(&C) /
+粘贴图层样式(&P)`。**不加加速键**是刻意的：PS 的 `Ctrl+Alt+C/V` 在本项目里已经是
+「画布大小 / 贴入」，抢过来会破坏既有键位；菜单 + 脚本命令号足够覆盖日常路径。
+
+**2. 剪贴板是 `ShellState` 的字段，不是引擎状态。** 引擎两个导出都是无状态的
+（导出只读、导入只写目标层），样式块落在 `std::string layer_style_clipboard`。
+这样做的直接好处：**可以跨文档粘贴**——在 A 里拷贝、切到 B 里粘贴，与 PS 一致；
+代价是它不跟随系统剪贴板（不与其它应用互通），这是已知边界，不是遗漏。
+
+**3. 拷贝走两段式，先问长度再分配。** `comp_layer_export_style(doc, id, nullptr,
+0, &need)` 只回报长度，然后 `std::vector<char> buffer(need + 1)` 再取一次；
+`need` 不含结尾 NUL，所以必须 `+1`。组图层会拿到 `COMP_ERR_UNSUPPORTED`，壳层转述
+成 `该图层不能拷贝样式（图层组没有求值的样式）`——不减信息，用户能明白原因。
+成功文案 `已拷贝图层样式（N 字节）`（N 用报文长度，便于对日志）。
+
+**4. 粘贴的可用性看剪贴板。** `menu_set_enabled_recursive(menu,
+kCmdLayerPasteStyle, enabled.layer_present && !shell.layer_style_clipboard.empty())`：
+**空的就置灰**，而不是让用户点下去再收到「剪贴板为空」。拷贝项只要求有选中层，
+门槛（组层 / 未知 kind）由引擎给原因。
+
+**5. 单层靠隐式事务，多选必须显式包。** `comp_layer_import_style` 自带
+`ImplicitTxn("Paste Layer Style")`，单层粘贴天然一步撤销；但多选循环时每个调用
+各自成一步，撤销会一层一层往回退。所以 `batch.size() > 1` 时先
+`comp_txn_begin(..., "Paste Layer Style", &txn)`，循环里的隐式事务会自动并入；
+**若一层都没真正改动则 `comp_txn_abort`**——不能 commit 一个空事务，否则用户
+撤销一次什么也没发生。
+
+**6. 状态栏按四类计数拼装。** `changed` / `same`（已是这份样式，引擎返回
+`changed=0` 且不落撤销步）/ `groups`（组层 `UNSUPPORTED`）/ `failed`。文案把
+「为什么看起来没反应」写出来，例如
+`粘贴图层样式：选中的图层没有改动（组图层不参与样式）`；有改动时给
+`已粘贴图层样式：N 层更新`，并把跳过的组层数附在后面。随后
+`refresh_effects` / `refresh_layers`，仅当 `changed > 0` 才置 `needs_render`，
+最后 `refresh_history_status`。
+
+**7. 视觉探针 `layer_style_paste`（5 条，截图 148–152）。** 橙色矩形
+（`ff8800`）→ `Ctrl+J` → 上层加 Color Overlay（默认不透明黑）→ 画布纯黑；
+点上层 1676 拷贝，画布**逐像素不变**；隐藏供体（命令 1011，画布回到橙色，得到
+无样式基线）；点下层 1677 粘贴，画布纯黑；`Ctrl+Z` 后与「隐藏供体」那张逐像素
+相同（`pixel_diff == 0`）。供体必须在拷贝后再隐藏：副本与原件像素重合，副本留在
+上面会盖住靶层，「粘贴没生效」与「被盖住」就分不出来。细节见 manual-test M64。
+
+**8. 已知边界。** 只搬效果栈（不透明度/混合模式/锁定/蒙版不搬）；剪贴板不与
+系统剪贴板互通；组图层不能拷贝也不能粘贴；报文是引擎自有 JSON，不解析 PS 原生
+样式文本。
+
+

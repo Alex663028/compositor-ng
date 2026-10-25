@@ -261,6 +261,10 @@ void sync_menu_state(HWND window, ShellState& shell) {
   menu_set_enabled_recursive(menu, kCmdLayerReverse, enabled.layer_flatten);
   /* 链接/解除：有选中层即可点（少于两层的拒绝文案由面板函数给）。 */
   menu_set_enabled_recursive(menu, kCmdLayerLinkToggle, enabled.layer_present);
+  /* 样式：拷贝要选中层（组由面板函数如实拒绝）；粘贴还要求剪贴板里有报文。 */
+  menu_set_enabled_recursive(menu, kCmdLayerCopyStyle, enabled.layer_present);
+  menu_set_enabled_recursive(menu, kCmdLayerPasteStyle,
+                             enabled.layer_present && !shell.layer_style_clipboard.empty());
   menu_set_enabled_recursive(menu, kCmdLayerRasterizeText, enabled.layer_rasterize_text);
   menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
@@ -4093,6 +4097,14 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerReverse, L"反向排列(&R)");
   /* P1-2 ③：链接图层（多选后点一次连上，再点一次解开）。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerLinkToggle, L"链接图层(&K)");
+  /*
+   * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
+   * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。
+   */
+  HMENU style_menu = CreatePopupMenu();
+  AppendMenuW(style_menu, MF_STRING, kCmdLayerCopyStyle, L"拷贝图层样式(&C)");
+  AppendMenuW(style_menu, MF_STRING, kCmdLayerPasteStyle, L"粘贴图层样式(&P)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(style_menu), L"图层样式(&Y)");
   /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
   /* P0-6 ②：字体面板（枚举系统字体，切换下一次打字的字体轨道）。 */
