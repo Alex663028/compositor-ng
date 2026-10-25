@@ -77,3 +77,11 @@ desktop.ini
 # ---------------------------------------------- 外壳运行期输出（可重跑生成，不入库）
 # S16 `--present-bench` 的基准报告；`--selftest` 的 compositor_shell_selftest.txt 是基线，入库。
 present_bench.txt
+
+# ---------------------------------------------- 鸿蒙 HAP 工程（OPT-22，可重跑生成）
+# hvigor 缓存 / 模块依赖 / 构建输出（entry/build 已被上面的 build/ 规则覆盖）。
+# libs/*/libcompositor.so 与 libc++_shared.so 是构建产物：scripts/build_ohos_hap.sh
+# 从 build_ohos_shell.sh 产出拷入，不入库。*.hap 同理。
+shells/ohos/.hvigor/
+shells/ohos/**/oh_modules/
+*.hap

@@ -1,0 +1,7 @@
+{
+  "modelVersion": "6.0.2",
+  "name": "compositor-ohos-shell",
+  "version": "0.1.0",
+  "description": "compositor-ng HarmonyOS shell (NAPI + XComponent)",
+  "dependencies": {}
+}
