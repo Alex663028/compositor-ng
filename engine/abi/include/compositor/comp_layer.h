@@ -1607,6 +1607,71 @@ COMP_API comp_result comp_layer_unlink(comp_document document, const comp_layer_
 COMP_API comp_result comp_layer_get_link(comp_document document, comp_layer_id id,
                                          uint32_t* out_group);
 
+/* ------------------------------------- 图层样式拷贝 / 粘贴（P1-2 ④ 尾部追加） */
+
+/*
+ * 图层样式（layer style）在本引擎里就是该层的**效果栈**（comp_effect_kind 0..9，
+ * 见 comp_layer_set_effect）。这里只提供「导出成一段 JSON」与「用一段 JSON 整份
+ * 替换」，剪贴板由**宿主**持有：样式块可以放系统剪贴板，也可以存成预设文件，
+ * Windows 壳与鸿蒙壳因此共享同一份格式与校验。
+ *
+ * 不把剪贴板做进引擎的理由：剪贴板是进程级状态，而引擎可同时被多个文档共享；
+ * 把它挂在某个文档句柄后面，跨文档粘贴就会变成看不见的全局变量。
+ *
+ * 样式块格式与 .comp 的 engineEffects 同形（紧凑 JSON 数组）：
+ *
+ *     [{"effect":2,"settings":"{\"color\":[255,0,0,255]}"}, ...]
+ *
+ * `settings` 保持为**字符串**且不在这里做语义解释：未知键与数字精度原样往返，
+ * 与 .comp 的往返保真口径一致。
+ */
+
+/*
+ * 导出图层样式。`out_size` 必填：写回报文长度（**不含**结尾 NUL，与
+ * comp_layer_effect_at 同口径，宿主按 out_size + 1 分配）。
+ *
+ * 两段式：`style_json_utf8 == NULL` 或 `capacity == 0` 时只回报长度；缓冲不够
+ * -> COMP_ERR_INVALID_ARGUMENT（不静默截断——截断的 JSON 不是 JSON，静默返回
+ * 会让宿主粘进去半份样式）。
+ *
+ *   - 没有样式 -> 导出 "[]"（合法的空栈；粘贴它会清空目标层样式）；
+ *   - 图层组 -> COMP_ERR_UNSUPPORTED：合成时组根本不求值自己的 effects
+ *     （blend_layer_into 对组早退），导出它等于承诺一次永远不会发生的渲染；
+ *   - 带本引擎不求值的 effect kind（例如更高版本 .comp 读进来的）-> 同样
+ *     COMP_ERR_UNSUPPORTED，理由对称：导出了也粘不回来，不制造半程可用的剪贴板。
+ *
+ * 只读，不开事务。图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_export_style(comp_document document, comp_layer_id id,
+                                             char* style_json_utf8, size_t capacity,
+                                             size_t* out_size);
+
+/*
+ * 导入（粘贴）图层样式：**整份替换**目标层的效果栈（对齐 Photoshop 的
+ * Paste Layer Style），不做「按 kind 合并」——合并会让连续两次粘贴叠加出用户
+ * 没见过的样式。
+ *
+ * 校验（全部先于任何状态改动，参数闸在事务之前）：
+ *   - 报文必须是数组；每项是对象，带整数 `effect` 与字符串 `settings`，其它键忽略；
+ *   - 同一个 effect kind 出现两次 -> COMP_ERR_INVALID_ARGUMENT（PS 的效果栈每种
+ *     最多一份，重复项无法定义谁覆盖谁）；
+ *   - 越界或本引擎不求值的 kind -> COMP_ERR_UNSUPPORTED；
+ *   - 上面的形状错误 -> COMP_ERR_INVALID_ARGUMENT（报文由本引擎导出，不该走到这里）。
+ * 空数组是合法输入：清空目标层的样式。
+ *
+ * 幂等：结果栈与现状逐项相同（kind 与 settings 字符串都相同）-> COMP_OK 且
+ * `*out_changed = 0`，不落撤销步。否则一步撤销（加入调用方的显式事务，或自成一个
+ * 隐式步），并推进内容修订号（样式参与像素求值）。
+ *
+ * 锁：与 comp_layer_set_effect 同口径——锁定全部 -> COMP_ERR_STATE；锁定图像像素
+ * 不拦（改样式不改像素）。目标层不存在 -> COMP_ERR_NOT_FOUND；组 -> COMP_ERR_UNSUPPORTED。
+ *
+ * `out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_import_style(comp_document document, comp_layer_id id,
+                                             const char* style_json_utf8,
+                                             int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

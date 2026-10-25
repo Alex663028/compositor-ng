@@ -1191,6 +1191,126 @@ void panel_toggle_link(ShellState& shell) {
   refresh_history_status(shell, buffer);
 }
 
+/*
+ * 图层样式的拷贝 / 粘贴（P1-2 第四批）。
+ *
+ * 「图层样式」在本引擎里就是层的效果栈，所以这一对命令不新增文档语义：
+ *   - 引擎负责把效果栈导出成与 `.comp` engineEffects 同形的报文（kind 顺序、
+ *     settings 原文都不变形，未知键也带着），外壳只当剪贴板；
+ *   - 粘贴是**整份替换**而不是合并：目标层原有样式全被剪贴板取代，`[]` 即清空；
+ *   - 多选粘贴包在一个事务里 = 一步撤销（与批量切效果同口径）。
+ *
+ * 拒绝面照抄引擎：组图层两侧都不支持（组的样式从不参与求值），最高版本才
+ * 认识的 kind 导出时直接拒绝，不产出粘不回来的剪贴板。
+ */
+void panel_copy_layer_style(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  size_t need = 0;
+  comp_result result = comp_layer_export_style(shell.doc.document, id, nullptr, 0, &need);
+  if (result == COMP_ERR_UNSUPPORTED) {
+    set_status(shell, L"该图层不能拷贝样式（图层组没有求值的样式）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"导出图层样式失败");
+    return;
+  }
+  std::vector<char> buffer(need + 1, '\0');
+  result = comp_layer_export_style(shell.doc.document, id, buffer.data(), buffer.size(), &need);
+  if (result != COMP_OK) {
+    set_status(shell, L"导出图层样式失败");
+    return;
+  }
+  shell.layer_style_clipboard.assign(buffer.data(), need);
+  refresh_layers(shell);
+  wchar_t message[160];
+  wsprintfW(message, L"已拷贝图层样式（%u 字节）", static_cast<unsigned>(need));
+  set_status(shell, message);
+}
+
+void panel_paste_layer_style(ShellState& shell) {
+  if (shell.layer_style_clipboard.empty()) {
+    set_status(shell, L"剪贴板里没有图层样式（先拷贝一次）");
+    return;
+  }
+  const std::vector<comp_layer_id> batch = panel_selection_ids(shell, true);
+  if (batch.empty()) {
+    set_status(shell, L"无图层");
+    return;
+  }
+
+  /* 单层粘贴走引擎的隐式事务；多选必须显式包一层，才能一步撤销整批。 */
+  comp_txn txn = nullptr;
+  if (batch.size() > 1) {
+    if (comp_txn_begin(shell.doc.document, "Paste Layer Style", &txn) != COMP_OK) {
+      set_status(shell, L"粘贴图层样式：无法开始事务");
+      return;
+    }
+  }
+  size_t changed = 0;
+  size_t same = 0;
+  size_t groups = 0;
+  size_t failed = 0;
+  for (comp_layer_id id : batch) {
+    int32_t at = 0;
+    const comp_result result = comp_layer_import_style(
+        shell.doc.document, id, shell.layer_style_clipboard.c_str(), &at);
+    if (result == COMP_OK) {
+      if (at != 0) {
+        ++changed;
+      } else {
+        ++same; /* 已经是这份样式：引擎不落撤销步，这里也不计入改动。 */
+      }
+    } else if (result == COMP_ERR_UNSUPPORTED) {
+      ++groups;
+    } else {
+      ++failed;
+    }
+  }
+
+  if (txn != nullptr) {
+    if (changed == 0) {
+      comp_txn_abort(txn);
+      wchar_t empty_message[224];
+      wsprintfW(empty_message, L"粘贴图层样式：选中的图层没有改动%s",
+                groups > 0 ? L"（组图层不参与样式）" : L"");
+      set_status(shell, empty_message);
+      return;
+    }
+    if (comp_txn_commit(txn) != COMP_OK) {
+      set_status(shell, L"粘贴图层样式：提交失败");
+      return;
+    }
+  }
+
+  refresh_effects(shell);
+  refresh_layers(shell);
+  if (changed > 0) shell.doc.needs_render = true;
+  wchar_t buffer[320];
+  if (changed == 0) {
+    wsprintfW(buffer, L"粘贴图层样式：没有改动%s",
+              groups > 0 ? L"（组图层不参与样式）" : L"（样式已相同）");
+    set_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已为 %u 个图层粘贴样式", static_cast<unsigned>(changed));
+  if (same > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L"（%u 个已相同）", static_cast<unsigned>(same));
+  }
+  if (groups > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L" · 跳过 %u 个组图层", static_cast<unsigned>(groups));
+  }
+  if (failed > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L" · %u 个失败", static_cast<unsigned>(failed));
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/*
  * 效果开关（S24）。
  *
  * 引擎侧 9 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/

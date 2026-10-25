@@ -3519,6 +3519,81 @@ def scene_layer_link(shell, checker):
                   "面板行差异像素 %d" % unlink_rows)
 
 
+def scene_layer_style_paste(shell, checker):
+    """P1-2 第四批：图层样式拷贝/粘贴（命令号 1676 / 1677）。
+
+    判据不是「命令没报错」，而是画布真的换了样式：
+      1. 拷贝只读：拷贝前后画布逐像素不变（剪贴板由外壳持有，不碰文档）；
+      2. 供体层加颜色叠加后确实变黑；隐藏供体后基线回到橙色矩形；
+      3. 粘贴到不带样式的靶层：靶层被刷成纯黑（样式参与了求值）；
+      4. 整次粘贴是一步撤销：Ctrl+Z 后画布逐像素回到粘贴前。
+    供体必须在拷贝之后隐藏：副本与原件像素重合，副本留在上面会盖住靶层，
+    「粘贴没生效」与「粘贴被盖住」就分不出来了。
+    """
+    scene = "layer_style_paste"
+    layer = shell.layout["layer"]
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    row_y = layer[1] + 30
+    row_x = layer[0] + 80
+    top_row = row_y
+    bottom_row = row_y + 22
+
+    # 底：橙色矩形。颜色叠加的缺省值是不透明纯黑，橙 -> 黑是最干净的判据。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    x0, y0 = left + 20, top + 20
+    x1, y1 = right - 20, bottom - 20
+    shell.drag(x0, y0, x1, y1, steps=10)
+
+    # 复制一层（副本在上、像素与原件重合），给副本加颜色叠加当样式供体。
+    shell.press(ord("J"), ctrl=True)
+    shell.command(CMD_EFFECT_BASE + 2)  # 颜色叠加（默认不透明纯黑）
+    shell.wait(0.6)
+    shell.press(VK_ESCAPE)  # 只关参数面板，效果留在图层上
+    shell.wait(0.3)
+
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    probe = (cx - 30, cy - 30, cx + 30, cy + 30)
+    styled = shell.shot("148_style_donor_black")
+    donor = mean_rgb(styled, probe)
+    checker.check(scene, "供体层加颜色叠加后变纯黑", near(donor, (0, 0, 0), 24),
+                  "实测 %s" % (donor,))
+
+    # 选中供体行，拷贝样式。
+    shell.click(row_x, top_row)
+    shell.command(1676)  # 图层 > 图层样式 > 拷贝图层样式
+    copied = shell.shot("149_style_copied")
+    copy_delta = pixel_diff(copied, styled, doc, 24)
+    checker.check(scene, "拷贝样式不改画布（只读导出）", copy_delta == 0,
+                  "画布差异像素 %d" % copy_delta)
+
+    # 藏掉供体，露出下面的橙色原件：这才是粘贴前的基线。
+    shell.command(1011)  # 切换选中层可见性（供体行仍选中）
+    hidden = shell.shot("150_style_donor_hidden")
+    base = mean_rgb(hidden, probe)
+    checker.check(scene, "隐藏供体后画布回到橙色矩形", near(base, (255, 136, 0), 30),
+                  "实测 %s" % (base,))
+
+    # 选中靶层（下面那行），粘贴样式。
+    shell.click(row_x, bottom_row)
+    shell.command(1677)  # 图层 > 图层样式 > 粘贴图层样式
+    shell.wait(0.3)
+    pasted = shell.shot("151_style_pasted")
+    target = mean_rgb(pasted, probe)
+    checker.check(scene, "粘贴后靶层被刷成纯黑（样式真的参与求值）",
+                  near(target, (0, 0, 0), 24), "实测 %s" % (target,))
+
+    # 一步撤销：粘贴整步回退，画布逐像素回到粘贴前。
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("152_style_paste_undo")
+    undo_delta = pixel_diff(undone, hidden, doc, 24)
+    checker.check(scene, "一步撤销把粘贴整步回退（画布逐像素还原）", undo_delta == 0,
+                  "画布差异像素 %d" % undo_delta)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),

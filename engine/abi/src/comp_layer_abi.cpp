@@ -2611,4 +2611,182 @@ comp_result comp_layer_get_link(comp_document document, comp_layer_id id, uint32
   COMP_ABI_CATCH(engine)
 }
 
+/* --------------------------------------------- 图层样式拷贝 / 粘贴（P1-2 ④） */
+
+namespace {
+
+/* 本文件的实现体整体位于 extern "C" 区段内，匿名命名空间的辅助函数默认也会拿到
+ * C 链接——返回 std::string 的函数会被 -Wreturn-type-c-linkage 点名。这里显式
+ * 回到 C++ 链接（与下面图层复合块同一写法）。 */
+extern "C++" {
+
+/* 样式块与 .comp 的 engineEffects 同形；settings 保持为字符串（不解释）。 */
+std::string dump_layer_style(const std::vector<compositor::Effect>& effects) {
+  compositor::JsonValue list = compositor::JsonValue::array({});
+  for (const compositor::Effect& effect : effects) {
+    compositor::JsonValue item = compositor::JsonValue::object({});
+    item.set("effect", compositor::JsonValue::integer(static_cast<long long>(effect.effect)));
+    item.set("settings", compositor::JsonValue::string(effect.settings_json));
+    list.push(std::move(item));
+  }
+  return compositor::json_dump(list, 0);
+}
+
+/* 本引擎求值不了的 effect kind（更高版本 .comp 读进来的）：不导出、不导入。 */
+bool style_kind_supported(uint32_t kind) { return kind < COMP_EFFECT_KIND_COUNT; }
+
+/*
+ * 解析样式块。两类错误分开报：报文形状错 -> INVALID_ARGUMENT（宿主传错了），
+ * 求值不了的 kind -> UNSUPPORTED（这里做不到），宿主才能给出不同的提示。
+ */
+bool parse_layer_style(const std::string& text, std::vector<compositor::Effect>* out,
+                       comp_result* out_code, std::string* out_error) {
+  std::string parse_error;
+  compositor::JsonValue root = compositor::json_parse(text, &parse_error);
+  if (!parse_error.empty() || !root.is_array()) {
+    *out_code = COMP_ERR_INVALID_ARGUMENT;
+    *out_error = parse_error.empty() ? std::string("style JSON must be an array") : parse_error;
+    return false;
+  }
+  std::vector<compositor::Effect> parsed;
+  for (const compositor::JsonValue& item : root.as_array()) {
+    if (!item.is_object()) {
+      *out_code = COMP_ERR_INVALID_ARGUMENT;
+      *out_error = "each style entry must be an object";
+      return false;
+    }
+    const compositor::JsonValue* kind_value = item.find("effect");
+    const compositor::JsonValue* settings_value = item.find("settings");
+    if (kind_value == nullptr || !kind_value->is_number() || settings_value == nullptr ||
+        !settings_value->is_string()) {
+      *out_code = COMP_ERR_INVALID_ARGUMENT;
+      *out_error = "style entries need an integer 'effect' and a string 'settings'";
+      return false;
+    }
+    /* 非整数 kind 不能被静默截断成相邻的合法 kind（2.9 不等于 2）。 */
+    const double kind_number = kind_value->as_number(-1.0);
+    if (kind_number != std::floor(kind_number) || kind_number < 0.0) {
+      *out_code = COMP_ERR_INVALID_ARGUMENT;
+      *out_error = "'effect' must be a non-negative integer";
+      return false;
+    }
+    const uint32_t kind = static_cast<uint32_t>(kind_number);
+    if (!style_kind_supported(kind)) {
+      *out_code = COMP_ERR_UNSUPPORTED;
+      *out_error = compositor::kUnevaluatedEffectMarker;
+      return false;
+    }
+    for (const compositor::Effect& existing : parsed) {
+      if (existing.effect == kind) {
+        *out_code = COMP_ERR_INVALID_ARGUMENT;
+        *out_error = "duplicate effect kind in style";
+        return false;
+      }
+    }
+    compositor::Effect effect;
+    effect.effect = kind;
+    effect.settings_json = settings_value->as_string("{}");
+    parsed.push_back(std::move(effect));
+  }
+  *out = std::move(parsed);
+  return true;
+}
+
+bool same_style(const std::vector<compositor::Effect>& a,
+                const std::vector<compositor::Effect>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].effect != b[i].effect || a[i].settings_json != b[i].settings_json) return false;
+  }
+  return true;
+}
+
+}  /* extern "C++" */
+
+}  // namespace
+
+comp_result comp_layer_export_style(comp_document document, comp_layer_id id,
+                                    char* style_json_utf8, size_t capacity, size_t* out_size) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_size == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_size is null");
+  }
+  const Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (layer->is_group) {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                 "layer groups do not render layer styles");
+  }
+  /* 先把整层检查完再生成报文：半份可用的剪贴板比拒绝更难排查。 */
+  for (const compositor::Effect& effect : layer->effects) {
+    if (!style_kind_supported(effect.effect)) {
+      return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                   compositor::kUnevaluatedEffectMarker);
+    }
+  }
+  const std::string blob = dump_layer_style(layer->effects);
+  *out_size = blob.size();
+  /* 两段式：pixels 风格的查询调用只回报长度，不碰缓冲。 */
+  if (style_json_utf8 == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < blob.size() + 1) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "style buffer is too small (see out_size)");
+  }
+  std::memcpy(style_json_utf8, blob.c_str(), blob.size() + 1);
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_import_style(comp_document document, comp_layer_id id,
+                                    const char* style_json_utf8, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_changed != nullptr) *out_changed = 0;
+  if (style_json_utf8 == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "style_json_utf8 is null");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  if (layer->is_group) {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                 "layer groups do not render layer styles");
+  }
+  /* 参数闸全部先于状态改动：报文坏掉时连撤销步都不该出现。 */
+  std::vector<compositor::Effect> parsed;
+  comp_result parse_code = COMP_ERR_INVALID_ARGUMENT;
+  std::string parse_error;
+  if (!parse_layer_style(style_json_utf8, &parsed, &parse_code, &parse_error)) {
+    return compositor::abi::fail(engine, parse_code, parse_error);
+  }
+  /* 幂等：同一样式不落撤销步（宿主可以无脑「粘贴到所有选中层」）。 */
+  if (same_style(parsed, layer->effects)) return compositor::abi::ok(engine);
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_ALL, "change a layer style");
+    if (locked != COMP_OK) return locked;
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Paste Layer Style");
+  layer->effects = std::move(parsed);
+  /* 样式参与像素求值：修订号必须换，否则合成/GPU 缓存会复用旧样式的结果。 */
+  doc->touch_layer(id);
+  txn.commit();
+  if (out_changed != nullptr) *out_changed = 1;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
 } /* extern "C" */

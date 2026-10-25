@@ -7951,6 +7951,80 @@ Ctrl+J 复制成完全重合的两层 → `Ctrl` 点选两层 → 1675 链接 �
 - **一次联动只落一个撤销步**，但撤销粒度是「整个 set_transform 调用」：脚本一次
   改十层仍是一步，不会拆开。
 
+### 6.109 图层样式拷贝/粘贴：把「效果栈」当成一份可搬运的报文（P1-2 第四批，2026-10-24，Claude）
+
+**缺口。** P1-2 第四批：PS 的「拷贝图层样式 / 粘贴图层样式」。本项目的
+`ShellState::layer_style_clipboard`（`std::string`），所以「在文档 A 拷贝、切到
+文档 B 粘贴」可用——这正是 PS 的行为。命令号 **1676 / 1677**：
+
+- 图层 > **图层样式(&Y)** > 拷贝图层样式(&C) / 粘贴图层样式(&P)。**不加加速键**：
+  PS 的 `Ctrl+Alt+C/V` 在本项目里已被「画布大小 / 贴入」占用，改键位会破坏既有
+  肌肉记忆，所以只做菜单（与链接图层同一取舍）；
+- 可用性：拷贝 = `enabled.layer_present`；粘贴额外要求剪贴板非空
+  （`!shell.layer_style_clipboard.empty()`），空剪贴板直接置灰，而不是点了才报错；
+- 拷贝走两段式：先 `nullptr/0` 问长度，再按 `need + 1` 分配取报文；成功状态栏
+  `"已拷贝图层样式（N 字节）"`；组图层给 `"该图层不能拷贝样式（图层组没有求值的
+  样式）"`（引擎的拒绝原因原样转述，不减信息）；
+- 粘贴对 `panel_selection_ids(shell, true)`（剔除组行与被覆盖层）逐个调用；**多选
+  时显式包一层 `comp_txn_begin("Paste Layer Style")`**，整批一个撤销步；若无一层
+  真正改动则 `comp_txn_abort`（不产生空撤销步），有改动才 commit，随后
+  `refresh_effects` / `refresh_layers` / `needs_render`；
+- 状态栏按计数拼装：改动 N 层、已是该样式 N 层、跳过组 N 层、失败 N 层——把
+  「为什么看起来没反应」直接写出来。
+
+**测试钉的七件事**（`tests/test_layer_style.cpp`，742 = 735 + 7）：
+
+| case | 钉住什么 |
+|---|---|
+| `layer_style_export_import_roundtrip` | 导出是 JSON 数组、kind 顺序与 settings 原文逐字复制到目标层、`changed=1`、再粘一次 `changed=0` 且不进历史 |
+| `layer_style_export_buffer_contract` | `out_size` 不含 NUL；查询调用不写缓冲；差一个字节 → `COMP_ERR_INVALID_ARGUMENT`；恰好够 → OK；`out_size=NULL` 拒绝；不存在的层 `NOT_FOUND` |
+| `layer_style_export_rejections` | 组层导出/导入都 `UNSUPPORTED`；未知 kind 整层拒绝导出（不回半份） |
+| `layer_style_import_payload_validation` | 非数组/非对象/缺键/非整数 kind 均 `INVALID_ARGUMENT`；未知 kind `UNSUPPORTED`；重复 kind 拒绝；合法报文成功；`[]` 清空且再次 `[]` 是 no-op；不存在的层 `NOT_FOUND` |
+| `layer_style_import_locks` | 锁定全部 → `COMP_ERR_STATE` 且栈不变；解锁后同一报文生效 |
+| `layer_style_paste_changes_rendering` | 供体加 Color Overlay 后画布变色；粘贴到裸层后**像素逐字节等于供体**；一步撤销回到 pristine（供体事先隐藏，避免它的样式污染基线） |
+| `layer_style_multi_paste_single_undo` | 显式事务内粘两层，一次撤销两层同时回退（壳层多选粘贴的引擎侧契约） |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_export_style` / `comp_layer_import_style`（含报文格式与两段式契约注释） |
+| `engine/abi/src/comp_layer_abi.cpp` | `dump_layer_style` / `parse_layer_style` / `same_style` / `style_kind_supported` + 两个新导出 |
+| `tests/test_layer_style.cpp` | 7 个新 case（735 → 742） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerCopyStyle = 1676` / `kCmdLayerPasteStyle = 1677`、`std::string layer_style_clipboard` |
+| `shells/windows/src/shell_layers.cpp` | `panel_copy_layer_style`（两段式导出、组层文案）/ `panel_paste_layer_style`（多选单事务、按计数拼状态） |
+| `shells/windows/src/shell_internal.h`、`shell_document.cpp`、`shell_window.cpp` | 声明 / case / 「图层样式」子菜单 + 可用性 |
+| `scripts/visual_check.py` | 追加 `layer_style_paste` 场景（截图 148–152，5 条断言） |
+
+**视觉探针实测（`layer_style_paste` 场景）：** 画橙色矩形（`ff8800`）→ `Ctrl+J`
+复制 → 给上层加 Color Overlay（默认不透明黑）→ 画布变纯黑；点上层执行 1676
+拷贝，画布**一格不动**（证明拷贝只读）；把供体隐藏后画布回到橙色矩形（得到
+「无样式」基线）；点下层执行 1677 粘贴，画布变纯黑（样式真的进了求值路径）；
+`Ctrl+Z` 后与隐藏供体时的画面**逐像素相同**（`pixel_diff == 0`）。5 条全 PASS。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **742 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **178**（176 → 178，尾部追加 2 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **233 条 / 38 场景 / 0 失败** |
+
+**已知边界：**
+
+- **样式 = 效果栈**：混合模式、不透明度、锁定、蒙版、颜色标签都不随「样式」走。
+  这与 PS 的 Paste Layer Style 一致，且这些属性各自有独立的入口。
+- **剪贴板是引擎报文，不是 PS 原生格式**：跨应用粘贴不做兼容，也不尝试解析
+  外部 JSON；报文由本引擎导出，宿主的职责只是原样保存。
+- **组图层两侧都不支持**：组的样式本来就不参与求值，允许粘贴只会得到「面板上
+  有、画面没有」的假象。
+- **settings 不做语义校验**：导入只保证「是字符串」，坏 settings 由各效果在
+  求值时按默认值兜底——与 `.comp` 读盘同一口径（格式层不替渲染层做语义判断）。
+- **重复 kind 拒绝而不是合并**：合法报文永远不会含重复 kind（效果栈本身去重），
+  出现重复只可能是手写报文。
+- **无快捷键**：`Ctrl+Alt+C/V` 已被占用；命令号只挂在菜单上，脚本/自检仍可直呼。
+
 
 
 
