@@ -303,6 +303,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_rasterize_text(ShellState& shell);
   void panel_merge_down(ShellState& shell);
   void panel_flatten(ShellState& shell);
+  void panel_merge_visible(ShellState& shell);
+  void panel_reverse_layers(ShellState& shell);
   std::string number_text(double value);
   std::wstring widen_ascii(const char* text);
   std::wstring widen_utf8(const std::string& text);

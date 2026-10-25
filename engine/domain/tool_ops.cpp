@@ -732,7 +732,6 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
    */
   if (layer->has_text()) {
     return bad_state("layer is an editable text layer; rasterize it before running pixel tools");
-  }
   if (!layer->has_pixels()) return bad_state("layer has no pixels");
   /*
    * 锁定透明像素（P1-2 第一批）：只在 RGBA8 上做 alpha 还原。16 位/HDR 的

@@ -7697,6 +7697,116 @@ NaN → 0、越界夹取）、插入/删除（段中点、颜色随左端、首�
   不是文件加密。
 - **颜色标签不参与导出**：它不写 PSD/PNG，只在 `.comp` 与面板里存在。
 
+### 6.107 合并可见 + 反向排列：把「改整篇结构」也纳入渲染不变契约（P1-2 第二批，2026-10-24，Claude）
+
+**缺口。** 上一批补的是图层属性（锁、色标签），这一批补的是两个**一次点击
+改整篇结构**的命令：`图层 > 合并可见`（PS 的 Merge Visible）与
+`图层 > 反向排列`（Reverse Layers）。两者都不带面板、没有参数，但都直接
+改写 `state_.layers` 的向量顺序与成员，是最容易把堆叠顺序或渲染结果改错的一类
+操作。**ABI 尾部追加 2 个导出（171 → 173）。**
+
+**合并可见 = 「参与合成的都烘进去，结果画布必须逐字节不变」。** 难点不在合成
+本身（`composite_merge_subset` 已有），而在**选定谁**：
+
+- 参与集合是「根上**有效可见**的单元」——自可见 + 全部祖先组可见。组隐藏时
+  引擎返回空 surface（`filter_graph.cpp`），所以整棵子树对画布没有贡献；
+- 一旦某个**可见组**入选，它的**全部后代都进烘焙子集**，包括隐藏的孩子。理由：
+  组被烘成一个普通图层后不再有组结构，隐藏孩子只能以普通图层身份留在原位；
+- 隐藏的**根**层完全不进子集，原样留在列表里。
+
+三条必须守住的性质，任何一条破了就不再是「合并」：
+
+1. **画布不变**：烘完立刻 `trim_to_content`，合成结果与合并前逐像素相同。测试
+   里对合并前后的 `composite` 帧做 `memcmp`；
+2. **剪贴到隐藏基底 → 拒绝**。`clipping_factor()` 只看 `clipping_base`，不看
+   可见性；一个可见层剪贴到**隐藏**基底时，单独烘它会把它从「被隐藏基底的
+   alpha 乘过」变成「正常混合」，画布会变。这种情况返回
+   `"visible layer '<name>' is clipped to a hidden layer; merging would change
+   the canvas"`，ABI 映射成 `COMP_ERR_UNSUPPORTED`，文档一字不改；
+3. **参与不足两层就是 no-op**：`contributing < 2` 直接 `changed=false` 返回
+   true，**不开事务**（因此不产生空撤销步）。这一条让「只选中一个层时点合并
+   可见」不会在历史里留下噪声。
+
+合并结果的落点：新图层的**锚点取参与单元里最上面的那个**（`units.back()`），
+继承它的名字，属性归一成 `NORMAL` / 不透明度 1 / 根级；被合并的层从向量里
+摘掉，**被留在列表里的层若父节点在合并集合内，会提升到最近的存活祖先**（否则
+会挂在一个已不存在的组上）；原来指向被合并层的剪贴关系改指向合并结果；最后
+重建**所有**组的 `children` 缓存（向量是权威顺序，`children` 只是缓存，改完
+必须重算）。
+
+**反向排列 = 只动同级顺序，不动像素。** `reverse_layers(parent)`：父节点必须
+存在且是组（根用 `parent = 0`），否则 `NOT_FOUND` / `COMP_ERR_STATE`
+（"not a layer group"）。把该父节点下所有兄弟的槽位顺序反转，同时反转父组的
+`children`，`invalidate_composite`，一个撤销步（"Reverse Layer Order"）。同级
+不足两层同样 no-op 不开事务。因为是同一组图层换顺序，**画布差异恒为 0**——
+探针就是拿这条当断言。
+
+**壳层。** 命令号 1673 / 1674：
+
+- 图层 > **合并可见(&V)** `Ctrl+Alt+E`。加速键不能用 `Ctrl+Shift+E`——那已经
+  是 `kCmdEffectEdit`（效果参数面板）；走 `WM_SYSKEYDOWN` 的
+  `Ctrl+Alt+E` 分支；
+- 图层 > **反向排列(&R)**，无加速键；
+- 两者的可用性都复用 `enabled.layer_flatten`（`layer_count >= 2`），菜单里
+  紧跟「拼合图像」之后；
+- 反向排列的父节点取法：选中层是组就用它自己，否则用它的 `group_parent`
+  （`comp_layer_get_group_info` 回读），都没有就落到根 `0`；
+- 合并可见有锁闸：参与合并的非组可见层里任一被 `ALL`/`PIXELS` 锁住即拒，
+  文案 `layer '<name>' is locked (merge visible)`；这是 ABI 层闸，域层不看锁
+  （与 §6.106 的口径一致）；
+- 失败一律 `set_status(..., "…失败（未改动）")`，no-op 与真合并的状态文案不同，
+  用户能分清「没生效」和「不需要生效」。
+
+**测试钉的七件事**（`tests/test_layer_merge.cpp` 追加 7 个 case）：
+
+| case | 钉住什么 |
+|---|---|
+| `merge_visible_keeps_hidden_layers_and_is_render_invariant` | 隐藏层保留、50% 蓝色并入后像素 (128,0,128,255)、画布不变、撤销/重做各一步 |
+| `merge_visible_bakes_group_and_promotes_hidden_children` | 可见组整体烘焙、组内隐藏孩子被提升到根（`parent==0`）、撤销后父子关系复原 |
+| `merge_visible_refuses_visible_layer_clipped_to_hidden_base` | 剪贴到隐藏基底：报错、`changed=false`、层数与 `undo_depth` 都不变 |
+| `merge_visible_is_noop_with_single_visible_layer` | 只有一层可见 → no-op，不产生撤销步 |
+| `reverse_layers_reverses_root_siblings_and_undoes` | 根级 A,B,C → C,B,A，名字跟随层走，撤销复原 |
+| `reverse_layers_inside_group_keeps_children_in_sync` | 组内反转与 `children` 同步；非组父层报错；空组 no-op |
+| `abi_merge_visible_and_reverse` | ABI 层：`changed` 标志、`NOT_FOUND` / `STATE` 映射、反向两次回到原序 |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_merge_visible` / `comp_layer_reverse` |
+| `engine/domain/document.h`、`engine/domain/document.cpp` | `merge_visible`（有效可见集合、组烘焙、隐藏后代提升、剪贴基底拒绝、锚点取名）/ `reverse_layers` |
+| `engine/abi/src/comp_layer_abi.cpp` | 两个导出：锁闸、<2 参与层的 no-op、错误文案 → `COMP_ERR_UNSUPPORTED` / `COMP_ERR_STATE` 映射 |
+| `tests/test_layer_merge.cpp` | 7 个新 case（722 → 729） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerMergeVisible = 1673`、`kCmdLayerReverse = 1674` |
+| `shells/windows/src/shell_internal.h`、`shell_layers.cpp` | `panel_merge_visible` / `panel_reverse_layers`（父节点推断、no-op 文案） |
+| `shells/windows/src/shell_document.cpp` | 两个 case（排在 `kCmdLayerFlatten` 之后） |
+| `shells/windows/src/shell_window.cpp` | 菜单两项 + 复用 `layer_flatten` 置灰 + `WM_SYSKEYDOWN` `Ctrl+Alt+E` |
+| `scripts/visual_check.py` | 追加 `merge_visible` 场景 6 条 |
+
+**视觉探针实测（`merge_visible` 场景）：** 三可见层里隐藏中间层 → 面板亮像素
+1851 → 1104（行真的少了），**画布差异 0**；`Ctrl+Z` 后面板回到 1851；
+反向排列后面板差异 1674px 而画布差异仍为 0；再反向一次面板差异 **0**（严格
+复原）——结构收敛与渲染不变两条契约分别被钉住。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **729 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **173**（171 → 173，尾部追加 2 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **220 条 / 36 场景 / 0 失败** |
+
+**已知边界：**
+
+- **合并可见只认「有效可见」**：整棵子树因祖先组隐藏而不可见时，它不进子集，
+  也不会被提升——它仍然是那个隐藏组的孩子，组结构原样保留。
+- **不处理智能对象 / 文本层的语义合并**：合并集合里若含未求值的效果
+  （`kUnevaluatedEffectMarker`），走 `merge_subset_is_bakeable` 拒绝，返回
+  `COMP_ERR_UNSUPPORTED` 而不是悄悄丢效果。
+- **反向排列不做「跨组搬动」**：它只反转某一父节点下的兄弟顺序；要跨组移动
+  仍是拖动/`comp_layer_move` 的活。
+
 
 
 

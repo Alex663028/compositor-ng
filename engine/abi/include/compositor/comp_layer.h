@@ -1534,6 +1534,40 @@ COMP_API comp_result comp_layer_set_color_label(comp_document document, comp_lay
 COMP_API comp_result comp_layer_get_color_label(comp_document document, comp_layer_id id,
                                                 uint32_t* out_label);
 
+/* ------------------------------------------- 合并可见 / 反向排列（P1-2 ② 尾部追加） */
+
+/*
+ * 合并可见（对齐 Photoshop 的 Merge Visible；PS 默认 Ctrl+Shift+E，本壳该键已被
+ * 「效果参数」占用，Windows 壳改绑 Ctrl+Alt+E、命令号 1673）：把当前文档里所有
+ * **实际参与合成**的图层（自身可见、且祖先组全部可见）合成一个像素层，落在
+ * 最高的那个参与单元（根级图层或根级组）的槽位；隐藏图层与隐藏组原样保留。
+ *
+ * 语义与边界：
+ *   - 可见组按**整体**烘焙（组内可见子层由合成器处理）；组内的**隐藏**后代
+ *     不参与合并，组消失后被提升到组原来的父级——它们不可见，所以渲染不变；
+ *   - 参与层剪贴到的基底若**不参与**合并（例如可见层剪贴到隐藏层）-> 明确拒绝：
+ *     剪贴因数只看基底像素、不看可见性，剪断剪贴会改变画布；
+ *   - 携带引擎不认识的 effect -> 明确拒绝（烘焙会静默丢弃，与 merge_down 同口径）；
+ *   - 实际贡献像素的图层少于 2 个 -> 空操作：返回 COMP_OK、`*out_changed = 0`，
+ *     不进历史；
+ *   - 一步撤销（加入调用方的显式事务，或自成一个隐式步）。
+ *
+ * `out_layer_id` 可空；非空时写回结果层 id（空操作时写 0）。`out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_merge_visible(comp_document document, comp_layer_id* out_layer_id,
+                                              int32_t* out_changed);
+
+/*
+ * 反向排列（对齐 Photoshop 的 Layer > Arrange > Reverse）：反转 `parent` 下的
+ * **直接**兄弟顺序。`parent == 0` 表示根级；非 0 必须存在且是图层组，否则
+ * COMP_ERR_NOT_FOUND / COMP_ERR_STATE。
+ *
+ * 只重排，不改像素、几何或混合；兄弟少于 2 个时空操作（COMP_OK、
+ * `*out_changed = 0`，不进历史）。一步撤销。`out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_reverse(comp_document document, comp_layer_id parent,
+                                        int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

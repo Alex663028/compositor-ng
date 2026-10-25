@@ -66,7 +66,6 @@ std::size_t document_state_bytes(const DocumentState& state) {
       total += string_bytes(layer.text->text);
       total += string_bytes(layer.text->font_path);
       total += string_bytes(layer.text->font_family);
-    }
   }
   /* 选区蒙版（深拷贝口径，与图层像素/蒙版一致）。 */
   total += state.selection.base.pixel_data().capacity();

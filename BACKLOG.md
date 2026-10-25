@@ -138,13 +138,12 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-24）**：
-日常使用路径 **≈78%**，全功能面 **≈57%**（190 条 PS 核心条目加权，原始命中 104 条）；
 与口径 A/B 的差异原因在该文件 §3 说明。ROI **前 8 项**（字体选择、PSD 分层导出、
 锐化/降噪入口、标尺/参考线/网格/对齐、存储/载入选区通道、组混合模式、HiDPI、
 破坏性 `图像 > 调整`）已全部落地，日常路径 70% → 78%；其后的 P1-6 调整族、
 P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段落框/对齐也已落地
 （§6.95～§6.99）；P0-5 变换选区（§6.102）与 P1-3 数值变换/再次变换（§6.103）
-把选区与变换两个维度的条目继续补齐（全功能面 51% → 57%）。
+（锁/标签、合并可见/反向排列、图层链接、样式拷贝/粘贴、面板过滤、图层复合、
 
 ---
 
@@ -645,4 +644,4 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **162/162 / 29 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`） |
+| 壳自检/视觉探针基线 | 壳自检 **267 项** failures=0、SHA256 `cae18080…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **233/233 / 38 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`） |

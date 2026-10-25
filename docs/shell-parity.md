@@ -3342,4 +3342,45 @@ if (id >= kCmdImageAdjustBase /*1590*/ && id < kCmdImageAdjustBase + 64) { ...; 
 写像素的路径；锁不是文件保护（合成/导出/读盘都不看）；标签不导出到 PSD；
 没有图层链接、按颜色过滤、图层复合（仍在 BACKLOG P1-2）。
 
+### 5.67 合并可见 + 反向排列：两个「无面板」的结构命令（P1-2 第二批，2026-10-24）
+
+引擎侧的语义（有效可见集合、组烘焙、隐藏后代提升、剪贴到隐藏基底拒绝）见
+README §6.107。这一节只记壳层：两个新菜单项、一个加速键冲突、一个父节点推断。
+
+**1. 命令号 1673 / 1674，紧跟拼合之后。** `kCmdLayerMergeVisible = 1673`
+（`图层 > 合并可见(&V)\tCtrl+Alt+E`）、`kCmdLayerReverse = 1674`
+（`图层 > 反向排列(&R)`，无加速键）。两者都不开面板、没有参数，点击即落一步。
+
+**2. 加速键不能用 `Ctrl+Shift+E`。** 它已经是 `kCmdEffectEdit`（效果参数
+面板）。`Ctrl+Alt+E` 不在主加速键表里，走 `WM_SYSKEYDOWN` 里那条
+`Ctrl+Alt` 分支 `case 'E'`。改这块之前先扫一遍 `kCmdEffectEdit` 与主表。
+
+**3. 置灰复用 `enabled.layer_flatten`。** 判据是 `layer_count >= 2`——
+单层文档里两个命令都无事可做。真实的「参与不足两层」由引擎返回
+`changed = 0`，壳侧给不同文案（`…：实际参与合成的图层不足两层（未产生撤销步）`
+/ `…：同级图层不足两层（未产生撤销步）`），与失败文案
+`…失败（未改动）` 三态分明。
+
+**4. 反向排列的父节点要推断。** 命令语义是「反转某一父节点下的兄弟顺序」，
+壳侧只拿到选中行：选中层是组 → 用它自己的 id；否则用它的 `group_parent`
+（`comp_layer_get_group_info` 回读）；再否则根 `0`。这条推断不做缓存，
+每次命令时现读，因为多选/拖动后选中行可能已经换了。
+
+**5. 合并可见先过 ABI 锁闸。** 参与合并的非组可见层里任一被 `ALL`/`PIXELS`
+锁住即整个命令拒绝（`layer '<name>' is locked (merge visible)`）。壳侧不
+自己判锁，交给 ABI——和 §5.66 的「闸在引擎里」保持一致。
+
+**6. 成功后一律 `refresh_layers` + `refresh_history_status`。** 两个命令都真的
+改像素/结构（合并会改画布），所以置 `needs_render`；反向排列虽然画布不变，
+但同样走 `refresh_layers` 重排面板行。`refresh_layers` 会把 `selected_layer`
+夹回合法下标，但**不同步 layer id**——与 `merge_down` / `flatten` 的行为一致，
+不在这里另立规则。
+
+**7. 视觉探针 `merge_visible`（6 条）。** 三可见层隐藏中间层 → 面板亮像素
+1851 → 1104、画布差异 0；`Ctrl+Z` 后 1851 复原；反向排列后面板差异 1674 px、
+画布差异仍 0；再反向一次面板差异 0。断言细节见 manual-test M62。
+
+**8. 已知边界。** 合并可见不处理智能对象 / 未求值效果（含
+`kUnevaluatedEffectMarker` 的子集直接 `COMP_ERR_UNSUPPORTED`）；反向排列只
+反转同级，跨组搬动仍是拖动 / `comp_layer_move` 的活。
 

@@ -276,7 +276,6 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
     return compositor::abi::fail(engine, COMP_ERR_STATE,
                                  "layer is an editable text layer; rasterize it first "
                                  "(comp_layer_rasterize_text)");
-  }
   /* 锁定图像像素：整层像素写入是 PIXELS 明令禁止的入口（含「贴一张新像素」）。
    * 锁定透明像素在这里也拒绝：整份替换无法按原 alpha 裁剪（尺寸/格式都可能变），
    * 与其静默改掉透明区，不如让宿主先解锁或改用绘画类工具。 */
@@ -2254,6 +2253,109 @@ comp_result comp_layer_get_color_label(comp_document document, comp_layer_id id,
     return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
   }
   *out_label = layer->color_label;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/*
+ * 合并可见（P1-2 第二批，ChangeLog：ABI 171 -> 172）。
+ *
+ * 锁闸：不按「选中层」判，而按**参与集合**判——合并会删除每一个参与层，
+ * 所以任意一个参与层带「锁定全部」（或图像像素锁）都应拒绝。错误文案里指出
+ * 具体层名，宿主才能定位。域方法自行管事务，这里不再包 ImplicitTxn。
+ */
+comp_result comp_layer_merge_visible(comp_document document, comp_layer_id* out_layer_id,
+                                     int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /*
+   * 先做空操作短路：没有足够可见层时，锁也不该把「本来什么都不做」变成报错
+   * （PS 里该命令此时是置灰的，不是弹错误）。
+   *
+   * 参与集合 = 自身可见、且祖先组全部可见的非组图层（与 Document::merge_visible
+   * 的 layer_is_effectively_visible 同一把尺子；隐藏组里的「可见」子层不贡献像素，
+   * 既不该计入数量，也不该用它的锁拦下整条命令）。
+   */
+  std::vector<const Layer*> participating;
+  for (const Layer& layer : doc->state().layers) {
+    if (layer.is_group || !layer.visible) continue;
+    bool ancestors_visible = true;
+    for (comp_layer_id parent = layer.parent; parent != 0;) {
+      const Layer* group = doc->find(parent);
+      if (group == nullptr || !group->visible) {
+        ancestors_visible = false;
+        break;
+      }
+      parent = group->parent;
+    }
+    if (ancestors_visible) participating.push_back(&layer);
+  }
+  if (participating.size() < 2) {
+    if (out_layer_id != nullptr) *out_layer_id = 0;
+    if (out_changed != nullptr) *out_changed = 0;
+    return compositor::abi::ok(engine);
+  }
+
+  /*
+   * 参与集合的锁闸：锁是「删改」的闸，合并会让每一层消失，故锁定全部 /
+   * 锁定图像像素都拒绝。锁定透明/位置不拦（合并不改用户对像素/位置的手工意图，
+   * 与 merge_down 只拦 LOCK_ALL 的口径保持一致；这里更严一档，因为合并可见
+   * 会一次删掉很多层，误操作代价更大）。
+   */
+  for (const Layer* layer : participating) {
+    if (!compositor::abi::lock_has(layer->lock_flags, COMP_LAYER_LOCK_ALL) &&
+        !compositor::abi::lock_has(layer->lock_flags, COMP_LAYER_LOCK_PIXELS)) {
+      continue;
+    }
+    std::string message = "layer '" + layer->name + "' is locked (merge visible)";
+    return compositor::abi::fail(engine, COMP_ERR_STATE, message);
+  }
+
+  std::string error;
+  if (!doc->merge_visible(&error, out_layer_id, nullptr)) {
+    const comp_result code = error.find(compositor::kUnevaluatedEffectMarker) != std::string::npos
+                                 ? COMP_ERR_UNSUPPORTED
+                                 : COMP_ERR_STATE;
+    return compositor::abi::fail(engine, code, error);
+  }
+  if (out_changed != nullptr) *out_changed = 1;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/*
+ * 反向排列（P1-2 第二批，ABI 172 -> 173）。
+ *
+ * 只重排，不动内容：锁不拦（PS 里锁定位置/图像后仍可在图层面板里重排）。
+ * 域方法自行管事务。
+ */
+comp_result comp_layer_reverse(comp_document document, comp_layer_id parent,
+                               int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (parent != 0) {
+    const Layer* group = doc->find(parent);
+    if (group == nullptr) {
+      return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "parent layer not found");
+    }
+    if (!group->is_group) {
+      return compositor::abi::fail(engine, COMP_ERR_STATE, "parent is not a layer group");
+    }
+  }
+  std::string error;
+  bool changed = false;
+  if (!doc->reverse_layers(parent, &error, &changed)) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE, error);
+  }
+  if (out_changed != nullptr) *out_changed = changed ? 1 : 0;
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }
