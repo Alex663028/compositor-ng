@@ -100,10 +100,6 @@ COMP_API comp_result comp_document_is_dirty(comp_document document, int32_t* out
 /* 只读查询：文档所属引擎。 */
 COMP_API comp_result comp_document_engine(comp_document document, comp_engine* out_engine);
 
-#ifdef __cplusplus
-} /* extern "C" */
-#endif
-
 /* ------------------------------------------------- ABI 版本握手（OPT-8，尾部追加）
  *
  * comp_engine_desc 只能尾部追加字段；等第一次真正加字段时再启用握手，启用本身
@@ -114,5 +110,10 @@ COMP_API comp_result comp_document_engine(comp_document document, comp_engine* o
 COMP_API comp_result comp_engine_create2(const comp_engine_desc* desc,
                                          size_t desc_size,
                                          comp_engine* out_engine);
+
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* COMPOSITOR_COMP_ENGINE_H */
