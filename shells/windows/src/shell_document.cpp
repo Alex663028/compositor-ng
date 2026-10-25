@@ -1983,6 +1983,19 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerCompStatus:
       panel_layer_comp_status(shell);
       break;
+    /* ---- P1-2 收尾 ⑦：智能对象 / 智能滤镜 ---- */
+    case kCmdLayerSmartConvert:
+      panel_smart_convert(shell);
+      break;
+    case kCmdLayerSmartRasterize:
+      panel_smart_rasterize(shell);
+      break;
+    case kCmdLayerSmartClear:
+      panel_smart_clear_filters(shell);
+      break;
+    case kCmdLayerSmartStatus:
+      panel_smart_status(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);

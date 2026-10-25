@@ -19,6 +19,7 @@
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
 #include "core/comp_geometry.h"
+#include "domain/filters.h"
 #include "domain/text_object.h"
 
 namespace compositor {
@@ -225,6 +226,40 @@ struct Effect {
   std::string settings_json = "{}";
 };
 
+struct SmartFilter {
+  FilterSettings settings;
+  bool enabled = true;
+  std::string name;
+};
+
+/*
+ * 智能对象（P1-2 收尾 ⑦，语义与 text 同款：对象是真源，像素是缓存）。
+ *
+ *   - `source` 是**不可变**的原始像素：创建那一刻图层像素的整份拷贝（共享
+ *     shared_ptr + COW，拷贝图层/历史快照不会复制这份缓冲）。之后任何滤镜都
+ *     只读它，绝不原地改；
+ *   - `filters` 是有序滤镜栈：求值 = source 逐条跑一遍（见
+ *     `filter_render_stack`），栈的顺序就是画面的顺序；
+ *   - 图层 `pixels` 是「source + filters」的**渲染缓存**：合成/缩略图/合并/GPU
+ *     纹理仍走既有像素路径，合成内核不感知智能对象；
+ *   - `source_name` 只用于面板回显与 `.comp` 可读性，不参与求值（可空）。
+ *
+ * 不变量（与文字图层逐条对齐）：
+ *   - 像素写入**只能**经智能滤镜入口（comp_layer_smart_filter_*）；工具算子、
+ *     comp_layer_set_pixels、comp_filter_apply 遇到智能图层一律 COMP_ERR_STATE，
+ *     要求宿主先栅格化——否则「删掉一条滤镜重新求值」会把手绘像素整份抹掉；
+ *   - 求值在**对象像素空间**做（原点 0,0、不读选区）：图层移动/缩放到哪里，
+ *     同一条滤镜都渲出同样的结果，不随文档几何漂移；
+ *   - 随 DocumentState 快照一起进事务/历史，撤销天然一致；
+ *   - 进 `.comp` 的 `engineSmart` 键（可选键，缺键 = 普通图层）：原始像素写到
+ *     `images/<uuid>.smart.png`，渲染结果仍走该层自己的 imageFile。
+ */
+struct SmartObject {
+  ImageBuffer source;
+  std::vector<SmartFilter> filters;
+  std::string source_name;
+};
+
 struct Layer {
   comp_layer_id id = 0;
   std::string name;
@@ -305,6 +340,17 @@ struct Layer {
   std::optional<TextObject> text;
 
   /*
+   * 智能对象（P1-2 收尾 ⑦，语义见上面的 `SmartObject`）。
+   *
+   * 有值时这一层是**智能对象图层**：`smart->source` + `smart->filters` 是唯一
+   * 真源，`pixels` 是它当前求值结果的缓存。与 `text` 互斥：文字图层不能再
+   * 转成智能对象（文字对象本身已经是可编辑真源，两层真源会让「改字号」和
+   * 「删滤镜」互相抹对方的结果）；先栅格化文字再转换。
+   */
+  std::optional<SmartObject> smart;
+
+
+  /*
    * 内容修订号（S18 / R1，设计见 docs/gpu-layer-revision.md §3）。
    *
    * 标识「这一层的图形输入」（像素 / 蒙版 / 效果 / 调整 / 几何 / 混合参数）处于哪个
@@ -363,6 +409,8 @@ struct Layer {
   bool has_pixels() const { return !pixels.empty(); }
   /* 是否为可编辑文字图层（pixels 只是 text 的渲染缓存）。 */
   bool has_text() const { return text.has_value(); }
+  /* 是否为智能对象图层（pixels 只是 source + 滤镜栈的渲染缓存）。 */
+  bool has_smart_object() const { return smart.has_value(); }
 };
 
 }  // namespace compositor

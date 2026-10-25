@@ -331,6 +331,27 @@ void sync_menu_state(HWND window, ShellState& shell) {
   for (UINT id : layer_comp_items) {
     menu_set_enabled_recursive(menu, id, layer_comp_present);
   }
+  /*
+   * P1-2 收尾 ⑦：智能对象三条。转换只要求有选中图层（组 / 文字 / HDR / 锁定由引擎
+   * 判定并在状态栏说明）；栅格化与清除滤镜要求当前层**确实是**智能对象——直接问
+   * 引擎，不用壳侧缓存，撤销掉转换后菜单立刻跟着置灰。
+   */
+  int32_t smart_selected = 0;
+  const comp_layer_id smart_target =
+      shell.doc.document != nullptr ? selected_layer_id(shell) : 0;
+  if (smart_target != 0) {
+    comp_layer_smart_object_is_smart(shell.doc.document, smart_target, &smart_selected);
+  }
+  size_t smart_filter_total = 0;
+  if (smart_selected != 0 &&
+      comp_layer_smart_filter_count(shell.doc.document, smart_target, &smart_filter_total) !=
+          COMP_OK) {
+    smart_filter_total = 0;
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerSmartConvert,
+                             enabled.layer_present && smart_selected == 0);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartRasterize, smart_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartClear, smart_filter_total > 0);
   menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskRemove, enabled.mask_remove);
@@ -4177,6 +4198,17 @@ HMENU build_menu() {
   AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompNext, L"下一个复合(&X)");
   AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_comp_menu),
               L"图层复合(&O)");
+  /*
+   * P1-2 收尾 ⑦：智能对象。转换把当前像素冻结成不可变 source，之后的「滤镜 > 应用」
+   * 变成非破坏的智能滤镜；栅格化丢掉可编辑性、保留当前渲染。清除滤镜整次只落一步
+   * 撤销（壳开显式事务包住逐条删除）。
+   */
+  HMENU smart_menu = CreatePopupMenu();
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartConvert, L"转换为智能对象(&V)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartRasterize, L"栅格化(&R)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartClear, L"清除全部智能滤镜(&X)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
   /*
    * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
    * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。

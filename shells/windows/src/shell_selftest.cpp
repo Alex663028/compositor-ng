@@ -2393,6 +2393,116 @@ int run_selftest(const wchar_t* out_path) {
              "layer comp captures / applies / is idempotent without touching the layer stack");
     }
 
+    /*
+     * P1-2 收尾 ⑦：智能对象 / 智能滤镜。转换 -> 画面逐字节不变、is_smart = 1；
+     * 加一条高斯 -> 栈里 1 条且像素变了（像素是求值缓存）；直接写像素被拒
+     * （必须先栅格化）；栅格化后 is_smart = 0、渲染结果留下。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      comp_layer_id target = 0;
+      size_t listed_one = 0;
+      /* comp_layer_list 的 out_count 是**总数**（不受 capacity 限制），所以这里只要求 >= 1。 */
+      const bool listed_ok =
+          comp_layer_list(doc, &target, 1u, &listed_one) == COMP_OK && listed_one >= 1u;
+      int32_t px_w = 0;
+      int32_t px_h = 0;
+      comp_pixel_format px_fmt = COMP_PIXEL_RGBA8;
+      std::vector<uint8_t> before;
+      if (listed_ok &&
+          comp_layer_get_pixels(doc, target, nullptr, 0, &px_w, &px_h, &px_fmt) == COMP_OK &&
+          px_w >= 4 && px_h >= 4 && px_fmt == COMP_PIXEL_RGBA8) {
+        /*
+         * 不依赖当前图层里恰好有什么（拍平的 PSD 夹具可能是一整块纯色，模糊前后逐字节相同）。
+         * 先画一个已知图案：透明底 + 中央不透明白块。模糊半径 3 必然改动边缘像素。
+         */
+        const size_t stride = static_cast<size_t>(px_w) * 4u;
+        before.assign(stride * static_cast<size_t>(px_h), 0u);
+        const int32_t x0 = px_w / 4;
+        const int32_t y0 = px_h / 4;
+        const int32_t x1 = px_w - px_w / 4;
+        const int32_t y1 = px_h - px_h / 4;
+        for (int32_t y = y0; y < y1; ++y) {
+          for (int32_t x = x0; x < x1; ++x) {
+            uint8_t* px = before.data() + static_cast<size_t>(y) * stride +
+                          static_cast<size_t>(x) * 4u;
+            px[0] = 255u;
+            px[1] = 255u;
+            px[2] = 255u;
+            px[3] = 255u;
+          }
+        }
+        comp_image pattern{};
+        pattern.width = px_w;
+        pattern.height = px_h;
+        pattern.format = COMP_PIXEL_RGBA8;
+        pattern.stride = stride;
+        pattern.pixels = before.data();
+        if (comp_layer_set_pixels(doc, target, &pattern) != COMP_OK) {
+          before.clear();
+        }
+        /* 读回来当基准：写进去的字节未必等于引擎内部存的（预乘等），比较必须以读回为准。 */
+        if (!before.empty()) {
+          std::vector<uint8_t> read_back(before.size(), 0u);
+          int32_t rw = px_w;
+          int32_t rh = px_h;
+          comp_pixel_format rfmt = px_fmt;
+          if (comp_layer_get_pixels(doc, target, read_back.data(), stride, &rw, &rh, &rfmt) ==
+                  COMP_OK &&
+              rw == px_w && rh == px_h) {
+            before.swap(read_back);
+          } else {
+            before.clear();
+          }
+        }
+      }
+      int32_t changed = 0;
+      const bool converted =
+          !before.empty() &&
+          comp_layer_smart_object_create(doc, target, &changed) == COMP_OK && changed == 1;
+      int32_t smart = 0;
+      comp_layer_smart_object_is_smart(doc, target, &smart);
+      std::vector<uint8_t> after_convert(before.size(), 0u);
+      int32_t cw = px_w;
+      int32_t ch = px_h;
+      comp_pixel_format cfmt = px_fmt;
+      const bool pixels_kept =
+          converted && smart == 1 &&
+          comp_layer_get_pixels(doc, target, after_convert.data(),
+                                static_cast<size_t>(cw) * 4u, &cw, &ch, &cfmt) == COMP_OK &&
+          after_convert == before;
+      comp_filter_desc blur{};
+      blur.kind = COMP_FILTER_GAUSSIAN_BLUR;
+      blur.gaussian_blur.radius = 3.0;
+      const bool added =
+          converted && comp_layer_smart_filter_add(doc, target, &blur) == COMP_OK;
+      size_t filters = 0;
+      comp_layer_smart_filter_count(doc, target, &filters);
+      std::vector<uint8_t> after_filter(before.size(), 0u);
+      int32_t fw = px_w;
+      int32_t fh = px_h;
+      comp_pixel_format ffmt = px_fmt;
+      const bool render_changed =
+          added &&
+          comp_layer_get_pixels(doc, target, after_filter.data(),
+                                static_cast<size_t>(fw) * 4u, &fw, &fh, &ffmt) == COMP_OK &&
+          after_filter != before;
+      comp_image write_image{};
+      write_image.width = px_w;
+      write_image.height = px_h;
+      write_image.format = px_fmt;
+      write_image.stride = static_cast<size_t>(px_w) * 4u;
+      write_image.pixels = before.data();
+      const bool refused =
+          converted && comp_layer_set_pixels(doc, target, &write_image) == COMP_ERR_STATE;
+      const bool rasterized =
+          converted && comp_layer_smart_object_rasterize(doc, target) == COMP_OK &&
+          comp_layer_smart_object_is_smart(doc, target, &smart) == COMP_OK && smart == 0;
+      verify(listed_ok && converted && pixels_kept && added && filters == 1 && render_changed &&
+                 refused && rasterized,
+             "smart object converts / adds a smart filter / refuses pixel writes / rasterizes");
+    }
+
     /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
     if (probe_png_exists(probe_path)) {
       open_path_as_document(shell, probe_path);
