@@ -52,9 +52,9 @@ enum {
   COMP_ERR_STATE             = 5,  /* 对象状态不允许该操作 */
   COMP_ERR_BACKEND           = 6,  /* 渲染后端内部错误 */
   COMP_ERR_NOT_FOUND         = 7,  /* 指定对象不存在 */
-  COMP_ERR_ALREADY_EXISTS    = 8,  /* 指定对象已存在 */
+  COMP_ERR_ALREADY_EXISTS    = 8,  /* 指定对象已存在（预留位：本构建不返回，全仓无返回点） */
   COMP_ERR_DECODE            = 9,  /* 解码/解析失败（格式损坏或不兼容） */
-  COMP_ERR_CANCELLED         = 10, /* 操作被取消 */
+  COMP_ERR_CANCELLED         = 10, /* 操作被取消（预留位：本构建不返回，全仓无返回点） */
   COMP_ERR_INTERNAL          = 11  /* 未归类的内部错误 */
 };
 

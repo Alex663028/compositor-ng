@@ -122,6 +122,33 @@ def sha256_of(path: str) -> str:
     return hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
 
 
+def step_blocks_gate(reg: Regression) -> bool:
+    """OPT-7：blocks 逃逸闸。
+
+    engine/imaging 的 clang block 只允许栈内同步用法（comp_blocks_rt.c 的
+    _Block_copy 恒等实现决定了 block 一旦逃逸就是悬垂指针，且该文件自曝的
+    abort 闸在当前构建不可达——见 comp_blocks_rt.c N6 注记）。机械可查的约束：
+    仓内（除 BlocksRuntime 桩自身）不得出现 Block_copy 调用点。
+    """
+    import glob as _glob
+
+    def fn() -> tuple[str, str]:
+        offenders: list[str] = []
+        for path in _glob.glob(os.path.join(ROOT, "engine", "**", "*.[ch]"),
+                               recursive=True) +                 _glob.glob(os.path.join(ROOT, "engine", "**", "*.cpp"), recursive=True):
+            if os.path.basename(path) == "comp_blocks_rt.c":
+                continue  # 桩自身的定义不是调用点
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if "Block_copy(" in line or "Block_copy (" in line:
+                        offenders.append(f"{os.path.relpath(path, ROOT)}:{lineno}")
+        if offenders:
+            return "FAIL", "block 逃逸调用点: " + ", ".join(offenders[:5])
+        return "PASS", "Block_copy 调用点 = 0"
+
+    return reg.step("0. blocks 逃逸闸（Block_copy 调用点 = 0）", fn)
+
+
 def step_build_and_tests(reg: Regression, clean: bool) -> bool:
     title = "1. 全量构建 + 单元测试（build.py" + (" --clean）" if clean else "，增量）")
 
@@ -318,6 +345,7 @@ def main() -> int:
     print("compositor-ng regression "
           f"(clean={not args.keep_build}, ohos={'required' if args.require_ohos else 'auto'})")
 
+    step_blocks_gate(reg)
     step_build_and_tests(reg, clean=not args.keep_build)
     step_windows_shell(reg)
     step_crosscheck(reg, "crosscheck_codec.py", "3. 编解码交叉验证（引擎写 -> PIL 读）", args.python)

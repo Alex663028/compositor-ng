@@ -110,7 +110,7 @@ COMP_TEST(parallel_callback_exception_is_contained) {
   Coverage cover(16);
   comp_parallel_ranges_n(16, cover_range, &cover, 4);
   COMP_CHECK(exactly_once(cover));
-  COMP_CHECK_MSG(comp_parallel_last_error() == nullptr, "clean dispatch clears the diagnostic");
+  COMP_CHECK_MSG(std::string(comp_parallel_last_error()) == "", "clean dispatch clears the diagnostic");
 }
 
 COMP_TEST(parallel_band_threads_defaults_to_sequential) {

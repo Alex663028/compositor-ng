@@ -210,5 +210,7 @@ extern "C" void comp_parallel_ranges(size_t count, comp_range_fn body, void* ctx
 }
 
 extern "C" const char* comp_parallel_last_error(void) {
-  return g_last_error.empty() ? nullptr : g_last_error.c_str();
+  /* OPT-5：与 comp_engine_last_error 统一——无错误返回空串，不返回 nullptr。
+   * 两种「无错误」表达曾并存（"" vs NULL），宿主判空口径只能猜。 */
+  return g_last_error.c_str();
 }

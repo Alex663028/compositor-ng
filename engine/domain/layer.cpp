@@ -2,6 +2,8 @@
 #include "domain/layer.h"
 
 #include <algorithm>
+
+#include "core/comp_geometry.h"  // OPT-6：resize 兜底护栏的 limits 单一真源
 #include <cmath>
 #include <cstring>
 
@@ -10,8 +12,16 @@
 namespace compositor {
 
 void ImageBuffer::resize(int32_t w, int32_t h, comp_pixel_format fmt) {
-  width = std::max(0, w);
-  height = std::max(0, h);
+  /* OPT-6：兜底护栏——调用方理应先过 is_valid_canvas（三处口径见 comp_geometry.h），
+   * 但任何漏网调用都不该把「超大宽高」变成一次整 GB 级分配或溢出。钳到
+   * limits 常量（单一真源），宁可尺寸错误可被发现，不给 OOM 留门。 */
+  w = std::clamp(w, 0, static_cast<int32_t>(compositor::limits::kMaxSide));
+  h = std::clamp(h, 0, static_cast<int32_t>(compositor::limits::kMaxSide));
+  if (static_cast<int64_t>(w) * h > compositor::limits::kMaxSurfacePixels) {
+    h = static_cast<int32_t>(w > 0 ? compositor::limits::kMaxSurfacePixels / w : 0);
+  }
+  width = w;
+  height = h;
   format = fmt;
   writable_pixels().assign(byte_size(), 0);
 }
@@ -239,8 +249,14 @@ bool wide_asset_from_linear(const float* rgba, int32_t width, int32_t height, Im
 }
 
 void MaskBuffer::resize(int32_t w, int32_t h, uint8_t fill_value) {
-  width = std::max(0, w);
-  height = std::max(0, h);
+  /* OPT-6：同 ImageBuffer 的兜底护栏（1 字节/像素，同钳）。 */
+  w = std::clamp(w, 0, static_cast<int32_t>(compositor::limits::kMaxSide));
+  h = std::clamp(h, 0, static_cast<int32_t>(compositor::limits::kMaxSide));
+  if (static_cast<int64_t>(w) * h > compositor::limits::kMaxSurfacePixels) {
+    h = static_cast<int32_t>(w > 0 ? compositor::limits::kMaxSurfacePixels / w : 0);
+  }
+  width = w;
+  height = h;
   writable_pixels().assign(byte_size(), fill_value);
 }
 
