@@ -137,7 +137,12 @@ const VulkanApi& vulkan_api() {
 #if defined(_WIN32)
     a.library = open_library("vulkan-1.dll");
 #else
+    /* 桌面 Linux 的 loader 叫 libvulkan.so.1；OHOS 只提供 libvulkan.so（无 .1
+     * 软链，实测 NDK sysroot）。两个名字都试，探测失败的原因照实进 why_not。 */
     a.library = open_library("libvulkan.so.1");
+    if (a.library == nullptr) {
+      a.library = open_library("libvulkan.so");
+    }
 #endif
     a.create_instance = reinterpret_cast<PFN_vkCreateInstance>(load_symbol(a.library, "vkCreateInstance"));
     a.enumerate_devices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
@@ -158,7 +163,7 @@ bool probe_vulkan(std::string* why_not) {
 #if defined(_WIN32)
       *why_not = "vulkan-1.dll not found";
 #else
-      *why_not = "libvulkan.so.1 not found";
+      *why_not = "libvulkan.so.1 / libvulkan.so not found";
 #endif
     }
     return false;
