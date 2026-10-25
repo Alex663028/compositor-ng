@@ -352,6 +352,20 @@ void sync_menu_state(HWND window, ShellState& shell) {
                              enabled.layer_present && smart_selected == 0);
   menu_set_enabled_recursive(menu, kCmdLayerSmartRasterize, smart_selected != 0);
   menu_set_enabled_recursive(menu, kCmdLayerSmartClear, smart_filter_total > 0);
+  /*
+   * P1-2 收尾 ⑧：填充图层。三种「新建」只要有文档就能点；编辑 / 栅格化 / 状态要求
+   * 当前层**确实是**填充层——同样直接问引擎，撤销掉新建后菜单立刻跟着置灰。
+   */
+  int32_t fill_selected = 0;
+  if (smart_target != 0) {
+    comp_layer_is_fill(shell.doc.document, smart_target, &fill_selected);
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerFillSolid, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillGradient, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillPattern, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillEdit, fill_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerFillRasterize, fill_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerFillStatus, fill_selected != 0);
   menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskRemove, enabled.mask_remove);
@@ -989,7 +1003,7 @@ void commit_color_input(ShellState& shell) {
   set_status(shell, buffer);
 }
 
-void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
+void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift, bool alt) {
   /*
    * P0-1：图层名 / 不透明度键入态是最高的模态。字符本体由 WM_CHAR 送进来
    * （CJK 走 WM_IME_CHAR），这里只处理编辑键；其余按键一律吞掉，理由同其它
@@ -1464,6 +1478,78 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       return;
     }
     /* 其余按键在面板打开时吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
+  /* 填充参数面板输入态（P1-2 收尾 ⑧）：与效果面板同一套输入规矩。 */
+  if (!shell.doc.fill_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.doc.fill_input.clear();
+      set_status(shell, L"已取消输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      fill_panel_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      /* 键入 + 回车 = 落值并立刻应用（新建态则建层），少一次按键。 */
+      fill_panel_commit_input(shell);
+      if (shell.doc.fill_input.empty()) panel_apply_fill(shell);
+      return;
+    }
+    if (key == VK_TAB) {
+      shell.doc.fill_input.clear();
+      fill_panel_move_param(shell, shift ? -1 : 1);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      shell.doc.fill_input.push_back(static_cast<wchar_t>(key));
+      return;
+    }
+    if (key == VK_OEM_PERIOD) {
+      shell.doc.fill_input.push_back(L'.');
+      return;
+    }
+    if (key == VK_OEM_MINUS) {
+      shell.doc.fill_input.push_back(L'-');
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* 填充参数面板打开时，键盘归面板：Esc 只关面板（不关窗），Ctrl 组合仍可穿透。 */
+  if (shell.doc.fill_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        close_fill_panel(shell);
+        return;
+      case VK_TAB:
+        fill_panel_move_param(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        panel_apply_fill(shell);
+        return;
+      case VK_OEM_MINUS:
+        fill_panel_step_value(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        fill_panel_step_value(shell, 1);
+        return;
+      case VK_BACK:
+        fill_panel_reset_values(shell);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      fill_panel_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键在面板打开时吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
     return;
   }
 
@@ -2773,6 +2859,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             refresh_adjustments(*shell);
             /* S24：效果列表同样跟随选中图层，否则菜单勾选与 fx 标记会停在上一层。 */
             refresh_effects(*shell);
+            /* P1-2 收尾 ⑧：填充面板也跟随选中图层（绑定层或退回新建态）。 */
+            refresh_fill(*shell);
             const LayerRow* selected = selected_row(*shell);
             if (selected != nullptr) {
               wchar_t buffer[160];
@@ -2838,6 +2926,44 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (shell->doc.fill_open && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 填充参数行（P1-2 收尾 ⑧）：上半行 = 聚焦，下半行（滑道）= 聚焦 + 拖动。
+             * 行/滑道几何与 draw_fill_panel 同源（ui_core::adjust_param_row_rect /
+             * adjust_slider_track_rect）。布尔没有滑道，点一下就切换。
+             * 面板里点空白也吞掉：面板开着时右栏没有第二个来源。
+             */
+            const int32_t total = static_cast<int32_t>(shell->doc.fill_values.size());
+            const int32_t scroll = comp_ui::adjust_param_clamp_scroll(
+                layout.adjust_panel, total, shell->doc.fill_scroll);
+            shell->doc.fill_scroll = scroll;
+            const int row = comp_ui::adjust_param_row_at(layout.adjust_panel, total, scroll,
+                                                        mouse_x, mouse_y);
+            if (row >= 0) {
+              comp_fill_param param{};
+              if (fill_param_query(*shell, row, &param)) {
+                shell->doc.fill_input.clear();
+                if (param.type == COMP_PARAM_BOOL) {
+                  fill_panel_focus_row(*shell, row);
+                  fill_panel_step_value(*shell, 1);
+                  /* 已绑定则一次写入（一步撤销）；新建态只改缓冲，回车建层。 */
+                  if (shell->doc.fill_layer != 0) panel_apply_fill(*shell);
+                } else if (comp_ui::adjust_row_track_hit(layout.adjust_panel, row, scroll,
+                                                         mouse_x, mouse_y)) {
+                  fill_panel_begin_drag(*shell, layout.adjust_panel, row,
+                                        static_cast<double>(mouse_x));
+                  if (shell->doc.fill_drag_param >= 0) SetCapture(window);
+                } else {
+                  fill_panel_focus_row(*shell, row);
+                }
+              }
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          if (shell->doc.smart_open && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
           if (type_panel_visible(*shell) && layout.adjust_panel.w > 0) {
             /* 点属性行 = 聚焦到该行；行几何与绘制共用 type_param_row_rect。 */
             const int row =
@@ -2865,7 +2991,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
           if (!shell->doc.effect_open && !shell->doc.filter_open && !shell->doc.trim_open &&
-              !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
+              !shell->doc.fill_open && !shell->doc.smart_open &&
+              !type_panel_visible(*shell) &&
+              !font_panel_visible(*shell) &&
               shell->doc.doc_dialog == comp_ui::DocDialogKind::None &&
               !shell->doc.color_range_open && !path_panel_visible(*shell) &&
               !history_panel_visible(*shell) && !channel_panel_visible(*shell) &&
@@ -3247,6 +3375,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             shell->doc.selected_layer = row;
             refresh_adjustments(*shell);
             refresh_effects(*shell);
+            refresh_fill(*shell);
             panel_begin_rename(*shell);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -3304,6 +3433,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       /* P0-3 滑杆松手：提交事务 = 一次拖动只占一步撤销。 */
       if (shell != nullptr && shell->doc.adj_drag_param >= 0) {
         adjust_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /* P1-2 收尾 ⑧ 填充滑杆松手：有实际写入才提交，空拖动不占撤销步。 */
+      if (shell != nullptr && shell->doc.fill_drag_param >= 0) {
+        fill_panel_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -3463,10 +3601,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         /* S24：拖行/框选是「按住鼠标」的临时态，失焦必须取消，否则指示线一直挂着。 */
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
         shell->doc.histogram_drag = false;
         /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
         curve_drag_finish(*shell, false);
         adjust_drag_finish(*shell, false);
+        fill_panel_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 整层拖动被 abort 后画面必须重画，否则图层会「停在」被拖到的位置。 */
@@ -3498,10 +3642,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         guide_drag_cancel(*shell);
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
         shell->doc.histogram_drag = false;
         /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
         curve_drag_finish(*shell, false);
         adjust_drag_finish(*shell, false);
+        fill_panel_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 同上：捕获被抢走时整层拖动也要回滚并重画。 */
@@ -3656,6 +3806,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             adjust_drag_value(*shell, static_cast<double>(mouse_x));
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          /* P1-2 收尾 ⑧ 填充滑杆同理：几何用按下瞬间冻结的滑道。 */
+          if (shell->doc.fill_drag_param >= 0) {
+            fill_panel_drag_value(*shell, static_cast<double>(mouse_x));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           }
           /*
            * S24：图层拖行（超过 4px 阈值才进入 active）与直方图框选优先于工具状态机。
@@ -4007,6 +4164,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           return 0;
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && shell->doc.fill_open &&
+                   !shell->doc.effect_open && !shell->doc.filter_open &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* 填充参数表滚轮翻行：一格 3 行，夹取在 ui_core（图案 10 行会用到）。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int32_t count = static_cast<int32_t>(shell->doc.fill_values.size());
+            const int next = shell->doc.fill_scroll + (delta > 0 ? -3 : 3);
+            shell->doc.fill_scroll =
+                comp_ui::adjust_param_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && shell->doc.smart_open &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
                    !layout.adjust_collapsed && !shell->doc.effect_open && !shell->doc.filter_open &&
                    !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
                    !channel_panel_visible(*shell) &&
@@ -4209,6 +4382,20 @@ HMENU build_menu() {
   AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartClear, L"清除全部智能滤镜(&X)");
   AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  /*
+   * P1-2 收尾 ⑧：新建填充图层。三种 kind 共用一套参数行（参数表由引擎驱动）：
+   * 菜单项 = 开面板 + 用缺省参数立刻建层，之后在面板里调；「编辑」只对已选中的
+   * 填充层生效（kind 取自图层本身，避免用上次的 kind 把渐变改写成纯色）。
+   */
+  HMENU fill_menu = CreatePopupMenu();
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillSolid, L"纯色…(&C)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillGradient, L"渐变…(&G)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillPattern, L"图案…(&P)");
+  AppendMenuW(fill_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillEdit, L"编辑填充参数(&E)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillRasterize, L"栅格化填充(&Z)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillStatus, L"状态（种类/参数）");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fill_menu), L"新建填充图层(&F)");
   /*
    * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
    * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。

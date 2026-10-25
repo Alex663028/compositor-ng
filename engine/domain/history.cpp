@@ -81,6 +81,11 @@ std::size_t document_state_bytes(const DocumentState& state) {
       total += layer.smart->filters.capacity() * sizeof(SmartFilter);
       total += string_bytes(layer.smart->source_name);
     }
+    /* 填充层：参数是真源，settings 字符串随快照一起进历史（同 text/adjustments 口径）。 */
+    if (layer.fill) {
+      total += sizeof(FillLayer);
+      total += string_bytes(layer.fill->settings_json);
+    }
   }
   /* 选区蒙版（深拷贝口径，与图层像素/蒙版一致）。 */
   total += state.selection.base.pixel_data().capacity();

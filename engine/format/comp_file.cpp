@@ -14,6 +14,7 @@
 #include "compositing/resample.h"
 #include "core/comp_geometry.h"
 #include "domain/document.h"
+#include "domain/fill_layer.h"
 #include "domain/filters.h"
 #include "domain/guide.h"
 #include "domain/selection.h"
@@ -577,6 +578,18 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
    */
   if (layer.smart) {
     j.set("engineSmart", smart_to_json(*layer.smart, uuid));
+  }
+  /*
+   * 填充图层（engineFill）：同一条「缺键 = 普通图层」。settings 按**字符串**落盘，
+   * 与 engineAdjustments[].settings 同一口径——参数由参数表校验，落盘不需要解码成
+   * JSON 对象，往返因此逐字节保真。imageFile 照常写：那是渲染缓存，让不认识本键的
+   * 读方看到的仍是正确画面（与 engineText / engineSmart 一致）。
+   */
+  if (layer.fill) {
+    JsonValue fill = JsonValue::object({});
+    fill.set("kind", JsonValue::integer(static_cast<long long>(layer.fill->kind)));
+    fill.set("settings", JsonValue::string(layer.fill->settings_json));
+    j.set("engineFill", std::move(fill));
   }
   /*
    * 图层锁（engineLock）与颜色标签（engineColorLabel）：同一条「默认值不写」。
@@ -1523,6 +1536,21 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
         if (smart_from_json(*smart_entry, root, &smart, &why)) layer.smart = std::move(smart);
       }
 
+      /* engineFill：缺键 = 普通图层。kind 越界或 settings 过不了参数表（键白名单 /
+       * 类型 / 量程）就整份丢弃——像素已由 imageFile 读回，画面不变，只是失去
+       * 可编辑性；好过让一份非法参数决定下一次重渲的结果。与 engineText /
+       * engineSmart / 图层组互斥（同一层只能有一个真源），手改过的 manifest 也按
+       * 这一条处理。 */
+      const JsonValue* fill_entry = entry.find("engineFill");
+      if (fill_entry != nullptr && fill_entry->is_object() && !layer.text && !layer.smart &&
+          !layer.is_group) {
+        const long long fill_kind = fill_entry->integer_or("kind", 0);
+        const std::string fill_settings = fill_entry->string_or("settings", "{}");
+        if (fill_kind > 0 && fill_kind <= 4294967295LL &&
+            fill_validate_settings(static_cast<uint32_t>(fill_kind), fill_settings, nullptr)) {
+          layer.fill = FillLayer{static_cast<uint32_t>(fill_kind), fill_settings};
+        }
+      }
 
       uuid_to_id[uuid] = layer.id;
       state.layers.push_back(std::move(layer));

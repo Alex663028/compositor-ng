@@ -18,124 +18,19 @@
 #include <cstring>
 
 #include "domain/curves_settings.h"
+#include "domain/settings_json_util.h"
 #include "format/comp_json.h"
 
 namespace compositor {
 namespace {
-/* 纯数字段 = 数组下标（Levels 的 ranges.0 / Curves 的 channels.0）。 */
-bool segment_index(const std::string& text, size_t* out) {
-  if (text.empty() || text.size() > 6) return false;
-  size_t value = 0;
-  for (const char c : text) {
-    if (c < '0' || c > '9') return false;
-    value = value * 10 + static_cast<size_t>(c - '0');
-  }
-  *out = value;
-  return true;
-}
 
-/* 按点分路径定位叶子；中间段缺失视为「未提供」（合法），中间段存在但类型不符视为错误。 */
-const JsonValue* locate_leaf(const JsonValue& root, const char* path, bool* malformed) {
-  const JsonValue* current = &root;
-  const char* cursor = path;
-  while (true) {
-    const char* dot = std::strchr(cursor, '.');
-    const size_t length = dot != nullptr ? static_cast<size_t>(dot - cursor) : std::strlen(cursor);
-    const std::string key(cursor, length);
-    size_t slot = 0;
-    if (segment_index(key, &slot)) {
-      if (!current->is_array()) {
-        *malformed = true;
-        return nullptr;
-      }
-      if (slot >= current->as_array().size()) return nullptr;
-      current = &current->as_array()[slot];
-    } else {
-      if (!current->is_object()) {
-        *malformed = true;
-        return nullptr;
-      }
-      const JsonValue* next = current->find(key);
-      if (next == nullptr) return nullptr;
-      current = next;
-    }
-    if (dot == nullptr) return current;
-    cursor = dot + 1;
-  }
-}
-
-std::string number_to_text(double value) {
-  char buffer[32];
-  const bool integral = std::fabs(value - std::floor(value)) < 1e-9;
-  if (integral) {
-    std::snprintf(buffer, sizeof(buffer), "%.0f", value);
-  } else {
-    std::snprintf(buffer, sizeof(buffer), "%g", value);
-  }
-  return std::string(buffer);
-}
-
-/* 点分路径切段。 */
-std::vector<std::string> split_path(const char* path) {
-  std::vector<std::string> segments;
-  const std::string text(path);
-  size_t start = 0;
-  while (start <= text.size()) {
-    const size_t dot = text.find('.', start);
-    segments.push_back(text.substr(start, dot == std::string::npos ? std::string::npos : dot - start));
-    if (dot == std::string::npos) break;
-    start = dot + 1;
-  }
-  return segments;
-}
-
-/*
- * 在（可能是新建的）对象/数组树里按段路径放置叶子。JsonValue 只有 const find，故用重建式赋值。
- * 已存在的中间对象/数组会被保留并继续向下合并，而非整棵替换；数字段按数组下标处理，
- * 缺位补 null（Levels 的 ranges 由此从空树长成 4 元素数组）。
- */
-JsonValue set_path(const JsonValue& node, const std::vector<std::string>& segments, size_t index,
-                   JsonValue value) {
-  size_t slot = 0;
-  if (segment_index(segments[index], &slot)) {
-    JsonValue result = node.is_array() ? node : JsonValue::array({});
-    if (index + 1 == segments.size()) {
-      result.set_index(slot, std::move(value));
-      return result;
-    }
-    const JsonValue* child =
-        (node.is_array() && slot < node.as_array().size()) ? &node.as_array()[slot] : nullptr;
-    const JsonValue next = child != nullptr ? *child : JsonValue();
-    result.set_index(slot, set_path(next, segments, index + 1, std::move(value)));
-    return result;
-  }
-  JsonValue result = node.is_object() ? node : JsonValue::object({});
-  if (index + 1 == segments.size()) {
-    result.set(segments[index], std::move(value));
-    return result;
-  }
-  const JsonValue* child = node.is_object() ? node.find(segments[index]) : nullptr;
-  const JsonValue next = child != nullptr ? *child : JsonValue::object({});
-  result.set(segments[index], set_path(next, segments, index + 1, std::move(value)));
-  return result;
-}
-
-namespace {
-
-bool parse_bool_text(const std::string& text, bool* out) {
-  if (text == "1" || text == "true" || text == "TRUE" || text == "True") {
-    *out = true;
-    return true;
-  }
-  if (text == "0" || text == "false" || text == "FALSE" || text == "False") {
-    *out = false;
-    return true;
-  }
-  return false;
-}
-
-}  // namespace
-
+/* 路径工具与填充图层共用（见 domain/settings_json_util.h）。 */
+using settings_json::locate_leaf;
+using settings_json::number_to_text;
+using settings_json::parse_bool_text;
+using settings_json::segment_index;
+using settings_json::set_path;
+using settings_json::split_path;
 
 #define COMP_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 

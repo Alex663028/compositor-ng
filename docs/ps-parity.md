@@ -111,16 +111,21 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 | 21 | ~~按类型/名称/颜色过滤图层面板（P1-2 第五批）~~ **已落地（2026-10-25，README §6.110）** | 【壳层】S（**零 ABI**） | 图层维不单独加分（PS 里它是面板的筛选器，不是独立条目），但把「20 层以上找一层」从滚动变成一次点击 | 七种类型（像素/文字/组/调整/填充/智能对象/全部）+ 8 个颜色标签 + 名称子串，AND 语义；命中的祖先组保留（否则子层失去缩进上下文），一趟遍历同时算命中与保留祖先并带环保护；ASCII 大小写折叠；纯视图态，不碰文档、不进历史。命令号 1680..1700 |
 | 22 | ~~图层复合（P1-2 第六批）~~ **已落地（2026-10-25，README §6.111）** | 【ABI 追加】+【引擎】S–M | 图层维 **19/20**（智能对象/复合/填充层三件全命中）；全功能面 59% → 61% | 尾部追加 10 个 `comp_layer_comp_*` 导出（178 → 188）。一份复合 = 每层的 `{layer, visible, opacity}` 快照；`apply` 跳过已删除的条目，id 单调递增且永不复用，上限 128 份 / 名字 1024 字节；持久化在清单级 `engineLayerComps`（空表不写键）。壳层 1701..1708 |
 | 23 | ~~智能对象 / 智能滤镜（P1-2 第七批）~~ **已落地（2026-10-25，README §6.112）** | 【ABI 追加】+【引擎】M–L | 智能对象在条目口径里算 1 条（智能滤镜是其子项，不重复计）；日常路径 85% → 87% | 尾部追加 8 个导出（188 → 196）。核心是**滤镜在对象空间求值**：存参数不存烘过的像素，反复改参不累积插值误差，`enabled=0` 保留参数只跳求值；文字/组/HDR 拒绝转换，16 位降 RGBA8，直写像素 `COMP_ERR_STATE`，栅格化保留当前渲染。持久化 `engineSmart` + 原始像素写 `sourceFile`。壳层 1710..1726（转换 / 栅格化 / 整栈清除 / 状态 + 智能滤镜栈面板：逐条列出 / 开关 / 改参数 / 删除，README §6.114）。**收尾批（§6.115）再尾部追加 3 个导出（208 → 211）**：`_move`（取出再插入、整栈重求值 = 一步撤销、锁像素拒绝）、`_set_name` / `_name`（纯元数据、不改画面、锁像素也能改名、空名回退类型名），壳侧 Alt+↑/↓、拖动行、F2 改名，命令号 1724..1726 |
+| 24 | ~~填充层（P1-2 第八批 = 收尾）~~ **已落地（2026-10-25，README §6.113）** | 【ABI 追加】+【引擎】M | 全功能面 61% → **62%**（命中 106 → 109）；P1-2 全部条目关闭 | 尾部追加 12 个导出（196 → 208）：三种 kind 的名称/参数表、`_validate`/`_default_settings`/`_read_value`/`_build_settings` 与 `comp_layer_add_fill`/`_set_fill`/`_get_fill`/`_is_fill`/`_rasterize_fill`。第四次贯彻「参数是真源，像素是缓存」：`Layer::fill` 与 `text`/`smart`/组互斥，同值 no-op 不进历史，栅格化像素逐字节不变。壳层 1714..1719，面板跟随选中层，拖拽滑杆 = 一步撤销 |
 
 不推荐现在做：色彩管理 / 打印 / 自动化 / 多文档 / 3D·视频。它们是独立子系统，
 在「日常路径」权重里合计不足 5%，投入产出比最差（BACKLOG §7 阶段 G）。
 
 ---
 
+## 5. 本轮验证基线（2026-10-25 实跑）
 
 | 项 | 结果 |
 |---|---|
+| `scripts/build.py` | **772 例 / 0 失败**（§6.115 新增调序、改名校验/撤销、往返 3 例：769 → 772） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（772 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
 | 壳自检 | **267 项 failures=0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批；其后 §6.94～§6.109 未改自检项，§6.110～§6.113 追加 4 项——面板过滤、图层复合、智能对象/智能滤镜、填充层——基线同步到 267 项；§6.114/§6.115 未改自检项，SHA256 不变） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（回归步骤 6 rc=0 复核；121 = 118 + 3 个新翻译单元 `fill_layer.cpp`、`comp_fill_abi.cpp`、`shell_fill.cpp`；复合与智能对象写进既有文件，不增单元） |
 | `^COMP_API` 导出 | **211**（152 → 158 → 163 → 164 → 166 → 167 → 171 → 173 → 176 → 178 → 188 → 196 → 208 → 211，全部尾部追加、无重排：6 个 `comp_guide_*`、5 个 `comp_selection_channel_*`、`comp_layer_apply_adjustment`、`comp_selection_grow`/`comp_selection_similar`、`comp_selection_transform`、4 个 `comp_layer_*_lock` / `color_label`、`comp_layer_merge_visible`/`comp_layer_reverse`、`comp_layer_link`/`unlink`/`get_link`、`comp_layer_export_style`/`comp_layer_import_style`（178），10 个 `comp_layer_comp_*`（188），8 个 `comp_layer_smart_object_*` / `comp_layer_smart_filter_*`（196），12 个 `comp_layer_*_fill` 与填充参数表（208），`comp_layer_smart_filter_move`/`_set_name`/`_name`（211）；§6.97/§6.104 只追加枚举值，§6.98 只追加枚举/结构体与 `comp_tool_op_desc` 尾字段） |
 | `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
 | `scripts/visual_check.py --scene all` | **233 条 / 38 场景 / 0 失败**（追加过 `font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`，并扩了 `destructive_adjust` 的 Photo Filter / Auto Tone 两条；§6.110～§6.113 未新增场景，条数不变；既有阈值未动） |

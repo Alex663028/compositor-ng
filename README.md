@@ -7954,6 +7954,67 @@ Ctrl+J 复制成完全重合的两层 → `Ctrl` 点选两层 → 1675 链接 �
 ### 6.109 图层样式拷贝/粘贴：把「效果栈」当成一份可搬运的报文（P1-2 第四批，2026-10-24，Claude）
 
 **缺口。** P1-2 第四批：PS 的「拷贝图层样式 / 粘贴图层样式」。本项目的
+「图层样式」就是层的**效果栈**（`Effect { kind, settings_json }`），此前只能一层
+一层用 `comp_layer_set_effect` 摆出来；换个层想复用同一套投影+描边，壳层没有
+任何入口，用户只能逐个效果重配。这一批补的是**整栈搬运**：引擎导出/导入，
+壳层只当剪贴板。**ABI 尾部追加 2 个导出（176 → 178）。**
+
+**为什么放在引擎而不是壳层循环。** 壳层当然可以「读每个 kind、再逐个
+`set_effect`」把栈抄过去，但那样有三处会失真：`settings_json` 要经过壳层的
+解析再序列化（数字精度、未知键、键顺序都可能被磨掉）；效果数量要壳层自己数；
+「整栈替换」还得壳层先逐个清空（中途失败会留下半份样式）。所以导出/导入做成
+引擎导出，壳层拿到的是**已经序列化好的报文**，原样存、原样粘。
+
+**报文格式 = `.comp` 的 `engineEffects`。** 同一个数组形状，同一套转义口径：
+
+```
+[{"effect":2,"settings":"{\"color\":[255,0,0,255]}"}, ...]
+```
+
+`settings` 始终是**字符串**，引擎不在导出/导入时解释它——未知键、数字写法、
+键顺序逐字往返。导出用 `json_dump(value, 0)` 紧凑序列化；`.comp` 写盘用的是
+缩进 2 的 manifest，所以两者只保证**形状与转义口径一致**，不要求逐字节相同——
+共享的契约是「`settings` 原文不动」，这就够让「存盘再打开」与「拷贝再粘贴」
+走同一条数据语义。
+
+**导出：两段式缓冲 + 拒绝而不是截断。** `out_size` 必填（不含结尾 NUL，与
+`comp_layer_effect_at` 同口径，宿主按 `out_size + 1` 分配）。`style_json_utf8 ==
+NULL` 或 `capacity == 0` 只回报长度，不碰缓冲；缓冲不够
+`COMP_ERR_INVALID_ARGUMENT`（文案 `"style buffer is too small (see out_size)"`）——
+截断的 JSON 不是 JSON，静默返回会让宿主把半份样式粘进去。没有样式导出 `"[]"`，
+这是**合法空栈**，粘贴它就是清空目标层样式。
+
+两条对称的拒绝：
+
+- **图层组** `COMP_ERR_UNSUPPORTED`（`"layer groups do not render layer styles"`）：
+  合成时组根本不求值自己的 `effects`（`blend_layer_into` 对组早退），导出它等于
+  承诺一次永远不会发生的渲染；导入同理，组层没有可被替换的「渲染中的样式」。
+- **本引擎不求值的 effect kind**（更高版本 `.comp` 读进来的）同样
+  `COMP_ERR_UNSUPPORTED`，且**整层先查完再生成报文**——不产出「粘到一半才发现
+  有项粘不回来」的剪贴板。
+
+**导入：整份替换，不按 kind 合并。** 对齐 PS 的 Paste Layer Style：目标层原有
+效果栈被整份取代。合并语义（保留目标层独有项、只用剪贴板覆盖同名项）会让连续
+两次粘贴叠加出用户没见过的样式。参数闸全部先于状态改动：
+
+- 报文必须是数组；每项是对象，带**整数** `effect` 与**字符串** `settings`；
+  非整数（2.9）、负数一律 `COMP_ERR_INVALID_ARGUMENT`——不允许被静默截断成
+  相邻的合法 kind；
+- 同一 kind 出现两次 → `COMP_ERR_INVALID_ARGUMENT`（PS 的效果栈每种最多一份，
+  重复项无法定义谁覆盖谁）；
+- 越界 / 不求值的 kind → `COMP_ERR_UNSUPPORTED`；
+- 其余形状错误 → `COMP_ERR_INVALID_ARGUMENT`（报文由本引擎导出，走到这里就是
+  宿主传错了，不是用户输入）。
+
+**幂等与一步撤销。** 结果栈与现状**逐项相同**（kind 与 settings 字符串都相同）
+→ `COMP_OK` 且 `changed = 0`，**不落撤销步**；壳层「粘贴到所有选中层」因此可以
+无脑循环。有改动时走 `ImplicitTxn("Paste Layer Style")`（调用方已开显式事务时
+自动加入），并 `touch_layer` 推进内容修订号——样式参与像素求值，不换修订号
+合成/GPU 缓存会复用旧结果。锁与 `comp_layer_set_effect` 同口径：
+`lock_gate(..., COMP_LAYER_LOCK_ALL)` → `COMP_ERR_STATE`，**图像像素锁不拦**
+（改样式不改像素）。
+
+**壳层：剪贴板在宿主的会话状态里。** 两个引擎调用都是无状态的，样式块存在
 `ShellState::layer_style_clipboard`（`std::string`），所以「在文档 A 拷贝、切到
 文档 B 粘贴」可用——这正是 PS 的行为。命令号 **1676 / 1677**：
 
@@ -8139,8 +8200,80 @@ parent 环不能把面板挂死。
 | `shells/windows/src/shell_layers.cpp` | `panel_smart_convert` / `rasterize` / `clear_filters` / `status` |
 | `shells/windows/src/shell_window.cpp`、`shell_document.cpp` | 「智能对象」子菜单 + 可用性、case 分派 |
 
+### 6.113 填充图层：纯色 / 渐变 / 图案，参数是真源（P1-2 第八批 = 收尾，2026-10-25，Claude）
+
+**缺口。** P1-2 的最后一项，也是「参数是真源」的**第四次**应用。此前渐变/图案只能
+烘成像素（`comp_tool_apply(COMP_TOOL_GRADIENT)` 之类），改颜色就得重画。填充图层把
+`{kind, settings}` 存成图层的真源，像素由引擎按参数渲染——与文字层、调整层、智能
+对象同一族。**ABI 尾部追加 12 个导出（196 → 208）**：
+
+- 参数表与报文：`comp_fill_kind_name` / `_kind_param_count` / `_kind_param_at` /
+  `_validate` / `_default_settings` / `_read_value` / `_build_settings`；
+- 图层：`comp_layer_add_fill` / `_set_fill` / `_get_fill` / `_is_fill` / `_rasterize_fill`。
+
+**三种 kind 与它们的参数**（`COMP_FILL_SOLID` / `GRADIENT` / `PATTERN`，参数表在
+`engine/domain/fill_layer.cpp`，壳层一行都不抄）：
+
+| kind | 参数（引擎给出的量程/缺省） |
+|---|---|
+| 纯色 | `color.red/green/blue/alpha`，各 0..255，缺省 128/128/128/255 |
+| 渐变 | 起点色、终点色（RGBA）、`angle` 0..360、`reverse` 布尔；缺省红→蓝、0° |
+| 图案 | `pattern` 0..3（四种内置）、`size` 2..256 缺省 16、前景/背景 RGBA |
+
+**互斥与闸门。** `Layer::fill` 与 `text` / `smart` / 组互斥——同一层只能有一个真源，
+切换必须走栅格化或删除。直接写像素（`comp_layer_set_pixels`、工具算子）返回
+`COMP_ERR_STATE`；锁定全部 → 参数写入也是 `COMP_ERR_STATE`（填充参数改的就是渲染
+结果）。`comp_layer_set_fill` **幂等**：kind 与 settings 都相同 → `changed = 0`、不重渲、
+不落撤销步；`comp_layer_rasterize_fill` 丢掉参数、保留像素，对普通层是 no-op。
+
+**报文。** `build_settings` 的输入是**扁平字符串数组**（按参数表顺序），输出是紧凑
+JSON，构造结果再过一次 `comp_fill_validate` 才回报 `COMP_OK`。与
+`comp_layer_effect_build_settings` 不同，它**没有 base-json 深合并参数**：每种 kind
+的顶层键白名单是闭合的（`root_allowed`），不存在需要原样带回去的未知键；`.comp` 读侧
+对过不了校验的 `engineFill` 整块丢弃，也不会把未知键留下来。
+
+**`.comp`。** 逐层键 `engineFill = { "kind": 1, "settings": "{\"color\":[...]}" }`，
+`settings` 按**字符串**落盘（与 `engineText` / `engineEffects` 同口径）。缺键 = 普通
 图层；kind 越界、settings 过不了参数表、或与 `engineText` / `engineSmart` / 组同时
 出现 → 整块丢弃，读方看到的仍是普通像素层。
+
+**壳层面板。** 命令号 **1714..1719**：图层 > **新建填充图层** > 纯色 / 渐变 / 图案
+（开面板 + 立刻按缺省参数建层），另有「编辑填充参数 / 栅格化填充 / 状态」。面板与
+调整/效果面板同款几何（行高 34、页脚 180、滚轮 `adjust_param_*`），**跟随选中图层**：
+选中层是填充层就绑定它并回填既有参数，不是就退回「新建态」（回车才建层）——不会
+出现「面板显示 A 的色值、回车写进 B」。
+
+拖动滑杆时按下即开显式事务，拖动途中的每次写回都在事务里，松手 commit =
+**一步撤销**；参数没变则 `comp_txn_abort`（空拖动不产生撤销步）；Esc / 失焦 / 捕获
+丢失一律 abort 回滚。实时预览帧只在事务内可见，关面板或换层即收口。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_fill_*` 枚举/结构/12 个导出（两段式字符串、幂等、互斥契约） |
+| `engine/domain/fill_layer.h/.cpp` | 参数表、`fill_render`（纯色 / 角度渐变 / 四种图案平铺） |
+| `engine/abi/src/comp_fill_abi.cpp` | 参数表导出、settings 构造/校验/回读、图层增改查/栅格化 |
+| `engine/format/comp_file.cpp` | `engineFill` 读写（字符串 settings，非法即整块丢弃） |
+| `tests/test_fill_layers.cpp` | 11 个 case（建层渲染/撤销、非法输入零副作用、参数表与渲染一致、渐变角度、图案平铺确定性、set 幂等与写像素闸、类型混淆、栅格化保留渲染、锁定闸、`.comp` 往返、普通工程无填充键） |
+| `shells/windows/src/shell_fill.cpp` | 面板全部逻辑：参数行、键入、步进、拖动事务、应用/新建/编辑/栅格化/状态 |
+| `shells/windows/src/shell_paint.cpp` | `draw_fill_panel`（行/滑道/焦点带/滚动标签/页脚/提示） |
+| `shells/windows/src/shell_window.cpp`、`shell_document.cpp`、`shell_layers.cpp` | 键/鼠标/滚轮链路、六个命令分派、「新建填充图层」子菜单与可用性、`refresh_fill` 汇合点 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **768 例 / 0 失败**（742 → 768：复合 +5、智能对象 +10、填充层 +11） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（768 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线一致（新增 4 项：过滤 / 复合 / 智能对象 / 填充层） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（118 → 121：新增 `fill_layer.cpp`、`comp_fill_abi.cpp`、`shell_fill.cpp` 三个翻译单元；复合与智能对象都写进了既有文件） |
+| `^COMP_API` 导出 | **208**（178 → 208，尾部追加 30：复合 10、智能对象 8、填充层 12） |
+| `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
+
+**P1-2 收尾后的边界：** 填充层只有**两色标线性渐变**（多色标/径向/角度/菱形渐变
+在渐变工具那条线上，见 §6.98 / §6.105）；图案只有四种内置，没有「从图层定义图案」；
+智能滤镜只支持引擎已在的滤镜族（`COMP_FILTER_*`），逐条参数复用滤镜面板、没有为
+智能滤镜单开一套控件（条目顺序与名字见 §6.114 / §6.115）；图层
+复合不包含混合模式与效果。这些都是**已知边界**，不是遗漏。
 
 整栈清除 / 状态」四个命令：引擎的 `comp_layer_smart_filter_at` / `_set` / `_remove`
 一条都没接 UI，用户想改某一条的半径、临时关掉某一条、删掉中间那条，只能整栈清除再

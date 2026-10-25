@@ -1755,6 +1755,115 @@ COMP_API comp_result comp_layer_comp_entry(comp_document document, comp_layer_co
                                            size_t index, comp_layer_id* out_layer,
                                            uint8_t* out_visible, float* out_opacity);
 
+/* ------------------------------------------- 填充图层（P1-2 收尾 ⑧，尾部追加） */
+
+/*
+ * 填充图层与文字图层、智能对象同族：**参数是真源，图层像素是渲染缓存**
+ * （见 domain/fill_layer.h）。
+ *
+ *   - 有 `comp_layer_is_fill` 为真的图层，其像素由 `kind + settings` 唯一决定；
+ *   - 改参数 = 整幅重渲这一层的像素缓存，其它图层逐字节不动；
+ *   - 直接写像素（comp_layer_set_pixels / 工具算子 / comp_filter_apply）遇到
+ *     填充图层一律 COMP_ERR_STATE，要求宿主先 rasterize——否则「改一次渐变
+ *     颜色」会把手绘像素整份抹掉；
+ *   - 与文字图层、智能对象、图层组三者互斥（同一层只能有一个真源）。
+ *
+ * 本轮追加只增函数与枚举，不改前序结构体布局（冻结面不变）。
+ */
+typedef enum comp_fill_kind {
+  COMP_FILL_NONE = 0,     /* 不是填充层（JSON 内同样表示「缺键」） */
+  COMP_FILL_SOLID = 1,    /* 纯色 */
+  COMP_FILL_GRADIENT = 2, /* 两色标线性渐变 */
+  COMP_FILL_PATTERN = 3,  /* 内置图案平铺 */
+} comp_fill_kind;
+
+#define COMP_FILL_KIND_COUNT 4
+
+/* 单个填充参数的元数据（布局与 comp_adjustment_param 同口径）。 */
+typedef struct comp_fill_param {
+  const char* json_path; /* 相对 settings 的点分键路径 */
+  const char* label;     /* 面板显示名（ASCII） */
+  comp_param_type type;  /* COMP_PARAM_NUMBER / COMP_PARAM_BOOL */
+  double min_value;
+  double max_value;
+  double default_value;
+  uint32_t flags; /* 保留，恒为 0 */
+} comp_fill_param;
+
+/* kind 的显示名（COMP_FILL_NONE 返回 "None"）；kind 越界 -> COMP_ERR_INVALID_ARGUMENT。 */
+COMP_API comp_result comp_fill_kind_name(uint32_t kind, const char** out_name);
+
+/* 该 kind 的参数数量（0 表示无逐参数面板，如 COMP_FILL_NONE）。 */
+COMP_API comp_result comp_fill_kind_param_count(uint32_t kind, size_t* out_count);
+
+/* 取第 index 个参数的元数据（index 越界 -> COMP_ERR_INVALID_ARGUMENT）。 */
+COMP_API comp_result comp_fill_kind_param_at(uint32_t kind, size_t index,
+                                             comp_fill_param* out_param);
+
+/*
+ * 只校验不写入：kind 合法且 settings 通过顶层键白名单与取值范围校验时返回 COMP_OK。
+ * 缺键合法（= 用缺省值）；未知键 -> INVALID_ARGUMENT（每 kind 的参数表封闭）。
+ */
+COMP_API comp_result comp_fill_validate(uint32_t kind, const char* settings_json_utf8);
+
+/* 该 kind 的缺省 settings JSON（两段式：capacity 为 0 时只回报长度）。 */
+COMP_API comp_result comp_fill_default_settings(uint32_t kind, char* settings_json_utf8,
+                                                size_t capacity, size_t* out_size);
+
+/*
+ * 从 settings JSON 按 json_path 读标量叶子（面板回填用）：命中数值写 out_number、
+ * 命中布尔写 out_boolean（0/1）；路径缺失或非标量返回 COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_fill_read_value(const char* settings_json_utf8, const char* json_path,
+                                          double* out_number, int32_t* out_boolean);
+
+/*
+ * 由面板扁平值构造 settings JSON（引擎侧组装，外壳不写 JSON）：
+ * values[i] 对应 kind_param_at(kind, i)，ASCII 文本（布尔 "0"/"1"），空串 = 沿用缺省。
+ * values 可少于 param_count（缺的按空串处理）。两段式：capacity 为 0 时只回报长度。
+ * 构造结果再过一次 comp_fill_validate 才回报 COMP_OK。
+ */
+COMP_API comp_result comp_fill_build_settings(uint32_t kind, const char* const* values,
+                                              size_t value_count, char* settings_json_utf8,
+                                              size_t capacity, size_t* out_size);
+
+/*
+ * 新建填充图层：kind 必须 1..3，settings 先校验再渲染（渲染在事务之前，失败则
+ * 不建层、不消耗图层 id、不进撤销栈）。图层尺寸 = 当前画布尺寸、原点 (0,0)、
+ * 混合 Normal、不透明度 1；缺省名由 kind 决定（"Color Fill" / "Gradient Fill" /
+ * "Pattern Fill"）。`out_id` 可空。一步撤销。
+ */
+COMP_API comp_result comp_layer_add_fill(comp_document document, uint32_t kind,
+                                         const char* settings_json_utf8, comp_layer_id* out_id);
+
+/*
+ * 改既有填充图层的参数（kind 与 settings 一并替换，校验/渲染同 add）。
+ * 目标必须是填充图层，否则 COMP_ERR_STATE（不把普通图层悄悄变成填充层）。
+ * 参数与当前相同 -> `*out_changed = 0`、不落撤销步；否则一步撤销。
+ * `out_changed` 可空。锁定全部拦（改参数 = 重写整层像素缓存）。
+ */
+COMP_API comp_result comp_layer_set_fill(comp_document document, comp_layer_id id, uint32_t kind,
+                                         const char* settings_json_utf8, int32_t* out_changed);
+
+/*
+ * 读填充图层的 kind 与 settings JSON（两段式：capacity 为 0 时只回报长度）。
+ * 非填充图层 -> COMP_ERR_STATE。
+ */
+COMP_API comp_result comp_layer_get_fill(comp_document document, comp_layer_id id,
+                                         uint32_t* out_kind, char* settings_json_utf8,
+                                         size_t capacity, size_t* out_size);
+
+/* 是否填充图层（1/0）。只读，不开事务。 */
+COMP_API comp_result comp_layer_is_fill(comp_document document, comp_layer_id id,
+                                        int32_t* out_is_fill);
+
+/*
+ * 栅格化：丢掉填充参数，图层变成普通像素图层（像素缓存原样保留）。
+ * 非填充图层 -> 幂等返回 COMP_OK（与 comp_layer_rasterize_text 同口径）；
+ * 锁定全部拦。一步撤销（本来就非填充层时不落步）。
+ */
+COMP_API comp_result comp_layer_rasterize_fill(comp_document document, comp_layer_id id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

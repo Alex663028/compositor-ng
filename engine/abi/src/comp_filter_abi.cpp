@@ -269,6 +269,13 @@ comp_result comp_layer_smart_object_create(comp_document document_handle, comp_l
                                  "layer is an editable text layer; rasterize it first "
                                  "(comp_layer_rasterize_text)");
   }
+  /* 填充层同理：参数已是真源，再叠一层 source 会让「改渐变颜色」与「删滤镜」
+   * 互相抹掉对方的结果。先 rasterize 把画面固定下来。 */
+  if (layer->has_fill()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "layer is a fill layer; rasterize it first "
+                                 "(comp_layer_rasterize_fill)");
+  }
   if (!layer->has_pixels()) {
     return compositor::abi::fail(engine, COMP_ERR_STATE, "layer has no pixels");
   }

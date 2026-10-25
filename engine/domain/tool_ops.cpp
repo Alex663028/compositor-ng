@@ -739,6 +739,10 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
     return bad_state(
         "layer is a smart object; rasterize it before running pixel tools");
   }
+  /* 填充图层同一条规矩：pixels 是 kind + settings 的渲染缓存，改参数就整份重渲。 */
+  if (layer->has_fill()) {
+    return bad_state("layer is a fill layer; rasterize it before running pixel tools");
+  }
   if (!layer->has_pixels()) return bad_state("layer has no pixels");
   /*
    * 锁定透明像素（P1-2 第一批）：只在 RGBA8 上做 alpha 还原。16 位/HDR 的

@@ -600,6 +600,14 @@ bool build_psd_document(const compositor::Document& doc, compositor::PsdDocument
       }
       return false;
     }
+    /* 填充层在 PSD 里是 Solid Color / Gradient / Pattern Fill 调整层：本子集只写
+     * 像素层，写成普通像素层就等于静默丢掉「参数是真源」这份可编辑性。 */
+    if (layer.has_fill()) {
+      if (error != nullptr) {
+        *error = "PSD: 填充图层 '" + layer.name + "' 无法写成 PSD（PSD 子集不含填充图层）";
+      }
+      return false;
+    }
     if (!layer.adjustments.empty()) {
       if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 带调整图层参数，无法写成 PSD";
       return false;

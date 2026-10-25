@@ -955,6 +955,13 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   channel_panel_close(shell);
   shell.doc.trim_open = false;
   shell.doc.trim_input.clear();
+  /* P1-2 收尾 ⑧：填充面板同样让位；拖动可能持有捕获与事务，先收口再清状态。 */
+  if (shell.doc.fill_open) {
+    fill_panel_drag_finish(shell, false);
+    shell.doc.fill_open = false;
+    shell.doc.fill_input.clear();
+    shell.doc.fill_layer = 0;
+  }
 
   shell.doc.doc_dialog = kind;
   shell.doc.doc_dialog_focus = 0;
@@ -1995,6 +2002,25 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdLayerSmartStatus:
       panel_smart_status(shell);
+      break;
+    /* ---- P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案） ---- */
+    case kCmdLayerFillSolid:
+      panel_add_fill(shell, COMP_FILL_SOLID);
+      break;
+    case kCmdLayerFillGradient:
+      panel_add_fill(shell, COMP_FILL_GRADIENT);
+      break;
+    case kCmdLayerFillPattern:
+      panel_add_fill(shell, COMP_FILL_PATTERN);
+      break;
+    case kCmdLayerFillEdit:
+      panel_edit_fill(shell);
+      break;
+    case kCmdLayerFillRasterize:
+      panel_rasterize_fill(shell);
+      break;
+    case kCmdLayerFillStatus:
+      panel_fill_status(shell);
       break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:

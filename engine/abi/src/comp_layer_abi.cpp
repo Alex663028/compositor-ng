@@ -391,6 +391,13 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
                                  "layer is a smart object; rasterize it first "
                                  "(comp_layer_smart_object_rasterize)");
   }
+  /* 填充图层同理：pixels 是 kind + settings 的渲染缓存。要改画面就改参数
+   * （comp_layer_set_fill），要保留当前画面再手绘就先 rasterize。 */
+  if (layer->has_fill()) {
+    return compositor::abi::fail(engine, COMP_ERR_STATE,
+                                 "layer is a fill layer; rasterize it first "
+                                 "(comp_layer_rasterize_fill)");
+  }
   /* 锁定图像像素：整层像素写入是 PIXELS 明令禁止的入口（含「贴一张新像素」）。
    * 锁定透明像素在这里也拒绝：整份替换无法按原 alpha 裁剪（尺寸/格式都可能变），
    * 与其静默改掉透明区，不如让宿主先解锁或改用绘画类工具。 */

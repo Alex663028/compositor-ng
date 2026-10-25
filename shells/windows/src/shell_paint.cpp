@@ -745,6 +745,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     if (row.link_group != 0) marks += L"~";
     /* P1-2 收尾 ⑦：S = 智能对象（像素只是 source + 滤镜栈的求值缓存）。 */
     if (row.is_smart != 0) marks += L"S";
+    /* P1-2 收尾 ⑧：F = 填充层（像素只是 kind + settings 的渲染缓存）。 */
+    if (row.fill_kind != 0) marks += L"F";
     /*
      * P0-1：行内显示图层名（引擎是唯一真源，refresh_layers 回读）。
      * 名称为空（旧引擎 / 查询失败）时回落到 id，面板不至于变成空行。
@@ -1481,6 +1483,156 @@ void draw_effect_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
       L"Esc 关闭面板",
   };
   int hint_y = bottom - 120;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
+/*
+ * 填充图层参数面板（P1-2 收尾 ⑧）。行几何与调整/效果面板同源（ui_core.h 的
+ * adjust_param_* 系列）：绘制、命中、滚动三处用的是同一组函数。参数名与量程
+ * 全部来自引擎参数表，壳里没有第二份。
+ */
+void draw_fill_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[256];
+  int y = panel_rect.y + 8;
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"填充图层（Fill Layer）";
+  TextOutW(dc, left + 10, y, title, lstrlenW(title));
+  y += 22;
+
+  const uint32_t kind = shell.doc.fill_kind;
+  const char* kind_name = nullptr;
+  if (comp_fill_kind_name(kind, &kind_name) != COMP_OK || kind_name == nullptr) kind_name = "Fill";
+  SetTextColor(dc, RGB(150, 210, 255));
+  if (shell.doc.fill_layer != 0) {
+    wsprintfW(line, L"%s · 目标：图层 #%I64u", widen_ascii(kind_name).c_str(),
+              static_cast<unsigned long long>(shell.doc.fill_layer));
+  } else {
+    wsprintfW(line, L"%s · 目标：新建图层（回车建层）", widen_ascii(kind_name).c_str());
+  }
+  TextOutW(dc, left + 10, y, line, lstrlenW(line));
+
+  int32_t total = 0;
+  {
+    size_t count = 0;
+    if (comp_fill_kind_param_count(kind, &count) == COMP_OK) total = static_cast<int32_t>(count);
+  }
+  const int scroll = comp_ui::adjust_param_clamp_scroll(panel_rect, total, shell.doc.fill_scroll);
+  const int visible = comp_ui::adjust_param_visible_rows(panel_rect);
+  if (total == 0) {
+    SetTextColor(dc, RGB(200, 170, 120));
+    const wchar_t* note = L"（该填充类型没有可面板编辑的参数）";
+    TextOutW(dc, left + 10, panel_rect.y + comp_ui::kAdjustParamRowsTop, note, lstrlenW(note));
+  }
+
+  for (int32_t row = scroll; row < total && row < scroll + visible; ++row) {
+    comp_fill_param param{};
+    if (!fill_param_query(shell, row, &param)) break;
+    const comp_ui::Rect row_rect = comp_ui::adjust_param_row_rect(panel_rect, row, scroll);
+    const bool focused = row == shell.doc.fill_param;
+    if (focused) {
+      RECT highlight{row_rect.x + 4, row_rect.y - 1, row_rect.right() - 6, row_rect.bottom() - 1};
+      HBRUSH brush = CreateSolidBrush(RGB(56, 76, 120));
+      FillRect(dc, &highlight, brush);
+      DeleteObject(brush);
+    }
+    const size_t index = static_cast<size_t>(row);
+    const std::string value =
+        index < shell.doc.fill_values.size() ? shell.doc.fill_values[index] : std::string("?");
+    std::wstring shown;
+    if (focused && !shell.doc.fill_input.empty()) {
+      shown = L"输入中：";
+      shown += shell.doc.fill_input;
+    } else if (param.type == COMP_PARAM_BOOL) {
+      shown = value == "1" ? L"true" : L"false";
+    } else {
+      shown = widen_ascii(value.c_str());
+    }
+    const std::wstring label = widen_ascii(param.label != nullptr ? param.label : "");
+    SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    TextOutW(dc, row_rect.x + 12, row_rect.y + 1, label.c_str(), lstrlenW(label.c_str()));
+    /* 数值右对齐，和滑道两端对齐，拖动时眼睛不用在行里找。 */
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, shown.c_str(), lstrlenW(shown.c_str()), &extent);
+    TextOutW(dc, row_rect.right() - 12 - extent.cx, row_rect.y + 1, shown.c_str(),
+             lstrlenW(shown.c_str()));
+    if (param.type == COMP_PARAM_BOOL) continue;
+
+    const comp_ui::Rect track = comp_ui::adjust_slider_track_rect(row_rect);
+    const int mid = track.y + track.h / 2;
+    HBRUSH groove = CreateSolidBrush(RGB(44, 48, 58));
+    RECT groove_rect{track.x, mid - 2, track.right(), mid + 2};
+    FillRect(dc, &groove_rect, groove);
+    DeleteObject(groove);
+
+    const double number = std::atof(value.c_str());
+    const int knob_x = static_cast<int>(std::lround(
+        comp_ui::adjust_slider_knob_x(track, number, param.min_value, param.max_value)));
+    if (knob_x > track.x) {
+      HBRUSH filled = CreateSolidBrush(RGB(78, 126, 208));
+      RECT fill_rect{track.x, mid - 2, knob_x, mid + 2};
+      FillRect(dc, &fill_rect, filled);
+      DeleteObject(filled);
+    }
+    HBRUSH knob = CreateSolidBrush(focused ? RGB(255, 240, 190) : RGB(214, 220, 232));
+    RECT knob_rect{knob_x - 3, track.y + 2, knob_x + 4, track.bottom() - 2};
+    FillRect(dc, &knob_rect, knob);
+    DeleteObject(knob);
+  }
+
+  /* 滚动位置：只在参数表长于可视行数时出现（图案 10 行会用到）。 */
+  if (comp_ui::adjust_param_max_scroll(panel_rect, total) > 0) {
+    const int last_row = scroll + visible < total ? scroll + visible : total;
+    wsprintfW(line, L"%d-%d / %d", scroll + 1, last_row, total);
+    SetTextColor(dc, RGB(150, 154, 166));
+    SIZE extent{};
+    GetTextExtentPoint32W(dc, line, lstrlenW(line), &extent);
+    TextOutW(dc, panel_rect.right() - 12 - extent.cx, panel_rect.y + 30, line, lstrlenW(line));
+  }
+
+  /* 底部固定区：上「settings 规模 / 绑定状态」，下快捷键提示（不跟参数表滚走）。 */
+  const int footer_top = bottom - comp_ui::kAdjustPanelFooter;
+  int footer_y = footer_top + 2;
+  SetTextColor(dc, RGB(180, 184, 196));
+  size_t settings_size = 0;
+  if (shell.doc.fill_layer != 0 && shell.doc.document != nullptr) {
+    comp_layer_get_fill(shell.doc.document, shell.doc.fill_layer, nullptr, nullptr, 0,
+                        &settings_size);
+  }
+  wsprintfW(line, L"参数 %d 项 · settings %u 字节 · %s", total,
+            static_cast<unsigned>(settings_size),
+            shell.doc.fill_layer != 0 ? L"回车应用改动（幂等，没改不落撤销步）"
+                                      : L"回车新建填充图层（一步撤销）");
+  TextOutW(dc, left + 10, footer_y, line, lstrlenW(line));
+  footer_y += 18;
+  wsprintfW(line, L"%s", shell.doc.fill_input.empty() ? L"" : L"（输入态：回车提交 · Esc 取消）");
+  TextOutW(dc, left + 10, footer_y, line, lstrlenW(line));
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"图层 > 新建填充图层 > 纯色 / 渐变 / 图案",
+      L"Tab / Shift+Tab 切参数（面板跟随选中图层）",
+      L"拖动滑杆或 - / = 调值 · 数字键输入",
+      L"回车：新建态建层，已绑定则应用参数",
+      L"Backspace 重置为默认值 · Esc 关闭",
+  };
+  int hint_y = bottom - 96;
+  for (const wchar_t* hint : hints) {
+    TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
+    hint_y += 18;
+  }
+}
+
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;
@@ -3029,6 +3181,10 @@ void present(HWND window, ShellState& shell) {
       draw_effect_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.doc.filter_open) {
       draw_filter_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.doc.fill_open) {
+      draw_fill_panel(memory_dc, shell, layout.adjust_panel);
+    } else if (shell.doc.smart_open) {
+      draw_smart_panel(memory_dc, shell, layout.adjust_panel);
     } else if (shell.tool == comp_ui::ToolId::Type) {
       draw_type_panel(memory_dc, shell, layout.adjust_panel);
     } else {
