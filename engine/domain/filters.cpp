@@ -921,6 +921,12 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     return fail(COMP_ERR_STATE,
                 "layer is a smart object; add the filter to its smart filter stack instead");
   }
+  /* 填充图层同理：pixels 由 kind + settings 渲出，烤进去会在下一次改参数时整份
+   * 丢掉。要滤镜就把画面固定下来（comp_layer_rasterize_fill）。 */
+  if (layer->has_fill()) {
+    return fail(COMP_ERR_STATE,
+                "layer is a fill layer; rasterize it before applying a filter");
+  }
   if (!layer->has_pixels()) return fail(COMP_ERR_STATE, "filter layer has no pixels");
 
   const SelectionState& selection = document->state().selection;

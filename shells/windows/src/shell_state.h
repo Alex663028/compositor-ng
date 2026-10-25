@@ -352,6 +352,19 @@ constexpr UINT kCmdLayerSmartConvert = 1710;   /* 图层 > 智能对象 > 转换
 constexpr UINT kCmdLayerSmartRasterize = 1711; /* 图层 > 智能对象 > 栅格化 */
 constexpr UINT kCmdLayerSmartClear = 1712;     /* 图层 > 智能对象 > 清除全部智能滤镜 */
 constexpr UINT kCmdLayerSmartStatus = 1713;    /* 状态栏报智能滤镜条数 */
+/*
+ * P1-2 收尾 ⑧：新建填充层（1714 段）。
+ *
+ * 纯色 / 渐变 / 图案三种 kind 共用一个参数面板（参数表由引擎的
+ * comp_fill_kind_param_at 驱动），所以菜单只报三个「新建」，编辑参数与栅格化
+ * 各一个动作。填充层的「参数是真源、像素是缓存」由引擎持有。
+ */
+constexpr UINT kCmdLayerFillSolid = 1714;     /* 图层 > 新建填充图层 > 纯色… */
+constexpr UINT kCmdLayerFillGradient = 1715;  /* 图层 > 新建填充图层 > 渐变… */
+constexpr UINT kCmdLayerFillPattern = 1716;   /* 图层 > 新建填充图层 > 图案… */
+constexpr UINT kCmdLayerFillEdit = 1717;      /* 编辑当前填充层的参数 */
+constexpr UINT kCmdLayerFillRasterize = 1718; /* 栅格化填充层 */
+constexpr UINT kCmdLayerFillStatus = 1719;    /* 状态栏报填充层种类/参数 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -406,6 +419,18 @@ struct LayerRow {
   uint8_t flip_x = 0;
   uint8_t flip_y = 0;
   int32_t effect_count = 0; /* 本层已有效果的个数（菜单标勾、面板标 fxN） */
+  /*
+   * P1-2 收尾：图层面板过滤用的只读类型快照。三者都从 ABI 回读，与 has_mask /
+   * is_group 同一口径；过滤只读它们，不改文档。
+   *   - is_text：可编辑文字图层（text 对象存在，像素只是渲染缓存）；
+   *   - adjustment_count：调整层判定（>0 即调整层；PS 的「调整图层」过滤项）；
+   *   - fill_kind：填充层种类（0 = 非填充层，1 纯色 / 2 渐变 / 3 图案）；
+   *   - is_smart：智能对象（像素只读、滤镜非破坏）。
+   */
+  uint8_t is_text = 0;
+  int32_t adjustment_count = 0;
+  uint32_t fill_kind = 0;
+  uint8_t is_smart = 0;
   /*
    * P0-1：名字来自 comp_layer_get_name（UTF-8），面板只读回读结果。
    * 壳侧**不再自持名字**——重命名、撤销、合并、读盘之后名字都可能变，
@@ -586,6 +611,22 @@ struct DocumentContext {
   std::vector<std::string> effect_values;
   std::wstring effect_input;
   std::string effect_base_json;
+  /*
+   * P1-2 收尾 ⑧：新建填充层。三种 kind 共用一套参数行（参数表由引擎驱动），
+   * 所以只有一个面板；fill_values 与参数表按下标对齐，写入时整体交给
+   * comp_fill_build_settings 组装 JSON（缺省项/越界由引擎校验）。
+   */
+  bool fill_open = false;
+  uint32_t fill_kind = 0;               /* 1 纯色 / 2 渐变 / 3 图案 */
+  comp_layer_id fill_layer = 0;         /* 面板编辑的目标层；0 = 新建态 */
+  int32_t fill_param = 0;               /* 聚焦的可编辑参数序号 */
+  std::vector<std::string> fill_values; /* 与参数表对齐的 ASCII 编辑值 */
+  std::wstring fill_input;              /* 键入缓冲；非空 = 输入态 */
+  int32_t fill_drag_param = -1;
+  comp_ui::Rect fill_drag_track{}; /* 拖动期间冻结的轨道（指针 -> 值换算用） */
+  comp_txn fill_drag_txn = nullptr;
+  bool fill_drag_dirty = false;
+  int32_t fill_scroll = 0;
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
   /* P1-4：一笔内 WM_POINTER 笔压采样（整笔取平均；_begin 清零）。 */

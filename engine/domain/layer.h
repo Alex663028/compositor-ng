@@ -260,6 +260,21 @@ struct SmartObject {
   std::string source_name;
 };
 
+/*
+ * 填充层参数（P1-2 收尾 ⑧）：kind（1 纯色 / 2 渐变 / 3 图案）+ settings JSON。
+ *
+ * 与智能对象同一条语义：参数是唯一真源，图层 `pixels` 是由它渲出的缓存
+ * （见 domain/fill_layer.h 的 `fill_render`）。改参数 = 重渲这一层的像素；
+ * 直接写像素会让参数与画面分叉，所以 ABI 一律 COMP_ERR_STATE 要求先栅格化。
+ *
+ * `kind` 的取值与 ABI `comp_fill_kind` 一致；`settings_json` 的键名/量程由
+ * fill_layer.h 的参数表校验。进 `.comp` 的 `engineFill` 键（可选键，缺键 = 普通图层）。
+ */
+struct FillLayer {
+  uint32_t kind = 0;
+  std::string settings_json = "{}";
+};
+
 struct Layer {
   comp_layer_id id = 0;
   std::string name;
@@ -349,6 +364,14 @@ struct Layer {
    */
   std::optional<SmartObject> smart;
 
+  /*
+   * 填充层（P1-2 收尾 ⑧，语义见上面的 `FillLayer`）。
+   *
+   * 有值时这一层是**填充图层**：`fill->kind` + `fill->settings_json` 是真源，
+   * `pixels` 是 `fill_render` 渲出的缓存。与文字图层、智能对象两者互斥
+   * （同一层只能有一个真源，否则两条写路径会互相抹掉对方的结果）。
+   */
+  std::optional<FillLayer> fill;
 
   /*
    * 内容修订号（S18 / R1，设计见 docs/gpu-layer-revision.md §3）。
@@ -411,6 +434,8 @@ struct Layer {
   bool has_text() const { return text.has_value(); }
   /* 是否为智能对象图层（pixels 只是 source + 滤镜栈的渲染缓存）。 */
   bool has_smart_object() const { return smart.has_value(); }
+  /* 是否为填充图层（pixels 只是 fill 参数的渲染缓存）。 */
+  bool has_fill() const { return fill.has_value(); }
 };
 
 }  // namespace compositor

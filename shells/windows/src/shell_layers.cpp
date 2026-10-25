@@ -1165,6 +1165,18 @@ void refresh_layers(ShellState& shell) {
     if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK) {
       row.is_smart = smart != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
     }
+    /*
+     * P1-2 收尾 ⑧：填充层标记。is_fill 是只读判定（不开事务），get_fill 再取种类
+     * 供过滤与行内 F 标记；两者都失败时保持 0 = 当作普通图层，不会被过滤掉。
+     */
+    int32_t is_fill = 0;
+    if (comp_layer_is_fill(shell.doc.document, id, &is_fill) == COMP_OK && is_fill != 0) {
+      uint32_t fill_kind = 0;
+      if (comp_layer_get_fill(shell.doc.document, id, &fill_kind, nullptr, 0, nullptr) ==
+          COMP_OK) {
+        row.fill_kind = fill_kind;
+      }
+    }
     shell.doc.layers.push_back(row);
   }
 
@@ -1198,6 +1210,8 @@ void refresh_layers(ShellState& shell) {
   refresh_adjustments(shell);
   /* S24：效果列表与调整列表同一数据源（选中图层），同一刷新汇合点。 */
   refresh_effects(shell);
+  /* P1-2 收尾 ⑧：填充面板同理——选中层换了，绑定的填充层（或新建态）跟着换。 */
+  refresh_fill(shell);
   /*
    * S22：直方图随后同步。挂在这里而不是每个写入口各调一次，是因为
    * refresh_layers 已经是全部变更路径（滤镜 / 工具 / 撤销 / 合并 / 打开文档）

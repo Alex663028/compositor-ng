@@ -232,6 +232,28 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_smart_convert(ShellState& shell);
   void panel_smart_rasterize(ShellState& shell);
   void panel_smart_clear_filters(ShellState& shell);
+  /* P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案，参数表由引擎驱动）。 */
+  bool fill_param_query(const ShellState& shell, int32_t row, comp_fill_param* out);
+  void refresh_fill(ShellState& shell);
+  void open_fill_panel(ShellState& shell, uint32_t kind);
+  void close_fill_panel(ShellState& shell);
+  void fill_panel_focus_row(ShellState& shell, int32_t row);
+  void fill_panel_move_param(ShellState& shell, int32_t delta);
+  void fill_panel_step_value(ShellState& shell, int32_t direction);
+  void fill_panel_begin_input(ShellState& shell, wchar_t character);
+  void fill_panel_backspace(ShellState& shell);
+  void fill_panel_commit_input(ShellState& shell);
+  void fill_panel_reset_values(ShellState& shell);
+  bool build_fill_settings_json(const ShellState& shell, std::string* out_json);
+  void panel_apply_fill(ShellState& shell);
+  void panel_add_fill(ShellState& shell, uint32_t kind);
+  void panel_edit_fill(ShellState& shell);
+  void panel_rasterize_fill(ShellState& shell);
+  void panel_fill_status(ShellState& shell);
+  void fill_panel_begin_drag(ShellState& shell, const comp_ui::Rect& panel, int32_t row,
+                             double x);
+  void fill_panel_drag_value(ShellState& shell, double x);
+  void fill_panel_drag_finish(ShellState& shell, bool commit);
   void refresh_layers(ShellState& shell);
   const LayerRow* selected_row(const ShellState& shell);
   void panel_move_selection(ShellState& shell, int32_t delta);
@@ -679,6 +701,7 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void draw_doc_dialog(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_effect_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
+  void draw_fill_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_color_range_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_path_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_history_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
@@ -754,7 +777,7 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void curve_delete_point(ShellState& shell, int32_t index);
   void curve_set_channel(ShellState& shell, int32_t channel);
   void adjust_set_channel(ShellState& shell, int32_t channel);
-  void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift);
+  void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift, bool alt);
   LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
   HMENU build_menu();
   const char* backend_name(comp_backend backend);

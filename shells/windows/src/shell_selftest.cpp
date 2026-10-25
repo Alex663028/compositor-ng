@@ -2503,6 +2503,93 @@ int run_selftest(const wchar_t* out_path) {
              "smart object converts / adds a smart filter / refuses pixel writes / rasterizes");
     }
 
+    /*
+     * P1-2 收尾 ⑧：填充图层（纯色）。走壳的面板路径（菜单项 = 开面板 + 缺省参数建层）：
+     * 文档层数 +1、顶层 is_fill = 1 且 kind 是纯色；像素是该纯色的均匀渲染（缺省
+     * 128/128/128/255）；直接写像素被拒（参数才是真源）；栅格化后 is_fill = 0、
+     * 像素原样留下。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      size_t count_before = 0;
+      comp_size canvas{};
+      const bool before_ok =
+          doc != nullptr && comp_layer_count(doc, &count_before) == COMP_OK &&
+          comp_document_size(doc, &canvas) == COMP_OK && canvas.width > 0 && canvas.height > 0;
+      panel_add_fill(shell, COMP_FILL_SOLID);
+      size_t count_after = 0;
+      comp_layer_id fill_id = 0;
+      size_t listed = 0;
+      bool added = before_ok && comp_layer_count(doc, &count_after) == COMP_OK &&
+                   count_after == count_before + 1;
+      if (added) {
+        /*
+         * 数组序**自下而上**（compositor 按 state_.layers 顺序合成，面板再逆序显示），
+         * 新层是 push_back 上去的，所以栈顶是最后一个 id——不是 [0]。
+         */
+        std::vector<comp_layer_id> stack_ids(count_after, 0u);
+        added = comp_layer_list(doc, stack_ids.data(), stack_ids.size(), &listed) == COMP_OK &&
+                listed >= 1u;
+        if (added) {
+          /* out_count 是总数，不受 capacity 限制：先夹一次再取最后一个。 */
+          if (listed > stack_ids.size()) listed = stack_ids.size();
+          fill_id = stack_ids[listed - 1u];
+        }
+      }
+      int32_t is_fill = 0;
+      uint32_t fill_kind = COMP_FILL_NONE;
+      const bool described =
+          added && comp_layer_is_fill(doc, fill_id, &is_fill) == COMP_OK && is_fill != 0 &&
+          comp_layer_get_fill(doc, fill_id, &fill_kind, nullptr, 0, nullptr) == COMP_OK &&
+          fill_kind == COMP_FILL_SOLID;
+      /* 纯色 = 整幅均匀：逐像素与首像素比，且首像素就是缺省色（读回值，不假设预乘细节）。 */
+      std::vector<uint8_t> pixels;
+      int32_t px_w = 0;
+      int32_t px_h = 0;
+      comp_pixel_format px_fmt = COMP_PIXEL_RGBA8;
+      bool uniform = false;
+      if (described &&
+          comp_layer_get_pixels(doc, fill_id, nullptr, 0, &px_w, &px_h, &px_fmt) == COMP_OK &&
+          px_w > 0 && px_h > 0) {
+        const size_t stride = static_cast<size_t>(px_w) * 4u;
+        pixels.assign(stride * static_cast<size_t>(px_h), 0u);
+        if (comp_layer_get_pixels(doc, fill_id, pixels.data(), stride, &px_w, &px_h, &px_fmt) ==
+            COMP_OK) {
+          uniform = pixels[0] == 128u && pixels[1] == 128u && pixels[2] == 128u &&
+                    pixels[3] == 255u;
+          for (size_t i = 4; uniform && i + 3 < pixels.size(); i += 4) {
+            uniform = pixels[i] == pixels[0] && pixels[i + 1] == pixels[1] &&
+                      pixels[i + 2] == pixels[2] && pixels[i + 3] == pixels[3];
+          }
+        }
+      }
+      comp_image write_image{};
+      write_image.width = px_w;
+      write_image.height = px_h;
+      write_image.format = px_fmt;
+      write_image.stride = static_cast<size_t>(px_w) * 4u;
+      write_image.pixels = pixels.empty() ? nullptr : pixels.data();
+      const bool refused = !pixels.empty() &&
+                           comp_layer_set_pixels(doc, fill_id, &write_image) == COMP_ERR_STATE;
+      const bool rasterized =
+          described && comp_layer_rasterize_fill(doc, fill_id) == COMP_OK &&
+          comp_layer_is_fill(doc, fill_id, &is_fill) == COMP_OK && is_fill == 0;
+      /* 栅格化只丢参数、不重渲：像素必须逐字节不变。 */
+      bool kept = false;
+      if (rasterized && !pixels.empty()) {
+        std::vector<uint8_t> after(pixels.size(), 0u);
+        int32_t aw = px_w;
+        int32_t ah = px_h;
+        comp_pixel_format afmt = px_fmt;
+        kept = comp_layer_get_pixels(doc, fill_id, after.data(),
+                                     static_cast<size_t>(px_w) * 4u, &aw, &ah, &afmt) == COMP_OK &&
+               after == pixels;
+      }
+      close_fill_panel(shell); /* 面板别跨段留着：后面还要换文档 */
+      verify(added && described && uniform && refused && rasterized && kept,
+             "fill layer creates / renders uniformly / refuses pixel writes / rasterizes");
+    }
+
     /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
     if (probe_png_exists(probe_path)) {
       open_path_as_document(shell, probe_path);
