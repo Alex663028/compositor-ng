@@ -253,6 +253,9 @@ void sync_menu_state(HWND window, ShellState& shell) {
   }
   menu_set_enabled_recursive(menu, kCmdLayerMergeDown, enabled.layer_merge_down);
   menu_set_enabled_recursive(menu, kCmdLayerFlatten, enabled.layer_flatten);
+  /* 合并可见 / 反向排列：少于两层时都是空操作（引擎返回 changed=0），一律置灰。 */
+  menu_set_enabled_recursive(menu, kCmdLayerMergeVisible, enabled.layer_flatten);
+  menu_set_enabled_recursive(menu, kCmdLayerReverse, enabled.layer_flatten);
   menu_set_enabled_recursive(menu, kCmdLayerRasterizeText, enabled.layer_rasterize_text);
   menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
@@ -3751,6 +3754,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             case 'S': command = kCmdSaveAs; break;
             case 'I': command = kCmdImageSize; break;
             case 'C': command = kCmdCanvasSize; break;
+            case 'E': command = kCmdLayerMergeVisible; break; /* P1-2 ② 合并可见 */
             case 'V': command = kCmdEditPasteInto; break; /* P0-4 贴入选区 */
             case 'R': command = kCmdCameraRaw; break;
             default: break;
@@ -4075,6 +4079,13 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeDown, L"向下合并(&M)\tCtrl+E");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlatten, L"拼合图像(&F)");
+  /*
+   * P1-2 第二批：合并可见 / 反向排列。上游 Merge Visible 的 Ctrl+Shift+E 在本壳
+   * 已被「效果参数」占用（§6.3x），这里退到 Ctrl+Alt+E；反向排列沿用上游的
+   * 「作用于当前层所在层级」语义，不需要面板。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeVisible, L"合并可见(&V)\tCtrl+Alt+E");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerReverse, L"反向排列(&R)");
   /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
   /* P0-6 ②：字体面板（枚举系统字体，切换下一次打字的字体轨道）。 */

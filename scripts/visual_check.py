@@ -685,6 +685,25 @@ class Shell:
         user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
         self.wait(0.25)
 
+    def modified_click(self, x, y, ctrl=False, shift=False):
+        """带修饰键的单击（面板多选）。
+
+        与 press() 同一套机关：修饰状态写进目标线程的输入状态，并且在消息被
+        处理完之前不能恢复——否则 GetKeyState 读到的已是干净状态，Ctrl+点
+        会被当成普通点，多选永远选不上第二个。
+        """
+        x, y = int(x), int(y)
+        current, target, attached, state, saved = self._set_modifiers(shift, ctrl, False)
+        try:
+            user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
+            user32.PostMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
+            self.wait(0.05)
+            user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
+            self.wait(0.2)
+        finally:
+            self._restore_modifiers(current, target, attached, state, saved)
+        self.wait(0.1)
+
     def drag(self, x0, y0, x1, y1, steps=12):
         x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
         user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x0, y0))
@@ -3328,6 +3347,64 @@ def scene_layer_lock(shell, checker):
                   "行内变化像素 %d" % all_mark)
 
 
+def scene_merge_visible(shell, checker):
+    """P1-2 第二批：合并可见 / 反向排列（命令号 1673 / 1674）。
+
+    合并可见的契约是「渲染不变、结构收敛」：参与合成的层并成一个，隐藏层原样
+    保留。所以这里不比对颜色，而是同时断言两件事——
+      1. 画布逐像素不变（隐藏层本来就不参与合成，可见层并一层后必须等价）；
+      2. 面板行文本变少（层数真的少了），撤销后恢复三行。
+    反向排列只动堆叠序：面板行内容变化、画布不变；再反一次逐像素回到原样。
+    """
+    scene = "merge_visible"
+    layer = shell.layout["layer"]
+    canvas = shell.layout["canvas"]
+    # 面板顶 + 30px 标题；留 4 行高度，三行 / 两行都在框内。
+    panel = (layer[0], layer[1] + 30, layer[2], layer[1] + 30 + 22 * 4)
+
+    shell.command(1660)  # 解除上一场景留下的「全部锁」，否则合并可见会被引擎拒绝
+
+    for _ in range(2):
+        shell.press(ord("N"), ctrl=True, shift=True)
+    # 藏掉中间那层：选中下一行后切换可见性（隐藏层不参与合成、也不会被合并）。
+    shell.command(1010)
+    shell.command(1011)
+
+    before = shell.shot("138_merge_visible_before")
+    texts_before = count_bright(before, panel, 150)
+
+    shell.command(1673)  # 图层 > 合并可见
+    after = shell.shot("139_merge_visible_after")
+    texts_after = count_bright(after, panel, 150)
+    checker.check(scene, "合并可见后面板行数变少（可见层并成一个）",
+                  texts_after < texts_before,
+                  "行文本亮像素 %d -> %d" % (texts_before, texts_after))
+    canvas_delta = pixel_diff(after, before, canvas, 24)
+    checker.check(scene, "合并可见对画布零影响（隐藏层不参与、可见层代数等价）",
+                  canvas_delta == 0, "画布差异像素 %d" % canvas_delta)
+
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("140_merge_visible_undo")
+    texts_undone = count_bright(undone, panel, 150)
+    checker.check(scene, "撤销合并可见：面板恢复三行", texts_undone >= texts_before - 5,
+                  "行文本亮像素 %d（原 %d）" % (texts_undone, texts_before))
+
+    shell.command(1674)  # 图层 > 反向排列
+    flipped = shell.shot("141_reverse_rows")
+    rows_delta = pixel_diff(flipped, undone, panel, 24)
+    checker.check(scene, "反向排列改变面板行顺序", rows_delta > 20,
+                  "面板差异像素 %d" % rows_delta)
+    reverse_canvas = pixel_diff(flipped, undone, canvas, 24)
+    checker.check(scene, "反向排列不动画布", reverse_canvas == 0,
+                  "画布差异像素 %d" % reverse_canvas)
+
+    shell.command(1674)
+    back = shell.shot("142_reverse_back")
+    panel_delta = pixel_diff(back, undone, panel, 24)
+    checker.check(scene, "再反向一次回到原顺序（面板逐像素还原）", panel_delta == 0,
+                  "面板差异像素 %d" % panel_delta)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3363,6 +3440,9 @@ SCENES = [    ("start", scene_start, ()),
     ("effect_pattern", scene_effect_pattern, ()),
     ("gradient_stops", scene_gradient_stops, ()),
     ("layer_lock", scene_layer_lock, ()),
+    ("merge_visible", scene_merge_visible, ()),
+    ("layer_link", scene_layer_link, ()),
+    ("layer_style_paste", scene_layer_style_paste, ()),
 ]
 
 

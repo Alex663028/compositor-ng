@@ -294,6 +294,12 @@ constexpr UINT kCmdLayerLockPixels = 1662;      /* 图层 > 锁定 > 图像像�
 constexpr UINT kCmdLayerLockPosition = 1663;    /* 图层 > 锁定 > 位置 */
 constexpr UINT kCmdLayerLockAll = 1664;         /* 图层 > 锁定 > 全部 */
 constexpr UINT kCmdLayerColorBase = 1665;       /* 图层 > 颜色标签 > 无/红/橙/黄/绿/蓝/紫/灰 */
+/*
+ * P1-2 第二批（1673 段，紧接颜色标签 1665..1672）：合并可见 / 反向排列。
+ * 两者都是「一次点击改整篇结构」的命令，不需要面板，也没有可调参数。
+ */
+constexpr UINT kCmdLayerMergeVisible = 1673; /* 图层 > 合并可见（Ctrl+Alt+E） */
+constexpr UINT kCmdLayerReverse = 1674;      /* 图层 > 反向排列 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*

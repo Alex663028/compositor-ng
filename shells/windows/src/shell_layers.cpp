@@ -58,6 +58,7 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 }
 
 /*
+  const int32_t count = static_cast<int32_t>(shell.doc.layers.size());
  * S44：重建树形显示序（组行在上、子层缩进在下、折叠的组不展开）。
  *
  * layers 变了（换文档 / 撤销 / 增删层）或折叠状态变了都要调。折叠集合先按「仍是组」
@@ -65,7 +66,6 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
  * 处于折叠态。
  */
 void rebuild_layer_display(ShellState& shell) {
-  const int32_t count = static_cast<int32_t>(shell.doc.layers.size());
   if (!shell.doc.collapsed_groups.empty()) {
     std::vector<comp_layer_id> alive;
     alive.reserve(shell.doc.collapsed_groups.size());
@@ -2454,6 +2454,67 @@ void panel_flatten(ShellState& shell) {
   refresh_layers(shell);
   shell.doc.needs_render = true;
   refresh_history_status(shell, L"已拼合图像");
+}
+
+/*
+ * 合并可见（对齐上游 Merge Visible）：所有「实际参与合成」的图层烘成一个像素层，
+ * 隐藏图层 / 隐藏组原样保留。拒绝原因（可见层剪贴到隐藏基底 / 引擎不认识的
+ * effect）由 set_status 附带的引擎 last_error 如实透出；参与层不足两层时引擎
+ * 返回 changed=0，这里明确提示而不是假装成功。
+ */
+void panel_merge_visible(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  comp_layer_id merged = 0;
+  int32_t changed = 0;
+  if (comp_layer_merge_visible(shell.doc.document, &merged, &changed) != COMP_OK) {
+    set_status(shell, L"合并可见失败（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    set_status(shell, L"合并可见：实际参与合成的图层不足两层（未产生撤销步）");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已合并可见图层");
+}
+
+/*
+ * 反向排列（对齐上游 Arrange > Reverse）：反转同级顺序。选中组时反转组内子层，
+ * 选中普通层时反转它的同级，未选中时反转根级——与上游「Reverse 作用于当前层
+ * 所在层级」一致。少于两个兄弟是空操作，引擎返回 changed=0。
+ */
+void panel_reverse_layers(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  comp_layer_id parent = 0;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id != 0) {
+    int32_t is_group = 0;
+    comp_layer_id group_parent = 0;
+    comp_layer_id clipping = 0;
+    if (comp_layer_get_group_info(shell.doc.document, id, &is_group, &group_parent, &clipping) ==
+        COMP_OK) {
+      parent = is_group != 0 ? id : group_parent;
+    }
+  }
+  int32_t changed = 0;
+  if (comp_layer_reverse(shell.doc.document, parent, &changed) != COMP_OK) {
+    set_status(shell, L"反向排列失败（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    set_status(shell, L"反向排列：同级图层不足两层（未产生撤销步）");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已反向排列");
 }
 
 /* 名称经 ABI 取自引擎键名表，外壳不复制任何键名。 */

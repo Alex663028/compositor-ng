@@ -690,3 +690,293 @@ COMP_TEST(abi_merge_down_error_paths) {
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 }
+
+/* ------------------------------------------- P1-2 第二批：合并可见 / 反向排列 */
+
+COMP_TEST(merge_visible_keeps_hidden_layers_and_is_render_invariant) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id red = add_solid_layer(document, "Red", 255, 0, 0, 255);
+  const comp_layer_id hidden = add_solid_layer(document, "HiddenGreen", 0, 255, 0, 255);
+  const comp_layer_id blue = add_solid_layer(document, "Blue", 0, 0, 255, 255, 0.5f);
+  document.find(hidden)->visible = false;
+
+  std::vector<uint8_t> before;
+  std::string error;
+  COMP_CHECK(flatten_copy(document, &before, &error));
+
+  comp_layer_id out = 0;
+  bool changed = false;
+  COMP_CHECK(document.merge_visible(&error, &out, &changed));
+  COMP_CHECK(changed);
+  COMP_CHECK(out != 0);
+
+  /* 隐藏层原位保留；两个可见层并成一个。 */
+  COMP_CHECK(document.state().layers.size() == 2);
+  COMP_CHECK(document.find(hidden) != nullptr);
+  COMP_CHECK(document.find(red) == nullptr && document.find(blue) == nullptr);
+
+  const Layer* merged = document.find(out);
+  COMP_CHECK(merged != nullptr);
+  COMP_CHECK(merged->name == "Blue"); /* 结果沿用最高可见层的名字 */
+  COMP_CHECK(merged->parent == 0);
+  COMP_CHECK(merged->blend == COMP_BLEND_NORMAL && merged->opacity == 1.0f);
+  COMP_CHECK(document.state().active_layer == out);
+
+  /* 渲染不变：隐藏层不贡献，合并前后必须逐字节一致。 */
+  std::vector<uint8_t> after;
+  COMP_CHECK(flatten_copy(document, &after, &error));
+  COMP_CHECK_MSG(before == after, "merge visible must not change the rendered canvas");
+
+  /* 混合算术：蓝 50% 叠红 -> (128, 0, 128, 255)。 */
+  uint8_t px[4] = {0, 0, 0, 0};
+  pixel_at(merged->pixels, 1, 1, px);
+  COMP_CHECK_MSG(px[0] == 128 && px[1] == 0 && px[2] == 128 && px[3] == 255,
+                 "merge visible bakes blend and opacity");
+
+  /* 一次合并 = 一步撤销。 */
+  COMP_CHECK(document.history().undo_depth() == 1);
+  COMP_CHECK(document.undo());
+  COMP_CHECK(document.state().layers.size() == 3);
+  COMP_CHECK(document.find(red) != nullptr && document.find(blue) != nullptr);
+  COMP_CHECK(document.redo());
+  COMP_CHECK(document.state().layers.size() == 2);
+}
+
+COMP_TEST(merge_visible_bakes_group_and_promotes_hidden_children) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "Group";
+  group_desc.is_group = 1;
+  group_desc.opacity = 1.0f;
+  group_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id group = 0;
+  document.create_layer(group_desc, &group);
+
+  comp_layer_desc child{};
+  child.blend = COMP_BLEND_NORMAL;
+  child.opacity = 1.0f;
+  child.transform = comp_rect{0, 0, 4, 4};
+  child.parent = group;
+  comp_layer_id group_red = 0;
+  document.create_layer(child, &group_red);
+  comp_layer_id group_hidden = 0;
+  document.create_layer(child, &group_hidden);
+
+  const comp_layer_id blue = add_solid_layer(document, "Blue", 0, 0, 255, 255);
+
+  document.find(group_red)->name = "GroupRed";
+  document.find(group_red)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 255, 0, 0, 255);
+  document.find(group_hidden)->name = "GroupHidden";
+  document.find(group_hidden)->pixels = ImageBuffer::solid(4, 4, COMP_PIXEL_RGBA8, 0, 255, 0, 255);
+  document.find(group_hidden)->visible = false;
+
+  std::vector<uint8_t> before;
+  std::string error;
+  COMP_CHECK(flatten_copy(document, &before, &error));
+
+  comp_layer_id out = 0;
+  bool changed = false;
+  COMP_CHECK(document.merge_visible(&error, &out, &changed));
+  COMP_CHECK(changed && out != 0);
+
+  /*
+   * 可见组整体烘入结果；组内的隐藏子层保留，并提升到组原来的父级（根级）。
+   */
+  COMP_CHECK(document.state().layers.size() == 2);
+  COMP_CHECK(document.find(group) == nullptr);
+  COMP_CHECK(document.find(group_red) == nullptr);
+  COMP_CHECK(document.find(blue) == nullptr);
+  const Layer* promoted = document.find(group_hidden);
+  COMP_CHECK(promoted != nullptr);
+  COMP_CHECK_MSG(promoted->parent == 0, "hidden child must be promoted to the group's parent");
+
+  std::vector<uint8_t> after;
+  COMP_CHECK(flatten_copy(document, &after, &error));
+  COMP_CHECK_MSG(before == after, "group bake + hidden promotion must not change the canvas");
+
+  COMP_CHECK(document.undo());
+  COMP_CHECK(document.state().layers.size() == 4);
+  COMP_CHECK(document.find(group) != nullptr);
+  COMP_CHECK(document.find(group_hidden)->parent == group);
+}
+
+COMP_TEST(merge_visible_refuses_visible_layer_clipped_to_hidden_base) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id base = add_solid_layer(document, "HiddenBase", 255, 0, 0, 255);
+  const comp_layer_id clip = add_solid_layer(document, "Clip", 0, 0, 255, 255);
+  add_solid_layer(document, "Other", 0, 255, 0, 255);
+  document.find(base)->visible = false;
+  document.find(clip)->clipping_source = base;
+
+  std::string error;
+  comp_layer_id out = 123;
+  bool changed = true;
+  COMP_CHECK(!document.merge_visible(&error, &out, &changed));
+  COMP_CHECK_MSG(error.find("clipped to a hidden layer") != std::string::npos,
+                 "clipping to a hidden base must be refused, not silently cut");
+  COMP_CHECK(out == 0);
+  COMP_CHECK(!changed);
+  COMP_CHECK(document.state().layers.size() == 3);
+  COMP_CHECK(document.history().undo_depth() == 0);
+}
+
+COMP_TEST(merge_visible_is_noop_with_single_visible_layer) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id a = add_solid_layer(document, "A", 255, 0, 0, 255);
+  const comp_layer_id b = add_solid_layer(document, "B", 0, 255, 0, 255);
+  const comp_layer_id c = add_solid_layer(document, "C", 0, 0, 255, 255);
+  document.find(a)->visible = false;
+  document.find(b)->visible = false;
+
+  std::string error;
+  comp_layer_id out = 123;
+  bool changed = true;
+  COMP_CHECK(document.merge_visible(&error, &out, &changed));
+  COMP_CHECK(!changed);
+  COMP_CHECK(out == 0);
+  COMP_CHECK_MSG(document.history().undo_depth() == 0, "noop must not push a history step");
+  COMP_CHECK(document.state().layers.size() == 3);
+  COMP_CHECK(document.find(c) != nullptr);
+}
+
+COMP_TEST(reverse_layers_reverses_root_siblings_and_undoes) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  const comp_layer_id a = add_solid_layer(document, "A", 1, 0, 0, 255);
+  const comp_layer_id b = add_solid_layer(document, "B", 2, 0, 0, 255);
+  const comp_layer_id c = add_solid_layer(document, "C", 3, 0, 0, 255);
+
+  std::string error;
+  bool changed = false;
+  COMP_CHECK(document.reverse_layers(0, &error, &changed));
+  COMP_CHECK(changed);
+  COMP_CHECK(document.state().layers.size() == 3);
+  COMP_CHECK(document.state().layers[0].id == c);
+  COMP_CHECK(document.state().layers[1].id == b);
+  COMP_CHECK(document.state().layers[2].id == a);
+
+  /* 只重排、不动内容：像素与名字必须跟着各自的层走。 */
+  COMP_CHECK(document.state().layers[0].name == "C");
+  COMP_CHECK(document.state().layers[2].name == "A");
+
+  COMP_CHECK(document.history().undo_depth() == 1);
+  COMP_CHECK(document.undo());
+  COMP_CHECK(document.state().layers[0].id == a);
+  COMP_CHECK(document.state().layers[2].id == c);
+}
+
+COMP_TEST(reverse_layers_inside_group_keeps_children_in_sync) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 4, 4, 72.0f, "sRGB");
+
+  comp_layer_desc group_desc{};
+  group_desc.name = "Group";
+  group_desc.is_group = 1;
+  group_desc.opacity = 1.0f;
+  group_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id group = 0;
+  document.create_layer(group_desc, &group);
+
+  comp_layer_desc child{};
+  child.blend = COMP_BLEND_NORMAL;
+  child.opacity = 1.0f;
+  child.transform = comp_rect{0, 0, 4, 4};
+  child.parent = group;
+  comp_layer_id x = 0;
+  document.create_layer(child, &x);
+  comp_layer_id y = 0;
+  document.create_layer(child, &y);
+  comp_layer_id z = 0;
+  document.create_layer(child, &z);
+
+  /* 非组当 parent -> 拒绝。 */
+  std::string error;
+  bool changed = true;
+  COMP_CHECK(!document.reverse_layers(x, &error, &changed));
+  COMP_CHECK_MSG(error.find("not a layer group") != std::string::npos, "non-group parent");
+  COMP_CHECK(!changed);
+
+  COMP_CHECK(document.reverse_layers(group, &error, &changed));
+  COMP_CHECK(changed);
+  const Layer* g = document.find(group);
+  COMP_CHECK(g != nullptr);
+  COMP_CHECK(g->children.size() == 3);
+  COMP_CHECK(g->children[0] == z && g->children[1] == y && g->children[2] == x);
+
+  /* 空组：兄弟为 0 个 -> 空操作，不进历史。 */
+  comp_layer_desc empty_desc{};
+  empty_desc.name = "Empty";
+  empty_desc.is_group = 1;
+  empty_desc.opacity = 1.0f;
+  empty_desc.transform = comp_rect{0, 0, 4, 4};
+  comp_layer_id empty = 0;
+  document.create_layer(empty_desc, &empty);
+  changed = true;
+  COMP_CHECK(document.reverse_layers(empty, &error, &changed));
+  COMP_CHECK(!changed);
+}
+
+COMP_TEST(abi_merge_visible_and_reverse) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  document_desc.dpi = 72.0f;
+  document_desc.color_space = "sRGB";
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create(engine, &document_desc, &document) == COMP_OK);
+
+  const comp_layer_id blue = abi_add_solid_layer(document, 4, 4, 0, 0, 255, 255);
+  const std::vector<uint8_t> before = abi_flatten(document, 4, 4);
+
+  comp_layer_id merged = 0;
+  int32_t changed = 0;
+  COMP_CHECK(comp_layer_merge_visible(document, &merged, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1 && merged != 0);
+  size_t count = 0;
+  COMP_CHECK(comp_layer_count(document, &count) == COMP_OK);
+  COMP_CHECK(count == 1);
+  COMP_CHECK_MSG(abi_flatten(document, 4, 4) == before, "ABI merge visible must not change canvas");
+
+  /* 只有一层时反向是空操作。 */
+  changed = 1;
+  COMP_CHECK(comp_layer_reverse(document, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+
+  COMP_CHECK(comp_document_undo(document) == COMP_OK);
+  COMP_CHECK(comp_layer_count(document, &count) == COMP_OK);
+  COMP_CHECK(count == 2);
+
+  /* 两层反向：一次改变顺序，再反一次恢复。 */
+  changed = 0;
+  COMP_CHECK(comp_layer_reverse(document, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  comp_layer_id order[4] = {0};
+  size_t n = 0;
+  COMP_CHECK(comp_layer_list(document, order, 4, &n) == COMP_OK);
+  COMP_CHECK(n == 2);
+  COMP_CHECK(order[0] == blue); /* 反向：后创建的蓝层落到最底 */
+  COMP_CHECK(comp_layer_reverse(document, 0, &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  COMP_CHECK(comp_layer_list(document, order, 4, &n) == COMP_OK);
+  COMP_CHECK(order[1] == blue);
+
+  /* 不存在的 parent -> NOT_FOUND；非组 parent -> STATE。 */
+  COMP_CHECK(comp_layer_reverse(document, 9999, &changed) == COMP_ERR_NOT_FOUND);
+  COMP_CHECK(comp_layer_reverse(document, blue, &changed) == COMP_ERR_STATE);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}

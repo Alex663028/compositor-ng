@@ -137,6 +137,30 @@ class Document {
   bool flatten_image(std::string* error);
 
   /*
+   * 合并可见（对齐上游 Merge Visible）：把所有「实际参与合成」的图层（自身可见、
+   * 祖先组全部可见）合成一个像素层，落在最高参与单元的槽位；隐藏图层/隐藏组
+   * 原样保留。可见组按整体烘焙，组内**隐藏**后代保留并提升到组原来的父级
+   * （结构变化、渲染不变）。
+   *
+   * 边界：
+   *   - 参与层剪贴到的基底不在参与集合里 -> 明确拒绝（剪贴因数只看基底像素、
+   *     不看可见性，剪断会把画布改成另一种样子）；
+   *   - 携带引擎不认识的 effect -> 明确拒绝（与 merge_down 同一口径）；
+   *   - 实际贡献像素的非组图层少于 2 个 -> 空操作（out_changed = false，
+   *     不进历史；返回 true）。
+   * 一步撤销（加入宿主显式事务或自开自提交）。
+   */
+  bool merge_visible(std::string* error, comp_layer_id* out_id, bool* out_changed);
+
+  /*
+   * 反向排列：反转 parent 下的直接兄弟顺序（parent == 0 = 根级）。只重排，
+   * 不改像素/几何/混合；兄弟少于 2 个为空操作（out_changed = false，不进历史）。
+   * 一步撤销。
+   */
+  bool reverse_layers(comp_layer_id parent, std::string* error, bool* out_changed);
+
+
+  /*
    * 整篇重采样到新画布尺寸（对齐上游 ImageResizer / Image Size）：
    *   - 每层像素与掩版按画布缩放比例重采样（层的采样模式），transform 的
    *     原点与尺寸同步缩放；w/h<=0 的「按像素尺寸」分量保持未指定语义；

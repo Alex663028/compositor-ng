@@ -1933,6 +1933,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerFlatten:
       panel_flatten(shell);
       break;
+    /* ---- P1-2 第二批：合并可见 / 反向排列 ---- */
+    case kCmdLayerMergeVisible:
+      panel_merge_visible(shell);
+      break;
+    case kCmdLayerReverse:
+      panel_reverse_layers(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);

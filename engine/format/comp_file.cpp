@@ -947,6 +947,7 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
     }
   }
 
+    std::unordered_map<std::string, comp_layer_id> uuid_to_id;
   const JsonValue* layers = manifest.find("layers");
   if (layers != nullptr && layers->is_array()) {
     if (static_cast<int64_t>(layers->as_array().size()) > kMaxLayers) {
@@ -954,7 +955,6 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       return false;
     }
 
-    std::unordered_map<std::string, comp_layer_id> uuid_to_id;
     /*
      * engineLayerID 是引擎内部 id 的持久化形态：两条不同 UUID 的层一旦声明同一
      * id，find()/parentID 解析全部别名错层，撤销栈按 id 寻的也会打到别人。
