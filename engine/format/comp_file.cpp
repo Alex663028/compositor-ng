@@ -445,6 +445,10 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
   if (layer.color_label != 0u) {
     j.set("engineColorLabel", JsonValue::integer(static_cast<long long>(layer.color_label)));
   }
+  /* 图层链接（engineLink）：0 = 未链接，缺键即未链接。组号 >0 才是有效状态。 */
+  if (layer.link_group != 0u) {
+    j.set("engineLink", JsonValue::integer(static_cast<long long>(layer.link_group)));
+  }
   return j;
 }
 
@@ -1096,6 +1100,19 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
         return false;
       }
       layer.color_label = static_cast<uint32_t>(color_label);
+
+      /* engineLink：缺键 = 未链接。组号必须 >0；负数/0 显式写出属于非法状态
+       * （0 是缺省值，写出来只说明生成方口径不一致），一律拒绝而不是静默归零。 */
+      if (entry.find("engineLink") != nullptr) {
+        const long long link_group = entry.integer_or("engineLink", 0);
+        if (link_group <= 0 || link_group > 4294967295LL) {
+          if (error != nullptr) {
+            *error = "layer " + uuid + ": invalid engineLink " + std::to_string(link_group);
+          }
+          return false;
+        }
+        layer.link_group = static_cast<uint32_t>(link_group);
+      }
 
       /* engineText：缺键 = 普通图层；解析出的对象不可渲染则整体忽略（像素照旧
        * 由 imageFile 读回，画面不变，只是失去可编辑性——好过让半个文字对象

@@ -8,7 +8,10 @@
 #include "compositor/comp_layer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "comp_abi_internal.h"
 
@@ -20,6 +23,8 @@
 #include "domain/effect_table.h"
 #include "domain/text_layer.h"
 #include "domain/tool_ops.h"
+#include "domain/utf8_text.h"
+#include "format/comp_json.h"
 
 using compositor::Document;
 using compositor::DocumentState;
@@ -42,6 +47,108 @@ float clamp_opacity(float value) {
   if (value < 0.0f) return 0.0f;
   if (value > 1.0f) return 1.0f;
   return value;
+}
+
+/* ------------------------------------------------ 图层链接的仿射联动（P1-2 ③） */
+
+constexpr double kPi = 3.14159265358979323846;
+
+/*
+ * 把「目标层从旧矩形+旋转 -> 新矩形+旋转」这张映射，套到同组另一层上：
+ *
+ *   p' = C_new + R(θ_new) · S(sx, sy) · R(-θ_old) · (p - C_old)
+ *
+ * 尺寸按层自身坐标系缩放；旋转层与目标的相对角不是 90° 整数倍又遇上
+ * 非等比缩放时，结果会带剪切——本仓的 origin/size/rotation 模型表示不了，
+ * 明确拒绝（返回 false + error），不做静默近似。
+ */
+struct LinkAffine {
+  double sx = 1.0;
+  double sy = 1.0;
+  double old_cx = 0.0;
+  double old_cy = 0.0;
+  double new_cx = 0.0;
+  double new_cy = 0.0;
+  double old_rotation = 0.0;
+  double new_rotation = 0.0;
+};
+
+bool apply_link_affine(const LinkAffine& m, const Layer& mate, comp_rect* out_rect,
+                       float* out_rotation, std::string* error) {
+  const double theta_old = m.old_rotation * kPi / 180.0;
+  const double theta_new = m.new_rotation * kPi / 180.0;
+
+  /* 相对角归一化到 [0, 360)，用来判断「缩放是否能在该层的轴向上表示」。 */
+  double rel = std::fmod(mate.rotation - m.old_rotation, 360.0);
+  if (rel < 0.0) rel += 360.0;
+  const double k = std::round(rel / 90.0);
+  const double residual = std::fabs(rel - k * 90.0);
+  const bool uniform = std::fabs(m.sx - m.sy) <= 1e-9;
+  if (!uniform && residual > 0.01) {
+    if (error != nullptr) {
+      *error = "non-uniform scale across linked layers with differing rotation "
+               "(shear is not representable)";
+    }
+    return false;
+  }
+  const bool swap = (static_cast<int32_t>(std::llround(k)) % 2) != 0;
+  const double scale_w = swap ? m.sy : m.sx;
+  const double scale_h = swap ? m.sx : m.sy;
+
+  const comp_rect bounds = mate.effective_bounds();
+  const bool degenerate = bounds.w <= 0 || bounds.h <= 0;
+  const double cx = bounds.x + bounds.w / 2.0;
+  const double cy = bounds.y + bounds.h / 2.0;
+
+  /* R(-θ_old)·(p - C_old) */
+  const double qx = cx - m.old_cx;
+  const double qy = cy - m.old_cy;
+  const double ux = qx * std::cos(theta_old) + qy * std::sin(theta_old);
+  const double uy = -qx * std::sin(theta_old) + qy * std::cos(theta_old);
+  /* S */
+  const double vx = ux * (degenerate ? 1.0 : m.sx);
+  const double vy = uy * (degenerate ? 1.0 : m.sy);
+  /* R(θ_new) + C_new */
+  const double nx = m.new_cx + vx * std::cos(theta_new) - vy * std::sin(theta_new);
+  const double ny = m.new_cy + vx * std::sin(theta_new) + vy * std::cos(theta_new);
+
+  /* 显式尺寸才缩放；w/h <= 0 的「按像素尺寸」分量保持未指定语义（不偷偷改成
+   * 显式），撤空图层（clipped_empty，包围盒为空）也不放大。 */
+  const bool has_w = mate.transform.w > 0;
+  const bool has_h = mate.transform.h > 0;
+  double new_w = static_cast<double>(mate.transform.w);
+  double new_h = static_cast<double>(mate.transform.h);
+  double actual_w = new_w;
+  double actual_h = new_h;
+  if (!degenerate) {
+    if (has_w) {
+      new_w = std::round(bounds.w * scale_w);
+      actual_w = new_w;
+    } else {
+      actual_w = bounds.w;
+    }
+    if (has_h) {
+      new_h = std::round(bounds.h * scale_h);
+      actual_h = new_h;
+    } else {
+      actual_h = bounds.h;
+    }
+  }
+
+  const comp_rect rect{
+      static_cast<int32_t>(std::llround(nx - actual_w / 2.0)),
+      static_cast<int32_t>(std::llround(ny - actual_h / 2.0)),
+      static_cast<int32_t>(new_w),
+      static_cast<int32_t>(new_h),
+  };
+  const float rotation = static_cast<float>(mate.rotation + (m.new_rotation - m.old_rotation));
+  if (!compositor::is_valid_transform(rect, rotation)) {
+    if (error != nullptr) *error = "linked layer geometry out of range";
+    return false;
+  }
+  *out_rect = rect;
+  *out_rotation = rotation;
+  return true;
 }
 
 /* comp_text_desc -> 域层 TextObject。只做拷贝与**廉价的**字段闸；文本/样式/
@@ -530,13 +637,60 @@ comp_result comp_layer_set_transform(comp_document document, comp_layer_id id,
                                  "|origin| <= 1000000, finite rotation)");
   }
 
-  compositor::abi::ImplicitTxn txn(doc, "Set Transform");
+  /*
+   * 图层链接：把同一链接组（link_group != 0）的其它层带上同样的仿射量。
+   * 全部计算与锁闸都在事务之前完成——失败的调用零状态变动、不留撤销步；
+   * 同组任一锁定位置就整次拒绝（不做「一部分动了」的半截提交）。
+   */
+  struct LinkMate {
+    Layer* layer = nullptr;
+    comp_layer_id id = 0;
+    comp_rect rect{0, 0, 0, 0};
+    float rotation = 0.0f;
+  };
+  std::vector<LinkMate> mates;
+  if (layer->link_group != 0) {
+    const comp_rect old_bounds = layer->effective_bounds();
+    LinkAffine affine;
+    affine.old_rotation = layer->rotation;
+    affine.new_rotation = rotation;
+    affine.old_cx = old_bounds.x + old_bounds.w / 2.0;
+    affine.old_cy = old_bounds.y + old_bounds.h / 2.0;
+    affine.new_cx = transform.x + transform.w / 2.0;
+    affine.new_cy = transform.y + transform.h / 2.0;
+    /* 旧尺寸为空（缩画布裁空）时无从谈缩放，只做平移/旋转。 */
+    affine.sx = old_bounds.w > 0 ? static_cast<double>(transform.w) / old_bounds.w : 1.0;
+    affine.sy = old_bounds.h > 0 ? static_cast<double>(transform.h) / old_bounds.h : 1.0;
+
+    for (Layer& other : doc->state().layers) {
+      if (other.id == id || other.link_group != layer->link_group) continue;
+      const comp_result locked = compositor::abi::lock_gate(
+          engine, &other, COMP_LAYER_LOCK_POSITION, "transform linked layers");
+      if (locked != COMP_OK) return locked;
+      LinkMate mate;
+      mate.layer = &other;
+      mate.id = other.id;
+      std::string mate_error;
+      if (!apply_link_affine(affine, other, &mate.rect, &mate.rotation, &mate_error)) {
+        return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, mate_error.c_str());
+      }
+      mates.push_back(mate);
+    }
+  }
+
+  compositor::abi::ImplicitTxn txn(doc, mates.empty() ? "Set Transform" : "Set Linked Transform");
   layer->transform = transform;
   /* 显式给回尺寸 = 用户把图层放回画布，清掉缩画布留下的「已裁空」标记，
    * 否则 effective_bounds 会一直返回空矩形。 */
   layer->clipped_empty = false;
   layer->rotation = rotation;
   doc->touch_layer(id);
+  for (LinkMate& mate : mates) {
+    mate.layer->transform = mate.rect;
+    mate.layer->clipped_empty = false;
+    mate.layer->rotation = mate.rotation;
+    doc->touch_layer(mate.id);
+  }
   txn.commit();
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
@@ -2357,6 +2511,102 @@ comp_result comp_layer_reverse(comp_document document, comp_layer_id parent,
     return compositor::abi::fail(engine, COMP_ERR_STATE, error);
   }
   if (out_changed != nullptr) *out_changed = changed ? 1 : 0;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+/* --------------------------------------------- 图层链接（P1-2 第三批） */
+
+static comp_result link_fail(Engine* engine, const std::string& error) {
+  if (error == "layer not found") {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, error);
+  }
+  if (error == "layer groups cannot be linked") {
+    return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED, error);
+  }
+  return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
+}
+
+comp_result comp_layer_link(comp_document document, const comp_layer_id* ids, size_t count,
+                            uint32_t* out_group, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_changed != nullptr) *out_changed = 0;
+  if (ids == nullptr || count < 2) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "linking requires at least two layer ids");
+  }
+  /* 逐层先给准确错误码（域方法只回字符串）；组图层明确不支持。 */
+  for (size_t i = 0; i < count; ++i) {
+    const Layer* layer = doc->find(ids[i]);
+    if (layer == nullptr) {
+      return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+    }
+    if (layer->is_group) {
+      return compositor::abi::fail(engine, COMP_ERR_UNSUPPORTED,
+                                   "layer groups cannot be linked");
+    }
+  }
+  std::vector<comp_layer_id> list(ids, ids + count);
+  std::string error;
+  uint32_t group = 0;
+  bool changed = false;
+  if (!doc->link_layers(list, &group, &error, &changed)) {
+    return link_fail(engine, error);
+  }
+  if (out_group != nullptr) *out_group = group;
+  if (out_changed != nullptr) *out_changed = changed ? 1 : 0;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_unlink(comp_document document, const comp_layer_id* ids, size_t count,
+                              int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_changed != nullptr) *out_changed = 0;
+  if (ids == nullptr || count == 0) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "no layer ids given");
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (doc->find(ids[i]) == nullptr) {
+      return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+    }
+  }
+  std::vector<comp_layer_id> list(ids, ids + count);
+  std::string error;
+  bool changed = false;
+  if (!doc->unlink_layers(list, &error, &changed)) {
+    return link_fail(engine, error);
+  }
+  if (out_changed != nullptr) *out_changed = changed ? 1 : 0;
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_get_link(comp_document document, comp_layer_id id, uint32_t* out_group) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_group == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_group is null");
+  }
+  Layer* layer = doc->find(id);
+  if (layer == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_NOT_FOUND, "layer not found");
+  }
+  *out_group = layer->link_group;
   return compositor::abi::ok(engine);
   COMP_ABI_CATCH(engine)
 }

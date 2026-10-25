@@ -1568,6 +1568,45 @@ COMP_API comp_result comp_layer_merge_visible(comp_document document, comp_layer
 COMP_API comp_result comp_layer_reverse(comp_document document, comp_layer_id parent,
                                         int32_t* out_changed);
 
+/* ------------------------------------------------- 图层链接（P1-2 ③ 尾部追加） */
+
+/*
+ * 图层链接（对齐 Photoshop 的 Link Layers）：`count` 个图层并成同一个链接组，
+ * 之后任一层的**几何变换**（位移/缩放/旋转，统一走 comp_layer_set_transform）
+ * 会以同样的仿射量作用到同组其它层。
+ *
+ * 语义与边界：
+ *   - `count < 2` / `ids == NULL` / 有重复 id -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 任一层不存在 -> COMP_ERR_NOT_FOUND；
+ *   - 含图层组 -> COMP_ERR_UNSUPPORTED（组的变换是壳层的几何，不做联动）；
+ *   - 已经在同一非空组 -> 空操作（COMP_OK、`*out_changed = 0`，不进历史）；
+ *   - ids 分属不同既有组时**合并**这些组（原组成员一并改投新组，不把旧组拆半）；
+ *     全未链接时分配新组号（现有最大组号 + 1，不复用空洞）；
+ *   - 链接是纯关系元数据：不改像素/几何、不推进修订号、不使合成缓存失效；
+ *   - 一步撤销（加入调用方的显式事务，或自成一个隐式步）。
+ *
+ * `out_group` / `out_changed` 可空；`out_group` 写回组号（>0；空操作时写既有组号）。
+ */
+COMP_API comp_result comp_layer_link(comp_document document, const comp_layer_id* ids,
+                                     size_t count, uint32_t* out_group, int32_t* out_changed);
+
+/*
+ * 解除链接：把 `ids` 中图层的链接组清 0（同组未被列举的层保持原组，PS 同款：
+ * 解除只作用于「被选中的层」）。
+ *
+ * `count == 0` / `ids == NULL` / 重复 id -> COMP_ERR_INVALID_ARGUMENT；任一层
+ * 不存在 -> COMP_ERR_NOT_FOUND；都不在组 -> 空操作（COMP_OK、`*out_changed = 0`）。
+ * 一步撤销；纯元数据，不碰修订号与合成缓存。
+ */
+COMP_API comp_result comp_layer_unlink(comp_document document, const comp_layer_id* ids,
+                                       size_t count, int32_t* out_changed);
+
+/*
+ * 读回链接组号（0 = 未链接）。只读，不开事务。图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_get_link(comp_document document, comp_layer_id id,
+                                         uint32_t* out_group);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -261,6 +261,20 @@ struct Layer {
    * （缺键 = 无），撤销/重做随快照回退。
    */
   uint32_t color_label = 0;
+  /*
+   * 图层链接（P1-2 第三批）：0 = 未链接，>0 = 链接组编号（同组一起变换）。
+   * 纯关系元数据：不进合成、不改像素、不改内容修订号（同锁/色标）；
+   * 进 `.comp` 的 `engineLink`（缺键 = 0），撤销/重做随快照回退。
+   *
+   * 语义口径：
+   *   - 链接只对「几何变换」生效（位移/缩放/旋转一起走），可见性、混合、
+   *     不透明度和翻转仍按各自图层走；
+   *   - 联动由引擎在 comp_layer_set_transform 内统一展开，宿主只需写
+   *     「被拖动的那一层」，否则同组多层被选中时会重复叠加位移；
+   *   - 跨父级允许（PS 同样允许链到组外），组图层本身不可链接；
+   *   - 链接组编号由引擎分配（现有最大值 +1），宿主不得自造。
+   */
+  uint32_t link_group = 0;
   comp_layer_id parent = 0;
   comp_layer_id clipping_source = 0;
   /* .comp 互通：上游 live-mask 的来源图层 UUID（manifest 键 maskSourceID）。

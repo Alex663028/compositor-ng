@@ -727,6 +727,8 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
      *   fx    = 带效果        （effect_eval 的图层效果参与像素求值）
      * P1-2 追加（锁，位可组合，所以逐位报）：
      *   T = 锁透明像素  P = 锁图像像素  G = 锁位置  L = 锁全部
+     * P1-2 ③ 追加：
+     *   ~ = 已链接（与同组图层一起位移/缩放/旋转）
      * 不另开一列图标区：22px 行高 + 248px 栏宽已经排满，标号跟着层名走最省地方。
      */
     std::wstring marks;
@@ -740,6 +742,7 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     if ((row.lock_flags & COMP_LAYER_LOCK_PIXELS) != 0) marks += L"P";
     if ((row.lock_flags & COMP_LAYER_LOCK_POSITION) != 0) marks += L"G";
     if ((row.lock_flags & COMP_LAYER_LOCK_ALL) != 0) marks += L"L";
+    if (row.link_group != 0) marks += L"~";
     /*
      * P0-1：行内显示图层名（引擎是唯一真源，refresh_layers 回读）。
      * 名称为空（旧引擎 / 查询失败）时回落到 id，面板不至于变成空行。

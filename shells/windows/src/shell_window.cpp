@@ -207,6 +207,9 @@ void sync_menu_state(HWND window, ShellState& shell) {
     menu_radio_check_recursive(menu, kCmdLayerColorBase,
                                kCmdLayerColorBase + COMP_LAYER_COLOR_COUNT - 1,
                                kCmdLayerColorBase + label);
+    /* 链接是勾选项（不是单选组）：主选中层在组里就勾上，点一次解/加。 */
+    menu_set_checked_recursive(menu, kCmdLayerLinkToggle, row->link_group != 0);
+  }
   }
   /* 效果项：kEffectKindCount 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
@@ -256,6 +259,8 @@ void sync_menu_state(HWND window, ShellState& shell) {
   /* 合并可见 / 反向排列：少于两层时都是空操作（引擎返回 changed=0），一律置灰。 */
   menu_set_enabled_recursive(menu, kCmdLayerMergeVisible, enabled.layer_flatten);
   menu_set_enabled_recursive(menu, kCmdLayerReverse, enabled.layer_flatten);
+  /* 链接/解除：有选中层即可点（少于两层的拒绝文案由面板函数给）。 */
+  menu_set_enabled_recursive(menu, kCmdLayerLinkToggle, enabled.layer_present);
   menu_set_enabled_recursive(menu, kCmdLayerRasterizeText, enabled.layer_rasterize_text);
   menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
@@ -4086,6 +4091,8 @@ HMENU build_menu() {
    */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeVisible, L"合并可见(&V)\tCtrl+Alt+E");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerReverse, L"反向排列(&R)");
+  /* P1-2 ③：链接图层（多选后点一次连上，再点一次解开）。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerLinkToggle, L"链接图层(&K)");
   /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
   /* P0-6 ②：字体面板（枚举系统字体，切换下一次打字的字体轨道）。 */

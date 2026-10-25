@@ -159,6 +159,22 @@ class Document {
    */
   bool reverse_layers(comp_layer_id parent, std::string* error, bool* out_changed);
 
+  /*
+   * 图层链接（对齐上游 Link Layers）：
+   *   - link_layers：把 ids 全部并入同一个链接组。已在同一非空组的视为
+   *     空操作（out_changed = false，不进历史）；否则分配新组号
+   *     （现有最大 link_group + 1）并改写每一层的 link_group。
+   *   - unlink_layers：把 ids 的 link_group 清 0（不在组的空操作）。
+   *
+   * 边界：ids 少于 2 个 / 任一层不存在 / 有重复 id / 任一层是图层组 ->
+   * 返回 false 并写 error（COMP_ERR_UNSUPPORTED 语义由 ABI 层映射）。
+   * 纯关系元数据，不碰像素与几何，也不 invalidate 合成。
+   * 一步撤销（加入宿主显式事务或自开自提交）。
+   */
+  bool link_layers(const std::vector<comp_layer_id>& ids, uint32_t* out_group,
+                   std::string* error, bool* out_changed);
+  bool unlink_layers(const std::vector<comp_layer_id>& ids, std::string* error,
+                     bool* out_changed);
 
   /*
    * 整篇重采样到新画布尺寸（对齐上游 ImageResizer / Image Size）：
