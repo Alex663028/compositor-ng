@@ -3405,6 +3405,120 @@ def scene_merge_visible(shell, checker):
                   "面板差异像素 %d" % panel_delta)
 
 
+def scene_layer_link(shell, checker):
+    """P1-2 第三批：图层链接（命令号 1675）。
+
+    链接是**关系元数据**：命令本身不该改一个像素。真正的判据是联动——
+    背景层与它的副本在画布上完全重合，链接后**只选背景层**右移 10px：
+      1. 副本跟着走（旧位置必须变成空的；没联动时副本会留在原地，两个副本
+         叠在旧位置，那一带仍是橙色）；
+      2. 这一步是一步撤销，撤销后画布逐像素回到原位；
+      3. 解除链接后两行文本恢复原样（面板行逐像素还原）。
+    行内的 `~` 标记只用来证明「壳真的把链接状态画出来了」，不与几何判据混谈。
+    """
+    scene = "layer_link"
+    layer = shell.layout["layer"]
+    canvas = shell.layout["canvas"]
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+
+    row_y = layer[1] + 30
+    row_band = (layer[0], row_y, layer[2], row_y + 22 * 2)
+    row_x = layer[0] + 80
+    top_row = row_y
+    bottom_row = row_y + 22
+
+    # 背景层画一段橙色横线，再复制一层：两层像素完全重合，肉眼分不出「副本
+    # 留下了」还是「两层都走了」——所以下面必须量「旧位置是否变空」。
+    shell.select_tool("brush")
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    cx = (left + right) // 2
+    cy = (top + bottom) // 2
+    stroke_half = max(20, min(40, (right - left) // 6))
+    shell.drag(cx - stroke_half, cy, cx + stroke_half, cy, steps=10)
+    shell.press(ord("J"), ctrl=True)  # 复制图层：副本与原件像素重合
+
+    # 多选两层：先点背景行（清掉多选），再 Ctrl+点副本行。
+    shell.click(row_x, bottom_row)
+    shell.modified_click(row_x, top_row, ctrl=True)
+
+    base = shell.shot("143_link_base")
+
+    shell.command(1675)  # 图层 > 链接图层
+    linked = shell.shot("144_link_linked")
+    rows_delta = pixel_diff(linked, base, row_band, 24)
+    checker.check(scene, "链接后两行都出现链接标记（行文本变化）", rows_delta > 20,
+                  "面板行差异像素 %d" % rows_delta)
+    canvas_delta = pixel_diff(linked, base, canvas, 24)
+    checker.check(scene, "链接本身不改画布（纯关系元数据）", canvas_delta == 0,
+                  "画布差异像素 %d" % canvas_delta)
+
+    # 只选背景层，Ctrl+→ 移 10px：副本必须跟过来。
+    shell.click(row_x, bottom_row)
+    shell.press(VK_RIGHT, ctrl=True)
+    moved = shell.shot("145_link_moved")
+
+    # 取样带按实际笔画外接框算：笔画比拖拽端点两头各多出一截（笔刷半径），
+    # 用常量去猜迟早差几像素、量到空白处。这里直接从像素里量「笔画到哪结束」。
+    # 只看文档矩形：canvas 矩形下半部还画着快捷键提示文字，混进来会把外接框
+    # 撑到整块画布。
+    def stroke_box(img):
+        mask = img.crop(doc).split()[0].point(lambda value: 255 if value >= 120 else 0)
+        found = mask.getbbox()
+        if found is None:
+            return None
+        return (found[0] + doc[0], found[1] + doc[1],
+                found[2] + doc[0], found[3] + doc[1])
+
+    box = stroke_box(base)
+    checker.check(scene, "背景层上确有笔迹（后续取样以它为基准）", box is not None,
+                  "笔迹外接框 %s" % (box,))
+    moved_box = stroke_box(moved)
+    checker.check(scene, "移动后仍只有一份笔迹（副本没有留在原地叠出第二份）",
+                  box is not None and moved_box is not None and
+                  abs((moved_box[2] - moved_box[0]) - (box[2] - box[0])) <= 2,
+                  "笔迹宽度 %s -> %s" % (
+                      None if box is None else box[2] - box[0],
+                      None if moved_box is None else moved_box[2] - moved_box[0]))
+
+    if box is not None and moved_box is not None and moved_box[0] > box[0]:
+        # 画布是缩放显示的（这里约 49%），10 个文档像素只折合约 5 个屏幕像素：
+        # 位移量直接从两帧外接框的差值量，不拿文档像素当屏幕像素用。
+        shift = moved_box[0] - box[0]
+        vacated = (box[0], box[1] + 2, box[0] + max(1, shift - 1), box[3] - 2)
+        arrival = (box[2] + 1, box[1] + 2, box[2] + shift, box[3] - 2)
+    else:
+        vacated = (cx - 20, cy - 8, cx - 12, cy + 8)
+        arrival = (cx + 20, cy - 8, cx + 28, cy + 8)
+    vacated_before = count_bright(base, vacated, 120)
+    vacated_after = count_bright(moved, vacated, 120)
+    arrival_before = count_bright(base, arrival, 120)
+    arrival_after = count_bright(moved, arrival, 120)
+    checker.check(scene, "链接层右移后旧位置变空（副本没有留在原地）",
+                  vacated_before > 0 and vacated_after == 0,
+                  "橙色像素 %d -> %d" % (vacated_before, vacated_after))
+    checker.check(scene, "新位置出现内容（整组跟着移动）",
+                  arrival_before == 0 and arrival_after > 0,
+                  "橙色像素 %d -> %d" % (arrival_before, arrival_after))
+
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("146_link_undo")
+    undo_delta = pixel_diff(undone, base, canvas, 24)
+    checker.check(scene, "一步撤销把两层一起复位（画布逐像素还原）", undo_delta == 0,
+                  "画布差异像素 %d" % undo_delta)
+
+    # 解除链接：两行标记消失，面板行逐像素回到链接前。
+    shell.click(row_x, bottom_row)
+    shell.modified_click(row_x, top_row, ctrl=True)
+    shell.command(1675)  # 同一命令：同组再执行一次 = 解除
+    unlinked = shell.shot("147_link_unlinked")
+    unlink_rows = pixel_diff(unlinked, base, row_band, 24)
+    checker.check(scene, "解除链接后面板行逐像素还原", unlink_rows == 0,
+                  "面板行差异像素 %d" % unlink_rows)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),

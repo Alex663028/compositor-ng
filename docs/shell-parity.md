@@ -3384,3 +3384,62 @@ README §6.107。这一节只记壳层：两个新菜单项、一个加速键冲
 `kUnevaluatedEffectMarker` 的子集直接 `COMP_ERR_UNSUPPORTED`）；反向排列只
 反转同级，跨组搬动仍是拖动 / `comp_layer_move` 的活。
 
+### 5.68 图层链接：一个命令做开关 + 多选移动去重（P1-2 第三批，2026-10-24）
+
+引擎侧的链接语义（关系元数据、组号分配、仿射展开、剪切拒绝）见 README §6.108。
+这一节只记壳层：菜单三态、面板标记、以及最容易写错的「多选移动别动两次」。
+
+**1. 命令号 1675，一个命令做链/解链。** `kCmdLayerLinkToggle = 1675`，
+`图层 > 链接图层(&K)`，无加速键。点击后做的是「切换」而不是两个命令：
+
+- `panel_selection_ids(shell, false)` 拿到多选集合，**剔除组行**（组不能入链，
+  ABI 会返回 `COMP_ERR_UNSUPPORTED`，壳侧提前过滤，用户看不到这条错误）；
+- 逐个 `comp_layer_get_link` 回读：若全部非零且组号一致 → `comp_layer_unlink`；
+  否则 `comp_layer_link`（引擎负责并组合并）；
+- 成功文案：链接 `已链接 N 个图层（组 G）`，同组再点 `已在同一链接组：G`
+  （`changed == 0`，不落撤销步）；解除 `已解除 N 个图层的链接`。都走
+  `refresh_history_status`，所以状态栏能同时看到撤销栈深度变化。
+
+**2. 菜单勾选看主选中行，不看整个多选。** `menu_set_checked_recursive(menu,
+kCmdLayerLinkToggle, row->link_group != 0)`——`row` 是 `selected_layer` 指向的
+**主选中行**。勾选项（不是 `menu_radio_check_recursive` 那类单选组），因为
+「链接」不是互斥状态。多选集合里混有已链接/未链接时，勾选状态只反映主选中行，
+这是刻意的：菜单表达的是「点下去会对这一组做什么」的近似提示，最终判定在命令里。
+
+**3. 可用性走 `enabled.layer_present`，门槛放在命令里。** 有选中层就能点；
+「不足两个非组层」不置灰，而是给状态栏文案
+`链接图层需要至少选中两个图层（不含图层组）`。理由：置灰是无声的，用户不知道
+缺什么；这一条要求（≥2 且不含组）无法从单行选中状态推断，必须解释。
+
+**4. 面板标记复用 `marks` 路径。** `refresh_layers` 回读 `link_group` 存进
+`LayerRow`，`shell_paint.cpp` 里 `if (row.link_group != 0) marks += L"~";`——
+与锁的 `T/P/G/L`、色块同一条渲染路径，不新增列、不改行高，自检 263 项 SHA 不变。
+
+**5. 多选移动必须按链接组去重。** 引擎的联动会在 `comp_layer_set_transform`
+里把同组伙伴一起带走，所以壳层若把 a、b 都列进移动目标，b 会**动两次**
+（自己一次 + 被 a 带一次），位移翻倍。`shell_tools.cpp` 的
+`append_move_target` 做两级去重：
+
+- 先按 id 去重（同层不重复列）；
+- 再按 `row_link_group` 去重：同一非零链接组只保留**一个代表**，其余交给引擎。
+
+`collect_group_members`（拖动组时的成员展开）与 `build_move_targets`（多选
+位移）共用这一个函数，两条路径不会各自漂移。新增「让某些层一起动」的功能时，
+必须走 `append_move_target`，否则就会重新引入双倍位移。
+
+**6. 微调步长仍是 10 文档像素。** `Ctrl+→` 等方向键走
+`layer_transform_move_step(true)`，与 §5.60 的数值一致；探针正是在 ~49% 画布
+缩放下用这个步长量到 ~5 屏幕像素的位移。
+
+**7. 视觉探针 `layer_link`（8 条，截图 143–147）。** 两层画同一笔橙色描边
+（`ff8800`）→ `Ctrl+J` 复制成完全重合的两层 → 普通点底行 + `Ctrl` 点顶行
+（`modified_click` 通过 `AttachThreadInput` + `SetKeyboardState` 在目标线程里
+置修饰键，`PostMessage` 期间保持，否则 Ctrl 不生效）→ 1675 链接 → 只单选背景层
+`Ctrl+→`。断言：旧笔迹带完全腾空、新笔迹带被涂上、红色通道 bbox 宽度不变
+（没有变成两份错开的笔迹）、位移与 10 文档像素在 49% 缩放下相符；`Ctrl+Z`
+后画布逐像素复原；再按 1675 解链后面板行逐像素复原。细节见 manual-test M63。
+
+**8. 已知边界。** 链接只联几何（位移/旋转/等比缩放），不联不透明度、混合模式、
+效果与蒙版；组图层不能入链；`.comp` 的组号只在本文档内有意义，粘贴/导入一律
+按未链接处理。
+

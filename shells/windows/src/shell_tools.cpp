@@ -1202,6 +1202,39 @@ bool move_available(const ShellState& shell) {
 }
 
 /*
+ * P1-2 ③：链接联动的去重。引擎在 comp_layer_set_transform 里会把同组其余层一起
+ * 变换（绝对写入各自的新矩形）；若同组多个成员都在本次目标清单里，引擎会按
+ * 相对量把位移叠加多次（A 写一次带动 B，B 又被写一次）。
+ * 所以清单里同一链接组只保留一个代表：代表负责触发联动，其余成员交给引擎。
+ */
+uint32_t row_link_group(const ShellState& shell, comp_layer_id id) {
+  for (const LayerRow& row : shell.doc.layers) {
+    if (row.id == id) return row.link_group;
+  }
+  return 0;
+}
+
+void append_move_target(const ShellState& shell, comp_layer_id id,
+                        std::vector<GroupMemberMove>* out) {
+  for (GroupMemberMove& existing : *out) {
+    if (existing.id == id) return;
+  }
+  const uint32_t link = row_link_group(shell, id);
+  if (link != 0) {
+    for (const GroupMemberMove& existing : *out) {
+      if (row_link_group(shell, existing.id) == link) return;
+    }
+  }
+  GroupMemberMove member{};
+  member.id = id;
+  if (comp_layer_get_transform(shell.doc.document, member.id, &member.base, &member.rotation) !=
+      COMP_OK) {
+    return;
+  }
+  out->push_back(member);
+}
+
+/*
  * 整层拖动（Move 工具、无选区；§6.63 起「有选区但落点在选区外」也走这里）。
  * 与选区搬移分开实现：
  *   - 选区搬移改的是**像素**（comp_selection_move_pixels），只动当前图层选区内的字节；
@@ -1235,13 +1268,8 @@ void collect_group_members(const ShellState& shell, comp_layer_id root,
                                    static_cast<int64_t>(root))) {
       continue;
     }
-    GroupMemberMove member{};
-    member.id = item.id;
-    if (comp_layer_get_transform(shell.doc.document, member.id, &member.base, &member.rotation) !=
-        COMP_OK) {
-      continue;
-    }
-    out->push_back(member);
+    /* 经 append_move_target：同组链接层与重复 id 都只留一个代表。 */
+    append_move_target(shell, item.id, out);
   }
 }
 
@@ -1262,16 +1290,13 @@ void build_move_targets(const ShellState& shell,
       break;
     }
     if (is_group) {
-      collect_group_members(shell, id, out);
+      /* 组成员逐个走 append_move_target（同样按链接组去重）。 */
+      std::vector<GroupMemberMove> members;
+      collect_group_members(shell, id, &members);
+      for (const GroupMemberMove& member : members) append_move_target(shell, member.id, out);
       continue;
     }
-    GroupMemberMove member{};
-    member.id = id;
-    if (comp_layer_get_transform(shell.doc.document, member.id, &member.base, &member.rotation) !=
-        COMP_OK) {
-      continue;
-    }
-    out->push_back(member);
+    append_move_target(shell, id, out);
   }
 }
 

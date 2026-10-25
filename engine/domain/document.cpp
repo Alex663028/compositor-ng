@@ -405,6 +405,8 @@ bool Document::duplicate_layer(comp_layer_id id, comp_layer_id* out_id) {
     Layer clone = *source;
     clone.id = state_.next_layer_id++;
     clone.content_revision = allocate_revision();
+    /* 链接不随副本走：复制出来的层应能单独移动（PS 同款）。 */
+    clone.link_group = 0;
     remap.emplace(old_id, clone.id);
     clones.push_back(std::move(clone));
   }
@@ -1151,6 +1153,125 @@ bool Document::reverse_layers(comp_layer_id parent, std::string* error, bool* ou
   }
 
   invalidate_composite();
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
+  return txn_commit(error) == COMP_OK;
+}
+
+bool Document::link_layers(const std::vector<comp_layer_id>& ids, uint32_t* out_group,
+                           std::string* error, bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (out_group != nullptr) *out_group = 0;
+  if (ids.size() < 2) {
+    if (error != nullptr) *error = "linking requires at least two layers";
+    return false;
+  }
+
+  /* 先全量校验再动状态：不给「一半改完才报错」留口子。 */
+  bool same_group = true;
+  uint32_t chosen = 0;                 /* 参与链接的既有组里编号最小的那个 */
+  std::vector<uint32_t> involved;      /* 要被并进来的既有组 */
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const Layer* layer = find(ids[i]);
+    if (layer == nullptr) {
+      if (error != nullptr) *error = "layer not found";
+      return false;
+    }
+    if (layer->is_group) {
+      if (error != nullptr) *error = "layer groups cannot be linked";
+      return false;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (ids[j] == ids[i]) {
+        if (error != nullptr) *error = "duplicate layer id";
+        return false;
+      }
+    }
+    if (layer->link_group == 0) {
+      same_group = false;
+      continue;
+    }
+    if (chosen == 0 || layer->link_group < chosen) chosen = layer->link_group;
+    if (std::find(involved.begin(), involved.end(), layer->link_group) == involved.end()) {
+      involved.push_back(layer->link_group);
+    }
+  }
+  /* 只要牵涉两个及以上既有组（或还有未链接层），就不是「已在同一组」。 */
+  if (involved.size() > 1) same_group = false;
+  if (same_group) {
+    /* 已在同一组：空操作，不进历史。 */
+    if (out_group != nullptr) *out_group = chosen;
+    return true;
+  }
+
+  /* 组号：优先复用参与组里最小的那个；全未链接则取现有最大值 +1
+   * （不复用空洞，避免「旧引用误连新组」）。 */
+  uint32_t target = chosen;
+  if (target == 0) {
+    target = 1;
+    for (const Layer& layer : state_.layers) {
+      if (layer.link_group >= target) target = layer.link_group + 1;
+    }
+  }
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Link Layers", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+  /* 合并既有组：被卷入的其它组的原有成员一并改投 target，不把原组拆成两半。 */
+  for (Layer& layer : state_.layers) {
+    if (layer.link_group == 0 || layer.link_group == target) continue;
+    if (std::find(involved.begin(), involved.end(), layer.link_group) == involved.end()) continue;
+    layer.link_group = target;
+  }
+  for (comp_layer_id id : ids) {
+    Layer* layer = find(id);
+    if (layer != nullptr) layer->link_group = target;
+  }
+  /* 纯关系元数据：不 invalidate 合成、不 touch_layer。 */
+  if (out_group != nullptr) *out_group = target;
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
+  return txn_commit(error) == COMP_OK;
+}
+
+bool Document::unlink_layers(const std::vector<comp_layer_id>& ids, std::string* error,
+                             bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (ids.empty()) {
+    if (error != nullptr) *error = "no layers given";
+    return false;
+  }
+
+  bool any_linked = false;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const Layer* layer = find(ids[i]);
+    if (layer == nullptr) {
+      if (error != nullptr) *error = "layer not found";
+      return false;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (ids[j] == ids[i]) {
+        if (error != nullptr) *error = "duplicate layer id";
+        return false;
+      }
+    }
+    if (layer->link_group != 0) any_linked = true;
+  }
+  if (!any_linked) return true; /* 空操作，不进历史 */
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Unlink Layers", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+  for (comp_layer_id id : ids) {
+    Layer* layer = find(id);
+    if (layer != nullptr) layer->link_group = 0;
+  }
   if (out_changed != nullptr) *out_changed = true;
   if (!owns_txn) return true;
   return txn_commit(error) == COMP_OK;

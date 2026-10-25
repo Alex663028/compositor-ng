@@ -7807,6 +7807,150 @@ NaN → 0、越界夹取）、插入/删除（段中点、颜色随左端、首�
 - **反向排列不做「跨组搬动」**：它只反转某一父节点下的兄弟顺序；要跨组移动
   仍是拖动/`comp_layer_move` 的活。
 
+### 6.108 图层链接：把「整组一起动」做成引擎关系 + 一步撤销（P1-2 第三批，2026-10-24，Claude）
+
+**缺口。** P1-2 的最后一项：PS 的图层链接（Link Layers）。此前多选移动是在
+壳层把每个选中层各自 `comp_layer_set_transform` 一遍——位移能「看起来像联动」，
+但缩放/旋转根本没有传递，而且每层各落一个撤销步；用户按一次 `Ctrl+Z` 只回去
+一层，画面就散架了。所以这一批不是加一个 UI 开关，而是把「同组层共享几何
+变换」提升为**引擎侧的关系语义**。**ABI 尾部追加 3 个导出（173 → 176）。**
+
+**链接是关系元数据，不是几何快照。** `Layer::link_group`（0 = 未链接）只记录
+「我和谁一组」，不缓存任何矩阵。三条由此推出的性质：
+
+1. **链接本身不产生渲染变化**：`link_layers` / `unlink_layers` 不
+   `invalidate_composite`、不 `touch_layer`——不改像素，只改关系；
+2. **但它是可撤销的**：关系变更仍开一个事务（"Link Layers" / "Unlink Layers"），
+   一步撤销整组关系回退；
+3. **组 id 由引擎分配，壳层不猜**：`comp_layer_link` 的 `out_group` 回填实际组号。
+   规则是——选中集合里已有链接组的，取**最小**的那个组号作为 `target`；集合里
+   一个链接组都没有时取 `max(link_group) + 1`。合并两个已有组时，**被卷入的其它
+   组的原有成员一并改投 `target`**，绝不把旧组拆成两半（老组里没被选中的层也跟着
+   走，这才是「合并」而不是「抢人」）。
+
+**参数闸与语义闸。** `comp_layer_link(ids, count)`：`count < 2`、`ids == NULL`、
+集合内有重复 id 一律 `COMP_ERR_INVALID_ARGUMENT`；任一 id 不存在
+`COMP_ERR_NOT_FOUND`；**图层组**参与链接 `COMP_ERR_UNSUPPORTED`（文案
+`"layer groups cannot be linked"`）——组的几何是子树合成的产物，没有可联动的
+自有矩形，允许它参与只会得到「组框跟着变、内容不跟」的假联动。参数校验全部
+在**动状态之前**完成，所以拒绝时文档一字不改。`unlink` 只作用于被列举的层，
+同组里没列举到的成员留在原组。两者都有 `changed` 输出：同组再链一次、
+解除一组本来就没链接的层，都是 `changed = false` 且**不进历史**（不产生空撤销步）。
+
+**联动口径：在一个choke point 上做仿射展开。** 展开只发生在
+`comp_layer_set_transform` 里——这是全项目唯一写层几何的入口，放在这里才能保证
+「拖动、面板输入、快捷键微调、脚本」四条路径口径一致。对每个同组伙伴，以上一层
+的**目标中心 `C_old` / 旋转 `θ_old`** 与**新中心 `C_new` / 旋转 `θ_new`** 构造
+
+```
+p' = C_new + R(θ_new) · S(sx, sy) · R(−θ_old) · (p − C_old)
+```
+
+即：整组绕目标层中心做同一个相似变换。由此得到的行为：
+
+- **位移**：伙伴跟同样的平移量；
+- **旋转**：伙伴的 `rotation += Δθ`，且**绕目标中心公转**（不是原地自转）。
+  测试里 30° 让 20×20 @ (50,50) 的伙伴落到 (18,68)，再转到 −15° 落到 (61,35)——
+  联动的是**增量**，不是把目标的角度绝对值抄过去；
+- **等比缩放**：伙伴尺寸按各自轴缩放，位置按相对目标中心的向量缩放；
+- **非等比缩放 × 非 90° 相对角 = 剪切**：矩形 + 单角度表示不了剪切，直接
+  `COMP_ERR_UNSUPPORTED`（文案 `"non-uniform scale across linked layers with
+  differing rotation ..."`），**整次拒绝**，目标层自己也不写。绝不静默近似；
+- **退化/裁空的保持**：`apply_link_affine` 前先判 `is_valid_transform`，缩放为 0
+  或结果越界时保持伙伴原样，不让一次合法操作把伙伴矩形算成垃圾。
+
+**锁闸整次拒绝。** 写任何一层之前，先对**每个伙伴**过
+`lock_gate(..., COMP_LAYER_LOCK_POSITION, "transform linked layers")`；任一伙伴
+被位置锁住就整次 `COMP_ERR_STATE`，目标层与所有伙伴都保持原样——不留「目标动了、
+伙伴没动」的半截提交。解锁后同一操作立刻生效。
+
+**复制不带链接。** `duplicate_layer` 显式 `clone.link_group = 0`：副本若继承链接，
+用户一拖副本原件就跟着走，与「复制出来单独用」的预期相反（PS 同款）。
+
+**`.comp` 往返。** `manifest.json` 里只有 `link_group != 0` 的层写
+`"engineLink": <组号>`（默认值省略，与 `engineLock` / `engineColorLabel` 同一
+策略）；读取时校验非整数 / `<= 0` / `> 4294967295` 一律报错，不做静默归零。往返后
+组号原样恢复，联动照样生效——测试里读盘后平移目标层，伙伴跟同样 5px。
+
+**壳层。** 命令号 **1675**（`kCmdLayerLinkToggle`）：
+
+- 图层 > **链接图层(&K)**，无加速键；菜单 `MF_CHECKED` 只看**主选中行**是否
+  在非零组里（`menu_set_checked_recursive`，勾选项而非单选组），点一次即触发
+  `panel_toggle_link`：多选集合**全部属于同一非零组**时解除，否则链接——一个
+  命令做开关，与 PS 的 `Link/Unlink` 一致；
+- 可用性走 `enabled.layer_present`（有选中层就可点），真实门槛在面板函数里：
+  `panel_selection_ids` 里剔除组行后仍需 ≥ 2 个层，否则状态栏给
+  `"链接图层需要至少选中两个图层（不含图层组）"`——不置灰是刻意的，用户需要
+  这句解释，而不是一个无声的灰项；
+- 面板里链接成员的名字后加 `~` 标记（与锁 `*`、色标签同一条 `marks` 渲染路径），
+  不占额外列宽；
+- **多选移动去重**：这是最容易写错的地方。壳层多选位移会构造移动目标清单，
+  若 a、b 已链接，清单里同时含 a 和 b 就会「a 动一次、b 被引擎带一次、b 自己
+  再动一次」——位移翻倍。`append_move_target` 先按 id 去重，再按**非零
+  `link_group`** 去重：同一链接组只留一个代表，其余交给引擎展开。
+  `collect_group_members`（组的成员展开）走同一函数，两条路径共用一套去重规则；
+- `Ctrl+→` / 方向键微调沿用 `layer_transform_move_step(true)` = **10 文档像素**，
+  探针就是靠这个步长在 ~49% 缩放下量到 ~5 屏幕像素的位移。
+
+**测试钉的六件事**（`tests/test_layer_links.cpp`，735 = 729 + 6）：
+
+| case | 钉住什么 |
+|---|---|
+| `layer_link_set_get_validation_and_undo` | 参数闸（1 个 id / 空指针 / 重复 id / 不存在 / 组层）、引擎分配非零组号、同组再链 no-op、一步撤销/重做、unlink 只作用于列举层、两个组链成一次后全员改投存活组号 |
+| `layer_link_transform_translates_and_scales_mates` | 2x 等比 + 平移后伙伴精确落到 `(200,140,40,40)`、非同组层一格不动、整次联动一步撤销 |
+| `layer_link_transform_rotates_mates` | 伙伴绕目标中心公转 `(18,68)` 且 `rotation=30`；再转 −15° 落到 `(61,35)`，证明联动的是增量而非绝对值 |
+| `layer_link_rejects_shear_inducing_scale` | 伙伴 45° 时非等比缩放 → `COMP_ERR_UNSUPPORTED` 且目标与伙伴都没变；同场景等比缩放允许 |
+| `layer_link_transform_is_blocked_by_mate_position_lock` | 伙伴位置锁 → 整次 `COMP_ERR_STATE`、两层都不写；解锁后同一操作通过 |
+| `layer_link_duplicate_clears_and_comp_round_trip` | 副本 `link_group == 0`、manifest 里每个成员都写 `engineLink` 且值一致、读回后联动仍生效 |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_link` / `comp_layer_unlink` / `comp_layer_get_link` |
+| `engine/domain/layer.h` | `uint32_t link_group = 0;`（含契约注释） |
+| `engine/domain/document.h`、`document.cpp` | `link_layers`（组号分配 / 并组合并 / no-op 判定）/ `unlink_layers`；`duplicate_layer` 清空链接 |
+| `engine/abi/src/comp_layer_abi.cpp` | `LinkAffine` / `apply_link_affine`（含剪切拒绝）、`comp_layer_set_transform` 收集伙伴并整次写、三个新导出 |
+| `engine/format/comp_file.cpp` | `engineLink` 的默认省略写 + 读取校验 |
+| `tests/test_layer_links.cpp` | 6 个新 case（729 → 735） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerLinkToggle = 1675`、`LayerRow::link_group` |
+| `shells/windows/src/shell_layers.cpp` | `refresh_layers` 回读链接、`panel_toggle_link`（组行排除、全同组则解除） |
+| `shells/windows/src/shell_internal.h`、`shell_document.cpp`、`shell_window.cpp` | 声明 / case / 菜单项 + 勾选 + 置灰 |
+| `shells/windows/src/shell_paint.cpp` | 面板 `~` 标记 |
+| `shells/windows/src/shell_tools.cpp` | `row_link_group` / `append_move_target`（按 id、按链接组双重去重） |
+| `scripts/visual_check.py` | 追加 `layer_link` 场景（截图 143–147，8 条断言） |
+
+**视觉探针实测（`layer_link` 场景）：** 两层画同一笔橙色描边（`ff8800`），
+Ctrl+J 复制成完全重合的两层 → `Ctrl` 点选两层 → 1675 链接 → 只单选背景层按
+`Ctrl+→`。断言全部落在像素上：旧笔迹带被**完全腾空**、新笔迹带被涂上、
+**红色通道 bbox 宽度不变**（证明没有变成「两份笔迹错开」），位移量与 10 文档
+像素在 49% 缩放下的期望一致；`Ctrl+Z` 后画布逐像素复原；再按 1675 解除链接后
+面板行逐像素复原。8 条全 PASS，全量 `228 条 / 37 场景 / 0 失败`。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **735 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **176**（173 → 176，尾部追加 3 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **228 条 / 37 场景 / 0 失败** |
+
+**已知边界：**
+
+- **只联几何，不联内容/样式**：改不透明度、混合模式、效果参数、蒙版都不扩散。
+  这是有意收窄：几何是唯一能用一个仿射量精确表达的部分，其余「联动」都需要
+  语义决策（PS 也不联）。
+- **链接不跨文档**：`.comp` 里的组号只在本文档内有意义，粘贴/导入不做组号重映射，
+  副本一律按未链接处理。
+- **组图层不能入链**，只能链接普通层；需要「组跟着动」时链接组里的成员层，
+  或直接把组移动。
+- **剪切场景是拒绝而不是分解**：非等比缩放 × 非 90° 相对角在矩形+单角度的模型里
+  无解，返回 `COMP_ERR_UNSUPPORTED` 让上层提示用户，不做近似变换（否则用户看到
+  的是「链接后角度慢慢跑偏」）。
+- **一次联动只落一个撤销步**，但撤销粒度是「整个 set_transform 调用」：脚本一次
+  改十层仍是一步，不会拆开。
+
 
 
 

@@ -311,6 +311,25 @@ void refresh_layers(ShellState& shell) {
     if (comp_layer_get_color_label(shell.doc.document, id, &color_label) == COMP_OK) {
       row.color_label = color_label < COMP_LAYER_COLOR_COUNT ? color_label : 0u;
     }
+    uint32_t link_group = 0;
+    if (comp_layer_get_link(shell.doc.document, id, &link_group) == COMP_OK) {
+      row.link_group = link_group;
+    }
+    /*
+     * P1-2 收尾：过滤用的类型快照（只读）。文字层用 get_text 的空查询判定
+     * （非文字层返回 COMP_ERR_STATE），调整层数走 adjustment_count；
+     * 智能对象与填充层分别走 is_smart / is_fill（见下）。
+     */
+    size_t text_required = 0;
+    row.is_text = comp_layer_get_text(shell.doc.document, id, nullptr, nullptr, 0,
+                                      &text_required) == COMP_OK
+                      ? 1
+                      : 0;
+    size_t adjustment_count = 0;
+    if (comp_layer_adjustment_count(shell.doc.document, id, &adjustment_count) == COMP_OK) {
+      row.adjustment_count =
+          adjustment_count > 255u ? 255 : static_cast<int32_t>(adjustment_count);
+    }
     shell.doc.layers.push_back(row);
   }
 
@@ -1095,6 +1114,83 @@ void panel_set_color_label(ShellState& shell, uint32_t label) {
 }
 
 /*
+ * 链接图层（P1-2 第三批）。
+ *
+ * PS 的「链接图层」是勾选式：选中的多个层已经同组 -> 解除；否则并成一组。
+ * 这里沿用同一点选口径，但**只作用在选中的像素/文字层上**：
+ *   - 组图层跳过（引擎明确不支持，且组的几何由子树合成，没有可联动的矩形）；
+ *   - 有效选中层少于 2 个 -> 直接拒绝并提示（不偷偷对主选中层做单层操作）；
+ *   - 判定用引擎回读的 link_group，不信任面板缓存（撤销后缓存会滞后一帧）。
+ *
+ * 链接是纯关系元数据，但会进撤销栈，所以用 refresh_history_status 刷新
+ * 「撤销」标题——与设置锁/色标同一条路径，不置 needs_render。
+ */
+void panel_toggle_link(ShellState& shell) {
+  std::vector<comp_layer_id> batch = panel_selection_ids(shell, false);
+  std::vector<comp_layer_id> targets;
+  targets.reserve(batch.size());
+  for (comp_layer_id id : batch) {
+    const LayerRow* row = nullptr;
+    for (const LayerRow& candidate : shell.doc.layers) {
+      if (candidate.id == id) {
+        row = &candidate;
+        break;
+      }
+    }
+    if (row == nullptr || row->is_group != 0) continue;
+    targets.push_back(id);
+  }
+  if (targets.size() < 2) {
+    set_status(shell, L"链接图层需要至少选中两个图层（不含图层组）");
+    return;
+  }
+
+  uint32_t shared = 0;
+  bool all_linked = true;
+  for (comp_layer_id id : targets) {
+    uint32_t group = 0;
+    if (comp_layer_get_link(shell.doc.document, id, &group) != COMP_OK) {
+      set_status(shell, L"读取图层链接失败");
+      return;
+    }
+    if (group == 0) {
+      all_linked = false;
+    } else if (shared == 0) {
+      shared = group;
+    } else if (shared != group) {
+      all_linked = false;
+    }
+  }
+
+  wchar_t buffer[128];
+  if (all_linked) {
+    int32_t changed = 0;
+    if (comp_layer_unlink(shell.doc.document, targets.data(), targets.size(), &changed) != COMP_OK) {
+      set_status(shell, L"解除图层链接失败");
+      return;
+    }
+    refresh_layers(shell);
+    wsprintfW(buffer, L"已解除 %d 个图层的链接", static_cast<int>(targets.size()));
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  uint32_t group = 0;
+  int32_t changed = 0;
+  if (comp_layer_link(shell.doc.document, targets.data(), targets.size(), &group, &changed) !=
+      COMP_OK) {
+    set_status(shell, L"链接图层失败");
+    return;
+  }
+  refresh_layers(shell);
+  if (changed == 0) {
+    wsprintfW(buffer, L"已在同一链接组：%u", group);
+  } else {
+    wsprintfW(buffer, L"已链接 %d 个图层（组 %u）", static_cast<int>(targets.size()), group);
+  }
+  refresh_history_status(shell, buffer);
+}
+
  * 效果开关（S24）。
  *
  * 引擎侧 9 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/

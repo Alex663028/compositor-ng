@@ -300,6 +300,8 @@ constexpr UINT kCmdLayerColorBase = 1665;       /* 图层 > 颜色标签 > 无/�
  */
 constexpr UINT kCmdLayerMergeVisible = 1673; /* 图层 > 合并可见（Ctrl+Alt+E） */
 constexpr UINT kCmdLayerReverse = 1674;      /* 图层 > 反向排列 */
+/* P1-2 第三批（1675）：链接图层开关（同组一起移动/缩放/旋转）。 */
+constexpr UINT kCmdLayerLinkToggle = 1675;   /* 图层 > 链接图层 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -337,6 +339,8 @@ struct LayerRow {
    */
   uint32_t lock_flags = 0;  /* comp_layer_lock 位组合 */
   uint32_t color_label = 0; /* comp_layer_color_label，0 = 无 */
+  /* 链接组号（0 = 未链接）；只读快照，写路径走 comp_layer_link/unlink。 */
+  uint32_t link_group = 0;
   /*
    * S23：父级 id（0 = 根级）。剪贴基底必须与自身**同父**才算合法——引擎
    * filter_graph 只把同一 siblings 序列里紧跟基底的那串成员收进剪贴栈。S22 只按
