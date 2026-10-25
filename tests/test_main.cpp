@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -44,6 +45,20 @@ int main(int argc, char** argv) {
       filter = argv[i];
     }
   }
+  /* OPT-18：--shard=i/n 把 registry 按 index%n==i 切片。崩溃只杀本进程，
+   * 外层把 n 片分进程跑、汇总 summary，就得到「崩溃只丢一片」的隔离。
+   * 与子串过滤可叠加（先 shard 后 filter）。 */
+  int shard_index = 0;
+  int shard_count = 1;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strncmp(argv[i], "--shard=", 8) == 0) {
+      std::sscanf(argv[i] + 8, "%d/%d", &shard_index, &shard_count);
+      if (shard_count < 1 || shard_index < 0 || shard_index >= shard_count) {
+        shard_index = 0;
+        shard_count = 1;
+      }
+    }
+  }
 
   int failed_tests = 0;
   const std::vector<comptest::TestCase>& cases = comptest::registry();
@@ -61,7 +76,12 @@ int main(int argc, char** argv) {
   }
 
   size_t ran = 0;
+  size_t seen = 0;
   for (const comptest::TestCase& test : cases) {
+    const bool in_shard = shard_count == 1 || (seen % static_cast<size_t>(shard_count)) ==
+                                              static_cast<size_t>(shard_index);
+    ++seen;
+    if (!in_shard) continue;
     if (filter != nullptr && std::strstr(test.name, filter) == nullptr) continue;
     ++ran;
     const int before = comptest::failures;

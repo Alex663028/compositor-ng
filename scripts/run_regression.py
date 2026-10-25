@@ -288,6 +288,25 @@ def step_shared_dll(reg: Regression) -> bool:
     return reg.step("5. 共享构建 + ctypes 真实调用", fn)
 
 
+def step_present_bench(reg: Regression) -> bool:
+    """OPT-16：性能趋势记录（不门禁）。--present-bench 连跑对比 GPU 直呈 vs CPU
+    展平（S16），数字此前只手记在 README——换机器/驱动必然无声漂移。这里把输出
+    落盘 build/present_bench_last.txt 供前后对比；rc!=0 才算 FAIL（跑不动=环境问题）。
+    """
+    def fn():
+        if not IS_WINDOWS:
+            return "SKIP", "非 Windows 平台"
+        bench = os.path.join(BUILD, "present_bench.txt")
+        proc = reg.run_cmd([SHELL_EXE, "--present-bench=30"], capture=True)
+        if proc.returncode != 0:
+            return "FAIL", f"present-bench rc={proc.returncode}"
+        import shutil as _shutil
+        _shutil.copyfile(bench, os.path.join(BUILD, "present_bench_last.txt"))             if os.path.isfile(bench) else None
+        return "PASS", "趋势已记录 build/present_bench_last.txt（不门禁）"
+
+    return reg.step("7. present-bench 性能趋势记录（不门禁）", fn)
+
+
 def ohos_arch() -> str:
     """build_ohos.sh 的目标架构；默认 aarch64（真机），模拟器用 OHOS_ARCH=x86_64。"""
     return os.environ.get("OHOS_ARCH", "aarch64")
@@ -351,6 +370,7 @@ def main() -> int:
     step_crosscheck(reg, "crosscheck_codec.py", "3. 编解码交叉验证（引擎写 -> PIL 读）", args.python)
     step_crosscheck(reg, "crosscheck_comp.py", "4. .comp 双向交叉验证（<-> PIL）", args.python)
     step_shared_dll(reg)
+    step_present_bench(reg)
     if not args.skip_ohos:
         step_ohos(reg, require=args.require_ohos)
     else:

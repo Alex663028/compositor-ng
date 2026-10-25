@@ -17,6 +17,7 @@
 #include "compositor/comp_command.h"
 #include "compositor/comp_core.h"
 #include "compositor/comp_engine.h"
+#include "compositor/comp_filter.h"
 #include "compositor/comp_io.h"
 #include "compositor/comp_layer.h"
 #include "compositor/comp_render.h"
@@ -2222,4 +2223,55 @@ COMP_TEST(engine_create2_size_handshake_rejects_mismatched_descriptor) {
                  "long descriptor rejected by handshake");
   COMP_CHECK(comp_engine_create2(&desc, sizeof(comp_engine_desc), nullptr) ==
              COMP_ERR_INVALID_ARGUMENT);
+}
+
+/* OPT-17：多线程写操作矩阵——同一引擎、每线程一份文档，滤镜/撤销/导出交错。
+ * 契约：引擎级共享资源（登记表/分配器/文档登记，OPT-3 加锁）必须撑住并发写；
+ * 「同一线程内串行使用同一文档」仍是宿主责任（comp_engine.h 契约）。 */
+COMP_TEST(engine_concurrent_write_matrix_two_documents) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  std::atomic<int> failures(0);
+  auto worker = [&](int seed) {
+    comp_document_desc dd{};
+    dd.width = 32;
+    dd.height = 32;
+    comp_document doc = nullptr;
+    if (comp_document_create(engine, &dd, &doc) != COMP_OK || doc == nullptr) {
+      ++failures;
+      return;
+    }
+    for (int i = 0; i < 12; ++i) {
+      comp_layer_desc ld{};
+      ld.name = "layer";
+      comp_layer_id id = 0;
+      if (comp_layer_add(doc, &ld, &id) != COMP_OK) { ++failures; break; }
+      comp_image img{};
+      std::vector<uint8_t> px(32u * 32u * 4u, static_cast<uint8_t>(seed + i));
+      img.width = 32;
+      img.height = 32;
+      img.format = COMP_PIXEL_RGBA8;
+      img.stride = 32u * 4u;
+      img.pixels = px.data();
+      if (comp_layer_set_pixels(doc, id, &img) != COMP_OK) { ++failures; break; }
+      comp_filter_desc fd{};
+      std::memset(&fd, 0, sizeof(fd));
+      fd.kind = COMP_FILTER_VIGNETTE;
+      fd.vignette.amount = 0.5;
+      if (comp_filter_apply(doc, id, &fd, 1.0, nullptr, nullptr, 0, nullptr) != COMP_OK) {
+        ++failures;
+        break;
+      }
+      if (comp_document_undo(doc) != COMP_OK) { ++failures; break; }
+    }
+    comp_document_destroy(doc);
+  };
+  std::thread a(worker, 7);
+  std::thread b(worker, 200);
+  a.join();
+  b.join();
+  COMP_CHECK_MSG(failures.load() == 0, "concurrent per-document write matrix all succeed");
+  comp_engine_destroy(engine);
 }

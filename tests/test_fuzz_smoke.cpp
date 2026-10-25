@@ -13,6 +13,8 @@
  * 对「最经典攻击面」的最小钉子；更全面的样本集见任务卡 OPT-14 后续。
  */
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -105,4 +107,29 @@ COMP_TEST(fuzz_smoke_truncated_and_flipped_inputs_never_crash) {
   compositor::CodecImage sanity;
   COMP_CHECK(compositor::codec_lib_decode(png.data(), png.size(), kFormatPng, &sanity, &error));
   COMP_CHECK(sanity.width == 96 && sanity.height == 64);
+}
+
+COMP_TEST(fuzz_smoke_sample_files_all_rejected_or_safe) {
+  /* resources/fuzz/ 样本集（OPT-14）：每个文件解码都必须「成功或拒绝」，
+   * 不崩不越界；样本损坏模式见该目录 README。目录缺省时跳过（解耦检出裁剪）。 */
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::path("resources") / "fuzz";
+  if (!fs::exists(dir)) return;
+  int files = 0;
+  for (const auto& entry : fs::directory_iterator(dir)) {
+    if (entry.path().extension() != ".png") continue;
+    ++files;
+    std::vector<uint8_t> bytes;
+    FILE* f = std::fopen(entry.path().string().c_str(), "rb");
+    if (f == nullptr) continue;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.insert(bytes.end(), buf, buf + n);
+    std::fclose(f);
+    compositor::CodecImage image;
+    std::string error;
+    compositor::codec_lib_decode(bytes.data(), bytes.size(),
+                                  static_cast<uint32_t>(COMP_FORMAT_PNG), &image, &error);
+  }
+  COMP_CHECK(files >= 6);
 }
