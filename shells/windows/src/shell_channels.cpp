@@ -231,6 +231,7 @@ void channel_panel_toggle(ShellState& shell) {
   }
   /* 右栏一次只挂一个面板：色彩范围持有显式事务，必须先 abort 再让位。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);

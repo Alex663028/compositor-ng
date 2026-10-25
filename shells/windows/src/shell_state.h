@@ -294,6 +294,99 @@ constexpr UINT kCmdLayerLockPixels = 1662;      /* 图层 > 锁定 > 图像像�
 constexpr UINT kCmdLayerLockPosition = 1663;    /* 图层 > 锁定 > 位置 */
 constexpr UINT kCmdLayerLockAll = 1664;         /* 图层 > 锁定 > 全部 */
 constexpr UINT kCmdLayerColorBase = 1665;       /* 图层 > 颜色标签 > 无/红/橙/黄/绿/蓝/紫/灰 */
+/*
+ * P1-2 第二批（1673 段，紧接颜色标签 1665..1672）：合并可见 / 反向排列。
+ * 两者都是「一次点击改整篇结构」的命令，不需要面板，也没有可调参数。
+ */
+constexpr UINT kCmdLayerMergeVisible = 1673; /* 图层 > 合并可见（Ctrl+Alt+E） */
+constexpr UINT kCmdLayerReverse = 1674;      /* 图层 > 反向排列 */
+/* P1-2 第三批（1675）：链接图层开关（同组一起移动/缩放/旋转）。 */
+constexpr UINT kCmdLayerLinkToggle = 1675;   /* 图层 > 链接图层 */
+/*
+ * P1-2 第四批（1676 段）：图层样式的拷贝 / 粘贴。
+ * 上游的 Ctrl+Alt+C / Ctrl+Alt+V 在本壳已分别是「画布大小…」与「贴入选区」，
+ * 所以这两条只做菜单入口，不抢既有按键（面板里会把旧命令的提示写清楚）。
+ */
+constexpr UINT kCmdLayerCopyStyle = 1676;  /* 图层 > 图层样式 > 拷贝图层样式 */
+constexpr UINT kCmdLayerPasteStyle = 1677; /* 图层 > 图层样式 > 粘贴图层样式 */
+/*
+ * P1-2 收尾：图层面板过滤（1680 段）。过滤是**纯视图态**：不改文档、不进撤销、
+ * 不落 .comp，只决定面板上列出哪些行。三种维度（类型 / 名称 / 颜色标签）可以
+ * 叠加，菜单里的勾选态直接读这三个字段。
+ *
+ * 类型用基址 + 枚举（0 全部 / 1 像素 / 2 文字 / 3 组 / 4 调整 / 5 填充 / 6 智能）；
+ * 颜色分「全部」「无标签」「红..灰」三段——PS 的「无颜色」是独立槽位，不是
+ * 颜色枚举里的 0，混在基址里会与「全部」撞车。
+ */
+constexpr UINT kCmdLayerFilterKindBase = 1680;   /* +0..6 */
+constexpr UINT kCmdLayerFilterColorAll = 1690;  /* 图层 > 过滤 > 颜色 > 全部 */
+constexpr UINT kCmdLayerFilterColorNone = 1691; /* 图层 > 过滤 > 颜色 > 无标签 */
+constexpr UINT kCmdLayerFilterColorBase = 1692; /* +0..6 = 红/橙/黄/绿/蓝/紫/灰 */
+constexpr UINT kCmdLayerFilterName = 1699;      /* 图层 > 过滤 > 按名称… */
+constexpr UINT kCmdLayerFilterClear = 1700;     /* 图层 > 过滤 > 清除过滤 */
+/*
+ * P1-2 收尾 ⑤：图层复合（1701 段）。
+ *
+ * 复合本身是**文档状态**（进 `.comp`、随撤销/重做），壳里只多一条视图态：
+ * 「当前选中的复合 id」。菜单里没有展开的动态列表——面板/菜单每次都从引擎现读
+ * （comp_layer_comp_count / _id_at / _name），壳不缓存名字，也就不会与撤销后的
+ * 文档漂移。捕获需要一个名字，走与「重命名图层」同一套键入态（LayerInput）。
+ */
+constexpr UINT kCmdLayerCompCapture = 1701; /* 图层 > 图层复合 > 捕获为新复合… */
+constexpr UINT kCmdLayerCompApply = 1702;   /* 应用当前复合 */
+constexpr UINT kCmdLayerCompUpdate = 1703;  /* 用当前状态更新当前复合 */
+constexpr UINT kCmdLayerCompDelete = 1704;  /* 删除当前复合 */
+constexpr UINT kCmdLayerCompPrev = 1705;    /* 选择上一个复合 */
+constexpr UINT kCmdLayerCompNext = 1706;    /* 选择下一个复合 */
+constexpr UINT kCmdLayerCompRename = 1707;  /* 重命名当前复合… */
+constexpr UINT kCmdLayerCompStatus = 1708;  /* 状态栏报当前复合（菜单项不用，快捷键用） */
+/*
+ * P1-2 收尾 ⑦：智能对象 / 智能滤镜（1710 段）。
+ *
+ * 「像素是 source + 滤镜栈的求值缓存」这件事由引擎持有；壳只暴露三个动作：
+ * 转换、栅格化、清空滤镜栈。滤镜的**添加**不走这里——选中智能图层时
+ * 「滤镜 > 应用」本身就是添加一条智能滤镜（见 shell_filter.cpp 的 apply_filter），
+ * 与 PS 同一条路：同一个面板、同一次回车，普通层是破坏性应用，智能层是叠加。
+ */
+constexpr UINT kCmdLayerSmartConvert = 1710;   /* 图层 > 智能对象 > 转换为智能对象 */
+constexpr UINT kCmdLayerSmartRasterize = 1711; /* 图层 > 智能对象 > 栅格化 */
+constexpr UINT kCmdLayerSmartClear = 1712;     /* 图层 > 智能对象 > 清除全部智能滤镜 */
+constexpr UINT kCmdLayerSmartStatus = 1713;    /* 状态栏报智能滤镜条数 */
+/*
+ * P1-2 收尾 ⑧：新建填充层（1714 段）。
+ *
+ * 纯色 / 渐变 / 图案三种 kind 共用一个参数面板（参数表由引擎的
+ * comp_fill_kind_param_at 驱动），所以菜单只报三个「新建」，编辑参数与栅格化
+ * 各一个动作。填充层的「参数是真源、像素是缓存」由引擎持有。
+ */
+constexpr UINT kCmdLayerFillSolid = 1714;     /* 图层 > 新建填充图层 > 纯色… */
+constexpr UINT kCmdLayerFillGradient = 1715;  /* 图层 > 新建填充图层 > 渐变… */
+constexpr UINT kCmdLayerFillPattern = 1716;   /* 图层 > 新建填充图层 > 图案… */
+constexpr UINT kCmdLayerFillEdit = 1717;      /* 编辑当前填充层的参数 */
+constexpr UINT kCmdLayerFillRasterize = 1718; /* 栅格化填充层 */
+constexpr UINT kCmdLayerFillStatus = 1719;    /* 状态栏报填充层种类/参数 */
+/*
+ * P1-2 收尾 ⑨：智能滤镜栈面板（1720 段）。
+ *
+ * ⑦ 只把「叠加一条 / 整栈清除」接到 UI；单条参数编辑与单条开关当时只有引擎导出。
+ * 这一段把 comp_layer_smart_filter_at / _set / _remove 接上：面板逐条列出滤镜栈，
+ * 空格开关、回车改参数（滤镜面板进入「编辑该条」模式，回车走 _set）、Del 删除。
+ * 命令号取自 1719 之后的空段，避开 1590..1653 的调整段与 1660..1719 的已用段。
+ */
+constexpr UINT kCmdLayerSmartPanel = 1720;        /* 图层 > 智能对象 > 智能滤镜面板… */
+constexpr UINT kCmdLayerSmartPanelToggle = 1721;  /* 开/关当前条（不改参数） */
+constexpr UINT kCmdLayerSmartPanelEdit = 1722;    /* 编辑当前条参数（滤镜面板） */
+constexpr UINT kCmdLayerSmartPanelRemove = 1723;  /* 删除当前条 */
+/*
+ * P1-2 收尾 ⑩：栈序与展示名（1724..1726）。
+ *
+ * ⑨ 把逐条操作接上 UI 之后还剩两条能力边界：不能调序、不能命名。两者都是纯
+ * 面板动作（引擎导出 comp_layer_smart_filter_move / _set_name / _name）。
+ * 命令号接在 1723 之后，仍避开 1100/1200 段与已用的 1660..1723。
+ */
+constexpr UINT kCmdLayerSmartPanelRename = 1724;   /* 重命名当前条…（F2） */
+constexpr UINT kCmdLayerSmartPanelMoveUp = 1725;   /* 当前条上移一位（Alt+↑） */
+constexpr UINT kCmdLayerSmartPanelMoveDown = 1726; /* 当前条下移一位（Alt+↓） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -331,6 +424,8 @@ struct LayerRow {
    */
   uint32_t lock_flags = 0;  /* comp_layer_lock 位组合 */
   uint32_t color_label = 0; /* comp_layer_color_label，0 = 无 */
+  /* 链接组号（0 = 未链接）；只读快照，写路径走 comp_layer_link/unlink。 */
+  uint32_t link_group = 0;
   /*
    * S23：父级 id（0 = 根级）。剪贴基底必须与自身**同父**才算合法——引擎
    * filter_graph 只把同一 siblings 序列里紧跟基底的那串成员收进剪贴栈。S22 只按
@@ -347,6 +442,18 @@ struct LayerRow {
   uint8_t flip_y = 0;
   int32_t effect_count = 0; /* 本层已有效果的个数（菜单标勾、面板标 fxN） */
   /*
+   * P1-2 收尾：图层面板过滤用的只读类型快照。三者都从 ABI 回读，与 has_mask /
+   * is_group 同一口径；过滤只读它们，不改文档。
+   *   - is_text：可编辑文字图层（text 对象存在，像素只是渲染缓存）；
+   *   - adjustment_count：调整层判定（>0 即调整层；PS 的「调整图层」过滤项）；
+   *   - fill_kind：填充层种类（0 = 非填充层，1 纯色 / 2 渐变 / 3 图案）；
+   *   - is_smart：智能对象（像素只读、滤镜非破坏）。
+   */
+  uint8_t is_text = 0;
+  int32_t adjustment_count = 0;
+  uint32_t fill_kind = 0;
+  uint8_t is_smart = 0;
+  /*
    * P0-1：名字来自 comp_layer_get_name（UTF-8），面板只读回读结果。
    * 壳侧**不再自持名字**——重命名、撤销、合并、读盘之后名字都可能变，
    * 存第二份就会与文档漂移（与 opacity / blend 同一口径）。
@@ -354,8 +461,13 @@ struct LayerRow {
   std::string name;
 };
 
-/* P0-1：图层面板键入态（重命名 / 精确不透明度）。 */
-enum class LayerInput { None, Rename, Opacity };
+/*
+ * 图层面板键入态（重命名 / 精确不透明度 / 过滤词 / 复合名 / 智能滤镜名）。
+ *
+ * `FilterName` 是「按名称过滤图层」的过滤词，不是滤镜的名字；智能滤镜的展示名
+ * 用 `SmartFilterName`（P1-2 收尾 ⑩），两者别混。
+ */
+enum class LayerInput { None, Rename, Opacity, FilterName, CompName, SmartFilterName };
 
 /* 整组移动的成员快照（原 ShellState::GroupMemberMove）。 */
   struct GroupMemberMove {
@@ -419,6 +531,9 @@ struct DocumentContext {
   LayerInput layer_input = LayerInput::None;
   std::wstring layer_input_text;
   comp_layer_id layer_input_id = 0;
+  /* 键入态的第二坐标：智能滤镜改名时的栈内下标（layer_input_id 只装得下图层）。
+   * 其它键入态不用它，panel_cancel_layer_input 一律清零。 */
+  size_t layer_input_slot = 0;
   std::vector<uint32_t> adj_kinds;       /* 选中图层已有调整的 kind（数组序） */
   std::vector<std::string> adj_settings; /* 与 adj_kinds 对齐的 settings JSON */
   int32_t selected_adjustment = -1;      /* 已有调整的选中索引；-1 = 未选（新增态） */
@@ -526,6 +641,47 @@ struct DocumentContext {
   std::vector<std::string> effect_values;
   std::wstring effect_input;
   std::string effect_base_json;
+  /*
+   * P1-2 收尾 ⑧：新建填充层。三种 kind 共用一套参数行（参数表由引擎驱动），
+   * 所以只有一个面板；fill_values 与参数表按下标对齐，写入时整体交给
+   * comp_fill_build_settings 组装 JSON（缺省项/越界由引擎校验）。
+   */
+  bool fill_open = false;
+  uint32_t fill_kind = 0;               /* 1 纯色 / 2 渐变 / 3 图案 */
+  comp_layer_id fill_layer = 0;         /* 面板编辑的目标层；0 = 新建态 */
+  int32_t fill_param = 0;               /* 聚焦的可编辑参数序号 */
+  std::vector<std::string> fill_values; /* 与参数表对齐的 ASCII 编辑值 */
+  std::wstring fill_input;              /* 键入缓冲；非空 = 输入态 */
+  int32_t fill_drag_param = -1;
+  comp_ui::Rect fill_drag_track{}; /* 拖动期间冻结的轨道（指针 -> 值换算用） */
+  comp_txn fill_drag_txn = nullptr;
+  bool fill_drag_dirty = false;
+  int32_t fill_scroll = 0;
+  /*
+   * P1-2 收尾 ⑨：智能滤镜栈面板。列表每次绘制都从引擎现读（count / _at），壳里
+   * 不缓存滤镜参数，撤销 / 重做后不会出现「面板还停在旧栈」。
+   * smart_edit_* 是「滤镜面板改成编辑某一条」的那层绑定：smart_edit_base 保存读回
+   * 的那条 desc，写回时只覆盖面板行承载的字段——Vignette 的边缘色、Progressive
+   * Blur 的显式轴不在面板行里，必须原样带回，否则一次回车就把它们悄悄清零。
+   */
+  bool smart_open = false;
+  int32_t smart_focus = 0;
+  int32_t smart_scroll = 0;
+  comp_layer_id smart_layer = 0;      /* 面板绑定的层；refresh 时与选中层同步 */
+  comp_layer_id smart_edit_layer = 0; /* 非 0 = 滤镜面板正编辑该层的某一条 */
+  size_t smart_edit_index = 0;
+  int32_t smart_edit_enabled = 1;
+  comp_filter_desc smart_edit_base{};
+  /*
+   * 面板内拖拽重排（P1-2 收尾 ⑩）：按下即 pending，纵向移动超过 4 px 才 active
+   * （单击必须仍是「选中」）。active 期间 smart_drag_to 是「松手后这条会落在的
+   * 行」，松手才写引擎（comp_layer_smart_filter_move = 一步撤销）。
+   */
+  bool smart_drag_pending = false;
+  bool smart_drag_active = false;
+  int32_t smart_drag_from = -1;
+  int32_t smart_drag_to = -1;
+  int32_t smart_drag_press_y = 0;
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
   /* P1-4：一笔内 WM_POINTER 笔压采样（整笔取平均；_begin 清零）。 */
@@ -786,6 +942,31 @@ struct ShellState {
    * 只有窗口尺寸、位图尺寸与鼠标坐标需要在这两个坐标系之间换算。
    */
   int dpi = 96;
+  /*
+   * P1-2 ④：图层样式剪贴板（引擎导出的整份报文，空串 = 尚未拷贝）。
+   * 与位图剪贴板不同，样式报文很小、也不需要和系统剪贴板互通，所以由外壳
+   * 自己持有；放会话态而非文档态，拷贝后换文档仍能粘贴。
+   */
+  std::string layer_style_clipboard;
+  /*
+   * P1-2 收尾：图层面板过滤（视图态）。三项叠加生效：
+   *   - layer_filter_kind：0 全部 / 1 像素 / 2 文字 / 3 组 / 4 调整 / 5 填充 / 6 智能；
+   *   - layer_filter_color：-1 全部 / 0 无标签 / 1..7 红..灰；
+   *   - layer_filter_name：UTF-16 子串（不分大小写），空串 = 不过滤。
+   * 三者都不进文档、不进撤销、不落 .comp，换文档时保持——这是「看的方式」，
+   * 不是文档属性（与折叠集合同一类）。
+   */
+  int layer_filter_kind = 0;
+  int layer_filter_color = -1;
+  std::wstring layer_filter_name;
+
+  /*
+   * 当前选中的图层复合 id（0 = 尚未选）。纯视图态：复合数据在文档里，这里只记
+   * 「菜单上的应用/更新/删除指向哪一个」。文档里已不存在该 id 时（撤销、换文档）
+   * 由 panel_current_layer_comp() 退回到第一个复合，不在这里做失效清理——
+   * 撤销栈随时会把它变回来。
+   */
+  comp_layer_comp_id layer_comp_current = 0;
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;

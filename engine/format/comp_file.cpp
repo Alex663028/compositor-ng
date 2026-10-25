@@ -14,10 +14,13 @@
 #include "compositing/resample.h"
 #include "core/comp_geometry.h"
 #include "domain/document.h"
+#include "domain/fill_layer.h"
+#include "domain/filters.h"
 #include "domain/guide.h"
 #include "domain/selection.h"
 #include "domain/selection_channel.h"
 #include "domain/text_layer.h"
+#include "domain/utf8_text.h"
 #include "engine.h"
 #include "format/comp_json.h"
 #include "format/comp_png.h"
@@ -143,6 +146,11 @@ std::string pixel_file_name(const std::string& uuid, comp_pixel_format format) {
   return uuid + ".png";
 }
 std::string mask_file_name(const std::string& uuid) { return uuid + ".mask.png"; }
+
+/* 智能对象的**原始像素**（P1-2 收尾 ⑦）：图层自己的 imageFile 是滤镜求值后的
+ * 渲染缓存，改滤镜会整份换掉它，所以「不许被滤镜改」的 source 必须另存一份。
+ * 恒为预乘 RGBA8 PNG——创建智能对象时 16 位就已经落成 8 位工作副本了。 */
+std::string smart_source_file_name(const std::string& uuid) { return uuid + ".smart.png"; }
 
 /* 选区通道的资产名**由文档 ID + 数组下标派生**，manifest 里不存路径：
  * 载入时不接受任何来自文件的路径字符串，也就不存在「manifest 指到 images/
@@ -350,6 +358,138 @@ bool text_from_json(const JsonValue& j, TextObject* out) {
   return true;
 }
 
+/* ---------------------------------------------------- 智能对象（P1-2 收尾 ⑦） */
+
+/*
+ * 智能滤镜的落盘形态（engineSmart.filters[]）：
+ *
+ *   { "kind": 4, "enabled": true, "settings": { "radius": 3.5, ... } }
+ *
+ * `settings` 只写当前 kind **真正被读取**的那一份子结构（与 ABI 的「只有 kind
+ * 对应的子结构有意义」同一口径），所以一条 Gaussian Blur 不会顺带把整份
+ * Vignette 参数写进工程文件。键名 camelCase，与本文件其它 engine 键一致；
+ * 布尔按布尔存（不写 0/1），可读性与手改友好。
+ *
+ * 与 ABI 的分工：这里是**持久化**形状，不是 ABI 形状——ABI 描述符要跨版本稳定，
+ * 而 manifest 只在本仓读写（键名带 kind，旧构建不认识时会整份丢弃 engineSmart，
+ * 见读侧）。
+ */
+JsonValue filter_settings_to_json(const FilterSettings& settings) {
+  JsonValue s = JsonValue::object({});
+  switch (settings.kind) {
+    case kFilterVignette: {
+      const VignetteSettings& v = settings.vignette;
+      s.set("amount", JsonValue::number(v.amount));
+      s.set("midpoint", JsonValue::number(v.midpoint));
+      s.set("roundness", JsonValue::number(v.roundness));
+      s.set("feather", JsonValue::number(v.feather));
+      s.set("highlights", JsonValue::number(v.highlights));
+      s.set("color", JsonValue::array({JsonValue::number(v.color[0]),
+                                       JsonValue::number(v.color[1]),
+                                       JsonValue::number(v.color[2])}));
+      break;
+    }
+    case kFilterTonalContrast: {
+      const TonalContrastSettings& v = settings.tonal_contrast;
+      s.set("amount", JsonValue::number(v.amount));
+      s.set("radius", JsonValue::number(v.radius));
+      s.set("shadows", JsonValue::number(v.shadows));
+      s.set("midtones", JsonValue::number(v.midtones));
+      s.set("highlights", JsonValue::number(v.highlights));
+      break;
+    }
+    case kFilterBloom: {
+      s.set("amount", JsonValue::number(settings.bloom.amount));
+      s.set("radius", JsonValue::number(settings.bloom.radius));
+      break;
+    }
+    case kFilterLensCorrection: {
+      s.set("distortion", JsonValue::number(settings.lens_correction.distortion));
+      break;
+    }
+    case kFilterGaussianBlur: {
+      const GaussianBlurSettings& v = settings.gaussian_blur;
+      s.set("radius", JsonValue::number(v.radius));
+      s.set("preserveTransparency", JsonValue::boolean(v.preserve_transparency));
+      break;
+    }
+    case kFilterAddNoise: {
+      const AddNoiseSettings& v = settings.add_noise;
+      s.set("amount", JsonValue::number(v.amount));
+      s.set("gaussian", JsonValue::boolean(v.gaussian));
+      s.set("monochromatic", JsonValue::boolean(v.monochromatic));
+      s.set("seed", JsonValue::integer(static_cast<long long>(v.seed)));
+      break;
+    }
+    case kFilterGrain: {
+      const GrainSettings& v = settings.grain;
+      s.set("amount", JsonValue::number(v.amount));
+      s.set("size", JsonValue::number(v.size));
+      s.set("roughness", JsonValue::number(v.roughness));
+      s.set("seed", JsonValue::integer(static_cast<long long>(v.seed)));
+      break;
+    }
+    case kFilterMotionBlur: {
+      s.set("angle", JsonValue::number(settings.motion_blur.angle));
+      s.set("distance", JsonValue::number(settings.motion_blur.distance));
+      break;
+    }
+    case kFilterProgressiveBlur: {
+      const ProgressiveBlurSettings& v = settings.progressive_blur;
+      s.set("from", JsonValue::number(v.from));
+      s.set("to", JsonValue::number(v.to));
+      s.set("startX", JsonValue::number(v.start_x));
+      s.set("startY", JsonValue::number(v.start_y));
+      s.set("endX", JsonValue::number(v.end_x));
+      s.set("endY", JsonValue::number(v.end_y));
+      s.set("radial", JsonValue::boolean(v.radial));
+      s.set("inverted", JsonValue::boolean(v.inverted));
+      /* 名字对齐 ABI：explicitAxis = 假 就是「用缺省轴」（auto_axis = 真）。 */
+      s.set("explicitAxis", JsonValue::boolean(!v.auto_axis));
+      break;
+    }
+    case kFilterSharpen: {
+      const SharpenSettings& v = settings.sharpen;
+      s.set("amount", JsonValue::number(v.amount));
+      s.set("radius", JsonValue::number(v.radius));
+      s.set("threshold", JsonValue::number(v.threshold));
+      break;
+    }
+    case kFilterReduceNoise: {
+      const ReduceNoiseSettings& v = settings.reduce_noise;
+      s.set("strength", JsonValue::number(v.strength));
+      s.set("preserveDetails", JsonValue::number(v.preserve_details));
+      s.set("reduceColorNoise", JsonValue::number(v.reduce_color_noise));
+      break;
+    }
+  }
+  return s;
+}
+
+JsonValue smart_filter_to_json(const SmartFilter& filter) {
+  JsonValue j = JsonValue::object({});
+  j.set("kind", JsonValue::integer(static_cast<long long>(filter.settings.kind)));
+  /* enabled 一律写出：停用的条目也要留住参数，缺键会让「停用」变成「删除」。 */
+  j.set("enabled", JsonValue::boolean(filter.enabled));
+  /* name 只在非空时写出（P1-2 收尾 ⑩）：缺键 = 空 = 用滤镜类型名回退。
+   * 与 engineLock/engineColorLabel 同一口径，旧工程因此逐字节不变。 */
+  if (!filter.name.empty()) j.set("name", JsonValue::string(filter.name));
+  j.set("settings", filter_settings_to_json(filter.settings));
+  return j;
+}
+
+JsonValue smart_to_json(const SmartObject& object, const std::string& uuid) {
+  JsonValue j = JsonValue::object({});
+  j.set("sourceFile", JsonValue::string(smart_source_file_name(uuid)));
+  if (!object.source_name.empty()) j.set("sourceName", JsonValue::string(object.source_name));
+  JsonValue filters = JsonValue::array({});
+  for (const SmartFilter& filter : object.filters) filters.push(smart_filter_to_json(filter));
+  /* 空栈也写出空数组：键存在就表示「这是智能对象」，与「缺键 = 普通图层」
+   * 区分开——智能对象 + 空栈的画面等于 source，但可编辑性不同。 */
+  j.set("filters", std::move(filters));
+  return j;
+}
+
 /* ------------------------------------------------------------ 写：单个图层 */
 
 /* 返回该图层在 manifest 中的记录；uuid 为该图层派生出的 UUID 文本。 */
@@ -435,6 +575,26 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
     j.set("engineText", text_to_json(*layer.text));
   }
   /*
+   * 智能对象（engineSmart）：同样「缺键 = 普通图层」。imageFile 照常写——那是
+   * 求值缓存，让不认识本键的读方（含外部工具）看到的仍是正确画面；原始像素
+   * 另存 images/<uuid>.smart.png（见 save_project 的资产写出）。
+   */
+  if (layer.smart) {
+    j.set("engineSmart", smart_to_json(*layer.smart, uuid));
+  }
+  /*
+   * 填充图层（engineFill）：同一条「缺键 = 普通图层」。settings 按**字符串**落盘，
+   * 与 engineAdjustments[].settings 同一口径——参数由参数表校验，落盘不需要解码成
+   * JSON 对象，往返因此逐字节保真。imageFile 照常写：那是渲染缓存，让不认识本键的
+   * 读方看到的仍是正确画面（与 engineText / engineSmart 一致）。
+   */
+  if (layer.fill) {
+    JsonValue fill = JsonValue::object({});
+    fill.set("kind", JsonValue::integer(static_cast<long long>(layer.fill->kind)));
+    fill.set("settings", JsonValue::string(layer.fill->settings_json));
+    j.set("engineFill", std::move(fill));
+  }
+  /*
    * 图层锁（engineLock）与颜色标签（engineColorLabel）：同一条「默认值不写」。
    * 锁是整数字节掩码（comp_layer_lock），缺键 = 未锁；颜色标签 0 = 无。
    * 两者都是纯文档状态：不进合成、不推进内容修订号，但随撤销/重做与工程往返。
@@ -444,6 +604,10 @@ JsonValue layer_to_json(const Layer& layer, const std::string& uuid,
   }
   if (layer.color_label != 0u) {
     j.set("engineColorLabel", JsonValue::integer(static_cast<long long>(layer.color_label)));
+  }
+  /* 图层链接（engineLink）：0 = 未链接，缺键即未链接。组号 >0 才是有效状态。 */
+  if (layer.link_group != 0u) {
+    j.set("engineLink", JsonValue::integer(static_cast<long long>(layer.link_group)));
   }
   return j;
 }
@@ -627,9 +791,73 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
       }
     }
 
+    /* 智能对象的原始像素（engineSmart.sourceFile）。与 imageFile 分开写、**先于**
+     * manifest 落盘：manifest 一旦指到它，文件就必须已经在盘上。
+     * source 恒为 RGBA8（创建时 16 位已落 8 位工作副本）；出现别的格式说明内存
+     * 状态违反了 SmartObject 的不变量，明确失败而不是写一张「看起来能读」的图。 */
+    if (layer.smart) {
+      const ImageBuffer& source = layer.smart->source;
+      if (source.empty() || source.format != COMP_PIXEL_RGBA8) {
+        if (error != nullptr) {
+          *error = "layer " + uuid +
+                   ": smart object source must be a non-empty RGBA8 buffer (.comp stores "
+                   "images/<uuid>.smart.png only)";
+        }
+        return false;
+      }
+      if (!is_valid_canvas(comp_size{source.width, source.height})) {
+        if (error != nullptr) *error = "smart object source size out of range";
+        return false;
+      }
+      std::vector<uint8_t> png;
+      if (!png_encode_rgba8(source.pixel_data().data(), source.width, source.height, &png, error)) {
+        return false;
+      }
+      if (!write_bytes_file(images_dir / fs::u8path(smart_source_file_name(uuid)), png.data(),
+                            png.size(), error)) {
+        return false;
+      }
+    }
+
     layers.push(layer_to_json(layer, uuid, layer_uuid));
   }
   manifest.set("layers", std::move(layers));
+
+  /*
+   * 图层复合（engineLayerComps）：空表不写键——没有复合的工程落盘结果与旧版
+   * 逐字节一致（同 engineGuides / engineChannels / engineText 的规矩）。
+   *
+   * 每条 entry 的图层引用用 **UUID 文本**而不是 engineLayerID：manifest 里所有
+   * 跨图层引用（parentID / engineClippingSourceID / maskSourceID）都是 UUID，
+   * 只有它才是上游也认得的稳定身份；engineLayerID 是本引擎的会话内 id，换个
+   * 生成方就可能变。
+   *
+   * visible / opacity 一律写出（不按「默认值不写」省略）：复合记的是「捕获那
+   * 一刻所有存在图层」的完整快照，缺省省略会让「捕获时可见、之后被隐藏」的层
+   * 在读回后无从区分于「捕获时还不存在的层」。
+   */
+  if (!state.layer_comps.empty()) {
+    JsonValue comps = JsonValue::array({});
+    for (const LayerComp& comp : state.layer_comps) {
+      JsonValue item = JsonValue::object({});
+      item.set("id", JsonValue::integer(static_cast<long long>(comp.id)));
+      item.set("name", JsonValue::string(comp.name));
+      JsonValue entries = JsonValue::array({});
+      for (const LayerCompEntry& entry : comp.entries) {
+        const auto it = layer_uuid.find(entry.layer);
+        if (it == layer_uuid.end()) continue; /* 已被删除的层：跳过，不留空洞记录 */
+        JsonValue e = JsonValue::object({});
+        e.set("layer", JsonValue::string(it->second));
+        e.set("visible", JsonValue::boolean(entry.visible != 0));
+        e.set("opacity", JsonValue::number(std::min(1.0, std::max(0.0, static_cast<double>(entry.opacity)))));
+        entries.push(std::move(e));
+      }
+      item.set("entries", std::move(entries));
+      comps.push(std::move(item));
+    }
+    manifest.set("engineLayerComps", std::move(comps));
+  }
+
   manifest.set("engineVersion", JsonValue::string("1.0.0"));
 
   const std::string text = json_dump(manifest, 2) + "\n";
@@ -769,6 +997,195 @@ bool read_layer_mask(const JsonValue& entry, const fs::path& root, Layer* layer,
               static_cast<size_t>(x)] = decoded.rgba[index];
     }
   }
+  return true;
+}
+
+/* ------------------------------------------- 智能对象（P1-2 收尾 ⑦）读侧 */
+
+/* filter_settings_to_json 的逆。缺字段取该 kind 的缺省值（forward-compatible：
+ * 某个 kind 以后加字段时，旧工程仍读得回一条语义完整的设置）；但 kind、settings
+ * 容器必须存在，且**整份设置要过领域层的参数闸**——越界值不静默 clamp，直接让
+ * 整条 engineSmart 失效（见下面的 smart_from_json）。 */
+bool filter_settings_from_json(const JsonValue& j, FilterSettings* out) {
+  const long long kind = j.integer_or("kind", -1);
+  if (kind < static_cast<long long>(kFilterVignette) ||
+      kind > static_cast<long long>(kFilterReduceNoise)) {
+    return false;
+  }
+  const JsonValue* settings = j.find("settings");
+  if (settings == nullptr || !settings->is_object()) return false;
+
+  FilterSettings s;
+  s.kind = static_cast<FilterKind>(kind);
+  switch (s.kind) {
+    case kFilterVignette: {
+      VignetteSettings& v = s.vignette;
+      v.amount = settings->number_or("amount", v.amount);
+      v.midpoint = settings->number_or("midpoint", v.midpoint);
+      v.roundness = settings->number_or("roundness", v.roundness);
+      v.feather = settings->number_or("feather", v.feather);
+      v.highlights = settings->number_or("highlights", v.highlights);
+      const JsonValue* color = settings->find("color");
+      if (color != nullptr && color->is_array() && color->as_array().size() >= 3) {
+        for (int i = 0; i < 3; ++i) {
+          v.color[i] = color->as_array()[static_cast<size_t>(i)].as_number(v.color[i]);
+        }
+      }
+      break;
+    }
+    case kFilterTonalContrast: {
+      TonalContrastSettings& v = s.tonal_contrast;
+      v.amount = settings->number_or("amount", v.amount);
+      v.radius = settings->number_or("radius", v.radius);
+      v.shadows = settings->number_or("shadows", v.shadows);
+      v.midtones = settings->number_or("midtones", v.midtones);
+      v.highlights = settings->number_or("highlights", v.highlights);
+      break;
+    }
+    case kFilterBloom: {
+      s.bloom.amount = settings->number_or("amount", s.bloom.amount);
+      s.bloom.radius = settings->number_or("radius", s.bloom.radius);
+      break;
+    }
+    case kFilterLensCorrection: {
+      s.lens_correction.distortion =
+          settings->number_or("distortion", s.lens_correction.distortion);
+      break;
+    }
+    case kFilterGaussianBlur: {
+      GaussianBlurSettings& v = s.gaussian_blur;
+      v.radius = settings->number_or("radius", v.radius);
+      v.preserve_transparency = settings->bool_or("preserveTransparency", v.preserve_transparency);
+      break;
+    }
+    case kFilterAddNoise: {
+      AddNoiseSettings& v = s.add_noise;
+      v.amount = settings->number_or("amount", v.amount);
+      v.gaussian = settings->bool_or("gaussian", v.gaussian);
+      v.monochromatic = settings->bool_or("monochromatic", v.monochromatic);
+      const long long seed = settings->integer_or("seed", static_cast<long long>(v.seed));
+      if (seed < 0 || seed > 4294967295LL) return false;
+      v.seed = static_cast<uint32_t>(seed);
+      break;
+    }
+    case kFilterGrain: {
+      GrainSettings& v = s.grain;
+      v.amount = settings->number_or("amount", v.amount);
+      v.size = settings->number_or("size", v.size);
+      v.roughness = settings->number_or("roughness", v.roughness);
+      const long long seed = settings->integer_or("seed", static_cast<long long>(v.seed));
+      if (seed < 0 || seed > 4294967295LL) return false;
+      v.seed = static_cast<uint32_t>(seed);
+      break;
+    }
+    case kFilterMotionBlur: {
+      s.motion_blur.angle = settings->number_or("angle", s.motion_blur.angle);
+      s.motion_blur.distance = settings->number_or("distance", s.motion_blur.distance);
+      break;
+    }
+    case kFilterProgressiveBlur: {
+      ProgressiveBlurSettings& v = s.progressive_blur;
+      v.from = settings->number_or("from", v.from);
+      v.to = settings->number_or("to", v.to);
+      v.start_x = settings->number_or("startX", v.start_x);
+      v.start_y = settings->number_or("startY", v.start_y);
+      v.end_x = settings->number_or("endX", v.end_x);
+      v.end_y = settings->number_or("endY", v.end_y);
+      v.radial = settings->bool_or("radial", v.radial);
+      v.inverted = settings->bool_or("inverted", v.inverted);
+      v.auto_axis = !settings->bool_or("explicitAxis", !v.auto_axis);
+      break;
+    }
+    case kFilterSharpen: {
+      SharpenSettings& v = s.sharpen;
+      v.amount = settings->number_or("amount", v.amount);
+      v.radius = settings->number_or("radius", v.radius);
+      v.threshold = settings->number_or("threshold", v.threshold);
+      break;
+    }
+    case kFilterReduceNoise: {
+      ReduceNoiseSettings& v = s.reduce_noise;
+      v.strength = settings->number_or("strength", v.strength);
+      v.preserve_details = settings->number_or("preserveDetails", v.preserve_details);
+      v.reduce_color_noise = settings->number_or("reduceColorNoise", v.reduce_color_noise);
+      break;
+    }
+  }
+  std::string why;
+  if (!filter_settings_valid(s, &why)) return false;
+  *out = s;
+  return true;
+}
+
+/* 读原始像素（images/<uuid>.smart.png）。与 imageFile 同一套「声明与资产必须
+ * 相符」的规矩：这里只认 PNG，别的扩展名明确失败，不按 imageFile 的格式猜。 */
+bool read_smart_source(const std::string& file, const fs::path& root, ImageBuffer* out,
+                       std::string* error) {
+  if (!ends_with(file, ".png")) {
+    if (error != nullptr) *error = "smart source must be a PNG: " + file;
+    return false;
+  }
+  std::vector<uint8_t> bytes;
+  if (!read_bytes_file(images_dir_of(root) / fs::u8path(file), &bytes, error)) return false;
+  PngImage decoded;
+  if (!png_decode_rgba8(bytes.data(), bytes.size(), &decoded, error)) return false;
+  if (!is_valid_canvas(comp_size{decoded.width, decoded.height})) {
+    if (error != nullptr) *error = "smart source pixel size out of range";
+    return false;
+  }
+  out->resize(decoded.width, decoded.height, COMP_PIXEL_RGBA8);
+  if (!decoded.rgba.empty()) {
+    std::memcpy(out->writable_pixels().data(), decoded.rgba.data(), decoded.rgba.size());
+  }
+  return true;
+}
+
+/*
+ * 读回 engineSmart。**任何**问题都返回 false（整份丢弃，图层退回普通像素层），
+ * 与 engineText 同一条规矩：像素照旧由 imageFile 读回，画面不变，只是失去可
+ * 编辑性——好过让半个滤镜栈决定下一次「删滤镜重求值」渲出什么。
+ * 与 engineText 的差别只在原因不同：这里的失败源可能是原始像素缺失/损坏。
+ */
+bool smart_from_json(const JsonValue& entry, const fs::path& root, SmartObject* out,
+                     std::string* why) {
+  const std::string source_file = entry.string_or("sourceFile", "");
+  if (source_file.empty()) {
+    if (why != nullptr) *why = "sourceFile is missing";
+    return false;
+  }
+  const JsonValue* filters = entry.find("filters");
+  if (filters == nullptr || !filters->is_array()) {
+    if (why != nullptr) *why = "filters must be an array";
+    return false;
+  }
+  SmartObject object;
+  if (!read_smart_source(source_file, root, &object.source, why)) return false;
+  for (const JsonValue& f : filters->as_array()) {
+    if (!f.is_object()) {
+      if (why != nullptr) *why = "filters must contain objects";
+      return false;
+    }
+    SmartFilter filter;
+    if (!filter_settings_from_json(f, &filter.settings)) {
+      if (why != nullptr) *why = "a smart filter entry is not a valid setting";
+      return false;
+    }
+    filter.enabled = f.bool_or("enabled", true);
+    /*
+     * name（P1-2 收尾 ⑩）：缺键 = 空（用滤镜类型名回退）。**非法名字只清空名字**，
+     * 不整份丢弃 engineSmart——名字不参与像素求值，丢弃整条可编辑性去惩罚一个
+     * 只有面板才看得见的字段不合理。口径与 ABI 写入口一致：UTF-8、单行、
+     * ≤ kMaxSmartFilterNameBytes；不合规一律当没写。
+     */
+    const std::string name = f.string_or("name", "");
+    if (!name.empty() && name.size() <= kMaxSmartFilterNameBytes && utf8_is_valid(name) &&
+        utf8_is_single_line(name)) {
+      filter.name = name;
+    }
+    object.filters.push_back(std::move(filter));
+  }
+  object.source_name = entry.string_or("sourceName", "");
+  *out = std::move(object);
   return true;
 }
 
@@ -947,6 +1364,10 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
     }
   }
 
+  /* UUID -> 内部 id 的解析表。声明在图层块之外：图层复合（engineLayerComps）
+   * 在图层之后解析，也要用它把 entry 里的 UUID 换回内部 id。 */
+  std::unordered_map<std::string, comp_layer_id> uuid_to_id;
+
   const JsonValue* layers = manifest.find("layers");
   if (layers != nullptr && layers->is_array()) {
     if (static_cast<int64_t>(layers->as_array().size()) > kMaxLayers) {
@@ -954,7 +1375,6 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       return false;
     }
 
-    std::unordered_map<std::string, comp_layer_id> uuid_to_id;
     /*
      * engineLayerID 是引擎内部 id 的持久化形态：两条不同 UUID 的层一旦声明同一
      * id，find()/parentID 解析全部别名错层，撤销栈按 id 寻的也会打到别人。
@@ -1097,6 +1517,19 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       }
       layer.color_label = static_cast<uint32_t>(color_label);
 
+      /* engineLink：缺键 = 未链接。组号必须 >0；负数/0 显式写出属于非法状态
+       * （0 是缺省值，写出来只说明生成方口径不一致），一律拒绝而不是静默归零。 */
+      if (entry.find("engineLink") != nullptr) {
+        const long long link_group = entry.integer_or("engineLink", 0);
+        if (link_group <= 0 || link_group > 4294967295LL) {
+          if (error != nullptr) {
+            *error = "layer " + uuid + ": invalid engineLink " + std::to_string(link_group);
+          }
+          return false;
+        }
+        layer.link_group = static_cast<uint32_t>(link_group);
+      }
+
       /* engineText：缺键 = 普通图层；解析出的对象不可渲染则整体忽略（像素照旧
        * 由 imageFile 读回，画面不变，只是失去可编辑性——好过让半个文字对象
        * 决定下一次重渲染的结果）。 */
@@ -1104,6 +1537,33 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       if (text_entry != nullptr && text_entry->is_object()) {
         TextObject text;
         if (text_from_json(*text_entry, &text)) layer.text = std::move(text);
+      }
+
+      /* engineSmart：缺键 = 普通图层；解析失败整份丢弃（原因同 engineText）。
+       * 与 engineText 互斥：文字图层已经是可编辑真源，两层真源会互相抹对方
+       * 的结果（ABI 侧同样拒绝），手改过的 manifest 也按这一条处理。 */
+      const JsonValue* smart_entry = entry.find("engineSmart");
+      if (smart_entry != nullptr && smart_entry->is_object() && !layer.text &&
+          !layer.is_group) {
+        SmartObject smart;
+        std::string why;
+        if (smart_from_json(*smart_entry, root, &smart, &why)) layer.smart = std::move(smart);
+      }
+
+      /* engineFill：缺键 = 普通图层。kind 越界或 settings 过不了参数表（键白名单 /
+       * 类型 / 量程）就整份丢弃——像素已由 imageFile 读回，画面不变，只是失去
+       * 可编辑性；好过让一份非法参数决定下一次重渲的结果。与 engineText /
+       * engineSmart / 图层组互斥（同一层只能有一个真源），手改过的 manifest 也按
+       * 这一条处理。 */
+      const JsonValue* fill_entry = entry.find("engineFill");
+      if (fill_entry != nullptr && fill_entry->is_object() && !layer.text && !layer.smart &&
+          !layer.is_group) {
+        const long long fill_kind = fill_entry->integer_or("kind", 0);
+        const std::string fill_settings = fill_entry->string_or("settings", "{}");
+        if (fill_kind > 0 && fill_kind <= 4294967295LL &&
+            fill_validate_settings(static_cast<uint32_t>(fill_kind), fill_settings, nullptr)) {
+          layer.fill = FillLayer{static_cast<uint32_t>(fill_kind), fill_settings};
+        }
       }
 
       uuid_to_id[uuid] = layer.id;
@@ -1137,6 +1597,93 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
       const auto it = uuid_to_id.find(active);
       if (it != uuid_to_id.end()) state.active_layer = it->second;
     }
+  }
+
+  /*
+   * 图层复合（engineLayerComps，见 comp_file.cpp 的写侧）。缺键 = 没有复合；
+   * 键存在则严格读（与 engineGuides / engineChannels 同一条规矩）：
+   *   - 名字必须是**合法**的复合名（非空、单行、UTF-8、≤ 上界）；
+   *   - id 必须是正整数且互不重复——id 是宿主（面板/撤销）认复合的唯一把手；
+   *   - visible / opacity 必须显式给出且在取值域内。
+   * 唯一宽容处是 entry 的 layer：指向一个 manifest 里不存在的 UUID 时**跳过**
+   * 该条而不是整篇失败——这与 apply 的「已删除的层跳过」是同一语义，也让
+   * 「手改过 manifest 删了一层」不至于让整份工程打不开。
+   */
+  const JsonValue* comp_entries = manifest.find("engineLayerComps");
+  if (comp_entries != nullptr && !comp_entries->is_null()) {
+    if (!comp_entries->is_array()) {
+      if (error != nullptr) *error = "engineLayerComps must be an array";
+      return false;
+    }
+    if (comp_entries->as_array().size() > kMaxLayerComps) {
+      if (error != nullptr) *error = "too many layer comps in manifest";
+      return false;
+    }
+    uint32_t max_comp_id = 0;
+    for (const JsonValue& item : comp_entries->as_array()) {
+      if (!item.is_object()) {
+        if (error != nullptr) *error = "engineLayerComps must contain objects";
+        return false;
+      }
+      LayerComp comp;
+      const long long comp_id = item.integer_or("id", 0);
+      if (comp_id <= 0 || comp_id > 4294967295LL) {
+        if (error != nullptr) *error = "layer comp id is out of range";
+        return false;
+      }
+      comp.id = static_cast<uint32_t>(comp_id);
+      comp.name = item.string_or("name", "");
+      if (comp.name.empty() || comp.name.size() > kMaxLayerCompNameBytes ||
+          !utf8_is_valid(comp.name) || !utf8_is_single_line(comp.name)) {
+        if (error != nullptr) *error = "layer comp has an invalid name";
+        return false;
+      }
+      const JsonValue* entries = item.find("entries");
+      if (entries == nullptr || !entries->is_array()) {
+        if (error != nullptr) *error = "layer comp must carry an entries array";
+        return false;
+      }
+      for (const JsonValue& e : entries->as_array()) {
+        if (!e.is_object()) {
+          if (error != nullptr) *error = "layer comp entries must be objects";
+          return false;
+        }
+        const JsonValue* visible = e.find("visible");
+        const JsonValue* opacity = e.find("opacity");
+        if (visible == nullptr || !visible->is_bool() || opacity == nullptr ||
+            !opacity->is_number()) {
+          if (error != nullptr) {
+            *error = "layer comp entry must carry boolean visible and numeric opacity";
+          }
+          return false;
+        }
+        const std::string layer_uuid_text = e.string_or("layer", "");
+        const auto it = uuid_to_id.find(layer_uuid_text);
+        if (it == uuid_to_id.end()) continue; /* 已删除的层 */
+        const double opacity_value = opacity->as_number();
+        if (!(opacity_value >= 0.0) || opacity_value > 1.0) {
+          if (error != nullptr) *error = "layer comp entry opacity is out of range";
+          return false;
+        }
+        LayerCompEntry entry;
+        entry.layer = it->second;
+        entry.visible = visible->as_bool() ? 1u : 0u;
+        entry.opacity = static_cast<float>(opacity_value);
+        comp.entries.push_back(entry);
+      }
+      /* 同一层只能出现一次：重复项会让 apply 的结果取决于遍历顺序。 */
+      std::unordered_set<comp_layer_id> seen_layers;
+      for (const LayerCompEntry& entry : comp.entries) {
+        if (!seen_layers.insert(entry.layer).second) {
+          if (error != nullptr) *error = "layer comp lists the same layer twice";
+          return false;
+        }
+      }
+      if (comp.id > max_comp_id) max_comp_id = comp.id;
+      state.layer_comps.push_back(std::move(comp));
+    }
+    /* id 分配器与图层 id 同规：取 max+1，删除留下的空洞不复用。 */
+    state.next_layer_comp_id = max_comp_id + 1;
   }
 
   /* 重建组-子关系。 */

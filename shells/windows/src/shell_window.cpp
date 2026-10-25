@@ -207,6 +207,29 @@ void sync_menu_state(HWND window, ShellState& shell) {
     menu_radio_check_recursive(menu, kCmdLayerColorBase,
                                kCmdLayerColorBase + COMP_LAYER_COLOR_COUNT - 1,
                                kCmdLayerColorBase + label);
+    /* 链接是勾选项（不是单选组）：主选中层在组里就勾上，点一次解/加。 */
+    menu_set_checked_recursive(menu, kCmdLayerLinkToggle, row->link_group != 0);
+  }
+  /*
+   * P1-2 收尾：面板过滤是视图态单选组，勾选态直接读 shell 的三个字段——它不随
+   * 选中的图层变化，所以放在 row 判空之外。
+   */
+  menu_radio_check_recursive(menu, kCmdLayerFilterKindBase,
+                             kCmdLayerFilterKindBase + 6,
+                             kCmdLayerFilterKindBase +
+                                 static_cast<UINT>(shell.layer_filter_kind < 0
+                                                       ? 0
+                                                       : shell.layer_filter_kind));
+  {
+    UINT color_id = kCmdLayerFilterColorAll;
+    if (shell.layer_filter_color == 0) {
+      color_id = kCmdLayerFilterColorNone;
+    } else if (shell.layer_filter_color > 0 && shell.layer_filter_color <= 7) {
+      color_id = kCmdLayerFilterColorBase +
+                 static_cast<UINT>(shell.layer_filter_color - 1);
+    }
+    menu_radio_check_recursive(menu, kCmdLayerFilterColorAll, kCmdLayerFilterColorBase + 6,
+                               color_id);
   }
   /* 效果项：kEffectKindCount 个 kind 各自独立勾选（已启用 = 勾），不是互斥组。 */
   for (int kind = 0; kind < comp_ui::kEffectKindCount; ++kind) {
@@ -253,6 +276,15 @@ void sync_menu_state(HWND window, ShellState& shell) {
   }
   menu_set_enabled_recursive(menu, kCmdLayerMergeDown, enabled.layer_merge_down);
   menu_set_enabled_recursive(menu, kCmdLayerFlatten, enabled.layer_flatten);
+  /* 合并可见 / 反向排列：少于两层时都是空操作（引擎返回 changed=0），一律置灰。 */
+  menu_set_enabled_recursive(menu, kCmdLayerMergeVisible, enabled.layer_flatten);
+  menu_set_enabled_recursive(menu, kCmdLayerReverse, enabled.layer_flatten);
+  /* 链接/解除：有选中层即可点（少于两层的拒绝文案由面板函数给）。 */
+  menu_set_enabled_recursive(menu, kCmdLayerLinkToggle, enabled.layer_present);
+  /* 样式：拷贝要选中层（组由面板函数如实拒绝）；粘贴还要求剪贴板里有报文。 */
+  menu_set_enabled_recursive(menu, kCmdLayerCopyStyle, enabled.layer_present);
+  menu_set_enabled_recursive(menu, kCmdLayerPasteStyle,
+                             enabled.layer_present && !shell.layer_style_clipboard.empty());
   menu_set_enabled_recursive(menu, kCmdLayerRasterizeText, enabled.layer_rasterize_text);
   menu_set_enabled_recursive(menu, kCmdLayerSelectUp, enabled.layer_step);
   menu_set_enabled_recursive(menu, kCmdLayerSelectDown, enabled.layer_step);
@@ -281,6 +313,74 @@ void sync_menu_state(HWND window, ShellState& shell) {
   for (uint32_t label = 0; label < COMP_LAYER_COLOR_COUNT; ++label) {
     menu_set_enabled_recursive(menu, kCmdLayerColorBase + label, enabled.layer_present);
   }
+  /*
+   * P1-2 收尾：图层复合。捕获只要有文档就能点（空文档的复合也合法）；其余六条
+   * 都要求复合表非空——直接问引擎，不用壳侧缓存，撤销到「还没有复合」时菜单
+   * 会立刻跟着置灰。
+   */
+  size_t layer_comp_count = 0;
+  if (shell.doc.document == nullptr ||
+      comp_layer_comp_count(shell.doc.document, &layer_comp_count) != COMP_OK) {
+    layer_comp_count = 0;
+  }
+  const bool layer_comp_present = layer_comp_count > 0;
+  menu_set_enabled_recursive(menu, kCmdLayerCompCapture, shell.doc.document != nullptr);
+  const UINT layer_comp_items[] = {kCmdLayerCompApply,  kCmdLayerCompUpdate,
+                                   kCmdLayerCompRename, kCmdLayerCompDelete,
+                                   kCmdLayerCompPrev,   kCmdLayerCompNext};
+  for (UINT id : layer_comp_items) {
+    menu_set_enabled_recursive(menu, id, layer_comp_present);
+  }
+  /*
+   * P1-2 收尾 ⑦：智能对象三条。转换只要求有选中图层（组 / 文字 / HDR / 锁定由引擎
+   * 判定并在状态栏说明）；栅格化与清除滤镜要求当前层**确实是**智能对象——直接问
+   * 引擎，不用壳侧缓存，撤销掉转换后菜单立刻跟着置灰。
+   */
+  int32_t smart_selected = 0;
+  const comp_layer_id smart_target =
+      shell.doc.document != nullptr ? selected_layer_id(shell) : 0;
+  if (smart_target != 0) {
+    comp_layer_smart_object_is_smart(shell.doc.document, smart_target, &smart_selected);
+  }
+  size_t smart_filter_total = 0;
+  if (smart_selected != 0 &&
+      comp_layer_smart_filter_count(shell.doc.document, smart_target, &smart_filter_total) !=
+          COMP_OK) {
+    smart_filter_total = 0;
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerSmartConvert,
+                             enabled.layer_present && smart_selected == 0);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartRasterize, smart_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartClear, smart_filter_total > 0);
+  /*
+   * P1-2 收尾 ⑨：智能滤镜栈面板。面板开关与「当前条」三个动作分开判定：开关只要
+   * 当前层是智能对象就能点（面板开着时也允许关掉）；三个动作还要求栈里至少一条
+   * ——条数同样现问引擎，撤销/删除后菜单立刻跟着置灰。
+   */
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanel,
+                             smart_selected != 0 || shell.doc.smart_open);
+  const bool smart_entry_present = smart_selected != 0 && smart_filter_total > 0;
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelToggle, smart_entry_present);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelEdit, smart_entry_present);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelRemove, smart_entry_present);
+  /* P1-2 收尾 ⑩：改名只要有一条；调序要求至少两条（一条换不了位）。 */
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelRename, smart_entry_present);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelMoveUp, smart_filter_total > 1);
+  menu_set_enabled_recursive(menu, kCmdLayerSmartPanelMoveDown, smart_filter_total > 1);
+  /*
+   * P1-2 收尾 ⑧：填充图层。三种「新建」只要有文档就能点；编辑 / 栅格化 / 状态要求
+   * 当前层**确实是**填充层——同样直接问引擎，撤销掉新建后菜单立刻跟着置灰。
+   */
+  int32_t fill_selected = 0;
+  if (smart_target != 0) {
+    comp_layer_is_fill(shell.doc.document, smart_target, &fill_selected);
+  }
+  menu_set_enabled_recursive(menu, kCmdLayerFillSolid, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillGradient, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillPattern, shell.doc.document != nullptr);
+  menu_set_enabled_recursive(menu, kCmdLayerFillEdit, fill_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerFillRasterize, fill_selected != 0);
+  menu_set_enabled_recursive(menu, kCmdLayerFillStatus, fill_selected != 0);
   menu_set_enabled_recursive(menu, kCmdLayerMaskFromSelection, enabled.mask_from_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskToSelection, enabled.mask_to_selection);
   menu_set_enabled_recursive(menu, kCmdLayerMaskRemove, enabled.mask_remove);
@@ -918,7 +1018,7 @@ void commit_color_input(ShellState& shell) {
   set_status(shell, buffer);
 }
 
-void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift) {
+void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift, bool alt) {
   /*
    * P0-1：图层名 / 不透明度键入态是最高的模态。字符本体由 WM_CHAR 送进来
    * （CJK 走 WM_IME_CHAR），这里只处理编辑键；其余按键一律吞掉，理由同其它
@@ -1393,6 +1493,125 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       return;
     }
     /* 其余按键在面板打开时吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
+  /* 填充参数面板输入态（P1-2 收尾 ⑧）：与效果面板同一套输入规矩。 */
+  if (!shell.doc.fill_input.empty()) {
+    if (key == VK_ESCAPE) {
+      shell.doc.fill_input.clear();
+      set_status(shell, L"已取消输入");
+      return;
+    }
+    if (key == VK_BACK) {
+      fill_panel_backspace(shell);
+      return;
+    }
+    if (key == VK_RETURN) {
+      /* 键入 + 回车 = 落值并立刻应用（新建态则建层），少一次按键。 */
+      fill_panel_commit_input(shell);
+      if (shell.doc.fill_input.empty()) panel_apply_fill(shell);
+      return;
+    }
+    if (key == VK_TAB) {
+      shell.doc.fill_input.clear();
+      fill_panel_move_param(shell, shift ? -1 : 1);
+      return;
+    }
+    if (key >= '0' && key <= '9') {
+      shell.doc.fill_input.push_back(static_cast<wchar_t>(key));
+      return;
+    }
+    if (key == VK_OEM_PERIOD) {
+      shell.doc.fill_input.push_back(L'.');
+      return;
+    }
+    if (key == VK_OEM_MINUS) {
+      shell.doc.fill_input.push_back(L'-');
+      return;
+    }
+    return; /* 输入态下屏蔽其它快捷键，避免误触发 */
+  }
+
+  /* 填充参数面板打开时，键盘归面板：Esc 只关面板（不关窗），Ctrl 组合仍可穿透。 */
+  if (shell.doc.fill_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        close_fill_panel(shell);
+        return;
+      case VK_TAB:
+        fill_panel_move_param(shell, shift ? -1 : 1);
+        return;
+      case VK_RETURN:
+        panel_apply_fill(shell);
+        return;
+      case VK_OEM_MINUS:
+        fill_panel_step_value(shell, -1);
+        return;
+      case VK_OEM_PLUS:
+        fill_panel_step_value(shell, 1);
+        return;
+      case VK_BACK:
+        fill_panel_reset_values(shell);
+        return;
+      default:
+        break;
+    }
+    if (key >= '0' && key <= '9') {
+      fill_panel_begin_input(shell, static_cast<wchar_t>(key));
+      return;
+    }
+    /* 其余按键在面板打开时吞掉：避免工具字母键把面板留在「另一个工具」上。 */
+    return;
+  }
+
+  /*
+   * 智能滤镜栈面板（P1-2 收尾 ⑨）：键盘归面板。Ctrl 组合仍穿透——撤销 / 重做
+   * 要能直接按，列表与画面都会跟着引擎收敛（面板不缓存 desc）。
+   */
+  if (shell.doc.smart_open && !ctrl) {
+    switch (key) {
+      case VK_ESCAPE:
+        close_smart_panel(shell);
+        return;
+      case VK_UP:
+        /* Alt+↑ = 当前条上移一位（换栈序 = 改画面，一步撤销）；无 Alt 仍是选行。 */
+        if (alt) {
+          smart_panel_move_entry(shell, -1);
+        } else {
+          smart_panel_move(shell, -1);
+        }
+        return;
+      case VK_DOWN:
+        if (alt) {
+          smart_panel_move_entry(shell, 1);
+        } else {
+          smart_panel_move(shell, 1);
+        }
+        return;
+      case VK_SPACE:
+        smart_panel_toggle_entry(shell);
+        return;
+      case VK_RETURN:
+        smart_panel_edit_entry(shell);
+        return;
+      case VK_F2:
+        /* 面板开着时 F2 给滤镜改名（与图层面板的 F2 = 改图层名同一手感）。 */
+        panel_begin_smart_filter_name(shell);
+        return;
+      case VK_DELETE:
+        smart_panel_remove_entry(shell);
+        return;
+      case VK_HOME:
+        smart_panel_focus_row(shell, 0);
+        return;
+      case VK_END:
+        smart_panel_focus_row(shell, smart_panel_count(shell) - 1);
+        return;
+      default:
+        break;
+    }
+    /* 其余按键在面板打开时吞掉：避免按工具字母键把面板留在「另一个工具」上。 */
     return;
   }
 
@@ -2436,7 +2655,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           break;
         }
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        handle_key(window, *shell, wparam, ctrl, shift);
+        const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        handle_key(window, *shell, wparam, ctrl, shift, alt);
         InvalidateRect(window, nullptr, FALSE);
       }
       break;
@@ -2702,6 +2922,8 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             refresh_adjustments(*shell);
             /* S24：效果列表同样跟随选中图层，否则菜单勾选与 fx 标记会停在上一层。 */
             refresh_effects(*shell);
+            /* P1-2 收尾 ⑧：填充面板也跟随选中图层（绑定层或退回新建态）。 */
+            refresh_fill(*shell);
             const LayerRow* selected = selected_row(*shell);
             if (selected != nullptr) {
               wchar_t buffer[160];
@@ -2767,6 +2989,73 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               return 0;
             }
           }
+          if (shell->doc.fill_open && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 填充参数行（P1-2 收尾 ⑧）：上半行 = 聚焦，下半行（滑道）= 聚焦 + 拖动。
+             * 行/滑道几何与 draw_fill_panel 同源（ui_core::adjust_param_row_rect /
+             * adjust_slider_track_rect）。布尔没有滑道，点一下就切换。
+             * 面板里点空白也吞掉：面板开着时右栏没有第二个来源。
+             */
+            const int32_t total = static_cast<int32_t>(shell->doc.fill_values.size());
+            const int32_t scroll = comp_ui::adjust_param_clamp_scroll(
+                layout.adjust_panel, total, shell->doc.fill_scroll);
+            shell->doc.fill_scroll = scroll;
+            const int row = comp_ui::adjust_param_row_at(layout.adjust_panel, total, scroll,
+                                                        mouse_x, mouse_y);
+            if (row >= 0) {
+              comp_fill_param param{};
+              if (fill_param_query(*shell, row, &param)) {
+                shell->doc.fill_input.clear();
+                if (param.type == COMP_PARAM_BOOL) {
+                  fill_panel_focus_row(*shell, row);
+                  fill_panel_step_value(*shell, 1);
+                  /* 已绑定则一次写入（一步撤销）；新建态只改缓冲，回车建层。 */
+                  if (shell->doc.fill_layer != 0) panel_apply_fill(*shell);
+                } else if (comp_ui::adjust_row_track_hit(layout.adjust_panel, row, scroll,
+                                                         mouse_x, mouse_y)) {
+                  fill_panel_begin_drag(*shell, layout.adjust_panel, row,
+                                        static_cast<double>(mouse_x));
+                  if (shell->doc.fill_drag_param >= 0) SetCapture(window);
+                } else {
+                  fill_panel_focus_row(*shell, row);
+                }
+              }
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          if (shell->doc.smart_open && layout.adjust_panel.w > 0 &&
+              layout.adjust_panel.contains(mouse_x, mouse_y)) {
+            /*
+             * 智能滤镜栈：点行 = 聚焦该条（只移动键盘焦点，不写文档）。面板里
+             * 点空白也吞掉——面板开着时右栏没有第二个来源。行几何与
+             * draw_smart_panel 同源（smart_row_rect / smart_row_at）；双击改
+             * 参数在 WM_LBUTTONDBLCLK 里处理，单击这一下已经先把焦点落好。
+             */
+            const int count = smart_panel_count(*shell);
+            const int scroll = comp_ui::smart_clamp_scroll(layout.adjust_panel, count,
+                                                           shell->doc.smart_scroll);
+            shell->doc.smart_scroll = scroll;
+            const int row = comp_ui::smart_row_at(layout.adjust_panel, count, scroll, mouse_x,
+                                                  mouse_y);
+            if (row >= 0) {
+              smart_panel_focus_row(*shell, row);
+              /*
+               * P1-2 收尾 ⑩ 拖拽重排：按下即 pending（记起点行与 y），纵向移动超过
+               * 4 px 才进入 active。单击必须仍是「选中」，手抖 1px 不该把滤镜挪位；
+               * 捕获在 WM_LBUTTONUP / WM_CAPTURECHANGED 里释放。
+               */
+              shell->doc.smart_drag_from = row;
+              shell->doc.smart_drag_to = row;
+              shell->doc.smart_drag_press_y = mouse_y;
+              shell->doc.smart_drag_pending = true;
+              shell->doc.smart_drag_active = false;
+              SetCapture(window);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           if (type_panel_visible(*shell) && layout.adjust_panel.w > 0) {
             /* 点属性行 = 聚焦到该行；行几何与绘制共用 type_param_row_rect。 */
             const int row =
@@ -2794,7 +3083,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
           if (!shell->doc.effect_open && !shell->doc.filter_open && !shell->doc.trim_open &&
-              !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
+              !shell->doc.fill_open && !shell->doc.smart_open &&
+              !type_panel_visible(*shell) &&
+              !font_panel_visible(*shell) &&
               shell->doc.doc_dialog == comp_ui::DocDialogKind::None &&
               !shell->doc.color_range_open && !path_panel_visible(*shell) &&
               !history_panel_visible(*shell) && !channel_panel_visible(*shell) &&
@@ -3148,6 +3439,26 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
         }
         /*
+         * 智能滤镜栈：双击某条 = 聚焦并打开它的参数面板（等价「编辑当前」）。
+         * 单击那一下已经把焦点落到该行（见 WM_LBUTTONDOWN），这里只补上
+         * 「双击 = 打开编辑器」，与路径/通道面板的双击规矩一致。
+         */
+        if (client_layout(*shell, &layout) && shell->doc.smart_open &&
+            layout.adjust_panel.w > 0) {
+          const int count = smart_panel_count(*shell);
+          const int scroll = comp_ui::smart_clamp_scroll(layout.adjust_panel, count,
+                                                         shell->doc.smart_scroll);
+          shell->doc.smart_scroll = scroll;
+          const int row = comp_ui::smart_row_at(layout.adjust_panel, count, scroll, mouse_x,
+                                                mouse_y);
+          if (row >= 0) {
+            shell->doc.smart_focus = row;
+            smart_panel_edit_entry(*shell);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        }
+        /*
          * P0-1：双击图层行 = 重命名（与上游图层面板一致）。
          * 必须先于「还原成普通按下」——否则第二次点击只会重选一次，双击永远
          * 进不了改名态。
@@ -3176,6 +3487,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             shell->doc.selected_layer = row;
             refresh_adjustments(*shell);
             refresh_effects(*shell);
+            refresh_fill(*shell);
             panel_begin_rename(*shell);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
@@ -3233,6 +3545,29 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       /* P0-3 滑杆松手：提交事务 = 一次拖动只占一步撤销。 */
       if (shell != nullptr && shell->doc.adj_drag_param >= 0) {
         adjust_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /* P1-2 收尾 ⑧ 填充滑杆松手：有实际写入才提交，空拖动不占撤销步。 */
+      if (shell != nullptr && shell->doc.fill_drag_param >= 0) {
+        fill_panel_drag_finish(*shell, true);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
+       * P1-2 收尾 ⑩ 智能滤镜拖拽落点。pending 未 active = 单纯点选，什么都不做
+       * （不能把「点一下」变成一次撤销步）；active 才把 move 交给引擎。
+       */
+      if (shell != nullptr && shell->doc.smart_drag_pending) {
+        const bool dragged = shell->doc.smart_drag_active;
+        const int32_t from = shell->doc.smart_drag_from;
+        const int32_t to = shell->doc.smart_drag_to;
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
+        ReleaseCapture();
+        if (dragged) smart_panel_drop(*shell, from, to);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -3392,10 +3727,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         /* S24：拖行/框选是「按住鼠标」的临时态，失焦必须取消，否则指示线一直挂着。 */
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
         shell->doc.histogram_drag = false;
         /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
         curve_drag_finish(*shell, false);
         adjust_drag_finish(*shell, false);
+        fill_panel_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 整层拖动被 abort 后画面必须重画，否则图层会「停在」被拖到的位置。 */
@@ -3427,10 +3768,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         guide_drag_cancel(*shell);
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
         shell->doc.histogram_drag = false;
         /* P0-3：拖动中的滑杆/曲线点收不到松手事件，abort 事务回滚到按下前（幂等）。 */
         curve_drag_finish(*shell, false);
         adjust_drag_finish(*shell, false);
+        fill_panel_drag_finish(*shell, false);
         end_pan(window, *shell);
         stroke_cancel(*shell);
         /* 同上：捕获被抢走时整层拖动也要回滚并重画。 */
@@ -3585,6 +3932,39 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             adjust_drag_value(*shell, static_cast<double>(mouse_x));
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          /* P1-2 收尾 ⑧ 填充滑杆同理：几何用按下瞬间冻结的滑道。 */
+          if (shell->doc.fill_drag_param >= 0) {
+            fill_panel_drag_value(*shell, static_cast<double>(mouse_x));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+          /*
+           * P1-2 收尾 ⑩ 智能滤镜拖拽重排：与图层拖行同一套 4 px 阈值。落点是
+           * 「松手后这条会落在的行」；指针跑出列表时夹到首/末行——拖出面板仍然是
+           * 合法落点，否则想挪到栈底得精确对准 22 px 的高亮带。
+           */
+          if (shell->doc.smart_drag_pending) {
+            const int dy = mouse_y - shell->doc.smart_drag_press_y;
+            if (!shell->doc.smart_drag_active && (dy >= 4 || dy <= -4)) {
+              shell->doc.smart_drag_active = true;
+            }
+            if (shell->doc.smart_drag_active) {
+              const int count = smart_panel_count(*shell);
+              if (count > 0) {
+                const int scroll = comp_ui::smart_clamp_scroll(layout.adjust_panel, count,
+                                                               shell->doc.smart_scroll);
+                int target = comp_ui::smart_row_at(layout.adjust_panel, count, scroll, mouse_x,
+                                                   mouse_y);
+                if (target < 0) {
+                  target = mouse_y < layout.adjust_panel.y + comp_ui::kSmartRowsTop ? 0
+                                                                                    : count - 1;
+                }
+                shell->doc.smart_drag_to = target;
+              }
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
           }
           /*
            * S24：图层拖行（超过 4px 阈值才进入 active）与直方图框选优先于工具状态机。
@@ -3751,6 +4131,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             case 'S': command = kCmdSaveAs; break;
             case 'I': command = kCmdImageSize; break;
             case 'C': command = kCmdCanvasSize; break;
+            case 'E': command = kCmdLayerMergeVisible; break; /* P1-2 ② 合并可见 */
             case 'V': command = kCmdEditPasteInto; break; /* P0-4 贴入选区 */
             case 'R': command = kCmdCameraRaw; break;
             default: break;
@@ -3935,7 +4316,35 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           return 0;
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && shell->doc.fill_open &&
+                   !shell->doc.effect_open && !shell->doc.filter_open &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* 填充参数表滚轮翻行：一格 3 行，夹取在 ui_core（图案 10 行会用到）。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int32_t count = static_cast<int32_t>(shell->doc.fill_values.size());
+            const int next = shell->doc.fill_scroll + (delta > 0 ? -3 : 3);
+            shell->doc.fill_scroll =
+                comp_ui::adjust_param_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
+                   !layout.adjust_collapsed && shell->doc.smart_open &&
+                   layout.adjust_panel.contains(cursor.x, cursor.y)) {
+          /* 智能滤镜栈滚轮翻列表：一格 3 行，夹取在 ui_core；滚轮不动焦点。 */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int count = smart_panel_count(*shell);
+            const int next = shell->doc.smart_scroll + (delta > 0 ? -3 : 3);
+            shell->doc.smart_scroll =
+                comp_ui::smart_clamp_scroll(layout.adjust_panel, count, next);
+            InvalidateRect(window, nullptr, FALSE);
+          }
+          return 0;
+        } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
                    !layout.adjust_collapsed && !shell->doc.effect_open && !shell->doc.filter_open &&
+                   !shell->doc.fill_open && !shell->doc.smart_open &&
                    !type_panel_visible(*shell) && !font_panel_visible(*shell) &&
                    !channel_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {
@@ -4075,6 +4484,102 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeDown, L"向下合并(&M)\tCtrl+E");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerFlatten, L"拼合图像(&F)");
+  /*
+   * P1-2 第二批：合并可见 / 反向排列。上游 Merge Visible 的 Ctrl+Shift+E 在本壳
+   * 已被「效果参数」占用（§6.3x），这里退到 Ctrl+Alt+E；反向排列沿用上游的
+   * 「作用于当前层所在层级」语义，不需要面板。
+   */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerMergeVisible, L"合并可见(&V)\tCtrl+Alt+E");
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerReverse, L"反向排列(&R)");
+  /* P1-2 ③：链接图层（多选后点一次连上，再点一次解开）。 */
+  AppendMenuW(layer_menu, MF_STRING, kCmdLayerLinkToggle, L"链接图层(&K)");
+  /*
+   * P1-2 收尾：按类型 / 名称 / 颜色过滤面板（纯视图态，不写文档）。PS 把这三条
+   * 放在图层面板顶部的下拉里；本壳没有面板顶栏，收进「图层 > 过滤」子菜单。
+   */
+  HMENU layer_filter_menu = CreatePopupMenu();
+  const wchar_t* filter_kind_labels[] = {L"全部类型", L"像素图层", L"文字图层",
+                                         L"图层组",   L"调整图层", L"填充图层",
+                                         L"智能对象"};
+  for (UINT i = 0; i < 7; ++i) {
+    AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterKindBase + i, filter_kind_labels[i]);
+  }
+  HMENU layer_filter_color_menu = CreatePopupMenu();
+  AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorAll, L"全部颜色");
+  AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorNone, L"无标签");
+  const wchar_t* filter_color_labels[] = {L"红", L"橙", L"黄", L"绿", L"蓝", L"紫", L"灰"};
+  for (UINT i = 0; i < 7; ++i) {
+    AppendMenuW(layer_filter_color_menu, MF_STRING, kCmdLayerFilterColorBase + i,
+                filter_color_labels[i]);
+  }
+  AppendMenuW(layer_filter_menu, MF_POPUP,
+              reinterpret_cast<UINT_PTR>(layer_filter_color_menu), L"颜色标签(&C)");
+  AppendMenuW(layer_filter_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterName, L"按名称过滤…(&N)");
+  AppendMenuW(layer_filter_menu, MF_STRING, kCmdLayerFilterClear, L"清除过滤(&X)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_filter_menu),
+              L"过滤图层(&F)");
+  /*
+   * P1-2 收尾：图层复合（PS 的 Layer Comps 面板）。复合记「每个现存图层的可见性 +
+   * 不透明度」，存进文档、进撤销栈、随 .comp 落盘；「当前复合」只是视图态。
+   * 上游的面板用缩略图列表，本壳没有该面板，改成子菜单 + 上一个/下一个循环切换。
+   */
+  HMENU layer_comp_menu = CreatePopupMenu();
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompCapture, L"捕获为新复合…(&C)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompApply, L"应用当前复合(&A)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompUpdate, L"用当前状态更新(&U)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompRename, L"重命名当前复合…(&N)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompDelete, L"删除当前复合(&D)");
+  AppendMenuW(layer_comp_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompPrev, L"上一个复合(&P)");
+  AppendMenuW(layer_comp_menu, MF_STRING, kCmdLayerCompNext, L"下一个复合(&X)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(layer_comp_menu),
+              L"图层复合(&O)");
+  /*
+   * P1-2 收尾 ⑦：智能对象。转换把当前像素冻结成不可变 source，之后的「滤镜 > 应用」
+   * 变成非破坏的智能滤镜；栅格化丢掉可编辑性、保留当前渲染。清除滤镜整次只落一步
+   * 撤销（壳开显式事务包住逐条删除）。
+   */
+  HMENU smart_menu = CreatePopupMenu();
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartConvert, L"转换为智能对象(&V)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartRasterize, L"栅格化(&R)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartClear, L"清除全部智能滤镜(&X)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  /* P1-2 收尾 ⑨：逐条滤镜栈（面板 = 列表；三条动作针对当前条）。 */
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanel, L"智能滤镜面板…(&L)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelToggle, L"开关当前条(&T)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelEdit, L"编辑当前参数…(&E)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelRemove, L"删除当前条(&D)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelRename, L"重命名当前条…(&N)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelMoveUp, L"当前条上移一位(&U)");
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartPanelMoveDown, L"当前条下移一位(&W)");
+  AppendMenuW(smart_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(smart_menu, MF_STRING, kCmdLayerSmartStatus, L"状态（滤镜条数）");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(smart_menu), L"智能对象(&S)");
+  /*
+   * P1-2 收尾 ⑧：新建填充图层。三种 kind 共用一套参数行（参数表由引擎驱动）：
+   * 菜单项 = 开面板 + 用缺省参数立刻建层，之后在面板里调；「编辑」只对已选中的
+   * 填充层生效（kind 取自图层本身，避免用上次的 kind 把渐变改写成纯色）。
+   */
+  HMENU fill_menu = CreatePopupMenu();
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillSolid, L"纯色…(&C)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillGradient, L"渐变…(&G)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillPattern, L"图案…(&P)");
+  AppendMenuW(fill_menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillEdit, L"编辑填充参数(&E)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillRasterize, L"栅格化填充(&Z)");
+  AppendMenuW(fill_menu, MF_STRING, kCmdLayerFillStatus, L"状态（种类/参数）");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fill_menu), L"新建填充图层(&F)");
+  /*
+   * P1-2 ④：图层样式（= 效果栈）的拷贝/粘贴。上游的 Ctrl+Alt+C / Ctrl+Alt+V
+   * 在本壳分别是「画布大小…」与「贴入选区」，所以这两条只做菜单入口。
+   */
+  HMENU style_menu = CreatePopupMenu();
+  AppendMenuW(style_menu, MF_STRING, kCmdLayerCopyStyle, L"拷贝图层样式(&C)");
+  AppendMenuW(style_menu, MF_STRING, kCmdLayerPasteStyle, L"粘贴图层样式(&P)");
+  AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(style_menu), L"图层样式(&Y)");
   /* P0-6 ①：文字图层的像素是文字对象的渲染缓存，要直接涂像素必须先显式栅格化。 */
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerRasterizeText, L"栅格化文字(&R)");
   /* P0-6 ②：字体面板（枚举系统字体，切换下一次打字的字体轨道）。 */

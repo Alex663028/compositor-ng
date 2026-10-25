@@ -209,7 +209,8 @@ bool font_entry_before(const ShellFontEntry& left, const ShellFontEntry& right) 
 bool font_panel_visible(const ShellState& shell) {
   if (!shell.font_open) return false;
   return !shell.doc.path_open && !shell.doc.history_open && !shell.doc.color_range_open &&
-         !shell.doc.trim_open && !shell.doc.effect_open && !shell.doc.filter_open;
+         !shell.doc.trim_open && !shell.doc.effect_open && !shell.doc.filter_open &&
+         !shell.doc.smart_open;
 }
 
 void font_refilter(ShellState& shell) {
@@ -384,6 +385,7 @@ void font_panel_toggle(HWND window, ShellState& shell) {
   }
   /* 右栏一次只挂一个面板：色彩范围持有显式事务，必须先 abort 再让位。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);

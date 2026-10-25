@@ -2311,6 +2311,285 @@ int run_selftest(const wchar_t* out_path) {
                           shell_count == 2;
     verify(shell_ok, "shell open_path_as_document(.psd) takes the layered path");
 
+    /*
+     * P1-2 收尾：图层面板过滤。纯视图态——只改显示序，层数组与文档层数都不变，
+     * 也不产生撤销步；类型 / 颜色 / 名称三维是「与」关系。用刚打开的两层做探针。
+     */
+    {
+      refresh_layers(shell);
+      const int32_t all_rows = panel_row_count(shell);
+      const int32_t doc_layers = static_cast<int32_t>(shell.doc.layers.size());
+      panel_set_filter_kind(shell, 1); /* 像素图层 */
+      const int32_t pixel_rows = panel_row_count(shell);
+      panel_set_filter_kind(shell, 3); /* 图层组：这份文档没有组 */
+      const int32_t group_rows = panel_row_count(shell);
+      panel_set_filter_kind(shell, 0);
+      shell.layer_filter_name = L"psd-top";
+      panel_refresh_after_filter(shell);
+      const int32_t name_rows = panel_row_count(shell);
+      bool name_ok = name_rows > 0;
+      for (int32_t row = 0; row < name_rows; ++row) {
+        const LayerRow* shown = layer_row_at(shell, row);
+        if (shown == nullptr || shown->name.find("psd-top") == std::string::npos) {
+          name_ok = false;
+        }
+      }
+      panel_set_filter_color(shell, 7); /* 灰色标签：两层都没有标签 */
+      const int32_t gray_rows = panel_row_count(shell);
+      panel_clear_filter(shell);
+      size_t layers_after = 0;
+      verify(all_rows == doc_layers && all_rows > 1 && pixel_rows == all_rows &&
+                 group_rows == 0 && name_ok && name_rows < all_rows && gray_rows == 0 &&
+                 panel_row_count(shell) == all_rows &&
+                 comp_layer_count(shell.doc.document, &layers_after) == COMP_OK &&
+                 static_cast<int32_t>(layers_after) == doc_layers,
+             "layer panel filter narrows by type / color / name without touching the document");
+    }
+
+    /*
+     * P1-2 收尾：图层复合。捕获 -> 改可见性/不透明度 -> 应用 -> 回读；
+     * 第二次应用必须幂等（changed == 0），文档层数不受影响。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      size_t comps_before = 0;
+      comp_layer_comp_count(doc, &comps_before);
+      comp_layer_comp_id comp = 0;
+      const bool capture_ok = comp_layer_comp_capture(doc, "selftest-comp", &comp) == COMP_OK;
+      size_t comps_after = 0;
+      comp_layer_comp_count(doc, &comps_after);
+      size_t layer_count = 0;
+      comp_layer_count(doc, &layer_count);
+      std::vector<comp_layer_id> layer_ids(layer_count, 0);
+      size_t listed = 0;
+      const bool listed_ok =
+          layer_count > 0 &&
+          comp_layer_list(doc, layer_ids.data(), layer_ids.size(), &listed) == COMP_OK &&
+          listed == layer_count;
+      bool restored = false;
+      int32_t applied_changed = -1;
+      int32_t applied_again = -1;
+      if (capture_ok && listed_ok) {
+        int32_t visible = 1;
+        float opacity = 1.0f;
+        comp_layer_get_visible(doc, layer_ids[0], &visible);
+        comp_layer_get_opacity(doc, layer_ids[0], &opacity);
+        const bool mutated =
+            comp_layer_set_visible(doc, layer_ids[0], visible != 0 ? 0 : 1) == COMP_OK &&
+            comp_layer_set_opacity(doc, layer_ids[0], 0.25f) == COMP_OK;
+        const bool applied = comp_layer_comp_apply(doc, comp, &applied_changed) == COMP_OK;
+        if (applied) comp_layer_comp_apply(doc, comp, &applied_again);
+        int32_t restored_visible = -1;
+        float restored_opacity = 0.0f;
+        comp_layer_get_visible(doc, layer_ids[0], &restored_visible);
+        comp_layer_get_opacity(doc, layer_ids[0], &restored_opacity);
+        restored = mutated && restored_visible == visible && restored_opacity == opacity;
+      }
+      size_t layer_count_after = 0;
+      comp_layer_count(doc, &layer_count_after);
+      verify(comps_before == 0 && capture_ok && comp != 0 && comps_after == comps_before + 1 &&
+                 restored && applied_changed > 0 && applied_again == 0 &&
+                 layer_count_after == layer_count,
+             "layer comp captures / applies / is idempotent without touching the layer stack");
+    }
+
+    /*
+     * P1-2 收尾 ⑦：智能对象 / 智能滤镜。转换 -> 画面逐字节不变、is_smart = 1；
+     * 加一条高斯 -> 栈里 1 条且像素变了（像素是求值缓存）；直接写像素被拒
+     * （必须先栅格化）；栅格化后 is_smart = 0、渲染结果留下。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      comp_layer_id target = 0;
+      size_t listed_one = 0;
+      /* comp_layer_list 的 out_count 是**总数**（不受 capacity 限制），所以这里只要求 >= 1。 */
+      const bool listed_ok =
+          comp_layer_list(doc, &target, 1u, &listed_one) == COMP_OK && listed_one >= 1u;
+      int32_t px_w = 0;
+      int32_t px_h = 0;
+      comp_pixel_format px_fmt = COMP_PIXEL_RGBA8;
+      std::vector<uint8_t> before;
+      if (listed_ok &&
+          comp_layer_get_pixels(doc, target, nullptr, 0, &px_w, &px_h, &px_fmt) == COMP_OK &&
+          px_w >= 4 && px_h >= 4 && px_fmt == COMP_PIXEL_RGBA8) {
+        /*
+         * 不依赖当前图层里恰好有什么（拍平的 PSD 夹具可能是一整块纯色，模糊前后逐字节相同）。
+         * 先画一个已知图案：透明底 + 中央不透明白块。模糊半径 3 必然改动边缘像素。
+         */
+        const size_t stride = static_cast<size_t>(px_w) * 4u;
+        before.assign(stride * static_cast<size_t>(px_h), 0u);
+        const int32_t x0 = px_w / 4;
+        const int32_t y0 = px_h / 4;
+        const int32_t x1 = px_w - px_w / 4;
+        const int32_t y1 = px_h - px_h / 4;
+        for (int32_t y = y0; y < y1; ++y) {
+          for (int32_t x = x0; x < x1; ++x) {
+            uint8_t* px = before.data() + static_cast<size_t>(y) * stride +
+                          static_cast<size_t>(x) * 4u;
+            px[0] = 255u;
+            px[1] = 255u;
+            px[2] = 255u;
+            px[3] = 255u;
+          }
+        }
+        comp_image pattern{};
+        pattern.width = px_w;
+        pattern.height = px_h;
+        pattern.format = COMP_PIXEL_RGBA8;
+        pattern.stride = stride;
+        pattern.pixels = before.data();
+        if (comp_layer_set_pixels(doc, target, &pattern) != COMP_OK) {
+          before.clear();
+        }
+        /* 读回来当基准：写进去的字节未必等于引擎内部存的（预乘等），比较必须以读回为准。 */
+        if (!before.empty()) {
+          std::vector<uint8_t> read_back(before.size(), 0u);
+          int32_t rw = px_w;
+          int32_t rh = px_h;
+          comp_pixel_format rfmt = px_fmt;
+          if (comp_layer_get_pixels(doc, target, read_back.data(), stride, &rw, &rh, &rfmt) ==
+                  COMP_OK &&
+              rw == px_w && rh == px_h) {
+            before.swap(read_back);
+          } else {
+            before.clear();
+          }
+        }
+      }
+      int32_t changed = 0;
+      const bool converted =
+          !before.empty() &&
+          comp_layer_smart_object_create(doc, target, &changed) == COMP_OK && changed == 1;
+      int32_t smart = 0;
+      comp_layer_smart_object_is_smart(doc, target, &smart);
+      std::vector<uint8_t> after_convert(before.size(), 0u);
+      int32_t cw = px_w;
+      int32_t ch = px_h;
+      comp_pixel_format cfmt = px_fmt;
+      const bool pixels_kept =
+          converted && smart == 1 &&
+          comp_layer_get_pixels(doc, target, after_convert.data(),
+                                static_cast<size_t>(cw) * 4u, &cw, &ch, &cfmt) == COMP_OK &&
+          after_convert == before;
+      comp_filter_desc blur{};
+      blur.kind = COMP_FILTER_GAUSSIAN_BLUR;
+      blur.gaussian_blur.radius = 3.0;
+      const bool added =
+          converted && comp_layer_smart_filter_add(doc, target, &blur) == COMP_OK;
+      size_t filters = 0;
+      comp_layer_smart_filter_count(doc, target, &filters);
+      std::vector<uint8_t> after_filter(before.size(), 0u);
+      int32_t fw = px_w;
+      int32_t fh = px_h;
+      comp_pixel_format ffmt = px_fmt;
+      const bool render_changed =
+          added &&
+          comp_layer_get_pixels(doc, target, after_filter.data(),
+                                static_cast<size_t>(fw) * 4u, &fw, &fh, &ffmt) == COMP_OK &&
+          after_filter != before;
+      comp_image write_image{};
+      write_image.width = px_w;
+      write_image.height = px_h;
+      write_image.format = px_fmt;
+      write_image.stride = static_cast<size_t>(px_w) * 4u;
+      write_image.pixels = before.data();
+      const bool refused =
+          converted && comp_layer_set_pixels(doc, target, &write_image) == COMP_ERR_STATE;
+      const bool rasterized =
+          converted && comp_layer_smart_object_rasterize(doc, target) == COMP_OK &&
+          comp_layer_smart_object_is_smart(doc, target, &smart) == COMP_OK && smart == 0;
+      verify(listed_ok && converted && pixels_kept && added && filters == 1 && render_changed &&
+                 refused && rasterized,
+             "smart object converts / adds a smart filter / refuses pixel writes / rasterizes");
+    }
+
+    /*
+     * P1-2 收尾 ⑧：填充图层（纯色）。走壳的面板路径（菜单项 = 开面板 + 缺省参数建层）：
+     * 文档层数 +1、顶层 is_fill = 1 且 kind 是纯色；像素是该纯色的均匀渲染（缺省
+     * 128/128/128/255）；直接写像素被拒（参数才是真源）；栅格化后 is_fill = 0、
+     * 像素原样留下。
+     */
+    {
+      comp_document doc = shell.doc.document;
+      size_t count_before = 0;
+      comp_size canvas{};
+      const bool before_ok =
+          doc != nullptr && comp_layer_count(doc, &count_before) == COMP_OK &&
+          comp_document_size(doc, &canvas) == COMP_OK && canvas.width > 0 && canvas.height > 0;
+      panel_add_fill(shell, COMP_FILL_SOLID);
+      size_t count_after = 0;
+      comp_layer_id fill_id = 0;
+      size_t listed = 0;
+      bool added = before_ok && comp_layer_count(doc, &count_after) == COMP_OK &&
+                   count_after == count_before + 1;
+      if (added) {
+        /*
+         * 数组序**自下而上**（compositor 按 state_.layers 顺序合成，面板再逆序显示），
+         * 新层是 push_back 上去的，所以栈顶是最后一个 id——不是 [0]。
+         */
+        std::vector<comp_layer_id> stack_ids(count_after, 0u);
+        added = comp_layer_list(doc, stack_ids.data(), stack_ids.size(), &listed) == COMP_OK &&
+                listed >= 1u;
+        if (added) {
+          /* out_count 是总数，不受 capacity 限制：先夹一次再取最后一个。 */
+          if (listed > stack_ids.size()) listed = stack_ids.size();
+          fill_id = stack_ids[listed - 1u];
+        }
+      }
+      int32_t is_fill = 0;
+      uint32_t fill_kind = COMP_FILL_NONE;
+      const bool described =
+          added && comp_layer_is_fill(doc, fill_id, &is_fill) == COMP_OK && is_fill != 0 &&
+          comp_layer_get_fill(doc, fill_id, &fill_kind, nullptr, 0, nullptr) == COMP_OK &&
+          fill_kind == COMP_FILL_SOLID;
+      /* 纯色 = 整幅均匀：逐像素与首像素比，且首像素就是缺省色（读回值，不假设预乘细节）。 */
+      std::vector<uint8_t> pixels;
+      int32_t px_w = 0;
+      int32_t px_h = 0;
+      comp_pixel_format px_fmt = COMP_PIXEL_RGBA8;
+      bool uniform = false;
+      if (described &&
+          comp_layer_get_pixels(doc, fill_id, nullptr, 0, &px_w, &px_h, &px_fmt) == COMP_OK &&
+          px_w > 0 && px_h > 0) {
+        const size_t stride = static_cast<size_t>(px_w) * 4u;
+        pixels.assign(stride * static_cast<size_t>(px_h), 0u);
+        if (comp_layer_get_pixels(doc, fill_id, pixels.data(), stride, &px_w, &px_h, &px_fmt) ==
+            COMP_OK) {
+          uniform = pixels[0] == 128u && pixels[1] == 128u && pixels[2] == 128u &&
+                    pixels[3] == 255u;
+          for (size_t i = 4; uniform && i + 3 < pixels.size(); i += 4) {
+            uniform = pixels[i] == pixels[0] && pixels[i + 1] == pixels[1] &&
+                      pixels[i + 2] == pixels[2] && pixels[i + 3] == pixels[3];
+          }
+        }
+      }
+      comp_image write_image{};
+      write_image.width = px_w;
+      write_image.height = px_h;
+      write_image.format = px_fmt;
+      write_image.stride = static_cast<size_t>(px_w) * 4u;
+      write_image.pixels = pixels.empty() ? nullptr : pixels.data();
+      const bool refused = !pixels.empty() &&
+                           comp_layer_set_pixels(doc, fill_id, &write_image) == COMP_ERR_STATE;
+      const bool rasterized =
+          described && comp_layer_rasterize_fill(doc, fill_id) == COMP_OK &&
+          comp_layer_is_fill(doc, fill_id, &is_fill) == COMP_OK && is_fill == 0;
+      /* 栅格化只丢参数、不重渲：像素必须逐字节不变。 */
+      bool kept = false;
+      if (rasterized && !pixels.empty()) {
+        std::vector<uint8_t> after(pixels.size(), 0u);
+        int32_t aw = px_w;
+        int32_t ah = px_h;
+        comp_pixel_format afmt = px_fmt;
+        kept = comp_layer_get_pixels(doc, fill_id, after.data(),
+                                     static_cast<size_t>(px_w) * 4u, &aw, &ah, &afmt) == COMP_OK &&
+               after == pixels;
+      }
+      close_fill_panel(shell); /* 面板别跨段留着：后面还要换文档 */
+      verify(added && described && uniform && refused && rasterized && kept,
+             "fill layer creates / renders uniformly / refuses pixel writes / rasterizes");
+    }
+
     /* 同一入口打开位图必须仍然是一张拍平图：分派不能为了 PSD 把普通格式也改道。 */
     if (probe_png_exists(probe_path)) {
       open_path_as_document(shell, probe_path);

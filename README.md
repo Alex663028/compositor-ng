@@ -7697,6 +7697,777 @@ NaN → 0、越界夹取）、插入/删除（段中点、颜色随左端、首�
   不是文件加密。
 - **颜色标签不参与导出**：它不写 PSD/PNG，只在 `.comp` 与面板里存在。
 
+### 6.107 合并可见 + 反向排列：把「改整篇结构」也纳入渲染不变契约（P1-2 第二批，2026-10-24，Claude）
+
+**缺口。** 上一批补的是图层属性（锁、色标签），这一批补的是两个**一次点击
+改整篇结构**的命令：`图层 > 合并可见`（PS 的 Merge Visible）与
+`图层 > 反向排列`（Reverse Layers）。两者都不带面板、没有参数，但都直接
+改写 `state_.layers` 的向量顺序与成员，是最容易把堆叠顺序或渲染结果改错的一类
+操作。**ABI 尾部追加 2 个导出（171 → 173）。**
+
+**合并可见 = 「参与合成的都烘进去，结果画布必须逐字节不变」。** 难点不在合成
+本身（`composite_merge_subset` 已有），而在**选定谁**：
+
+- 参与集合是「根上**有效可见**的单元」——自可见 + 全部祖先组可见。组隐藏时
+  引擎返回空 surface（`filter_graph.cpp`），所以整棵子树对画布没有贡献；
+- 一旦某个**可见组**入选，它的**全部后代都进烘焙子集**，包括隐藏的孩子。理由：
+  组被烘成一个普通图层后不再有组结构，隐藏孩子只能以普通图层身份留在原位；
+- 隐藏的**根**层完全不进子集，原样留在列表里。
+
+三条必须守住的性质，任何一条破了就不再是「合并」：
+
+1. **画布不变**：烘完立刻 `trim_to_content`，合成结果与合并前逐像素相同。测试
+   里对合并前后的 `composite` 帧做 `memcmp`；
+2. **剪贴到隐藏基底 → 拒绝**。`clipping_factor()` 只看 `clipping_base`，不看
+   可见性；一个可见层剪贴到**隐藏**基底时，单独烘它会把它从「被隐藏基底的
+   alpha 乘过」变成「正常混合」，画布会变。这种情况返回
+   `"visible layer '<name>' is clipped to a hidden layer; merging would change
+   the canvas"`，ABI 映射成 `COMP_ERR_UNSUPPORTED`，文档一字不改；
+3. **参与不足两层就是 no-op**：`contributing < 2` 直接 `changed=false` 返回
+   true，**不开事务**（因此不产生空撤销步）。这一条让「只选中一个层时点合并
+   可见」不会在历史里留下噪声。
+
+合并结果的落点：新图层的**锚点取参与单元里最上面的那个**（`units.back()`），
+继承它的名字，属性归一成 `NORMAL` / 不透明度 1 / 根级；被合并的层从向量里
+摘掉，**被留在列表里的层若父节点在合并集合内，会提升到最近的存活祖先**（否则
+会挂在一个已不存在的组上）；原来指向被合并层的剪贴关系改指向合并结果；最后
+重建**所有**组的 `children` 缓存（向量是权威顺序，`children` 只是缓存，改完
+必须重算）。
+
+**反向排列 = 只动同级顺序，不动像素。** `reverse_layers(parent)`：父节点必须
+存在且是组（根用 `parent = 0`），否则 `NOT_FOUND` / `COMP_ERR_STATE`
+（"not a layer group"）。把该父节点下所有兄弟的槽位顺序反转，同时反转父组的
+`children`，`invalidate_composite`，一个撤销步（"Reverse Layer Order"）。同级
+不足两层同样 no-op 不开事务。因为是同一组图层换顺序，**画布差异恒为 0**——
+探针就是拿这条当断言。
+
+**壳层。** 命令号 1673 / 1674：
+
+- 图层 > **合并可见(&V)** `Ctrl+Alt+E`。加速键不能用 `Ctrl+Shift+E`——那已经
+  是 `kCmdEffectEdit`（效果参数面板）；走 `WM_SYSKEYDOWN` 的
+  `Ctrl+Alt+E` 分支；
+- 图层 > **反向排列(&R)**，无加速键；
+- 两者的可用性都复用 `enabled.layer_flatten`（`layer_count >= 2`），菜单里
+  紧跟「拼合图像」之后；
+- 反向排列的父节点取法：选中层是组就用它自己，否则用它的 `group_parent`
+  （`comp_layer_get_group_info` 回读），都没有就落到根 `0`；
+- 合并可见有锁闸：参与合并的非组可见层里任一被 `ALL`/`PIXELS` 锁住即拒，
+  文案 `layer '<name>' is locked (merge visible)`；这是 ABI 层闸，域层不看锁
+  （与 §6.106 的口径一致）；
+- 失败一律 `set_status(..., "…失败（未改动）")`，no-op 与真合并的状态文案不同，
+  用户能分清「没生效」和「不需要生效」。
+
+**测试钉的七件事**（`tests/test_layer_merge.cpp` 追加 7 个 case）：
+
+| case | 钉住什么 |
+|---|---|
+| `merge_visible_keeps_hidden_layers_and_is_render_invariant` | 隐藏层保留、50% 蓝色并入后像素 (128,0,128,255)、画布不变、撤销/重做各一步 |
+| `merge_visible_bakes_group_and_promotes_hidden_children` | 可见组整体烘焙、组内隐藏孩子被提升到根（`parent==0`）、撤销后父子关系复原 |
+| `merge_visible_refuses_visible_layer_clipped_to_hidden_base` | 剪贴到隐藏基底：报错、`changed=false`、层数与 `undo_depth` 都不变 |
+| `merge_visible_is_noop_with_single_visible_layer` | 只有一层可见 → no-op，不产生撤销步 |
+| `reverse_layers_reverses_root_siblings_and_undoes` | 根级 A,B,C → C,B,A，名字跟随层走，撤销复原 |
+| `reverse_layers_inside_group_keeps_children_in_sync` | 组内反转与 `children` 同步；非组父层报错；空组 no-op |
+| `abi_merge_visible_and_reverse` | ABI 层：`changed` 标志、`NOT_FOUND` / `STATE` 映射、反向两次回到原序 |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_merge_visible` / `comp_layer_reverse` |
+| `engine/domain/document.h`、`engine/domain/document.cpp` | `merge_visible`（有效可见集合、组烘焙、隐藏后代提升、剪贴基底拒绝、锚点取名）/ `reverse_layers` |
+| `engine/abi/src/comp_layer_abi.cpp` | 两个导出：锁闸、<2 参与层的 no-op、错误文案 → `COMP_ERR_UNSUPPORTED` / `COMP_ERR_STATE` 映射 |
+| `tests/test_layer_merge.cpp` | 7 个新 case（722 → 729） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerMergeVisible = 1673`、`kCmdLayerReverse = 1674` |
+| `shells/windows/src/shell_internal.h`、`shell_layers.cpp` | `panel_merge_visible` / `panel_reverse_layers`（父节点推断、no-op 文案） |
+| `shells/windows/src/shell_document.cpp` | 两个 case（排在 `kCmdLayerFlatten` 之后） |
+| `shells/windows/src/shell_window.cpp` | 菜单两项 + 复用 `layer_flatten` 置灰 + `WM_SYSKEYDOWN` `Ctrl+Alt+E` |
+| `scripts/visual_check.py` | 追加 `merge_visible` 场景 6 条 |
+
+**视觉探针实测（`merge_visible` 场景）：** 三可见层里隐藏中间层 → 面板亮像素
+1851 → 1104（行真的少了），**画布差异 0**；`Ctrl+Z` 后面板回到 1851；
+反向排列后面板差异 1674px 而画布差异仍为 0；再反向一次面板差异 **0**（严格
+复原）——结构收敛与渲染不变两条契约分别被钉住。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **729 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **173**（171 → 173，尾部追加 2 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **220 条 / 36 场景 / 0 失败** |
+
+**已知边界：**
+
+- **合并可见只认「有效可见」**：整棵子树因祖先组隐藏而不可见时，它不进子集，
+  也不会被提升——它仍然是那个隐藏组的孩子，组结构原样保留。
+- **不处理智能对象 / 文本层的语义合并**：合并集合里若含未求值的效果
+  （`kUnevaluatedEffectMarker`），走 `merge_subset_is_bakeable` 拒绝，返回
+  `COMP_ERR_UNSUPPORTED` 而不是悄悄丢效果。
+- **反向排列不做「跨组搬动」**：它只反转某一父节点下的兄弟顺序；要跨组移动
+  仍是拖动/`comp_layer_move` 的活。
+
+### 6.108 图层链接：把「整组一起动」做成引擎关系 + 一步撤销（P1-2 第三批，2026-10-24，Claude）
+
+**缺口。** P1-2 的最后一项：PS 的图层链接（Link Layers）。此前多选移动是在
+壳层把每个选中层各自 `comp_layer_set_transform` 一遍——位移能「看起来像联动」，
+但缩放/旋转根本没有传递，而且每层各落一个撤销步；用户按一次 `Ctrl+Z` 只回去
+一层，画面就散架了。所以这一批不是加一个 UI 开关，而是把「同组层共享几何
+变换」提升为**引擎侧的关系语义**。**ABI 尾部追加 3 个导出（173 → 176）。**
+
+**链接是关系元数据，不是几何快照。** `Layer::link_group`（0 = 未链接）只记录
+「我和谁一组」，不缓存任何矩阵。三条由此推出的性质：
+
+1. **链接本身不产生渲染变化**：`link_layers` / `unlink_layers` 不
+   `invalidate_composite`、不 `touch_layer`——不改像素，只改关系；
+2. **但它是可撤销的**：关系变更仍开一个事务（"Link Layers" / "Unlink Layers"），
+   一步撤销整组关系回退；
+3. **组 id 由引擎分配，壳层不猜**：`comp_layer_link` 的 `out_group` 回填实际组号。
+   规则是——选中集合里已有链接组的，取**最小**的那个组号作为 `target`；集合里
+   一个链接组都没有时取 `max(link_group) + 1`。合并两个已有组时，**被卷入的其它
+   组的原有成员一并改投 `target`**，绝不把旧组拆成两半（老组里没被选中的层也跟着
+   走，这才是「合并」而不是「抢人」）。
+
+**参数闸与语义闸。** `comp_layer_link(ids, count)`：`count < 2`、`ids == NULL`、
+集合内有重复 id 一律 `COMP_ERR_INVALID_ARGUMENT`；任一 id 不存在
+`COMP_ERR_NOT_FOUND`；**图层组**参与链接 `COMP_ERR_UNSUPPORTED`（文案
+`"layer groups cannot be linked"`）——组的几何是子树合成的产物，没有可联动的
+自有矩形，允许它参与只会得到「组框跟着变、内容不跟」的假联动。参数校验全部
+在**动状态之前**完成，所以拒绝时文档一字不改。`unlink` 只作用于被列举的层，
+同组里没列举到的成员留在原组。两者都有 `changed` 输出：同组再链一次、
+解除一组本来就没链接的层，都是 `changed = false` 且**不进历史**（不产生空撤销步）。
+
+**联动口径：在一个choke point 上做仿射展开。** 展开只发生在
+`comp_layer_set_transform` 里——这是全项目唯一写层几何的入口，放在这里才能保证
+「拖动、面板输入、快捷键微调、脚本」四条路径口径一致。对每个同组伙伴，以上一层
+的**目标中心 `C_old` / 旋转 `θ_old`** 与**新中心 `C_new` / 旋转 `θ_new`** 构造
+
+```
+p' = C_new + R(θ_new) · S(sx, sy) · R(−θ_old) · (p − C_old)
+```
+
+即：整组绕目标层中心做同一个相似变换。由此得到的行为：
+
+- **位移**：伙伴跟同样的平移量；
+- **旋转**：伙伴的 `rotation += Δθ`，且**绕目标中心公转**（不是原地自转）。
+  测试里 30° 让 20×20 @ (50,50) 的伙伴落到 (18,68)，再转到 −15° 落到 (61,35)——
+  联动的是**增量**，不是把目标的角度绝对值抄过去；
+- **等比缩放**：伙伴尺寸按各自轴缩放，位置按相对目标中心的向量缩放；
+- **非等比缩放 × 非 90° 相对角 = 剪切**：矩形 + 单角度表示不了剪切，直接
+  `COMP_ERR_UNSUPPORTED`（文案 `"non-uniform scale across linked layers with
+  differing rotation ..."`），**整次拒绝**，目标层自己也不写。绝不静默近似；
+- **退化/裁空的保持**：`apply_link_affine` 前先判 `is_valid_transform`，缩放为 0
+  或结果越界时保持伙伴原样，不让一次合法操作把伙伴矩形算成垃圾。
+
+**锁闸整次拒绝。** 写任何一层之前，先对**每个伙伴**过
+`lock_gate(..., COMP_LAYER_LOCK_POSITION, "transform linked layers")`；任一伙伴
+被位置锁住就整次 `COMP_ERR_STATE`，目标层与所有伙伴都保持原样——不留「目标动了、
+伙伴没动」的半截提交。解锁后同一操作立刻生效。
+
+**复制不带链接。** `duplicate_layer` 显式 `clone.link_group = 0`：副本若继承链接，
+用户一拖副本原件就跟着走，与「复制出来单独用」的预期相反（PS 同款）。
+
+**`.comp` 往返。** `manifest.json` 里只有 `link_group != 0` 的层写
+`"engineLink": <组号>`（默认值省略，与 `engineLock` / `engineColorLabel` 同一
+策略）；读取时校验非整数 / `<= 0` / `> 4294967295` 一律报错，不做静默归零。往返后
+组号原样恢复，联动照样生效——测试里读盘后平移目标层，伙伴跟同样 5px。
+
+**壳层。** 命令号 **1675**（`kCmdLayerLinkToggle`）：
+
+- 图层 > **链接图层(&K)**，无加速键；菜单 `MF_CHECKED` 只看**主选中行**是否
+  在非零组里（`menu_set_checked_recursive`，勾选项而非单选组），点一次即触发
+  `panel_toggle_link`：多选集合**全部属于同一非零组**时解除，否则链接——一个
+  命令做开关，与 PS 的 `Link/Unlink` 一致；
+- 可用性走 `enabled.layer_present`（有选中层就可点），真实门槛在面板函数里：
+  `panel_selection_ids` 里剔除组行后仍需 ≥ 2 个层，否则状态栏给
+  `"链接图层需要至少选中两个图层（不含图层组）"`——不置灰是刻意的，用户需要
+  这句解释，而不是一个无声的灰项；
+- 面板里链接成员的名字后加 `~` 标记（与锁 `*`、色标签同一条 `marks` 渲染路径），
+  不占额外列宽；
+- **多选移动去重**：这是最容易写错的地方。壳层多选位移会构造移动目标清单，
+  若 a、b 已链接，清单里同时含 a 和 b 就会「a 动一次、b 被引擎带一次、b 自己
+  再动一次」——位移翻倍。`append_move_target` 先按 id 去重，再按**非零
+  `link_group`** 去重：同一链接组只留一个代表，其余交给引擎展开。
+  `collect_group_members`（组的成员展开）走同一函数，两条路径共用一套去重规则；
+- `Ctrl+→` / 方向键微调沿用 `layer_transform_move_step(true)` = **10 文档像素**，
+  探针就是靠这个步长在 ~49% 缩放下量到 ~5 屏幕像素的位移。
+
+**测试钉的六件事**（`tests/test_layer_links.cpp`，735 = 729 + 6）：
+
+| case | 钉住什么 |
+|---|---|
+| `layer_link_set_get_validation_and_undo` | 参数闸（1 个 id / 空指针 / 重复 id / 不存在 / 组层）、引擎分配非零组号、同组再链 no-op、一步撤销/重做、unlink 只作用于列举层、两个组链成一次后全员改投存活组号 |
+| `layer_link_transform_translates_and_scales_mates` | 2x 等比 + 平移后伙伴精确落到 `(200,140,40,40)`、非同组层一格不动、整次联动一步撤销 |
+| `layer_link_transform_rotates_mates` | 伙伴绕目标中心公转 `(18,68)` 且 `rotation=30`；再转 −15° 落到 `(61,35)`，证明联动的是增量而非绝对值 |
+| `layer_link_rejects_shear_inducing_scale` | 伙伴 45° 时非等比缩放 → `COMP_ERR_UNSUPPORTED` 且目标与伙伴都没变；同场景等比缩放允许 |
+| `layer_link_transform_is_blocked_by_mate_position_lock` | 伙伴位置锁 → 整次 `COMP_ERR_STATE`、两层都不写；解锁后同一操作通过 |
+| `layer_link_duplicate_clears_and_comp_round_trip` | 副本 `link_group == 0`、manifest 里每个成员都写 `engineLink` 且值一致、读回后联动仍生效 |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_link` / `comp_layer_unlink` / `comp_layer_get_link` |
+| `engine/domain/layer.h` | `uint32_t link_group = 0;`（含契约注释） |
+| `engine/domain/document.h`、`document.cpp` | `link_layers`（组号分配 / 并组合并 / no-op 判定）/ `unlink_layers`；`duplicate_layer` 清空链接 |
+| `engine/abi/src/comp_layer_abi.cpp` | `LinkAffine` / `apply_link_affine`（含剪切拒绝）、`comp_layer_set_transform` 收集伙伴并整次写、三个新导出 |
+| `engine/format/comp_file.cpp` | `engineLink` 的默认省略写 + 读取校验 |
+| `tests/test_layer_links.cpp` | 6 个新 case（729 → 735） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerLinkToggle = 1675`、`LayerRow::link_group` |
+| `shells/windows/src/shell_layers.cpp` | `refresh_layers` 回读链接、`panel_toggle_link`（组行排除、全同组则解除） |
+| `shells/windows/src/shell_internal.h`、`shell_document.cpp`、`shell_window.cpp` | 声明 / case / 菜单项 + 勾选 + 置灰 |
+| `shells/windows/src/shell_paint.cpp` | 面板 `~` 标记 |
+| `shells/windows/src/shell_tools.cpp` | `row_link_group` / `append_move_target`（按 id、按链接组双重去重） |
+| `scripts/visual_check.py` | 追加 `layer_link` 场景（截图 143–147，8 条断言） |
+
+**视觉探针实测（`layer_link` 场景）：** 两层画同一笔橙色描边（`ff8800`），
+Ctrl+J 复制成完全重合的两层 → `Ctrl` 点选两层 → 1675 链接 → 只单选背景层按
+`Ctrl+→`。断言全部落在像素上：旧笔迹带被**完全腾空**、新笔迹带被涂上、
+**红色通道 bbox 宽度不变**（证明没有变成「两份笔迹错开」），位移量与 10 文档
+像素在 49% 缩放下的期望一致；`Ctrl+Z` 后画布逐像素复原；再按 1675 解除链接后
+面板行逐像素复原。8 条全 PASS，全量 `228 条 / 37 场景 / 0 失败`。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **735 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **176**（173 → 176，尾部追加 3 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **228 条 / 37 场景 / 0 失败** |
+
+**已知边界：**
+
+- **只联几何，不联内容/样式**：改不透明度、混合模式、效果参数、蒙版都不扩散。
+  这是有意收窄：几何是唯一能用一个仿射量精确表达的部分，其余「联动」都需要
+  语义决策（PS 也不联）。
+- **链接不跨文档**：`.comp` 里的组号只在本文档内有意义，粘贴/导入不做组号重映射，
+  副本一律按未链接处理。
+- **组图层不能入链**，只能链接普通层；需要「组跟着动」时链接组里的成员层，
+  或直接把组移动。
+- **剪切场景是拒绝而不是分解**：非等比缩放 × 非 90° 相对角在矩形+单角度的模型里
+  无解，返回 `COMP_ERR_UNSUPPORTED` 让上层提示用户，不做近似变换（否则用户看到
+  的是「链接后角度慢慢跑偏」）。
+- **一次联动只落一个撤销步**，但撤销粒度是「整个 set_transform 调用」：脚本一次
+  改十层仍是一步，不会拆开。
+
+### 6.109 图层样式拷贝/粘贴：把「效果栈」当成一份可搬运的报文（P1-2 第四批，2026-10-24，Claude）
+
+**缺口。** P1-2 第四批：PS 的「拷贝图层样式 / 粘贴图层样式」。本项目的
+「图层样式」就是层的**效果栈**（`Effect { kind, settings_json }`），此前只能一层
+一层用 `comp_layer_set_effect` 摆出来；换个层想复用同一套投影+描边，壳层没有
+任何入口，用户只能逐个效果重配。这一批补的是**整栈搬运**：引擎导出/导入，
+壳层只当剪贴板。**ABI 尾部追加 2 个导出（176 → 178）。**
+
+**为什么放在引擎而不是壳层循环。** 壳层当然可以「读每个 kind、再逐个
+`set_effect`」把栈抄过去，但那样有三处会失真：`settings_json` 要经过壳层的
+解析再序列化（数字精度、未知键、键顺序都可能被磨掉）；效果数量要壳层自己数；
+「整栈替换」还得壳层先逐个清空（中途失败会留下半份样式）。所以导出/导入做成
+引擎导出，壳层拿到的是**已经序列化好的报文**，原样存、原样粘。
+
+**报文格式 = `.comp` 的 `engineEffects`。** 同一个数组形状，同一套转义口径：
+
+```
+[{"effect":2,"settings":"{\"color\":[255,0,0,255]}"}, ...]
+```
+
+`settings` 始终是**字符串**，引擎不在导出/导入时解释它——未知键、数字写法、
+键顺序逐字往返。导出用 `json_dump(value, 0)` 紧凑序列化；`.comp` 写盘用的是
+缩进 2 的 manifest，所以两者只保证**形状与转义口径一致**，不要求逐字节相同——
+共享的契约是「`settings` 原文不动」，这就够让「存盘再打开」与「拷贝再粘贴」
+走同一条数据语义。
+
+**导出：两段式缓冲 + 拒绝而不是截断。** `out_size` 必填（不含结尾 NUL，与
+`comp_layer_effect_at` 同口径，宿主按 `out_size + 1` 分配）。`style_json_utf8 ==
+NULL` 或 `capacity == 0` 只回报长度，不碰缓冲；缓冲不够
+`COMP_ERR_INVALID_ARGUMENT`（文案 `"style buffer is too small (see out_size)"`）——
+截断的 JSON 不是 JSON，静默返回会让宿主把半份样式粘进去。没有样式导出 `"[]"`，
+这是**合法空栈**，粘贴它就是清空目标层样式。
+
+两条对称的拒绝：
+
+- **图层组** `COMP_ERR_UNSUPPORTED`（`"layer groups do not render layer styles"`）：
+  合成时组根本不求值自己的 `effects`（`blend_layer_into` 对组早退），导出它等于
+  承诺一次永远不会发生的渲染；导入同理，组层没有可被替换的「渲染中的样式」。
+- **本引擎不求值的 effect kind**（更高版本 `.comp` 读进来的）同样
+  `COMP_ERR_UNSUPPORTED`，且**整层先查完再生成报文**——不产出「粘到一半才发现
+  有项粘不回来」的剪贴板。
+
+**导入：整份替换，不按 kind 合并。** 对齐 PS 的 Paste Layer Style：目标层原有
+效果栈被整份取代。合并语义（保留目标层独有项、只用剪贴板覆盖同名项）会让连续
+两次粘贴叠加出用户没见过的样式。参数闸全部先于状态改动：
+
+- 报文必须是数组；每项是对象，带**整数** `effect` 与**字符串** `settings`；
+  非整数（2.9）、负数一律 `COMP_ERR_INVALID_ARGUMENT`——不允许被静默截断成
+  相邻的合法 kind；
+- 同一 kind 出现两次 → `COMP_ERR_INVALID_ARGUMENT`（PS 的效果栈每种最多一份，
+  重复项无法定义谁覆盖谁）；
+- 越界 / 不求值的 kind → `COMP_ERR_UNSUPPORTED`；
+- 其余形状错误 → `COMP_ERR_INVALID_ARGUMENT`（报文由本引擎导出，走到这里就是
+  宿主传错了，不是用户输入）。
+
+**幂等与一步撤销。** 结果栈与现状**逐项相同**（kind 与 settings 字符串都相同）
+→ `COMP_OK` 且 `changed = 0`，**不落撤销步**；壳层「粘贴到所有选中层」因此可以
+无脑循环。有改动时走 `ImplicitTxn("Paste Layer Style")`（调用方已开显式事务时
+自动加入），并 `touch_layer` 推进内容修订号——样式参与像素求值，不换修订号
+合成/GPU 缓存会复用旧结果。锁与 `comp_layer_set_effect` 同口径：
+`lock_gate(..., COMP_LAYER_LOCK_ALL)` → `COMP_ERR_STATE`，**图像像素锁不拦**
+（改样式不改像素）。
+
+**壳层：剪贴板在宿主的会话状态里。** 两个引擎调用都是无状态的，样式块存在
+`ShellState::layer_style_clipboard`（`std::string`），所以「在文档 A 拷贝、切到
+文档 B 粘贴」可用——这正是 PS 的行为。命令号 **1676 / 1677**：
+
+- 图层 > **图层样式(&Y)** > 拷贝图层样式(&C) / 粘贴图层样式(&P)。**不加加速键**：
+  PS 的 `Ctrl+Alt+C/V` 在本项目里已被「画布大小 / 贴入」占用，改键位会破坏既有
+  肌肉记忆，所以只做菜单（与链接图层同一取舍）；
+- 可用性：拷贝 = `enabled.layer_present`；粘贴额外要求剪贴板非空
+  （`!shell.layer_style_clipboard.empty()`），空剪贴板直接置灰，而不是点了才报错；
+- 拷贝走两段式：先 `nullptr/0` 问长度，再按 `need + 1` 分配取报文；成功状态栏
+  `"已拷贝图层样式（N 字节）"`；组图层给 `"该图层不能拷贝样式（图层组没有求值的
+  样式）"`（引擎的拒绝原因原样转述，不减信息）；
+- 粘贴对 `panel_selection_ids(shell, true)`（剔除组行与被覆盖层）逐个调用；**多选
+  时显式包一层 `comp_txn_begin("Paste Layer Style")`**，整批一个撤销步；若无一层
+  真正改动则 `comp_txn_abort`（不产生空撤销步），有改动才 commit，随后
+  `refresh_effects` / `refresh_layers` / `needs_render`；
+- 状态栏按计数拼装：改动 N 层、已是该样式 N 层、跳过组 N 层、失败 N 层——把
+  「为什么看起来没反应」直接写出来。
+
+**测试钉的七件事**（`tests/test_layer_style.cpp`，742 = 735 + 7）：
+
+| case | 钉住什么 |
+|---|---|
+| `layer_style_export_import_roundtrip` | 导出是 JSON 数组、kind 顺序与 settings 原文逐字复制到目标层、`changed=1`、再粘一次 `changed=0` 且不进历史 |
+| `layer_style_export_buffer_contract` | `out_size` 不含 NUL；查询调用不写缓冲；差一个字节 → `COMP_ERR_INVALID_ARGUMENT`；恰好够 → OK；`out_size=NULL` 拒绝；不存在的层 `NOT_FOUND` |
+| `layer_style_export_rejections` | 组层导出/导入都 `UNSUPPORTED`；未知 kind 整层拒绝导出（不回半份） |
+| `layer_style_import_payload_validation` | 非数组/非对象/缺键/非整数 kind 均 `INVALID_ARGUMENT`；未知 kind `UNSUPPORTED`；重复 kind 拒绝；合法报文成功；`[]` 清空且再次 `[]` 是 no-op；不存在的层 `NOT_FOUND` |
+| `layer_style_import_locks` | 锁定全部 → `COMP_ERR_STATE` 且栈不变；解锁后同一报文生效 |
+| `layer_style_paste_changes_rendering` | 供体加 Color Overlay 后画布变色；粘贴到裸层后**像素逐字节等于供体**；一步撤销回到 pristine（供体事先隐藏，避免它的样式污染基线） |
+| `layer_style_multi_paste_single_undo` | 显式事务内粘两层，一次撤销两层同时回退（壳层多选粘贴的引擎侧契约） |
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_layer_export_style` / `comp_layer_import_style`（含报文格式与两段式契约注释） |
+| `engine/abi/src/comp_layer_abi.cpp` | `dump_layer_style` / `parse_layer_style` / `same_style` / `style_kind_supported` + 两个新导出 |
+| `tests/test_layer_style.cpp` | 7 个新 case（735 → 742） |
+| `shells/windows/src/shell_state.h` | `kCmdLayerCopyStyle = 1676` / `kCmdLayerPasteStyle = 1677`、`std::string layer_style_clipboard` |
+| `shells/windows/src/shell_layers.cpp` | `panel_copy_layer_style`（两段式导出、组层文案）/ `panel_paste_layer_style`（多选单事务、按计数拼状态） |
+| `shells/windows/src/shell_internal.h`、`shell_document.cpp`、`shell_window.cpp` | 声明 / case / 「图层样式」子菜单 + 可用性 |
+| `scripts/visual_check.py` | 追加 `layer_style_paste` 场景（截图 148–152，5 条断言） |
+
+**视觉探针实测（`layer_style_paste` 场景）：** 画橙色矩形（`ff8800`）→ `Ctrl+J`
+复制 → 给上层加 Color Overlay（默认不透明黑）→ 画布变纯黑；点上层执行 1676
+拷贝，画布**一格不动**（证明拷贝只读）；把供体隐藏后画布回到橙色矩形（得到
+「无样式」基线）；点下层执行 1677 粘贴，画布变纯黑（样式真的进了求值路径）；
+`Ctrl+Z` 后与隐藏供体时的画面**逐像素相同**（`pixel_diff == 0`）。5 条全 PASS。
+
+**本轮验证（2026-10-24 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **742 例 / 0 失败** |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（OHOS `compile ok=118 fail=0`） |
+| 壳自检 | **263 项 / failures=0**，SHA256 `2f3b81c4fc599cb7…` 与基线一致（未加自检项） |
+| `^COMP_API` 导出 | **178**（176 → 178，尾部追加 2 个） |
+| `scripts/check_tool_table.py` | PASS（20 工具） |
+| `scripts/visual_check.py --scene all` | **233 条 / 38 场景 / 0 失败** |
+
+**已知边界：**
+
+- **样式 = 效果栈**：混合模式、不透明度、锁定、蒙版、颜色标签都不随「样式」走。
+  这与 PS 的 Paste Layer Style 一致，且这些属性各自有独立的入口。
+- **剪贴板是引擎报文，不是 PS 原生格式**：跨应用粘贴不做兼容，也不尝试解析
+  外部 JSON；报文由本引擎导出，宿主的职责只是原样保存。
+- **组图层两侧都不支持**：组的样式本来就不参与求值，允许粘贴只会得到「面板上
+  有、画面没有」的假象。
+- **settings 不做语义校验**：导入只保证「是字符串」，坏 settings 由各效果在
+  求值时按默认值兜底——与 `.comp` 读盘同一口径（格式层不替渲染层做语义判断）。
+- **重复 kind 拒绝而不是合并**：合法报文永远不会含重复 kind（效果栈本身去重），
+  出现重复只可能是手写报文。
+- **无快捷键**：`Ctrl+Alt+C/V` 已被占用；命令号只挂在菜单上，脚本/自检仍可直呼。
+
+### 6.110 图层面板过滤：三个维度、一条视图态（P1-2 第五批，2026-10-25，Claude）
+
+**缺口。** PS 的图层面板顶部有「按类型 / 名称 / 颜色」的过滤下拉，本项目的图层面板
+只能从头翻到尾。本壳没有面板顶栏，所以把这三条收进 **图层 > 过滤图层** 子菜单，
+命令号 **1680..1700**（类型 `1680+0..6`、颜色 `1690..1698`、名称 `1699`、清除 `1700`）。
+**本批零 ABI 追加**——过滤是纯视图态，引擎不知道、也不需要知道。
+
+**为什么不做进文档。** 过滤不改变任何图层的属性，也不该进撤销栈（「我刚才看的列表
+短了一点」不是可撤销的编辑）。所以状态放在 `ShellState::layer_filter_kind` /
+`layer_filter_color` / `layer_filter_name`，文档打开/关闭时清零，`.comp` 里也没有
+对应的键。唯一的汇合点是 `filtered_layer_indices()`：面板行表由它生成，其它读路径
+一律走 `layer_row_at()`（显示行 → `layer_display[]` → 数组下标），因此不会出现
+「面板上看不见、快捷键还能选中」的层。
+
+**三个维度是「与」。** 类型 0..6 = 全部 / 像素 / 文字 / 组 / 调整 / 填充 / 智能；
+颜色 = 全部 / 无标签 / 红橙黄绿蓝紫灰（直接比 `color_label`）；名称 = UTF-16 子串，
+只折叠 ASCII 大小写（`A-Z` → `a-z`），中文按原样比较。三项同时满足才显示。
+
+**祖先保留。** 命中行的父组即使自己不命中也要显示，否则组行消失后子行会带着一段
+「凭空出现的缩进」出现在列表里，看起来像层级坏了。祖先行按命中处理（可选中、
+可操作），命中集合由「自身 + 沿 parent 链上溯」得到，上溯带步数上限——脏数据里的
+parent 环不能把面板挂死。
+
+**像素图层的定义是排他的**：不是组、不是文字、没有调整层、不是填充层、不是智能
+对象。这样六个类型互不重叠，任何一层最多出现在一个类型过滤里。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/shell_state.h` | `kCmdLayerFilter*`（1680..1700）、三个过滤字段 |
+| `shells/windows/src/shell_layers.cpp` | `layer_filter_active` / `row_matches_filter` / `filtered_layer_indices`（祖先保留） |
+| `shells/windows/src/shell_window.cpp` | 「过滤图层」子菜单 + 单选勾选态（`menu_radio_check_recursive`） |
+| `shells/windows/src/shell_selftest.cpp` | 面板过滤自检：三种维度各自收窄、祖先保留、文档与历史零改动 |
+
+### 6.111 图层复合：把「一组显隐 + 不透明度」存成可应用快照（P1-2 第六批，2026-10-25，Claude）
+
+**缺口。** PS 的 Layer Comps 面板：把「哪些层可见、各自多不透明」存成一组命名快照，
+一键切回。此前壳层只能手工重摆可见性。**ABI 尾部追加 10 个导出（178 → 188）**：
+`comp_layer_comp_count` / `comp_layer_comp_id_at` / `comp_layer_comp_name` /
+`comp_layer_comp_capture` / `comp_layer_comp_apply` / `comp_layer_comp_update` /
+`comp_layer_comp_rename` / `comp_layer_comp_delete` /
+`comp_layer_comp_entry_count` / `comp_layer_comp_entry`。
+
+**快照记什么。** 每个**现存**图层一条 `{ layer, visible, opacity }`，顺序 = 堆叠序。
+只记这两项，是因为它们正是 PS Layer Comps 的语义：混合模式、效果、蒙版、填充参数
+属于「内容」，改内容不该被一次「应用复合」吞掉。名副其实比覆盖面广更重要。
+
+**快照在文档里、进撤销栈。** 复合存在 `Document::state().layer_comps`，捕获 / 更新 /
+重命名 / 删除各自一步撤销；`apply` 有改动才落步（`changed` 出参），没改动
+`COMP_OK + changed = 0` 不进历史——壳层可以无脑循环应用。撤销捕获之后复合整个消失，
+撤销删除后又回来（同一 id）；**id 单调递增、空洞不复用**，所以「面板上选中的那个
+复合」不会在一次删除 + 捕获之后悄悄指向另一个对象。
+
+**上限与校验。** 最多 **128** 个复合（`kMaxLayerComps`）；名字非空、单行、UTF-8
+≤ **1024** 字节（`COMP_LAYER_COMP_NAME_MAX_BYTES`）；重名拒绝。`entry` 的图层在
+应用时可能已被删——**跳过它，其余照常应用**（整体失败会让一份只过时一个条目的快照
+完全不可用）。
+
+**壳层：当前复合只是视图态。** 命令号 **1701..1708**（捕获 / 应用 / 更新 / 重命名 /
+删除 / 上一个 / 下一个 / 状态），菜单在 **图层 > 图层复合**。`ShellState::layer_comp_current`
+不进文档：撤销、重开文档后按 id 重新定位，找不到就回落到第一个复合——「选中项」
+永远是视图态。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 10 个导出（含上限 / 幂等 / 跳过已删条目的契约注释） |
+| `engine/domain/document.cpp`、`domain_state.h` | `LayerComp` / `LayerCompEntry` 状态与增删改查、上限校验 |
+| `engine/format/comp_file.cpp` | manifest 顶层 `engineLayerComps`（空表不写键；读侧形状错误整份拒绝） |
+| `tests/test_layer_comps.cpp` | 5 个 case（捕获/校验、应用/幂等、更新/重命名/删除/id 不复用、数量上界、`.comp` 往返） |
+| `shells/windows/src/shell_layers.cpp` | `panel_layer_comp_*`（应用/更新/删除/切换 + 当前复合重定位） |
+| `shells/windows/src/shell_document.cpp`、`shell_window.cpp` | case 分派、「图层复合」子菜单 + 可用性、名称输入复用图层重命名槽 |
+
+### 6.112 智能对象 / 智能滤镜：把滤镜做成「参数」而不是「烘过的像素」（P1-2 第七批，2026-10-25，Claude）
+
+**缺口。** 滤镜一路是破坏性的：`comp_filter_apply` 直接改像素，同样的高斯压在缩放
+过的图上，结果与压在原图上再缩放不同。智能对象把「原始像素 + 一条可编辑的滤镜栈」
+存成参数，像素只是求值缓存——本项目「参数是真源」的第三次应用。**ABI 尾部追加 8 个
+导出（188 → 196）**：`comp_layer_smart_object_create` / `_is_smart` / `_rasterize`、
+`comp_layer_smart_filter_count` / `_at` / `_add` / `_set` / `_remove`（都在
+`comp_filter.h` 的智能对象块）。
+
+**对象空间求值。** 整条栈在**对象像素空间**（原点 `0,0`、不读选区）里跑，再把结果按
+图层的变换贴回画布。所以「移动 / 缩放 / 旋转到哪，同一条滤镜都渲出逐字节相同的结果」，
+这也是智能滤镜与破坏性滤镜的可观察差别。
+
+**闸门。** 转换拒绝文字层（先栅格化文字）、组层、无像素层、HDR 层
+（`COMP_ERR_STATE`）；16 位层先落 8 位工作副本（与滤镜同一约定，之后该层就是 RGBA8）。
+转换本身的像素**逐字节不变**（此刻像素成为不可变 source，滤镜栈为空）。已是智能
+对象 → `COMP_OK + changed = 0`，不进历史。
+
+**像素写入口一律拒绝。** `comp_layer_set_pixels`、工具算子、`comp_filter_apply` 对
+智能层返回 `COMP_ERR_STATE`，文案要求先栅格化。理由和文字层/填充层一致：像素是缓存，
+直接写会产生「参数说 A、画面是 B」的中间态。栅格化丢掉 source 与整条栈、**保留当前
+渲染出的像素**，一步撤销；对普通层是幂等的 no-op（不落撤销步）。
+
+**滤镜栈的编辑。** `add` 恒等参数也照常入栈（画面不变，但栈变了，之后可改参数）；
+`set` 的 `(settings, enabled)` 与当前条目完全相同 → 不落撤销步；`enabled = 0` 保留
+参数、停止求值（`smart_filter_disabled_keeps_parameters_and_stops_evaluating`）；
+`remove` 删到空栈时画面回到 source。每次写操作一步撤销，参数闸与求值失败都在开事务
+之前——失败不留撤销步、不动像素。
+
+**`.comp`：`engineSmart` + `sourceFile`。** 逐层键 `engineSmart`
+`{ "sourceFile": <uuid>, "filters": [ { "kind": 4, "enabled": true, "settings": {...} } ] }`；
+`settings` 只写当前 kind **真正被读取**的那份子结构（一条高斯不会顺带写入整份暗角
+参数），键名 camelCase、布尔按布尔存。原始像素单独落在 `sourceFile` 指向的文件里，
+**先于**图层块写。缺键 = 普通图层；解析失败整份丢弃、图层退回普通像素层（与
+`engineText` 同一策略：格式层不替渲染层做语义判断）。
+
+**壳层。** 命令号 **1710..1713**（转换为智能对象 / 栅格化 / 清除全部智能滤镜 /
+状态），菜单在 **图层 > 智能对象**；层行带 `S` 标记，转换与栅格化都走一步撤销。
+逐条列出 / 开关 / 改参数 / 删除在 §6.114 的滤镜栈面板（1720..1723）；调序与改名
+在 §6.115（1724..1726，ABI 208 → 211）。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_filter.h` | 智能对象块：8 个导出 + 对象空间 / 闸门 / 幂等契约 |
+| `engine/domain/layer.h`、`comp_filter_abi.cpp` | `Layer::smart`（source + 滤镜栈），求值接入渲染 |
+| `engine/format/comp_file.cpp` | `engineSmart` 读写、`sourceFile` 原图落盘与回收 |
+| `tests/test_smart_objects.cpp` | 10 个 case（转换幂等/拒绝/16→8 位、add/set/remove 各一步、停用保留参数、对象空间求值、像素写拒绝、栅格化保留渲染、`.comp` 往返、普通工程无智能键） |
+| `shells/windows/src/shell_layers.cpp` | `panel_smart_convert` / `rasterize` / `clear_filters` / `status` |
+| `shells/windows/src/shell_window.cpp`、`shell_document.cpp` | 「智能对象」子菜单 + 可用性、case 分派 |
+
+### 6.113 填充图层：纯色 / 渐变 / 图案，参数是真源（P1-2 第八批 = 收尾，2026-10-25，Claude）
+
+**缺口。** P1-2 的最后一项，也是「参数是真源」的**第四次**应用。此前渐变/图案只能
+烘成像素（`comp_tool_apply(COMP_TOOL_GRADIENT)` 之类），改颜色就得重画。填充图层把
+`{kind, settings}` 存成图层的真源，像素由引擎按参数渲染——与文字层、调整层、智能
+对象同一族。**ABI 尾部追加 12 个导出（196 → 208）**：
+
+- 参数表与报文：`comp_fill_kind_name` / `_kind_param_count` / `_kind_param_at` /
+  `_validate` / `_default_settings` / `_read_value` / `_build_settings`；
+- 图层：`comp_layer_add_fill` / `_set_fill` / `_get_fill` / `_is_fill` / `_rasterize_fill`。
+
+**三种 kind 与它们的参数**（`COMP_FILL_SOLID` / `GRADIENT` / `PATTERN`，参数表在
+`engine/domain/fill_layer.cpp`，壳层一行都不抄）：
+
+| kind | 参数（引擎给出的量程/缺省） |
+|---|---|
+| 纯色 | `color.red/green/blue/alpha`，各 0..255，缺省 128/128/128/255 |
+| 渐变 | 起点色、终点色（RGBA）、`angle` 0..360、`reverse` 布尔；缺省红→蓝、0° |
+| 图案 | `pattern` 0..3（四种内置）、`size` 2..256 缺省 16、前景/背景 RGBA |
+
+**互斥与闸门。** `Layer::fill` 与 `text` / `smart` / 组互斥——同一层只能有一个真源，
+切换必须走栅格化或删除。直接写像素（`comp_layer_set_pixels`、工具算子）返回
+`COMP_ERR_STATE`；锁定全部 → 参数写入也是 `COMP_ERR_STATE`（填充参数改的就是渲染
+结果）。`comp_layer_set_fill` **幂等**：kind 与 settings 都相同 → `changed = 0`、不重渲、
+不落撤销步；`comp_layer_rasterize_fill` 丢掉参数、保留像素，对普通层是 no-op。
+
+**报文。** `build_settings` 的输入是**扁平字符串数组**（按参数表顺序），输出是紧凑
+JSON，构造结果再过一次 `comp_fill_validate` 才回报 `COMP_OK`。与
+`comp_layer_effect_build_settings` 不同，它**没有 base-json 深合并参数**：每种 kind
+的顶层键白名单是闭合的（`root_allowed`），不存在需要原样带回去的未知键；`.comp` 读侧
+对过不了校验的 `engineFill` 整块丢弃，也不会把未知键留下来。
+
+**`.comp`。** 逐层键 `engineFill = { "kind": 1, "settings": "{\"color\":[...]}" }`，
+`settings` 按**字符串**落盘（与 `engineText` / `engineEffects` 同口径）。缺键 = 普通
+图层；kind 越界、settings 过不了参数表、或与 `engineText` / `engineSmart` / 组同时
+出现 → 整块丢弃，读方看到的仍是普通像素层。
+
+**壳层面板。** 命令号 **1714..1719**：图层 > **新建填充图层** > 纯色 / 渐变 / 图案
+（开面板 + 立刻按缺省参数建层），另有「编辑填充参数 / 栅格化填充 / 状态」。面板与
+调整/效果面板同款几何（行高 34、页脚 180、滚轮 `adjust_param_*`），**跟随选中图层**：
+选中层是填充层就绑定它并回填既有参数，不是就退回「新建态」（回车才建层）——不会
+出现「面板显示 A 的色值、回车写进 B」。
+
+拖动滑杆时按下即开显式事务，拖动途中的每次写回都在事务里，松手 commit =
+**一步撤销**；参数没变则 `comp_txn_abort`（空拖动不产生撤销步）；Esc / 失焦 / 捕获
+丢失一律 abort 回滚。实时预览帧只在事务内可见，关面板或换层即收口。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_layer.h` | 尾部追加 `comp_fill_*` 枚举/结构/12 个导出（两段式字符串、幂等、互斥契约） |
+| `engine/domain/fill_layer.h/.cpp` | 参数表、`fill_render`（纯色 / 角度渐变 / 四种图案平铺） |
+| `engine/abi/src/comp_fill_abi.cpp` | 参数表导出、settings 构造/校验/回读、图层增改查/栅格化 |
+| `engine/format/comp_file.cpp` | `engineFill` 读写（字符串 settings，非法即整块丢弃） |
+| `tests/test_fill_layers.cpp` | 11 个 case（建层渲染/撤销、非法输入零副作用、参数表与渲染一致、渐变角度、图案平铺确定性、set 幂等与写像素闸、类型混淆、栅格化保留渲染、锁定闸、`.comp` 往返、普通工程无填充键） |
+| `shells/windows/src/shell_fill.cpp` | 面板全部逻辑：参数行、键入、步进、拖动事务、应用/新建/编辑/栅格化/状态 |
+| `shells/windows/src/shell_paint.cpp` | `draw_fill_panel`（行/滑道/焦点带/滚动标签/页脚/提示） |
+| `shells/windows/src/shell_window.cpp`、`shell_document.cpp`、`shell_layers.cpp` | 键/鼠标/滚轮链路、六个命令分派、「新建填充图层」子菜单与可用性、`refresh_fill` 汇合点 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py` | **768 例 / 0 失败**（742 → 768：复合 +5、智能对象 +10、填充层 +11） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（768 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线一致（新增 4 项：过滤 / 复合 / 智能对象 / 填充层） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（118 → 121：新增 `fill_layer.cpp`、`comp_fill_abi.cpp`、`shell_fill.cpp` 三个翻译单元；复合与智能对象都写进了既有文件） |
+| `^COMP_API` 导出 | **208**（178 → 208，尾部追加 30：复合 10、智能对象 8、填充层 12） |
+| `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
+
+**P1-2 收尾后的边界：** 填充层只有**两色标线性渐变**（多色标/径向/角度/菱形渐变
+在渐变工具那条线上，见 §6.98 / §6.105）；图案只有四种内置，没有「从图层定义图案」；
+智能滤镜只支持引擎已在的滤镜族（`COMP_FILTER_*`），逐条参数复用滤镜面板、没有为
+智能滤镜单开一套控件（条目顺序与名字见 §6.114 / §6.115）；图层
+复合不包含混合模式与效果。这些都是**已知边界**，不是遗漏。
+
+### 6.114 智能滤镜栈面板：逐条列出 / 开关 / 改参数 / 删除（P1-2 第九批，2026-10-25，Claude）
+
+**缺口。** §6.112 把智能滤镜做成了非破坏参数栈，但壳层只接了「转换 / 栅格化 /
+整栈清除 / 状态」四个命令：引擎的 `comp_layer_smart_filter_at` / `_set` / `_remove`
+一条都没接 UI，用户想改某一条的半径、临时关掉某一条、删掉中间那条，只能整栈清除再
+重加。本批把这三件事补上——**ABI 与引擎一行未改**（208 个导出不变），只加壳层
+（命令号 1720..1723）。
+
+**面板是栈的只读投影，不缓存。** 标题摘要的条数、每行的 kind / enabled / 参数摘要、
+三个动作的取值，全部当场问引擎（`_count` / `_at`）。好处是撤销、重做、整栈清除之后
+列表不可能与文档漂移；代价是一屏 N 行要 N+1 次只读查询，这些查询不开事务，可以接受。
+
+**一行 = 一条。** 格式 `序号. [关] 滤镜名 · 前两个参数名值对`；`[关] ` 是「已关闭」
+的唯一标记（关闭的条目仍在列表里，还能再打开）。空态按四种原因分别提示（无文档 /
+没选图层 / 不是智能对象 / 还没叠加过），不拿一句「列表为空」糊住四种下一步。
+
+**开关 = 先读整条再写回。** `空格` 用 `_at` 取整条 desc，翻转 `enabled` 后
+`_set(..., &desc, 新开关)`：参数原样带过去，只改开关。引擎的 `_set` 幂等条件
+（settings 与 enabled 都相同才不落步）在这里必然不成立，所以**恰好一步撤销**。
+
+**编辑复用滤镜参数面板。** `open_smart_filter_editor(index)` 读该条 desc → 按
+`filter_spec_at(kind)` 打开既有的滤镜面板（同一份行几何、步进、键入、预览）→
+`filter_load_values` 灌值 → 装上 `smart_edit_{layer,index,enabled,base}` 绑定。预览
+`filter_preview_render` 在编辑态改走 `_set`（仍包在事务里、取帧后 abort），所以画面
+看到的是「这一条改完」的结果而文档停在预览前；回车 `apply_filter` 写回**同一条**
+（栈不变长），参数与开关都没变时引擎不落撤销步，状态栏因此只报「已写回第 N 条」
+而不承诺一步撤销；Esc / 切工具 = 丢弃（状态栏明说「本次编辑未写回」）。
+
+**面板行表达不了的字段按原值带回。** 参数面板没有 `vignette.color` 与
+`progressive_blur` 显式轴的行。`build_filter_desc_patched` 从 `smart_edit_base`
+（打开时的原 desc）复制这些字段（同 kind 才采信），再用面板值覆盖面板控制的字段；
+本次拖过轴则以拖拽值为准。否则「双击改个半径」会把暗角颜色清零、把拖出来的显式轴
+悄悄丢掉。
+
+**删除与收敛。** `Del` 走 `_remove`（一步撤销），焦点落到下一条、条数缩了夹回、
+删到空栈列表回到空态。所有面板动作之后 `refresh_layers` 会调 `refresh_smart_panel`：
+选中层变了就换绑定回第 1 条，条数缩了就把焦点与滚动夹回去——这也是撤销 / 重做后
+列表自动同步的原因。
+
+**互斥与生命周期。** 打开栈面板会收起颜色范围 / 填充 / 滤镜 / 效果 / 修边 / 路径 /
+历史 / 通道；反过来每个面板打开时都 `smart_panel_dismiss`，字体面板与文字属性面板的
+可见性判断也把 `smart_open` 纳入让位条件。换文档（新建 / 打开 / 载入分层 PSD）
+`smart_panel_reset` 把开关、焦点、滚动与编辑绑定一起清零。
+
+**几何在 ui_core。** `kSmartRowHeight = 22`、`kSmartRowsTop = 64`、
+`kSmartPanelFooter = 96`（页脚按 5 行提示预留；§6.115 真正画满 5 行后改为 98），配
+`smart_visible_rows` / `_max_scroll` /
+`_clamp_scroll` / `_ensure_visible` / `_row_rect` / `_row_at`——绘制与
+`WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK` / `WM_MOUSEWHEEL` 读同一组函数。
+`ui_core_smart_panel_rows_hit_what_they_paint` 把行高、页脚、只认画得出来的行钉住。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/shell_layers.cpp` | 栈面板全部逻辑：目标判定、条数、焦点/滚动、状态行、开关/编辑/删除、`refresh_smart_panel` 汇合点 |
+| `shells/windows/src/shell_filter.cpp` | `filter_load_values`、`build_filter_desc_patched`、`open_smart_filter_editor`、`filter_preview_render` / `apply_filter` 的编辑态分支 |
+| `shells/windows/src/shell_paint.cpp` | `draw_smart_panel`（标题/摘要/空态/焦点带/`[关]` 标记/4 行提示） |
+| `shells/windows/src/shell_window.cpp` | 行命中 / 双击编辑 / 滚轮翻列表、四条菜单项与可用性、`smart_open` 纳入调整面板与滚轮的让位条件 |
+| `shells/windows/src/shell_document.cpp` | 四个命令分派、换文档 `smart_panel_reset` |
+| `shells/windows/src/shell_state.h`、`shell_internal.h`、`ui_core.h` | 1720..1723、`smart_*` 文档状态、列表几何常量与包装 |
+| `tests/test_ui_core.cpp` | `ui_core_smart_panel_rows_hit_what_they_paint` |
+| 其余面板文件（`shell_channels/fill/fonts/path_history/selection/tools/type` 等） | 各自打开面板时 `smart_panel_dismiss`，`*_panel_visible` 让位 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **769 例 / 0 失败**（768 → 769：新增栈面板行几何 1 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（769 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（本批不加自检项） |
+| `scripts/visual_check.py --scene all` | **233 项 / 0 失败** |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（新逻辑全在既有翻译单元里，TU 数不变） |
+| `^COMP_API` 导出 | **208**（本批无 ABI 变化） |
+
+**已知边界：** 引擎没有「调整顺序 / 移动某条」的导出，列表只读顺序、不能拖动排序；
+没有重命名；关闭的条目仍可编辑参数，写回后保持关闭（状态栏明说画面不变）。这些前两条
+是引擎能力边界、不是壳层遗漏——**已在 §6.115 补齐**；第三条是 Photoshop 语义，保留。
+
+### 6.115 智能滤镜栈：调序与改名（P1-2 收尾 ⑩，2026-10-25，Claude）
+
+**缺口。** §6.114 的面板只读顺序、也没有展示名：想「把锐化挪到模糊前面」只能删两条再
+按新顺序重加（会多落撤销步、也会丢自定义参数），想区分同一 kind 的两条（两个不同半径
+的高斯）只能看参数摘要。这两条都卡在引擎：壳里改顺序等于重写整份栈，改名根本没有字段
+可写。本批补**尾部 3 个导出**（208 → 211），壳侧接 Alt+↑/↓、F2、拖动与菜单。
+
+**引擎：`move` 是「取出再插入」，且必须重求值。** `comp_layer_smart_filter_move(doc,
+id, from, to)` 的 `to` 是**移动后**的最终下标：先从 `from` 取出、`erase`、再 `insert`
+到 `to`——`from < to` 时 erase 已让目标左移，这样正好落到用户期望的位置（与
+`std::vector` 拖拽语义一致）。三个前置判定与它们的后果：
+
+| 情况 | 结果 |
+|---|---|
+| `from == to` | `COMP_OK`，不重求值、不落撤销步（宿主可以无脑「拖回原位」） |
+| `from` / `to` 越界 | `COMP_ERR_INVALID_ARGUMENT` |
+| 图层锁住像素 | `COMP_ERR_STATE`（`COMP_LAYER_LOCK_PIXELS` 闸，理由是「reorder smart filters」） |
+
+顺序改动会改画面（滤镜不可交换），所以**整条栈从头重跑**：先在事务外 `evaluate_stack`，
+失败直接返回、像素与历史都干净；成功后 `ImplicitTxn("Reorder Smart Filters")` +
+`touch_layer` + `commit`，因此成功即**恰好一步撤销**。这里和 `_set` 的区别值得记住：
+`_set` 改的是参数、可幂等；`move` 改的是求值顺序，幂等只体现在 `from == to`。
+
+**引擎：名字是元数据，不是滤镜状态。** `comp_layer_smart_filter_set_name(doc, id,
+index, name_utf8)` 只写 `SmartFilter::name`：
+
+- 同值重设 = `COMP_OK` 且不落步（宿主可以每帧把输入框内容写回来）；
+- **不重新求值、不过像素锁闸**——名字与画面无关，锁「图像像素」的图层照样能改名（与
+  色标改造、图层链接同一口径）；仍进快照，所以撤销会退回旧名字；
+- 空串合法 = 「回到类型名」：引擎只存空，展示层回退到 `filter_kind_name(kind)`，**不**
+  把 "Gaussian Blur" 抄成自定义名（否则以后改类型名就断了）；
+- 校验：合法 UTF-8、单行（含任何控制字符即拒，换行 / 制表符是最常见的两种）、
+  ≤ `COMP_SMART_FILTER_NAME_MAX_BYTES`（256）**字节**——不是码元，中文一个字 3 字节。
+
+读取走两段式的 `comp_layer_smart_filter_name(doc, id, index, buffer, capacity,
+out_required)`：`buffer = NULL` 或 `capacity = 0` 只回报所需长度（含 `'\0'`）；容量不足
+返回 `COMP_ERR_INVALID_ARGUMENT` 并已写好 `out_required`，**不截断**。`out_required`
+为 NULL 属调用错误。头文件里 `COMP_SMART_FILTER_NAME_MAX_BYTES` 与引擎的
+`compositor::kMaxSmartFilterNameBytes` 用 `static_assert` 钉死，两边不可能漂。
+
+**持久化。** `.comp` 的 `engineSmart` 每条多一个 `name` 字符串字段；载入时不合规的名字
+（超长 / 非法 UTF-8 / 含换行制表符）一律当没写、回退类型名——坏字段只能丢一个展示名，
+不能连累整条滤镜或整层。往返测试同时覆盖「乱序 + 自定义名」。
+
+**壳层三条入口，一套落点。**
+
+- `Alt+↑ / Alt+↓`（菜单 `当前条上移一位(&U)` 1725 / `当前条下移一位(&W)` 1726）→
+  `smart_panel_move_entry(±1)`。夹到 ±1（不让它跳格），到端明说「已经是第 1 条 / 最后
+  一条，不能再上移 / 下移（未改动）」；成功后焦点跟着这条走，`needs_render` 置位并
+  `refresh_layers`。菜单给这两项开条件是 `smart_filter_total > 1`——一条换不了位。
+- `F2`（菜单 `重命名当前条…(&N)` 1724）→ `panel_begin_smart_filter_name`。复用状态栏
+  键入态，新增 `LayerInput::SmartFilterName`；**不复用 `FilterName`**，那个枚举是「按
+  名称过滤图层」的过滤词，两者同名不同义。键入态多一个第二坐标 `layer_input_slot` 装栈
+  内下标（`layer_input_id` 只装得下图层），取消时一起清零。**预填只给自定义名**：没改过
+  就空着——否则随手回车会把类型名写成自定义名，从此不再跟随类型。键入时按候选串的
+  **真实 UTF-8 字节数**夹 256（中文一个字 3 字节，按 UTF-16 码元夹会放行超长串到 ABI 才
+  被拒），回车再查一遍；空串 = 用类型名。改名成功 `refresh_layers` 并报「已重命名第 N 条
+  / 第 N 条智能滤镜已改用类型名」；同名再回车引擎不落撤销步（面板照报「已重命名」，因为
+  展示名确实已是它）。
+- 拖动行 = 与图层面板同一套手势：按下只记 `smart_drag_pending`，**移动超过 4 px** 才
+  进 active（单击仍然是「选中」），拖动中把落点行画成暖绿底（焦点蓝画在前面、落点盖在
+  上面，因为拖动时真正要看的是「松手落到哪」），松手才调 `_move`；`WM_KILLFOCUS` /
+  `WM_CAPTURECHANGED` 把 pending / active / from / to 全清掉，不留悬挂高亮。落点行 =
+  松手后这条**所占**的行。
+
+**失败一律「未改动」。** 调序与拖拽都先 `_at` 取整条、再 `_move`：引擎在开事务前求值，
+锁闸与求值失败都不会留下半步；壳侧对应报「调整智能滤镜顺序失败（未改动）」。拖拽落点
+在松手时已失效（撤销把条数缩了）则报「拖拽落点已失效（未改动）」，不硬算下标。
+
+**名字只有一个口径。** `smart_entry_name(document, layer, index, desc)`：`_name` 拿到非空
+就用它（`smart_clip_text` 截到 16 字符＋省略号，避免 256 字节的名字撑爆状态行 288 与行
+缓冲 320），否则回退 `filter_kind_name(desc.kind)`。面板行、标题状态、开关 / 删除 / 调序
+的回执全部走它——所以「第 2 条叫 我的模糊」在每个地方都一致。**删除与调序要在写之前
+取名**：删掉 / 挪走之后同一个下标已经指向邻居了。
+
+**几何。** `kSmartPanelFooter` 96 → **98**：提示从 4 行变 5 行（只有 4 行仍拿得到页脚，
+但少 2 px 行距），`hint_y = bottom - 8 - 5 * 18 + 4`。行几何仍全在 ui_core，
+`ui_core_smart_panel_rows_hit_what_they_paint` 把行高 / 页脚 / 只认画得出来的行钉住。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/layer.h` | `SmartFilter::name`、`kMaxSmartFilterNameBytes` |
+| `engine/abi/include/compositor/comp_filter.h` | 尾部 3 个导出 + `COMP_SMART_FILTER_NAME_MAX_BYTES` |
+| `engine/abi/src/comp_filter_abi.cpp` | `_move` / `_set_name` / `_name`、`read_smart_filter_name`、`static_assert` |
+| `engine/format/comp_file.cpp` | `engineSmart.filters[].name` 写读 + 不合规丢弃 |
+| `tests/test_smart_objects.cpp` | 3 例：`move_reorders_and_reevaluates` / `name_validates_undoes_and_persists` / `names_and_order_survive_comp_round_trip` |
+| `shells/windows/src/shell_layers.cpp` | `smart_entry_name`、`smart_panel_move_entry`、`smart_panel_drop`、`panel_begin_smart_filter_name`、键入态改名分支、状态行 |
+| `shells/windows/src/shell_paint.cpp` | 行名字改口径、拖动落点带、5 行提示 |
+| `shells/windows/src/shell_window.cpp` | `alt` 传入 `handle_key`、Alt+↑/↓ 与 F2、拖动状态机、两条菜单项与可用性 |
+| `shells/windows/src/shell_document.cpp` | 1724..1726 分派 |
+| `shells/windows/src/shell_state.h`、`shell_internal.h`、`ui_core.h` | `LayerInput::SmartFilterName`、`layer_input_slot`、`smart_drag_*`、1724..1726、页脚 98 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **772 例 / 0 失败**（769 → 772：新增 3 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（772 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（本批不加自检项） |
+| `scripts/visual_check.py --scene all` | **233 项 / 0 失败**（面板不在视觉场景里，阈值一处未动） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（新逻辑都在既有翻译单元里，TU 数不变） |
+| `^COMP_API` 导出 | **211**（208 → 211，全部在尾部追加） |
+| `scripts/check_tool_table.py` | **20 个工具 PASS**（未动工具表） |
+
+**已知边界：** 拖动只在可见行内换位，拖到列表边缘不会自动滚动；没有多选条目、不能批量
+调序，也没有 Alt+拖动复制；名字只做展示，不参与图层面板的搜索 / 过滤，也不影响 `.comp`
+里滤镜的类型与参数；关闭的条目仍可编辑参数、写回后保持关闭（PS 语义，同 §6.114）。
+
+
 
 
 

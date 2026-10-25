@@ -58,6 +58,119 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
 }
 
 /*
+ * P1-2 收尾：图层面板过滤（视图态，见 shell_state.h 的字段说明）。
+ *
+ * 判定只用 LayerRow 的只读快照，不调引擎、不开事务。三个维度是「与」关系：
+ * 类型、颜色、名称同时满足才显示。名称比较按 UTF-16 折叠大小写后做子串匹配，
+ * 中文不受影响（只折叠 ASCII / 拉丁）。
+ *
+ * 祖先保留：命中行的父组即使自己没命中也要显示，否则组消失后子行会以
+ * 「凭空出现的缩进」出现，层级看起来像坏了。祖先行按命中处理（可选中、可操作）。
+ */
+bool layer_filter_active(const ShellState& shell) {
+  return shell.layer_filter_kind != 0 || shell.layer_filter_color >= 0 ||
+         !shell.layer_filter_name.empty();
+}
+
+namespace {
+
+wchar_t fold_case(wchar_t ch) {
+  if (ch >= L'A' && ch <= L'Z') return static_cast<wchar_t>(ch - L'A' + L'a');
+  return ch;
+}
+
+bool name_contains(const std::wstring& haystack, const std::wstring& needle) {
+  if (needle.empty()) return true;
+  if (needle.size() > haystack.size()) return false;
+  const size_t last = haystack.size() - needle.size();
+  for (size_t start = 0; start <= last; ++start) {
+    size_t i = 0;
+    while (i < needle.size() && fold_case(haystack[start + i]) == fold_case(needle[i])) ++i;
+    if (i == needle.size()) return true;
+  }
+  return false;
+}
+
+bool row_matches_filter(const ShellState& shell, const LayerRow& row) {
+  switch (shell.layer_filter_kind) {
+    case 0:
+      break;
+    case 1: /* 像素层：不是组、不是文字、不是调整层、不是填充层、不是智能对象 */
+      if (row.is_group != 0 || row.is_text != 0 || row.adjustment_count > 0 ||
+          row.fill_kind != 0 || row.is_smart != 0) {
+        return false;
+      }
+      break;
+    case 2:
+      if (row.is_text == 0) return false;
+      break;
+    case 3:
+      if (row.is_group == 0) return false;
+      break;
+    case 4:
+      if (row.adjustment_count <= 0) return false;
+      break;
+    case 5:
+      if (row.fill_kind == 0) return false;
+      break;
+    case 6:
+      if (row.is_smart == 0) return false;
+      break;
+    default:
+      break;
+  }
+  if (shell.layer_filter_color >= 0 &&
+      static_cast<int>(row.color_label) != shell.layer_filter_color) {
+    return false;
+  }
+  if (!shell.layer_filter_name.empty() &&
+      !name_contains(widen_utf8(row.name), shell.layer_filter_name)) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+/*
+ * 过滤后的显示序：命中行 + 其全部祖先。返回的是 `shell.doc.layers` 的下标
+ * （升序，与数组序一致）。无过滤时返回全量。
+ */
+std::vector<int32_t> filtered_layer_indices(const ShellState& shell) {
+  const int32_t count = static_cast<int32_t>(shell.doc.layers.size());
+  std::vector<int32_t> indices;
+  indices.reserve(static_cast<size_t>(count));
+  if (!layer_filter_active(shell)) {
+    for (int32_t i = 0; i < count; ++i) indices.push_back(i);
+    return indices;
+  }
+  std::vector<uint8_t> keep(static_cast<size_t>(count), 0);
+  for (int32_t i = 0; i < count; ++i) {
+    const LayerRow& row = shell.doc.layers[static_cast<size_t>(i)];
+    if (!row_matches_filter(shell, row)) continue;
+    /* 自身 + 沿 parent 链上溯（含防御性上限：脏数据里的环不能把这里挂死）。 */
+    int32_t cursor = i;
+    for (int32_t guard = 0; cursor >= 0 && guard <= count; ++guard) {
+      if (keep[static_cast<size_t>(cursor)] != 0) break;
+      keep[static_cast<size_t>(cursor)] = 1;
+      const comp_layer_id parent = shell.doc.layers[static_cast<size_t>(cursor)].parent;
+      if (parent == 0) break;
+      cursor = -1;
+      for (int32_t j = 0; j < count; ++j) {
+        if (shell.doc.layers[static_cast<size_t>(j)].id == parent) {
+          cursor = j;
+          break;
+        }
+      }
+    }
+  }
+  for (int32_t i = 0; i < count; ++i) {
+    if (keep[static_cast<size_t>(i)] != 0) indices.push_back(i);
+  }
+  return indices;
+}
+
+/*
  * S44：重建树形显示序（组行在上、子层缩进在下、折叠的组不展开）。
  *
  * layers 变了（换文档 / 撤销 / 增删层）或折叠状态变了都要调。折叠集合先按「仍是组」
@@ -65,7 +178,6 @@ void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value) {
  * 处于折叠态。
  */
 void rebuild_layer_display(ShellState& shell) {
-  const int32_t count = static_cast<int32_t>(shell.doc.layers.size());
   if (!shell.doc.collapsed_groups.empty()) {
     std::vector<comp_layer_id> alive;
     alive.reserve(shell.doc.collapsed_groups.size());
@@ -80,10 +192,13 @@ void rebuild_layer_display(ShellState& shell) {
     shell.doc.collapsed_groups.swap(alive);
   }
 
-  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(count));
-  std::vector<uint8_t> collapsed(static_cast<size_t>(count), 0);
-  for (int32_t i = 0; i < count; ++i) {
-    const LayerRow& row = shell.doc.layers[static_cast<size_t>(i)];
+  /* P1-2 收尾：先算可见子集，再把它当成一个紧凑数组交给树形排布。 */
+  const std::vector<int32_t> indices = filtered_layer_indices(shell);
+  const int32_t visible = static_cast<int32_t>(indices.size());
+  std::vector<comp_ui::LayerStackEntry> entries(static_cast<size_t>(visible));
+  std::vector<uint8_t> collapsed(static_cast<size_t>(visible), 0);
+  for (int32_t i = 0; i < visible; ++i) {
+    const LayerRow& row = shell.doc.layers[static_cast<size_t>(indices[static_cast<size_t>(i)])];
     entries[static_cast<size_t>(i)] = comp_ui::LayerStackEntry{
         static_cast<int64_t>(row.id), static_cast<int64_t>(row.parent),
         static_cast<int64_t>(row.clipping)};
@@ -94,13 +209,18 @@ void rebuild_layer_display(ShellState& shell) {
       }
     }
   }
-  shell.doc.layer_display.assign(static_cast<size_t>(count), 0);
-  shell.doc.layer_depth.assign(static_cast<size_t>(count), 0);
+  shell.doc.layer_display.assign(static_cast<size_t>(visible), 0);
+  shell.doc.layer_depth.assign(static_cast<size_t>(visible), 0);
   const int32_t rows = comp_ui::build_layer_display(
-      entries.data(), count, collapsed.data(), shell.doc.layer_display.data(),
-      shell.doc.layer_depth.data(), count);
+      entries.data(), visible, collapsed.data(), shell.doc.layer_display.data(),
+      shell.doc.layer_depth.data(), visible);
   shell.doc.layer_display.resize(static_cast<size_t>(rows));
   shell.doc.layer_depth.resize(static_cast<size_t>(rows));
+  /* display 里存的是紧凑下标；投影回 layers 的真实下标。 */
+  for (int32_t& index : shell.doc.layer_display) {
+    const int32_t compact = index;
+    index = (compact >= 0 && compact < visible) ? indices[static_cast<size_t>(compact)] : -1;
+  }
 }
 
 /* 面板显示行数（折叠之后可能少于图层数）。 */
@@ -185,6 +305,942 @@ void panel_toggle_group_collapsed(ShellState& shell, comp_layer_id id) {
     }
     shell.doc.extra_selection.swap(visible);
   }
+}
+
+/* ------------------------------------------------ 面板过滤（P1-2 收尾） */
+
+/*
+ * 过滤条件变化后的统一收尾：重建显示序，把选中行夹回范围，并让多选集合只
+ * 保留仍可见的层——否则「已选中 N 个」的计数会包含面板上根本看不见的行。
+ */
+void panel_refresh_after_filter(ShellState& shell) {
+  const LayerRow* selected_before = selected_row(shell);
+  const comp_layer_id selected_id = selected_before != nullptr ? selected_before->id : 0;
+
+  rebuild_layer_display(shell);
+  const int32_t rows = panel_row_count(shell);
+  if (shell.doc.selected_layer < 0) shell.doc.selected_layer = 0;
+  if (rows <= 0) {
+    shell.doc.selected_layer = 0;
+  } else if (shell.doc.selected_layer >= rows) {
+    shell.doc.selected_layer = rows - 1;
+  }
+  /* 原选中层若被过滤掉，落到离它最近的可见行（面板非空时至少能继续操作）。 */
+  if (selected_id != 0 && panel_row_of_id(shell, selected_id) < 0 && rows > 0) {
+    if (shell.doc.selected_layer >= rows) shell.doc.selected_layer = rows - 1;
+  }
+  if (!shell.doc.extra_selection.empty()) {
+    std::vector<comp_layer_id> visible;
+    visible.reserve(shell.doc.extra_selection.size());
+    for (comp_layer_id extra : shell.doc.extra_selection) {
+      if (panel_row_of_id(shell, extra) >= 0) visible.push_back(extra);
+    }
+    shell.doc.extra_selection.swap(visible);
+  }
+
+  wchar_t buffer[224];
+  if (!layer_filter_active(shell)) {
+    wsprintfW(buffer, L"过滤已清除（%d 行）", static_cast<int>(rows));
+  } else {
+    const wchar_t* kind = L"全部";
+    switch (shell.layer_filter_kind) {
+      case 1: kind = L"像素"; break;
+      case 2: kind = L"文字"; break;
+      case 3: kind = L"组"; break;
+      case 4: kind = L"调整"; break;
+      case 5: kind = L"填充"; break;
+      case 6: kind = L"智能对象"; break;
+      default: break;
+    }
+    wsprintfW(buffer, L"过滤：类型=%s 颜色=%d 名称=%s（%d 行）", kind,
+              shell.layer_filter_color, shell.layer_filter_name.c_str(),
+              static_cast<int>(rows));
+  }
+  set_status(shell, buffer);
+}
+
+void panel_set_filter_kind(ShellState& shell, int kind) {
+  if (kind < 0 || kind > 6) return;
+  shell.layer_filter_kind = kind;
+  panel_refresh_after_filter(shell);
+}
+
+void panel_set_filter_color(ShellState& shell, int color) {
+  if (color < -1 || color > 7) return;
+  shell.layer_filter_color = color;
+  panel_refresh_after_filter(shell);
+}
+
+void panel_begin_filter_name(ShellState& shell) {
+  shell.doc.layer_input = LayerInput::FilterName;
+  shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_text = shell.layer_filter_name;
+  refresh_layer_input_status(shell);
+}
+
+void panel_clear_filter(ShellState& shell) {
+  shell.layer_filter_kind = 0;
+  shell.layer_filter_color = -1;
+  shell.layer_filter_name.clear();
+  panel_refresh_after_filter(shell);
+}
+
+/* ------------------------------------------------ 图层复合（P1-2 收尾 ⑥） */
+
+/*
+ * 图层复合 = 「每个现存图层可见不可见 + 不透明度多少」的一份具名快照。
+ *
+ * 与 PS 一致的口径：只记可见性与不透明度，不记位置/几何（那是变换的事）；
+ * 捕获之后才建的层不受复合管辖，应用时已被删除层按 id 找不到就跳过。
+ *
+ * 与 PS 的差异：复合表存在**文档里**（进撤销栈、随 .comp 落盘），壳只额外记
+ * 一个「当前复合」的视图态 id（ShellState::layer_comp_current）。撤销/重开文档
+ * 后该 id 可能失效，因此每次读取都用引擎现状校验一次，失效就退回第一个复合，
+ * 不靠壳侧缓存与引擎对齐。
+ */
+
+namespace {
+
+/* 复合是否还存在：按 id_at 线性枚举，不依赖引擎内部的查找接口。 */
+bool layer_comp_exists(comp_document document, comp_layer_comp_id comp) {
+  if (document == nullptr || comp == 0) return false;
+  size_t count = 0;
+  if (comp_layer_comp_count(document, &count) != COMP_OK) return false;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_comp_id id = 0;
+    if (comp_layer_comp_id_at(document, i, &id) != COMP_OK) return false;
+    if (id == comp) return true;
+  }
+  return false;
+}
+
+/* 复合名（两段式读取，UTF-8 -> UTF-16）。失败回空串，状态栏据此降级显示。 */
+std::wstring layer_comp_display_name(comp_document document, comp_layer_comp_id comp) {
+  size_t required = 0;
+  if (comp_layer_comp_name(document, comp, nullptr, 0, &required) != COMP_OK || required == 0) {
+    return std::wstring();
+  }
+  std::vector<char> buffer(required, '\0');
+  if (comp_layer_comp_name(document, comp, buffer.data(), buffer.size(), &required) != COMP_OK) {
+    return std::wstring();
+  }
+  return widen_utf8(std::string(buffer.data()));
+}
+
+/*
+ * 复合是否与文档当前状态一致（口径与引擎的 update 幂等判定相同：逐条比可见性
+ * 与不透明度，已删除的层跳过）。不用撤销深度去猜——栈满被截断后深度不涨，
+ * 那样会把「其实记了一步」误报成「未记入撤销」。
+ */
+bool layer_comp_matches_current(comp_document document, comp_layer_comp_id comp) {
+  size_t count = 0;
+  if (comp_layer_comp_entry_count(document, comp, &count) != COMP_OK) return false;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_id layer = 0;
+    uint8_t visible = 0;
+    float opacity = 0.0f;
+    if (comp_layer_comp_entry(document, comp, i, &layer, &visible, &opacity) != COMP_OK) {
+      return false;
+    }
+    int32_t current_visible = 0;
+    float current_opacity = 0.0f;
+    if (comp_layer_get_visible(document, layer, &current_visible) != COMP_OK) continue;
+    if (comp_layer_get_opacity(document, layer, &current_opacity) != COMP_OK) continue;
+    if ((current_visible != 0 ? 1 : 0) != (visible != 0 ? 1 : 0)) return false;
+    if (current_opacity != opacity) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+comp_layer_comp_id panel_current_layer_comp(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    shell.layer_comp_current = 0;
+    return 0;
+  }
+  if (layer_comp_exists(shell.doc.document, shell.layer_comp_current)) {
+    return shell.layer_comp_current;
+  }
+  comp_layer_comp_id first = 0;
+  if (comp_layer_comp_id_at(shell.doc.document, 0, &first) != COMP_OK) first = 0;
+  shell.layer_comp_current = first;
+  return first;
+}
+
+/* 状态栏报「当前复合」的位置与条目数（条目数 = 捕获时的图层数）。 */
+void panel_layer_comp_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  if (count == 0) {
+    set_status(shell, L"还没有图层复合（图层 > 图层复合 > 捕获为新复合）");
+    return;
+  }
+  const comp_layer_comp_id current = panel_current_layer_comp(shell);
+  size_t index = 0;
+  for (size_t i = 0; i < count; ++i) {
+    comp_layer_comp_id id = 0;
+    if (comp_layer_comp_id_at(shell.doc.document, i, &id) == COMP_OK && id == current) {
+      index = i;
+      break;
+    }
+  }
+  size_t entries = 0;
+  if (comp_layer_comp_entry_count(shell.doc.document, current, &entries) != COMP_OK) entries = 0;
+  const std::wstring name = layer_comp_display_name(shell.doc.document, current);
+  wchar_t buffer[224];
+  wsprintfW(buffer, L"图层复合 %u/%u：%s（%u 个图层）", static_cast<unsigned>(index + 1),
+            static_cast<unsigned>(count), name.c_str(), static_cast<unsigned>(entries));
+  set_status(shell, buffer);
+}
+
+/* 上一个 / 下一个复合（循环）。只改视图态 id，不碰文档、不落撤销步。 */
+void panel_layer_comp_select(ShellState& shell, int delta) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  if (count == 0) {
+    shell.layer_comp_current = 0;
+    set_status(shell, L"还没有图层复合（图层 > 图层复合 > 捕获为新复合）");
+    return;
+  }
+  std::vector<comp_layer_comp_id> ids(count, 0);
+  for (size_t i = 0; i < count; ++i) {
+    if (comp_layer_comp_id_at(shell.doc.document, i, &ids[i]) != COMP_OK) {
+      set_status(shell, L"读取图层复合列表失败");
+      return;
+    }
+  }
+  const comp_layer_comp_id current = panel_current_layer_comp(shell);
+  size_t index = 0;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] == current) {
+      index = i;
+      break;
+    }
+  }
+  const long long total = static_cast<long long>(ids.size());
+  long long next = static_cast<long long>(index) + static_cast<long long>(delta);
+  next %= total;
+  if (next < 0) next += total;
+  shell.layer_comp_current = ids[static_cast<size_t>(next)];
+  panel_layer_comp_status(shell);
+}
+
+/*
+ * 捕获/改名共用一条文本输入通道：layer_input_id == 0 表示捕获新复合，
+ * 非 0 表示改这个复合的名字。默认名「复合 N」按当前数量 +1 起，重名引擎允许
+ * （与上游一致），名字只用来给人看。
+ */
+void panel_layer_comp_capture_begin(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_comp_count(shell.doc.document, &count) != COMP_OK) count = 0;
+  wchar_t buffer[64];
+  wsprintfW(buffer, L"复合 %d", static_cast<int>(count + 1));
+  shell.doc.layer_input = LayerInput::CompName;
+  shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_text = buffer;
+  refresh_layer_input_status(shell);
+}
+
+void panel_layer_comp_rename_begin(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  shell.doc.layer_input = LayerInput::CompName;
+  shell.doc.layer_input_id = comp;
+  shell.doc.layer_input_text = layer_comp_display_name(shell.doc.document, comp);
+  refresh_layer_input_status(shell);
+}
+
+/*
+ * 应用复合。幂等由引擎判定：全表都已是快照状态 -> changed == 0，不落撤销步，
+ * 壳也就别推进缓存、别置 needs_render（否则每按一次都像改了什么）。
+ */
+void panel_layer_comp_apply(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  int32_t changed = 0;
+  if (comp_layer_comp_apply(shell.doc.document, comp, &changed) != COMP_OK) {
+    set_status(shell, L"应用图层复合失败");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(shell.doc.document, comp);
+  refresh_layers(shell);
+  wchar_t buffer[192];
+  if (changed == 0) {
+    wsprintfW(buffer, L"复合「%s」已是当前状态（0 处改动）", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  shell.doc.needs_render = true;
+  wsprintfW(buffer, L"已应用复合「%s」（%d 个图层被改动）", name.c_str(),
+            static_cast<int>(changed));
+  refresh_history_status(shell, buffer);
+}
+
+/* 用当前状态覆盖复合。内容未变时引擎不落步，状态栏照实说「无变化」。 */
+void panel_layer_comp_update(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  comp_document document = shell.doc.document;
+  const bool unchanged = layer_comp_matches_current(document, comp);
+  if (comp_layer_comp_update(document, comp) != COMP_OK) {
+    set_status(shell, L"更新图层复合失败");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(document, comp);
+  wchar_t buffer[192];
+  if (unchanged) {
+    wsprintfW(buffer, L"复合「%s」内容未变，未记入撤销", name.c_str());
+    set_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已用当前状态更新复合「%s」", name.c_str());
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 删除当前复合。引擎对不存在的 id 返回 NOT_FOUND（删除故意不幂等），所以先从
+ * 视图态里退一个仍然存在的复合，避免删完还指着孤儿 id。删除不影响像素。
+ */
+void panel_layer_comp_delete(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_comp_id comp = panel_current_layer_comp(shell);
+  if (comp == 0) {
+    set_status(shell, L"还没有图层复合");
+    return;
+  }
+  const std::wstring name = layer_comp_display_name(shell.doc.document, comp);
+  if (comp_layer_comp_delete(shell.doc.document, comp) != COMP_OK) {
+    set_status(shell, L"删除图层复合失败");
+    return;
+  }
+  shell.layer_comp_current = 0;
+  panel_current_layer_comp(shell);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已删除复合「%s」", name.c_str());
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------------- P1-2 收尾 ⑦：智能对象 / 智能滤镜 */
+
+/*
+ * 状态栏报智能滤镜条数。菜单里的「清除全部智能滤镜」是否可点由同一个查询决定
+ * （见 shell_window.cpp 的菜单闸），此处只负责把「几条、哪几条」说清楚。
+ */
+void panel_smart_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) != COMP_OK ||
+      smart == 0) {
+    set_status(shell, L"智能对象：当前图层不是智能对象");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"智能对象：读取滤镜栈失败");
+    return;
+  }
+  wchar_t buffer[192];
+  if (count == 0) {
+    wsprintfW(buffer, L"智能对象：暂无智能滤镜（用「滤镜 > 应用」叠加）");
+  } else {
+    wsprintfW(buffer, L"智能对象：%d 条智能滤镜（图层 > 智能对象 > 清除全部智能滤镜）",
+              static_cast<int>(count));
+  }
+  set_status(shell, buffer);
+}
+
+/*
+ * 转换为智能对象。此刻的像素成为不可变 source，画面逐字节不变——所以只需要重画
+ * 一帧（实际没有像素变化）与刷新面板标记，不需要 finish_canvas_command。
+ * 幂等：已经是智能对象时引擎回 changed = 0、不落撤销步，这里如实回报。
+ */
+void panel_smart_convert(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  int32_t changed = 0;
+  const comp_result result = comp_layer_smart_object_create(shell.doc.document, id, &changed);
+  if (result == COMP_ERR_STATE) {
+    /* 引擎不细说原因（组 / 无像素 / 文字 / HDR / 锁定共用 STATE），状态栏一次列全，
+     * 免得用户逐个猜。真正的判定仍在引擎：这里只说「可能是哪几种」。 */
+    set_status(shell,
+               L"转换为智能对象失败：组图层、无像素、文字图层、HDR 或已锁定（未改动）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"转换为智能对象失败（未改动）");
+    return;
+  }
+  refresh_layers(shell);
+  if (changed == 0) {
+    set_status(shell, L"该图层已经是智能对象（未产生撤销步）");
+    return;
+  }
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已转换为智能对象（像素成为不可变源，滤镜改为非破坏）");
+}
+
+/* 栅格化：丢掉 source 与滤镜栈，保留当前渲染出的像素（可编辑性不可逆地丢失）。 */
+void panel_smart_rasterize(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"栅格化：请先选择一个图层");
+    return;
+  }
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK &&
+      smart == 0) {
+    set_status(shell, L"栅格化：当前图层不是智能对象");
+    return;
+  }
+  if (comp_layer_smart_object_rasterize(shell.doc.document, id) != COMP_OK) {
+    set_status(shell, L"栅格化智能对象失败");
+    return;
+  }
+  refresh_layers(shell);
+  refresh_history_status(shell, L"已栅格化智能对象（滤镜烘进像素，可编辑性已丢弃）");
+}
+
+/*
+ * 清空滤镜栈：逐条删除会各落一步撤销，所以先开一个显式事务，让整次清除成为
+ * 一步（ABI 的 remove 会加入调用方已开的事务）。删到空栈时画面回到 source。
+ */
+void panel_smart_clear_filters(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"智能对象：请先选择一个图层");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"清除智能滤镜：当前图层不是智能对象");
+    return;
+  }
+  if (count == 0) {
+    set_status(shell, L"清除智能滤镜：本来就没有（未产生撤销步）");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document, "Clear Smart Filters", &txn) != COMP_OK) {
+    set_status(shell, L"清除智能滤镜：无法开启事务（未改动）");
+    return;
+  }
+  bool ok = true;
+  for (size_t remaining = count; remaining > 0; --remaining) {
+    if (comp_layer_smart_filter_remove(shell.doc.document, id, 0) != COMP_OK) {
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    comp_txn_abort(txn);
+    set_status(shell, L"清除智能滤镜失败（已回滚，未改动）");
+    return;
+  }
+  comp_txn_commit(txn);
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已清除 %d 条智能滤镜（画面回到原始像素）", static_cast<int>(count));
+  refresh_history_status(shell, buffer);
+}
+
+/* ------------------------------------- P1-2 收尾 ⑨：智能滤镜栈面板（1720 段） */
+
+/*
+ * 「这一层现在能不能编辑滤镜栈」的唯一判定：绘制、动作、菜单闸同源。
+ * 面板跟随选中层（与 PS 一致）；选到非智能层时面板还留着，但只显示一条提示，
+ * 不会把动作打到上一层的栈上。
+ */
+comp_layer_id smart_panel_target(const ShellState& shell) {
+  if (shell.doc.document == nullptr) return 0;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) return 0;
+  int32_t smart = 0;
+  if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) != COMP_OK || smart == 0) {
+    return 0;
+  }
+  return id;
+}
+
+int smart_panel_count(const ShellState& shell) {
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) return 0;
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) return 0;
+  return static_cast<int>(count);
+}
+
+bool smart_panel_visible(const ShellState& shell) { return shell.doc.smart_open; }
+
+/* 让位给别的右栏面板：不清焦点、不清绑定，下次打开还停在原处。 */
+void smart_panel_dismiss(ShellState& shell) { shell.doc.smart_open = false; }
+
+/* 换文档：面板状态整体归零（绑定一起清，别把上篇文档的条目带过来）。 */
+void smart_panel_reset(ShellState& shell) {
+  shell.doc.smart_open = false;
+  shell.doc.smart_focus = 0;
+  shell.doc.smart_scroll = 0;
+  shell.doc.smart_layer = 0;
+  filter_smart_edit_clear(shell);
+}
+
+std::wstring filter_kind_name(comp_filter_kind kind) {
+  const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(static_cast<int>(kind));
+  return widen_ascii(spec != nullptr ? spec->name : "?");
+}
+
+/* 一行面板文字能装下的名字字数：引擎上限是 256 字节，整段塞进 22 px 的行里
+ * 会把参数摘要挤出面板。截断只影响显示，写回引擎的永远是完整名字。 */
+static constexpr size_t kSmartNameChars = 16;
+
+/* 按 wchar 截断并补省略号；不劈开代理对（半个代理在 GDI 里是乱码）。 */
+static std::wstring smart_clip_text(const std::wstring& text, size_t max_chars) {
+  if (text.size() <= max_chars) return text;
+  std::wstring clipped = text.substr(0, max_chars - 1);
+  if (!clipped.empty()) {
+    const wchar_t last = clipped.back();
+    if (last >= 0xD800 && last <= 0xDBFF) clipped.pop_back();
+  }
+  clipped += L'…';
+  return clipped;
+}
+
+/*
+ * 一条在面板上叫什么（P1-2 收尾 ⑩）：自定义名优先，空名回退到滤镜类型名。
+ * 绘制、状态栏、动作回报三处都走这里，名字与面板永远同一口径。
+ */
+std::wstring smart_entry_name(comp_document document, comp_layer_id layer, size_t index,
+                              const comp_filter_desc& desc) {
+  if (document != nullptr) {
+    /* 缓冲区正好够引擎上限 + NUL，所以这里不可能拿到「太短」的错误。 */
+    char buffer[COMP_SMART_FILTER_NAME_MAX_BYTES + 1];
+    size_t required = 0;
+    if (comp_layer_smart_filter_name(document, layer, index, buffer, sizeof(buffer), &required) ==
+            COMP_OK &&
+        required > 1) {
+      return smart_clip_text(widen_utf8(std::string(buffer, required - 1)), kSmartNameChars);
+    }
+  }
+  return filter_kind_name(desc.kind);
+}
+
+/*
+ * 一行的参数摘要：跨滤镜统一取前两行面板参数（"Amount 50 · Radius 4"）。
+ * 面板行承载不到的字段（Vignette 边缘色 / Progressive Blur 显式轴）不挤进这一行。
+ */
+std::wstring smart_entry_summary(const comp_filter_desc& desc) {
+  const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(static_cast<int>(desc.kind));
+  if (spec == nullptr) return std::wstring();
+  comp_ui::FilterPanel panel;
+  panel.id = spec->id;
+  filter_load_values(panel, desc);
+  std::wstring text;
+  const int shown = spec->param_count < 2 ? spec->param_count : 2;
+  for (int i = 0; i < shown; ++i) {
+    if (!text.empty()) text += L" · ";
+    text += widen_ascii(spec->params[i].label);
+    text += L" ";
+    text += widen_ascii(number_text(panel.value(i)).c_str());
+  }
+  return text;
+}
+
+/* 把焦点行滚进可视区（面板矮 / 条目多时必需）；键盘、鼠标、动作共用。 */
+static void smart_scroll_to_focus(ShellState& shell) {
+  Layout layout{};
+  if (!client_layout(shell, &layout) || layout.adjust_panel.w <= 0) return;
+  shell.doc.smart_scroll = comp_ui::smart_ensure_visible(
+      layout.adjust_panel, smart_panel_count(shell), shell.doc.smart_focus,
+      shell.doc.smart_scroll);
+}
+
+/*
+ * 收敛：选中层变了就换绑定并回到第 1 条；条数缩了就把焦点与滚动夹回去。
+ * 只挂在 refresh_layers（选中层 / 撤销 / 重做的唯一汇聚点）里；绘制与动作
+ * 都现读引擎，所以这里不缓存任何 desc，撤销后列表不会与文档漂移。
+ */
+void refresh_smart_panel(ShellState& shell) {
+  if (!shell.doc.smart_open) return;
+  const comp_layer_id target = smart_panel_target(shell);
+  if (target != shell.doc.smart_layer) {
+    shell.doc.smart_layer = target;
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+    return;
+  }
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+    return;
+  }
+  if (shell.doc.smart_focus >= count) shell.doc.smart_focus = count - 1;
+  if (shell.doc.smart_focus < 0) shell.doc.smart_focus = 0;
+  smart_scroll_to_focus(shell);
+}
+
+/* 焦点位置 + 当前条的一句话状态（列表为空 / 非智能层时也各有实话）。 */
+void smart_panel_status(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  if (selected_layer_id(shell) == 0) {
+    set_status(shell, L"智能滤镜：请先选择一个图层");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（转换为智能对象后才能叠加滤镜）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取滤镜栈失败");
+    return;
+  }
+  if (count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（用「滤镜 > 任一项」叠加，回车应用）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  shell.doc.smart_focus = static_cast<int32_t>(index);
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    wchar_t buffer[192];
+    wsprintfW(buffer, L"智能滤镜：%d 条（读取当前条失败）", static_cast<int>(count));
+    set_status(shell, buffer);
+    return;
+  }
+  wchar_t buffer[288];
+  wsprintfW(buffer,
+            L"智能滤镜 %d/%d：%s · %s｜%s（空格 开关 · 回车 改参数 · F2 重命名 · "
+            L"Alt+↑↓ 调序 · Del 删除）",
+            static_cast<int>(index + 1), static_cast<int>(count),
+            smart_entry_name(shell.doc.document, id, index, desc).c_str(),
+            enabled != 0 ? L"启用" : L"关闭", smart_entry_summary(desc).c_str());
+  set_status(shell, buffer);
+}
+
+void smart_panel_focus_row(ShellState& shell, int32_t row) {
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    smart_panel_status(shell);
+    return;
+  }
+  if (row < 0) row = 0;
+  if (row >= count) row = count - 1;
+  shell.doc.smart_focus = row;
+  smart_scroll_to_focus(shell);
+  smart_panel_status(shell);
+}
+
+void smart_panel_move(ShellState& shell, int32_t delta) {
+  smart_panel_focus_row(shell, shell.doc.smart_focus + delta);
+}
+
+/*
+ * Alt+↑ / Alt+↓（P1-2 收尾 ⑩）：把当前条与相邻条换位。栈序就是求值顺序，所以
+ * 这会改画面——成功即一步撤销，失败不动像素也不留撤销步（引擎在开事务前求值）。
+ */
+void smart_panel_move_entry(ShellState& shell, int32_t delta) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  if (delta < 0 && index == 0) {
+    set_status(shell, L"智能滤镜：已经是第 1 条，不能再上移（未改动）");
+    return;
+  }
+  if (delta > 0 && index + 1 >= count) {
+    set_status(shell, L"智能滤镜：已经是最后一条，不能再下移（未改动）");
+    return;
+  }
+  /* 夹到 ±1：调用方只该传一个方向，传大了按「换一位」处理，不让它跳格。 */
+  const size_t target = delta < 0 ? index - 1 : index + 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const std::wstring label = smart_entry_name(shell.doc.document, id, index, desc);
+  if (comp_layer_smart_filter_move(shell.doc.document, id, index, target) != COMP_OK) {
+    set_status(shell, L"调整智能滤镜顺序失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = static_cast<int32_t>(target);
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：已%s到第 %d 条（一步撤销）", label.c_str(),
+            delta < 0 ? L"上移" : L"下移", static_cast<int>(target + 1));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 拖拽落点（P1-2 收尾 ⑩）：from/to 都是**移动前**的行号，语义同 _move。没跨行
+ * 就什么都不做——单击仍然是选中，不能顺手落一步撤销。
+ */
+void smart_panel_drop(ShellState& shell, int32_t from, int32_t to) {
+  if (shell.doc.document == nullptr) return;
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) return;
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) return;
+  if (from == to) return;
+  if (from < 0 || to < 0 || static_cast<size_t>(from) >= count ||
+      static_cast<size_t>(to) >= count) {
+    set_status(shell, L"智能滤镜：拖拽落点已失效（未改动）");
+    return;
+  }
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, static_cast<size_t>(from), &desc,
+                                 &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const std::wstring label =
+      smart_entry_name(shell.doc.document, id, static_cast<size_t>(from), desc);
+  if (comp_layer_smart_filter_move(shell.doc.document, id, static_cast<size_t>(from),
+                                   static_cast<size_t>(to)) != COMP_OK) {
+    set_status(shell, L"调整智能滤镜顺序失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = to;
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：已移到第 %d 条（一步撤销）", label.c_str(), to + 1);
+  refresh_history_status(shell, buffer);
+}
+
+void open_smart_panel(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  /* 右栏一次只挂一个面板：与滤镜 / 填充 / 效果 / 修边 / 路径 / 历史 / 通道 / 色彩范围互斥。 */
+  if (shell.doc.color_range_open) color_range_cancel(shell);
+  if (shell.doc.fill_open) close_fill_panel(shell);
+  shell.doc.filter_open = false;
+  shell.doc.filter_input.clear();
+  filter_preview_forget(shell); /* 滤镜预览帧不能留在这个面板底下 */
+  filter_smart_edit_clear(shell);
+  shell.doc.effect_open = false;
+  shell.doc.effect_input.clear();
+  shell.doc.trim_open = false;
+  shell.doc.trim_input.clear();
+  shell.doc.path_open = false;
+  shell.doc.history_open = false;
+  channel_panel_close(shell);
+
+  const comp_layer_id target = smart_panel_target(shell);
+  if (target != shell.doc.smart_layer) {
+    shell.doc.smart_focus = 0;
+    shell.doc.smart_scroll = 0;
+  }
+  shell.doc.smart_layer = target;
+  shell.doc.smart_open = true;
+  smart_scroll_to_focus(shell);
+  smart_panel_status(shell);
+}
+
+void close_smart_panel(ShellState& shell) {
+  if (!shell.doc.smart_open) return;
+  shell.doc.smart_open = false;
+  set_status(shell, L"已关闭智能滤镜面板（滤镜栈未改动）");
+}
+
+/* 空格：同参翻转 enabled（引擎 _set 幂等：设置没变、只有开关变 → 一步撤销）。 */
+void smart_panel_toggle_entry(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  const int32_t flipped = enabled != 0 ? 0 : 1;
+  if (comp_layer_smart_filter_set(shell.doc.document, id, index, &desc, flipped) != COMP_OK) {
+    set_status(shell, L"智能滤镜：开关失败（未改动）");
+    return;
+  }
+  shell.doc.smart_focus = static_cast<int32_t>(index);
+  shell.doc.needs_render = true;
+  refresh_layers(shell); /* 行内 S 标记 / 条数 / 栈面板同源收敛 */
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"%s：第 %d 条已%s（一步撤销）",
+            smart_entry_name(shell.doc.document, id, index, desc).c_str(),
+            static_cast<int>(index + 1), flipped != 0 ? L"启用" : L"关闭");
+  refresh_history_status(shell, buffer);
+}
+
+/* 回车：进滤镜面板的「编辑该条」模式（面板排版与键盘完全复用普通滤镜面板）。 */
+void smart_panel_edit_entry(ShellState& shell) {
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    smart_panel_status(shell);
+    return;
+  }
+  int32_t index = shell.doc.smart_focus;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  open_smart_filter_editor(shell, static_cast<size_t>(index));
+}
+
+/* Del：删掉当前条（一步撤销；删到空栈画面回到 source）。 */
+void smart_panel_remove_entry(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（未改动）");
+    return;
+  }
+  size_t count = 0;
+  if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK || count == 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（未改动）");
+    return;
+  }
+  size_t index = static_cast<size_t>(shell.doc.smart_focus);
+  if (index >= count) index = count - 1;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  /* 名字要在删除**之前**读：删掉之后这个下标已经指向下一条了。 */
+  const std::wstring label = smart_entry_name(shell.doc.document, id, index, desc);
+  if (comp_layer_smart_filter_remove(shell.doc.document, id, index) != COMP_OK) {
+    set_status(shell, L"智能滤镜：删除失败（未改动）");
+    return;
+  }
+  shell.doc.needs_render = true;
+  refresh_layers(shell);
+  /* 焦点留在原位（删的是最后一条就往前挪一格）。 */
+  if (count > 1 && index >= count - 1) index = count - 2;
+  shell.doc.smart_focus = static_cast<int32_t>(count > 1 ? index : 0);
+  smart_scroll_to_focus(shell);
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"已删除第 %d 条 %s（一步撤销 · 剩 %d 条）", static_cast<int>(index + 1),
+            label.c_str(), static_cast<int>(count - 1));
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 从「编辑某条」回到栈列表。层在编辑期间被撤销掉 / 不再是智能对象时，不硬开
+ * 一个空面板——只把面板收起来，状态行由调用方（回车 / Esc 两条路径）写实话。
+ */
+void smart_panel_reopen_after_edit(ShellState& shell, int focus_index) {
+  const comp_layer_id target = smart_panel_target(shell);
+  if (shell.doc.document == nullptr || target == 0) {
+    shell.doc.smart_open = false;
+    return;
+  }
+  shell.doc.smart_layer = target;
+  const int count = smart_panel_count(shell);
+  int focus = focus_index;
+  if (focus < 0) focus = 0;
+  if (count > 0 && focus >= count) focus = count - 1;
+  shell.doc.smart_focus = focus;
+  shell.doc.smart_open = true;
+  smart_scroll_to_focus(shell);
 }
 
 /* 两段式枚举图层 id，并逐个查询属性（只读，不引入隐式事务）。 */
@@ -311,6 +1367,45 @@ void refresh_layers(ShellState& shell) {
     if (comp_layer_get_color_label(shell.doc.document, id, &color_label) == COMP_OK) {
       row.color_label = color_label < COMP_LAYER_COLOR_COUNT ? color_label : 0u;
     }
+    uint32_t link_group = 0;
+    if (comp_layer_get_link(shell.doc.document, id, &link_group) == COMP_OK) {
+      row.link_group = link_group;
+    }
+    /*
+     * P1-2 收尾：过滤用的类型快照（只读）。文字层用 get_text 的空查询判定
+     * （非文字层返回 COMP_ERR_STATE），调整层数走 adjustment_count；
+     * 智能对象与填充层分别走 is_smart / is_fill（见下）。
+     */
+    size_t text_required = 0;
+    row.is_text = comp_layer_get_text(shell.doc.document, id, nullptr, nullptr, 0,
+                                      &text_required) == COMP_OK
+                      ? 1
+                      : 0;
+    size_t adjustment_count = 0;
+    if (comp_layer_adjustment_count(shell.doc.document, id, &adjustment_count) == COMP_OK) {
+      row.adjustment_count =
+          adjustment_count > 255u ? 255 : static_cast<int32_t>(adjustment_count);
+    }
+    /*
+     * P1-2 收尾 ⑦：智能对象标记。只读查询（is_smart 不开事务），用于过滤「智能对象」
+     * 与行内 S 标记；写路径仍全部回到 comp_layer_smart_*。
+     */
+    int32_t smart = 0;
+    if (comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK) {
+      row.is_smart = smart != 0 ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+    }
+    /*
+     * P1-2 收尾 ⑧：填充层标记。is_fill 是只读判定（不开事务），get_fill 再取种类
+     * 供过滤与行内 F 标记；两者都失败时保持 0 = 当作普通图层，不会被过滤掉。
+     */
+    int32_t is_fill = 0;
+    if (comp_layer_is_fill(shell.doc.document, id, &is_fill) == COMP_OK && is_fill != 0) {
+      uint32_t fill_kind = 0;
+      if (comp_layer_get_fill(shell.doc.document, id, &fill_kind, nullptr, 0, nullptr) ==
+          COMP_OK) {
+        row.fill_kind = fill_kind;
+      }
+    }
     shell.doc.layers.push_back(row);
   }
 
@@ -344,6 +1439,10 @@ void refresh_layers(ShellState& shell) {
   refresh_adjustments(shell);
   /* S24：效果列表与调整列表同一数据源（选中图层），同一刷新汇合点。 */
   refresh_effects(shell);
+  /* P1-2 收尾 ⑧：填充面板同理——选中层换了，绑定的填充层（或新建态）跟着换。 */
+  refresh_fill(shell);
+  /* P1-2 收尾 ⑨：智能滤镜栈面板跟随选中层；撤销 / 重做后条目由绘制现读，不会漂移。 */
+  refresh_smart_panel(shell);
   /*
    * S22：直方图随后同步。挂在这里而不是每个写入口各调一次，是因为
    * refresh_layers 已经是全部变更路径（滤镜 / 工具 / 撤销 / 合并 / 打开文档）
@@ -1095,6 +2194,203 @@ void panel_set_color_label(ShellState& shell, uint32_t label) {
 }
 
 /*
+ * 链接图层（P1-2 第三批）。
+ *
+ * PS 的「链接图层」是勾选式：选中的多个层已经同组 -> 解除；否则并成一组。
+ * 这里沿用同一点选口径，但**只作用在选中的像素/文字层上**：
+ *   - 组图层跳过（引擎明确不支持，且组的几何由子树合成，没有可联动的矩形）；
+ *   - 有效选中层少于 2 个 -> 直接拒绝并提示（不偷偷对主选中层做单层操作）；
+ *   - 判定用引擎回读的 link_group，不信任面板缓存（撤销后缓存会滞后一帧）。
+ *
+ * 链接是纯关系元数据，但会进撤销栈，所以用 refresh_history_status 刷新
+ * 「撤销」标题——与设置锁/色标同一条路径，不置 needs_render。
+ */
+void panel_toggle_link(ShellState& shell) {
+  std::vector<comp_layer_id> batch = panel_selection_ids(shell, false);
+  std::vector<comp_layer_id> targets;
+  targets.reserve(batch.size());
+  for (comp_layer_id id : batch) {
+    const LayerRow* row = nullptr;
+    for (const LayerRow& candidate : shell.doc.layers) {
+      if (candidate.id == id) {
+        row = &candidate;
+        break;
+      }
+    }
+    if (row == nullptr || row->is_group != 0) continue;
+    targets.push_back(id);
+  }
+  if (targets.size() < 2) {
+    set_status(shell, L"链接图层需要至少选中两个图层（不含图层组）");
+    return;
+  }
+
+  uint32_t shared = 0;
+  bool all_linked = true;
+  for (comp_layer_id id : targets) {
+    uint32_t group = 0;
+    if (comp_layer_get_link(shell.doc.document, id, &group) != COMP_OK) {
+      set_status(shell, L"读取图层链接失败");
+      return;
+    }
+    if (group == 0) {
+      all_linked = false;
+    } else if (shared == 0) {
+      shared = group;
+    } else if (shared != group) {
+      all_linked = false;
+    }
+  }
+
+  wchar_t buffer[128];
+  if (all_linked) {
+    int32_t changed = 0;
+    if (comp_layer_unlink(shell.doc.document, targets.data(), targets.size(), &changed) != COMP_OK) {
+      set_status(shell, L"解除图层链接失败");
+      return;
+    }
+    refresh_layers(shell);
+    wsprintfW(buffer, L"已解除 %d 个图层的链接", static_cast<int>(targets.size()));
+    refresh_history_status(shell, buffer);
+    return;
+  }
+
+  uint32_t group = 0;
+  int32_t changed = 0;
+  if (comp_layer_link(shell.doc.document, targets.data(), targets.size(), &group, &changed) !=
+      COMP_OK) {
+    set_status(shell, L"链接图层失败");
+    return;
+  }
+  refresh_layers(shell);
+  if (changed == 0) {
+    wsprintfW(buffer, L"已在同一链接组：%u", group);
+  } else {
+    wsprintfW(buffer, L"已链接 %d 个图层（组 %u）", static_cast<int>(targets.size()), group);
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 图层样式的拷贝 / 粘贴（P1-2 第四批）。
+ *
+ * 「图层样式」在本引擎里就是层的效果栈，所以这一对命令不新增文档语义：
+ *   - 引擎负责把效果栈导出成与 `.comp` engineEffects 同形的报文（kind 顺序、
+ *     settings 原文都不变形，未知键也带着），外壳只当剪贴板；
+ *   - 粘贴是**整份替换**而不是合并：目标层原有样式全被剪贴板取代，`[]` 即清空；
+ *   - 多选粘贴包在一个事务里 = 一步撤销（与批量切效果同口径）。
+ *
+ * 拒绝面照抄引擎：组图层两侧都不支持（组的样式从不参与求值），最高版本才
+ * 认识的 kind 导出时直接拒绝，不产出粘不回来的剪贴板。
+ */
+void panel_copy_layer_style(ShellState& shell) {
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"无图层");
+    return;
+  }
+  size_t need = 0;
+  comp_result result = comp_layer_export_style(shell.doc.document, id, nullptr, 0, &need);
+  if (result == COMP_ERR_UNSUPPORTED) {
+    set_status(shell, L"该图层不能拷贝样式（图层组没有求值的样式）");
+    return;
+  }
+  if (result != COMP_OK) {
+    set_status(shell, L"导出图层样式失败");
+    return;
+  }
+  std::vector<char> buffer(need + 1, '\0');
+  result = comp_layer_export_style(shell.doc.document, id, buffer.data(), buffer.size(), &need);
+  if (result != COMP_OK) {
+    set_status(shell, L"导出图层样式失败");
+    return;
+  }
+  shell.layer_style_clipboard.assign(buffer.data(), need);
+  refresh_layers(shell);
+  wchar_t message[160];
+  wsprintfW(message, L"已拷贝图层样式（%u 字节）", static_cast<unsigned>(need));
+  set_status(shell, message);
+}
+
+void panel_paste_layer_style(ShellState& shell) {
+  if (shell.layer_style_clipboard.empty()) {
+    set_status(shell, L"剪贴板里没有图层样式（先拷贝一次）");
+    return;
+  }
+  const std::vector<comp_layer_id> batch = panel_selection_ids(shell, true);
+  if (batch.empty()) {
+    set_status(shell, L"无图层");
+    return;
+  }
+
+  /* 单层粘贴走引擎的隐式事务；多选必须显式包一层，才能一步撤销整批。 */
+  comp_txn txn = nullptr;
+  if (batch.size() > 1) {
+    if (comp_txn_begin(shell.doc.document, "Paste Layer Style", &txn) != COMP_OK) {
+      set_status(shell, L"粘贴图层样式：无法开始事务");
+      return;
+    }
+  }
+  size_t changed = 0;
+  size_t same = 0;
+  size_t groups = 0;
+  size_t failed = 0;
+  for (comp_layer_id id : batch) {
+    int32_t at = 0;
+    const comp_result result = comp_layer_import_style(
+        shell.doc.document, id, shell.layer_style_clipboard.c_str(), &at);
+    if (result == COMP_OK) {
+      if (at != 0) {
+        ++changed;
+      } else {
+        ++same; /* 已经是这份样式：引擎不落撤销步，这里也不计入改动。 */
+      }
+    } else if (result == COMP_ERR_UNSUPPORTED) {
+      ++groups;
+    } else {
+      ++failed;
+    }
+  }
+
+  if (txn != nullptr) {
+    if (changed == 0) {
+      comp_txn_abort(txn);
+      wchar_t empty_message[224];
+      wsprintfW(empty_message, L"粘贴图层样式：选中的图层没有改动%s",
+                groups > 0 ? L"（组图层不参与样式）" : L"");
+      set_status(shell, empty_message);
+      return;
+    }
+    if (comp_txn_commit(txn) != COMP_OK) {
+      set_status(shell, L"粘贴图层样式：提交失败");
+      return;
+    }
+  }
+
+  refresh_effects(shell);
+  refresh_layers(shell);
+  if (changed > 0) shell.doc.needs_render = true;
+  wchar_t buffer[320];
+  if (changed == 0) {
+    wsprintfW(buffer, L"粘贴图层样式：没有改动%s",
+              groups > 0 ? L"（组图层不参与样式）" : L"（样式已相同）");
+    set_status(shell, buffer);
+    return;
+  }
+  wsprintfW(buffer, L"已为 %u 个图层粘贴样式", static_cast<unsigned>(changed));
+  if (same > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L"（%u 个已相同）", static_cast<unsigned>(same));
+  }
+  if (groups > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L" · 跳过 %u 个组图层", static_cast<unsigned>(groups));
+  }
+  if (failed > 0) {
+    wsprintfW(buffer + lstrlenW(buffer), L" · %u 个失败", static_cast<unsigned>(failed));
+  }
+  refresh_history_status(shell, buffer);
+}
+
+/*
  * 效果开关（S24）。
  *
  * 引擎侧 9 种效果（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/
@@ -1302,6 +2598,7 @@ void open_effect_panel(ShellState& shell, int kind) {
     return;
   }
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   /* 右栏一次只挂一个面板：滤镜、路径、历史与效果共用同一块矩形，同时打开会互相遮住。 */
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
@@ -2251,11 +3548,27 @@ void panel_duplicate_layer(ShellState& shell) {
 /* ------------------------------------------------- 图层名 / 不透明度键入 */
 
 void refresh_layer_input_status(ShellState& shell) {
-  wchar_t buffer[224];
+  wchar_t buffer[240];
   if (shell.doc.layer_input == LayerInput::Rename) {
     wsprintfW(buffer, L"重命名图层 #%I64u：%s（回车确认 / Esc 取消）",
               static_cast<unsigned long long>(shell.doc.layer_input_id),
               shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::SmartFilterName) {
+    wsprintfW(buffer, L"智能滤镜第 %d 条：%s（回车确认 / Esc 取消，空 = 用类型名）",
+              static_cast<int>(shell.doc.layer_input_slot + 1),
+              shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::FilterName) {
+    wsprintfW(buffer, L"按名称过滤图层：%s（回车应用 / Esc 取消，空 = 不过滤）",
+              shell.doc.layer_input_text.c_str());
+  } else if (shell.doc.layer_input == LayerInput::CompName) {
+    if (shell.doc.layer_input_id != 0) {
+      wsprintfW(buffer, L"重命名图层复合 #%I64u：%s（回车确认 / Esc 取消）",
+                static_cast<unsigned long long>(shell.doc.layer_input_id),
+                shell.doc.layer_input_text.c_str());
+    } else {
+      wsprintfW(buffer, L"新建图层复合：%s（回车捕获当前可见性 + 不透明度 / Esc 取消）",
+                shell.doc.layer_input_text.c_str());
+    }
   } else {
     wsprintfW(buffer, L"图层不透明度：%s%%（回车应用 / Esc 取消，0..100）",
               shell.doc.layer_input_text.c_str());
@@ -2273,6 +3586,52 @@ void panel_begin_rename(ShellState& shell) {
   shell.doc.layer_input = LayerInput::Rename;
   shell.doc.layer_input_id = row->id;
   shell.doc.layer_input_text = widen_utf8(row->name);
+  refresh_layer_input_status(shell);
+}
+
+/*
+ * 智能滤镜改名（F2 / 菜单，P1-2 收尾 ⑩）：预填**自定义名**（空 = 还没命名，
+ * 从空开始敲）。不预填滤镜类型名——否则一次回车就把「Gaussian Blur」存成一条
+ * 同名的自定义名，之后面板再也拿不到类型名的回退口径。
+ */
+void panel_begin_smart_filter_name(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（没有可改名的条目）");
+    return;
+  }
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（没有可改名的条目）");
+    return;
+  }
+  int32_t index = shell.doc.smart_focus;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  shell.doc.smart_focus = index;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, static_cast<size_t>(index), &desc,
+                                 &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  std::wstring current;
+  char buffer[COMP_SMART_FILTER_NAME_MAX_BYTES + 1];
+  size_t required = 0;
+  if (comp_layer_smart_filter_name(shell.doc.document, id, static_cast<size_t>(index), buffer,
+                                   sizeof(buffer), &required) == COMP_OK &&
+      required > 1) {
+    current = widen_utf8(std::string(buffer, required - 1));
+  }
+  shell.doc.layer_input = LayerInput::SmartFilterName;
+  shell.doc.layer_input_id = id;
+  shell.doc.layer_input_slot = static_cast<size_t>(index);
+  shell.doc.layer_input_text = current;
   refresh_layer_input_status(shell);
 }
 
@@ -2297,6 +3656,7 @@ void panel_begin_opacity_set(ShellState& shell) {
 void panel_cancel_layer_input(ShellState& shell) {
   shell.doc.layer_input = LayerInput::None;
   shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_slot = 0;
   shell.doc.layer_input_text.clear();
 }
 
@@ -2313,6 +3673,12 @@ void panel_layer_input_char(ShellState& shell, wchar_t ch) {
     if ((ch < L'0' || ch > L'9') && ch != L'.') return;
     if (ch == L'.' && shell.doc.layer_input_text.find(L'.') != std::wstring::npos) return;
     if (shell.doc.layer_input_text.size() >= 6) return;
+  } else if (shell.doc.layer_input == LayerInput::SmartFilterName) {
+    /* 引擎上限是 256 **字节**（不是码元）：按候选串的真实 UTF-8 长度夹，
+     * ASCII 与 CJK 都不浪费额度，也别让用户敲完一长串才在提交时被拒。 */
+    std::wstring candidate = shell.doc.layer_input_text;
+    candidate.push_back(ch);
+    if (narrow_utf8(candidate).size() > COMP_SMART_FILTER_NAME_MAX_BYTES) return;
   } else if (shell.doc.layer_input_text.size() >= kLayerNameCapacity) {
     return;
   }
@@ -2330,6 +3696,13 @@ void panel_layer_input_backspace(ShellState& shell) {
 /* 提交键入：改名走 comp_layer_set_name（严格 UTF-8），不透明度走批量设置。 */
 void panel_commit_layer_input(ShellState& shell) {
   if (shell.doc.layer_input == LayerInput::None) return;
+  /* 过滤词不属于文档：没有文档也能改（清空过滤后状态栏照常回报行数）。 */
+  if (shell.doc.layer_input == LayerInput::FilterName) {
+    shell.layer_filter_name = shell.doc.layer_input_text;
+    panel_cancel_layer_input(shell);
+    panel_refresh_after_filter(shell);
+    return;
+  }
   if (shell.doc.document == nullptr) {
     panel_cancel_layer_input(shell);
     set_status(shell, L"无文档");
@@ -2338,6 +3711,66 @@ void panel_commit_layer_input(ShellState& shell) {
   const LayerInput mode = shell.doc.layer_input;
   const comp_layer_id id = shell.doc.layer_input_id;
   const std::wstring text = shell.doc.layer_input_text;
+  if (mode == LayerInput::SmartFilterName) {
+    const size_t index = shell.doc.layer_input_slot;
+    const std::string name = narrow_utf8(text);
+    /* 空串 = 清除自定义名（面板回退到类型名），不是错误。字节上限在这里先
+     * 拦一次：引擎也会拒绝，但状态栏能说清是「太长」而不是笼统的失败。 */
+    if (name.size() > COMP_SMART_FILTER_NAME_MAX_BYTES) {
+      set_status(shell, L"智能滤镜名过长（UTF-8 最多 256 字节）");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    if (comp_layer_smart_filter_set_name(shell.doc.document, id, index, name.c_str()) != COMP_OK) {
+      /* 引擎 last_error 已由 set_status 附上（坏编码 / 下标越界 / 层已不是智能对象）。 */
+      set_status(shell, L"重命名智能滤镜失败");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    panel_cancel_layer_input(shell);
+    refresh_layers(shell);
+    wchar_t buffer[192];
+    if (name.empty()) {
+      wsprintfW(buffer, L"第 %d 条智能滤镜已改用类型名", static_cast<int>(index + 1));
+    } else {
+      wsprintfW(buffer, L"已重命名第 %d 条智能滤镜", static_cast<int>(index + 1));
+    }
+    refresh_history_status(shell, buffer);
+    return;
+  }
+  if (mode == LayerInput::CompName) {
+    const std::string name = narrow_utf8(text);
+    if (name.empty()) {
+      /* 无名复合在状态栏与菜单里都没法指认；拒绝并保持输入态。 */
+      set_status(shell, L"图层复合名不能为空");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    wchar_t buffer[192];
+    if (id == 0) {
+      comp_layer_comp_id created = 0;
+      if (comp_layer_comp_capture(shell.doc.document, name.c_str(), &created) != COMP_OK) {
+        /* 引擎 last_error 已由 set_status 附上（空名/坏编码/超长/达到上限）。 */
+        set_status(shell, L"捕获图层复合失败");
+        refresh_layer_input_status(shell);
+        return;
+      }
+      panel_cancel_layer_input(shell);
+      shell.layer_comp_current = created;
+      wsprintfW(buffer, L"已捕获图层复合「%s」", text.c_str());
+      refresh_history_status(shell, buffer);
+      return;
+    }
+    if (comp_layer_comp_rename(shell.doc.document, id, name.c_str()) != COMP_OK) {
+      set_status(shell, L"重命名图层复合失败");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    panel_cancel_layer_input(shell);
+    wsprintfW(buffer, L"已重命名图层复合「%s」", text.c_str());
+    refresh_history_status(shell, buffer);
+    return;
+  }
   if (mode == LayerInput::Rename) {
     const std::string name = narrow_utf8(text);
     if (name.empty()) {
@@ -2454,6 +3887,67 @@ void panel_flatten(ShellState& shell) {
   refresh_layers(shell);
   shell.doc.needs_render = true;
   refresh_history_status(shell, L"已拼合图像");
+}
+
+/*
+ * 合并可见（对齐上游 Merge Visible）：所有「实际参与合成」的图层烘成一个像素层，
+ * 隐藏图层 / 隐藏组原样保留。拒绝原因（可见层剪贴到隐藏基底 / 引擎不认识的
+ * effect）由 set_status 附带的引擎 last_error 如实透出；参与层不足两层时引擎
+ * 返回 changed=0，这里明确提示而不是假装成功。
+ */
+void panel_merge_visible(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  comp_layer_id merged = 0;
+  int32_t changed = 0;
+  if (comp_layer_merge_visible(shell.doc.document, &merged, &changed) != COMP_OK) {
+    set_status(shell, L"合并可见失败（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    set_status(shell, L"合并可见：实际参与合成的图层不足两层（未产生撤销步）");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已合并可见图层");
+}
+
+/*
+ * 反向排列（对齐上游 Arrange > Reverse）：反转同级顺序。选中组时反转组内子层，
+ * 选中普通层时反转它的同级，未选中时反转根级——与上游「Reverse 作用于当前层
+ * 所在层级」一致。少于两个兄弟是空操作，引擎返回 changed=0。
+ */
+void panel_reverse_layers(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  comp_layer_id parent = 0;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id != 0) {
+    int32_t is_group = 0;
+    comp_layer_id group_parent = 0;
+    comp_layer_id clipping = 0;
+    if (comp_layer_get_group_info(shell.doc.document, id, &is_group, &group_parent, &clipping) ==
+        COMP_OK) {
+      parent = is_group != 0 ? id : group_parent;
+    }
+  }
+  int32_t changed = 0;
+  if (comp_layer_reverse(shell.doc.document, parent, &changed) != COMP_OK) {
+    set_status(shell, L"反向排列失败（未改动）");
+    return;
+  }
+  if (changed == 0) {
+    set_status(shell, L"反向排列：同级图层不足两层（未产生撤销步）");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"已反向排列");
 }
 
 /* 名称经 ABI 取自引擎键名表，外壳不复制任何键名。 */

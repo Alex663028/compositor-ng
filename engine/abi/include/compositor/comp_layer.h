@@ -1534,6 +1534,336 @@ COMP_API comp_result comp_layer_set_color_label(comp_document document, comp_lay
 COMP_API comp_result comp_layer_get_color_label(comp_document document, comp_layer_id id,
                                                 uint32_t* out_label);
 
+/* ------------------------------------------- 合并可见 / 反向排列（P1-2 ② 尾部追加） */
+
+/*
+ * 合并可见（对齐 Photoshop 的 Merge Visible；PS 默认 Ctrl+Shift+E，本壳该键已被
+ * 「效果参数」占用，Windows 壳改绑 Ctrl+Alt+E、命令号 1673）：把当前文档里所有
+ * **实际参与合成**的图层（自身可见、且祖先组全部可见）合成一个像素层，落在
+ * 最高的那个参与单元（根级图层或根级组）的槽位；隐藏图层与隐藏组原样保留。
+ *
+ * 语义与边界：
+ *   - 可见组按**整体**烘焙（组内可见子层由合成器处理）；组内的**隐藏**后代
+ *     不参与合并，组消失后被提升到组原来的父级——它们不可见，所以渲染不变；
+ *   - 参与层剪贴到的基底若**不参与**合并（例如可见层剪贴到隐藏层）-> 明确拒绝：
+ *     剪贴因数只看基底像素、不看可见性，剪断剪贴会改变画布；
+ *   - 携带引擎不认识的 effect -> 明确拒绝（烘焙会静默丢弃，与 merge_down 同口径）；
+ *   - 实际贡献像素的图层少于 2 个 -> 空操作：返回 COMP_OK、`*out_changed = 0`，
+ *     不进历史；
+ *   - 一步撤销（加入调用方的显式事务，或自成一个隐式步）。
+ *
+ * `out_layer_id` 可空；非空时写回结果层 id（空操作时写 0）。`out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_merge_visible(comp_document document, comp_layer_id* out_layer_id,
+                                              int32_t* out_changed);
+
+/*
+ * 反向排列（对齐 Photoshop 的 Layer > Arrange > Reverse）：反转 `parent` 下的
+ * **直接**兄弟顺序。`parent == 0` 表示根级；非 0 必须存在且是图层组，否则
+ * COMP_ERR_NOT_FOUND / COMP_ERR_STATE。
+ *
+ * 只重排，不改像素、几何或混合；兄弟少于 2 个时空操作（COMP_OK、
+ * `*out_changed = 0`，不进历史）。一步撤销。`out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_reverse(comp_document document, comp_layer_id parent,
+                                        int32_t* out_changed);
+
+/* ------------------------------------------------- 图层链接（P1-2 ③ 尾部追加） */
+
+/*
+ * 图层链接（对齐 Photoshop 的 Link Layers）：`count` 个图层并成同一个链接组，
+ * 之后任一层的**几何变换**（位移/缩放/旋转，统一走 comp_layer_set_transform）
+ * 会以同样的仿射量作用到同组其它层。
+ *
+ * 语义与边界：
+ *   - `count < 2` / `ids == NULL` / 有重复 id -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 任一层不存在 -> COMP_ERR_NOT_FOUND；
+ *   - 含图层组 -> COMP_ERR_UNSUPPORTED（组的变换是壳层的几何，不做联动）；
+ *   - 已经在同一非空组 -> 空操作（COMP_OK、`*out_changed = 0`，不进历史）；
+ *   - ids 分属不同既有组时**合并**这些组（原组成员一并改投新组，不把旧组拆半）；
+ *     全未链接时分配新组号（现有最大组号 + 1，不复用空洞）；
+ *   - 链接是纯关系元数据：不改像素/几何、不推进修订号、不使合成缓存失效；
+ *   - 一步撤销（加入调用方的显式事务，或自成一个隐式步）。
+ *
+ * `out_group` / `out_changed` 可空；`out_group` 写回组号（>0；空操作时写既有组号）。
+ */
+COMP_API comp_result comp_layer_link(comp_document document, const comp_layer_id* ids,
+                                     size_t count, uint32_t* out_group, int32_t* out_changed);
+
+/*
+ * 解除链接：把 `ids` 中图层的链接组清 0（同组未被列举的层保持原组，PS 同款：
+ * 解除只作用于「被选中的层」）。
+ *
+ * `count == 0` / `ids == NULL` / 重复 id -> COMP_ERR_INVALID_ARGUMENT；任一层
+ * 不存在 -> COMP_ERR_NOT_FOUND；都不在组 -> 空操作（COMP_OK、`*out_changed = 0`）。
+ * 一步撤销；纯元数据，不碰修订号与合成缓存。
+ */
+COMP_API comp_result comp_layer_unlink(comp_document document, const comp_layer_id* ids,
+                                       size_t count, int32_t* out_changed);
+
+/*
+ * 读回链接组号（0 = 未链接）。只读，不开事务。图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_get_link(comp_document document, comp_layer_id id,
+                                         uint32_t* out_group);
+
+/* ------------------------------------- 图层样式拷贝 / 粘贴（P1-2 ④ 尾部追加） */
+
+/*
+ * 图层样式（layer style）在本引擎里就是该层的**效果栈**（comp_effect_kind 0..9，
+ * 见 comp_layer_set_effect）。这里只提供「导出成一段 JSON」与「用一段 JSON 整份
+ * 替换」，剪贴板由**宿主**持有：样式块可以放系统剪贴板，也可以存成预设文件，
+ * Windows 壳与鸿蒙壳因此共享同一份格式与校验。
+ *
+ * 不把剪贴板做进引擎的理由：剪贴板是进程级状态，而引擎可同时被多个文档共享；
+ * 把它挂在某个文档句柄后面，跨文档粘贴就会变成看不见的全局变量。
+ *
+ * 样式块格式与 .comp 的 engineEffects 同形（紧凑 JSON 数组）：
+ *
+ *     [{"effect":2,"settings":"{\"color\":[255,0,0,255]}"}, ...]
+ *
+ * `settings` 保持为**字符串**且不在这里做语义解释：未知键与数字精度原样往返，
+ * 与 .comp 的往返保真口径一致。
+ */
+
+/*
+ * 导出图层样式。`out_size` 必填：写回报文长度（**不含**结尾 NUL，与
+ * comp_layer_effect_at 同口径，宿主按 out_size + 1 分配）。
+ *
+ * 两段式：`style_json_utf8 == NULL` 或 `capacity == 0` 时只回报长度；缓冲不够
+ * -> COMP_ERR_INVALID_ARGUMENT（不静默截断——截断的 JSON 不是 JSON，静默返回
+ * 会让宿主粘进去半份样式）。
+ *
+ *   - 没有样式 -> 导出 "[]"（合法的空栈；粘贴它会清空目标层样式）；
+ *   - 图层组 -> COMP_ERR_UNSUPPORTED：合成时组根本不求值自己的 effects
+ *     （blend_layer_into 对组早退），导出它等于承诺一次永远不会发生的渲染；
+ *   - 带本引擎不求值的 effect kind（例如更高版本 .comp 读进来的）-> 同样
+ *     COMP_ERR_UNSUPPORTED，理由对称：导出了也粘不回来，不制造半程可用的剪贴板。
+ *
+ * 只读，不开事务。图层不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_export_style(comp_document document, comp_layer_id id,
+                                             char* style_json_utf8, size_t capacity,
+                                             size_t* out_size);
+
+/*
+ * 导入（粘贴）图层样式：**整份替换**目标层的效果栈（对齐 Photoshop 的
+ * Paste Layer Style），不做「按 kind 合并」——合并会让连续两次粘贴叠加出用户
+ * 没见过的样式。
+ *
+ * 校验（全部先于任何状态改动，参数闸在事务之前）：
+ *   - 报文必须是数组；每项是对象，带整数 `effect` 与字符串 `settings`，其它键忽略；
+ *   - 同一个 effect kind 出现两次 -> COMP_ERR_INVALID_ARGUMENT（PS 的效果栈每种
+ *     最多一份，重复项无法定义谁覆盖谁）；
+ *   - 越界或本引擎不求值的 kind -> COMP_ERR_UNSUPPORTED；
+ *   - 上面的形状错误 -> COMP_ERR_INVALID_ARGUMENT（报文由本引擎导出，不该走到这里）。
+ * 空数组是合法输入：清空目标层的样式。
+ *
+ * 幂等：结果栈与现状逐项相同（kind 与 settings 字符串都相同）-> COMP_OK 且
+ * `*out_changed = 0`，不落撤销步。否则一步撤销（加入调用方的显式事务，或自成一个
+ * 隐式步），并推进内容修订号（样式参与像素求值）。
+ *
+ * 锁：与 comp_layer_set_effect 同口径——锁定全部 -> COMP_ERR_STATE；锁定图像像素
+ * 不拦（改样式不改像素）。目标层不存在 -> COMP_ERR_NOT_FOUND；组 -> COMP_ERR_UNSUPPORTED。
+ *
+ * `out_changed` 可空。
+ */
+COMP_API comp_result comp_layer_import_style(comp_document document, comp_layer_id id,
+                                             const char* style_json_utf8,
+                                             int32_t* out_changed);
+
+/* -------------------------------------- 图层复合（P1-2 收尾 ⑤ 尾部追加） */
+
+/*
+ * 图层复合 = 「某一刻全部图层的可见性与不透明度」的快照（对齐 Photoshop 的
+ * Layer Comp；只做 Visibility + Appearance，不做 Position，理由见
+ * domain/domain_state.h 的 LayerComp）。
+ *
+ * 生命周期：capture 建新、apply 套用、update 用当前状态覆盖、rename / delete
+ * 改名字与删除。全部**一步撤销**（加入调用方的显式事务，或自成一个隐式步），
+ * 复合表因此随撤销快照一起进退——「建了复合又撤销」不会留下孤儿。
+ *
+ * 复合 id 单调递增、删除后不复用；索引型入口（_id_at / _entry）只接受
+ * [0, count) 内的下标，越界 -> COMP_ERR_INVALID_ARGUMENT。
+ */
+typedef uint64_t comp_layer_comp_id;
+
+/* 复合名的字节上界（含于 ABI 契约：超长 -> INVALID_ARGUMENT，不截断）。 */
+#define COMP_LAYER_COMP_NAME_MAX_BYTES 1024
+
+/* 复合数量。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_count(comp_document document, size_t* out_count);
+
+/* 按存储序（= 创建序）取第 index 个复合的 id。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_id_at(comp_document document, size_t index,
+                                           comp_layer_comp_id* out_id);
+
+/*
+ * 读复合名（UTF-8，含结尾 NUL），两段式：`buffer == NULL` 或 `capacity == 0`
+ * 只回所需字节数（含 NUL）；缓冲不够 -> COMP_ERR_INVALID_ARGUMENT，不截断。
+ * 只读，不开事务。复合不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_comp_name(comp_document document, comp_layer_comp_id comp,
+                                          char* buffer, size_t capacity, size_t* out_required);
+
+/*
+ * 捕获当前状态为新复合：记录**每个现存图层**的 visible 与 opacity（顺序为
+ * 文档堆叠序）。`name_utf8` 必须非空、严格合法 UTF-8、单行、≤ 1024 字节，否则
+ * COMP_ERR_INVALID_ARGUMENT 且不建复合；重名允许（与上游一致）。
+ * 复合数达到上限 -> COMP_ERR_STATE。
+ *
+ * 文档没有任何图层时仍可捕获（空 entries 的复合是合法的，应用它不做任何事）。
+ * `out_id` 可空；非空时写新复合 id。一步撤销。
+ */
+COMP_API comp_result comp_layer_comp_capture(comp_document document, const char* name_utf8,
+                                             comp_layer_comp_id* out_id);
+
+/*
+ * 应用复合：对表中每个**仍存在**的图层写回 visible 与 opacity；表里没有的图层
+ * （捕获之后才建的）保持原样，已被删除的条目跳过。
+ *
+ * 幂等：所有目标层当前值都与快照相同 -> COMP_OK、`*out_changed = 0`，不落撤销步；
+ * 否则一步撤销，改动过的层推进内容修订号（可见性/不透明度参与合成求值）。
+ * `out_changed` 可空。复合不存在 -> COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_layer_comp_apply(comp_document document, comp_layer_comp_id comp,
+                                           int32_t* out_changed);
+
+/*
+ * 用当前状态覆盖复合的 entries（id 与名字不变）。内容未变 -> 不落撤销步。
+ * 复合不存在 -> COMP_ERR_NOT_FOUND。一步撤销。
+ */
+COMP_API comp_result comp_layer_comp_update(comp_document document, comp_layer_comp_id comp);
+
+/* 改名；校验口径与 capture 相同，同名 -> 空操作（不落撤销步）。一步撤销。 */
+COMP_API comp_result comp_layer_comp_rename(comp_document document, comp_layer_comp_id comp,
+                                            const char* name_utf8);
+
+/* 删除复合；不存在的 id -> COMP_ERR_NOT_FOUND（删除不幂等，便于宿主发现 stale id）。 */
+COMP_API comp_result comp_layer_comp_delete(comp_document document, comp_layer_comp_id comp);
+
+/* 复合表的条目数（捕获时的图层数，之后删层不缩减）。只读，不开事务。 */
+COMP_API comp_result comp_layer_comp_entry_count(comp_document document,
+                                                 comp_layer_comp_id comp, size_t* out_count);
+
+/*
+ * 取第 index 条快照：图层 id、可见性（0/1）与不透明度（0..1）。三个出参可空，
+ * 便于宿主只取需要的那一项。只读，不开事务。
+ * 复合不存在 -> NOT_FOUND；index 越界 -> INVALID_ARGUMENT。
+ */
+COMP_API comp_result comp_layer_comp_entry(comp_document document, comp_layer_comp_id comp,
+                                           size_t index, comp_layer_id* out_layer,
+                                           uint8_t* out_visible, float* out_opacity);
+
+/* ------------------------------------------- 填充图层（P1-2 收尾 ⑧，尾部追加） */
+
+/*
+ * 填充图层与文字图层、智能对象同族：**参数是真源，图层像素是渲染缓存**
+ * （见 domain/fill_layer.h）。
+ *
+ *   - 有 `comp_layer_is_fill` 为真的图层，其像素由 `kind + settings` 唯一决定；
+ *   - 改参数 = 整幅重渲这一层的像素缓存，其它图层逐字节不动；
+ *   - 直接写像素（comp_layer_set_pixels / 工具算子 / comp_filter_apply）遇到
+ *     填充图层一律 COMP_ERR_STATE，要求宿主先 rasterize——否则「改一次渐变
+ *     颜色」会把手绘像素整份抹掉；
+ *   - 与文字图层、智能对象、图层组三者互斥（同一层只能有一个真源）。
+ *
+ * 本轮追加只增函数与枚举，不改前序结构体布局（冻结面不变）。
+ */
+typedef enum comp_fill_kind {
+  COMP_FILL_NONE = 0,     /* 不是填充层（JSON 内同样表示「缺键」） */
+  COMP_FILL_SOLID = 1,    /* 纯色 */
+  COMP_FILL_GRADIENT = 2, /* 两色标线性渐变 */
+  COMP_FILL_PATTERN = 3,  /* 内置图案平铺 */
+} comp_fill_kind;
+
+#define COMP_FILL_KIND_COUNT 4
+
+/* 单个填充参数的元数据（布局与 comp_adjustment_param 同口径）。 */
+typedef struct comp_fill_param {
+  const char* json_path; /* 相对 settings 的点分键路径 */
+  const char* label;     /* 面板显示名（ASCII） */
+  comp_param_type type;  /* COMP_PARAM_NUMBER / COMP_PARAM_BOOL */
+  double min_value;
+  double max_value;
+  double default_value;
+  uint32_t flags; /* 保留，恒为 0 */
+} comp_fill_param;
+
+/* kind 的显示名（COMP_FILL_NONE 返回 "None"）；kind 越界 -> COMP_ERR_INVALID_ARGUMENT。 */
+COMP_API comp_result comp_fill_kind_name(uint32_t kind, const char** out_name);
+
+/* 该 kind 的参数数量（0 表示无逐参数面板，如 COMP_FILL_NONE）。 */
+COMP_API comp_result comp_fill_kind_param_count(uint32_t kind, size_t* out_count);
+
+/* 取第 index 个参数的元数据（index 越界 -> COMP_ERR_INVALID_ARGUMENT）。 */
+COMP_API comp_result comp_fill_kind_param_at(uint32_t kind, size_t index,
+                                             comp_fill_param* out_param);
+
+/*
+ * 只校验不写入：kind 合法且 settings 通过顶层键白名单与取值范围校验时返回 COMP_OK。
+ * 缺键合法（= 用缺省值）；未知键 -> INVALID_ARGUMENT（每 kind 的参数表封闭）。
+ */
+COMP_API comp_result comp_fill_validate(uint32_t kind, const char* settings_json_utf8);
+
+/* 该 kind 的缺省 settings JSON（两段式：capacity 为 0 时只回报长度）。 */
+COMP_API comp_result comp_fill_default_settings(uint32_t kind, char* settings_json_utf8,
+                                                size_t capacity, size_t* out_size);
+
+/*
+ * 从 settings JSON 按 json_path 读标量叶子（面板回填用）：命中数值写 out_number、
+ * 命中布尔写 out_boolean（0/1）；路径缺失或非标量返回 COMP_ERR_NOT_FOUND。
+ */
+COMP_API comp_result comp_fill_read_value(const char* settings_json_utf8, const char* json_path,
+                                          double* out_number, int32_t* out_boolean);
+
+/*
+ * 由面板扁平值构造 settings JSON（引擎侧组装，外壳不写 JSON）：
+ * values[i] 对应 kind_param_at(kind, i)，ASCII 文本（布尔 "0"/"1"），空串 = 沿用缺省。
+ * values 可少于 param_count（缺的按空串处理）。两段式：capacity 为 0 时只回报长度。
+ * 构造结果再过一次 comp_fill_validate 才回报 COMP_OK。
+ */
+COMP_API comp_result comp_fill_build_settings(uint32_t kind, const char* const* values,
+                                              size_t value_count, char* settings_json_utf8,
+                                              size_t capacity, size_t* out_size);
+
+/*
+ * 新建填充图层：kind 必须 1..3，settings 先校验再渲染（渲染在事务之前，失败则
+ * 不建层、不消耗图层 id、不进撤销栈）。图层尺寸 = 当前画布尺寸、原点 (0,0)、
+ * 混合 Normal、不透明度 1；缺省名由 kind 决定（"Color Fill" / "Gradient Fill" /
+ * "Pattern Fill"）。`out_id` 可空。一步撤销。
+ */
+COMP_API comp_result comp_layer_add_fill(comp_document document, uint32_t kind,
+                                         const char* settings_json_utf8, comp_layer_id* out_id);
+
+/*
+ * 改既有填充图层的参数（kind 与 settings 一并替换，校验/渲染同 add）。
+ * 目标必须是填充图层，否则 COMP_ERR_STATE（不把普通图层悄悄变成填充层）。
+ * 参数与当前相同 -> `*out_changed = 0`、不落撤销步；否则一步撤销。
+ * `out_changed` 可空。锁定全部拦（改参数 = 重写整层像素缓存）。
+ */
+COMP_API comp_result comp_layer_set_fill(comp_document document, comp_layer_id id, uint32_t kind,
+                                         const char* settings_json_utf8, int32_t* out_changed);
+
+/*
+ * 读填充图层的 kind 与 settings JSON（两段式：capacity 为 0 时只回报长度）。
+ * 非填充图层 -> COMP_ERR_STATE。
+ */
+COMP_API comp_result comp_layer_get_fill(comp_document document, comp_layer_id id,
+                                         uint32_t* out_kind, char* settings_json_utf8,
+                                         size_t capacity, size_t* out_size);
+
+/* 是否填充图层（1/0）。只读，不开事务。 */
+COMP_API comp_result comp_layer_is_fill(comp_document document, comp_layer_id id,
+                                        int32_t* out_is_fill);
+
+/*
+ * 栅格化：丢掉填充参数，图层变成普通像素图层（像素缓存原样保留）。
+ * 非填充图层 -> 幂等返回 COMP_OK（与 comp_layer_rasterize_text 同口径）；
+ * 锁定全部拦。一步撤销（本来就非填充层时不落步）。
+ */
+COMP_API comp_result comp_layer_rasterize_fill(comp_document document, comp_layer_id id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

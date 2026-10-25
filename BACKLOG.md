@@ -3,9 +3,10 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **167**）；回归 6/6、壳自检 263 项 SHA、视觉探针不得因新增功能而破（当前 **205 条 / 34 场景**；落地规则见 §6）。
-> 自检基线：**263 项 / SHA256 `2f3b81c4fc599cb7…`**（原 257 项 / `377de660d48ac933…`；2026-10-23 一次**显式审批**的
-> 附录式变更：`[summary]` 前插入 1 空行 + 6 项 PSD 分层入口断言，其余逐字节未动，见 README §6.88）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **208**）；回归 6/6、壳自检 267 项 SHA、视觉探针不得因新增功能而破（当前 **233 条 / 38 场景**；落地规则见 §6）。
+> 自检基线：**267 项 / SHA256 `cae180809eed3ba4…`**（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
+> 在末尾追加 4 项断言——面板过滤、图层复合、智能对象、填充层，其余逐字节未动；263 项那次是 2026-10-23 一次**显式审批**的
+> 附录式变更，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
 > P0-3 另存为 + 标题脏标记、P1-8 历史容量入口。四项**全部零 ABI 新增**（仍 145），
 > 视觉探针 80 → **86 条**（只追加 `doc_dialog` 场景，既有阈值未动），其余断言见 §2 各条。
@@ -138,13 +139,17 @@
 **像素保真度接近满配，缺的是把能力做成用户路径**。
 
 **对标 Photoshop 的计分见 [`docs/ps-parity.md`](docs/ps-parity.md)（2026-10-24）**：
-日常使用路径 **≈78%**，全功能面 **≈57%**（190 条 PS 核心条目加权，原始命中 104 条）；
+日常使用路径 **≈78%**，全功能面 **≈59%**（190 条 PS 核心条目加权，原始命中 106 条）；
 与口径 A/B 的差异原因在该文件 §3 说明。ROI **前 8 项**（字体选择、PSD 分层导出、
 锐化/降噪入口、标尺/参考线/网格/对齐、存储/载入选区通道、组混合模式、HiDPI、
 破坏性 `图像 > 调整`）已全部落地，日常路径 70% → 78%；其后的 P1-6 调整族、
 P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段落框/对齐也已落地
 （§6.95～§6.99）；P0-5 变换选区（§6.102）与 P1-3 数值变换/再次变换（§6.103）
-把选区与变换两个维度的条目继续补齐（全功能面 51% → 57%）。
+把选区与变换两个维度的条目继续补齐（全功能面 51% → 59%；P1-2 八批
+（锁/标签、合并可见/反向排列、图层链接、样式拷贝/粘贴、面板过滤、图层复合、
+智能对象/智能滤镜、填充图层）把图层管理收齐，§6.106～§6.113，ABI 167 → 208；
+其后第九批补上智能滤镜栈面板 §6.114，纯壳层、零 ABI；
+第十批补上滤镜栈调序与改名 §6.115，ABI 208 → 211）。
 
 ---
 
@@ -431,10 +436,80 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
     `comp_layer_set_lock` / `get_lock` / `set_color_label` / `get_color_label`
     （167 → 171），`.comp` 新键 `engineLock` / `engineColorLabel`，壳层命令号
     1660..1672。详见 README §6.106。
-  - 剩余：图层链接、按类型/名称/颜色过滤、图层复合、智能对象/智能滤镜、
-    合并可见、反向排列、样式拷贝粘贴、填充层。其中「按颜色过滤」与「图层复合」
-    是壳层/文档状态的活，`merge visible` 与 `reverse` 只是域层小接口。
-- 性质：【引擎】M–L；锁定与标签已做完（【ABI 追加】+【壳层】，见上）。
+  - **已落地（第二批，2026-10-24）**：**合并可见**与**反向排列**——ABI 尾部追加
+    `comp_layer_merge_visible` / `comp_layer_reverse`（171 → 173），壳层命令号
+    1673 / 1674（Ctrl+Alt+E / 菜单）。合并可见沿用渲染不变契约：隐藏层原样保留、
+    可见组整体烘焙、可见层剪贴到隐藏基底时明确拒绝。详见 README §6.107。
+  - **已落地（第三批，2026-10-24）**：**图层链接**——ABI 尾部追加
+    `comp_layer_link` / `unlink` / `get_link`（173 → 176），`.comp` 新键
+    `engineLink`，壳层命令号 1675（菜单「链接图层」，全同组再点即解除）。
+    链接是关系元数据（不碰像素）但一步撤销；联动在 `comp_layer_set_transform`
+    单点展开为整组相似变换（位移 / 旋转含公转 / 等比缩放），剪切场景明确拒绝；
+    同组多选移动在壳层按组去重，避免位移翻倍。详见 README §6.108。
+  - **已落地（第四批，2026-10-24）**：**图层样式拷贝/粘贴**——ABI 尾部追加
+    `comp_layer_export_style` / `comp_layer_import_style`（176 → 178）。这里
+    「样式」= 层的效果栈，报文与 `.comp` 的 `engineEffects` 同形（`settings`
+    保持字符串，逐字往返）；导入是整份替换而非合并，`[]` 即清空，同样式粘回
+    no-op 不进历史。壳层命令号 1676 / 1677（图层 > 图层样式），剪贴板存在
+    `ShellState`（会话级，可跨文档粘贴），多选粘贴包一个事务 = 一步撤销。
+    组图层两侧都拒绝（组的样式不参与求值）。详见 README §6.109。
+  - **已落地（第五批，2026-10-25）**：**按类型/名称/颜色过滤图层面板**——零 ABI，
+    纯视图态（`layer_filter_kind` / `layer_filter_color` / `layer_filter_name`
+    存在 `ShellState` 里）。七种类型（像素/文字/组/调整/填充/智能对象/全部）+
+    8 个颜色标签 + 名称子串，**AND** 语义；命中的祖先组仍然保留（否则子层会
+    失去缩进上下文）；一趟遍历同时算「命中」与「保留祖先」并带环保护。
+    ASCII 大小写折叠，不碰文档、不进历史。命令号 1680..1700。详见 README §6.110。
+  - **已落地（第六批，2026-10-25）**：**图层复合（Layer Comps）**——ABI 尾部追加
+    10 个导出（178 → 188）：`comp_layer_comp_count/id_at/name/capture/apply/update/
+    rename/delete/entry_count/entry`。一份复合 = 每个现存层的 `{layer, visible,
+    opacity}` 快照；`apply` 跳过已被删除的条目（复合比图层活得久），id 单调递增
+    且**永不复用**；上限 128 份 / 名字 1024 字节；持久化在清单级 `engineLayerComps`
+    （空表不写键）。壳层命令号 1701..1708。详见 README §6.111。
+  - **已落地（第七批，2026-10-25）**：**智能对象 / 智能滤镜**——ABI 尾部追加 8 个
+    导出（188 → 196）：`comp_layer_smart_object_create` / `_is_smart` / `_rasterize` +
+    `comp_layer_smart_filter_count/_at/_add/_set/_remove`。核心语义是**滤镜在
+    对象空间求值**：智能滤镜存的是参数（`{kind, enabled, settings}`），不是烘过的
+    像素，所以反复改参数不会累积插值误差；`enabled=0` 保留参数、只跳过求值。
+    文字/组/HDR 拒绝转换，16 位降为 RGBA8；直写像素返回 `COMP_ERR_STATE`；
+    栅格化保留当前渲染并转成普通像素层。持久化：原始像素先写到层块的
+    `sourceFile`，再写 `engineSmart`。壳层命令号 1710..1713。详见 README §6.112。
+  - **已落地（第八批 = 收尾，2026-10-25）**：**填充图层（纯色/渐变/图案）**——
+    ABI 尾部追加 12 个导出（196 → 208）：三种 kind 的名称/参数表（
+    `_kind_name/_kind_param_count/_kind_param_at`）、`_validate` /
+    `_default_settings` / `_read_value` / `_build_settings`（面板两段式取值→构造
+    settings）、`comp_layer_add_fill` / `_set_fill` / `_get_fill` / `_is_fill` /
+    `_rasterize_fill`。第四次贯彻「**参数是真源，像素是缓存**」：`Layer::fill`
+    是 `std::optional<FillLayer>`，与 `text` / `smart` / 组互斥；直接写像素返回
+    `COMP_ERR_STATE`；`set_fill` 同值即 no-op（不渲染、不进历史）；栅格化后像素
+    逐字节不变。持久化：每层 `engineFill`（settings 存字符串），非法块在载入
+    时整块丢弃。壳层命令号 1714..1719，面板跟随选中层（选中非填充层即「新建」
+    模式），拖拽滑杆包一个显式事务 = 一步撤销，空拖拽 `abort` 不留步骤。
+    详见 README §6.113。
+  - **已落地（第九批，2026-10-25，纯壳层）**：**智能滤镜栈面板**——第七批把引擎的
+    逐条 `_at` / `_set` / `_remove` 做出来但没接 UI，用户只能整栈清除后重加。本批
+    加右栏列表：一行一条（`[关]` 标已关闭），`↑↓` 选、`空格` 开关、`回车`/双击改
+    参数、`Del` 删除、滚轮翻列表；面板每帧现问引擎、不缓存栈，所以撤销/重做后
+    自动同步。开关 = `_at` + 翻转 enabled 的 `_set`（恰好一步撤销）；改参数复用既有
+    滤镜面板（编辑态，预览走事务 + abort，回车写回同一条，参数没变不落撤销步，
+    Esc 丢弃）；`vignette.color` / `progressive_blur` 显式轴等面板行表达不了的字段
+    按原 desc 带回，不被清零。命令号 1720..1723，ABI 仍是 208（本批无新增导出）。
+    详见 README §6.114。
+  - **已落地（收尾第十批，2026-10-25）**：**智能滤镜调序与改名**——第九批留的两条
+    边界都是引擎能力边界，本批尾部追加 3 个导出（208 → 211）：`_move` 是「取出再
+    插入」（`to` = 移动后的最终下标），顺序会改画面所以整栈在事务外先重求值、成功
+    才落**一步撤销**，锁像素的层拒绝；`_set_name` / `_name` 是纯元数据（不重求值、
+    不过像素锁闸、同值不落步、空名回退类型名，≤256 字节 UTF-8 单行），随
+    `engineSmart` 持久化、坏字段整块当没写。壳层命令号 1724..1726：F2 / 菜单改名
+    （复用状态栏键入态，预填只给自定义名）、Alt+↑/↓ 与拖动行调序（4 px 阈值、落点
+    暖绿底、松手才写）、行内显示自定义名（截 16 字符＋省略号）。详见 README §6.115。
+  - **剩余：无。P1-2 全部条目已落地**（八批 + 第九批壳层补全 + 第十批调序/改名收尾，
+    2026-10-25 收尾；ABI 167 → 211，其中锁定/标签/合并可见/反向排列/图层链接/样式
+    拷贝粘贴/图层复合/智能对象/填充层/滤镜栈调序与命名各占尾部一段，面板过滤零 ABI）。
+- 性质：【引擎】M–L；**本条已全部关闭**（【ABI 追加】+【壳层】，见上）。
+  已知边界（留作后续可选项，不属于本条）：面板过滤不含模糊匹配；图层复合
+  不记录混合模式与效果；智能滤镜栈的拖动不自动滚动、无多选批量调序，
+  开关关闭的条目可改参数但写回后仍保持关闭（PS 语义）；
+  填充图的渐变只有两站线性、图案只有四种内置程序化图案。
 
 ### P1-3 变换
 自由变换全套：斜切/扭曲/透视/变形（Warp 网格）、数值变换、再次变换（Ctrl+Shift+T）、变换选区、内容识别缩放。
@@ -613,7 +688,7 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   5 个 `comp_selection_channel_*` 选区通道导出、`comp_layer_apply_adjustment` 破坏性调整导出
   与 `comp_selection_grow` / `comp_selection_similar` / `comp_selection_transform`；
   滤镜 / 调整 / 效果枚举另追加 2 / 13 / 3 个 kind，不增导出）。
-- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **263 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言）、视觉探针 **171 条 / 30 场景**（2026-10-22/23 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options` 后；原 80 条含 IME 6/6）。
+- README §6.4 ④ 写"Windows 壳 **164 项** `--selftest` 基线"、"`visual_check.py`（11 场景 / 45 断言）"；当前基线为 **267 项**（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，2026-10-25 §6.110～§6.113 再追加 4 项）、视觉探针 **233 条 / 38 场景**（2026-10-22/23/24/25 依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste` 后；§6.110～§6.113 未加场景；原 80 条含 IME 6/6）。
 - README §6.3 的 `guides` 原本易被读成"画布参考线已有"；其实那指 Camera Raw 几何校准参数。
   2026-10-23 起画布参考线**真的有了**，但存在本引擎自己的 `engineGuides` 键里（P0-8），
   与上游/相机参数同名不同物——两种 `guides` 仍然互不读取。
@@ -645,4 +720,4 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **263 项** failures=0、SHA256 `2f3b81c4…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言，附录式、已审批）；视觉探针 **162/162 / 29 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`） |
+| 壳自检/视觉探针基线 | 壳自检 **267 项** failures=0、SHA256 `cae18080…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **233/233 / 38 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`） |

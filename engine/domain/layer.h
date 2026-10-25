@@ -19,6 +19,7 @@
 #include "compositor/comp_core.h"
 #include "compositor/comp_layer.h"
 #include "core/comp_geometry.h"
+#include "domain/filters.h"
 #include "domain/text_object.h"
 
 namespace compositor {
@@ -225,6 +226,71 @@ struct Effect {
   std::string settings_json = "{}";
 };
 
+/* 智能滤镜自定义名上限（字节，UTF-8，不含 NUL）。与图层名同量级：名字只进
+ * 面板与 `.comp`，不参与像素求值。 */
+constexpr size_t kMaxSmartFilterNameBytes = 256;
+
+/*
+ * 智能滤镜（P1-2 收尾 ⑦）：一条滤镜参数 + 是否启用 + 可选自定义名。
+ *
+ * `settings` 复用 domain/filters.h 的整份设置（与 Filter 菜单同一套量程闸）；
+ * `enabled = false` 的条目**保留在栈里但不参与求值**（Photoshop 的「停用智能
+ * 滤镜」口径），因此停用/启用不丢参数、也不需要宿主自己缓存一份副本。
+ *
+ * `name`（P1-2 收尾 ⑩）是**展示名**，UTF-8、单行、≤ kMaxSmartFilterNameBytes；
+ * 空串 = 用滤镜类型的名字（宿主自行回退，引擎不求值它）。它不参与像素求值，
+ * 也不影响栈序，所以改名不进求值路径、不 invalidate 合成；但仍随文档快照进
+ * 撤销栈与 `.comp`（`engineSmart.filters[].name`，缺键 = 空）。
+ */
+struct SmartFilter {
+  FilterSettings settings;
+  bool enabled = true;
+  std::string name;
+};
+
+/*
+ * 智能对象（P1-2 收尾 ⑦，语义与 text 同款：对象是真源，像素是缓存）。
+ *
+ *   - `source` 是**不可变**的原始像素：创建那一刻图层像素的整份拷贝（共享
+ *     shared_ptr + COW，拷贝图层/历史快照不会复制这份缓冲）。之后任何滤镜都
+ *     只读它，绝不原地改；
+ *   - `filters` 是有序滤镜栈：求值 = source 逐条跑一遍（见
+ *     `filter_render_stack`），栈的顺序就是画面的顺序；
+ *   - 图层 `pixels` 是「source + filters」的**渲染缓存**：合成/缩略图/合并/GPU
+ *     纹理仍走既有像素路径，合成内核不感知智能对象；
+ *   - `source_name` 只用于面板回显与 `.comp` 可读性，不参与求值（可空）。
+ *
+ * 不变量（与文字图层逐条对齐）：
+ *   - 像素写入**只能**经智能滤镜入口（comp_layer_smart_filter_*）；工具算子、
+ *     comp_layer_set_pixels、comp_filter_apply 遇到智能图层一律 COMP_ERR_STATE，
+ *     要求宿主先栅格化——否则「删掉一条滤镜重新求值」会把手绘像素整份抹掉；
+ *   - 求值在**对象像素空间**做（原点 0,0、不读选区）：图层移动/缩放到哪里，
+ *     同一条滤镜都渲出同样的结果，不随文档几何漂移；
+ *   - 随 DocumentState 快照一起进事务/历史，撤销天然一致；
+ *   - 进 `.comp` 的 `engineSmart` 键（可选键，缺键 = 普通图层）：原始像素写到
+ *     `images/<uuid>.smart.png`，渲染结果仍走该层自己的 imageFile。
+ */
+struct SmartObject {
+  ImageBuffer source;
+  std::vector<SmartFilter> filters;
+  std::string source_name;
+};
+
+/*
+ * 填充层参数（P1-2 收尾 ⑧）：kind（1 纯色 / 2 渐变 / 3 图案）+ settings JSON。
+ *
+ * 与智能对象同一条语义：参数是唯一真源，图层 `pixels` 是由它渲出的缓存
+ * （见 domain/fill_layer.h 的 `fill_render`）。改参数 = 重渲这一层的像素；
+ * 直接写像素会让参数与画面分叉，所以 ABI 一律 COMP_ERR_STATE 要求先栅格化。
+ *
+ * `kind` 的取值与 ABI `comp_fill_kind` 一致；`settings_json` 的键名/量程由
+ * fill_layer.h 的参数表校验。进 `.comp` 的 `engineFill` 键（可选键，缺键 = 普通图层）。
+ */
+struct FillLayer {
+  uint32_t kind = 0;
+  std::string settings_json = "{}";
+};
+
 struct Layer {
   comp_layer_id id = 0;
   std::string name;
@@ -261,6 +327,20 @@ struct Layer {
    * （缺键 = 无），撤销/重做随快照回退。
    */
   uint32_t color_label = 0;
+  /*
+   * 图层链接（P1-2 第三批）：0 = 未链接，>0 = 链接组编号（同组一起变换）。
+   * 纯关系元数据：不进合成、不改像素、不改内容修订号（同锁/色标）；
+   * 进 `.comp` 的 `engineLink`（缺键 = 0），撤销/重做随快照回退。
+   *
+   * 语义口径：
+   *   - 链接只对「几何变换」生效（位移/缩放/旋转一起走），可见性、混合、
+   *     不透明度和翻转仍按各自图层走；
+   *   - 联动由引擎在 comp_layer_set_transform 内统一展开，宿主只需写
+   *     「被拖动的那一层」，否则同组多层被选中时会重复叠加位移；
+   *   - 跨父级允许（PS 同样允许链到组外），组图层本身不可链接；
+   *   - 链接组编号由引擎分配（现有最大值 +1），宿主不得自造。
+   */
+  uint32_t link_group = 0;
   comp_layer_id parent = 0;
   comp_layer_id clipping_source = 0;
   /* .comp 互通：上游 live-mask 的来源图层 UUID（manifest 键 maskSourceID）。
@@ -289,6 +369,25 @@ struct Layer {
    *   - 进 `.comp` 的 `engineText` 键（可选键，缺键 = 普通图层）。
    */
   std::optional<TextObject> text;
+
+  /*
+   * 智能对象（P1-2 收尾 ⑦，语义见上面的 `SmartObject`）。
+   *
+   * 有值时这一层是**智能对象图层**：`smart->source` + `smart->filters` 是唯一
+   * 真源，`pixels` 是它当前求值结果的缓存。与 `text` 互斥：文字图层不能再
+   * 转成智能对象（文字对象本身已经是可编辑真源，两层真源会让「改字号」和
+   * 「删滤镜」互相抹对方的结果）；先栅格化文字再转换。
+   */
+  std::optional<SmartObject> smart;
+
+  /*
+   * 填充层（P1-2 收尾 ⑧，语义见上面的 `FillLayer`）。
+   *
+   * 有值时这一层是**填充图层**：`fill->kind` + `fill->settings_json` 是真源，
+   * `pixels` 是 `fill_render` 渲出的缓存。与文字图层、智能对象两者互斥
+   * （同一层只能有一个真源，否则两条写路径会互相抹掉对方的结果）。
+   */
+  std::optional<FillLayer> fill;
 
   /*
    * 内容修订号（S18 / R1，设计见 docs/gpu-layer-revision.md §3）。
@@ -349,6 +448,10 @@ struct Layer {
   bool has_pixels() const { return !pixels.empty(); }
   /* 是否为可编辑文字图层（pixels 只是 text 的渲染缓存）。 */
   bool has_text() const { return text.has_value(); }
+  /* 是否为智能对象图层（pixels 只是 source + 滤镜栈的渲染缓存）。 */
+  bool has_smart_object() const { return smart.has_value(); }
+  /* 是否为填充图层（pixels 只是 fill 参数的渲染缓存）。 */
+  bool has_fill() const { return fill.has_value(); }
 };
 
 }  // namespace compositor

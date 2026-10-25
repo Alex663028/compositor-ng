@@ -592,6 +592,22 @@ bool build_psd_document(const compositor::Document& doc, compositor::PsdDocument
       if (error != nullptr) *error = "PSD: 文字图层 '" + layer.name + "' 无法写成 PSD（PSD 子集不含文字图层）";
       return false;
     }
+    /* 智能对象在 PSD 里是 Placed Layer：本子集只写像素层，写成一个普通像素层
+     * 就等于静默丢掉「原始像素 + 滤镜栈」这份可编辑性。宁可失败。 */
+    if (layer.has_smart_object()) {
+      if (error != nullptr) {
+        *error = "PSD: 智能对象图层 '" + layer.name + "' 无法写成 PSD（PSD 子集不含智能对象）";
+      }
+      return false;
+    }
+    /* 填充层在 PSD 里是 Solid Color / Gradient / Pattern Fill 调整层：本子集只写
+     * 像素层，写成普通像素层就等于静默丢掉「参数是真源」这份可编辑性。 */
+    if (layer.has_fill()) {
+      if (error != nullptr) {
+        *error = "PSD: 填充图层 '" + layer.name + "' 无法写成 PSD（PSD 子集不含填充图层）";
+      }
+      return false;
+    }
     if (!layer.adjustments.empty()) {
       if (error != nullptr) *error = "PSD: 图层 '" + layer.name + "' 带调整图层参数，无法写成 PSD";
       return false;

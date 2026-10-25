@@ -241,6 +241,126 @@ COMP_API comp_result comp_filter_apply(comp_document document, comp_layer_id tar
                                        int32_t* out_changed, char* note, size_t note_capacity,
                                        size_t* out_note_size);
 
+/* ========================================= 智能对象 / 智能滤镜（P1-2 收尾 ⑦）
+ *
+ * 语义见 domain/layer.h 的 `SmartObject`：`source`（原始像素，不可变）+ `filters`
+ * （有序滤镜栈）是真源，图层像素是它俩的**求值缓存**。
+ *
+ * 通用口径：
+ *   - 每一步写操作一步撤销（加入调用方已开的事务，或自成一个隐式步）；
+ *   - 参数闸 / 求值失败都在开事务之前：失败不留撤销步、不动像素；
+ *   - 求值在**对象像素空间**做（原点 0,0、不读选区）：图层移动/缩放/旋转到哪，
+ *     同一条滤镜都渲出逐字节相同的结果；
+ *   - 智能图层的像素写入走本组入口；comp_layer_set_pixels、工具算子与
+ *     comp_filter_apply 一律 COMP_ERR_STATE（要求先栅格化）。
+ */
+
+/*
+ * 把当前像素层转换为智能对象：此刻的像素成为不可变的 source，滤镜栈为空
+ * （画面逐字节不变）。已经是智能对象 -> COMP_OK、*out_changed = 0（幂等，
+ * 不落撤销步）。文字图层 -> COMP_ERR_STATE（先 rasterize 文字）。
+ * 组图层 / 无像素 -> COMP_ERR_STATE。16 位图层先落 8 位工作副本（与滤镜
+ * 同一约定，之后该层就是 RGBA8）；HDR 图层 -> COMP_ERR_STATE。
+ * `out_changed` 可为 NULL。一步撤销。
+ */
+COMP_API comp_result comp_layer_smart_object_create(comp_document document, comp_layer_id id,
+                                                    int32_t* out_changed);
+
+/* 1 = 该层是智能对象（像素是求值缓存），0 = 普通图层。只读，不开事务。 */
+COMP_API comp_result comp_layer_smart_object_is_smart(comp_document document, comp_layer_id id,
+                                                      int32_t* out_is_smart);
+
+/*
+ * 栅格化：丢掉 source 与整条滤镜栈，**保留当前渲染出的像素**（不可逆的可编辑性
+ * 损失）。普通图层 -> COMP_OK（幂等，不落撤销步）。一步撤销。
+ */
+COMP_API comp_result comp_layer_smart_object_rasterize(comp_document document, comp_layer_id id);
+
+/* 滤镜栈条数（含被停用的）。只读。图层不是智能对象 -> COMP_ERR_STATE。 */
+COMP_API comp_result comp_layer_smart_filter_count(comp_document document, comp_layer_id id,
+                                                   size_t* out_count);
+
+/*
+ * 取第 index 条：整份设置写回 `out_desc`（其 `kind` 与条目一致），启用状态写回
+ * `out_enabled`（0/1）。两个出参均可为 NULL。只读。
+ * index 越界 -> COMP_ERR_INVALID_ARGUMENT；不是智能对象 -> COMP_ERR_STATE。
+ */
+COMP_API comp_result comp_layer_smart_filter_at(comp_document document, comp_layer_id id,
+                                                size_t index, comp_filter_desc* out_desc,
+                                                int32_t* out_enabled);
+
+/*
+ * 追加一条滤镜并立即重新求值（source 从头跑整条栈）。新条目 enabled = 1。
+ * 恒等参数也照常入栈（画面不变，但滤镜栈变了——宿主之后可改参数）。
+ * 参数越界 -> COMP_ERR_INVALID_ARGUMENT；不是智能对象 / 无 source -> COMP_ERR_STATE。
+ * 一步撤销。
+ */
+COMP_API comp_result comp_layer_smart_filter_add(comp_document document, comp_layer_id id,
+                                                 const comp_filter_desc* desc);
+
+/*
+ * 替换第 index 条的设置与启用状态，然后重新求值。
+ * (settings, enabled) 与当前条目完全相同 -> COMP_OK、不落撤销步。
+ * 参数越界 / index 越界 -> COMP_ERR_INVALID_ARGUMENT；不是智能对象 -> COMP_ERR_STATE。
+ * 一步撤销。
+ */
+COMP_API comp_result comp_layer_smart_filter_set(comp_document document, comp_layer_id id,
+                                                 size_t index, const comp_filter_desc* desc,
+                                                 int32_t enabled);
+
+/* 删除第 index 条并重新求值（删到空栈时画面回到 source）。一步撤销。 */
+COMP_API comp_result comp_layer_smart_filter_remove(comp_document document, comp_layer_id id,
+                                                    size_t index);
+
+/* ========================================= 智能滤镜栈顺序与命名（P1-2 收尾 ⑩）
+ *
+ * 尾部追加（P1-2 第九批之后）：栈序就是求值顺序（自下而上，索引 0 先跑），
+ * 改名只是面板展示名、不参与求值。两者都随快照进撤销栈与 `.comp`。
+ */
+
+/* 展示名字节上限（UTF-8，不含 '\0'），与 domain/layer.h 的
+ * kMaxSmartFilterNameBytes 必须一致。 */
+#define COMP_SMART_FILTER_NAME_MAX_BYTES 256
+
+/*
+ * 把第 `from` 条移到第 `to` 位（两者都是移动**前**的索引；语义同
+ * std::vector 的「取出再插入」），然后按新顺序重新求值。
+ *
+ *   - from == to：COMP_OK、不重新求值、不落撤销步（宿主可无脑调用）；
+ *   - 移动后栈序不变（例如把唯一一条移动 0→0 之外的空栈）不可能发生——越界即错误；
+ *   - 索引越界 -> COMP_ERR_INVALID_ARGUMENT；不是智能对象 -> COMP_ERR_STATE；
+ *   - 与其它写入口同一把锁闸（COMP_LAYER_LOCK_PIXELS）：顺序改变会改画面；
+ *   - 求值在开事务之前：失败不留撤销步、不动像素。一步撤销。
+ *
+ * 注意 `to` 可以是 `count - 1`（移到栈顶）与 0（移到栈底），不要求 `to < count`
+ * 之外的其它约定；`to == count` 视为越界（栈长度不变）。
+ */
+COMP_API comp_result comp_layer_smart_filter_move(comp_document document, comp_layer_id id,
+                                                  size_t from, size_t to);
+
+/*
+ * 设置第 index 条的展示名（`name_utf8` 可为 NULL 或空串 = 清除名字，回退到
+ * 滤镜类型名）。UTF-8、单行、≤ COMP_SMART_FILTER_NAME_MAX_BYTES 字节（不含
+ * '\0'）；含控制字符、非法 UTF-8 或超长 -> COMP_ERR_INVALID_ARGUMENT。
+ *
+ * 名字**不参与像素求值**：与当前名字相同 -> COMP_OK、不落撤销步；否则只改
+ * 元数据、不重新求值（画面逐字节不变），但仍进快照——一次撤销。不触发
+ * 像素锁闸（与色标/链接同一口径：它不改画面）。不是智能对象 -> COMP_ERR_STATE。
+ */
+COMP_API comp_result comp_layer_smart_filter_set_name(comp_document document, comp_layer_id id,
+                                                      size_t index, const char* name_utf8);
+
+/*
+ * 取第 index 条的展示名（两段式，口径同 comp_layer_comp_name）：`out_required`
+ * 写含 '\0' 的所需长度；`buffer == NULL` 或 `capacity == 0` 为查询模式。
+ * 名字为空（未命名）时长度为 1（只有 '\0'）。缓冲区不足 ->
+ * COMP_ERR_INVALID_ARGUMENT，不截断。index 越界 -> COMP_ERR_INVALID_ARGUMENT；
+ * 不是智能对象 -> COMP_ERR_STATE。只读，不开事务。
+ */
+COMP_API comp_result comp_layer_smart_filter_name(comp_document document, comp_layer_id id,
+                                                  size_t index, char* buffer, size_t capacity,
+                                                  size_t* out_required);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

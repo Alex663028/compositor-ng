@@ -20,9 +20,20 @@ void filter_preview_forget(ShellState& shell) {
   shell.doc.needs_render = true;
 }
 
+/* 退出「编辑某条智能滤镜」模式：绑定清空，滤镜面板本身不动。 */
+void filter_smart_edit_clear(ShellState& shell) {
+  shell.doc.smart_edit_layer = 0;
+  shell.doc.smart_edit_index = 0;
+  shell.doc.smart_edit_enabled = 1;
+  shell.doc.smart_edit_base = comp_filter_desc{};
+}
+
 void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
   /* 右栏一次只挂一个面板：打开滤镜即收起效果参数面板、色彩范围、路径与历史面板。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
+  /* 「滤镜 >」是普通应用路径：上一次的单条编辑绑定不能带进来。 */
+  filter_smart_edit_clear(shell);
   shell.doc.effect_open = false;
   shell.doc.effect_input.clear();
   shell.doc.path_open = false;
@@ -41,9 +52,19 @@ void open_filter_panel(ShellState& shell, comp_ui::FilterId id) {
 
 void close_filter_panel(ShellState& shell) {
   const bool had_preview = shell.doc.filter_preview_pending;
+  const bool editing = shell.doc.smart_edit_layer != 0;
+  const size_t edit_index = shell.doc.smart_edit_index;
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell); /* 预览帧作废：Document 从未改动，重画即回真状态 */
+  filter_smart_edit_clear(shell);
+  if (editing) {
+    /* 从「编辑某条」出来：右栏回到滤镜栈列表，焦点停在该条。 */
+    smart_panel_reopen_after_edit(shell, static_cast<int>(edit_index));
+    set_status(shell, had_preview ? L"已返回智能滤镜列表（本次编辑未写回，预览已丢弃）"
+                                  : L"已返回智能滤镜列表（本次编辑未写回）");
+    return;
+  }
   set_status(shell, had_preview ? L"已关闭滤镜面板（预览已丢弃，图层未改动）"
                                 : L"已关闭滤镜面板");
 }
@@ -51,6 +72,11 @@ void close_filter_panel(ShellState& shell) {
 void filter_reset_values(ShellState& shell) {
   shell.doc.filter_input.clear();
   shell.doc.filter.reset_values();
+  /*
+   * 编辑智能滤镜时，重置 = 回到全默认：把读回的底稿也清掉，写回时不再带回
+   * 边缘色 / 显式轴这些不在面板行里的旧字段（其余路径下该绑定本来就是空的）。
+   */
+  if (shell.doc.smart_edit_layer != 0) shell.doc.smart_edit_base = comp_filter_desc{};
   /* 复位也是一次参数变化：照样出预览；默认值若正好恒等，助手会如实回报「无预览」。 */
   filter_preview_render(shell, L"滤镜参数已重置为默认值");
 }
@@ -197,6 +223,158 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
 }
 
 /*
+ * 单条编辑的写回版：面板行只承载一部分字段，剩下的（Vignette 的边缘色、
+ * Progressive Blur 的显式轴）必须从读回的底稿原样带回——否则一次回车就把它们
+ * 悄悄抹成默认值。显式轴另外尊重本次编辑里的拖拽：画布拖过轴时
+ * progressive_axis_set 为真，面板状态优先；没拖过才回落到底稿里的轴。
+ * 底稿种类与面板种类不一致时一律不带走附带字段（正常路径不会发生：面板就是
+ * 按同一份 desc 的 kind 选的，这里只是防御）。
+ */
+void build_filter_desc_patched(const ShellState& shell, comp_filter_desc* out) {
+  comp_filter_desc desc{};
+  build_filter_desc(shell, &desc);
+  const comp_filter_desc& base = shell.doc.smart_edit_base;
+  if (desc.kind == base.kind) {
+    switch (desc.kind) {
+      case COMP_FILTER_VIGNETTE:
+        for (int channel = 0; channel < 3; ++channel) {
+          desc.vignette.color[channel] = base.vignette.color[channel];
+        }
+        break;
+      case COMP_FILTER_PROGRESSIVE_BLUR:
+        if (desc.progressive_blur.explicit_axis == 0 && base.progressive_blur.explicit_axis != 0) {
+          desc.progressive_blur.explicit_axis = 1;
+          desc.progressive_blur.start_x = base.progressive_blur.start_x;
+          desc.progressive_blur.start_y = base.progressive_blur.start_y;
+          desc.progressive_blur.end_x = base.progressive_blur.end_x;
+          desc.progressive_blur.end_y = base.progressive_blur.end_y;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  *out = desc;
+}
+
+/* 读回的 desc -> 面板行。夹到量程的责任留给 set_value（面板永不产生越界参数）。 */
+void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& desc) {
+  switch (desc.kind) {
+    case COMP_FILTER_VIGNETTE:
+      panel.set_value(0, desc.vignette.amount);
+      panel.set_value(1, desc.vignette.midpoint);
+      panel.set_value(2, desc.vignette.roundness);
+      panel.set_value(3, desc.vignette.feather);
+      panel.set_value(4, desc.vignette.highlights);
+      break;
+    case COMP_FILTER_TONAL_CONTRAST:
+      panel.set_value(0, desc.tonal_contrast.amount);
+      panel.set_value(1, desc.tonal_contrast.radius);
+      panel.set_value(2, desc.tonal_contrast.shadows);
+      panel.set_value(3, desc.tonal_contrast.midtones);
+      panel.set_value(4, desc.tonal_contrast.highlights);
+      break;
+    case COMP_FILTER_BLOOM:
+      panel.set_value(0, desc.bloom.amount);
+      panel.set_value(1, desc.bloom.radius);
+      break;
+    case COMP_FILTER_LENS_CORRECTION:
+      panel.set_value(0, desc.lens_correction.distortion);
+      break;
+    case COMP_FILTER_GAUSSIAN_BLUR:
+      panel.set_value(0, desc.gaussian_blur.radius);
+      panel.set_value(1, desc.gaussian_blur.preserve_transparency != 0 ? 1.0 : 0.0);
+      break;
+    case COMP_FILTER_ADD_NOISE:
+      panel.set_value(0, desc.add_noise.amount);
+      panel.set_value(1, desc.add_noise.gaussian != 0 ? 1.0 : 0.0);
+      panel.set_value(2, desc.add_noise.monochromatic != 0 ? 1.0 : 0.0);
+      panel.set_value(3, static_cast<double>(desc.add_noise.seed));
+      break;
+    case COMP_FILTER_GRAIN:
+      panel.set_value(0, desc.grain.amount);
+      panel.set_value(1, desc.grain.size);
+      panel.set_value(2, desc.grain.roughness);
+      panel.set_value(3, static_cast<double>(desc.grain.seed));
+      break;
+    case COMP_FILTER_MOTION_BLUR:
+      panel.set_value(0, desc.motion_blur.angle);
+      panel.set_value(1, desc.motion_blur.distance);
+      break;
+    case COMP_FILTER_PROGRESSIVE_BLUR:
+      panel.set_value(0, desc.progressive_blur.from);
+      panel.set_value(1, desc.progressive_blur.to);
+      panel.set_value(2, desc.progressive_blur.radial != 0 ? 1.0 : 0.0);
+      panel.set_value(3, desc.progressive_blur.inverted != 0 ? 1.0 : 0.0);
+      break;
+    case COMP_FILTER_SHARPEN:
+      panel.set_value(0, desc.sharpen.amount);
+      panel.set_value(1, desc.sharpen.radius);
+      panel.set_value(2, desc.sharpen.threshold);
+      break;
+    case COMP_FILTER_REDUCE_NOISE:
+      panel.set_value(0, desc.reduce_noise.strength);
+      panel.set_value(1, desc.reduce_noise.preserve_details);
+      panel.set_value(2, desc.reduce_noise.reduce_color_noise);
+      break;
+    default:
+      break;
+  }
+}
+
+void filter_load_values_from_desc(ShellState& shell, const comp_filter_desc& desc) {
+  filter_load_values(shell.doc.filter, desc);
+}
+
+/*
+ * 打开「编辑某条」：读一条 desc -> 普通滤镜面板（同一份排版与键盘）-> 装上绑定。
+ * 面板是唯一编辑入口，所以这里先把栈面板收起来（open_filter_panel 已做），
+ * 再显式装绑定——open_filter_panel 自己会清空绑定，不能先装后被清。
+ */
+bool open_smart_filter_editor(ShellState& shell, size_t index) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return false;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：请先选中一个智能对象图层");
+    return false;
+  }
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, index, &desc, &enabled) != COMP_OK) {
+    smart_panel_status(shell);
+    return false;
+  }
+  const int kind = static_cast<int>(desc.kind);
+  const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(kind);
+  if (spec == nullptr) {
+    set_status(shell, L"智能滤镜：该条的滤镜种类当前壳不支持");
+    return false;
+  }
+  open_filter_panel(shell, spec->id);
+  filter_load_values_from_desc(shell, desc);
+  shell.doc.smart_edit_layer = id;
+  shell.doc.smart_edit_index = index;
+  shell.doc.smart_edit_enabled = enabled != 0 ? 1 : 0;
+  shell.doc.smart_edit_base = desc;
+  /* 底稿里的显式轴也要让面板「看得见」：之后拖轴会覆盖它，没拖则写回原值。 */
+  if (kind == static_cast<int>(comp_ui::FilterId::ProgressiveBlur) &&
+      desc.progressive_blur.explicit_axis != 0) {
+    shell.doc.progressive_axis_set = true;
+    shell.doc.progressive_axis_start = {desc.progressive_blur.start_x, desc.progressive_blur.start_y};
+    shell.doc.progressive_axis_final = {desc.progressive_blur.end_x, desc.progressive_blur.end_y};
+  }
+  wchar_t buffer[288];
+  wsprintfW(buffer, L"编辑第 %d 条智能滤镜：%s（%s · -/= 预览 · 回车写回 · Esc 取消）",
+            static_cast<int>(index + 1), widen_ascii(spec->name).c_str(),
+            enabled != 0 ? L"启用" : L"关闭");
+  set_status(shell, buffer);
+  return true;
+}
+
+/*
  * §6.62 滤镜实时预览：改一个参数就出一帧，但**文档不动**。
  *
  * 引擎的 comp_filter_apply 会加入宿主已开的事务（owns_txn = !txn_active()），所以这里
@@ -217,13 +395,18 @@ bool filter_preview_render(ShellState& shell, const wchar_t* lead) {
   }
   const comp_layer_id id = selected_layer_id(shell);
   const comp_ui::FilterSpec* spec = shell.doc.filter.spec();
-  if (id == 0 || spec == nullptr) {
+  const bool editing = shell.doc.smart_edit_layer != 0;
+  if (spec == nullptr || (!editing && id == 0)) {
     set_status(shell, L"滤镜预览：请先用 ↑↓ 选择一个图层");
     return false;
   }
 
   comp_filter_desc desc{};
-  build_filter_desc(shell, &desc);
+  if (editing) {
+    build_filter_desc_patched(shell, &desc);
+  } else {
+    build_filter_desc(shell, &desc);
+  }
 
   comp_txn txn = nullptr;
   if (comp_txn_begin(shell.doc.document, "Filter Preview", &txn) != COMP_OK) {
@@ -236,8 +419,26 @@ bool filter_preview_render(ShellState& shell, const wchar_t* lead) {
   int32_t changed = 0;
   char note[512] = {0};
   size_t note_size = 0;
-  const comp_result result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
-                                               sizeof(note), &note_size);
+  int32_t smart = 0;
+  const bool smart_layer =
+      comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK && smart != 0;
+  comp_result result = COMP_OK;
+  if (editing) {
+    /* 单条编辑：预览 = 在事务里把新设置写到该条（栈照常整条重算），取帧后 abort。
+     * 引擎的 _set 幂等，参数没变就不落撤销步；这里照样取一帧，画面与文档一致。 */
+    changed = 1;
+    result = comp_layer_smart_filter_set(shell.doc.document, shell.doc.smart_edit_layer,
+                                         shell.doc.smart_edit_index, &desc,
+                                         shell.doc.smart_edit_enabled);
+  } else if (smart_layer) {
+    /* 智能图层：预览 = 在事务里往栈尾加一条，取帧后 abort。整条栈都从 source 重算，
+     * 所以看到的就是「真应用后」的画面；abort 把像素与栈一起回滚，文档不动。 */
+    changed = 1;
+    result = comp_layer_smart_filter_add(shell.doc.document, id, &desc);
+  } else {
+    result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
+                               sizeof(note), &note_size);
+  }
   bool drawn = false;
   if (result == COMP_OK && changed != 0) {
     drawn = render_canvas(shell); /* 必须在 abort 之前取帧：此时像素还是「应用后」 */
@@ -262,7 +463,12 @@ bool filter_preview_render(ShellState& shell, const wchar_t* lead) {
   /* render_canvas 已清掉 needs_render：这一帧是预览，下次绘制别从文档覆盖它。 */
   shell.doc.filter_preview_pending = true;
   wchar_t buffer[384];
-  wsprintfW(buffer, L"%s · 预览中（回车应用 · Esc 取消）", lead);
+  if (editing && shell.doc.smart_edit_enabled == 0) {
+    /* 关掉的条目本就不参与求值：预览帧 = 现状，不能假装看到了效果。 */
+    wsprintfW(buffer, L"%s · 该条已关闭，预览即当前画面（回车写回参数、保持关闭）", lead);
+  } else {
+    wsprintfW(buffer, L"%s · 预览中（回车应用 · Esc 取消）", lead);
+  }
   set_status(shell, buffer);
   return true;
 }
@@ -272,37 +478,96 @@ void apply_filter(ShellState& shell) {
     set_status(shell, L"无文档");
     return;
   }
-  const comp_layer_id id = selected_layer_id(shell);
+  const bool editing = shell.doc.smart_edit_layer != 0;
+  const comp_ui::FilterSpec* spec = shell.doc.filter.spec();
+  if (spec == nullptr) return;
+  const comp_layer_id id = editing ? shell.doc.smart_edit_layer : selected_layer_id(shell);
   if (id == 0) {
     set_status(shell, L"请先用 ↑↓ 选择一个图层");
     return;
   }
-  const comp_ui::FilterSpec* spec = shell.doc.filter.spec();
-  if (spec == nullptr) return;
 
   comp_filter_desc desc{};
-  build_filter_desc(shell, &desc);
+  if (editing) {
+    build_filter_desc_patched(shell, &desc);
+  } else {
+    build_filter_desc(shell, &desc);
+  }
+
+  const size_t edit_index = shell.doc.smart_edit_index;
+  const int32_t edit_enabled = shell.doc.smart_edit_enabled;
 
   int32_t changed = 0;
   char note[512] = {0};
   size_t note_size = 0;
-  /* 全分辨率渲染，scale = 1：高斯半径不缩放。 */
-  const comp_result result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
-                                               sizeof(note), &note_size);
+  int32_t smart = 0;
+  const bool smart_layer =
+      comp_layer_smart_object_is_smart(shell.doc.document, id, &smart) == COMP_OK && smart != 0;
+  comp_result result = COMP_OK;
+  if (editing) {
+    /* 单条编辑：把面板值写回第 edit_index 条。引擎幂等——设置与启用状态都没变时
+     * COMP_OK 且不落撤销步，所以状态行不能承诺「一步撤销」。 */
+    result = comp_layer_smart_filter_set(shell.doc.document, id, edit_index, &desc, edit_enabled);
+  } else if (smart_layer) {
+    /*
+     * P1-2 收尾 ⑦：智能图层的像素是求值缓存，comp_filter_apply 会（正确地）拒绝。
+     * 同一条路径在这里改走「往栈里加一条」——与 PS 一样：同一个面板、同一次回车，
+     * 普通层是破坏性应用，智能层是叠加一条可随时删掉的智能滤镜。
+     * changed 记 1：栈确实变了（恒等参数也照常入栈，便于之后调参数）。
+     */
+    changed = 1;
+    result = comp_layer_smart_filter_add(shell.doc.document, id, &desc);
+  } else {
+    /* 全分辨率渲染，scale = 1：高斯半径不缩放。 */
+    result = comp_filter_apply(shell.doc.document, id, &desc, 1.0, &changed, note,
+                               sizeof(note), &note_size);
+  }
   shell.doc.needs_render = true;
   shell.doc.filter_preview_pending = false; /* 真应用已落文档：画面重画即真状态 */
 
   wchar_t buffer[768];
   const std::wstring name = widen_ascii(spec->name);
   if (result != COMP_OK) {
-    wsprintfW(buffer, L"%s 失败", name.c_str());
+    if (editing) {
+      /* 绑定留着：用户还能改参数重试，或 Esc 退出（退出时同样回到栈列表）。 */
+      wsprintfW(buffer, L"%s：写回第 %d 条失败（未改动）", name.c_str(),
+                static_cast<int>(edit_index + 1));
+    } else {
+      wsprintfW(buffer, L"%s 失败", name.c_str());
+    }
     set_status(shell, buffer);
+    return;
+  }
+  if (editing) {
+    /* 写回成功：滤镜面板退回栈列表，焦点停在该条（与 Esc 出去的位置一致）。 */
+    shell.doc.filter_open = false;
+    shell.doc.filter_input.clear();
+    filter_smart_edit_clear(shell);
+    refresh_layers(shell); /* 行内 S 标记 / 滤镜条数同源 */
+    smart_panel_reopen_after_edit(shell, static_cast<int>(edit_index));
+    if (edit_enabled != 0) {
+      wsprintfW(buffer, L"%s：已写回第 %d 条智能滤镜（参数未变则不产生撤销步）", name.c_str(),
+                static_cast<int>(edit_index + 1));
+    } else {
+      wsprintfW(buffer, L"%s：已写回第 %d 条（该条仍为关闭，画面不变）", name.c_str(),
+                static_cast<int>(edit_index + 1));
+    }
+    refresh_history_status(shell, buffer);
     return;
   }
   if (changed == 0) {
     /* 恒等（例如 Amount 仍为 0）：引擎不碰像素、不开事务，这里如实回报。 */
     wsprintfW(buffer, L"%s：参数为恒等，未改动", name.c_str());
     set_status(shell, buffer);
+    return;
+  }
+  if (smart_layer) {
+    size_t count = 0;
+    if (comp_layer_smart_filter_count(shell.doc.document, id, &count) != COMP_OK) count = 0;
+    refresh_layers(shell); /* 行内 S 标记与滤镜条数同源，立即反映 */
+    wsprintfW(buffer, L"%s：已添加为智能滤镜（共 %d 条 · 一步撤销 · 图层 > 智能对象 可清除）",
+              name.c_str(), static_cast<int>(count));
+    refresh_history_status(shell, buffer);
     return;
   }
   if (note[0] != '\0' && note_size > 1) {
@@ -320,8 +585,9 @@ void trim_begin(ShellState& shell) {
     set_status(shell, L"修边：还没有文档");
     return;
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史/色彩范围互斥）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史/色彩范围/智能滤镜栈互斥）。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);

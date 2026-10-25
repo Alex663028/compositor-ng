@@ -28,6 +28,12 @@ void collect_state_assets(const DocumentState& state, std::set<const void*>* see
   for (const Layer& layer : state.layers) {
     account_asset(layer.pixels.pixels, seen, bytes);
     account_asset(layer.mask.pixels, seen, bytes);
+    /*
+     * 智能对象的原始像素（source）是**独立缓冲**：智能滤镜每求值一次产出一份新的
+     * 渲染缓存，而 source 只在「转为智能对象」那一刻创建。撤销回到转换之前时它随
+     * 历史快照整份保留——漏记的话一张 30000×30000 的源图就是约 3.6 GB 不计入预算。
+     */
+    if (layer.smart) account_asset(layer.smart->source.pixels, seen, bytes);
   }
   /*
    * 选区蒙版（文档分辨率的 8 位灰度）与图层资产走同一本账：一次形状操作
@@ -66,6 +72,19 @@ std::size_t document_state_bytes(const DocumentState& state) {
       total += string_bytes(layer.text->text);
       total += string_bytes(layer.text->font_path);
       total += string_bytes(layer.text->font_family);
+    }
+    /* 智能对象：source 像素按容量计（与 pixels/mask 同口径），滤镜栈按槽位计，
+     * 来源名按字符串容量计。 */
+    if (layer.smart) {
+      total += sizeof(SmartObject);
+      total += layer.smart->source.pixel_data().capacity();
+      total += layer.smart->filters.capacity() * sizeof(SmartFilter);
+      total += string_bytes(layer.smart->source_name);
+    }
+    /* 填充层：参数是真源，settings 字符串随快照一起进历史（同 text/adjustments 口径）。 */
+    if (layer.fill) {
+      total += sizeof(FillLayer);
+      total += string_bytes(layer.fill->settings_json);
     }
   }
   /* 选区蒙版（深拷贝口径，与图层像素/蒙版一致）。 */

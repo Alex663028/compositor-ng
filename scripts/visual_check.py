@@ -685,6 +685,25 @@ class Shell:
         user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
         self.wait(0.25)
 
+    def modified_click(self, x, y, ctrl=False, shift=False):
+        """带修饰键的单击（面板多选）。
+
+        与 press() 同一套机关：修饰状态写进目标线程的输入状态，并且在消息被
+        处理完之前不能恢复——否则 GetKeyState 读到的已是干净状态，Ctrl+点
+        会被当成普通点，多选永远选不上第二个。
+        """
+        x, y = int(x), int(y)
+        current, target, attached, state, saved = self._set_modifiers(shift, ctrl, False)
+        try:
+            user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
+            user32.PostMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
+            self.wait(0.05)
+            user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
+            self.wait(0.2)
+        finally:
+            self._restore_modifiers(current, target, attached, state, saved)
+        self.wait(0.1)
+
     def drag(self, x0, y0, x1, y1, steps=12):
         x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
         user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x0, y0))
@@ -3328,6 +3347,253 @@ def scene_layer_lock(shell, checker):
                   "行内变化像素 %d" % all_mark)
 
 
+def scene_merge_visible(shell, checker):
+    """P1-2 第二批：合并可见 / 反向排列（命令号 1673 / 1674）。
+
+    合并可见的契约是「渲染不变、结构收敛」：参与合成的层并成一个，隐藏层原样
+    保留。所以这里不比对颜色，而是同时断言两件事——
+      1. 画布逐像素不变（隐藏层本来就不参与合成，可见层并一层后必须等价）；
+      2. 面板行文本变少（层数真的少了），撤销后恢复三行。
+    反向排列只动堆叠序：面板行内容变化、画布不变；再反一次逐像素回到原样。
+    """
+    scene = "merge_visible"
+    layer = shell.layout["layer"]
+    canvas = shell.layout["canvas"]
+    # 面板顶 + 30px 标题；留 4 行高度，三行 / 两行都在框内。
+    panel = (layer[0], layer[1] + 30, layer[2], layer[1] + 30 + 22 * 4)
+
+    shell.command(1660)  # 解除上一场景留下的「全部锁」，否则合并可见会被引擎拒绝
+
+    for _ in range(2):
+        shell.press(ord("N"), ctrl=True, shift=True)
+    # 藏掉中间那层：选中下一行后切换可见性（隐藏层不参与合成、也不会被合并）。
+    shell.command(1010)
+    shell.command(1011)
+
+    before = shell.shot("138_merge_visible_before")
+    texts_before = count_bright(before, panel, 150)
+
+    shell.command(1673)  # 图层 > 合并可见
+    after = shell.shot("139_merge_visible_after")
+    texts_after = count_bright(after, panel, 150)
+    checker.check(scene, "合并可见后面板行数变少（可见层并成一个）",
+                  texts_after < texts_before,
+                  "行文本亮像素 %d -> %d" % (texts_before, texts_after))
+    canvas_delta = pixel_diff(after, before, canvas, 24)
+    checker.check(scene, "合并可见对画布零影响（隐藏层不参与、可见层代数等价）",
+                  canvas_delta == 0, "画布差异像素 %d" % canvas_delta)
+
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("140_merge_visible_undo")
+    texts_undone = count_bright(undone, panel, 150)
+    checker.check(scene, "撤销合并可见：面板恢复三行", texts_undone >= texts_before - 5,
+                  "行文本亮像素 %d（原 %d）" % (texts_undone, texts_before))
+
+    shell.command(1674)  # 图层 > 反向排列
+    flipped = shell.shot("141_reverse_rows")
+    rows_delta = pixel_diff(flipped, undone, panel, 24)
+    checker.check(scene, "反向排列改变面板行顺序", rows_delta > 20,
+                  "面板差异像素 %d" % rows_delta)
+    reverse_canvas = pixel_diff(flipped, undone, canvas, 24)
+    checker.check(scene, "反向排列不动画布", reverse_canvas == 0,
+                  "画布差异像素 %d" % reverse_canvas)
+
+    shell.command(1674)
+    back = shell.shot("142_reverse_back")
+    panel_delta = pixel_diff(back, undone, panel, 24)
+    checker.check(scene, "再反向一次回到原顺序（面板逐像素还原）", panel_delta == 0,
+                  "面板差异像素 %d" % panel_delta)
+
+
+def scene_layer_link(shell, checker):
+    """P1-2 第三批：图层链接（命令号 1675）。
+
+    链接是**关系元数据**：命令本身不该改一个像素。真正的判据是联动——
+    背景层与它的副本在画布上完全重合，链接后**只选背景层**右移 10px：
+      1. 副本跟着走（旧位置必须变成空的；没联动时副本会留在原地，两个副本
+         叠在旧位置，那一带仍是橙色）；
+      2. 这一步是一步撤销，撤销后画布逐像素回到原位；
+      3. 解除链接后两行文本恢复原样（面板行逐像素还原）。
+    行内的 `~` 标记只用来证明「壳真的把链接状态画出来了」，不与几何判据混谈。
+    """
+    scene = "layer_link"
+    layer = shell.layout["layer"]
+    canvas = shell.layout["canvas"]
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+
+    row_y = layer[1] + 30
+    row_band = (layer[0], row_y, layer[2], row_y + 22 * 2)
+    row_x = layer[0] + 80
+    top_row = row_y
+    bottom_row = row_y + 22
+
+    # 背景层画一段橙色横线，再复制一层：两层像素完全重合，肉眼分不出「副本
+    # 留下了」还是「两层都走了」——所以下面必须量「旧位置是否变空」。
+    shell.select_tool("brush")
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    cx = (left + right) // 2
+    cy = (top + bottom) // 2
+    stroke_half = max(20, min(40, (right - left) // 6))
+    shell.drag(cx - stroke_half, cy, cx + stroke_half, cy, steps=10)
+    shell.press(ord("J"), ctrl=True)  # 复制图层：副本与原件像素重合
+
+    # 多选两层：先点背景行（清掉多选），再 Ctrl+点副本行。
+    shell.click(row_x, bottom_row)
+    shell.modified_click(row_x, top_row, ctrl=True)
+
+    base = shell.shot("143_link_base")
+
+    shell.command(1675)  # 图层 > 链接图层
+    linked = shell.shot("144_link_linked")
+    rows_delta = pixel_diff(linked, base, row_band, 24)
+    checker.check(scene, "链接后两行都出现链接标记（行文本变化）", rows_delta > 20,
+                  "面板行差异像素 %d" % rows_delta)
+    canvas_delta = pixel_diff(linked, base, canvas, 24)
+    checker.check(scene, "链接本身不改画布（纯关系元数据）", canvas_delta == 0,
+                  "画布差异像素 %d" % canvas_delta)
+
+    # 只选背景层，Ctrl+→ 移 10px：副本必须跟过来。
+    shell.click(row_x, bottom_row)
+    shell.press(VK_RIGHT, ctrl=True)
+    moved = shell.shot("145_link_moved")
+
+    # 取样带按实际笔画外接框算：笔画比拖拽端点两头各多出一截（笔刷半径），
+    # 用常量去猜迟早差几像素、量到空白处。这里直接从像素里量「笔画到哪结束」。
+    # 只看文档矩形：canvas 矩形下半部还画着快捷键提示文字，混进来会把外接框
+    # 撑到整块画布。
+    def stroke_box(img):
+        mask = img.crop(doc).split()[0].point(lambda value: 255 if value >= 120 else 0)
+        found = mask.getbbox()
+        if found is None:
+            return None
+        return (found[0] + doc[0], found[1] + doc[1],
+                found[2] + doc[0], found[3] + doc[1])
+
+    box = stroke_box(base)
+    checker.check(scene, "背景层上确有笔迹（后续取样以它为基准）", box is not None,
+                  "笔迹外接框 %s" % (box,))
+    moved_box = stroke_box(moved)
+    checker.check(scene, "移动后仍只有一份笔迹（副本没有留在原地叠出第二份）",
+                  box is not None and moved_box is not None and
+                  abs((moved_box[2] - moved_box[0]) - (box[2] - box[0])) <= 2,
+                  "笔迹宽度 %s -> %s" % (
+                      None if box is None else box[2] - box[0],
+                      None if moved_box is None else moved_box[2] - moved_box[0]))
+
+    if box is not None and moved_box is not None and moved_box[0] > box[0]:
+        # 画布是缩放显示的（这里约 49%），10 个文档像素只折合约 5 个屏幕像素：
+        # 位移量直接从两帧外接框的差值量，不拿文档像素当屏幕像素用。
+        shift = moved_box[0] - box[0]
+        vacated = (box[0], box[1] + 2, box[0] + max(1, shift - 1), box[3] - 2)
+        arrival = (box[2] + 1, box[1] + 2, box[2] + shift, box[3] - 2)
+    else:
+        vacated = (cx - 20, cy - 8, cx - 12, cy + 8)
+        arrival = (cx + 20, cy - 8, cx + 28, cy + 8)
+    vacated_before = count_bright(base, vacated, 120)
+    vacated_after = count_bright(moved, vacated, 120)
+    arrival_before = count_bright(base, arrival, 120)
+    arrival_after = count_bright(moved, arrival, 120)
+    checker.check(scene, "链接层右移后旧位置变空（副本没有留在原地）",
+                  vacated_before > 0 and vacated_after == 0,
+                  "橙色像素 %d -> %d" % (vacated_before, vacated_after))
+    checker.check(scene, "新位置出现内容（整组跟着移动）",
+                  arrival_before == 0 and arrival_after > 0,
+                  "橙色像素 %d -> %d" % (arrival_before, arrival_after))
+
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("146_link_undo")
+    undo_delta = pixel_diff(undone, base, canvas, 24)
+    checker.check(scene, "一步撤销把两层一起复位（画布逐像素还原）", undo_delta == 0,
+                  "画布差异像素 %d" % undo_delta)
+
+    # 解除链接：两行标记消失，面板行逐像素回到链接前。
+    shell.click(row_x, bottom_row)
+    shell.modified_click(row_x, top_row, ctrl=True)
+    shell.command(1675)  # 同一命令：同组再执行一次 = 解除
+    unlinked = shell.shot("147_link_unlinked")
+    unlink_rows = pixel_diff(unlinked, base, row_band, 24)
+    checker.check(scene, "解除链接后面板行逐像素还原", unlink_rows == 0,
+                  "面板行差异像素 %d" % unlink_rows)
+
+
+def scene_layer_style_paste(shell, checker):
+    """P1-2 第四批：图层样式拷贝/粘贴（命令号 1676 / 1677）。
+
+    判据不是「命令没报错」，而是画布真的换了样式：
+      1. 拷贝只读：拷贝前后画布逐像素不变（剪贴板由外壳持有，不碰文档）；
+      2. 供体层加颜色叠加后确实变黑；隐藏供体后基线回到橙色矩形；
+      3. 粘贴到不带样式的靶层：靶层被刷成纯黑（样式参与了求值）；
+      4. 整次粘贴是一步撤销：Ctrl+Z 后画布逐像素回到粘贴前。
+    供体必须在拷贝之后隐藏：副本与原件像素重合，副本留在上面会盖住靶层，
+    「粘贴没生效」与「粘贴被盖住」就分不出来了。
+    """
+    scene = "layer_style_paste"
+    layer = shell.layout["layer"]
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    row_y = layer[1] + 30
+    row_x = layer[0] + 80
+    top_row = row_y
+    bottom_row = row_y + 22
+
+    # 底：橙色矩形。颜色叠加的缺省值是不透明纯黑，橙 -> 黑是最干净的判据。
+    shell.press(ord("X"), shift=True)
+    shell.type_text("ff8800")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    x0, y0 = left + 20, top + 20
+    x1, y1 = right - 20, bottom - 20
+    shell.drag(x0, y0, x1, y1, steps=10)
+
+    # 复制一层（副本在上、像素与原件重合），给副本加颜色叠加当样式供体。
+    shell.press(ord("J"), ctrl=True)
+    shell.command(CMD_EFFECT_BASE + 2)  # 颜色叠加（默认不透明纯黑）
+    shell.wait(0.6)
+    shell.press(VK_ESCAPE)  # 只关参数面板，效果留在图层上
+    shell.wait(0.3)
+
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    probe = (cx - 30, cy - 30, cx + 30, cy + 30)
+    styled = shell.shot("148_style_donor_black")
+    donor = mean_rgb(styled, probe)
+    checker.check(scene, "供体层加颜色叠加后变纯黑", near(donor, (0, 0, 0), 24),
+                  "实测 %s" % (donor,))
+
+    # 选中供体行，拷贝样式。
+    shell.click(row_x, top_row)
+    shell.command(1676)  # 图层 > 图层样式 > 拷贝图层样式
+    copied = shell.shot("149_style_copied")
+    copy_delta = pixel_diff(copied, styled, doc, 24)
+    checker.check(scene, "拷贝样式不改画布（只读导出）", copy_delta == 0,
+                  "画布差异像素 %d" % copy_delta)
+
+    # 藏掉供体，露出下面的橙色原件：这才是粘贴前的基线。
+    shell.command(1011)  # 切换选中层可见性（供体行仍选中）
+    hidden = shell.shot("150_style_donor_hidden")
+    base = mean_rgb(hidden, probe)
+    checker.check(scene, "隐藏供体后画布回到橙色矩形", near(base, (255, 136, 0), 30),
+                  "实测 %s" % (base,))
+
+    # 选中靶层（下面那行），粘贴样式。
+    shell.click(row_x, bottom_row)
+    shell.command(1677)  # 图层 > 图层样式 > 粘贴图层样式
+    shell.wait(0.3)
+    pasted = shell.shot("151_style_pasted")
+    target = mean_rgb(pasted, probe)
+    checker.check(scene, "粘贴后靶层被刷成纯黑（样式真的参与求值）",
+                  near(target, (0, 0, 0), 24), "实测 %s" % (target,))
+
+    # 一步撤销：粘贴整步回退，画布逐像素回到粘贴前。
+    shell.press(ord("Z"), ctrl=True)
+    undone = shell.shot("152_style_paste_undo")
+    undo_delta = pixel_diff(undone, hidden, doc, 24)
+    checker.check(scene, "一步撤销把粘贴整步回退（画布逐像素还原）", undo_delta == 0,
+                  "画布差异像素 %d" % undo_delta)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3363,6 +3629,9 @@ SCENES = [    ("start", scene_start, ()),
     ("effect_pattern", scene_effect_pattern, ()),
     ("gradient_stops", scene_gradient_stops, ()),
     ("layer_lock", scene_layer_lock, ()),
+    ("merge_visible", scene_merge_visible, ()),
+    ("layer_link", scene_layer_link, ()),
+    ("layer_style_paste", scene_layer_style_paste, ()),
 ]
 
 

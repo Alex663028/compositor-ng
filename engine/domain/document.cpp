@@ -405,6 +405,8 @@ bool Document::duplicate_layer(comp_layer_id id, comp_layer_id* out_id) {
     Layer clone = *source;
     clone.id = state_.next_layer_id++;
     clone.content_revision = allocate_revision();
+    /* 链接不随副本走：复制出来的层应能单独移动（PS 同款）。 */
+    clone.link_group = 0;
     remap.emplace(old_id, clone.id);
     clones.push_back(std::move(clone));
   }
@@ -550,6 +552,27 @@ void collect_descendants(const Document& doc, comp_layer_id group,
     out->push_back(layer.id);
     if (layer.is_group) collect_descendants(doc, layer.id, out);
   }
+}
+
+/*
+ * 「实际参与合成」= 自身可见，且整条祖先链上的每组都可见。
+ *
+ * 合成器对不可见的组直接返回空缓冲（filter_graph.cpp 的
+ * build_isolated_group_surface），穿透组同理跳过子树——所以隐藏组里的
+ * 「可见」子层不会贡献任何像素。合并可见（Merge Visible）的参与集合必须用
+ * 这同一把尺子，否则会把看不见的层烘进结果。
+ */
+bool layer_is_effectively_visible(const Document& doc, const Layer& layer) {
+  if (!layer.visible) return false;
+  comp_layer_id parent = layer.parent;
+  /* 结构异常（父级缺失/不是组）按不可见处理：宁可不合并，也不猜。 */
+  for (int depth = 0; parent != 0; ++depth) {
+    if (depth > 1024) return false;
+    const Layer* group = doc.find(parent);
+    if (group == nullptr || !group->is_group || !group->visible) return false;
+    parent = group->parent;
+  }
+  return true;
 }
 
 }  // namespace
@@ -926,6 +949,331 @@ bool Document::flatten_image(std::string* error) {
   invalidate_composite();
   if (!owns_txn) return true;
   /* commit 失败（历史栈分配失败）时 txn_commit 已自行回滚，避免「报失败但文档已改」。 */
+  return txn_commit(error) == COMP_OK;
+}
+
+/*
+ * 合并可见（P1-2 第二批）。
+ *
+ * 与 merge_down 的关键区别：merge_down 只合并「相邻两层」，渲染不变靠
+ * 「子集合成 == 原子集合成」；merge_visible 合并的是**全部有效可见层**，
+ * 中间可能夹着隐藏层。隐藏层在合成里本就被跳过，所以把它们排除在合并集合
+ * 之外不会改变画布——前提是可见层与隐藏层之间没有**剪贴**依赖：剪贴因数
+ * 只看基底像素、不看可见性（composite_ops.cpp 的 clipping_factor），
+ * 可见层剪贴到隐藏层时，把隐藏层排除会改变裁切结果，因此明确拒绝。
+ */
+bool Document::merge_visible(std::string* error, comp_layer_id* out_id, bool* out_changed) {
+  if (out_id != nullptr) *out_id = 0;
+  if (out_changed != nullptr) *out_changed = false;
+
+  /*
+   * 参与集合：
+   *   - merged_ids：所有「有效可见」的层（组与子层都算）——合并后全部消失；
+   *   - units：根级有效可见单元（可见组整体算一个），结果层落在最高单元的槽位；
+   *   - subset：交给 composite_merge_subset 的图层。根级组要连同**全部后代**
+   *     （含隐藏后代）一起给：隐藏后代在求值时被跳过，但剪贴因数仍要靠 find()
+   *     找到基底，才与整篇合成一致。
+   */
+  std::vector<comp_layer_id> merged_ids;
+  std::vector<comp_layer_id> units;
+  std::vector<comp_layer_id> subset;
+  size_t contributing = 0;
+  for (const Layer& layer : state_.layers) {
+    if (!layer_is_effectively_visible(*this, layer)) continue;
+    merged_ids.push_back(layer.id);
+    if (!layer.is_group) ++contributing;
+    if (layer.parent != 0) continue; /* 由根级组单元覆盖 */
+    units.push_back(layer.id);
+    if (layer.is_group) {
+      subset.push_back(layer.id);
+      collect_descendants(*this, layer.id, &subset);
+    } else {
+      subset.push_back(layer.id);
+    }
+  }
+
+  /* 只有一个（或零个）实际贡献像素的图层：合并没有任何可做的，按空操作处理。 */
+  if (contributing < 2) return true;
+
+  /*
+   * 剪贴的参与集合校验：参与合并的层若剪贴到**不参与**的基底（唯一可能是
+   * 根级可见层剪贴到根级隐藏层），合并会把剪贴关系剪断，画面随之改变——
+   * 明确拒绝，不做近似。
+   */
+  for (comp_layer_id id : merged_ids) {
+    const Layer* layer = find(id);
+    if (layer == nullptr || layer->clipping_source == 0) continue;
+    if (!contains_id(subset, layer->clipping_source)) {
+      if (error != nullptr) {
+        *error = "visible layer '" + layer->name +
+                 "' is clipped to a hidden layer; merging would change the canvas";
+      }
+      return false;
+    }
+  }
+
+  if (!merge_subset_is_bakeable(*this, merged_ids, error)) return false;
+
+  ImageBuffer canvas_composite;
+  if (!composite_merge_subset(*this, subset, &canvas_composite, error)) return false;
+
+  /* 内容裁剪（与 merge_down 同款）；全透明回退整幅，避免退化尺寸。 */
+  ImageBuffer result_pixels;
+  comp_rect placement{0, 0, canvas_composite.width, canvas_composite.height};
+  if (!trim_to_content(canvas_composite, &result_pixels, &placement)) {
+    result_pixels = canvas_composite;
+  }
+
+  const Layer* anchor = find(units.back());
+  if (anchor == nullptr) {
+    if (error != nullptr) *error = "merge anchor layer vanished";
+    return false;
+  }
+
+  Layer merged_layer;
+  merged_layer.name = anchor->name;       /* PS 保留最高可见层的名字 */
+  merged_layer.blend = COMP_BLEND_NORMAL; /* 混合已烘入 */
+  merged_layer.opacity = 1.0f;            /* 不透明度已烘入 */
+  merged_layer.transform = placement;
+  merged_layer.visible = true;
+  merged_layer.parent = 0;
+  merged_layer.pixels = std::move(result_pixels);
+
+  /* id 分配放在 txn_begin 之后：快照必须记的是合并前状态（与 merge_down 同款）。 */
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Merge Visible", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+  merged_layer.id = state_.next_layer_id++;
+  merged_layer.content_revision = allocate_revision();
+
+  std::vector<Layer> next;
+  next.reserve(state_.layers.size());
+  bool inserted = false;
+  for (const Layer& layer : state_.layers) {
+    if (layer.id == anchor->id) {
+      next.push_back(merged_layer);
+      inserted = true;
+      continue;
+    }
+    if (contains_id(merged_ids, layer.id)) continue;
+    Layer keep = layer;
+    /*
+     * 隐藏后代原本挂在某个被合并的组下面：组消失后逐级上溯，挂到最近一个
+     * 仍然存在的祖先（通常是根级）。它们不可见，所以只影响面板结构。
+     */
+    if (keep.parent != 0 && contains_id(merged_ids, keep.parent)) {
+      comp_layer_id ancestor = keep.parent;
+      while (ancestor != 0 && contains_id(merged_ids, ancestor)) {
+        const Layer* group = find(ancestor);
+        ancestor = group == nullptr ? 0 : group->parent;
+      }
+      keep.parent = ancestor;
+    }
+    next.push_back(std::move(keep));
+  }
+  if (!inserted) next.push_back(merged_layer); /* 理论不可达：anchor 必在 merged_ids 中 */
+
+  /* 剪贴到被合并图层的其它层，改剪到结果层（与 merge_down 同款）。 */
+  for (Layer& layer : next) {
+    if (layer.clipping_source != 0 && contains_id(merged_ids, layer.clipping_source)) {
+      layer.clipping_source = merged_layer.id;
+    }
+  }
+
+  /*
+   * children 簿记一次性重建：合并 + 隐藏后代提升会同时改动多个父级，
+   * 增量维护（像 merge_down 那样逐父改）在这里容易漏掉被提升的那几支。
+   * 向量序是权威，children 只是缓存。
+   */
+  for (Layer& layer : next) {
+    if (layer.is_group) layer.children.clear();
+  }
+  for (const Layer& layer : next) {
+    if (layer.parent == 0) continue;
+    for (Layer& group : next) {
+      if (group.id != layer.parent) continue;
+      group.children.push_back(layer.id);
+      break;
+    }
+  }
+
+  state_.layers = std::move(next);
+  state_.active_layer = merged_layer.id;
+  invalidate_composite();
+  if (out_id != nullptr) *out_id = merged_layer.id;
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
+  return txn_commit(error) == COMP_OK;
+}
+
+bool Document::reverse_layers(comp_layer_id parent, std::string* error, bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (parent != 0) {
+    const Layer* group = find(parent);
+    if (group == nullptr) {
+      if (error != nullptr) *error = "layer not found";
+      return false;
+    }
+    if (!group->is_group) {
+      if (error != nullptr) *error = "parent is not a layer group";
+      return false;
+    }
+  }
+
+  /* 向量序是权威：只翻转该父级兄弟所占的**槽位**，其它层的位置不动。 */
+  std::vector<size_t> slots;
+  for (size_t i = 0; i < state_.layers.size(); ++i) {
+    if (state_.layers[i].parent == parent) slots.push_back(i);
+  }
+  if (slots.size() < 2) return true; /* 空操作，不进历史 */
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Reverse Layer Order", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+
+  std::vector<Layer> picked;
+  picked.reserve(slots.size());
+  for (size_t slot : slots) picked.push_back(std::move(state_.layers[slot]));
+  std::reverse(picked.begin(), picked.end());
+  for (size_t k = 0; k < slots.size(); ++k) state_.layers[slots[k]] = std::move(picked[k]);
+
+  /* 组的 children 缓存与向量序保持一致（根级没有 children 簿记）。 */
+  if (parent != 0) {
+    for (Layer& layer : state_.layers) {
+      if (layer.id != parent) continue;
+      std::reverse(layer.children.begin(), layer.children.end());
+      break;
+    }
+  }
+
+  invalidate_composite();
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
+  return txn_commit(error) == COMP_OK;
+}
+
+bool Document::link_layers(const std::vector<comp_layer_id>& ids, uint32_t* out_group,
+                           std::string* error, bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (out_group != nullptr) *out_group = 0;
+  if (ids.size() < 2) {
+    if (error != nullptr) *error = "linking requires at least two layers";
+    return false;
+  }
+
+  /* 先全量校验再动状态：不给「一半改完才报错」留口子。 */
+  bool same_group = true;
+  uint32_t chosen = 0;                 /* 参与链接的既有组里编号最小的那个 */
+  std::vector<uint32_t> involved;      /* 要被并进来的既有组 */
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const Layer* layer = find(ids[i]);
+    if (layer == nullptr) {
+      if (error != nullptr) *error = "layer not found";
+      return false;
+    }
+    if (layer->is_group) {
+      if (error != nullptr) *error = "layer groups cannot be linked";
+      return false;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (ids[j] == ids[i]) {
+        if (error != nullptr) *error = "duplicate layer id";
+        return false;
+      }
+    }
+    if (layer->link_group == 0) {
+      same_group = false;
+      continue;
+    }
+    if (chosen == 0 || layer->link_group < chosen) chosen = layer->link_group;
+    if (std::find(involved.begin(), involved.end(), layer->link_group) == involved.end()) {
+      involved.push_back(layer->link_group);
+    }
+  }
+  /* 只要牵涉两个及以上既有组（或还有未链接层），就不是「已在同一组」。 */
+  if (involved.size() > 1) same_group = false;
+  if (same_group) {
+    /* 已在同一组：空操作，不进历史。 */
+    if (out_group != nullptr) *out_group = chosen;
+    return true;
+  }
+
+  /* 组号：优先复用参与组里最小的那个；全未链接则取现有最大值 +1
+   * （不复用空洞，避免「旧引用误连新组」）。 */
+  uint32_t target = chosen;
+  if (target == 0) {
+    target = 1;
+    for (const Layer& layer : state_.layers) {
+      if (layer.link_group >= target) target = layer.link_group + 1;
+    }
+  }
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Link Layers", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+  /* 合并既有组：被卷入的其它组的原有成员一并改投 target，不把原组拆成两半。 */
+  for (Layer& layer : state_.layers) {
+    if (layer.link_group == 0 || layer.link_group == target) continue;
+    if (std::find(involved.begin(), involved.end(), layer.link_group) == involved.end()) continue;
+    layer.link_group = target;
+  }
+  for (comp_layer_id id : ids) {
+    Layer* layer = find(id);
+    if (layer != nullptr) layer->link_group = target;
+  }
+  /* 纯关系元数据：不 invalidate 合成、不 touch_layer。 */
+  if (out_group != nullptr) *out_group = target;
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
+  return txn_commit(error) == COMP_OK;
+}
+
+bool Document::unlink_layers(const std::vector<comp_layer_id>& ids, std::string* error,
+                             bool* out_changed) {
+  if (out_changed != nullptr) *out_changed = false;
+  if (ids.empty()) {
+    if (error != nullptr) *error = "no layers given";
+    return false;
+  }
+
+  bool any_linked = false;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const Layer* layer = find(ids[i]);
+    if (layer == nullptr) {
+      if (error != nullptr) *error = "layer not found";
+      return false;
+    }
+    for (size_t j = 0; j < i; ++j) {
+      if (ids[j] == ids[i]) {
+        if (error != nullptr) *error = "duplicate layer id";
+        return false;
+      }
+    }
+    if (layer->link_group != 0) any_linked = true;
+  }
+  if (!any_linked) return true; /* 空操作，不进历史 */
+
+  const bool owns_txn = !txn_active_;
+  std::string txn_error;
+  if (owns_txn && txn_begin("Unlink Layers", &txn_error) != COMP_OK) {
+    if (error != nullptr) *error = txn_error;
+    return false;
+  }
+  for (comp_layer_id id : ids) {
+    Layer* layer = find(id);
+    if (layer != nullptr) layer->link_group = 0;
+  }
+  if (out_changed != nullptr) *out_changed = true;
+  if (!owns_txn) return true;
   return txn_commit(error) == COMP_OK;
 }
 

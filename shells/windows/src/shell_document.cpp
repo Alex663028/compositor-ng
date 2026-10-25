@@ -296,6 +296,7 @@ bool create_document_with(ShellState& shell, int width, int height, int dpi, int
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell); /* 旧文档的预览帧绝不能留在新文档的画布上 */
+  smart_panel_reset(shell);     /* 智能滤镜栈面板绑定的是旧文档的图层 id */
   shell.doc.filter.select(comp_ui::FilterId::Vignette);
   /* Progressive Blur 的渐变轴端点是旧文档坐标，换文档后一并作废。 */
   shell.doc.progressive_axis_set = false;
@@ -350,6 +351,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);
+  smart_panel_reset(shell);
   shell.doc.filter.select(comp_ui::FilterId::Vignette);
   shell.doc.progressive_axis_set = false;
   shell.doc.progressive_axis_dragging = false;
@@ -943,8 +945,9 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       return;
     }
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围互斥）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/修边/路径/历史/色彩范围/智能滤镜栈互斥）。 */
   if (shell.doc.color_range_open) color_range_cancel(shell);
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);
@@ -955,6 +958,13 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   channel_panel_close(shell);
   shell.doc.trim_open = false;
   shell.doc.trim_input.clear();
+  /* P1-2 收尾 ⑧：填充面板同样让位；拖动可能持有捕获与事务，先收口再清状态。 */
+  if (shell.doc.fill_open) {
+    fill_panel_drag_finish(shell, false);
+    shell.doc.fill_open = false;
+    shell.doc.fill_input.clear();
+    shell.doc.fill_layer = 0;
+  }
 
   shell.doc.doc_dialog = kind;
   shell.doc.doc_dialog_focus = 0;
@@ -1614,6 +1624,7 @@ void open_path_as_document(ShellState& shell, const char* path_utf8) {
     shell.doc.filter_open = false;
     shell.doc.filter_input.clear();
     filter_preview_forget(shell);
+    smart_panel_reset(shell);
     clone_reset_source(shell);
     stroke_cancel(shell);
     move_cancel(shell);
@@ -1933,6 +1944,115 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerFlatten:
       panel_flatten(shell);
       break;
+    /* ---- P1-2 第二批：合并可见 / 反向排列 ---- */
+    case kCmdLayerMergeVisible:
+      panel_merge_visible(shell);
+      break;
+    case kCmdLayerReverse:
+      panel_reverse_layers(shell);
+      break;
+    /* ---- P1-2 第三批：链接图层 ---- */
+    case kCmdLayerLinkToggle:
+      panel_toggle_link(shell);
+      break;
+    /* ---- P1-2 第四批：图层样式拷贝 / 粘贴（剪贴板由外壳持有） ---- */
+    case kCmdLayerCopyStyle:
+      panel_copy_layer_style(shell);
+      break;
+    case kCmdLayerPasteStyle:
+      panel_paste_layer_style(shell);
+      break;
+    /* ---- P1-2 收尾：图层面板过滤（视图态） ---- */
+    case kCmdLayerFilterName:
+      panel_begin_filter_name(shell);
+      break;
+    case kCmdLayerFilterClear:
+      panel_clear_filter(shell);
+      break;
+    /* ---- P1-2 收尾：图层复合（可见性 + 不透明度的具名快照） ---- */
+    case kCmdLayerCompCapture:
+      panel_layer_comp_capture_begin(shell);
+      break;
+    case kCmdLayerCompApply:
+      panel_layer_comp_apply(shell);
+      break;
+    case kCmdLayerCompUpdate:
+      panel_layer_comp_update(shell);
+      break;
+    case kCmdLayerCompRename:
+      panel_layer_comp_rename_begin(shell);
+      break;
+    case kCmdLayerCompDelete:
+      panel_layer_comp_delete(shell);
+      break;
+    case kCmdLayerCompPrev:
+      panel_layer_comp_select(shell, -1);
+      break;
+    case kCmdLayerCompNext:
+      panel_layer_comp_select(shell, 1);
+      break;
+    case kCmdLayerCompStatus:
+      panel_layer_comp_status(shell);
+      break;
+    /* ---- P1-2 收尾 ⑦：智能对象 / 智能滤镜 ---- */
+    case kCmdLayerSmartConvert:
+      panel_smart_convert(shell);
+      break;
+    case kCmdLayerSmartRasterize:
+      panel_smart_rasterize(shell);
+      break;
+    case kCmdLayerSmartClear:
+      panel_smart_clear_filters(shell);
+      break;
+    case kCmdLayerSmartStatus:
+      panel_smart_status(shell);
+      break;
+    /* ---- P1-2 收尾 ⑨：智能滤镜栈面板（1720 段） ---- */
+    case kCmdLayerSmartPanel:
+      if (shell.doc.smart_open) {
+        close_smart_panel(shell);
+      } else {
+        open_smart_panel(shell);
+      }
+      break;
+    case kCmdLayerSmartPanelToggle:
+      smart_panel_toggle_entry(shell);
+      break;
+    case kCmdLayerSmartPanelEdit:
+      smart_panel_edit_entry(shell);
+      break;
+    case kCmdLayerSmartPanelRemove:
+      smart_panel_remove_entry(shell);
+      break;
+    /* ---- P1-2 收尾 ⑩：栈序与展示名（1724 段） ---- */
+    case kCmdLayerSmartPanelRename:
+      panel_begin_smart_filter_name(shell);
+      break;
+    case kCmdLayerSmartPanelMoveUp:
+      smart_panel_move_entry(shell, -1);
+      break;
+    case kCmdLayerSmartPanelMoveDown:
+      smart_panel_move_entry(shell, 1);
+      break;
+    /* ---- P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案） ---- */
+    case kCmdLayerFillSolid:
+      panel_add_fill(shell, COMP_FILL_SOLID);
+      break;
+    case kCmdLayerFillGradient:
+      panel_add_fill(shell, COMP_FILL_GRADIENT);
+      break;
+    case kCmdLayerFillPattern:
+      panel_add_fill(shell, COMP_FILL_PATTERN);
+      break;
+    case kCmdLayerFillEdit:
+      panel_edit_fill(shell);
+      break;
+    case kCmdLayerFillRasterize:
+      panel_rasterize_fill(shell);
+      break;
+    case kCmdLayerFillStatus:
+      panel_fill_status(shell);
+      break;
     /* ---- P0-6 ①：文字图层栅格化（之后才是普通像素层） ---- */
     case kCmdLayerRasterizeText:
       panel_rasterize_text(shell);
@@ -2139,6 +2259,26 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       PostMessageW(window, WM_CLOSE, 0, 0);
       return;
     default:
+      /*
+       * 面板过滤（P1-2 收尾）：类型基址 + 0..6、颜色三段（全部 / 无标签 / 基址 +
+       * 0..6）。号段在 1680..1698，与锁/标签的 1660..1672 相邻但不重叠。
+       */
+      if (id >= kCmdLayerFilterKindBase && id <= kCmdLayerFilterKindBase + 6) {
+        panel_set_filter_kind(shell, static_cast<int>(id - kCmdLayerFilterKindBase));
+        break;
+      }
+      if (id == kCmdLayerFilterColorAll) {
+        panel_set_filter_color(shell, -1);
+        break;
+      }
+      if (id == kCmdLayerFilterColorNone) {
+        panel_set_filter_color(shell, 0);
+        break;
+      }
+      if (id >= kCmdLayerFilterColorBase && id < kCmdLayerFilterColorBase + 7) {
+        panel_set_filter_color(shell, static_cast<int>(id - kCmdLayerFilterColorBase) + 1);
+        break;
+      }
       /*
        * 颜色标签菜单项（P1-2）：kCmdLayerColorBase + label 0..7，0 = 无。
        * 号段在 1665..1672，已在图像调整的 64 宽宽容区间（1590..1653）之外；
