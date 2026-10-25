@@ -51,7 +51,8 @@ typedef enum comp_filter_kind {
   COMP_FILTER_HIGH_PASS        = 11,
   COMP_FILTER_MINIMUM          = 12,
   COMP_FILTER_MAXIMUM          = 13,
-  COMP_FILTER_OFFSET           = 14
+  COMP_FILTER_OFFSET           = 14,
+  COMP_FILTER_CUSTOM           = 15
 } comp_filter_kind;
 
 /*
@@ -246,13 +247,33 @@ typedef struct comp_filter_offset {
 } comp_filter_offset;
 
 /*
+ * Custom（上游 Filter > Other > Custom）。
+ *   kernel[25]  5×5 卷积核，行优先（第 0 行是最上面一行）
+ *   scale       除数；0 按 1 处理（面板可以把「Scale」清成 0 而不除零）
+ *   offset      每通道在除法之后加的常数
+ *
+ * 量程：核项 / scale / offset 都在 -999..999，越界拒绝（不静默夹取）。
+ * 卷积在直通色上做、alpha 逐字节不变；邻居坐标夹到图层内（边缘延展）。
+ *
+ * **零初始化 = 恒等**：kernel 全 0 且 scale 0 且 offset 0（即调用方根本没填这个
+ * 子结构）按恒等核处理，与 desc 其余字段「零值 = 恒等」的口径一致。显式想要
+ * 全 0 输出（黑）请把 scale 置 1 或 offset 置非 0。
+ */
+typedef struct comp_filter_custom {
+  double kernel[25];
+  double scale;
+  double offset;
+} comp_filter_custom;
+
+/*
  * 一次滤镜调用。只有 `kind` 对应的那个子结构被读取；其余忽略。
  * 零初始化 = Vignette + amount 0 = 恒等。
  *
  * `sharpen` / `reduce_noise` 是尾部追加（kind 9 / 10），`high_pass` /
- * `minimum` / `maximum` / `offset` 是再一批尾部追加（kind 11..14）：旧宿主按
- * 旧头文件编译时描述符更小，**新宿主必须用同一份头文件**——本仓两端同源构建，
- * 不提供跨版本结构体协商（导出符号表仍只做尾部追加）。
+ * `minimum` / `maximum` / `offset` 是再一批尾部追加（kind 11..14），`custom`
+ * 是第四批尾部追加（kind 15）：旧宿主按旧头文件编译时描述符更小，**新宿主必须
+ * 用同一份头文件**——本仓两端同源构建，不提供跨版本结构体协商（导出符号表
+ * 仍只做尾部追加）。
  */
 typedef struct comp_filter_desc {
   comp_filter_kind             kind;
@@ -271,6 +292,7 @@ typedef struct comp_filter_desc {
   comp_filter_minimum          minimum;
   comp_filter_maximum          maximum;
   comp_filter_offset           offset;
+  comp_filter_custom           custom;
 } comp_filter_desc;
 
 /*
@@ -279,7 +301,7 @@ typedef struct comp_filter_desc {
  * `scale` 是预览像素 / 图层像素（<= 0 视为 1）：影响以像素为单位的半径与位移
  * （Tonal Contrast / Bloom / Gaussian Blur / Motion Blur / Progressive Blur /
  * Sharpen / High Pass / Minimum / Maximum / Offset），让降采样预览看起来与
- * 全尺寸一致。
+ * 全尺寸一致。Custom 的卷积核不随 scale 缩放（核没有连续的半径语义）。
  *
  * 错误码：
  *   参数越界 / 非有限 / desc 为 NULL -> COMP_ERR_INVALID_ARGUMENT
@@ -288,7 +310,7 @@ typedef struct comp_filter_desc {
  *   分配失败                         -> COMP_ERR_OUT_OF_MEMORY
  *
  * note 可为 NULL；非 NULL 时写入 UTF-8 非致命说明（16 位降位、选区裁切、
- * Bloom / Gaussian Blur / Motion Blur / Progressive Blur 的近似口径），两段式：
+ * Bloom / Gaussian Blur / Motion Blur / Progressive Blur / Custom 的近似口径），两段式：
  * note_capacity 为 0 时只回报所需长度，out_note_size 写入含 '\0' 的长度。
  * out_changed 可为 NULL。
  */

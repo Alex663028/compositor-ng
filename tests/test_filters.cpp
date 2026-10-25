@@ -239,7 +239,7 @@ COMP_TEST(filters_new_kinds_are_identity_at_zero_initialisation) {
   const FilterKind kinds[] = {kFilterGaussianBlur, kFilterAddNoise, kFilterGrain,
                               kFilterMotionBlur, kFilterProgressiveBlur, kFilterSharpen,
                               kFilterReduceNoise, kFilterHighPass, kFilterMinimum,
-                              kFilterMaximum, kFilterOffset};
+                              kFilterMaximum, kFilterOffset, kFilterCustom};
   for (FilterKind kind : kinds) {
     FilterSettings settings;
     settings.kind = kind; /* 其余字段零初始化：radius / amount 为 0 = 恒等 */
@@ -518,6 +518,30 @@ COMP_TEST(filters_reject_out_of_range_settings_before_the_transaction) {
     s.offset.vertical = -4.0;
     s.offset.wrap = -1;
     cases.push_back({"offset wrap below 0", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterCustom;
+    s.custom.kernel[0] = 999.5;
+    cases.push_back({"custom kernel entry above 999", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterCustom;
+    s.custom.kernel[24] = -1000.0;
+    cases.push_back({"custom kernel entry below -999", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterCustom;
+    s.custom.scale = -999.5;
+    cases.push_back({"custom scale below -999", s});
+  }
+  {
+    FilterSettings s;
+    s.kind = kFilterCustom;
+    s.custom.offset = 1000.0;
+    cases.push_back({"custom offset above 999", s});
   }
 
   for (const Case& item : cases) {
@@ -2314,5 +2338,171 @@ COMP_TEST(filters_abi_maps_the_other_group_fields) {
 
   offset.offset.wrap = 3;
   COMP_CHECK(comp_filter_apply(as_document_handle(&shifted), shifted_id, &offset, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+}
+
+/* ================================================== 2e. Custom（5×5 卷积核） */
+
+COMP_TEST(filters_custom_is_a_5x5_convolution_on_straight_colour) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+
+  /* box 核（全 1，divisor 25）：均匀图层必须逐字节不变。邻居坐标夹到图层内，
+   * 窗外不当黑——当成黑的话四角只剩 9 份而不是 25 份，立刻变暗。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_solid_layer(&document, 40, 80, 120);
+    const std::vector<uint8_t> before = pixels_of(document, id);
+    FilterSettings settings;
+    settings.kind = kFilterCustom;
+    for (int i = 0; i < 25; ++i) settings.custom.kernel[i] = 1.0;
+    settings.custom.scale = 25.0;
+    const size_t undo_before = undo_depth(document);
+    COMP_CHECK_MSG(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error),
+                   "custom is a real product path");
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK(changed);
+    COMP_CHECK_MSG(note.find("5x5 convolution") != std::string::npos,
+                   "the note records the convolution formulation");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before + 1,
+                   "one custom filter is exactly one undo step");
+    COMP_CHECK_MSG(pixels_of(document, id) == before,
+                   "a box kernel over a flat field is byte-identical (edge clamp, not black)");
+  }
+
+  /* 恒等核 + offset：结果必须是精确的每通道 +10，alpha 不动。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_solid_layer(&document, 40, 80, 120);
+    FilterSettings settings;
+    settings.kind = kFilterCustom;
+    settings.custom.offset = 10.0;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 50, 90, 130, 255), "offset shifts every channel");
+    COMP_CHECK_MSG(pixel_is(after, size, size - 1, size - 1, 50, 90, 130, 255),
+                   "the offset is independent of the pixel's position in the kernel window");
+  }
+
+  /* 负结果夹到 0；alpha 逐字节不变；scale 0 与 scale 1 同义（除数 1）。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_solid_layer(&document, 40, 80, 120);
+    FilterSettings settings;
+    settings.kind = kFilterCustom;
+    settings.custom.offset = -100.0;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    /* (40, 80, 120) - 100：前两个通道夹到 0，蓝剩 120 - 100 = 20（逐通道夹取，不环绕）。 */
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 0, 0, 20, 255),
+                   "a negative result clamps to 0 per channel instead of wrapping");
+  }
+  {
+    Document a(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id_a = add_solid_layer(&a, 40, 80, 120);
+    FilterSettings settings;
+    settings.kind = kFilterCustom;
+    settings.custom.kernel[12] = 2.0; /* 中心 ×2，其余 0 */
+    settings.custom.scale = 0.0;      /* 面板把除数清成 0：按 1 处理 */
+    COMP_CHECK(filter_apply(&a, id_a, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    const std::vector<uint8_t> zero_scale = pixels_of(a, id_a);
+    COMP_CHECK_MSG(pixel_is(zero_scale, size, 5, 5, 80, 160, 240, 255),
+                   "scale 0 behaves as divisor 1, so the centre weight actually doubles");
+
+    Document b(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id_b = add_solid_layer(&b, 40, 80, 120);
+    settings.custom.scale = 1.0;
+    COMP_CHECK(filter_apply(&b, id_b, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK_MSG(pixels_of(b, id_b) == zero_scale, "scale 0 and scale 1 produce identical bytes");
+  }
+
+  /* 透明底上的方块：alpha 逐字节不变（滤镜不动轮廓），透明像素原样跳过。
+   * 边界像素会变暗，因为透明邻居没有直通色、除数又不按覆盖率归一——
+   * 这是 5×5 直通卷积的直接结果（docs/filters.md §3.16 记录）。 */
+  {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const std::vector<uint8_t> pattern = square_on_transparent(size, size);
+    const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+    FilterSettings settings;
+    settings.kind = kFilterCustom;
+    for (int i = 0; i < 25; ++i) settings.custom.kernel[i] = 1.0;
+    settings.custom.scale = 25.0;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    bool alpha_intact = true;
+    for (size_t i = 3; i < after.size(); i += 4) {
+      if (after[i] != pattern[i]) alpha_intact = false;
+    }
+    COMP_CHECK_MSG(alpha_intact, "custom leaves every alpha byte untouched");
+    COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 0, 0, 0, 0),
+                   "fully transparent pixels are skipped, not filled with the kernel");
+    COMP_CHECK_MSG(pixel_is(after, size, 7, 7, 255, 255, 255, 255),
+                   "an interior pixel of a flat opaque field is unchanged");
+    /* 方块左上角 (4,4)：窗口里只有 3×3=9 个不透明邻居 -> 9*255/25 = 91.8 -> 92。 */
+    COMP_CHECK_MSG(pixel_is(after, size, 4, 4, 92, 92, 92, 255),
+                   "rim pixels darken: transparent neighbours contribute no colour and the "
+                   "divisor is the panel's scale, not the coverage");
+  }
+}
+
+COMP_TEST(filters_abi_maps_the_custom_kernel) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 40, 80, 120);
+
+  char note[512] = {0};
+  size_t note_size = 0;
+  int32_t changed = 0;
+
+  /* kernel + scale + offset 三个字段都过 ABI：每通道精确 +20。 */
+  comp_filter_desc custom{};
+  custom.kind = COMP_FILTER_CUSTOM;
+  custom.custom.kernel[12] = 1.0;
+  custom.custom.scale = 1.0;
+  custom.custom.offset = 20.0;
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &custom, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the ABI accepts the custom desc");
+  COMP_CHECK(changed == 1);
+  COMP_CHECK_MSG(std::string(note).find("Custom applied") != std::string::npos,
+                 "the note names the custom filter");
+  COMP_CHECK_MSG(pixel_is(pixels_of(document, id), size, 6, 6, 60, 100, 140, 255),
+                 "kernel / scale / offset all cross the ABI");
+
+  /* 同一份 desc 再跑一次必须真的改像素（不是缓存了首次结果）。 */
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &custom, 1.0, &changed,
+                                   note, sizeof(note), &note_size) == COMP_OK,
+                 "the custom desc is repeatable");
+  COMP_CHECK_MSG(pixel_is(pixels_of(document, id), size, 6, 6, 80, 120, 160, 255),
+                 "re-applying the same kernel shifts again (offset accumulates)");
+
+  /* 零初始化 desc（kernel 全 0 + scale 0 + offset 0）映射成恒等核：
+   * 「零初始化 = 恒等」这条口径在 Custom 上也要成立。 */
+  comp_filter_desc zero{};
+  zero.kind = COMP_FILTER_CUSTOM;
+  changed = -1;
+  const std::vector<uint8_t> before_identity = pixels_of(document, id);
+  COMP_CHECK_MSG(comp_filter_apply(as_document_handle(&document), id, &zero, 1.0, &changed,
+                                   nullptr, 0, nullptr) == COMP_OK,
+                 "a zero-initialised custom desc is a successful call");
+  COMP_CHECK_MSG(changed == 0, "zero-init custom reports out_changed = 0");
+  COMP_CHECK_MSG(pixels_of(document, id) == before_identity,
+                 "zero-init custom leaves pixels byte-identical");
+
+  /* 越界核项过 ABI 直接被拒（参数闸先于事务）。 */
+  custom.custom.kernel[0] = 1000.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &custom, 1.0, &changed,
+                               nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
+  custom.custom.kernel[0] = 0.0;
+  custom.custom.scale = -1000.0;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &custom, 1.0, &changed,
                                nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }

@@ -481,6 +481,16 @@ JsonValue filter_settings_to_json(const FilterSettings& settings) {
       s.set("wrap", JsonValue::integer(static_cast<long long>(v.wrap)));
       break;
     }
+    case kFilterCustom: {
+      const CustomSettings& v = settings.custom;
+      /* 核一律整份写出（25 项）：缺项会让「读回」落到缺省核上，参数就悄悄变了。 */
+      JsonValue kernel = JsonValue::array({});
+      for (int i = 0; i < 25; ++i) kernel.push(JsonValue::number(v.kernel[i]));
+      s.set("kernel", std::move(kernel));
+      s.set("scale", JsonValue::number(v.scale));
+      s.set("offset", JsonValue::number(v.offset));
+      break;
+    }
   }
   return s;
 }
@@ -1028,7 +1038,7 @@ bool read_layer_mask(const JsonValue& entry, const fs::path& root, Layer* layer,
 bool filter_settings_from_json(const JsonValue& j, FilterSettings* out) {
   const long long kind = j.integer_or("kind", -1);
   if (kind < static_cast<long long>(kFilterVignette) ||
-      kind > static_cast<long long>(kFilterOffset)) {
+      kind > static_cast<long long>(kFilterCustom)) {
     return false;
   }
   const JsonValue* settings = j.find("settings");
@@ -1148,6 +1158,21 @@ bool filter_settings_from_json(const JsonValue& j, FilterSettings* out) {
       const long long wrap = settings->integer_or("wrap", static_cast<long long>(v.wrap));
       if (wrap < 0 || wrap > 2) return false;
       v.wrap = static_cast<int32_t>(wrap);
+      break;
+    }
+    case kFilterCustom: {
+      CustomSettings& v = s.custom;
+      /* 缺 kernel = 保留缺省恒等核（forward-compatible：旧工程读得回一条语义完整的
+       * 设置）。数组存在但不足 25 项时整条失效——半张核等于参数悄悄变了。 */
+      const JsonValue* kernel = settings->find("kernel");
+      if (kernel != nullptr) {
+        if (!kernel->is_array() || kernel->as_array().size() < 25) return false;
+        for (int i = 0; i < 25; ++i) {
+          v.kernel[i] = kernel->as_array()[static_cast<size_t>(i)].as_number(v.kernel[i]);
+        }
+      }
+      v.scale = settings->number_or("scale", v.scale);
+      v.offset = settings->number_or("offset", v.offset);
       break;
     }
   }

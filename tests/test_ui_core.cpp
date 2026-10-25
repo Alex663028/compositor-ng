@@ -774,10 +774,10 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
 COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   size_t count = 0;
   const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
-  COMP_CHECK(count == 15);
+  COMP_CHECK(count == 16);
   COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
 
-  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..14 一一对齐（main.cpp 里也有 static_assert）。 */
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..15 一一对齐（shell_internal.h 里也有 static_assert）。 */
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
@@ -793,11 +793,21 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Minimum) == 12);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Maximum) == 13);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Offset) == 14);
-  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 15);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Custom) == 15);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 16);
 
   /* 面板行数：docs/filters.md §3 各表的数据行数。 */
-  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4, 3, 3, 1, 1, 1, 3};
+  const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4, 3, 3, 1, 1, 1, 3, 27};
   for (size_t i = 0; i < count; ++i) {
+    /* 只有 Custom 是网格面板（5 列）；其余滤镜必须保持整宽单列，绘制不变。 */
+    if (table[i].id == comp_ui::FilterId::Custom) {
+      COMP_CHECK(table[i].columns == 5);
+      COMP_CHECK(table[i].grid_count == 25);
+    } else {
+      COMP_CHECK_MSG(table[i].columns == 1, "only Custom uses a grid layout");
+      COMP_CHECK_MSG(table[i].grid_count == 0, "only Custom uses a grid layout");
+    }
+    COMP_CHECK_MSG(table[i].grid_count <= table[i].param_count, "grid must fit in the rows");
     COMP_CHECK_MSG(table[i].param_count == row_counts[i], "panel row count");
     COMP_CHECK_MSG(table[i].param_count > 0 &&
                        table[i].param_count <= comp_ui::FilterSpec::kMaxParams,
@@ -953,6 +963,25 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(near_value(offset->params[2].step, 1.0));
   COMP_CHECK(near_value(offset->params[2].default_value, 0.0));
 
+  /* Custom：5×5 核（27 行里前 25 行按 5 列铺网格）+ 除数 + 偏移。
+   * 缺省必须是恒等核（中心 1，其余 0）+ 除数 1 + 偏移 0。 */
+  const comp_ui::FilterSpec* custom = comp_ui::filter_spec(comp_ui::FilterId::Custom);
+  COMP_CHECK(custom != nullptr && std::string(custom->name) == "Custom");
+  COMP_CHECK(custom->param_count == 27);
+  COMP_CHECK(custom->columns == 5);
+  COMP_CHECK(custom->grid_count == 25);
+  for (int row = 0; row < 25; ++row) {
+    COMP_CHECK_MSG(near_value(custom->params[row].min_value, -999.0), "kernel min");
+    COMP_CHECK_MSG(near_value(custom->params[row].max_value, 999.0), "kernel max");
+    COMP_CHECK_MSG(near_value(custom->params[row].default_value, row == 12 ? 1.0 : 0.0),
+                   "kernel default must be the identity kernel");
+  }
+  COMP_CHECK(std::string(custom->params[12].label) == "K13"); /* 中心 = 第 3 行第 3 列 */
+  COMP_CHECK(near_value(custom->params[25].default_value, 1.0)); /* Scale */
+  COMP_CHECK(near_value(custom->params[26].default_value, 0.0)); /* Offset */
+  COMP_CHECK(std::string(custom->params[25].label) == "Scale");
+  COMP_CHECK(std::string(custom->params[26].label) == "Offset");
+
   COMP_CHECK(comp_ui::filter_spec_at(-1) == nullptr);
   COMP_CHECK(comp_ui::filter_spec_at(static_cast<int>(count)) == nullptr);
 }
@@ -1051,6 +1080,83 @@ COMP_TEST(ui_core_filter_rows_hit_test_matches_geometry) {
                                           panel.y + comp_ui::kFilterRowsTop + 1.0) == -1);
   COMP_CHECK(comp_ui::filter_param_row_at(panel, 0, panel.x + 4.0,
                                           panel.y + comp_ui::kFilterRowsTop + 1.0) == -1);
+}
+
+COMP_TEST(ui_core_filter_grid_layout_and_navigation) {
+  const Rect panel{248, Layout::kToolbarHeight, Layout::kAdjustPanelWidth, 600};
+  const int columns = 5;
+  const int grid = 25;        /* 5×5 卷积核 */
+  const int param_count = 27; /* + Scale + Offset */
+
+  /* 网格：第 row 格在第 row/5 视觉行、第 row%5 列，列宽 = 面板宽 / 列数。 */
+  const int cell_w = panel.w / columns;
+  for (int row = 0; row < grid; ++row) {
+    const Rect rect = comp_ui::filter_param_row_rect(panel, row, columns, grid);
+    COMP_CHECK(rect.x == panel.x + (row % columns) * cell_w);
+    COMP_CHECK(rect.w == cell_w);
+    COMP_CHECK(rect.y == panel.y + comp_ui::kFilterRowsTop +
+                           (row / columns) * comp_ui::kFilterRowHeight);
+  }
+  /* 网格后的两行回到整宽，接在网格下面。 */
+  for (int row = grid; row < param_count; ++row) {
+    const Rect rect = comp_ui::filter_param_row_rect(panel, row, columns, grid);
+    COMP_CHECK(rect.x == panel.x && rect.w == panel.w);
+    COMP_CHECK(rect.y == panel.y + comp_ui::kFilterRowsTop +
+                           (grid / columns + row - grid) * comp_ui::kFilterRowHeight);
+  }
+
+  /* 命中：每格中心 + 顶端都回同一行；网格与整宽行不串。 */
+  for (int row = 0; row < param_count; ++row) {
+    const Rect rect = comp_ui::filter_param_row_rect(panel, row, columns, grid);
+    COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, rect.x + rect.w / 2.0,
+                                            rect.y + 1.0, columns, grid) == row);
+    COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, rect.x + 1.0,
+                                            rect.bottom() - 1.0, columns, grid) == row);
+  }
+  /* 最后一条整宽行下方不命中。 */
+  COMP_CHECK(comp_ui::filter_param_row_at(panel, param_count, panel.x + 4.0,
+                                          panel.y + comp_ui::kFilterRowsTop +
+                                              (grid / columns + 2) * comp_ui::kFilterRowHeight,
+                                          columns, grid) == -1);
+
+  /* 方向键导航：上下挪一整行、左右一格，撞边停住不折行。 */
+  comp_ui::FilterPanel nav;
+  nav.select(comp_ui::FilterId::Custom);
+  COMP_CHECK(nav.columns() == 5 && nav.grid_count() == 25);
+  COMP_CHECK(nav.focused == 0);
+  nav.focus_horizontal(1);
+  COMP_CHECK(nav.focused == 1);
+  nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 6);
+  nav.focus_vertical(-1);
+  COMP_CHECK(nav.focused == 1);
+  nav.focus_horizontal(-1);
+  COMP_CHECK(nav.focused == 0);
+  nav.focus_horizontal(-1); /* 行首：停住，不折到上一行 */
+  COMP_CHECK(nav.focused == 0);
+  nav.focus_vertical(-1); /* 顶行再往上：停在本列首格 */
+  COMP_CHECK(nav.focused == 0);
+
+  /* 从最后一行网格往下：落到 Scale，之后按单列逐行并夹在末尾。 */
+  nav.select(comp_ui::FilterId::Custom);
+  for (int i = 0; i < 4; ++i) nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 20);
+  nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 25); /* Scale */
+  nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 26); /* Offset */
+  nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 26);
+  nav.focus_horizontal(1); /* 网格外的行：不是网格，左右也不折 */
+  COMP_CHECK(nav.focused == 26);
+
+  /* 单列面板：columns()/grid_count() 回落 1 / 0，上下等于普通 focus。 */
+  nav.select(comp_ui::FilterId::Vignette);
+  COMP_CHECK(nav.columns() == 1 && nav.grid_count() == 0);
+  nav.focus_vertical(1);
+  COMP_CHECK(nav.focused == 1);
+  nav.focus_vertical(-1);
+  COMP_CHECK(nav.focused == 0);
 }
 
 COMP_TEST(ui_core_trim_panel_cycles_and_clamps) {

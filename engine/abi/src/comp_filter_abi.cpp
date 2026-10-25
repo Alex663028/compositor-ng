@@ -111,6 +111,18 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.offset.horizontal = desc.offset.horizontal;
   settings.offset.vertical = desc.offset.vertical;
   settings.offset.wrap = desc.offset.wrap;
+
+  /* Custom：desc 全零 = 调用方没填 -> 保留域层的恒等核（零初始化 = 恒等，
+   * 与 desc 其余字段的口径一致；见 comp_filter_custom 的注释）。 */
+  bool custom_touched = desc.custom.scale != 0.0 || desc.custom.offset != 0.0;
+  for (int i = 0; i < 25; ++i) {
+    if (desc.custom.kernel[i] != 0.0) custom_touched = true;
+  }
+  if (custom_touched) {
+    for (int i = 0; i < 25; ++i) settings.custom.kernel[i] = desc.custom.kernel[i];
+    settings.custom.scale = desc.custom.scale;
+    settings.custom.offset = desc.custom.offset;
+  }
   return settings;
 }
 

@@ -91,6 +91,23 @@ void filter_focus_row(ShellState& shell, int delta) {
   set_status(shell, buffer);
 }
 
+/*
+ * 网格面板（Custom 的 5×5 卷积核）方向键：dx 左右挪一格、dy 上下挪一整行。
+ * 撞到网格边缘时焦点不动，也不刷状态行（连续按方向键不会反复重写同一句）。
+ */
+void filter_focus_grid(ShellState& shell, int dx, int dy) {
+  if (!shell.doc.filter_open) return;
+  comp_ui::FilterPanel& panel = shell.doc.filter;
+  const int before = panel.focused;
+  if (dy != 0) panel.focus_vertical(dy);
+  if (dx != 0) panel.focus_horizontal(dx);
+  if (panel.focused == before) return;
+  const std::wstring text = param_status_text(panel);
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"参数 %d/%d：%s", panel.focused + 1, panel.param_count(), text.c_str());
+  set_status(shell, buffer);
+}
+
 void filter_step_value(ShellState& shell, int direction) {
   if (!shell.doc.filter_open) return;
   const comp_ui::FilterParamSpec* spec = shell.doc.filter.param_at(shell.doc.filter.focused);
@@ -230,6 +247,12 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
       desc.offset.vertical = panel.value(1);
       desc.offset.wrap = static_cast<int32_t>(std::llround(panel.value(2)));
       break;
+    case comp_ui::FilterId::Custom:
+      /* 前 25 行 = 5×5 卷积核（行优先），第 26/27 行 = 除数 / 偏移。 */
+      for (int i = 0; i < 25; ++i) desc.custom.kernel[i] = panel.value(i);
+      desc.custom.scale = panel.value(25);
+      desc.custom.offset = panel.value(26);
+      break;
     default:
       break;
   }
@@ -344,6 +367,11 @@ void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& des
       panel.set_value(0, desc.offset.horizontal);
       panel.set_value(1, desc.offset.vertical);
       panel.set_value(2, static_cast<double>(desc.offset.wrap));
+      break;
+    case COMP_FILTER_CUSTOM:
+      for (int i = 0; i < 25; ++i) panel.set_value(i, desc.custom.kernel[i]);
+      panel.set_value(25, desc.custom.scale);
+      panel.set_value(26, desc.custom.offset);
       break;
     default:
       break;

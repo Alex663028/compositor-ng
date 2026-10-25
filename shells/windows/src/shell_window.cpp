@@ -1410,6 +1410,19 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
       case VK_BACK:
         filter_reset_values(shell);
         return;
+      case VK_LEFT:
+      case VK_RIGHT:
+      case VK_UP:
+      case VK_DOWN: {
+        /* 网格滤镜（Custom 的 5×5 核）用方向键挪焦点；单列面板不吃方向键。 */
+        const comp_ui::FilterPanel& panel = shell.doc.filter;
+        if (panel.columns() > 1) {
+          const int dx = (key == VK_LEFT) ? -1 : (key == VK_RIGHT) ? 1 : 0;
+          const int dy = (key == VK_UP) ? -1 : (key == VK_DOWN) ? 1 : 0;
+          filter_focus_grid(shell, dx, dy);
+        }
+        return; /* 面板开着时方向键一律吞掉，不改视图滚动 */
+      }
       default:
         break;
     }
@@ -2980,8 +2993,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
           }
           if (shell->doc.filter_open && layout.adjust_panel.w > 0) {
             /* 点参数行 = 聚焦到该行；行几何与绘制共用 filter_param_row_rect。 */
-            const int row = comp_ui::filter_param_row_at(
-                layout.adjust_panel, shell->doc.filter.param_count(), mouse_x, mouse_y);
+            const comp_ui::FilterPanel& panel = shell->doc.filter;
+            const int row = comp_ui::filter_param_row_at(layout.adjust_panel, panel.param_count(),
+                                                         mouse_x, mouse_y, panel.columns(),
+                                                         panel.grid_count());
             if (row >= 0) {
               shell->doc.filter_input.clear();
               filter_focus_row(*shell, row - shell->doc.filter.focused);

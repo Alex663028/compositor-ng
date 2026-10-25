@@ -32,7 +32,7 @@
 | 选区 | 10% | 18 | 12 | 67% | 矩形/椭圆选框、多边形套索、魔棒、色彩范围、羽化、扩展/收缩/边界/平滑/扩大/选取相似、按图层像素/蒙版载入选区、**存储/载入选区通道**、移动与复制选区像素、扩缩手柄、**变换选区（数值宽高 + 旋转）** | 磁性套索、快速选择/对象选择、快速蒙版、选择并遮住、全部 ML 选择 |
 | 绘制与修饰 | 15% | 20 | 13 | 65% | 画笔/橡皮、仿制图章、涂抹、模糊、减淡/加深/海绵、修复画笔、污点修复、内容识别填充、液化 Push、历史记录画笔、渐变、油漆桶式填充、**画笔预设（5 档内置）/ 流量 / 压感（`WM_POINTER`，整笔取平均）** | 画笔动态/纹理/间距、图案图章、背景/魔术橡皮擦、混合器画笔、艺术历史画笔、完整液化、修复画笔变体、WinTab |
 | 文字 / 形状 / 渐变 | 10% | 16 | 8 | 50% | 可编辑文字图层（改字/改字号重渲、`.comp` 往返可编辑、栅格化）、**字体枚举与选择器**（系统字体扫描、过滤、CJK 标记、应用到文字图层）、CJK（Noto Sans SC）、字号/行距/字距/AA、**段落框（按框折行、框高裁切）与左/中/右对齐**、形状（矩形/椭圆/直线/贝塞尔）、**五类型渐变**（线性/径向/角度/对称/菱形）与多色标引擎（≤32 标、每标中点、确定性抖动、3 个只读预设 + **右栏可编辑色标表**：增删/位置/中点/RGB/不透明度） | 字体回退链、粗斜体、基线偏移、竖排、路径文字、文字变形、形状布尔运算、画布色标拖拽手柄、不透明度中点/噪点渐变、图案 |
-| 调整与滤镜 | 15% | 50 | 26 | 52% | 25 种调整（12 种上游 + 本仓追加 13 种：亮度对比/去色/阈值/色调分离/自然饱和度/可选颜色/照片滤镜/通道混合器/颜色查找/阴影高光/自动三档）、**破坏性 Image > Adjustments 全族 20 项**、15 种滤镜（含 Sharpen / Reduce Noise 与 Other 组的 High Pass / Minimum / Maximum / Offset）、Camera Raw 12 行 Basic | 模糊画廊/扭曲/像素化/风格化/渲染、RAW 解码、外部 LUT 文件 |
+| 调整与滤镜 | 15% | 50 | 26 | 52% | 25 种调整（12 种上游 + 本仓追加 13 种：亮度对比/去色/阈值/色调分离/自然饱和度/可选颜色/照片滤镜/通道混合器/颜色查找/阴影高光/自动三档）、**破坏性 Image > Adjustments 全族 20 项**、16 种滤镜（含 Sharpen / Reduce Noise 与 Other 组的 High Pass / Minimum / Maximum / Offset / Custom）、Camera Raw 12 行 Basic | 模糊画廊/扭曲/像素化/风格化/渲染、RAW 解码、外部 LUT 文件 |
 | 变换与画布 | 5% | 11 | 8 | 73% | 移动、缩放、15° 旋转、3 种重采样、水平/垂直翻转、裁剪（比例/对称）、图像大小（约束比例/百分比）、画布大小（九宫格锚点）、旋转画布、修边、**数值变换（宽/高/角度，中心锚定）与再次变换（`Ctrl+Shift+T`）** | 斜切/扭曲/透视/变形（Warp）、内容识别缩放、拉直裁剪 |
 | 视图 / 界面 | 5% | 20 | 11 | 55% | 10 个面板、三栏布局与侧栏整块收起、工具选项栏、笔尖轮廓光标、缩放/抓手、**标尺/参考线/网格/对齐**、**HiDPI 原生渲染（Per-Monitor V2）**、状态栏、历史容量设置、工具表 20 项 | 面板浮动/停靠/合并、工作区保存、通道/导航器/色板/属性/动作面板、主题、快捷键自定义 |
 | 色彩 / 输出 / 自动化 | 5% | 15 | 3 | 20% | sRGB 工作流、图层级 RGBA16/16F、7 条 ABI 命令表 | ICC/CMYK/Lab/灰度/索引、软打样、8/16/32 位**文档**模式、打印/PDF/X、动作录制、批处理、脚本、数据驱动图形 |
@@ -122,18 +122,18 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 
 | 项 | 结果 |
 |---|---|
-| `scripts/build.py` | **778 例 / 0 失败**（§6.116 新增 6 例：Other 组 5 例 + `.comp` 往返 1 例；772 → 778） |
-| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（778 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
-| 壳自检 | **267 项 failures=0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批；其后 §6.94～§6.109 未改自检项，§6.110～§6.113 追加 4 项——面板过滤、图层复合、智能对象/智能滤镜、填充层——基线同步到 267 项；§6.114～§6.116 未改自检项，SHA256 不变） |
+| `scripts/build.py` | **781 例 / 0 失败**（§6.117 新增 3 例：Custom 像素 1 例 + ABI 1 例 + `ui_core` 网格 1 例；778 → 781） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（781 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
+| 壳自检 | **267 项 failures=0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批；其后 §6.94～§6.109 未改自检项，§6.110～§6.113 追加 4 项——面板过滤、图层复合、智能对象/智能滤镜、填充层——基线同步到 267 项；§6.114～§6.117 未改自检项，SHA256 不变） |
 | OHOS 交叉编译 | `compile ok=121 fail=0`（回归步骤 6 rc=0 复核；121 = 118 + 3 个新翻译单元 `fill_layer.cpp`、`comp_fill_abi.cpp`、`shell_fill.cpp`；复合与智能对象写进既有文件，不增单元） |
 | `^COMP_API` 导出 | **211**（152 → 158 → 163 → 164 → 166 → 167 → 171 → 173 → 176 → 178 → 188 → 196 → 208 → 211，全部尾部追加、无重排：6 个 `comp_guide_*`、5 个 `comp_selection_channel_*`、`comp_layer_apply_adjustment`、`comp_selection_grow`/`comp_selection_similar`、`comp_selection_transform`、4 个 `comp_layer_*_lock` / `color_label`、`comp_layer_merge_visible`/`comp_layer_reverse`、`comp_layer_link`/`unlink`/`get_link`、`comp_layer_export_style`/`comp_layer_import_style`（178），10 个 `comp_layer_comp_*`（188），8 个 `comp_layer_smart_object_*` / `comp_layer_smart_filter_*`（196），12 个 `comp_layer_*_fill` 与填充参数表（208），`comp_layer_smart_filter_move`/`_set_name`/`_name`（211）；§6.97/§6.104 只追加枚举值，§6.98 只追加枚举/结构体与 `comp_tool_op_desc` 尾字段，§6.116 只追加 4 个 kind 与 5 个结构/枚举、导出数不变） |
 | `scripts/check_tool_table.py` | PASS（20 工具，下标 0..19） |
-| `scripts/visual_check.py --scene all` | **240 条 / 39 场景 / 0 失败**（追加过 `font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`，并扩了 `destructive_adjust` 的 Photo Filter / Auto Tone 两条；§6.110～§6.115 未新增场景；既有阈值未动） |
+| `scripts/visual_check.py --scene all` | **246 条 / 40 场景 / 0 失败**（追加过 `font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`、`filter_custom`，并扩了 `destructive_adjust` 的 Photo Filter / Auto Tone 两条；§6.110～§6.116 未新增场景；§6.117 追加 `filter_custom` 6 条；既有阈值未动） |
 | `scripts/crosscheck_psd.py` | **67 项断言 / 0 失败**（psd-tools 独立实现，见 README §6.87） |
 | 进程 DPI 感知 | `Shcore!GetProcessDpiAwareness` = **2（per-monitor）**；`--dpi=96/144/192` 覆盖截图见 `report/assets/s15/dpi-check-*.png`（§6.93） |
 
-规模参考（2026-10-25 实测）：引擎 ≈108.7k 行（含内嵌 zlib / libpng / stb，不含 freetype）、
-Windows 壳 ≈23.8k 行（17 个 `.cpp`，含 `main.cpp`）、测试 ≈36.3k 行（50 个 `.cpp`）。
+规模参考（2026-10-25 实测）：引擎 ≈108.9k 行（含内嵌 zlib / libpng / stb，不含 freetype）、
+Windows 壳 ≈23.9k 行（17 个 `.cpp`，含 `main.cpp`）、测试 ≈36.6k 行（50 个 `.cpp`）。
 
 ---
 
@@ -151,7 +151,8 @@ Windows 壳 ≈23.8k 行（17 个 `.cpp`，含 `main.cpp`）、测试 ≈36.3k �
 的最后一块补齐，P1-2 八批（锁/标签 §6.106、合并可见/反向排列 §6.107、图层链接
 §6.108、样式拷贝/粘贴 §6.109、面板过滤 §6.110、图层复合 §6.111、智能对象/智能滤镜
 §6.112、填充层 §6.113）把图层面板整个收齐——连 PS 里最「重」的两件（智能对象、
-图层复合）都在：
+图层复合）都在；滤镜菜单经 §6.116 / §6.117 补齐 `Other` 四件与 `Custom` 的 5×5
+核表（11 → 16 种，命令 1200..1215）：
 日常路径 70% → **78%**，全功能面 51% → **62%**。
 HiDPI 抬的更多是「用起来像不像 PS」（文字与分隔线在 150%/200% 屏上终于是原生像素），
 不是条目数；破坏性调整则是把「PS 里最顺手的一条路」补上。再往上要靠画笔动态、

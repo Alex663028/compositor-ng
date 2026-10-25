@@ -94,9 +94,9 @@ CMD_ADJ_KIND_PREV = 1014
 CMD_ADJ_ADD = 1022
 CMD_ADJ_APPLY = 1023
 CMD_ADJ_VALUE_UP = 1021
-# 面板动作号落在 1220 段：滤镜序号涨到 15 个（1200..1214）后，1210 已经是
-# Sharpen、1211..1214 是 High Pass / Minimum / Maximum / Offset 的菜单项，旧的应用号
-# 会和菜单项抢同一个 id（见 shell_state.h）。面板动作号 1220..1222。
+# 面板动作号落在 1220 段：滤镜序号涨到 16 个（1200..1215）后，1210 已经是
+# Sharpen、1211..1214 是 High Pass / Minimum / Maximum / Offset、1215 是 Custom 的
+# 菜单项，旧的应用号会和菜单项抢同一个 id（见 shell_state.h）。面板动作号 1220..1222。
 CMD_FILTER_APPLY = 1220
 # 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..24 是本仓追加的破坏性调整
 # （亮度对比、去色、阈值、色调分离、自然饱和度、可选颜色、照片滤镜、通道混合器、
@@ -1432,6 +1432,75 @@ def scene_filter_other(shell, checker):
                       count_matching(img, row1, COL_HIGHLIGHT, 12) > 100,
                       "高亮像素 %d" % count_matching(img, row1, COL_HIGHLIGHT, 12))
         shell.press(VK_ESCAPE)
+
+
+def scene_filter_custom(shell, checker):
+    """Custom（1215）：面板第一次用网格排版（5×5 核表 + 除数 + 偏移）。
+
+    钉三件事：
+      ① 命令号 1215 能打开 Custom，第一格高亮只占一行宽度的约 1/5——不是整宽行，
+         这证明 `FilterSpec::columns` 真的进了绘制与命中；
+      ② 方向键在核内下移 6 次落到第 27 项 Offset（整宽行），证明网格导航与
+         行几何同源（5 列 × 5 行核 = 25 项，第 26 项是 Scale、第 27 项是 Offset）；
+      ③ 在 Offset 行键入 40 回车，整幅平坦场每通道 +40，Ctrl+Z 一步还原。
+    """
+    scene = "filter_custom"
+    doc = shell.document_rect()
+    left, top, right, bottom = doc
+    shell.press(ord("X"), shift=True)
+    shell.type_text("8899aa")
+    shell.press(VK_RETURN)
+    shell.select_tool("shape")
+    shell.drag(left, top, right, bottom, steps=8)
+    shell.wait(0.4)
+    img = shell.shot("9c_custom_flat_field")
+    probe = (left + 20, top + 20, left + 80, top + 80)
+    before = mean_rgb(img, probe)
+    checker.check(scene, "铺一块平坦纯色场（用 offset 量整幅变化）",
+                  before[2] - before[0] > 20, "实测 %s" % (before,))
+
+    adjust = shell.layout["adjust"]
+    panel_w = adjust[2] - adjust[0]
+    cell_w = panel_w // 5
+    row_h = 20
+    rows_top = adjust[1] + 53
+    first_cell = (adjust[0] + 6, rows_top, adjust[0] + cell_w - 8, rows_top + row_h)
+    right_half = (adjust[0] + panel_w // 2, rows_top, adjust[2] - 8, rows_top + row_h)
+
+    shell.command(CMD_FILTER_BASE + 15)
+    img = shell.shot("9d_custom_panel")
+    checker.check(scene, "Custom 面板打开且第一格高亮",
+                  count_matching(img, first_cell, COL_HIGHLIGHT, 12) > 100,
+                  "首格高亮像素 %d" % count_matching(img, first_cell, COL_HIGHLIGHT, 12))
+    checker.check(scene, "高亮只占一格，不是整宽行（网格排版生效）",
+                  count_matching(img, right_half, COL_HIGHLIGHT, 12) < 40,
+                  "右半行高亮像素 %d" % count_matching(img, right_half, COL_HIGHLIGHT, 12))
+
+    # 6 次下移：0 → 5 → 10 → 15 → 20 → 25(Scale) → 26(Offset)。核占 5 个可视行，
+    # 所以 Offset 落在可视第 7 行（索引 6）。
+    for _ in range(6):
+        shell.press(VK_DOWN)
+    img = shell.shot("9e_custom_offset_row")
+    offset_row = (adjust[0] + 6, rows_top + 6 * row_h, adjust[2] - 8, rows_top + 7 * row_h)
+    checker.check(scene, "方向键把焦点从核内带到整宽的 Offset 行",
+                  count_matching(img, offset_row, COL_HIGHLIGHT, 12) > 200,
+                  "Offset 行高亮像素 %d" % count_matching(img, offset_row, COL_HIGHLIGHT, 12))
+
+    shell.type_text("40")
+    shell.press(VK_RETURN)
+    shell.press(VK_ESCAPE)
+    shell.wait(0.8)
+    img = shell.shot("9f_custom_offset_applied")
+    shifted = mean_rgb(img, probe)
+    target = tuple(min(255, int(round(c)) + 40) for c in before)
+    checker.check(scene, "Offset 40 让整幅每通道 +40（核仍是恒等核）",
+                  near(shifted, target, 10), "预期 %s 实测 %s" % (target, shifted))
+    shell.press(ord("Z"), ctrl=True)
+    shell.wait(0.8)
+    img = shell.shot("a0_custom_offset_undone")
+    restored = mean_rgb(img, probe)
+    checker.check(scene, "撤销一步回到原色（且只落了一步）",
+                  near(restored, before, 12), "原 %s 现 %s" % (before, restored))
 
 
 def scene_adjustment(shell, checker):
@@ -3694,6 +3763,7 @@ SCENES = [    ("start", scene_start, ()),
     ("layer_link", scene_layer_link, ()),
     ("layer_style_paste", scene_layer_style_paste, ()),
     ("filter_other", scene_filter_other, ()),
+    ("filter_custom", scene_filter_custom, ()),
 ]
 
 

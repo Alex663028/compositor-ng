@@ -324,6 +324,40 @@ struct OffsetSettings {
   int32_t wrap = 0;
 };
 
+/*
+ * Custom（上游 Filter > Other > Custom）。
+ *
+ * `kernel[25]` 是 5×5 卷积核，行优先（`kernel[row * 5 + column]`，第 0 行是
+ * 最上面一行）。卷积在**直通（unpremultiply 后）**颜色上做，每通道：
+ *
+ *   out = sum(kernel[i] * 邻居直通色) / divisor + offset
+ *   divisor = (scale == 0 ? 1 : scale)
+ *
+ * 再乘回**原** alpha；alpha 逐字节不变。alpha == 0 的像素原样跳过，邻域里的
+ * 透明像素没有直通色、按 0 参与累加——除数是面板给的 `scale`，不按覆盖率归一，
+ * 所以紧贴透明区的轮廓像素会因为少了那几格权重而偏暗（5×5 直通卷积的直接结果，
+ * 不是 bug；docs/filters.md §3.16 记这条边界）。
+ *
+ * 参数闸：核项 / `scale` / `offset` 都在 -999..999（上游对话框的量程）。
+ * `scale` 为 0 按 1 处理（= 不除），这样面板把「除数」清空时不会除零。
+ *
+ * 缺省 = 恒等核（中心 1，其余 0）+ scale 1 + offset 0：默认构造的
+ * `FilterSettings{}` 因此仍是恒等，与其余滤镜的零初始化口径一致。
+ *
+ * 边界：邻居坐标夹到图层内（边缘延展），不复制/环绕；预览（scale < 1）**不缩放**
+ * 核——卷积核没有连续的「半径」语义，降采样预览的观感会比全尺寸偏强，
+ * 这条差异写在 docs/filters.md §3.16。
+ */
+struct CustomSettings {
+  double kernel[25] = {0.0, 0.0, 0.0, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0, 0.0,
+                       0.0, 0.0, 1.0, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0, 0.0};
+  double scale = 1.0;
+  double offset = 0.0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -341,6 +375,7 @@ enum FilterKind {
   kFilterMinimum = 12,
   kFilterMaximum = 13,
   kFilterOffset = 14,
+  kFilterCustom = 15,
 };
 
 /*
@@ -364,6 +399,7 @@ struct FilterSettings {
   MinimumSettings minimum;
   MaximumSettings maximum;
   OffsetSettings offset;
+  CustomSettings custom;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

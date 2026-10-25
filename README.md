@@ -8573,9 +8573,118 @@ out_required)`：`buffer = NULL` 或 `capacity = 0` 只回报所需长度（含 
   半径上限 100；
 - Offset 的环绕范围是**图层像素矩形**，不是画布；`wrap = 1` 会丢掉移出图层的内容
   （反向位移不能完全还原，另两种可以）；
-- 滤镜面板仍是「回车即应用、没有取消预览」，参数步进会逐帧出全分辨率预览（同 §6.114）；
-- 上游 `Filter > Other` 里的 **Custom（自定）** 仍未做：它要的是一张可编辑的卷积核
-  表格，属于下一轮的面板模型扩展，不在本批。
+- 滤镜面板仍是「回车即应用、没有取消预览」，参数步进会逐帧出全分辨率预览（同 §6.114）。
+
+
+### 6.117 滤镜 Custom：一张 5×5 数字表，和它要的面板网格（P1-5 收尾，2026-10-25，Claude）
+
+**缺口。** §6.116 收尾时留下的唯一一条：`Filter > Other > Custom（自定）`。它和其余
+15 个滤镜的差别不在像素内核（卷积是最老的那类算子），而在**参数形态**——参数不是
+几个标量，而是一张 5×5 可编辑的核表，加除数与偏移。这正是它一直没人做的原因：
+面板模型（`FilterSpec` / `FilterPanel`）此前只会画「一行一个标量」。
+
+**引擎：三条口径。** `kFilterCustom = 15` 尾部追加，零初始化仍是恒等（恒等核是
+NSDMI 缺省，不是特判）：
+
+```
+out(p) = clamp(sum(kernel[i] * straight(neighbour_i)) / divisor + offset, 0, 255)
+divisor = (scale == 0 ? 1 : scale)        // 面板允许把除数清成 0，引擎不为 0 除
+```
+
+| 口径 | 判据 |
+|---|---|
+| 直通色上卷积、乘回**原** alpha | alpha 逐字节不变（滤镜不撑开 / 不啃掉轮廓） |
+| 邻居坐标夹到图层内（边缘延展） | 全 1 核 / divisor 25 作用在均匀图层上**逐字节不变** |
+| `scale == 0` 按 1 处理 | 同一份核在 `scale = 0` 与 `1` 下逐字节相同 |
+
+容易写错的地方：
+
+- **先整份拷出源像素**。卷积读的是原图邻居，原地写会污染右侧 / 下方的采样——
+  这和 Offset 的「先拷源再写」是同一条纪律，但这里连重叠区都不是安全的。
+- **透明邻居按 0 参与累加，除数不归一**。`alpha == 0` 的像素先跳过；邻居 alpha 为 0
+  时没有直通色可用，那一格就是 0 权重。于是紧贴透明区的轮廓像素会偏暗：
+  8×8 方块左上角的窗口里只有 9 个不透明邻居，`9 * 255 / 25 ≈ 92`，测试按 92 钉住。
+  **这不是 bug**，是「直通卷积 + 面板给的除数」这本账的直接结果；反过来如果按覆盖率
+  归一，用户填的 divisor 就不再是 divisor 了。文档 §3.16 / §5 第 14 条各记一次。
+- **预览不缩放核**。别的滤镜半径乘 `scale`，核没有连续的「半径」语义；这条差异
+  写进 note（`previews do not rescale the kernel`），不假装降采样预览等于全尺寸。
+- **零初始化有两层**。域层靠 NSDMI（`kernel[12] = 1`）让 `FilterSettings{}` 是恒等；
+  ABI 层收到的 `comp_filter_custom` 若**完全未触碰**（核全 0 + scale 0 + offset 0），
+  `to_domain` 映射成恒等核、不把它当「全 0 输出黑」。想显式要黑就把 `scale` 置 1 或
+  `offset` 置非 0——`comp_filter.h` 里写明了这条。
+- **恒等判据**：核恰为恒等核、`offset == 0`、`scale ∈ {0, 1}`（两者同为除数 1）。
+
+**ABI 仍是尾追加，导出数不变。** `COMP_FILTER_CUSTOM = 15`、
+`comp_filter_custom { double kernel[25]; double scale; double offset; }`、
+`comp_filter_desc` 尾部一个成员。`^COMP_API` 仍是 **211**。核项 / `scale` / `offset`
+都在 -999..999，越界在参数闸拒绝（不开事务、不写半成品）。
+
+**壳层：面板模型第一次有了「网格」。** 这是本批唯一需要动 `ui_core.h` 的地方：
+
+- `FilterSpec` 尾部追加 `columns` / `grid_count`（缺省 `1` / `0`），只有 Custom 填
+  `5` / `25`。聚合初始化器不必改，15 个既有滤镜的 `{id, name, count, {{…}}}` 照常编译。
+- `FilterParamSpec` 加了 NSDMI（`label = ""` 等），`kMaxParams` 6 → 32——否则核表
+  的 27 行装不下，且未填的槽位不再是「非空串 + 零量程」。
+- 行矩形与命中测试抽成 `filter_param_row_rect` / `filter_param_row_at`，新增的两个参数
+  **带默认值**，既有两参调用（含测试）一处未改；`in_grid` 的行按 `window.w / columns`
+  分格，核之后的行（Scale / Offset）仍整宽。
+- 方向键在核内移动（`focus_vertical` / `focus_horizontal` / `filter_focus_grid`）：
+  上下按行步进、行首行尾夹住、下移越过核落到第一条整宽行（Scale）；左右在行内走，
+  不折到相邻行。单列面板**完全不进这段逻辑**，键位与绘制逐像素未变——壳自检的
+  SHA256 因此仍是基线。
+- 核格子里只画数值（PS 的自定就是一张数字表），参数名（`K1`…`K25`）在状态行给；
+  提示行换成 `方向键在核内移动 · Tab 逐项` / `Scale 0 按 1 处理 · 核不随预览缩放`。
+- 智能滤镜栈里的条目摘要不再打印「前两个系数」（对核没意义），改印
+  `5x5 · Div <scale> · Off <offset>`。
+
+**命令号**：菜单项 1200..**1215**（Custom 占 1215，`kCmdFilterApply = 1220` 之前仍有余量）。
+
+**持久化。** `.comp` 的 `engineSmart.filters[]` 写 25 个 `kernel` 数字 + `scale` + `offset`；
+读回时 `kernel` 必须是长度 ≥ 25 的数组，缺字段保持恒等核，随后照常过
+`filter_settings_valid`（坏值让整条滤镜作废，不静默夹取）。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/domain/filters.h` / `.cpp` | `CustomSettings`、`kFilterCustom = 15`、`custom_pixels`、`custom_identity` / `custom_equal`、valid / label / note、dispatch |
+| `engine/abi/include/compositor/comp_filter.h` | `COMP_FILTER_CUSTOM`、`comp_filter_custom`、`comp_filter_desc.custom` |
+| `engine/abi/src/comp_filter_abi.cpp` | `to_domain` 的「未触碰才保留恒等核」判断 |
+| `engine/format/comp_file.cpp` | `kernel` / `scale` / `offset` 的写读与长度校验 |
+| `shells/windows/src/ui_core.h` | `FilterId::Custom`、`FilterSpec::columns/grid_count`、`FilterParamSpec` NSDMI、网格几何与方向键导航 |
+| `shells/windows/src/shell_filter.cpp` | `build_filter_desc` / `filter_load_values` 分支、`filter_focus_grid` |
+| `shells/windows/src/shell_window.cpp` | 面板开着时方向键先给网格；鼠标命中带上 `columns` / `grid_count` |
+| `shells/windows/src/shell_paint.cpp` | 网格行只画数值、提示行分两套文案 |
+| `shells/windows/src/shell_layers.cpp` | 智能滤镜摘要 `5x5 · Div · Off` |
+| `shells/windows/src/shell_internal.h` / `shell_state.h` | `static_assert`、`filter_focus_grid` 声明、命令号注释 0..15 |
+| `tests/test_filters.cpp` | 2 例：核的像素口径（含边缘延展 / 覆盖不归一 / scale 0）/ ABI 字段与零初始化 |
+| `tests/test_ui_core.cpp` | 表长 16、`{…,27}`、网格元数据、`ui_core_filter_grid_layout_and_navigation` |
+| `scripts/visual_check.py` | 追加 `filter_custom` 场景 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **781 例 / 0 失败**（778 → 781：滤镜 2 例、`ui_core` 网格 1 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（781 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（网格只在 Custom 上生效，15 个既有滤镜的绘制与命中路径未变） |
+| `scripts/visual_check.py --scene all` | **246 项 / 40 场景 / 0 失败**（240 → 246：只追加 `filter_custom`） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（Custom 落在 `filters.cpp` 与既有壳文件里，TU 数不变） |
+| `^COMP_API` 导出 | **211**（本批零新增） |
+| `scripts/check_tool_table.py` | **20 个工具 PASS** |
+
+`filter_custom` 场景不靠 OCR，量的是三件几何 / 数值事实：`1215` 打开面板后**左五分之一**
+首格有高亮（1000 px）而**右半边**同一行 0 px——网格排版真的生效，不是整宽行；连按 6 次
+`↓` 后焦点落进整宽的 Offset 行（6114 px 高亮）；在恒等核上键入 `40` 回车，探测区
+`(136,153,170) → (176,193,210)`，通道差恰为 +40，Ctrl+Z 一步回到原值。
+
+**已知边界：**
+
+- 核只到 5×5（同 PS 的「自定」对话框），没有 3×3 / 7×7 预设与「载入 / 存储」核文件；
+- 面板是数值表，画布上没有可拖的核图；`Scale` 允许为 0（按 1 处理），负数合法（反相）；
+- 透明邻居按 0 参与累加、除数不按覆盖率归一，所以紧贴透明区的轮廓会偏暗（§3.16 记了
+  92 这个可复现的数值）；这不影响不透明区的结果；
+- 预览不缩放核：全分辨率预览与最终落墨一致，但比别的滤镜慢（每像素 25 次采样，
+  与核里的零无关，不做稀疏跳过）。
+
 
 
 

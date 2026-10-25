@@ -958,7 +958,7 @@ inline int step_swatch(int index, int direction) {
 /* ------------------------------------------------------------ 滤镜面板 */
 
 /*
- * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..14，尾部追加）；
+ * 滤镜种类。数值必须与 ABI `comp_filter_kind` 一致（0..15，尾部追加）；
  * 头文件之间不互相 include，这条约束由 test_ui_core 的 static_assert 钉死。
  */
 enum class FilterId : int {
@@ -977,31 +977,43 @@ enum class FilterId : int {
   Minimum = 12,
   Maximum = 13,
   Offset = 14,
+  Custom = 15,
   Count
 };
 
-/* 面板上一行参数。量程 / 步长 / 缺省值逐项对齐 docs/filters.md §3 的表。 */
+/*
+ * 面板上一行参数。量程 / 步长 / 缺省值逐项对齐 docs/filters.md §3 的表。
+ *
+ * `label` 的缺省值必须是 `""` 而不是 nullptr：表格里没写满的行（`params` 的
+ * 尾部空位）靠 NSDMI 保持「非空指针 + 空串」，绘制与既有测试都按这个口径判断。
+ */
 struct FilterParamSpec {
-  const char* label; /* 英文名；外壳负责转宽字符 */
-  double min_value;
-  double max_value;
-  double step;
-  double default_value;
+  const char* label = ""; /* 英文名；外壳负责转宽字符 */
+  double min_value = 0.0;
+  double max_value = 0.0;
+  double step = 0.0;
+  double default_value = 0.0;
 };
 
 /*
  * 一个滤镜的面板定义。`params` 顺序 = 面板行序，也是壳层把 values[] 搬进
- * `comp_filter_desc` 的顺序（映射写在 main.cpp，一处）。
+ * `comp_filter_desc` 的顺序（映射写在 shell_filter.cpp，一处）。
+ *
+ * 排版：`columns > 1` 时**前 `grid_count` 行**按 `columns` 列排成网格
+ * （Custom 的 5×5 卷积核就是这样铺的），其余行仍是整宽单列。两个字段都有
+ * 缺省值，既有滤镜的聚合初始化不用改、绘制与命中逐像素不变。
  *
  * 能力边界：Vignette 的边缘色 `color[3]` 不在面板上（v1 固定 0,0,0），
  * 这不是遗漏——面板行模型只承载标量，颜色选择器属后续 UI 轮次。
  */
 struct FilterSpec {
-  static constexpr int kMaxParams = 6;
+  static constexpr int kMaxParams = 32;
   FilterId id;
   const char* name;
   int param_count;
   FilterParamSpec params[kMaxParams];
+  int columns = 1;     /* 网格列数；1 = 全部整宽单列 */
+  int grid_count = 0;  /* 参与网格的行数（从第 0 行起） */
 };
 
 inline const FilterSpec* filter_table(size_t* out_count) {
@@ -1144,6 +1156,40 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0},
         {"", 0.0, 0.0, 0.0, 0.0}}},
+      /* Filter > Other > Custom（kind 15）：5×5 卷积核（前 25 行按 5 列铺成
+       * 表格，第 0 行是最上面一行）+ 除数 + 偏移。缺省 = 恒等核（中心 1）。 */
+      {FilterId::Custom,
+       "Custom",
+       27,
+       {{"K1", -999.0, 999.0, 1.0, 0.0},
+        {"K2", -999.0, 999.0, 1.0, 0.0},
+        {"K3", -999.0, 999.0, 1.0, 0.0},
+        {"K4", -999.0, 999.0, 1.0, 0.0},
+        {"K5", -999.0, 999.0, 1.0, 0.0},
+        {"K6", -999.0, 999.0, 1.0, 0.0},
+        {"K7", -999.0, 999.0, 1.0, 0.0},
+        {"K8", -999.0, 999.0, 1.0, 0.0},
+        {"K9", -999.0, 999.0, 1.0, 0.0},
+        {"K10", -999.0, 999.0, 1.0, 0.0},
+        {"K11", -999.0, 999.0, 1.0, 0.0},
+        {"K12", -999.0, 999.0, 1.0, 0.0},
+        {"K13", -999.0, 999.0, 1.0, 1.0},
+        {"K14", -999.0, 999.0, 1.0, 0.0},
+        {"K15", -999.0, 999.0, 1.0, 0.0},
+        {"K16", -999.0, 999.0, 1.0, 0.0},
+        {"K17", -999.0, 999.0, 1.0, 0.0},
+        {"K18", -999.0, 999.0, 1.0, 0.0},
+        {"K19", -999.0, 999.0, 1.0, 0.0},
+        {"K20", -999.0, 999.0, 1.0, 0.0},
+        {"K21", -999.0, 999.0, 1.0, 0.0},
+        {"K22", -999.0, 999.0, 1.0, 0.0},
+        {"K23", -999.0, 999.0, 1.0, 0.0},
+        {"K24", -999.0, 999.0, 1.0, 0.0},
+        {"K25", -999.0, 999.0, 1.0, 0.0},
+        {"Scale", -999.0, 999.0, 1.0, 1.0},
+        {"Offset", -999.0, 999.0, 1.0, 0.0}},
+       5,
+       25},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kFilters) / sizeof(kFilters[0]);
@@ -1195,13 +1241,24 @@ struct FilterPanel {
 
   FilterId id = FilterId::Vignette;
   int focused = 0;
-  double values[kMaxParams] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  double values[kMaxParams] = {};
 
   const FilterSpec* spec() const { return filter_spec(id); }
 
   int param_count() const {
     const FilterSpec* definition = spec();
     return definition != nullptr ? definition->param_count : 0;
+  }
+
+  /* 网格排版（见 FilterSpec::columns / grid_count）；单列滤镜回落 1 / 0。 */
+  int columns() const {
+    const FilterSpec* definition = spec();
+    return (definition != nullptr && definition->columns > 0) ? definition->columns : 1;
+  }
+
+  int grid_count() const {
+    const FilterSpec* definition = spec();
+    return definition != nullptr ? definition->grid_count : 0;
   }
 
   const FilterParamSpec* param_at(int row) const {
@@ -1242,6 +1299,55 @@ struct FilterPanel {
     if (focused >= count) focused = count - 1;
   }
 
+  /*
+   * 网格上下移动（每次挪一整行 = `columns` 个参数）。只对网格部分生效：
+   *   - 在网格顶行再往上：停在本列首格，不跳到别的列；
+   *   - 往下越过网格：落到网格后的第一条整宽行（Custom 的 Scale），再往下走
+   *     就按单列口径逐行；网格外（Scale / Offset）沿用 `focus`。
+   * 非网格面板（columns == 1 或 grid_count == 0）等价于 `focus(direction)`。
+   */
+  void focus_vertical(int direction) {
+    const FilterSpec* definition = spec();
+    const int count = param_count();
+    if (definition == nullptr || count <= 0) {
+      focused = 0;
+      return;
+    }
+    const int grid_columns = columns();
+    const int grid = grid_count();
+    if (grid_columns <= 1 || grid <= 0 || focused >= grid) {
+      focus(direction);
+      return;
+    }
+    if (direction < 0) {
+      focused = focused >= grid_columns ? focused - grid_columns : (focused % grid_columns);
+      return;
+    }
+    int next = focused + grid_columns;
+    if (next >= grid) next = (grid < count) ? grid : grid - 1;
+    focused = next;
+  }
+
+  /*
+   * 网格左右移动（挪一格）。撞到本行行首/行尾（或网格最后一行的空位）就停住，
+   * 不折到上一行/下一行；网格外沿用 `focus`。
+   */
+  void focus_horizontal(int direction) {
+    const FilterSpec* definition = spec();
+    const int grid_columns = columns();
+    const int grid = grid_count();
+    if (definition == nullptr || grid_columns <= 1 || grid <= 0 || focused >= grid) {
+      focus(direction);
+      return;
+    }
+    const int column = focused % grid_columns;
+    const int row_start = focused - column;
+    const int next = column + (direction >= 0 ? 1 : -1);
+    if (next < 0 || next >= grid_columns) return;
+    if (row_start + next >= grid) return; /* 末行的空位 */
+    focused = row_start + next;
+  }
+
   /* 调整焦点行的值；返回是否真的变化。 */
   bool step(int direction) {
     const FilterParamSpec* parameter = param_at(focused);
@@ -1264,18 +1370,52 @@ struct FilterPanel {
 inline constexpr int kFilterRowHeight = 20;
 inline constexpr int kFilterRowsTop = 54; /* 标题 + 滤镜名两行 + 间距 */
 
-inline Rect filter_param_row_rect(const Rect& panel, int row) {
-  return Rect{panel.x, panel.y + kFilterRowsTop + row * kFilterRowHeight, panel.w,
-              kFilterRowHeight};
+/*
+ * 参数行的视觉行号：网格行按 `columns` 压缩，网格后的行接在网格下方。
+ * `columns <= 1` / `grid_count <= 0` 时就是行号本身（既有滤镜不变）。
+ */
+inline int filter_visual_row(int row, int columns, int grid_count) {
+  if (columns <= 1 || grid_count <= 0 || row < 0) return row;
+  if (row < grid_count) return row / columns;
+  return (grid_count + columns - 1) / columns + (row - grid_count);
 }
 
-inline int filter_param_row_at(const Rect& panel, int param_count, double x, double y) {
+inline Rect filter_param_row_rect(const Rect& panel, int row, int columns = 1,
+                                 int grid_count = 0) {
+  int x = panel.x;
+  int w = panel.w;
+  if (columns > 1 && grid_count > 0 && row >= 0 && row < grid_count) {
+    const int cell_w = panel.w / columns;
+    x = panel.x + (row % columns) * cell_w;
+    w = cell_w;
+  }
+  const int visual = filter_visual_row(row, columns, grid_count);
+  return Rect{x, panel.y + kFilterRowsTop + visual * kFilterRowHeight, w, kFilterRowHeight};
+}
+
+inline int filter_param_row_at(const Rect& panel, int param_count, double x, double y,
+                               int columns = 1, int grid_count = 0) {
   if (param_count <= 0 || !panel.contains(x, y)) return -1;
   const double local = y - static_cast<double>(panel.y + kFilterRowsTop);
   if (local < 0.0) return -1;
-  const int row = static_cast<int>(std::floor(local / static_cast<double>(kFilterRowHeight)));
-  if (row < 0 || row >= param_count) return -1;
-  return row;
+  const int visual = static_cast<int>(std::floor(local / static_cast<double>(kFilterRowHeight)));
+  if (visual < 0) return -1;
+  if (columns <= 1 || grid_count <= 0) {
+    if (visual >= param_count) return -1;
+    return visual;
+  }
+  const int grid_visual_rows = (grid_count + columns - 1) / columns;
+  if (visual < grid_visual_rows) {
+    const int cell_w = panel.w / columns;
+    if (cell_w <= 0) return -1;
+    const int column = static_cast<int>((x - static_cast<double>(panel.x)) /
+                                        static_cast<double>(cell_w));
+    if (column < 0 || column >= columns) return -1;
+    const int row = visual * columns + column;
+    return row < grid_count ? row : -1; /* 网格末行的空位不命中 */
+  }
+  const int row = grid_count + (visual - grid_visual_rows);
+  return row < param_count ? row : -1;
 }
 
 /* ------------------------------------------------------------ 修边面板（图像 > 修边） */

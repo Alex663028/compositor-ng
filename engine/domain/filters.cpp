@@ -19,6 +19,7 @@
  *   Minimum        本文件 morphology_pixels（方形窗口腐蚀，单调队列）
  *   Maximum        本文件 morphology_pixels（方形窗口膨胀，单调队列）
  *   Offset         本文件 offset_pixels（整像素平移，三种露出处理）
+ *   Custom         本文件 custom_pixels（5×5 卷积，边缘延展）
  *
  * 本文件只做「校验 -> 装配 -> 调用 -> 选区混合 -> 事务」，不重新定义内核语义。
  */
@@ -237,6 +238,37 @@ bool offset_valid(const OffsetSettings& s, std::string* error) {
     return set_error(error, "offset wrap must be 0 (transparent), 1 (edge) or 2 (wrap-around)");
   }
   return true;
+}
+
+/* 核项 / 除数 / 偏移都按上游对话框的 ±999 量程；越界拒绝，不静默夹取。 */
+bool custom_valid(const CustomSettings& s, std::string* error) {
+  for (int i = 0; i < 25; ++i) {
+    if (!in_range(s.kernel[i], -999.0, 999.0)) {
+      return set_error(error, "custom kernel entry out of -999..999");
+    }
+  }
+  if (!in_range(s.scale, -999.0, 999.0)) {
+    return set_error(error, "custom scale out of -999..999");
+  }
+  if (!in_range(s.offset, -999.0, 999.0)) {
+    return set_error(error, "custom offset out of -999..999");
+  }
+  return true;
+}
+
+/* 恒等核 + 不缩放 + 不偏移。scale 0 与 1 同义（都为除数 1），两者都算恒等。 */
+bool custom_identity(const CustomSettings& s) {
+  for (int i = 0; i < 25; ++i) {
+    if (s.kernel[i] != (i == 12 ? 1.0 : 0.0)) return false;
+  }
+  return (s.scale == 0.0 || s.scale == 1.0) && s.offset == 0.0;
+}
+
+bool custom_equal(const CustomSettings& a, const CustomSettings& b) {
+  for (int i = 0; i < 25; ++i) {
+    if (a.kernel[i] != b.kernel[i]) return false;
+  }
+  return a.scale == b.scale && a.offset == b.offset;
 }
 
 /* ------------------------------------------------------------ 像素算子 */
@@ -956,6 +988,67 @@ comp_result offset_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t s
   return COMP_OK;
 }
 
+/*
+ * Custom：5×5 卷积，直通色上算、乘回原 alpha。
+ *
+ * 与 High Pass / Sharpen / Reduce Noise 同一套「直通色 -> 预乘回去」的口径：
+ *   - alpha == 0 的像素原样跳过；邻居 alpha == 0 时按 0 参与累加（透明区没有色）；
+ *   - 邻居坐标夹到图层内（边缘延展），所以边缘不会因为窗外像素被当成黑而发暗；
+ *   - 结果 `sum / divisor + offset`，逐通道夹到 0..255 后再乘回本像素的 alpha。
+ *
+ * 先整份拷出源像素：卷积要读原图邻居，原地写会污染右侧/下方的采样。
+ * 除数为 0 时按 1 处理（面板允许把 Scale 清成 0；引擎不为 0 除）。
+ */
+comp_result custom_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          const CustomSettings& s) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+
+  const double divisor = s.scale == 0.0 ? 1.0 : s.scale;
+  const int32_t last_x = width - 1;
+  const int32_t last_y = height - 1;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      const double alpha = p[3];
+      if (alpha == 0.0) continue;
+      for (int c = 0; c < 3; ++c) {
+        double sum = 0.0;
+        for (int ky = -2; ky <= 2; ++ky) {
+          const double* weights = s.kernel + (ky + 2) * 5;
+          int32_t sy = y + ky;
+          if (sy < 0) sy = 0;
+          if (sy > last_y) sy = last_y;
+          const uint8_t* src_row = source.data() + static_cast<size_t>(sy) * row_bytes;
+          for (int kx = -2; kx <= 2; ++kx) {
+            const double weight = weights[kx + 2];
+            if (weight == 0.0) continue;
+            int32_t sx = x + kx;
+            if (sx < 0) sx = 0;
+            if (sx > last_x) sx = last_x;
+            const uint8_t* q = src_row + static_cast<size_t>(sx) * 4u;
+            if (q[3] == 0) continue;
+            const double straight =
+                std::min(255.0, static_cast<double>(q[c]) * 255.0 / static_cast<double>(q[3]));
+            sum += weight * straight;
+          }
+        }
+        const double value = sum / divisor + s.offset;
+        const double clamped = value < 0.0 ? 0.0 : (value > 255.0 ? 255.0 : value);
+        const double premultiplied = std::lround(clamped * alpha / 255.0);
+        p[c] = static_cast<uint8_t>(std::min(premultiplied, alpha));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -992,6 +1085,9 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return morphology_pixels(rgba, width, height, stride, settings.maximum.radius, scale, true);
     case kFilterOffset:
       return offset_pixels(rgba, width, height, stride, settings.offset, scale);
+    case kFilterCustom:
+      /* 核没有连续的「半径」语义：预览不缩放核（见 filters.h 的边界说明）。 */
+      return custom_pixels(rgba, width, height, stride, settings.custom);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -1025,6 +1121,7 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterMinimum: return minimum_valid(settings.minimum, error);
     case kFilterMaximum: return maximum_valid(settings.maximum, error);
     case kFilterOffset: return offset_valid(settings.offset, error);
+    case kFilterCustom: return custom_valid(settings.custom, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -1053,6 +1150,7 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterOffset:
       return std::llround(settings.offset.horizontal) == 0 &&
              std::llround(settings.offset.vertical) == 0;
+    case kFilterCustom: return custom_identity(settings.custom);
   }
   return true;
 }
@@ -1111,6 +1209,7 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
     case kFilterOffset:
       return a.offset.horizontal == b.offset.horizontal &&
              a.offset.vertical == b.offset.vertical && a.offset.wrap == b.offset.wrap;
+    case kFilterCustom: return custom_equal(a.custom, b.custom);
   }
   return false;
 }
@@ -1132,6 +1231,7 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterMinimum: return "Minimum";
     case kFilterMaximum: return "Maximum";
     case kFilterOffset: return "Offset";
+    case kFilterCustom: return "Custom";
   }
   return "filter";
 }
@@ -1325,6 +1425,10 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
       *note += settings.offset.wrap == 0   ? "transparent uncovered areas"
                : settings.offset.wrap == 1 ? "edge extension in the uncovered areas"
                                            : "wrap-around in the uncovered areas";
+    }
+    if (settings.kind == kFilterCustom) {
+      *note += " as a 5x5 convolution on straight colour with edge-clamped neighbours "
+               "(alpha untouched; previews do not rescale the kernel)";
     }
     if (clip) *note += ", clipped to the document selection";
   }

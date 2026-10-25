@@ -201,6 +201,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::Maximum) == COMP_FILTER_MAXIMU
               "FilterId::Maximum must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::Offset) == COMP_FILTER_OFFSET,
               "FilterId::Offset must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
+              "FilterId::Custom must match comp_filter_kind");
 /* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
  * 按真实面板矩形夹滚动位置。 */
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：
@@ -422,6 +424,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::Offset) == COMP_FILTER_OFFSET,
   void close_filter_panel(ShellState& shell);
   void filter_reset_values(ShellState& shell);
   void filter_focus_row(ShellState& shell, int delta);
+  /* 网格面板（Custom 的 5×5 核）方向键：dx 左右挪一格、dy 上下挪一行。 */
+  void filter_focus_grid(ShellState& shell, int dx, int dy);
   void filter_step_value(ShellState& shell, int direction);
   void filter_begin_input(ShellState& shell, wchar_t character);
   void filter_backspace(ShellState& shell);

@@ -891,6 +891,15 @@ std::wstring smart_entry_name(comp_document document, comp_layer_id layer, size_
 std::wstring smart_entry_summary(const comp_filter_desc& desc) {
   const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(static_cast<int>(desc.kind));
   if (spec == nullptr) return std::wstring();
+  /* Custom 的前两行是核左上的两个系数，对摘要没意义：报核尺寸 + 除数 / 偏移。 */
+  if (desc.kind == COMP_FILTER_CUSTOM) {
+    std::wstring text = L"5x5";
+    text += L" · Div ";
+    text += widen_ascii(number_text(desc.custom.scale).c_str());
+    text += L" · Off ";
+    text += widen_ascii(number_text(desc.custom.offset).c_str());
+    return text;
+  }
   comp_ui::FilterPanel panel;
   panel.id = spec->id;
   filter_load_values(panel, desc);

@@ -1359,10 +1359,14 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
             comp_ui::filter_count(), spec != nullptr ? widen_ascii(spec->name).c_str() : L"?");
   TextOutW(dc, left + 10, y, line, lstrlenW(line));
 
+  /* 网格排版：columns > 1 时前 grid_count 行按网铺开（Custom 的 5×5 核）。 */
+  const int columns = shell.doc.filter.columns();
+  const int grid = shell.doc.filter.grid_count();
   for (int row = 0; row < shell.doc.filter.param_count(); ++row) {
     const comp_ui::FilterParamSpec* parameter = shell.doc.filter.param_at(row);
     if (parameter == nullptr) break;
-    const comp_ui::Rect row_rect = comp_ui::filter_param_row_rect(panel_rect, row);
+    const comp_ui::Rect row_rect =
+        comp_ui::filter_param_row_rect(panel_rect, row, columns, grid);
     const bool focused = row == shell.doc.filter.focused;
     if (focused) {
       RECT highlight{row_rect.x + 4, row_rect.y - 2, row_rect.right() - 6,
@@ -1372,6 +1376,14 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
       DeleteObject(brush);
     }
     SetTextColor(dc, focused ? RGB(255, 255, 255) : RGB(206, 208, 216));
+    const bool in_grid = columns > 1 && grid > 0 && row < grid;
+    if (in_grid) {
+      /* 核格子只写数值（PS 的 Custom 就是一张数字表），参数名见状态行。 */
+      wsprintfW(line, L"%s",
+                widen_ascii(number_text(shell.doc.filter.value(row)).c_str()).c_str());
+      TextOutW(dc, row_rect.x + 6, row_rect.y, line, lstrlenW(line));
+      continue;
+    }
     wsprintfW(line, L"%s = %s", widen_ascii(parameter->label).c_str(),
               widen_ascii(number_text(shell.doc.filter.value(row)).c_str()).c_str());
     TextOutW(dc, left + 12, row_rect.y, line, lstrlenW(line));
@@ -1384,11 +1396,13 @@ void draw_filter_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
   }
 
   SetTextColor(dc, RGB(140, 144, 156));
+  const bool grid_layout = columns > 1 && grid > 0;
   const wchar_t* hints[] = {
-      L"Tab / Shift+Tab 切参数",
+      grid_layout ? L"方向键在核内移动 · Tab 逐项" : L"Tab / Shift+Tab 切参数",
       L"- / = 调值 · 数字键输入",
       L"回车应用 · Esc 关闭",
-      L"Amount = 0 时滤镜为恒等（不改像素）",
+      grid_layout ? L"Scale 0 按 1 处理 · 核不随预览缩放"
+                  : L"Amount = 0 时滤镜为恒等（不改像素）",
   };
   int hint_y = bottom - 104;
   for (const wchar_t* hint : hints) {

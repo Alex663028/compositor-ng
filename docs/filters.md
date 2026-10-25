@@ -317,6 +317,38 @@ Minimum / Maximum 共用一份实现（`morphology_pixels(..., dilate)`），只
 
 - 环绕范围是**图层像素矩形**，不是画布（见 §5 第 13 条）。
 
+### 3.16 Custom（`COMP_FILTER_CUSTOM`）
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `kernel[25]` | -999..999 | 中心 `kernel[12] = 1`，其余 0 | 5×5 卷积核，行优先（`kernel[row * 5 + column]`，第 0 行在最上面） |
+| `scale` | -999..999 | 1 | 除数；**0 按 1 处理**（面板把除数清空时不除零） |
+| `offset` | -999..999 | 0 | 卷积后逐通道相加的常量 |
+
+```
+out(p) = clamp(sum(kernel[i] * straight(neighbour_i)) / divisor + offset, 0, 255)
+divisor = (scale == 0 ? 1 : scale)
+```
+
+- 卷积在**直通色**上做（`rgb / alpha`，夹到 255），结果再乘回**原** alpha：
+  alpha 逐字节不变，图层轮廓不会被卷积核自己撑开或收掉。
+- `alpha == 0` 的像素原样跳过；邻域里 alpha 为 0 的位置没有直通色，**按 0 参与累加**。
+  除数是面板给的 `scale`，不按覆盖率归一，所以紧贴透明区的轮廓像素会因为少了
+  那几格权重而偏暗（上面的 8×8 方块测试里，角落像素 = `9 * 255 / 25 ≈ 92`）。
+  这是 5×5 直通卷积的直接结果，**不是 bug**；需要「只改颜色不咬边」时用
+  High Pass / Sharpen 那类乘回 alpha 的算子，而不是自定义核。
+- 邻居坐标**夹到图层内**（边缘延展），窗外不当黑：全 1 核 / divisor 25 作用在
+  均匀图层上逐字节不变——这条测试同时钉住了边界口径。
+- 恒等判据：核恰为恒等核、`offset == 0`、且 `scale ∈ {0, 1}`（0 与 1 同为除数 1）。
+  零初始化的 `FilterSettings{}` 因此仍是恒等；ABI 侧把**完全未触碰**的
+  `comp_filter_custom`（核全 0 + scale 0 + offset 0）映射成恒等核，让
+  「零初始化 = 恒等」在 C 边界也成立。想显式要全 0 输出（黑）就把 `scale` 置 1
+  或 `offset` 置非 0。
+- note 写明 `as a 5x5 convolution on straight colour with edge-clamped neighbours
+  (alpha untouched; previews do not rescale the kernel)`。
+- 预览（`scale < 1`）**不缩小卷积核**：核没有连续的「半径」语义，降采样预览
+  会比全尺寸偏强（见 §5 第 14 条）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
@@ -355,8 +387,8 @@ note 写明 `document selection is empty`。
    方向与长度两条可观察口径一致，形状不声称逐像素等同，note 写明
    `CIMotionBlur's radius is the equivalent standard deviation`。
 7. **其余算子同样没有 16 位通路**：Gaussian Blur / Add Noise / Grain / Motion Blur /
-   Progressive Blur / Sharpen / Reduce Noise / High Pass / Minimum / Maximum / Offset
-   都跑在 8 位工作副本上（见 §6），HDR 拒绝。
+   Progressive Blur / Sharpen / Reduce Noise / High Pass / Minimum / Maximum / Offset /
+   Custom 都跑在 8 位工作副本上（见 §6），HDR 拒绝。
 8. **Progressive Blur 是 8 档混合，不是逐像素半径**。上游 `CIMaskedVariableBlur`
    逐像素连续变化半径；本仓把 `[from, to]` 切成 8 档、逐档均匀模糊后按三角权重
    混合（见 §3.9）。可观察口径一致：两端半径、渐变方向、`radial` / `inverted`
@@ -381,6 +413,12 @@ note 写明 `document selection is empty`。
    部分；域层没有画布上下文，因此 `wrap = 2` 按图层宽高取模、`wrap = 1` 逐轴夹到
    图层边界（角带由角落像素填满）。note 分开写明三种露出处理，宿主可据 note 判断
    与上游的差异是否影响自己的合成。
+14. **Custom 的两条边界**：
+    a. **预览不缩放卷积核**。其余滤镜的半径乘 `scale`，但核没有连续的「半径」语义，
+       降采样预览里同一个核相对像素更「大」，观感比全尺寸偏强；全尺寸结果不受影响。
+    b. **透明邻域会让轮廓变暗**。直通卷积不按覆盖率归一除数，紧贴透明区的像素少了
+       那几格权重就偏暗（§3.16）。上游 `CIConvolution` 系列的边界处理不公开，本仓
+       取「窗外夹到边界、窗外透明按 0」这一份显式口径，不声称与上游逐像素等同。
 
 ## 6. 16 位与 HDR
 
@@ -394,14 +432,16 @@ note 写明 `document selection is empty`。
 
 ## 7. 护栏
 
-`tests/test_filters.cpp`（32 例，ABI + 域层混合视角）钉住：
+`tests/test_filters.cpp`（34 例，ABI + 域层混合视角）钉住：
 
-- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含新增七个 kind 的零初始化）；
-- 越界参数在事务之前拒绝（39 组，含 NaN scale / 轴端点；覆盖 blur radius、
+- 恒等设置是**真 no-op**（字节、事务、撤销栈都不动；含 Gaussian Blur … Custom 这 12 个
+  kind 的零初始化）；
+- 越界参数在事务之前拒绝（43 组，含 NaN scale / 轴端点；覆盖 blur radius、
   noise amount、grain size / roughness、motion blur angle / distance、
   progressive blur from / to、sharpen amount / radius / threshold、
   reduce noise strength / preserve details / color noise、high pass radius、
-  minimum / maximum radius、offset horizontal / vertical / wrap 的边界内外）；
+  minimum / maximum radius、offset horizontal / vertical / wrap、
+  custom kernel 项 / scale / offset 的边界内外）；
 - Vignette 压暗边角、中心不动、alpha 不变；一步撤销并可逐字节还原；
 - Tonal Contrast 改变细节但保留黑白格结构；
 - Bloom 向外扩散、远角不动、**alpha 全不变**、`rgb <= alpha`、note 含近似说明；
@@ -437,7 +477,13 @@ note 写明 `document selection is empty`。
   一步撤销逐字节还原；
 - Offset 三种 `wrap` 各验一遍：透明留空（露出区逐字节 0）、边缘延展（角带被角落
   像素填满、移出内容仍丢失）、环绕（从对侧卷回、反向量逐字节还原）、
-  每种都是一步撤销。
+  每种都是一步撤销；
+- Custom 的全 1 核 / divisor 25 作用在均匀图层上**逐字节不变**（钉住「窗外夹到边界、
+  不当黑」）、恒等核 + `offset = 10` 精确每通道 +10、负结果夹到 0、
+  `scale = 0` 与 `scale = 1` 逐字节相同、alpha 逐字节不变、透明像素被跳过、
+  透明底方块角落落到 92（覆盖率不归一，钉住 §3.16 的边界）、一步撤销；
+  ABI 侧 kernel / scale / offset 三个字段都搬运、零初始化 desc 回报 `changed == 0`
+  且不改字节、越界核项与 `scale` 在 ABI 边界被拒。
 
 另有 5 例在 `tests/test_tool_ops.cpp` / `tests/test_tool_ops_domain.cpp` 覆盖
 Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
@@ -448,6 +494,11 @@ Blur 工具（见 [`docs/tool-ops.md`](tool-ops.md) §4.9）。
 右侧面板的每一行也来自同一张表——**菜单、面板、值映射不各写一份清单**。
 Other 组四个滤镜印证了这条：它们只在表的尾部追加四条，菜单项、面板行、
 `build_filter_desc` / `filter_load_values` 的分支随之生效，`shell_window.cpp` 一行没改。
+Custom 则多要了一样东西：**网格布局**。`FilterSpec` 尾部追加 `columns` / `grid_count`
+（缺省 1 / 0），只有 Custom 填 5 / 25 —— 前 25 行按 5 列铺成数字表，第 26/27 行
+（Scale / Offset）仍整宽。行矩形与命中测试共用 `filter_param_row_rect` /
+`filter_param_row_at`（新增两个**带默认值**的参数），方向键在核内移动
+（`filter_focus_grid`），单列面板的键位与绘制**逐像素未变**。
 
 | 面板行 | ABI 字段 | 面板缺省 |
 |--------|---------|---------|
@@ -466,11 +517,13 @@ Other 组四个滤镜印证了这条：它们只在表的尾部追加四条，�
 | Minimum 0 | `minimum.radius` | 0 |
 | Maximum 0 | `maximum.radius` | 0 |
 | Offset 0..2 | `offset.horizontal/vertical/wrap` | 0 / 0 / 0 |
+| Custom 0..24（5×5 核） | `custom.kernel[0..24]` | 中心 `kernel[12] = 1`，其余 0 |
+| Custom 25..26 | `custom.scale/offset` | 1 / 0 |
 | （渐变轴） | `progressive_blur.start_x/start_y/end_x/end_y` + `explicit_axis = 1` | 画布拖拽定轴；未拖拽时 `explicit_axis = 0` 用缺省中线 |
 
-- **命令号**：菜单项 = `kCmdFilterBase(1200) + 滤镜序号`，当前 **1200..1214**
-  （0..14 共 15 个滤镜，Other 组的 High Pass / Minimum / Maximum / Offset 占
-  1211..1214）。面板动作（应用 / 重置 / 关闭）**不在**这段里：滤镜涨到 11 个之后
+- **命令号**：菜单项 = `kCmdFilterBase(1200) + 滤镜序号`，当前 **1200..1215**
+  （0..15 共 16 个滤镜，Other 组的 High Pass / Minimum / Maximum / Offset 占
+  1211..1214，Custom 占 1215）。面板动作（应用 / 重置 / 关闭）**不在**这段里：滤镜涨到 11 个之后
   1210 是 Sharpen，原先放在 1210..1212 的应用/重置/关闭会与它抢同一个 id（Sharpen
   菜单变成「应用」、面板打不开）。动作号现落在 **1220..1222**，当初留出的
   1211..1219 余量正好装下 Other 组，动作号不用再搬，见 `shell_state.h`。
