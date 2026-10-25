@@ -20,6 +20,10 @@
 #   OHOS_ARCH=x86_64 bash scripts/build_ohos.sh     # 模拟器（本地 x86_64 虚拟设备）
 #   OHOS_ARCH=armv7 bash scripts/build_ohos.sh      # 32 位
 #   OHOS_NDK=/path/to/native bash scripts/build_ohos.sh
+#   OHOS_ASAN=1 bash scripts/build_ohos.sh          # ASan 变体：独立输出目录
+#                                                  # build/ohos_${ARCH}_asan，对象不与
+#                                                  # 普通变体混链（S23 纪律；NDK 自带
+#                                                  # clang_rt.asan，与 Windows+zig 不同）
 #
 # 目标三元组映射：OpenHarmony 的 32 位 ARM 目标三元组是 arm-linux-ohos（而非 armv7-），
 # 故 OHOS_ARCH（用户视角的名字）与三元组（编译器视角）分开维护；
@@ -44,7 +48,13 @@ case "$ARCH" in
   *)               TRIPLE="$ARCH" ;;
 esac
 TARGET="${TRIPLE}-linux-ohos"
+# ASan 变体（配合 scripts/run_ohos_tests.sh OHOS_ASAN=1）：独立输出目录防对象混链。
+ASAN_FLAGS=""
 OUT="$ROOT/build/ohos_${ARCH}"
+if [ "${OHOS_ASAN:-0}" = "1" ]; then
+  ASAN_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
+  OUT="$ROOT/build/ohos_${ARCH}_asan"
+fi
 
 pick() {  # pick <basename> — 兼容 .exe 与无扩展名两种打包形态
   for candidate in "$BIN/$1" "$BIN/$1.exe"; do
@@ -109,7 +119,7 @@ failed_list=""
 
 for src in $(cd "$ROOT" && find engine -name "*.c" ! -path "$FT_ROOT/*" | sort); do
   obj="$OUT/$(echo "$src" | tr '/' '_').o"
-  if "$CC" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=gnu11 -O2 -fblocks $DEFINES \
+  if "$CC" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=gnu11 -O2 -fblocks $DEFINES $ASAN_FLAGS \
         -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
     ok=$((ok + 1))
   else
@@ -123,7 +133,7 @@ if [ -d "$ROOT/$FT_ROOT" ]; then
     obj="$OUT/$(echo "$src" | tr '/' '_').o"
     # -DFT2_BUILD_LIBRARY：fterrors.h 在没有它时会 #undef FT_ERR_PREFIX（上游编库口径）。
     if "$CC" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=gnu11 -O2 -fblocks \
-          -DFT2_BUILD_LIBRARY $DEFINES -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
+          -DFT2_BUILD_LIBRARY $DEFINES $ASAN_FLAGS -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
       ok=$((ok + 1))
     else
       fail=$((fail + 1)); failed_list="$failed_list $src"
@@ -133,7 +143,7 @@ fi
 
 for src in $(cd "$ROOT" && find engine -name "*.cpp" | sort); do
   obj="$OUT/$(echo "$src" | tr '/' '_').o"
-  if "$CXX" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=c++17 -O2 -fblocks $DEFINES \
+  if "$CXX" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden -std=c++17 -O2 -fblocks $DEFINES $ASAN_FLAGS \
         -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$OUT/last_error.log"; then
     ok=$((ok + 1))
   else

@@ -13,17 +13,32 @@
 #   OHOS_ARCH=aarch64 bash scripts/run_ohos_tests.sh  # 真机
 #   RUN_ARGS="txn_wild" bash scripts/run_ohos_tests.sh  # 透传给二进制的子串过滤（OPT-11）
 #   OHOS_SKIP_LIB=1 bash scripts/run_ohos_tests.sh   # 静态库已是最新时跳过第 1 步
+#   OHOS_ASAN=1 bash scripts/run_ohos_tests.sh       # ASan 插桩版（引擎+测试全量插桩，
+#                                                    # 独立 _asan 输出目录与远端文件名；
+#                                                    # NDK 自带 clang_rt.asan，2026-10-24
+#                                                    # 曾在模拟器抓出 4 条测试侧 UAF）
 #
 # 退出码：0 = summary 行显示 0 failed；1 = 失败/设备不在线。
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 ARCH="${OHOS_ARCH:-x86_64}"
-OUT="$ROOT/build/ohos_${ARCH}"
 NDK="${OHOS_NDK:-G:/DevEco Studio/sdk/default/openharmony/native}"
 HDC="${OHOS_HDC:-G:/DevEco Studio/sdk/default/openharmony/toolchains/hdc.exe}"
 TARGET_ID="${OHOS_TARGET:-127.0.0.1:5555}"   # DevEco 模拟器默认；真机换 sn 或用 OHOS_TARGET 覆盖
 REMOTE_DIR="/data/local/tmp/compositor"
+
+# ASan 变体：与 build_ohos.sh 同一开关，输出目录 / 测试旗标 / 远端文件名三处联动。
+ASAN_FLAGS=""
+BIN_SUFFIX=""
+RUN_ENV_PREFIX=""
+if [ "${OHOS_ASAN:-0}" = "1" ]; then
+  ASAN_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
+  BIN_SUFFIX="_asan"
+  # detect_leaks=0：OHOS 模拟器的 LSan 支持不完整，泄漏检测留待真机；UAF/越界照抓。
+  RUN_ENV_PREFIX="ASAN_OPTIONS=detect_leaks=0"
+fi
+OUT="$ROOT/build/ohos_${ARCH}${BIN_SUFFIX}"
 
 # 与 build_ohos.sh 同一条口径（用户视角名 → 编译器三元组），分叉即编译不过。
 case "$ARCH" in
@@ -55,7 +70,7 @@ echo "[ohos-test] arch=$ARCH target=$TARGET device=$TARGET_ID"
 
 # ------------------------------------------------------------- 1. 引擎静态库
 if [ "${OHOS_SKIP_LIB:-0}" != "1" ]; then
-  OHOS_ARCH="$ARCH" bash "$ROOT/scripts/build_ohos.sh" || exit 1
+  OHOS_ARCH="$ARCH" OHOS_ASAN="${OHOS_ASAN:-0}" bash "$ROOT/scripts/build_ohos.sh" || exit 1
 fi
 LIB="$OUT/libcompositor_engine_ohos.a"
 [ -f "$LIB" ] || { echo "[ohos-test] 缺 $LIB（先跑 build_ohos.sh）" >&2; exit 1; }
@@ -77,7 +92,7 @@ ok=0; fail=0; failed_list=""
 for src in $(cd "$ROOT" && ls tests/*.cpp | sort); do
   obj="$TESTS_OUT/$(basename "$src" .cpp).o"
   if "$CXX" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -fvisibility=hidden \
-        -std=c++17 -O2 -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$TESTS_OUT/last_error.log"; then
+        -std=c++17 -O2 $ASAN_FLAGS -c "$ROOT/$src" $CPPFLAGS -o "$obj" 2>"$TESTS_OUT/last_error.log"; then
     ok=$((ok + 1))
   else
     fail=$((fail + 1)); failed_list="$failed_list $src"
@@ -94,7 +109,7 @@ fi
 # 无 user32（S16 窗口直呈用例在非 _WIN32 下编译期排除）；musl 的 pthread/dlopen
 # 都在 libc 里，不额外链。
 TESTS_BIN="$OUT/compositor_tests"
-if ! "$CXX" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -O2 \
+if ! "$CXX" --target="$TARGET" --sysroot="$SYSROOT" -fPIC -O2 $ASAN_FLAGS \
      "$TESTS_OUT"/*.o "$LIB" -o "$TESTS_BIN" 2>"$TESTS_OUT/link_error.log"; then
   echo "[ohos-test] link failed:" >&2
   head -20 "$TESTS_OUT/link_error.log" >&2
@@ -134,14 +149,14 @@ fi
 # 测试以 cwd 相对路径读 resources/（camera_raw 表 + Noto 字体子集；缺表用例会
 # 如实报断言失败，所以两样都必须推）。hdc file send 不会建目录，先 mkdir。
 hdc_cmd shell "mkdir -p $REMOTE_DIR/resources/fonts" || exit 1
-send_file "$TESTS_BIN" "$REMOTE_DIR/compositor_tests" || exit 1
+send_file "$TESTS_BIN" "$REMOTE_DIR/compositor_tests${BIN_SUFFIX}" || exit 1
 send_file "$ROOT/resources/camera_raw_tables.bin" "$REMOTE_DIR/resources/camera_raw_tables.bin" || exit 1
 send_file "$ROOT/resources/fonts/NotoSansSC-Regular-Subset.ttf" \
     "$REMOTE_DIR/resources/fonts/NotoSansSC-Regular-Subset.ttf" || exit 1
 # 推送核验：二进制大小必须与本地一致（防「跑了设备上的旧文件」——2026-10-25 的
 # 事故：send 静默失败 + rc=0，结果跑的是前一天的旧 compositor_tests）。
 local_size=$(wc -c < "$TESTS_BIN" | tr -d ' ')
-remote_size="$(hdc_cmd shell "stat -c %s $REMOTE_DIR/compositor_tests" | tr -d '\r\n')"
+remote_size="$(hdc_cmd shell "stat -c %s $REMOTE_DIR/compositor_tests${BIN_SUFFIX}" | tr -d '\r\n')"
 if [ "$remote_size" != "$local_size" ]; then
   echo "[ohos-test] 推送核验失败：本地 $local_size 字节 vs 设备 ${remote_size:-?} 字节" >&2
   exit 1
@@ -150,9 +165,9 @@ echo "[ohos-test] 推送核验通过：$remote_size 字节"
 
 # ------------------------------------------------------------- 6. 运行 + 解析
 RUN_ARGS="${RUN_ARGS:-}"
-echo "[ohos-test] run: ./compositor_tests $RUN_ARGS  (cwd=$REMOTE_DIR)"
+echo "[ohos-test] run: $RUN_ENV_PREFIX ./compositor_tests${BIN_SUFFIX} $RUN_ARGS  (cwd=$REMOTE_DIR)"
 hdc_cmd shell \
-  "cd $REMOTE_DIR && chmod +x compositor_tests && ./compositor_tests $RUN_ARGS" | \
+  "cd $REMOTE_DIR && chmod +x compositor_tests${BIN_SUFFIX} && $RUN_ENV_PREFIX ./compositor_tests${BIN_SUFFIX} $RUN_ARGS" | \
   tee "$OUT/device_run.log" | grep -vE "^\[ (RUN|OK)"
 # 上行把逐用例行收进 device_run.log 存档，终端只留 summary 与失败详情。
 
