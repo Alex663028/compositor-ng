@@ -2204,3 +2204,22 @@ COMP_TEST(abi_layer_effect_enumeration_round_trip) {
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 }
+
+/* OPT-8：create2 的 desc_size 握手——错配必须拒绝，一致必须等价于 create。 */
+COMP_TEST(engine_create2_size_handshake_rejects_mismatched_descriptor) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create2(&desc, sizeof(comp_engine_desc), &engine) == COMP_OK);
+  COMP_CHECK(engine != nullptr);
+  comp_engine_destroy(engine);
+
+  /* 模拟「旧/新头文件编译的宿主」：sizeof 不一致一律拒绝，不越界读。 */
+  COMP_CHECK_MSG(comp_engine_create2(&desc, sizeof(comp_engine_desc) - 8, &engine) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "short descriptor rejected by handshake");
+  COMP_CHECK_MSG(comp_engine_create2(&desc, sizeof(comp_engine_desc) + 8, &engine) ==
+                     COMP_ERR_INVALID_ARGUMENT,
+                 "long descriptor rejected by handshake");
+  COMP_CHECK(comp_engine_create2(&desc, sizeof(comp_engine_desc), nullptr) ==
+             COMP_ERR_INVALID_ARGUMENT);
+}

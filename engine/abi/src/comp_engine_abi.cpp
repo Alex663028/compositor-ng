@@ -66,6 +66,15 @@ extern "C" {
 
 /* ---------------------------------------------------------------- 引擎 */
 
+comp_result comp_engine_create2(const comp_engine_desc* desc, size_t desc_size,
+                                comp_engine* out_engine) {
+  /* OPT-8：desc_size 握手在前——结构体版本错配连解析都不该发生。 */
+  if (desc_size != sizeof(comp_engine_desc)) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  return comp_engine_create(desc, out_engine);
+}
+
 comp_result comp_engine_create(const comp_engine_desc* desc, comp_engine* out_engine) {
   if (out_engine == nullptr) return COMP_ERR_INVALID_ARGUMENT;
 

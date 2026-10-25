@@ -104,4 +104,15 @@ COMP_API comp_result comp_document_engine(comp_document document, comp_engine* o
 } /* extern "C" */
 #endif
 
+/* ------------------------------------------------- ABI 版本握手（OPT-8，尾部追加）
+ *
+ * comp_engine_desc 只能尾部追加字段；等第一次真正加字段时再启用握手，启用本身
+ * 就是破坏性变更（老宿主传的短结构体会被引擎越界读）。create2 把握手做在**新
+ * 入口**上、零迁移：宿主传自己编译时的 sizeof(comp_engine_desc)，引擎校验与
+ * 自身一致才放行——不一致即宿主与引擎版本错配，返回 INVALID_ARGUMENT。
+ * 老的 comp_engine_create 永封当前字段面。 */
+COMP_API comp_result comp_engine_create2(const comp_engine_desc* desc,
+                                         size_t desc_size,
+                                         comp_engine* out_engine);
+
 #endif /* COMPOSITOR_COMP_ENGINE_H */
