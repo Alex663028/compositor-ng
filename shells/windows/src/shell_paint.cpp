@@ -1633,6 +1633,69 @@ void draw_fill_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel
   }
 }
 
+/*
+ * 智能滤镜栈面板（P1-2 收尾 ⑨）。排版与路径 / 历史 / 通道同一套（ui_core.h 的
+ * smart_row_rect / smart_row_at）：画在哪一行，点击与双击就命中哪一行。
+ * 行内容现读引擎（count / at），壳里不缓存 desc —— 撤销 / 重做后列表自然同步。
+ */
+void draw_smart_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
+  const int left = panel_rect.x;
+  const int bottom = panel_rect.bottom();
+  RECT panel{left, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(22, 24, 28));
+  FillRect(dc, &panel, background);
+  DeleteObject(background);
+  SetBkMode(dc, TRANSPARENT);
+
+  wchar_t line[320];
+  SetTextColor(dc, RGB(240, 240, 244));
+  const wchar_t* title = L"智能滤镜（Smart Filters）";
+  TextOutW(dc, left + 10, panel_rect.y + 8, title, lstrlenW(title));
+
+  const comp_layer_id target = smart_panel_target(shell);
+  int count = 0;
+  if (shell.doc.document != nullptr && target != 0) {
+    size_t raw = 0;
+    if (comp_layer_smart_filter_count(shell.doc.document, target, &raw) == COMP_OK) {
+      count = static_cast<int>(raw);
+    }
+  }
+  SetTextColor(dc, RGB(150, 210, 255));
+  if (target != 0) {
+    wsprintfW(line, L"图层 #%I64u · %d 条（自下而上求值）",
+              static_cast<unsigned long long>(target), count);
+  } else {
+    wsprintfW(line, L"当前没有可编辑滤镜栈的智能对象图层");
+  }
+  TextOutW(dc, left + 10, panel_rect.y + 30, line, lstrlenW(line));
+
+  const int scroll = comp_ui::smart_clamp_scroll(panel_rect, count, shell.doc.smart_scroll);
+  const int visible = comp_ui::smart_visible_rows(panel_rect);
+  if (count == 0) {
+    SetTextColor(dc, RGB(170, 150, 110));
+    const wchar_t* empty = nullptr;
+    if (shell.doc.document == nullptr) {
+      empty = L"（无文档）";
+    } else if (selected_layer_id(shell) == 0) {
+      empty = L"先选择一个图层（面板跟随选中层）";
+    } else if (target == 0) {
+      empty = L"当前图层不是智能对象：图层 > 智能对象 > 转换为智能对象";
+    } else {
+      empty = L"这一层还没有滤镜：用「滤镜 > 任一项」回车叠加";
+    }
+    TextOutW(dc, left + 12, panel_rect.y + comp_ui::kSmartRowsTop, empty, lstrlenW(empty));
+  }
+  for (int row = 0; row < visible; ++row) {
+    const int index = scroll + row;
+    if (index >= count) break;
+    const comp_ui::Rect rect = comp_ui::smart_row_rect(panel_rect, row);
+    const bool focused = index == shell.doc.smart_focus;
+    if (focused) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH highlight = CreateSolidBrush(RGB(48, 62, 86));
+      FillRect(dc, &band, highlight);
+      DeleteObject(highlight);
+    }
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;

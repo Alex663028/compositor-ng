@@ -232,6 +232,25 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void panel_smart_convert(ShellState& shell);
   void panel_smart_rasterize(ShellState& shell);
   void panel_smart_clear_filters(ShellState& shell);
+  /*
+   * P1-2 收尾 ⑨：智能滤镜栈面板。列表只读（count / _at），动作各走一条 ABI 写：
+   * 空格 = _set 同参翻转 enabled，Del = _remove，回车 = 滤镜面板进「编辑该条」模式。
+   * smart_panel_target 是唯一的「这一层能不能编辑滤镜栈」判定，绘制、动作、菜单同源。
+   */
+  comp_layer_id smart_panel_target(const ShellState& shell);
+  int smart_panel_count(const ShellState& shell);
+  bool smart_panel_visible(const ShellState& shell);
+  void smart_panel_dismiss(ShellState& shell);
+  void smart_panel_reset(ShellState& shell);
+  void refresh_smart_panel(ShellState& shell);
+  void open_smart_panel(ShellState& shell);
+  void close_smart_panel(ShellState& shell);
+  void smart_panel_status(ShellState& shell);
+  void smart_panel_focus_row(ShellState& shell, int32_t row);
+  void smart_panel_move(ShellState& shell, int32_t delta);
+  void smart_panel_toggle_entry(ShellState& shell);
+  void smart_panel_edit_entry(ShellState& shell);
+  void smart_panel_remove_entry(ShellState& shell);
   /* P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案，参数表由引擎驱动）。 */
   bool fill_param_query(const ShellState& shell, int32_t row, comp_fill_param* out);
   void refresh_fill(ShellState& shell);
@@ -391,6 +410,16 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void build_filter_desc(const ShellState& shell, comp_filter_desc* out);
   bool filter_preview_render(ShellState& shell, const wchar_t* lead);
   void apply_filter(ShellState& shell);
+  /* P1-2 收尾 ⑨：智能滤镜单条编辑——滤镜面板的「编辑该条」模式。 */
+  void filter_smart_edit_clear(ShellState& shell);
+  void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& desc);
+  void filter_load_values_from_desc(ShellState& shell, const comp_filter_desc& desc);
+  void build_filter_desc_patched(const ShellState& shell, comp_filter_desc* out);
+  bool open_smart_filter_editor(ShellState& shell, size_t index);
+  void smart_panel_reopen_after_edit(ShellState& shell, int focus_index);
+  /* 一行摘要（滤镜名 / 参数 / 开关），绘制与状态栏共用同一份口径。 */
+  std::wstring smart_entry_summary(const comp_filter_desc& desc);
+  std::wstring filter_kind_name(comp_filter_kind kind);
   void finish_canvas_command(ShellState& shell);
   void image_rotate_canvas(ShellState& shell, int32_t quarter_turns, const wchar_t* label);
   void image_invert_layer(ShellState& shell);

@@ -434,7 +434,8 @@ void color_range_begin(ShellState& shell) {
     shell.doc.color_range_txn = nullptr;
     shell.doc.color_range_open = false;
   }
-  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史互斥，避免两块矩形互相遮住）。 */
+  /* 右栏一次只挂一个面板（与滤镜/效果/路径/历史/智能滤镜栈互斥，避免两块矩形互相遮住）。 */
+  smart_panel_dismiss(shell);
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell);

@@ -167,14 +167,15 @@ void type_begin(HWND window, ShellState& shell, int x, int y, const Layout& layo
   /* 落插入点即离开属性面板的数值键入态，否则数字键会被面板缓冲吃掉。 */
   shell.doc.type_input.clear();
   /*
-   * 同理关掉效果/滤镜面板：这两块的键盘分支排在文字键入态之前，留着会把
-   * 刚点的这一笔字符全吞掉（用户看到插入点在闪、打字没反应）。
+   * 同理关掉效果/滤镜/智能滤镜栈面板：这几块的键盘分支排在文字键入态之前，
+   * 留着会把刚点的这一笔字符全吞掉（用户看到插入点在闪、打字没反应）。
    */
   shell.doc.effect_open = false;
   shell.doc.effect_input.clear();
   shell.doc.filter_open = false;
   shell.doc.filter_input.clear();
   filter_preview_forget(shell); /* 文字工具接管键盘：别让滤镜预览帧留在画布上 */
+  smart_panel_dismiss(shell);
   type_refresh_status(shell);
 }
 
@@ -359,9 +360,9 @@ void type_step_param(ShellState& shell, int direction, bool spacing) {
  * 不会漂移。
  */
 bool type_panel_visible(const ShellState& shell) {
-  /* 字体面板开着时右栏归它（同一块区域，画两层只会互相咬字）。 */
+  /* 字体 / 智能滤镜栈面板开着时右栏归它们（同一块区域，画两层只会互相咬字）。 */
   return shell.tool == comp_ui::ToolId::Type && !shell.doc.filter_open &&
-         !font_panel_visible(shell);
+         !shell.doc.smart_open && !font_panel_visible(shell);
 }
 
 double type_panel_value(const ShellState& shell, int row) {

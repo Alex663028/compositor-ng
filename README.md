@@ -8195,6 +8195,7 @@ parent 环不能把面板挂死。
 
 **壳层。** 命令号 **1710..1713**（转换为智能对象 / 栅格化 / 清除全部智能滤镜 /
 状态），菜单在 **图层 > 智能对象**；层行带 `S` 标记，转换与栅格化都走一步撤销。
+逐条列出 / 开关 / 改参数 / 删除在 §6.114 的滤镜栈面板（1720..1723）；调序与改名
 | `engine/format/comp_file.cpp` | `engineSmart` 读写、`sourceFile` 原图落盘与回收 |
 | `tests/test_smart_objects.cpp` | 10 个 case（转换幂等/拒绝/16→8 位、add/set/remove 各一步、停用保留参数、对象空间求值、像素写拒绝、栅格化保留渲染、`.comp` 往返、普通工程无智能键） |
 | `shells/windows/src/shell_layers.cpp` | `panel_smart_convert` / `rasterize` / `clear_filters` / `status` |
@@ -8275,12 +8276,83 @@ JSON，构造结果再过一次 `comp_fill_validate` 才回报 `COMP_OK`。与
 智能滤镜单开一套控件（条目顺序与名字见 §6.114 / §6.115）；图层
 复合不包含混合模式与效果。这些都是**已知边界**，不是遗漏。
 
+### 6.114 智能滤镜栈面板：逐条列出 / 开关 / 改参数 / 删除（P1-2 第九批，2026-10-25，Claude）
+
+**缺口。** §6.112 把智能滤镜做成了非破坏参数栈，但壳层只接了「转换 / 栅格化 /
 整栈清除 / 状态」四个命令：引擎的 `comp_layer_smart_filter_at` / `_set` / `_remove`
 一条都没接 UI，用户想改某一条的半径、临时关掉某一条、删掉中间那条，只能整栈清除再
 重加。本批把这三件事补上——**ABI 与引擎一行未改**（208 个导出不变），只加壳层
+（命令号 1720..1723）。
+
+**面板是栈的只读投影，不缓存。** 标题摘要的条数、每行的 kind / enabled / 参数摘要、
+三个动作的取值，全部当场问引擎（`_count` / `_at`）。好处是撤销、重做、整栈清除之后
+列表不可能与文档漂移；代价是一屏 N 行要 N+1 次只读查询，这些查询不开事务，可以接受。
+
+**一行 = 一条。** 格式 `序号. [关] 滤镜名 · 前两个参数名值对`；`[关] ` 是「已关闭」
+的唯一标记（关闭的条目仍在列表里，还能再打开）。空态按四种原因分别提示（无文档 /
+没选图层 / 不是智能对象 / 还没叠加过），不拿一句「列表为空」糊住四种下一步。
+
+**开关 = 先读整条再写回。** `空格` 用 `_at` 取整条 desc，翻转 `enabled` 后
+`_set(..., &desc, 新开关)`：参数原样带过去，只改开关。引擎的 `_set` 幂等条件
+（settings 与 enabled 都相同才不落步）在这里必然不成立，所以**恰好一步撤销**。
+
 **编辑复用滤镜参数面板。** `open_smart_filter_editor(index)` 读该条 desc → 按
 `filter_spec_at(kind)` 打开既有的滤镜面板（同一份行几何、步进、键入、预览）→
+`filter_load_values` 灌值 → 装上 `smart_edit_{layer,index,enabled,base}` 绑定。预览
+`filter_preview_render` 在编辑态改走 `_set`（仍包在事务里、取帧后 abort），所以画面
+看到的是「这一条改完」的结果而文档停在预览前；回车 `apply_filter` 写回**同一条**
+（栈不变长），参数与开关都没变时引擎不落撤销步，状态栏因此只报「已写回第 N 条」
+而不承诺一步撤销；Esc / 切工具 = 丢弃（状态栏明说「本次编辑未写回」）。
+
+**面板行表达不了的字段按原值带回。** 参数面板没有 `vignette.color` 与
+`progressive_blur` 显式轴的行。`build_filter_desc_patched` 从 `smart_edit_base`
+（打开时的原 desc）复制这些字段（同 kind 才采信），再用面板值覆盖面板控制的字段；
+本次拖过轴则以拖拽值为准。否则「双击改个半径」会把暗角颜色清零、把拖出来的显式轴
+悄悄丢掉。
+
+**删除与收敛。** `Del` 走 `_remove`（一步撤销），焦点落到下一条、条数缩了夹回、
+删到空栈列表回到空态。所有面板动作之后 `refresh_layers` 会调 `refresh_smart_panel`：
+选中层变了就换绑定回第 1 条，条数缩了就把焦点与滚动夹回去——这也是撤销 / 重做后
+列表自动同步的原因。
+
+**互斥与生命周期。** 打开栈面板会收起颜色范围 / 填充 / 滤镜 / 效果 / 修边 / 路径 /
+历史 / 通道；反过来每个面板打开时都 `smart_panel_dismiss`，字体面板与文字属性面板的
+可见性判断也把 `smart_open` 纳入让位条件。换文档（新建 / 打开 / 载入分层 PSD）
+`smart_panel_reset` 把开关、焦点、滚动与编辑绑定一起清零。
+
+**几何在 ui_core。** `kSmartRowHeight = 22`、`kSmartRowsTop = 64`、
+`kSmartPanelFooter = 96`（页脚按 5 行提示预留；§6.115 真正画满 5 行后改为 98），配
+`smart_visible_rows` / `_max_scroll` /
+`_clamp_scroll` / `_ensure_visible` / `_row_rect` / `_row_at`——绘制与
+`WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK` / `WM_MOUSEWHEEL` 读同一组函数。
+`ui_core_smart_panel_rows_hit_what_they_paint` 把行高、页脚、只认画得出来的行钉住。
+
+| 文件 | 改动 |
+|---|---|
+| `shells/windows/src/shell_layers.cpp` | 栈面板全部逻辑：目标判定、条数、焦点/滚动、状态行、开关/编辑/删除、`refresh_smart_panel` 汇合点 |
 | `shells/windows/src/shell_filter.cpp` | `filter_load_values`、`build_filter_desc_patched`、`open_smart_filter_editor`、`filter_preview_render` / `apply_filter` 的编辑态分支 |
+| `shells/windows/src/shell_paint.cpp` | `draw_smart_panel`（标题/摘要/空态/焦点带/`[关]` 标记/4 行提示） |
+| `shells/windows/src/shell_window.cpp` | 行命中 / 双击编辑 / 滚轮翻列表、四条菜单项与可用性、`smart_open` 纳入调整面板与滚轮的让位条件 |
+| `shells/windows/src/shell_document.cpp` | 四个命令分派、换文档 `smart_panel_reset` |
+| `shells/windows/src/shell_state.h`、`shell_internal.h`、`ui_core.h` | 1720..1723、`smart_*` 文档状态、列表几何常量与包装 |
+| `tests/test_ui_core.cpp` | `ui_core_smart_panel_rows_hit_what_they_paint` |
+| 其余面板文件（`shell_channels/fill/fonts/path_history/selection/tools/type` 等） | 各自打开面板时 `smart_panel_dismiss`，`*_panel_visible` 让位 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **769 例 / 0 失败**（768 → 769：新增栈面板行几何 1 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（769 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（本批不加自检项） |
+| `scripts/visual_check.py --scene all` | **233 项 / 0 失败** |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（新逻辑全在既有翻译单元里，TU 数不变） |
+| `^COMP_API` 导出 | **208**（本批无 ABI 变化） |
+
+**已知边界：** 引擎没有「调整顺序 / 移动某条」的导出，列表只读顺序、不能拖动排序；
+没有重命名；关闭的条目仍可编辑参数，写回后保持关闭（状态栏明说画面不变）。这些前两条
+是引擎能力边界、不是壳层遗漏——**已在 §6.115 补齐**；第三条是 Photoshop 语义，保留。
+
 顺序改动会改画面（滤镜不可交换），所以**整条栈从头重跑**：先在事务外 `evaluate_stack`，
 失败直接返回、像素与历史都干净；成功后 `ImplicitTxn("Reorder Smart Filters")` +
 `touch_layer` + `commit`，因此成功即**恰好一步撤销**。这里和 `_set` 的区别值得记住：
@@ -8299,6 +8371,12 @@ index, name_utf8)` 只写 `SmartFilter::name`：
 
 **壳层三条入口，一套落点。**
 
+**几何。** `kSmartPanelFooter` 96 → **98**：提示从 4 行变 5 行（只有 4 行仍拿得到页脚，
+但少 2 px 行距），`hint_y = bottom - 8 - 5 * 18 + 4`。行几何仍全在 ui_core，
+`ui_core_smart_panel_rows_hit_what_they_paint` 把行高 / 页脚 / 只认画得出来的行钉住。
+
+| 文件 | 改动 |
+|---|---|
 | `engine/domain/layer.h` | `SmartFilter::name`、`kMaxSmartFilterNameBytes` |
 | `engine/format/comp_file.cpp` | `engineSmart.filters[].name` 写读 + 不合规丢弃 |
 | `tests/test_smart_objects.cpp` | 3 例：`move_reorders_and_reevaluates` / `name_validates_undoes_and_persists` / `names_and_order_survive_comp_round_trip` |
