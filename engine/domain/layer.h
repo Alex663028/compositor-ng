@@ -226,6 +226,22 @@ struct Effect {
   std::string settings_json = "{}";
 };
 
+/* 智能滤镜自定义名上限（字节，UTF-8，不含 NUL）。与图层名同量级：名字只进
+ * 面板与 `.comp`，不参与像素求值。 */
+constexpr size_t kMaxSmartFilterNameBytes = 256;
+
+/*
+ * 智能滤镜（P1-2 收尾 ⑦）：一条滤镜参数 + 是否启用 + 可选自定义名。
+ *
+ * `settings` 复用 domain/filters.h 的整份设置（与 Filter 菜单同一套量程闸）；
+ * `enabled = false` 的条目**保留在栈里但不参与求值**（Photoshop 的「停用智能
+ * 滤镜」口径），因此停用/启用不丢参数、也不需要宿主自己缓存一份副本。
+ *
+ * `name`（P1-2 收尾 ⑩）是**展示名**，UTF-8、单行、≤ kMaxSmartFilterNameBytes；
+ * 空串 = 用滤镜类型的名字（宿主自行回退，引擎不求值它）。它不参与像素求值，
+ * 也不影响栈序，所以改名不进求值路径、不 invalidate 合成；但仍随文档快照进
+ * 撤销栈与 `.comp`（`engineSmart.filters[].name`，缺键 = 空）。
+ */
 struct SmartFilter {
   FilterSettings settings;
   bool enabled = true;

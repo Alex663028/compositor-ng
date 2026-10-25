@@ -318,6 +318,38 @@ COMP_API comp_result comp_layer_smart_filter_remove(comp_document document, comp
  * 改名只是面板展示名、不参与求值。两者都随快照进撤销栈与 `.comp`。
  */
 
+/* 展示名字节上限（UTF-8，不含 '\0'），与 domain/layer.h 的
+ * kMaxSmartFilterNameBytes 必须一致。 */
+#define COMP_SMART_FILTER_NAME_MAX_BYTES 256
+
+/*
+ * 把第 `from` 条移到第 `to` 位（两者都是移动**前**的索引；语义同
+ * std::vector 的「取出再插入」），然后按新顺序重新求值。
+ *
+ *   - from == to：COMP_OK、不重新求值、不落撤销步（宿主可无脑调用）；
+ *   - 移动后栈序不变（例如把唯一一条移动 0→0 之外的空栈）不可能发生——越界即错误；
+ *   - 索引越界 -> COMP_ERR_INVALID_ARGUMENT；不是智能对象 -> COMP_ERR_STATE；
+ *   - 与其它写入口同一把锁闸（COMP_LAYER_LOCK_PIXELS）：顺序改变会改画面；
+ *   - 求值在开事务之前：失败不留撤销步、不动像素。一步撤销。
+ *
+ * 注意 `to` 可以是 `count - 1`（移到栈顶）与 0（移到栈底），不要求 `to < count`
+ * 之外的其它约定；`to == count` 视为越界（栈长度不变）。
+ */
+COMP_API comp_result comp_layer_smart_filter_move(comp_document document, comp_layer_id id,
+                                                  size_t from, size_t to);
+
+/*
+ * 设置第 index 条的展示名（`name_utf8` 可为 NULL 或空串 = 清除名字，回退到
+ * 滤镜类型名）。UTF-8、单行、≤ COMP_SMART_FILTER_NAME_MAX_BYTES 字节（不含
+ * '\0'）；含控制字符、非法 UTF-8 或超长 -> COMP_ERR_INVALID_ARGUMENT。
+ *
+ * 名字**不参与像素求值**：与当前名字相同 -> COMP_OK、不落撤销步；否则只改
+ * 元数据、不重新求值（画面逐字节不变），但仍进快照——一次撤销。不触发
+ * 像素锁闸（与色标/链接同一口径：它不改画面）。不是智能对象 -> COMP_ERR_STATE。
+ */
+COMP_API comp_result comp_layer_smart_filter_set_name(comp_document document, comp_layer_id id,
+                                                      size_t index, const char* name_utf8);
+
 /*
  * 取第 index 条的展示名（两段式，口径同 comp_layer_comp_name）：`out_required`
  * 写含 '\0' 的所需长度；`buffer == NULL` 或 `capacity == 0` 为查询模式。
@@ -325,6 +357,10 @@ COMP_API comp_result comp_layer_smart_filter_remove(comp_document document, comp
  * COMP_ERR_INVALID_ARGUMENT，不截断。index 越界 -> COMP_ERR_INVALID_ARGUMENT；
  * 不是智能对象 -> COMP_ERR_STATE。只读，不开事务。
  */
+COMP_API comp_result comp_layer_smart_filter_name(comp_document document, comp_layer_id id,
+                                                  size_t index, char* buffer, size_t capacity,
+                                                  size_t* out_required);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

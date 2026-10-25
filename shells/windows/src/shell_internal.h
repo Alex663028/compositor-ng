@@ -251,6 +251,17 @@ static_assert(static_cast<int>(comp_ui::FilterId::ReduceNoise) == COMP_FILTER_RE
   void smart_panel_toggle_entry(ShellState& shell);
   void smart_panel_edit_entry(ShellState& shell);
   void smart_panel_remove_entry(ShellState& shell);
+  /*
+   * P1-2 收尾 ⑩：栈序与展示名。三条写路径各走一条引擎导出（_move / _set_name），
+   * 展示名只影响面板文字与 `.comp` 的 `filters[].name`，不参与求值。
+   * smart_entry_name 是「这一行显示什么」的唯一口径：自定义名优先、空名回退到
+   * 滤镜类型名——绘制、状态栏、动作回报三处同源。
+   */
+  std::wstring smart_entry_name(comp_document document, comp_layer_id layer, size_t index,
+                                const comp_filter_desc& desc);
+  void smart_panel_move_entry(ShellState& shell, int32_t delta);
+  void smart_panel_drop(ShellState& shell, int32_t from, int32_t to);
+  void panel_begin_smart_filter_name(ShellState& shell);
   /* P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案，参数表由引擎驱动）。 */
   bool fill_param_query(const ShellState& shell, int32_t row, comp_fill_param* out);
   void refresh_fill(ShellState& shell);

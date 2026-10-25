@@ -377,7 +377,16 @@ constexpr UINT kCmdLayerSmartPanel = 1720;        /* 图层 > 智能对象 > 智
 constexpr UINT kCmdLayerSmartPanelToggle = 1721;  /* 开/关当前条（不改参数） */
 constexpr UINT kCmdLayerSmartPanelEdit = 1722;    /* 编辑当前条参数（滤镜面板） */
 constexpr UINT kCmdLayerSmartPanelRemove = 1723;  /* 删除当前条 */
+/*
+ * P1-2 收尾 ⑩：栈序与展示名（1724..1726）。
+ *
+ * ⑨ 把逐条操作接上 UI 之后还剩两条能力边界：不能调序、不能命名。两者都是纯
+ * 面板动作（引擎导出 comp_layer_smart_filter_move / _set_name / _name）。
+ * 命令号接在 1723 之后，仍避开 1100/1200 段与已用的 1660..1723。
+ */
 constexpr UINT kCmdLayerSmartPanelRename = 1724;   /* 重命名当前条…（F2） */
+constexpr UINT kCmdLayerSmartPanelMoveUp = 1725;   /* 当前条上移一位（Alt+↑） */
+constexpr UINT kCmdLayerSmartPanelMoveDown = 1726; /* 当前条下移一位（Alt+↓） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..10（1200..1210） */
 /*
@@ -452,8 +461,13 @@ struct LayerRow {
   std::string name;
 };
 
-/* P0-1：图层面板键入态（重命名 / 精确不透明度）。 */
-enum class LayerInput { None, Rename, Opacity };
+/*
+ * 图层面板键入态（重命名 / 精确不透明度 / 过滤词 / 复合名 / 智能滤镜名）。
+ *
+ * `FilterName` 是「按名称过滤图层」的过滤词，不是滤镜的名字；智能滤镜的展示名
+ * 用 `SmartFilterName`（P1-2 收尾 ⑩），两者别混。
+ */
+enum class LayerInput { None, Rename, Opacity, FilterName, CompName, SmartFilterName };
 
 /* 整组移动的成员快照（原 ShellState::GroupMemberMove）。 */
   struct GroupMemberMove {
@@ -517,6 +531,9 @@ struct DocumentContext {
   LayerInput layer_input = LayerInput::None;
   std::wstring layer_input_text;
   comp_layer_id layer_input_id = 0;
+  /* 键入态的第二坐标：智能滤镜改名时的栈内下标（layer_input_id 只装得下图层）。
+   * 其它键入态不用它，panel_cancel_layer_input 一律清零。 */
+  size_t layer_input_slot = 0;
   std::vector<uint32_t> adj_kinds;       /* 选中图层已有调整的 kind（数组序） */
   std::vector<std::string> adj_settings; /* 与 adj_kinds 对齐的 settings JSON */
   int32_t selected_adjustment = -1;      /* 已有调整的选中索引；-1 = 未选（新增态） */
@@ -655,6 +672,16 @@ struct DocumentContext {
   size_t smart_edit_index = 0;
   int32_t smart_edit_enabled = 1;
   comp_filter_desc smart_edit_base{};
+  /*
+   * 面板内拖拽重排（P1-2 收尾 ⑩）：按下即 pending，纵向移动超过 4 px 才 active
+   * （单击必须仍是「选中」）。active 期间 smart_drag_to 是「松手后这条会落在的
+   * 行」，松手才写引擎（comp_layer_smart_filter_move = 一步撤销）。
+   */
+  bool smart_drag_pending = false;
+  bool smart_drag_active = false;
+  int32_t smart_drag_from = -1;
+  int32_t smart_drag_to = -1;
+  int32_t smart_drag_press_y = 0;
   comp_ui::StrokeKind stroke_kind = comp_ui::StrokeKind::None;
   std::vector<float> stroke_points;
   /* P1-4：一笔内 WM_POINTER 笔压采样（整笔取平均；_begin 清零）。 */

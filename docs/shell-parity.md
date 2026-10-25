@@ -31,6 +31,7 @@ compositor-ng 是「同引擎、两壳」结构：
 | 历史记录面板（P1） | 「编辑 → 历史记录…」+ 右侧列表（状态 0..N / 点行、↑↓、Home/End 回跳） | （未接 UI） | `comp_document_history_step_count` / `_step_label` / `_jump`（ABI 尾部追加，135 → 138） | **已达成**（§5.18）：回跳不新增撤销步；高亮 = 引擎 `current_index`，壳侧无第二份真相 |
 | 滤镜菜单 / 参数面板 | 「滤镜(&F)」动态菜单 + 右侧参数面板 | （未接 UI） | `comp_filter_apply` | 已达成（鸿蒙无面板） |
 | 智能滤镜栈面板（P1-2 第九批） | 「图层 → 智能对象 → 智能滤镜面板…」+ 右侧列表（↑↓ 选、空格开关、回车/双击改参数、Del 删除、滚轮翻页） | （未接 UI） | `comp_layer_smart_filter_count` / `_at` / `_set` / `_remove`（本批无新增导出） | **已达成（Windows）**（§5.74）：开关 / 删除各一步撤销；改参数复用滤镜面板，参数与开关都没变时不落撤销步；面板每帧现问引擎，撤销后自动同步 |
+| 智能滤镜调序与改名（P1-2 收尾 ⑩） | 栈面板内 Alt+↑/↓、拖动行重排、F2 / 菜单重命名、行显示自定义名 | （未接 UI） | `comp_layer_smart_filter_move` / `_set_name` / `_name`（尾部追加，208 → 211） | **已达成（Windows）**（§5.75）：调序整栈重求值 = 一步撤销，锁像素的层拒绝调序；改名是纯元数据（不重求值、锁像素也能改、同值不落步），空名回退类型名 |
 | 图层效果参数面板（P0-2） | 「图层效果」菜单 + 右侧参数面板（`Ctrl+Shift+E`） | （未接 UI） | `comp_layer_effect_param_count` / `_param_at` / `_read_value` / `_build_settings` | **已达成**（P0-2，见 §5.13）：标签/量程/缺省值全部来自 ABI 元数据表，壳不再自持任何一份数值 |
 | Blur 修饰工具 | 画布折线 → 一次 `COMP_TOOL_BLUR` | （未接 UI） | `comp_tool_apply` | 已达成（鸿蒙无面板） |
 | 减淡 / 加深 / 海绵（P1） | `O` 循环 8 档，画布折线 → 一次 `COMP_TOOL_DODGE` / `_BURN` / `_SPONGE` | （未接 UI） | `comp_tool_apply` | **已达成**（§5.19）：`Alt+[ / ]` 调强度，受选区约束 |
@@ -3726,6 +3727,22 @@ Esc / 切工具 = 丢弃缓冲回到列表，状态栏明说「本次编辑未�
 空态提示。（前两条已在 §5.75 补齐；第三条是 PS 语义。）
 
 
+### 5.75 智能滤镜调序与改名：`move` 与 `name`（P1-2 收尾 ⑩，2026-10-25）
+
+**1. 新增导出（尾部追加，208 → 211）。** `comp_layer_smart_filter_move(doc, id, from,
+to)`、`comp_layer_smart_filter_set_name(doc, id, index, name_utf8)`、
+`comp_layer_smart_filter_name(doc, id, index, buffer, capacity, out_required)`；头文件加
+`COMP_SMART_FILTER_NAME_MAX_BYTES = 256`，与引擎 `kMaxSmartFilterNameBytes` 由
+`static_assert` 对齐。命令号续在壳侧：`1724` 重命名当前条、`1725` 上移一位、`1726` 下移
+一位。
+
+**2. `move` 的记忆法：`to` 是移动后的最终下标。** 实现是 std::vector 那套「取出再
+插入」：存 `stack[from]` → `erase(from)` → `insert(to)`。`from < to` 时 erase 已让目标
+左移一格，所以 insert 到 `to` 恰好是用户期望的位置。`from == to` 返回 OK 且**不重求值、
+不落撤销步**；越界 `COMP_ERR_INVALID_ARGUMENT`；锁 `COMP_LAYER_LOCK_PIXELS` 的层返回
+`COMP_ERR_STATE`（理由是 "reorder smart filters"）。
+
+**3. 调序必须整栈重求值，且先于事务。** 滤镜不可交换，换顺序就换画面：先在事务外
 `evaluate_stack`，失败直接返回（像素与历史都干净），成功才开 `ImplicitTxn("Reorder
 Smart Filters")`、写 `filters` 与 `pixels`、`touch_layer`、`commit`——成功即**恰好一步
 撤销**。
@@ -3741,6 +3758,18 @@ Smart Filters")`、写 `filters` 与 `pixels`、`touch_layer`、`commit`——�
 
 **6. 持久化。** `.comp` 的 `engineSmart` 每条多一个 `name`；载入时不合规的名字（超长 /
 非法 UTF-8 / 含换行）当没写、回退类型名——坏字段只丢一个展示名，不连累整条滤镜或整层。
+
+**7. 壳层三条入口。** Alt+↑/↓（或菜单 1725/1726）走 `smart_panel_move_entry(±1)`：夹到
+±1、到端如实报「未改动」、成功焦点跟随；菜单要求条数 > 1。F2（或菜单 1724）走
+`panel_begin_smart_filter_name`：复用状态栏键入态，新增 `LayerInput::SmartFilterName`
+（`FilterName` 是「按名称过滤图层」，别混），栈内下标放 `layer_input_slot`；**预填只给
+自定义名**（从未改名就空着），键入按候选串真实 UTF-8 字节数夹 256，空串 = 回退类型名。
+拖动与图层面板同一套：4 px 阈值才 active、落点画暖绿底、松手才 `_move`、
+`WM_KILLFOCUS` / `WM_CAPTURECHANGED` 全清。
+
+**8. 展示名一个口径。** `smart_entry_name`：非空自定义名优先（截 16 字符＋省略号，免得
+256 字节撑爆状态行与行缓冲），否则类型名。行、标题状态、开关 / 删除 / 调序回执全用它；
+删除与调序必须**在写之前**取名，否则读到的已是邻居。
 
 **9. 几何微调。** `kSmartPanelFooter` 96 → 98，提示 4 行 → 5 行（Alt 调序 / F2 改名 /
 拖动重排各占一行）。行几何仍由 `smart_row_rect` / `smart_row_at` 单一口径提供。

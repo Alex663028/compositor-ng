@@ -3041,6 +3041,21 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                                                   mouse_y);
             if (row >= 0) {
               smart_panel_focus_row(*shell, row);
+              /*
+               * P1-2 收尾 ⑩ 拖拽重排：按下即 pending（记起点行与 y），纵向移动超过
+               * 4 px 才进入 active。单击必须仍是「选中」，手抖 1px 不该把滤镜挪位；
+               * 捕获在 WM_LBUTTONUP / WM_CAPTURECHANGED 里释放。
+               */
+              shell->doc.smart_drag_from = row;
+              shell->doc.smart_drag_to = row;
+              shell->doc.smart_drag_press_y = mouse_y;
+              shell->doc.smart_drag_pending = true;
+              shell->doc.smart_drag_active = false;
+              SetCapture(window);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
           if (type_panel_visible(*shell) && layout.adjust_panel.w > 0) {
             /* 点属性行 = 聚焦到该行；行几何与绘制共用 type_param_row_rect。 */
             const int row =
@@ -3539,6 +3554,20 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
+      /*
+       * P1-2 收尾 ⑩ 智能滤镜拖拽落点。pending 未 active = 单纯点选，什么都不做
+       * （不能把「点一下」变成一次撤销步）；active 才把 move 交给引擎。
+       */
+      if (shell != nullptr && shell->doc.smart_drag_pending) {
+        const bool dragged = shell->doc.smart_drag_active;
+        const int32_t from = shell->doc.smart_drag_from;
+        const int32_t to = shell->doc.smart_drag_to;
+        shell->doc.smart_drag_pending = false;
+        shell->doc.smart_drag_active = false;
+        shell->doc.smart_drag_from = -1;
+        shell->doc.smart_drag_to = -1;
+        ReleaseCapture();
+        if (dragged) smart_panel_drop(*shell, from, to);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }

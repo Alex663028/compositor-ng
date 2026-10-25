@@ -175,6 +175,22 @@ int filter_kind_at(comp_document document, comp_layer_id id, size_t index) {
   return static_cast<int>(desc.kind);
 }
 
+/* 两段式读名字：先问长度再取，空名字返回空串。失败返回 "<error>" 以便断言分辨
+ * 「空」与「读不到」。 */
+std::string smart_filter_name(comp_document document, comp_layer_id id, size_t index) {
+  size_t required = 0;
+  if (comp_layer_smart_filter_name(document, id, index, nullptr, 0, &required) != COMP_OK) {
+    return "<error>";
+  }
+  if (required == 0) return "<error>";
+  std::string text(required, '\0');
+  if (comp_layer_smart_filter_name(document, id, index, text.data(), text.size(), &required) !=
+      COMP_OK) {
+    return "<error>";
+  }
+  text.resize(std::strlen(text.c_str()));
+  return text;
+}
 
 /* 建一个已转换的智能对象图层（像素 = pattern）。 */
 struct SmartFixture {
@@ -621,3 +637,205 @@ COMP_TEST(plain_project_has_no_smart_keys) {
  * 栈序就是求值顺序：两条不可交换的滤镜换个位置，画面必须变；撤销必须把
  * 「顺序 + 像素」一起带回。停用条目的 enabled 跟着条目走，不按位置留。
  */
+COMP_TEST(smart_filter_move_reorders_and_reevaluates) {
+  SmartFixture fx;
+  const comp_filter_desc blur = gaussian(3.0);
+  const comp_filter_desc noise = add_noise(30.0, 11u);
+  COMP_CHECK(fx.build());
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &blur) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &noise) == COMP_OK);
+  COMP_CHECK(filter_kind_at(fx.document, fx.layer, 0) == COMP_FILTER_GAUSSIAN_BLUR);
+  COMP_CHECK(filter_kind_at(fx.document, fx.layer, 1) == COMP_FILTER_ADD_NOISE);
+  const Pixels first_order = read_pixels(fx.document, fx.layer);
+
+  /* 1 -> 0：挪到栈底。顺序、画面都要变，且只落一步撤销。 */
+  size_t steps = history_steps(fx.document);
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 1, 0) == COMP_OK);
+  COMP_CHECK_MSG(filter_kind_at(fx.document, fx.layer, 0) == COMP_FILTER_ADD_NOISE,
+                 "move(1, 0) puts the noise first");
+  COMP_CHECK(filter_kind_at(fx.document, fx.layer, 1) == COMP_FILTER_GAUSSIAN_BLUR);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps + 1, "a real move is one undo step");
+  const Pixels second_order = read_pixels(fx.document, fx.layer);
+  COMP_CHECK_MSG(second_order.bytes != first_order.bytes,
+                 "the stack is re-evaluated in the new order (blur and noise do not commute)");
+
+  /* 撤销把顺序与像素一起带回；重做再翻过来。 */
+  COMP_CHECK(comp_document_undo(fx.document) == COMP_OK);
+  COMP_CHECK(filter_kind_at(fx.document, fx.layer, 0) == COMP_FILTER_GAUSSIAN_BLUR);
+  COMP_CHECK_MSG(read_pixels(fx.document, fx.layer).bytes == first_order.bytes,
+                 "undo restores both the order and the render");
+  COMP_CHECK(comp_document_redo(fx.document) == COMP_OK);
+  COMP_CHECK(filter_kind_at(fx.document, fx.layer, 0) == COMP_FILTER_ADD_NOISE);
+  COMP_CHECK(read_pixels(fx.document, fx.layer).bytes == second_order.bytes);
+
+  /* from == to：不重求值、不落撤销步（宿主可以无脑「拖回原位」）。 */
+  steps = history_steps(fx.document);
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 0, 0) == COMP_OK);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps, "moving an entry onto itself is a no-op");
+  COMP_CHECK(read_pixels(fx.document, fx.layer).bytes == second_order.bytes);
+
+  /* 越界：两端都算错，且在开事务之前。 */
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 0, 2) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 2, 0) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps, "out-of-range moves leave no undo step");
+
+  /* 像素锁闸：顺序会改画面，锁「图像像素」的层不能重排（与 add/set/remove 同闸）。 */
+  COMP_CHECK(comp_layer_set_lock(fx.document, fx.layer, COMP_LAYER_LOCK_PIXELS) == COMP_OK);
+  steps = history_steps(fx.document); /* set_lock 自己是一步，重排不该再加 */
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 1, 0) == COMP_ERR_STATE);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps, "a locked layer rejects the reorder");
+  COMP_CHECK(comp_layer_set_lock(fx.document, fx.layer, 0) == COMP_OK);
+
+  /*
+   * 停用条目挪位置后仍是停用的：先把噪声停用（画面 == 只有模糊），再把它挪到
+   * 栈底。若 enabled 按位置留而不是跟条目走，噪声会自动启用、画面随之改变。
+   */
+  COMP_CHECK(comp_layer_smart_filter_set(fx.document, fx.layer, 0, &noise, 0) == COMP_OK);
+  const Pixels blur_only = read_pixels(fx.document, fx.layer);
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 0, 1) == COMP_OK);
+  comp_filter_desc moved{};
+  int32_t enabled = -1;
+  COMP_CHECK(comp_layer_smart_filter_at(fx.document, fx.layer, 1, &moved, &enabled) == COMP_OK);
+  COMP_CHECK_MSG(moved.kind == COMP_FILTER_ADD_NOISE && enabled == 0,
+                 "the disabled flag travels with the entry, not with the slot");
+  COMP_CHECK_MSG(read_pixels(fx.document, fx.layer).bytes == blur_only.bytes,
+                 "moving a disabled entry does not change the picture");
+}
+
+/* ------------------------------------ 8. 展示名（P1-2 收尾 ⑩） */
+
+/*
+ * 名字是纯展示元数据：不改像素、不过像素锁闸，但进快照（可撤销）、进 `.comp`。
+ * 读侧两段式，写侧闸在开事务之前。
+ */
+COMP_TEST(smart_filter_name_validates_undoes_and_persists) {
+  SmartFixture fx;
+  const comp_filter_desc blur = gaussian(3.0);
+  COMP_CHECK(fx.build());
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &blur) == COMP_OK);
+
+  /* 缺省无名：两段式读回长度为 1（只有 '\0'）。 */
+  size_t required = 0;
+  COMP_CHECK(comp_layer_smart_filter_name(fx.document, fx.layer, 0, nullptr, 0, &required) ==
+             COMP_OK);
+  COMP_CHECK_MSG(required == 1, "an unnamed entry needs exactly one byte (the NUL)");
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0).empty());
+
+  const Pixels picture = read_pixels(fx.document, fx.layer);
+  size_t steps = history_steps(fx.document);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "我的模糊") == COMP_OK);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps + 1, "a rename is one undo step");
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0) == "我的模糊");
+  COMP_CHECK_MSG(read_pixels(fx.document, fx.layer).bytes == picture.bytes,
+                 "a rename does not touch pixels");
+
+  /* 同值重设不落步。 */
+  steps = history_steps(fx.document);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "我的模糊") == COMP_OK);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps, "renaming to the same value is a no-op");
+
+  /* 缓冲区不足：报长度、不截断（buffer 原样不动）。 */
+  char tiny[2] = {'x', 'x'};
+  size_t need = 0;
+  COMP_CHECK(comp_layer_smart_filter_name(fx.document, fx.layer, 0, tiny, sizeof(tiny), &need) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK_MSG(need == std::strlen("我的模糊") + 1, "out_required is the full length incl. NUL");
+  COMP_CHECK_MSG(tiny[0] == 'x' && tiny[1] == 'x', "a short buffer must not be truncated into");
+
+  /* 非法输入：全在开事务之前，名字保持原值。 */
+  const char bad_utf8[] = {static_cast<char>(0xFF), '\0'};
+  std::string too_long(COMP_SMART_FILTER_NAME_MAX_BYTES + 1, 'x');
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, bad_utf8) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "two\nlines") ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "tab\there") ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, too_long.c_str()) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK_MSG(history_steps(fx.document) == steps, "rejected names leave no undo step");
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0) == "我的模糊");
+
+  /* 正好到上限：接受（边界含在闸内）。 */
+  const std::string exact(COMP_SMART_FILTER_NAME_MAX_BYTES, 'y');
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, exact.c_str()) == COMP_OK);
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0) == exact);
+
+  /* 清除（NULL 与空串等价）：回退到类型名，仍是一步撤销。 */
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "") == COMP_OK);
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0).empty());
+  COMP_CHECK(comp_document_undo(fx.document) == COMP_OK);
+  COMP_CHECK_MSG(smart_filter_name(fx.document, fx.layer, 0) == exact,
+                 "undo brings the cleared name back");
+
+  /* 越界索引 / 非智能图层。 */
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 5, "x") ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(comp_layer_smart_filter_name(fx.document, fx.layer, 5, nullptr, 0, &required) ==
+             COMP_ERR_INVALID_ARGUMENT);
+
+  const comp_layer_id plain = add_layer(fx.document, "plain", false);
+  COMP_CHECK(plain != 0);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, plain, 0, "x") == COMP_ERR_STATE);
+  COMP_CHECK(comp_layer_smart_filter_name(fx.document, plain, 0, nullptr, 0, &required) ==
+             COMP_ERR_STATE);
+
+  /* 纯元数据：像素锁不该拦住改名（它不改画面）。 */
+  COMP_CHECK(comp_layer_set_lock(fx.document, fx.layer, COMP_LAYER_LOCK_ALL) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "锁着也能改名") == COMP_OK);
+  COMP_CHECK(smart_filter_name(fx.document, fx.layer, 0) == "锁着也能改名");
+}
+
+/* 名字与顺序一起过 `.comp` 往返；空名字不写键（旧工程逐字节不变）。 */
+COMP_TEST(smart_filter_names_and_order_survive_comp_round_trip) {
+  SmartFixture fx;
+  const comp_filter_desc blur = gaussian(2.0);
+  const comp_filter_desc noise = add_noise(20.0, 3u);
+  COMP_CHECK(fx.build());
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &blur) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_add(fx.document, fx.layer, &noise) == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 0, "柔化") == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_set_name(fx.document, fx.layer, 1, "颗粒") == COMP_OK);
+  COMP_CHECK(comp_layer_smart_filter_move(fx.document, fx.layer, 1, 0) == COMP_OK);
+  const Pixels expected = read_pixels(fx.document, fx.layer);
+
+  const std::string path = work_path("named.comp");
+  std::error_code ec;
+  std::filesystem::remove_all(path, ec);
+  COMP_CHECK(comp_io_save_project(fx.document, path.c_str()) == COMP_OK);
+  const std::string manifest = read_text(path + "/manifest.json");
+  COMP_CHECK_MSG(manifest.find("柔化") != std::string::npos, "a custom name is written as UTF-8");
+  COMP_CHECK_MSG(manifest.find("颗粒") != std::string::npos, "every named entry is written");
+
+  comp_document loaded = nullptr;
+  COMP_CHECK(comp_io_load_project(fx.engine, path.c_str(), &loaded) == COMP_OK);
+  const comp_layer_id loaded_layer = bottom_layer(loaded);
+  COMP_CHECK(loaded_layer != 0 && is_smart(loaded, loaded_layer));
+  COMP_CHECK_MSG(filter_kind_at(loaded, loaded_layer, 0) == COMP_FILTER_ADD_NOISE,
+                 "the reordered stack keeps its order across save/load");
+  COMP_CHECK(filter_kind_at(loaded, loaded_layer, 1) == COMP_FILTER_GAUSSIAN_BLUR);
+  COMP_CHECK(smart_filter_name(loaded, loaded_layer, 0) == "颗粒");
+  COMP_CHECK(smart_filter_name(loaded, loaded_layer, 1) == "柔化");
+  COMP_CHECK(read_pixels(loaded, loaded_layer).bytes == expected.bytes);
+
+  /* 清掉一个名字再存：manifest 的 engineSmart 区段只剩另一个 name 键
+   * （缺键 = 空，旧工程不会凭空长出这一项）。 */
+  COMP_CHECK(comp_layer_smart_filter_set_name(loaded, loaded_layer, 0, nullptr) == COMP_OK);
+  const std::string bare = work_path("named_partial.comp");
+  std::filesystem::remove_all(bare, ec);
+  COMP_CHECK(comp_io_save_project(loaded, bare.c_str()) == COMP_OK);
+  const std::string bare_manifest = read_text(bare + "/manifest.json");
+  const size_t smart_at = bare_manifest.find("engineSmart");
+  COMP_CHECK(smart_at != std::string::npos);
+  size_t name_keys = 0;
+  for (size_t at = bare_manifest.find("\"name\":", smart_at); at != std::string::npos;
+       at = bare_manifest.find("\"name\":", at + 7)) {
+    ++name_keys;
+  }
+  COMP_CHECK_MSG(name_keys == 1, "an emptied name is not written at all");
+
+  comp_document_destroy(loaded);
+}
+

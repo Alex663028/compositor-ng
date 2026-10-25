@@ -13,11 +13,20 @@
 #include "compositor/comp_filter.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "comp_abi_internal.h"
 #include "domain/filters.h"
+#include "domain/layer.h"
+#include "domain/utf8_text.h"
+
+/* 头文件宏与领域常量必须同值：两处漂移会让宿主按旧上限截断，落进 `.comp`
+ * 的名字与 ABI 接受的名字于是分叉。 */
+static_assert(compositor::kMaxSmartFilterNameBytes == COMP_SMART_FILTER_NAME_MAX_BYTES,
+              "smart filter name limit must match COMP_SMART_FILTER_NAME_MAX_BYTES");
 
 namespace {
 
@@ -239,6 +248,35 @@ Layer* smart_layer_or_error(compositor::Document* doc, comp_layer_id id,
   return layer;
 }
 
+/*
+ * 读智能滤镜展示名（P1-2 收尾 ⑩）。
+ *
+ * 与 read_layer_comp_name 同一读法：不信「内存里一定有 NUL」，先按上界扫再校验，
+ * 免得宿主传进来一段没终止的缓冲时越界读。**这里允许空**：NULL / 空串 = 清除名字
+ * （回退到滤镜类型名），与图层名「必须非空」不同——条目本身已由 kind 命名。
+ */
+bool read_smart_filter_name(const char* utf8, std::string* out, std::string* why) {
+  out->clear();
+  if (utf8 == nullptr) return true;
+  size_t length = 0;
+  while (length <= compositor::kMaxSmartFilterNameBytes && utf8[length] != '\0') ++length;
+  if (length > compositor::kMaxSmartFilterNameBytes) {
+    *why = "smart filter name exceeds COMP_SMART_FILTER_NAME_MAX_BYTES";
+    return false;
+  }
+  if (length == 0) return true;
+  std::string name(utf8, length);
+  if (!compositor::utf8_is_valid(name)) {
+    *why = "smart filter name is not valid UTF-8";
+    return false;
+  }
+  if (!compositor::utf8_is_single_line(name)) {
+    *why = "smart filter name must be single-line (no control characters)";
+    return false;
+  }
+  *out = std::move(name);
+  return true;
+}
 
 }  // namespace
 
@@ -537,4 +575,114 @@ comp_result comp_layer_smart_filter_remove(comp_document document_handle, comp_l
 }
 
 /* ------------------------------------ 栈序与命名（P1-2 收尾 ⑩，尾部追加） */
+
+comp_result comp_layer_smart_filter_move(comp_document document_handle, comp_layer_id id,
+                                         size_t from, size_t to) {
+  compositor::Document* doc = nullptr;
+  compositor::Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document_handle, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  comp_result error = COMP_OK;
+  Layer* layer = smart_layer_or_error(doc, id, engine, &error);
+  if (layer == nullptr) return error;
+  const size_t count = layer->smart->filters.size();
+  if (from >= count || to >= count) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "smart filter index out of range");
+  }
+  /* 原地不动：不重新求值、不落撤销步（宿主可无脑「拖回原位」）。 */
+  if (from == to) return compositor::abi::ok(engine);
+  {
+    const comp_result locked =
+        compositor::abi::lock_gate(engine, layer, COMP_LAYER_LOCK_PIXELS, "reorder smart filters");
+    if (locked != COMP_OK) return locked;
+  }
+  std::vector<SmartFilter> stack = layer->smart->filters;
+  /* 「取出再插入」：from < to 时 erase 后目标下标已左移，insert 到 `to` 正好
+   * 落到用户期望的最终位置（与 std::vector 的常用拖拽语义一致）。 */
+  SmartFilter moved = std::move(stack[from]);
+  stack.erase(stack.begin() + static_cast<std::ptrdiff_t>(from));
+  stack.insert(stack.begin() + static_cast<std::ptrdiff_t>(to), std::move(moved));
+  /* 顺序会改画面（非交换律的滤镜），必须整条重跑；失败先于事务返回。 */
+  ImageBuffer rendered;
+  std::string failure;
+  if (!evaluate_stack(*layer->smart, stack, &rendered, &error, &failure)) {
+    return compositor::abi::fail(engine, error, failure);
+  }
+  compositor::abi::ImplicitTxn txn(doc, "Reorder Smart Filters");
+  layer->smart->filters = std::move(stack);
+  layer->pixels = std::move(rendered);
+  doc->touch_layer(id);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_smart_filter_set_name(comp_document document_handle, comp_layer_id id,
+                                             size_t index, const char* name_utf8) {
+  compositor::Document* doc = nullptr;
+  compositor::Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document_handle, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  comp_result error = COMP_OK;
+  Layer* layer = smart_layer_or_error(doc, id, engine, &error);
+  if (layer == nullptr) return error;
+  if (index >= layer->smart->filters.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "smart filter index out of range");
+  }
+  std::string name;
+  std::string why;
+  if (!read_smart_filter_name(name_utf8, &name, &why)) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, why);
+  }
+  /* 同值重设：不落撤销步（宿主可以每帧把输入框内容写回来）。 */
+  if (layer->smart->filters[index].name == name) return compositor::abi::ok(engine);
+  /*
+   * 只改元数据：不重新求值、不过像素锁闸。名字与画面无关，锁「图像像素」的
+   * 图层照样能改名（与色标/链接同一口径）。仍进快照，所以撤销会退回旧名字。
+   */
+  compositor::abi::ImplicitTxn txn(doc, "Rename Smart Filter");
+  layer->smart->filters[index].name = std::move(name);
+  txn.commit();
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
+
+comp_result comp_layer_smart_filter_name(comp_document document_handle, comp_layer_id id,
+                                         size_t index, char* buffer, size_t capacity,
+                                         size_t* out_required) {
+  compositor::Document* doc = nullptr;
+  compositor::Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document_handle, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  if (out_required == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_required is null");
+  }
+  comp_result error = COMP_OK;
+  Layer* layer = smart_layer_or_error(doc, id, engine, &error);
+  if (layer == nullptr) return error;
+  if (index >= layer->smart->filters.size()) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "smart filter index out of range");
+  }
+  const std::string& name = layer->smart->filters[index].name;
+  const size_t required = name.size() + 1;
+  *out_required = required;
+  /* 查询模式：buffer 为 NULL 或容量 0 时只回报长度（含 '\0'）。 */
+  if (buffer == nullptr || capacity == 0) return compositor::abi::ok(engine);
+  if (capacity < required) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "name buffer is too small (see out_required)");
+  }
+  std::memcpy(buffer, name.c_str(), required);
+  return compositor::abi::ok(engine);
+  COMP_ABI_CATCH(engine)
+}
 

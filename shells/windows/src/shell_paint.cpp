@@ -1696,6 +1696,43 @@ void draw_smart_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
       FillRect(dc, &band, highlight);
       DeleteObject(highlight);
     }
+    /*
+     * 拖拽落点（P1-2 收尾 ⑩）：换成暖绿底，画在焦点蓝之后——拖动中真正要看的
+     * 是「松手落到哪一行」，焦点只是辅助。落点行 = 松手后这条所在的行走。
+     */
+    const bool drop_target =
+        shell.doc.smart_drag_active && shell.doc.smart_drag_to == index && count > 1;
+    if (drop_target) {
+      RECT band{rect.x, rect.y, rect.right(), rect.bottom()};
+      HBRUSH target = CreateSolidBrush(RGB(62, 84, 58));
+      FillRect(dc, &band, target);
+      DeleteObject(target);
+    }
+    comp_filter_desc desc{};
+    int32_t enabled = 1;
+    if (comp_layer_smart_filter_at(shell.doc.document, target, static_cast<size_t>(index), &desc,
+                                   &enabled) != COMP_OK) {
+      break;
+    }
+    const std::wstring summary = smart_entry_summary(desc);
+    SetTextColor(dc, focused ? RGB(250, 250, 255) : RGB(196, 200, 210));
+    /* 名字：自定义名优先、空名回退到类型名（smart_entry_name 是唯一口径）。 */
+    wsprintfW(line, L"%d. %s%s  ·  %s", index + 1, enabled != 0 ? L"" : L"[关] ",
+              smart_entry_name(shell.doc.document, target, static_cast<size_t>(index), desc)
+                  .c_str(),
+              summary.c_str());
+    TextOutW(dc, left + 12, rect.y + 3, line, lstrlenW(line));
+  }
+
+  SetTextColor(dc, RGB(140, 144, 156));
+  const wchar_t* hints[] = {
+      L"↑ / ↓ 选择 · Alt+↑/↓ 调序 · F2 重命名",
+      L"空格 开/关该条 · 回车 / 双击 编辑参数",
+      L"拖动行可重排（松手才写入）· Del 删除该条",
+      L"以上写入各一步撤销 · 改名不改画面",
+      L"Esc 关闭面板 · 列表随撤销 / 重做自动同步",
+  };
+  int hint_y = bottom - 8 - 5 * 18 + 4;
   for (const wchar_t* hint : hints) {
     TextOutW(dc, left + 10, hint_y, hint, lstrlenW(hint));
     hint_y += 18;

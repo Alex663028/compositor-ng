@@ -471,6 +471,9 @@ JsonValue smart_filter_to_json(const SmartFilter& filter) {
   j.set("kind", JsonValue::integer(static_cast<long long>(filter.settings.kind)));
   /* enabled 一律写出：停用的条目也要留住参数，缺键会让「停用」变成「删除」。 */
   j.set("enabled", JsonValue::boolean(filter.enabled));
+  /* name 只在非空时写出（P1-2 收尾 ⑩）：缺键 = 空 = 用滤镜类型名回退。
+   * 与 engineLock/engineColorLabel 同一口径，旧工程因此逐字节不变。 */
+  if (!filter.name.empty()) j.set("name", JsonValue::string(filter.name));
   j.set("settings", filter_settings_to_json(filter.settings));
   return j;
 }
@@ -1168,6 +1171,17 @@ bool smart_from_json(const JsonValue& entry, const fs::path& root, SmartObject* 
       return false;
     }
     filter.enabled = f.bool_or("enabled", true);
+    /*
+     * name（P1-2 收尾 ⑩）：缺键 = 空（用滤镜类型名回退）。**非法名字只清空名字**，
+     * 不整份丢弃 engineSmart——名字不参与像素求值，丢弃整条可编辑性去惩罚一个
+     * 只有面板才看得见的字段不合理。口径与 ABI 写入口一致：UTF-8、单行、
+     * ≤ kMaxSmartFilterNameBytes；不合规一律当没写。
+     */
+    const std::string name = f.string_or("name", "");
+    if (!name.empty() && name.size() <= kMaxSmartFilterNameBytes && utf8_is_valid(name) &&
+        utf8_is_single_line(name)) {
+      filter.name = name;
+    }
     object.filters.push_back(std::move(filter));
   }
   object.source_name = entry.string_or("sourceName", "");

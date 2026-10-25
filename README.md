@@ -8196,6 +8196,12 @@ parent 环不能把面板挂死。
 **壳层。** 命令号 **1710..1713**（转换为智能对象 / 栅格化 / 清除全部智能滤镜 /
 状态），菜单在 **图层 > 智能对象**；层行带 `S` 标记，转换与栅格化都走一步撤销。
 逐条列出 / 开关 / 改参数 / 删除在 §6.114 的滤镜栈面板（1720..1723）；调序与改名
+在 §6.115（1724..1726，ABI 208 → 211）。
+
+| 文件 | 改动 |
+|---|---|
+| `engine/abi/include/compositor/comp_filter.h` | 智能对象块：8 个导出 + 对象空间 / 闸门 / 幂等契约 |
+| `engine/domain/layer.h`、`comp_filter_abi.cpp` | `Layer::smart`（source + 滤镜栈），求值接入渲染 |
 | `engine/format/comp_file.cpp` | `engineSmart` 读写、`sourceFile` 原图落盘与回收 |
 | `tests/test_smart_objects.cpp` | 10 个 case（转换幂等/拒绝/16→8 位、add/set/remove 各一步、停用保留参数、对象空间求值、像素写拒绝、栅格化保留渲染、`.comp` 往返、普通工程无智能键） |
 | `shells/windows/src/shell_layers.cpp` | `panel_smart_convert` / `rasterize` / `clear_filters` / `status` |
@@ -8353,11 +8359,30 @@ JSON，构造结果再过一次 `comp_fill_validate` 才回报 `COMP_OK`。与
 没有重命名；关闭的条目仍可编辑参数，写回后保持关闭（状态栏明说画面不变）。这些前两条
 是引擎能力边界、不是壳层遗漏——**已在 §6.115 补齐**；第三条是 Photoshop 语义，保留。
 
+### 6.115 智能滤镜栈：调序与改名（P1-2 收尾 ⑩，2026-10-25，Claude）
+
+**缺口。** §6.114 的面板只读顺序、也没有展示名：想「把锐化挪到模糊前面」只能删两条再
+按新顺序重加（会多落撤销步、也会丢自定义参数），想区分同一 kind 的两条（两个不同半径
+的高斯）只能看参数摘要。这两条都卡在引擎：壳里改顺序等于重写整份栈，改名根本没有字段
+可写。本批补**尾部 3 个导出**（208 → 211），壳侧接 Alt+↑/↓、F2、拖动与菜单。
+
+**引擎：`move` 是「取出再插入」，且必须重求值。** `comp_layer_smart_filter_move(doc,
+id, from, to)` 的 `to` 是**移动后**的最终下标：先从 `from` 取出、`erase`、再 `insert`
+到 `to`——`from < to` 时 erase 已让目标左移，这样正好落到用户期望的位置（与
+`std::vector` 拖拽语义一致）。三个前置判定与它们的后果：
+
+| 情况 | 结果 |
+|---|---|
+| `from == to` | `COMP_OK`，不重求值、不落撤销步（宿主可以无脑「拖回原位」） |
+| `from` / `to` 越界 | `COMP_ERR_INVALID_ARGUMENT` |
+| 图层锁住像素 | `COMP_ERR_STATE`（`COMP_LAYER_LOCK_PIXELS` 闸，理由是「reorder smart filters」） |
+
 顺序改动会改画面（滤镜不可交换），所以**整条栈从头重跑**：先在事务外 `evaluate_stack`，
 失败直接返回、像素与历史都干净；成功后 `ImplicitTxn("Reorder Smart Filters")` +
 `touch_layer` + `commit`，因此成功即**恰好一步撤销**。这里和 `_set` 的区别值得记住：
 `_set` 改的是参数、可幂等；`move` 改的是求值顺序，幂等只体现在 `from == to`。
 
+**引擎：名字是元数据，不是滤镜状态。** `comp_layer_smart_filter_set_name(doc, id,
 index, name_utf8)` 只写 `SmartFilter::name`：
 
 - 同值重设 = `COMP_OK` 且不落步（宿主可以每帧把输入框内容写回来）；
@@ -8365,11 +8390,49 @@ index, name_utf8)` 只写 `SmartFilter::name`：
   色标改造、图层链接同一口径）；仍进快照，所以撤销会退回旧名字；
 - 空串合法 = 「回到类型名」：引擎只存空，展示层回退到 `filter_kind_name(kind)`，**不**
   把 "Gaussian Blur" 抄成自定义名（否则以后改类型名就断了）；
+- 校验：合法 UTF-8、单行（含任何控制字符即拒，换行 / 制表符是最常见的两种）、
+  ≤ `COMP_SMART_FILTER_NAME_MAX_BYTES`（256）**字节**——不是码元，中文一个字 3 字节。
+
+读取走两段式的 `comp_layer_smart_filter_name(doc, id, index, buffer, capacity,
+out_required)`：`buffer = NULL` 或 `capacity = 0` 只回报所需长度（含 `'\0'`）；容量不足
+返回 `COMP_ERR_INVALID_ARGUMENT` 并已写好 `out_required`，**不截断**。`out_required`
+为 NULL 属调用错误。头文件里 `COMP_SMART_FILTER_NAME_MAX_BYTES` 与引擎的
+`compositor::kMaxSmartFilterNameBytes` 用 `static_assert` 钉死，两边不可能漂。
+
 **持久化。** `.comp` 的 `engineSmart` 每条多一个 `name` 字符串字段；载入时不合规的名字
 （超长 / 非法 UTF-8 / 含换行制表符）一律当没写、回退类型名——坏字段只能丢一个展示名，
 不能连累整条滤镜或整层。往返测试同时覆盖「乱序 + 自定义名」。
 
 **壳层三条入口，一套落点。**
+
+- `Alt+↑ / Alt+↓`（菜单 `当前条上移一位(&U)` 1725 / `当前条下移一位(&W)` 1726）→
+  `smart_panel_move_entry(±1)`。夹到 ±1（不让它跳格），到端明说「已经是第 1 条 / 最后
+  一条，不能再上移 / 下移（未改动）」；成功后焦点跟着这条走，`needs_render` 置位并
+  `refresh_layers`。菜单给这两项开条件是 `smart_filter_total > 1`——一条换不了位。
+- `F2`（菜单 `重命名当前条…(&N)` 1724）→ `panel_begin_smart_filter_name`。复用状态栏
+  键入态，新增 `LayerInput::SmartFilterName`；**不复用 `FilterName`**，那个枚举是「按
+  名称过滤图层」的过滤词，两者同名不同义。键入态多一个第二坐标 `layer_input_slot` 装栈
+  内下标（`layer_input_id` 只装得下图层），取消时一起清零。**预填只给自定义名**：没改过
+  就空着——否则随手回车会把类型名写成自定义名，从此不再跟随类型。键入时按候选串的
+  **真实 UTF-8 字节数**夹 256（中文一个字 3 字节，按 UTF-16 码元夹会放行超长串到 ABI 才
+  被拒），回车再查一遍；空串 = 用类型名。改名成功 `refresh_layers` 并报「已重命名第 N 条
+  / 第 N 条智能滤镜已改用类型名」；同名再回车引擎不落撤销步（面板照报「已重命名」，因为
+  展示名确实已是它）。
+- 拖动行 = 与图层面板同一套手势：按下只记 `smart_drag_pending`，**移动超过 4 px** 才
+  进 active（单击仍然是「选中」），拖动中把落点行画成暖绿底（焦点蓝画在前面、落点盖在
+  上面，因为拖动时真正要看的是「松手落到哪」），松手才调 `_move`；`WM_KILLFOCUS` /
+  `WM_CAPTURECHANGED` 把 pending / active / from / to 全清掉，不留悬挂高亮。落点行 =
+  松手后这条**所占**的行。
+
+**失败一律「未改动」。** 调序与拖拽都先 `_at` 取整条、再 `_move`：引擎在开事务前求值，
+锁闸与求值失败都不会留下半步；壳侧对应报「调整智能滤镜顺序失败（未改动）」。拖拽落点
+在松手时已失效（撤销把条数缩了）则报「拖拽落点已失效（未改动）」，不硬算下标。
+
+**名字只有一个口径。** `smart_entry_name(document, layer, index, desc)`：`_name` 拿到非空
+就用它（`smart_clip_text` 截到 16 字符＋省略号，避免 256 字节的名字撑爆状态行 288 与行
+缓冲 320），否则回退 `filter_kind_name(desc.kind)`。面板行、标题状态、开关 / 删除 / 调序
+的回执全部走它——所以「第 2 条叫 我的模糊」在每个地方都一致。**删除与调序要在写之前
+取名**：删掉 / 挪走之后同一个下标已经指向邻居了。
 
 **几何。** `kSmartPanelFooter` 96 → **98**：提示从 4 行变 5 行（只有 4 行仍拿得到页脚，
 但少 2 px 行距），`hint_y = bottom - 8 - 5 * 18 + 4`。行几何仍全在 ui_core，
@@ -8378,8 +8441,33 @@ index, name_utf8)` 只写 `SmartFilter::name`：
 | 文件 | 改动 |
 |---|---|
 | `engine/domain/layer.h` | `SmartFilter::name`、`kMaxSmartFilterNameBytes` |
+| `engine/abi/include/compositor/comp_filter.h` | 尾部 3 个导出 + `COMP_SMART_FILTER_NAME_MAX_BYTES` |
+| `engine/abi/src/comp_filter_abi.cpp` | `_move` / `_set_name` / `_name`、`read_smart_filter_name`、`static_assert` |
 | `engine/format/comp_file.cpp` | `engineSmart.filters[].name` 写读 + 不合规丢弃 |
 | `tests/test_smart_objects.cpp` | 3 例：`move_reorders_and_reevaluates` / `name_validates_undoes_and_persists` / `names_and_order_survive_comp_round_trip` |
+| `shells/windows/src/shell_layers.cpp` | `smart_entry_name`、`smart_panel_move_entry`、`smart_panel_drop`、`panel_begin_smart_filter_name`、键入态改名分支、状态行 |
+| `shells/windows/src/shell_paint.cpp` | 行名字改口径、拖动落点带、5 行提示 |
+| `shells/windows/src/shell_window.cpp` | `alt` 传入 `handle_key`、Alt+↑/↓ 与 F2、拖动状态机、两条菜单项与可用性 |
+| `shells/windows/src/shell_document.cpp` | 1724..1726 分派 |
+| `shells/windows/src/shell_state.h`、`shell_internal.h`、`ui_core.h` | `LayerInput::SmartFilterName`、`layer_input_slot`、`smart_drag_*`、1724..1726、页脚 98 |
+
+**本轮验证（2026-10-25 实跑）：**
+
+| 项 | 结果 |
+|---|---|
+| `scripts/build.py --clean` | **772 例 / 0 失败**（769 → 772：新增 3 例） |
+| `scripts/run_regression.py --require-ohos` | **6/6 PASS**（772 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS） |
+| 壳自检 | **267 项 / failures = 0**，SHA256 `cae180809eed3ba4…` 与基线逐字节一致（本批不加自检项） |
+| `scripts/visual_check.py --scene all` | **233 项 / 0 失败**（面板不在视觉场景里，阈值一处未动） |
+| OHOS 交叉编译 | `compile ok=121 fail=0`（新逻辑都在既有翻译单元里，TU 数不变） |
+| `^COMP_API` 导出 | **211**（208 → 211，全部在尾部追加） |
+| `scripts/check_tool_table.py` | **20 个工具 PASS**（未动工具表） |
+
+**已知边界：** 拖动只在可见行内换位，拖到列表边缘不会自动滚动；没有多选条目、不能批量
+调序，也没有 Alt+拖动复制；名字只做展示，不参与图层面板的搜索 / 过滤，也不影响 `.comp`
+里滤镜的类型与参数；关闭的条目仍可编辑参数、写回后保持关闭（PS 语义，同 §6.114）。
+
+
 
 
 

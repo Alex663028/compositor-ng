@@ -865,6 +865,47 @@ static std::wstring smart_clip_text(const std::wstring& text, size_t max_chars) 
   return clipped;
 }
 
+/*
+ * 一条在面板上叫什么（P1-2 收尾 ⑩）：自定义名优先，空名回退到滤镜类型名。
+ * 绘制、状态栏、动作回报三处都走这里，名字与面板永远同一口径。
+ */
+std::wstring smart_entry_name(comp_document document, comp_layer_id layer, size_t index,
+                              const comp_filter_desc& desc) {
+  if (document != nullptr) {
+    /* 缓冲区正好够引擎上限 + NUL，所以这里不可能拿到「太短」的错误。 */
+    char buffer[COMP_SMART_FILTER_NAME_MAX_BYTES + 1];
+    size_t required = 0;
+    if (comp_layer_smart_filter_name(document, layer, index, buffer, sizeof(buffer), &required) ==
+            COMP_OK &&
+        required > 1) {
+      return smart_clip_text(widen_utf8(std::string(buffer, required - 1)), kSmartNameChars);
+    }
+  }
+  return filter_kind_name(desc.kind);
+}
+
+/*
+ * 一行的参数摘要：跨滤镜统一取前两行面板参数（"Amount 50 · Radius 4"）。
+ * 面板行承载不到的字段（Vignette 边缘色 / Progressive Blur 显式轴）不挤进这一行。
+ */
+std::wstring smart_entry_summary(const comp_filter_desc& desc) {
+  const comp_ui::FilterSpec* spec = comp_ui::filter_spec_at(static_cast<int>(desc.kind));
+  if (spec == nullptr) return std::wstring();
+  comp_ui::FilterPanel panel;
+  panel.id = spec->id;
+  filter_load_values(panel, desc);
+  std::wstring text;
+  const int shown = spec->param_count < 2 ? spec->param_count : 2;
+  for (int i = 0; i < shown; ++i) {
+    if (!text.empty()) text += L" · ";
+    text += widen_ascii(spec->params[i].label);
+    text += L" ";
+    text += widen_ascii(number_text(panel.value(i)).c_str());
+  }
+  return text;
+}
+
+/* 把焦点行滚进可视区（面板矮 / 条目多时必需）；键盘、鼠标、动作共用。 */
 static void smart_scroll_to_focus(ShellState& shell) {
   Layout layout{};
   if (!client_layout(shell, &layout) || layout.adjust_panel.w <= 0) return;
@@ -960,6 +1001,10 @@ void smart_panel_move(ShellState& shell, int32_t delta) {
   smart_panel_focus_row(shell, shell.doc.smart_focus + delta);
 }
 
+/*
+ * Alt+↑ / Alt+↓（P1-2 收尾 ⑩）：把当前条与相邻条换位。栈序就是求值顺序，所以
+ * 这会改画面——成功即一步撤销，失败不动像素也不留撤销步（引擎在开事务前求值）。
+ */
 void smart_panel_move_entry(ShellState& shell, int32_t delta) {
   if (shell.doc.document == nullptr) {
     set_status(shell, L"无文档");
@@ -1008,6 +1053,10 @@ void smart_panel_move_entry(ShellState& shell, int32_t delta) {
   refresh_history_status(shell, buffer);
 }
 
+/*
+ * 拖拽落点（P1-2 收尾 ⑩）：from/to 都是**移动前**的行号，语义同 _move。没跨行
+ * 就什么都不做——单击仍然是选中，不能顺手落一步撤销。
+ */
 void smart_panel_drop(ShellState& shell, int32_t from, int32_t to) {
   if (shell.doc.document == nullptr) return;
   const comp_layer_id id = smart_panel_target(shell);
@@ -3540,6 +3589,52 @@ void panel_begin_rename(ShellState& shell) {
   refresh_layer_input_status(shell);
 }
 
+/*
+ * 智能滤镜改名（F2 / 菜单，P1-2 收尾 ⑩）：预填**自定义名**（空 = 还没命名，
+ * 从空开始敲）。不预填滤镜类型名——否则一次回车就把「Gaussian Blur」存成一条
+ * 同名的自定义名，之后面板再也拿不到类型名的回退口径。
+ */
+void panel_begin_smart_filter_name(ShellState& shell) {
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"无文档");
+    return;
+  }
+  const comp_layer_id id = smart_panel_target(shell);
+  if (id == 0) {
+    set_status(shell, L"智能滤镜：当前图层不是智能对象（没有可改名的条目）");
+    return;
+  }
+  const int count = smart_panel_count(shell);
+  if (count <= 0) {
+    set_status(shell, L"智能滤镜：这一层还没有滤镜（没有可改名的条目）");
+    return;
+  }
+  int32_t index = shell.doc.smart_focus;
+  if (index < 0) index = 0;
+  if (index >= count) index = count - 1;
+  shell.doc.smart_focus = index;
+  comp_filter_desc desc{};
+  int32_t enabled = 1;
+  if (comp_layer_smart_filter_at(shell.doc.document, id, static_cast<size_t>(index), &desc,
+                                 &enabled) != COMP_OK) {
+    set_status(shell, L"智能滤镜：读取该条失败（未改动）");
+    return;
+  }
+  std::wstring current;
+  char buffer[COMP_SMART_FILTER_NAME_MAX_BYTES + 1];
+  size_t required = 0;
+  if (comp_layer_smart_filter_name(shell.doc.document, id, static_cast<size_t>(index), buffer,
+                                   sizeof(buffer), &required) == COMP_OK &&
+      required > 1) {
+    current = widen_utf8(std::string(buffer, required - 1));
+  }
+  shell.doc.layer_input = LayerInput::SmartFilterName;
+  shell.doc.layer_input_id = id;
+  shell.doc.layer_input_slot = static_cast<size_t>(index);
+  shell.doc.layer_input_text = current;
+  refresh_layer_input_status(shell);
+}
+
 /* 直接键入不透明度（对齐上游双击不透明度数值）：预填当前百分比。 */
 void panel_begin_opacity_set(ShellState& shell) {
   const LayerRow* row = selected_row(shell);
@@ -3561,6 +3656,7 @@ void panel_begin_opacity_set(ShellState& shell) {
 void panel_cancel_layer_input(ShellState& shell) {
   shell.doc.layer_input = LayerInput::None;
   shell.doc.layer_input_id = 0;
+  shell.doc.layer_input_slot = 0;
   shell.doc.layer_input_text.clear();
 }
 
@@ -3577,6 +3673,12 @@ void panel_layer_input_char(ShellState& shell, wchar_t ch) {
     if ((ch < L'0' || ch > L'9') && ch != L'.') return;
     if (ch == L'.' && shell.doc.layer_input_text.find(L'.') != std::wstring::npos) return;
     if (shell.doc.layer_input_text.size() >= 6) return;
+  } else if (shell.doc.layer_input == LayerInput::SmartFilterName) {
+    /* 引擎上限是 256 **字节**（不是码元）：按候选串的真实 UTF-8 长度夹，
+     * ASCII 与 CJK 都不浪费额度，也别让用户敲完一长串才在提交时被拒。 */
+    std::wstring candidate = shell.doc.layer_input_text;
+    candidate.push_back(ch);
+    if (narrow_utf8(candidate).size() > COMP_SMART_FILTER_NAME_MAX_BYTES) return;
   } else if (shell.doc.layer_input_text.size() >= kLayerNameCapacity) {
     return;
   }
@@ -3609,6 +3711,17 @@ void panel_commit_layer_input(ShellState& shell) {
   const LayerInput mode = shell.doc.layer_input;
   const comp_layer_id id = shell.doc.layer_input_id;
   const std::wstring text = shell.doc.layer_input_text;
+  if (mode == LayerInput::SmartFilterName) {
+    const size_t index = shell.doc.layer_input_slot;
+    const std::string name = narrow_utf8(text);
+    /* 空串 = 清除自定义名（面板回退到类型名），不是错误。字节上限在这里先
+     * 拦一次：引擎也会拒绝，但状态栏能说清是「太长」而不是笼统的失败。 */
+    if (name.size() > COMP_SMART_FILTER_NAME_MAX_BYTES) {
+      set_status(shell, L"智能滤镜名过长（UTF-8 最多 256 字节）");
+      refresh_layer_input_status(shell);
+      return;
+    }
+    if (comp_layer_smart_filter_set_name(shell.doc.document, id, index, name.c_str()) != COMP_OK) {
       /* 引擎 last_error 已由 set_status 附上（坏编码 / 下标越界 / 层已不是智能对象）。 */
       set_status(shell, L"重命名智能滤镜失败");
       refresh_layer_input_status(shell);

@@ -2024,6 +2024,16 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerSmartPanelRemove:
       smart_panel_remove_entry(shell);
       break;
+    /* ---- P1-2 收尾 ⑩：栈序与展示名（1724 段） ---- */
+    case kCmdLayerSmartPanelRename:
+      panel_begin_smart_filter_name(shell);
+      break;
+    case kCmdLayerSmartPanelMoveUp:
+      smart_panel_move_entry(shell, -1);
+      break;
+    case kCmdLayerSmartPanelMoveDown:
+      smart_panel_move_entry(shell, 1);
+      break;
     /* ---- P1-2 收尾 ⑧：填充图层（纯色 / 渐变 / 图案） ---- */
     case kCmdLayerFillSolid:
       panel_add_fill(shell, COMP_FILL_SOLID);
