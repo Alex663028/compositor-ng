@@ -120,6 +120,17 @@ struct DocumentState {
   int32_t height = 0;
   float dpi = 72.0f;
   std::string color_space = "sRGB";
+  /*
+   * P0-1：文档级位深与颜色模式。创建时确定，之后不可转换（PS 的「模式转换」
+   * 是独立功能，本版不做）。
+   *
+   * pixel_format 是**新建空图层的缺省格式**，不是「所有图层都必须如此」：
+   * 导入的 16 位资产、单层 set_pixels 写入的 HDR 图层都可以与文档缺省不同。
+   * 放在 DocumentState 里是因为 .comp 要落盘、撤销快照要带上——模式是文档的
+   * 属性，丢一次就会让「保存后重开变 RGB」这种账算不清。
+   */
+  int32_t pixel_format = 0; /* comp_pixel_format：0=RGBA8 / 1=RGBA16 */
+  int32_t color_mode = 0;   /* comp_color_mode：0=RGB / 1=GRAYSCALE */
 
   /* .comp 包的 documentID（大写 UUID 文本）。文档创建时生成、随文档持久保存，
    * 图层文件名由 (documentID, 图层 id) 派生，因此同一文档多次保存不会漂移。 */

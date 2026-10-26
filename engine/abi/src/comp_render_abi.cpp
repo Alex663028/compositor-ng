@@ -170,7 +170,23 @@ comp_result comp_render_flatten(comp_document document, void* pixels, comp_pixel
   target.native_handle = nullptr;
   target.stride = stride;
   target.pixels = pixels;
-  return comp_render_document(document, &target);
+  const comp_result rendered = comp_render_document(document, &target);
+  if (rendered != COMP_OK) return rendered;
+  /*
+   * P0-1 灰阶模式：契约是「宿主观测到的一切像素输出恒为 R=G=B」。
+   *
+   * 放在 flatten 而不是合成内核里，是因为 flatten 是所有输出口径的唯一收口
+   * （上屏的 CPU 帧、PNG 导出、PSD 导出用的合成结果、16F 导出全都走这里），
+   * 一处兜住就不存在「某条导出路径漏了」。代价是灰阶文档每帧多一遍全画布
+   * 扫描——只在 color_mode 为 GRAYSCALE 时发生，RGB 文档零开销。
+   *
+   * GPU 后端回落 CPU 的情形无需额外处理：这里拿到的已经是回读后的缓冲。
+   */
+  if (compositor::abi::document_is_gray(doc->state())) {
+    compositor::abi::desaturate_premultiplied(pixels, doc->state().width, doc->state().height,
+                                              stride, format);
+  }
+  return rendered;
   COMP_ABI_CATCH(engine)
 }
 

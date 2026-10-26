@@ -22,7 +22,11 @@ using compositor::Layer;
 
 namespace {
 
-/* 新建文档必须至少有一个可绘制图层；创建后保证其像素缓冲铺满画布且全透明。 */
+/* 新建文档必须至少有一个可绘制图层；创建后保证其像素缓冲铺满画布且全透明。
+ *
+ * P0-1：背景层的像素格式取文档的缺省位深（state.pixel_format），不再写死 RGBA8。
+ * 判断条件里必须比格式——只比宽高会让「新建 16 位文档」拿到一个 8 位缓冲，
+ * 而 state 里记的是 16 位，回读与实际不符。 */
 Layer* ensure_background_layer(Document* document) {
   DocumentState& state = document->state();
   if (state.layers.empty()) {
@@ -41,9 +45,10 @@ Layer* ensure_background_layer(Document* document) {
   }
   Layer* layer = document->find(state.active_layer);
   if (layer == nullptr) return nullptr;
+  const comp_pixel_format want = compositor::abi::document_default_format(state);
   if (layer->pixels.width != state.width || layer->pixels.height != state.height ||
-      layer->pixels.format != COMP_PIXEL_RGBA8) {
-    layer->pixels.resize(state.width, state.height, COMP_PIXEL_RGBA8);
+      layer->pixels.format != want) {
+    layer->pixels.resize(state.width, state.height, want);
     layer->pixels.clear_transparent();
   }
   return layer;
@@ -158,6 +163,61 @@ comp_result comp_engine_threads(comp_engine engine, uint32_t* out_threads) {
 
 comp_result comp_document_create(comp_engine engine, const comp_document_desc* desc,
                                 comp_document* out_document) {
+  return comp_document_create_ex(engine, desc, nullptr, out_document);
+}
+
+/*
+ * P0-1 选项解码。两种失败必须分开：
+ *   - 结构本身不合法（struct_size 太小，说明宿主与引擎的头文件版本对不上）：
+ *     INVALID_ARGUMENT，与其它参数错误同一口径；
+ *   - 结构合法但值超出本版能力（CMYK / Lab / RGBA16F 新建）：UNSUPPORTED。
+ * 混成一个码会让宿主分不清「我传错了」和「引擎还没做」，前者要改代码，
+ * 后者要换功能。
+ */
+static comp_result decode_document_options(Engine* e, const comp_document_options* options,
+                                          comp_pixel_format* out_format,
+                                          comp_color_mode* out_mode) {
+  *out_format = COMP_PIXEL_RGBA8;
+  *out_mode = COMP_COLOR_MODE_RGB;
+  if (options == nullptr) return COMP_OK;
+
+  constexpr size_t kNeedFormat =
+      offsetof(comp_document_options, pixel_format) + sizeof(int32_t);
+  constexpr size_t kNeedMode = offsetof(comp_document_options, color_mode) + sizeof(int32_t);
+  if (options->struct_size != 0 && options->struct_size < kNeedFormat) {
+    return compositor::abi::fail(e, COMP_ERR_INVALID_ARGUMENT,
+                                 "document options struct_size is too small");
+  }
+  int32_t format = static_cast<int32_t>(COMP_PIXEL_RGBA8);
+  int32_t mode = static_cast<int32_t>(COMP_COLOR_MODE_RGB);
+  if (options->struct_size == 0 || options->struct_size >= kNeedFormat) {
+    format = options->pixel_format;
+  }
+  if (options->struct_size == 0 || options->struct_size >= kNeedMode) {
+    mode = options->color_mode;
+  }
+
+  if (format != static_cast<int32_t>(COMP_PIXEL_RGBA8) &&
+      format != static_cast<int32_t>(COMP_PIXEL_RGBA16)) {
+    return compositor::abi::fail(
+        e, COMP_ERR_UNSUPPORTED,
+        "document pixel format: only RGBA8 and RGBA16 can be created (HDR documents are a "
+        "separate path)");
+  }
+  if (mode != static_cast<int32_t>(COMP_COLOR_MODE_RGB) &&
+      mode != static_cast<int32_t>(COMP_COLOR_MODE_GRAYSCALE)) {
+    return compositor::abi::fail(e, COMP_ERR_UNSUPPORTED,
+                                 "document color mode: only RGB and GRAYSCALE are supported "
+                                 "(color management is out of scope)");
+  }
+  *out_format = static_cast<comp_pixel_format>(format);
+  *out_mode = static_cast<comp_color_mode>(mode);
+  return COMP_OK;
+}
+
+comp_result comp_document_create_ex(comp_engine engine, const comp_document_desc* desc,
+                                   const comp_document_options* options,
+                                   comp_document* out_document) {
   if (out_document == nullptr) return COMP_ERR_INVALID_ARGUMENT;
   Engine* e = compositor::abi::as_engine(engine);
   COMP_ABI_TRY(e)
@@ -169,6 +229,11 @@ comp_result comp_document_create(comp_engine engine, const comp_document_desc* d
   if (!compositor::is_valid_canvas(size)) {
     return compositor::abi::fail(e, COMP_ERR_INVALID_ARGUMENT, "invalid canvas size");
   }
+  comp_pixel_format pixel_format = COMP_PIXEL_RGBA8;
+  comp_color_mode color_mode = COMP_COLOR_MODE_RGB;
+  const comp_result options_result =
+      decode_document_options(e, options, &pixel_format, &color_mode);
+  if (options_result != COMP_OK) return options_result;
 
   const float dpi = desc->dpi > 0.0f ? desc->dpi : 72.0f;
   const std::string color_space = desc->color_space != nullptr ? desc->color_space : "sRGB";
@@ -195,6 +260,10 @@ comp_result comp_document_create(comp_engine engine, const comp_document_desc* d
   /* .comp 包的 documentID 必须非空（上游为必填 UUID）：文档一创建就分配，
    * 随文档持久保存，保证多次保存产出稳定的图层文件名。 */
   document->state().document_id = compositor::uuid_v4_new();
+  /* P0-1：位深与颜色模式要在**建背景层之前**落进状态——ensure_background_layer
+   * 按 state.pixel_format 决定缓冲格式，晚一步就是「声明 16 位、实际 8 位」。 */
+  document->state().pixel_format = static_cast<int32_t>(pixel_format);
+  document->state().color_mode = static_cast<int32_t>(color_mode);
 
   if (ensure_background_layer(document.get()) == nullptr) {
     return compositor::abi::fail(e, COMP_ERR_INTERNAL, "cannot create background layer");
@@ -271,6 +340,42 @@ comp_result comp_document_size(comp_document document, comp_size* out_size) {
     return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_size is null");
   }
   *out_size = comp_size{doc->state().width, doc->state().height};
+  return compositor::abi::ok(engine);
+}
+
+/*
+ * P0-1 位深回读。
+ *
+ * 口径是「文档缺省位深」而不是「背景层的当前格式」：8 位工具作用在 16 位图层上
+ * 会把那一层降成 8 位（见 tool_ops.cpp 的 use_rgba8_working_copy），如果这里跟着
+ * 背景层走，画第一笔之后标题栏的「16 位」就会自己变成「8 位」——而用户选的文档
+ * 位深并没有变。新建图层仍按文档位深创建，两者必须分开记。
+ */
+comp_result comp_document_pixel_format(comp_document document, comp_pixel_format* out_format) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_format == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_format is null");
+  }
+  *out_format = compositor::abi::document_default_format(doc->state());
+  return compositor::abi::ok(engine);
+}
+
+comp_result comp_document_color_mode(comp_document document, comp_color_mode* out_mode) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  if (out_mode == nullptr) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "out_mode is null");
+  }
+  const int32_t mode = doc->state().color_mode;
+  *out_mode = mode == static_cast<int32_t>(COMP_COLOR_MODE_GRAYSCALE) ? COMP_COLOR_MODE_GRAYSCALE
+                                                                     : COMP_COLOR_MODE_RGB;
   return compositor::abi::ok(engine);
 }
 

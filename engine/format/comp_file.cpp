@@ -12,6 +12,7 @@
 
 #include "compositing/blend.h"
 #include "compositing/resample.h"
+#include "compositor/comp_engine.h" /* P0-1：COMP_COLOR_MODE_* */
 #include "core/comp_geometry.h"
 #include "domain/document.h"
 #include "domain/fill_layer.h"
@@ -692,6 +693,14 @@ bool save_project(Document& doc, const std::string& path, std::string* error) {
   manifest.set("documentID", JsonValue::string(state.document_id));
   manifest.set("width", JsonValue::integer(state.width));
   manifest.set("height", JsonValue::integer(state.height));
+  /* P0-1：位深与颜色模式。缺省（8 位 RGB）不写键——旧版读到的 manifest 逐字节
+   * 不变，新版读旧包也照样是缺省，双向都不用迁移。 */
+  if (state.pixel_format != static_cast<int32_t>(COMP_PIXEL_RGBA8)) {
+    manifest.set("enginePixelFormat", JsonValue::integer(state.pixel_format));
+  }
+  if (state.color_mode != static_cast<int32_t>(COMP_COLOR_MODE_RGB)) {
+    manifest.set("engineColorMode", JsonValue::integer(state.color_mode));
+  }
   if (state.active_layer != 0) {
     const auto it = layer_uuid.find(state.active_layer);
     if (it != layer_uuid.end()) manifest.set("activeLayerID", JsonValue::string(it->second));
@@ -1322,6 +1331,25 @@ bool load_project(const std::string& path, Engine* engine, Document** out,
   DocumentState& state = doc->state();
   state.layers.clear();
   state.document_id = document_id;
+  /*
+   * P0-1：位深与颜色模式。缺键 = 缺省（8 位 RGB），旧 manifest 直接兼容。
+   * 值超出本版支持范围按坏数据处理——静默降级成 RGB 会让「存的是灰阶、
+   * 打开变成彩色」这种账查不出来；宁可明确拒绝，让宿主看见这条路径。
+   */
+  const long long pixel_format = manifest.integer_or("enginePixelFormat", 0);
+  if (pixel_format != static_cast<long long>(COMP_PIXEL_RGBA8) &&
+      pixel_format != static_cast<long long>(COMP_PIXEL_RGBA16)) {
+    if (error != nullptr) *error = "enginePixelFormat is out of range";
+    return false;
+  }
+  const long long color_mode = manifest.integer_or("engineColorMode", 0);
+  if (color_mode != static_cast<long long>(COMP_COLOR_MODE_RGB) &&
+      color_mode != static_cast<long long>(COMP_COLOR_MODE_GRAYSCALE)) {
+    if (error != nullptr) *error = "engineColorMode is out of range";
+    return false;
+  }
+  state.pixel_format = static_cast<int32_t>(pixel_format);
+  state.color_mode = static_cast<int32_t>(color_mode);
 
   /* 参考线（engineGuides）。缺键 = 没有参考线（旧 manifest 直接兼容）；
    * 键存在就必须是合法数组——坏数据静默丢弃会让「存过参考线怎么没了」

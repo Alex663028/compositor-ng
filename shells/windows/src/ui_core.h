@@ -5644,7 +5644,7 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
 inline const char* doc_dialog_subtitle(DocDialogKind kind) {
   switch (kind) {
     case DocDialogKind::NewDocument:
-      return "画布尺寸 / 分辨率 / 背景";
+      return "画布尺寸 / 分辨率 / 背景 / 位深 / 颜色模式";
     case DocDialogKind::ImageSize:
       return "整篇重采样；选区会被丢弃";
     case DocDialogKind::CanvasSize:
@@ -5694,7 +5694,7 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
 inline int doc_dialog_row_count(DocDialogKind kind) {
   switch (kind) {
     case DocDialogKind::NewDocument:
-      return 4; /* 宽 / 高 / 分辨率 / 背景 */
+      return 6; /* 宽 / 高 / 分辨率 / 背景 / 位深 / 颜色模式 */
     case DocDialogKind::ImageSize:
       return 4; /* 宽 / 高 / 约束比例 / 百分比 */
     case DocDialogKind::CanvasSize:
@@ -5724,6 +5724,10 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
         case 1: return DocRowSpec{"高度 (px)", DocRowKind::Number, kDocSizeMin, kDocSizeMax, 64, 0};
         case 2: return DocRowSpec{"分辨率 (dpi)", DocRowKind::Number, kDocDpiMin, kDocDpiMax, 1, 0};
         case 3: return DocRowSpec{"背景", DocRowKind::Choice, 0, 2, 1, 3};
+        /* P0-1：位深与颜色模式各自只有两档，且都是「创建时确定、之后不可转换」，
+         * 所以放在背景行后面，与 PS「新建对话框下半部分」的位置一致。 */
+        case 4: return DocRowSpec{"位深", DocRowKind::Choice, 0, 1, 1, 2};
+        case 5: return DocRowSpec{"颜色模式", DocRowKind::Choice, 0, 1, 1, 2};
         default: break;
       }
       break;
@@ -5833,6 +5837,30 @@ inline const char* doc_new_background_name(int choice) {
     case 0: return "白色";
     case 1: return "透明";
     case 2: return "前景色";
+    default: return "?";
+  }
+}
+
+/*
+ * P0-1 位深与颜色模式。枚举值直接就是 ABI 的取值（0/1），面板显示、状态栏、
+ * create_ex 的入参读同一份数——中间不再做一层映射，就不会出现「面板显示 16 位、
+ * 实际建了 8 位」。
+ *
+ * 只给两项：HDR 新建（RGBA16F）与 CMYK/Lab 都在引擎侧明确拒绝，界面上不摆
+ * 一个选了就报错的档位。
+ */
+inline const char* doc_new_bit_depth_name(int choice) {
+  switch (choice) {
+    case 0: return "8 位/通道";
+    case 1: return "16 位/通道";
+    default: return "?";
+  }
+}
+
+inline const char* doc_new_color_mode_name(int choice) {
+  switch (choice) {
+    case 0: return "RGB";
+    case 1: return "灰度";
     default: return "?";
   }
 }

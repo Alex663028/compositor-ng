@@ -144,6 +144,35 @@ class ImplicitTxn {
   DocumentState before_{};
 };
 
+/* ---------------------------------------------- P0-1 文档位深 / 颜色模式 */
+
+/* 文档缺省位深 -> 像素格式。非法/未设置一律按 RGBA8（缺省）。 */
+inline comp_pixel_format document_default_format(const DocumentState& state) {
+  return state.pixel_format == static_cast<int32_t>(COMP_PIXEL_RGBA16) ? COMP_PIXEL_RGBA16
+                                                                       : COMP_PIXEL_RGBA8;
+}
+
+inline bool document_is_gray(const DocumentState& state) {
+  return state.color_mode == static_cast<int32_t>(COMP_COLOR_MODE_GRAYSCALE);
+}
+
+/*
+ * 就地把一块**预乘**像素缓冲去色（R=G=B=Rec.709 亮度）。
+ *
+ * 为什么对预乘数据直接加权是对的：预乘通道 = 直通色 × alpha，而亮度是线性
+ * 加权，于是 luma(r·a, g·a, b·a) = luma(r,g,b)·a —— 恰好是「灰度色的预乘值」。
+ * 先反预乘再算再乘回去既慢又会在 alpha 很小时放大取整误差，没有必要。
+ *
+ * 权重取 Rec.709，与 imaging/AdjustPixels.c 的 rec709() 同口径（亮度类调整、
+ * 直方图都走它）。注意「去色」调整用的是 Rec.601，两者不同是各自上游的口径，
+ * 这里不改历史行为。
+ *
+ * 支持 RGBA8 / RGBA16 / RGBA16F；其它格式直接返回（未知格式的缓冲不由本函数管）。
+ * pixels 为 NULL 或尺寸非正为无操作。
+ */
+void desaturate_premultiplied(void* pixels, int32_t width, int32_t height, size_t stride,
+                              comp_pixel_format format);
+
 }  // namespace abi
 }  // namespace compositor
 

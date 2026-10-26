@@ -5,6 +5,7 @@
 
 #include "core/comp_geometry.h"
 #include "core/comp_live_handles.h"
+#include "imaging/DeepPixels.h"
 
 namespace compositor {
 namespace abi {
@@ -125,6 +126,64 @@ bool copy_mask_into(const comp_mask& source, MaskBuffer* destination, std::strin
                 source.pixels + static_cast<size_t>(y) * src_stride, row_bytes);
   }
   return true;
+}
+
+/* --------------------------------------------- P0-1 灰阶模式：缓冲去色 */
+
+void desaturate_premultiplied(void* pixels, int32_t width, int32_t height, size_t stride,
+                              comp_pixel_format format) {
+  if (pixels == nullptr || width <= 0 || height <= 0) return;
+  const size_t min_stride = static_cast<size_t>(width) * bytes_per_pixel(format);
+  const size_t row_stride = stride >= min_stride ? stride : min_stride;
+
+  if (format == COMP_PIXEL_RGBA8) {
+    for (int32_t y = 0; y < height; ++y) {
+      uint8_t* row = static_cast<uint8_t*>(pixels) + static_cast<size_t>(y) * row_stride;
+      for (int32_t x = 0; x < width; ++x, row += 4) {
+        /* 预乘数据上的加权：通道取整误差最多 ±1，落回三个通道同一值即可，
+         * 不做 dither——灰阶模式要比「看起来像灰度」更硬的「逐字节等于灰度」。 */
+        const uint8_t value = static_cast<uint8_t>(
+            (2126u * row[0] + 7152u * row[1] + 722u * row[2] + 5000u) / 10000u);
+        row[0] = value;
+        row[1] = value;
+        row[2] = value;
+      }
+    }
+    return;
+  }
+
+  if (format == COMP_PIXEL_RGBA16) {
+    for (int32_t y = 0; y < height; ++y) {
+      uint8_t* row = static_cast<uint8_t*>(pixels) + static_cast<size_t>(y) * row_stride;
+      for (int32_t x = 0; x < width; ++x, row += 8) {
+        uint16_t* channel = reinterpret_cast<uint16_t*>(row);
+        const uint32_t value = (2126u * channel[0] + 7152u * channel[1] + 722u * channel[2] + 5000u) /
+                               10000u;
+        channel[0] = static_cast<uint16_t>(value);
+        channel[1] = static_cast<uint16_t>(value);
+        channel[2] = static_cast<uint16_t>(value);
+      }
+    }
+    return;
+  }
+
+  if (format == COMP_PIXEL_RGBA16F) {
+    /* HDR：亮度可远超 1.0，不做任何截断——灰阶模式限制的是「有没有色」，不是
+     * 「有多亮」。 */
+    for (int32_t y = 0; y < height; ++y) {
+      uint8_t* row = static_cast<uint8_t*>(pixels) + static_cast<size_t>(y) * row_stride;
+      for (int32_t x = 0; x < width; ++x, row += 8) {
+        uint16_t* channel = reinterpret_cast<uint16_t*>(row);
+        const float value = 0.2126f * deep_half_value(channel[0]) +
+                            0.7152f * deep_half_value(channel[1]) +
+                            0.0722f * deep_half_value(channel[2]);
+        const uint16_t bits = deep_half_bits(value);
+        channel[0] = bits;
+        channel[1] = bits;
+        channel[2] = bits;
+      }
+    }
+  }
 }
 
 }  // namespace abi

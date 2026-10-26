@@ -602,6 +602,10 @@ struct DocumentContext {
   int doc_dialog_height = kDefaultHeight;
   int doc_dialog_dpi = 72;
   int doc_dialog_background = 1; /* 0 白 / 1 透明 / 2 前景色；缺省透明 = Ctrl+N 旧行为 */
+  /* P0-1：新建对话框的位深与颜色模式。取值直接是 ABI 枚举（0/1），
+   * 「记住上次设置」与背景行同一口径——面板收起后这些字段仍留着。 */
+  int doc_dialog_pixel_format = 0; /* 0 = 8 位 / 1 = 16 位 */
+  int doc_dialog_color_mode = 0;   /* 0 = RGB / 1 = 灰度 */
   int doc_dialog_lock_aspect = 1;
   int doc_dialog_anchor = 4; /* 居中 */
   int doc_dialog_steps = 0;
@@ -876,6 +880,9 @@ struct ShellState {
   int new_doc_height = kDefaultHeight;
   int new_doc_dpi = 72;
   int new_doc_background = 1;
+  /* P0-1：新建面板的「记住上次设置」——与尺寸/分辨率/背景同一口径。 */
+  int new_doc_pixel_format = 0;
+  int new_doc_color_mode = 0;
   bool camera_raw_tables_loaded = false;
   std::wstring window_title_cache;
   comp_ui::ColorRGB foreground{};

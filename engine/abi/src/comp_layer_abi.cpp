@@ -435,6 +435,20 @@ comp_result comp_layer_set_pixels(comp_document document, comp_layer_id id,
     if (!compositor::abi::copy_image_into(*image, &layer->pixels, &error)) {
       return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, error);
     }
+    /*
+     * P0-1 灰阶模式：写进灰阶文档的彩色像素按 Rec.709 亮度转灰后**存储**。
+     *
+     * 只在 flatten 去色也能让输出恒灰，但那样 comp_layer_get_pixels 会读回彩色，
+     * 宿主就得自己再转一次——同一个文档两套像素值，谁也说不清哪份是真的。
+     * 这里转在存储侧，读回与输出因此是同一份数据。RGBA16 / RGBA16F 一并处理，
+     * 否则 16 位灰阶文档会从这里漏掉唯一一条彩色入口。
+     */
+    if (compositor::abi::document_is_gray(doc->state()) && !layer->pixels.empty()) {
+      std::vector<uint8_t>& data = layer->pixels.writable_pixels();
+      compositor::abi::desaturate_premultiplied(data.data(), layer->pixels.width,
+                                                layer->pixels.height, layer->pixels.stride(),
+                                                layer->pixels.format);
+    }
   }
   /*
    * S18：内容变了 → 换修订号。**在 txn.commit() 之前**——历史 after 快照要带着

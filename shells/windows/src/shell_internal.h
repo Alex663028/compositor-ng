@@ -711,6 +711,9 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void forget_color_range(ShellState& shell);
   bool fill_document_background(ShellState& shell, int background);
   bool create_document_with(ShellState& shell, int width, int height, int dpi, int background);
+  /* P0-1：位深 0=8 位 / 1=16 位；颜色模式 0=RGB / 1=灰度（取值即 ABI 枚举）。 */
+  bool create_document_opts(ShellState& shell, int width, int height, int dpi, int background,
+                            int pixel_format, int color_mode);
   bool create_document(ShellState& shell);
   bool load_document(ShellState& shell, const char* path_utf8);
   bool save_document(ShellState& shell, const char* path_utf8);

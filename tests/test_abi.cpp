@@ -2275,3 +2275,212 @@ COMP_TEST(engine_concurrent_write_matrix_two_documents) {
   COMP_CHECK_MSG(failures.load() == 0, "concurrent per-document write matrix all succeed");
   comp_engine_destroy(engine);
 }
+
+/* ---------------------------------------------------------------- P0-1：位深 */
+
+/*
+ * 16 位文档：位深必须落到**背景层与后续新建图层**的像素格式上。
+ * 只回读一个枚举而不看图层，等于只测了「宿主传什么我记什么」——真正会出错的
+ * 是 ensure_background_layer / create_layer 里写死的 RGBA8（声明 16 位、实际 8 位）。
+ */
+COMP_TEST(abi_document_bit_depth_16) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 3;
+  comp_document_options options{};
+  options.struct_size = sizeof(options);
+  options.pixel_format = COMP_PIXEL_RGBA16;
+  options.color_mode = COMP_COLOR_MODE_RGB;
+
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) == COMP_OK);
+  COMP_CHECK(document != nullptr);
+
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_document_pixel_format(document, &format) == COMP_OK);
+  COMP_CHECK(format == COMP_PIXEL_RGBA16);
+  comp_color_mode mode = COMP_COLOR_MODE_CMYK;
+  COMP_CHECK(comp_document_color_mode(document, &mode) == COMP_OK);
+  COMP_CHECK(mode == COMP_COLOR_MODE_RGB);
+
+  /* 背景层：16 位，且铺满画布。 */
+  const comp_layer_id background = background_layer(document);
+  COMP_CHECK(background != 0);
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format layer_format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(document, background, nullptr, 0, &width, &height,
+                                   &layer_format) == COMP_OK);
+  COMP_CHECK(width == 4 && height == 3);
+  COMP_CHECK(layer_format == COMP_PIXEL_RGBA16);
+
+  /* 新建空图层必须跟随文档位深，否则「16 位文档」加一层就破功。 */
+  comp_layer_desc layer_desc{};
+  layer_desc.blend = COMP_BLEND_NORMAL;
+  layer_desc.opacity = 1.0f;
+  layer_desc.transform = comp_rect{0, 0, 4, 3};
+  comp_layer_id extra = 0;
+  COMP_CHECK(comp_layer_add(document, &layer_desc, &extra) == COMP_OK);
+  COMP_CHECK(extra != 0);
+  COMP_CHECK(comp_layer_get_pixels(document, extra, nullptr, 0, &width, &height,
+                                   &layer_format) == COMP_OK);
+  COMP_CHECK(layer_format == COMP_PIXEL_RGBA16);
+
+  /* 8 位写入照旧可用（会按契约降位），合成不出错。 */
+  SolidImage red(4, 3, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, extra, &red.image) == COMP_OK);
+  const std::vector<uint8_t> canvas = flatten(document, 4, 3);
+  COMP_CHECK(matches(canvas, 4, 1, 1, 255, 0, 0, 255, 1));
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* ------------------------------------------------------------ P0-1：颜色模式 */
+
+/*
+ * 灰阶文档的引擎契约：宿主可见的一切输出恒为 R=G=B。
+ * 写入纯红（预乘 255,0,0,255），flatten 必须是 Rec.709 亮度（≈54），且三通道相等；
+ * comp_layer_get_pixels 读回的也必须是同一份灰度值（存储侧就转了，不是只在输出转）。
+ */
+COMP_TEST(abi_document_grayscale_mode) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 4;
+  document_desc.height = 4;
+  comp_document_options options{};
+  options.struct_size = sizeof(options);
+  options.pixel_format = COMP_PIXEL_RGBA8;
+  options.color_mode = COMP_COLOR_MODE_GRAYSCALE;
+
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) == COMP_OK);
+  comp_color_mode mode = COMP_COLOR_MODE_RGB;
+  COMP_CHECK(comp_document_color_mode(document, &mode) == COMP_OK);
+  COMP_CHECK(mode == COMP_COLOR_MODE_GRAYSCALE);
+
+  const comp_layer_id background = background_layer(document);
+  SolidImage red(4, 4, 255, 0, 0, 255);
+  COMP_CHECK(comp_layer_set_pixels(document, background, &red.image) == COMP_OK);
+
+  /* Rec.709 亮度：0.2126 × 255 = 54.2 -> 54（整数权重 + 5000 四舍五入）。 */
+  const std::vector<uint8_t> canvas = flatten(document, 4, 4);
+  for (int32_t y = 0; y < 4; ++y) {
+    for (int32_t x = 0; x < 4; ++x) {
+      const size_t index = (static_cast<size_t>(y) * 4u + static_cast<size_t>(x)) * 4u;
+      COMP_CHECK(canvas[index + 0] == canvas[index + 1]);
+      COMP_CHECK(canvas[index + 1] == canvas[index + 2]);
+      COMP_CHECK(abs_diff(canvas[index + 0], 54) <= 1);
+      COMP_CHECK(canvas[index + 3] == 255);
+    }
+  }
+
+  /* 读回同一份数据：存储侧已经转过灰度，宿主不该拿到彩色。 */
+  std::vector<uint8_t> back(4u * 4u * 4u, 0);
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(document, background, back.data(), 4u * 4u, &width, &height,
+                                   &format) == COMP_OK);
+  COMP_CHECK(width == 4 && height == 4);
+  COMP_CHECK(back[0] == back[1] && back[1] == back[2]);
+
+  comp_document_destroy(document);
+  comp_engine_destroy(engine);
+}
+
+/* 选项校验：不支持的枚举要回 UNSUPPORTED，结构版本不对要回 INVALID_ARGUMENT。 */
+COMP_TEST(abi_document_options_rejected) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 2;
+  document_desc.height = 2;
+
+  comp_document_options options{};
+  options.struct_size = sizeof(options);
+  comp_document document = nullptr;
+
+  /* HDR 新建不在本版能力面（需要合成表面本身就是 RGBA16F）。 */
+  options.pixel_format = COMP_PIXEL_RGBA16F;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) ==
+             COMP_ERR_UNSUPPORTED);
+  COMP_CHECK(document == nullptr);
+
+  options.pixel_format = COMP_PIXEL_RGBA8;
+  options.color_mode = COMP_COLOR_MODE_CMYK;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) ==
+             COMP_ERR_UNSUPPORTED);
+  options.color_mode = COMP_COLOR_MODE_LAB;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) ==
+             COMP_ERR_UNSUPPORTED);
+  options.color_mode = 99; /* 未知值同口径 */
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) ==
+             COMP_ERR_UNSUPPORTED);
+
+  /* struct_size 太小 = 宿主与引擎头文件版本对不上，必须报参数错误而不是越界读。 */
+  options.color_mode = COMP_COLOR_MODE_RGB;
+  options.struct_size = 4;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) ==
+             COMP_ERR_INVALID_ARGUMENT);
+  COMP_CHECK(document == nullptr);
+
+  /* struct_size = 0 视为未填：等价于全缺省，与 comp_document_create 同一结果。 */
+  comp_document_options empty{};
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &empty, &document) == COMP_OK);
+  COMP_CHECK(document != nullptr);
+  comp_pixel_format format = COMP_PIXEL_RGBA16;
+  COMP_CHECK(comp_document_pixel_format(document, &format) == COMP_OK);
+  COMP_CHECK(format == COMP_PIXEL_RGBA8);
+  comp_document_destroy(document);
+
+  comp_engine_destroy(engine);
+}
+
+/* .comp 往返：位深与颜色模式要跟着文档走，不能存完就退回 RGB / 8 位。 */
+COMP_TEST(abi_document_mode_round_trip) {
+  comp_engine_desc desc = test_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  const std::string path =
+      (std::filesystem::temp_directory_path() / "compositor_mode_round_trip.comp").string();
+  std::error_code ignored;
+  std::filesystem::remove_all(path, ignored);
+
+  comp_document_desc document_desc{};
+  document_desc.width = 3;
+  document_desc.height = 3;
+  comp_document_options options{};
+  options.struct_size = sizeof(options);
+  options.pixel_format = COMP_PIXEL_RGBA16;
+  options.color_mode = COMP_COLOR_MODE_GRAYSCALE;
+
+  comp_document document = nullptr;
+  COMP_CHECK(comp_document_create_ex(engine, &document_desc, &options, &document) == COMP_OK);
+  COMP_CHECK(comp_document_save(document, path.c_str()) == COMP_OK);
+  comp_document_destroy(document);
+
+  comp_document loaded = nullptr;
+  COMP_CHECK(comp_document_load(engine, path.c_str(), &loaded) == COMP_OK);
+  COMP_CHECK(loaded != nullptr);
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  comp_color_mode mode = COMP_COLOR_MODE_RGB;
+  COMP_CHECK(comp_document_pixel_format(loaded, &format) == COMP_OK);
+  COMP_CHECK(comp_document_color_mode(loaded, &mode) == COMP_OK);
+  COMP_CHECK(format == COMP_PIXEL_RGBA16);
+  COMP_CHECK(mode == COMP_COLOR_MODE_GRAYSCALE);
+
+  comp_document_destroy(loaded);
+  std::filesystem::remove_all(path, ignored);
+  comp_engine_destroy(engine);
+}

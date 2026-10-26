@@ -60,10 +60,76 @@ typedef struct comp_document_desc {
   const char* color_space;  /* 可选，如 "sRGB"；NULL 表示默认 sRGB */
 } comp_document_desc;
 
-/* 新建空文档（单背景层），返回文档句柄。 */
+/*
+ * 颜色模式（P0-1）。文档创建时确定，之后不可转换。
+ *
+ * 只支持 RGB / 灰度两项，CMYK 与 Lab 保留编号但**明确拒绝**
+ * （COMP_ERR_UNSUPPORTED）：色彩管理（ICC、CMYK 色域、印刷打样）是一个独立
+ * 子系统，本版口径 C 已明确不做。给出编号只是为了让宿主的对话框能显示
+ * 「不支持」而不是「未知值」，不代表引擎有实现。
+ *
+ * 灰度的引擎契约：**一切宿主可见的像素输出恒为 R=G=B**。
+ *   - `comp_render_flatten` 在写进调用方缓冲之前统一去色（预乘数据的
+ *     亮度就是亮度，权重作用在预乘通道上恰好等价，不会让边缘 alpha 变浅）；
+ *   - `comp_layer_set_pixels` 写入的非灰度像素按同一口径转灰后存储。
+ * 因此「灰阶文档里出现彩色」在输出侧不可能发生，宿主无需自己再兜一遍。
+ */
+typedef enum comp_color_mode {
+  COMP_COLOR_MODE_RGB       = 0, /* 缺省 */
+  COMP_COLOR_MODE_GRAYSCALE = 1,
+  COMP_COLOR_MODE_CMYK      = 2, /* 保留：不支持，create_ex 返回 UNSUPPORTED */
+  COMP_COLOR_MODE_LAB       = 3  /* 保留：不支持，create_ex 返回 UNSUPPORTED */
+} comp_color_mode;
+
+/*
+ * 文档创建选项（P0-1：位深 + 颜色模式）。
+ *
+ * 为什么不是给 comp_document_desc 尾部追加字段：那份结构**没有长度参数**，
+ * 老宿主按自己编译时的短结构体传进来，新引擎读追加字段就是越界读（引擎头
+ * 里 comp_engine_create2 的注释写的是同一件事）。于是这里另开一个带
+ * struct_size 的结构：调用方填 sizeof(comp_document_options)，引擎只读
+ * struct_size 覆盖到的字节——今后再加字段（例如「默认 ICC」）依旧是纯追加，
+ * 老宿主传短结构也安全。
+ *
+ * struct_size 为 0 视为调用方未填写（等价于全缺省）；引擎要求它不小于
+ * offsetof(pixel_format) 之后的最小可用长度，否则返回 INVALID_ARGUMENT。
+ */
+typedef struct comp_document_options {
+  size_t  struct_size;    /* 必填 = sizeof(comp_document_options) */
+  int32_t pixel_format;   /* comp_pixel_format；仅 RGBA8 / RGBA16 可新建（见下） */
+  int32_t color_mode;     /* comp_color_mode；RGB / GRAYSCALE */
+} comp_document_options;
+
+/*
+ * 新建空文档（单背景层），返回文档句柄。
+ *
+ * 位深（pixel_format）决定背景层与后续新建空图层的像素格式：
+ *   - RGBA8（0，缺省）：4 字节/像素；
+ *   - RGBA16（1）：8 字节/像素、预乘；落笔族工具只改笔尖盖到的像素并在那里
+ *     保住 16 位精度（见 tool_ops.cpp 的 deep 往返），heal/dither 这类整幅算子
+ *     按上游口径把图层降为 8 位；
+ *   - RGBA16F（2）：拒绝（COMP_ERR_UNSUPPORTED）。HDR 文档需要合成表面本身
+ *     是 RGBA16F，属于另一条通路；新建对话框不提供，宿主仍可对单图层
+ *     `comp_layer_set_pixels` 传 RGBA16F。
+ */
 COMP_API comp_result comp_document_create(comp_engine engine,
                                           const comp_document_desc* desc,
                                           comp_document* out_document);
+
+/*
+ * 带选项的新建（P0-1）。options 为 NULL 时与 comp_document_create 逐字节等价。
+ * desc / engine / out_document 的校验口径与原入口完全相同。
+ */
+COMP_API comp_result comp_document_create_ex(comp_engine engine,
+                                             const comp_document_desc* desc,
+                                             const comp_document_options* options,
+                                             comp_document* out_document);
+
+/* 查询文档位深（背景层的像素格式）与颜色模式；任一 out 可为 NULL。 */
+COMP_API comp_result comp_document_pixel_format(comp_document document,
+                                                comp_pixel_format* out_format);
+COMP_API comp_result comp_document_color_mode(comp_document document,
+                                              comp_color_mode* out_mode);
 
 /* 从 .comp 目录包加载文档。 */
 COMP_API comp_result comp_document_load(comp_engine engine,

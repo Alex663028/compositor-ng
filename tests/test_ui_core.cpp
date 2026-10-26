@@ -4508,7 +4508,7 @@ COMP_TEST(ui_core_doc_dialog_rows) {
 
   /* 1. 四种对话框的行数与行序（顺序是壳取值 switch 的约定，不能随便调）。 */
   COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::None) == 0);
-  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::NewDocument) == 4);
+  COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::NewDocument) == 6);
   COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::ImageSize) == 4);
   COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::CanvasSize) == 3);
   COMP_CHECK(comp_ui::doc_dialog_row_count(DocDialogKind::HistoryLimit) == 2);
@@ -4522,6 +4522,20 @@ COMP_TEST(ui_core_doc_dialog_rows) {
   COMP_CHECK(new_w.step == new_h.step && new_w.min == new_h.min && new_w.max == new_h.max);
   COMP_CHECK(new_dpi.kind == DocRowKind::Number && new_dpi.min == comp_ui::kDocDpiMin);
   COMP_CHECK(new_bg.kind == DocRowKind::Choice && new_bg.choice_count == 3);
+
+  /* P0-1：位深 / 颜色模式两行（各两档）。行序是壳取值 switch 的约定：
+   * 4 = 位深、5 = 颜色模式，插在背景之后、不能挪到前面。 */
+  const comp_ui::DocRowSpec new_depth = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 4);
+  const comp_ui::DocRowSpec new_mode = comp_ui::doc_dialog_row(DocDialogKind::NewDocument, 5);
+  COMP_CHECK(new_depth.kind == DocRowKind::Choice && new_depth.choice_count == 2);
+  COMP_CHECK(new_mode.kind == DocRowKind::Choice && new_mode.choice_count == 2);
+  COMP_CHECK(new_depth.min == 0 && new_depth.max == 1);
+  COMP_CHECK(new_mode.min == 0 && new_mode.max == 1);
+  /* 枚举行文案不能互相串（背景名/位深名/模式名三套）。 */
+  COMP_CHECK(std::string(comp_ui::doc_new_bit_depth_name(0)) !=
+             std::string(comp_ui::doc_new_color_mode_name(0)));
+  COMP_CHECK(std::string(comp_ui::doc_new_bit_depth_name(1)).find("16") != std::string::npos);
+  COMP_CHECK(std::string(comp_ui::doc_new_color_mode_name(1)).find("灰") != std::string::npos);
 
   const comp_ui::DocRowSpec image_lock = comp_ui::doc_dialog_row(DocDialogKind::ImageSize, 2);
   const comp_ui::DocRowSpec image_percent = comp_ui::doc_dialog_row(DocDialogKind::ImageSize, 3);

@@ -158,8 +158,13 @@ Layer* Document::create_layer(const comp_layer_desc& desc, comp_layer_id* out_id
   }
 
   if (!layer.is_group) {
-    /* 新像素层默认铺满画布且全透明，避免出现“尺寸不确定”的中间态。 */
-    layer.pixels.resize(state_.width, state_.height, COMP_PIXEL_RGBA8);
+    /* 新像素层默认铺满画布且全透明，避免出现“尺寸不确定”的中间态。
+     * P0-1：格式跟随文档缺省位深——16 位文档里新建的空图层必须是 16 位，
+     * 否则「文档 16 位」只是一句声明：加一个图层、落一笔就变 8 位了。 */
+    const comp_pixel_format format =
+        state_.pixel_format == static_cast<int32_t>(COMP_PIXEL_RGBA16) ? COMP_PIXEL_RGBA16
+                                                                      : COMP_PIXEL_RGBA8;
+    layer.pixels.resize(state_.width, state_.height, format);
   }
 
   if (layer.parent != 0) {

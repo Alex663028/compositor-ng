@@ -262,14 +262,31 @@ void forget_color_range(ShellState& shell) {
 }
 
 bool create_document_with(ShellState& shell, int width, int height, int dpi, int background) {
+  return create_document_opts(shell, width, height, dpi, background, 0, 0);
+}
+
+/*
+ * P0-1：带位深与颜色模式的新建。
+ *
+ * 走 comp_document_create_ex（新入口，comp_document_desc 布局一个字节不动）——
+ * 老宿主那条 comp_document_create 仍然是「8 位 RGB」，与追加字段前完全一致。
+ * 背景填充仍走 comp_layer_set_pixels，但灰阶文档的写入侧会自己转灰（引擎侧契约），
+ * 所以这里不需要为「前景色填充」另写一条灰度分支。
+ */
+bool create_document_opts(ShellState& shell, int width, int height, int dpi, int background,
+                          int pixel_format, int color_mode) {
   comp_document_desc desc{};
   desc.width = comp_ui::clamp_doc_size(width);
   desc.height = comp_ui::clamp_doc_size(height);
   desc.dpi = static_cast<float>(comp_ui::clamp_doc_dpi(dpi));
   desc.color_space = "sRGB";
+  comp_document_options options{};
+  options.struct_size = sizeof(options);
+  options.pixel_format = pixel_format != 0 ? COMP_PIXEL_RGBA16 : COMP_PIXEL_RGBA8;
+  options.color_mode = color_mode != 0 ? COMP_COLOR_MODE_GRAYSCALE : COMP_COLOR_MODE_RGB;
 
   comp_document document = nullptr;
-  const comp_result result = comp_document_create(shell.engine, &desc, &document);
+  const comp_result result = comp_document_create_ex(shell.engine, &desc, &options, &document);
   if (result != COMP_OK || document == nullptr) {
     set_status(shell, L"新建文档失败");
     return false;
@@ -530,6 +547,8 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
         case 1: return shell.doc.doc_dialog_height;
         case 2: return shell.doc.doc_dialog_dpi;
         case 3: return shell.doc.doc_dialog_background;
+        case 4: return shell.doc.doc_dialog_pixel_format;
+        case 5: return shell.doc.doc_dialog_color_mode;
         default: return 0;
       }
     case comp_ui::DocDialogKind::ImageSize:
@@ -606,6 +625,10 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         case 1: shell.doc.doc_dialog_height = comp_ui::clamp_doc_size(value); break;
         case 2: shell.doc.doc_dialog_dpi = comp_ui::clamp_doc_dpi(value); break;
         case 3: shell.doc.doc_dialog_background = value < 0 ? 0 : (value > 2 ? 2 : value); break;
+        /* 两档都只有 0/1，仍夹一次：枚举行用 ←/→ 循环与点击前向循环，
+         * 数值越界只可能来自宿主的脏值，夹在写入口比在读取处夹更省事。 */
+        case 4: shell.doc.doc_dialog_pixel_format = value != 0 ? 1 : 0; break;
+        case 5: shell.doc.doc_dialog_color_mode = value != 0 ? 1 : 0; break;
         default: break;
       }
       break;
@@ -798,7 +821,14 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
       return value != 0 ? L"开" : L"关";
     case comp_ui::DocRowKind::Choice:
       if (shell.doc.doc_dialog == comp_ui::DocDialogKind::NewDocument) {
-        return widen_utf8(comp_ui::doc_new_background_name(value));
+        /* P0-1：新建面板现在有三条枚举行，必须按行分派——此前一律返回背景名，
+         * 加行之后位深行会显示成「透明」，属于把数据画错的典型写法。 */
+        switch (row) {
+          case 3: return widen_utf8(comp_ui::doc_new_background_name(value));
+          case 4: return widen_utf8(comp_ui::doc_new_bit_depth_name(value));
+          case 5: return widen_utf8(comp_ui::doc_new_color_mode_name(value));
+          default: return widen_utf8(comp_ui::doc_new_background_name(value));
+        }
       }
       if (shell.doc.doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
         return widen_utf8(comp_ui::doc_close_action_name(value));
@@ -978,6 +1008,8 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
       shell.doc.doc_dialog_height = shell.new_doc_height;
       shell.doc.doc_dialog_dpi = shell.new_doc_dpi;
       shell.doc.doc_dialog_background = shell.new_doc_background;
+      shell.doc.doc_dialog_pixel_format = shell.new_doc_pixel_format;
+      shell.doc.doc_dialog_color_mode = shell.new_doc_color_mode;
       shell.doc.doc_dialog_base_width = shell.new_doc_width;
       shell.doc.doc_dialog_base_height = shell.new_doc_height;
       break;
@@ -1302,18 +1334,24 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
     const int height = shell.doc.doc_dialog_height;
     const int dpi = shell.doc.doc_dialog_dpi;
     const int background = shell.doc.doc_dialog_background;
+    const int pixel_format = shell.doc.doc_dialog_pixel_format;
+    const int color_mode = shell.doc.doc_dialog_color_mode;
     /* 先记设置再建：建失败也保留用户刚填的参数。 */
     shell.new_doc_width = width;
     shell.new_doc_height = height;
     shell.new_doc_dpi = dpi;
     shell.new_doc_background = background;
-    if (!create_document_with(shell, width, height, dpi, background)) {
+    shell.new_doc_pixel_format = pixel_format;
+    shell.new_doc_color_mode = color_mode;
+    if (!create_document_opts(shell, width, height, dpi, background, pixel_format, color_mode)) {
       doc_dialog_close(shell, L"新建文档失败（未改动当前文档）");
       return;
     }
     doc_dialog_close(shell, nullptr);
     wchar_t buffer[192];
-    wsprintfW(buffer, L"已新建 %d×%d @%d dpi（背景：%s）", width, height, dpi,
+    wsprintfW(buffer, L"已新建 %d×%d @%d dpi（%s · %s · 背景：%s）", width, height, dpi,
+              widen_utf8(comp_ui::doc_new_bit_depth_name(pixel_format)).c_str(),
+              widen_utf8(comp_ui::doc_new_color_mode_name(color_mode)).c_str(),
               widen_utf8(comp_ui::doc_new_background_name(background)).c_str());
     refresh_history_status(shell, buffer);
     return;

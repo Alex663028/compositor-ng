@@ -57,6 +57,7 @@ void deep_cube_apply(uint16_t *pixels, size_t stride, size_t width, size_t heigh
 // above 1 where it holds light brighter than white (an HDR image).
 float deep_half_peak(const uint16_t *pixels, size_t stride, size_t width, size_t height);
 
+
 // HDR layers (half floats in extended sRGB, premultiplied, native-endian, 4 a pixel) through 8-bit operations: each
 // pixel brighter than white is divided by its brightest channel, into the 16-bit layout, so its color fits within white
 // with its hue; `scales` keeps each pixel's divisor (1 for the rest), `width` a row. The operation runs as on any

@@ -3126,6 +3126,28 @@ void update_window_title(HWND window, ShellState& shell) {
   } else if (shell.doc.document != nullptr) {
     title += L" - 未命名";
   }
+  /*
+   * P0-1：位深与颜色模式只在非缺省（8 位 RGB）时标出来。
+   * 每帧向引擎现问而不是读壳里的副本：新建/打开/撤销都可能换文档，副本迟早会
+   * 跟实际分叉——标题栏是用户唯一能看见「这份文档到底是什么」的地方。
+   * 两个 getter 都是读一个 int32，成本与下面的 is_dirty 同级。
+   */
+  if (shell.doc.document != nullptr) {
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    comp_color_mode mode = COMP_COLOR_MODE_RGB;
+    const bool has_format = comp_document_pixel_format(shell.doc.document, &format) == COMP_OK;
+    const bool has_mode = comp_document_color_mode(shell.doc.document, &mode) == COMP_OK;
+    if ((has_format && format == COMP_PIXEL_RGBA16) ||
+        (has_mode && mode == COMP_COLOR_MODE_GRAYSCALE)) {
+      title += L" [";
+      if (has_format) title += format == COMP_PIXEL_RGBA16 ? L"16 位" : L"8 位";
+      if (has_mode && mode == COMP_COLOR_MODE_GRAYSCALE) {
+        if (has_format) title += L" ";
+        title += L"灰度";
+      }
+      title += L"]";
+    }
+  }
   int32_t dirty = 0;
   if (shell.doc.document != nullptr &&
       comp_document_is_dirty(shell.doc.document, &dirty) == COMP_OK && dirty != 0) {
