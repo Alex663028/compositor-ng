@@ -90,7 +90,7 @@ ML 功能（选择主体 / 去背景 / Neural Filters）、TIFF / WebP / HEIF / 
 - Camera Raw 提示「色彩表未加载」：缺 resources\\camera_raw_tables.bin
 - 想确认程序本身是否正常：命令行跑
       compositor_shell.exe --selftest=report.txt
-  应输出 [PASS]，267 项断言 0 失败
+  应输出 [PASS]，全部断言 0 失败
 
 【许可】
 MIT。上游 robbietilton/Compositor（macOS 版）同许可，见 LICENSE.txt。
@@ -184,7 +184,13 @@ def main():
     print("[pack] 压缩包：%s（%.1f MB）" % (archive, size_mb))
     print("[pack] exe  ：%.2f MB  sha256=%s"
           % (os.path.getsize(exe) / (1024.0 * 1024.0), sha256(exe)[:16]))
-    print("[pack] 包内自检：PASS（267 项，0 失败）")
+    # 项数从实际报告里数，不写死：写死的数字会随自检增项而变成谎话。
+    # 另有几条依赖 build/ 探针夹具的断言在包目录里会 skip（包内没有 build/），
+    # 单独报出来，免得「项数变少了」看着像回归。
+    checked = text.count("[OK]") + text.count("[FAIL]")
+    skipped = text.count("[skip]")
+    print("[pack] 包内自检：PASS（%d 项断言 0 失败，%d 项跳过：缺 build/ 探针夹具）"
+          % (checked, skipped))
     return 0
 
 
