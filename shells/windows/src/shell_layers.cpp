@@ -235,12 +235,21 @@ void panel_sync_layer_scroll(ShellState& shell, const comp_ui::Rect& panel) {
   int scroll = comp_ui::layer_scroll_clamp(panel, count, row_top, shell.doc.layer_scroll);
   const int visible = comp_ui::layer_visible_rows(panel, row_top);
   const int selected = shell.doc.selected_layer;
-  if (selected >= 0 && selected < count && visible > 0) {
-    if (selected < scroll) {
-      scroll = selected;
-    } else if (selected >= scroll + visible) {
-      scroll = selected - visible + 1;
+  /*
+   * 只在**选中行变了**时才把选中行滚进可视区。
+   *
+   * 若每次渲染都 ensure，用户滚轮往下看底下的层时滚动位置会被立刻拉回选中行
+   * ——滚轮等于滚不动。滚轮滚动时选中没变，所以这里只夹取滚动量。
+   */
+  if (selected != shell.doc.layer_scroll_anchor) {
+    if (selected >= 0 && selected < count && visible > 0) {
+      if (selected < scroll) {
+        scroll = selected;
+      } else if (selected >= scroll + visible) {
+        scroll = selected - visible + 1;
+      }
     }
+    shell.doc.layer_scroll_anchor = selected;
   }
   shell.doc.layer_scroll = scroll;
 }

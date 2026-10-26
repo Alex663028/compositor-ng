@@ -50,6 +50,12 @@ WM_IME_CHAR = 0x0286
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_COMMAND = 0x0111
+# 滚轮（WM_MOUSEWHEEL）。lParam 是**屏幕**坐标，与其它鼠标消息的客户端坐标
+# 不同口径——壳侧按它 ScreenToClient 再换算 DPI，传错就滚到别的面板上。
+WM_MOUSEWHEEL = 0x020A
+# 图层列表可见滚动条的滑块颜色（壳侧画的 (122,126,136)）。
+# 唯一：面板底色 (24,26,30)、轨道 (38,40,46)、画布底色 (32,32,36) 都不是它。
+COL_SCROLL_THUMB = (122, 126, 136)
 # 布局查询（kMsgLayoutQuery = WM_APP + 1，与 shell_state.h 同值）。
 # 布局数据走**共享内存**（见 Shell.query_layout），消息只带「写了几字节」。
 MSG_LAYOUT_QUERY = 0x8001
@@ -840,6 +846,28 @@ class Shell:
             self.wait(0.02)
         user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x1, y1))
         self.wait(0.45)
+
+    def wheel(self, x, y, delta=120):
+        """滚轮（WM_MOUSEWHEEL）。
+
+        坐标口径与 click/drag **不同**：WM_MOUSEWHEEL 的 lParam 装的是**屏幕
+        坐标**（设备像素），壳侧拿它 ScreenToClient 再换算 DPI。直接传客户区
+        坐标 = 滚到窗口外面去了，表现为「滚了没反应」。
+        """
+        sx, sy = self.client_to_screen(int(x), int(y))
+        lparam = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
+        wparam = (int(delta) & 0xFFFF) << 16
+        user32.PostMessageW(self.hwnd, WM_MOUSEWHEEL, wparam, lparam)
+        self.wait(0.2)
+
+    def client_to_screen(self, x, y):
+        """客户区坐标 -> 屏幕坐标（滚轮消息要的是这个口径）。"""
+        # 用模块自己的 POINT 类型（不是 wintypes.POINT）——上面给
+        # ClientToScreen 设的 argtypes 指的是本模块的 POINT，两种类型不通用，
+        # 传错会报 "expected LP_POINT instance instead of LP_POINT"。
+        point = POINT(int(x), int(y))
+        user32.ClientToScreen(self.hwnd, ctypes.pointer(point))
+        return int(point.x), int(point.y)
 
     def stroke(self, points, steps=8):
         """折线落笔：逐段拖动（画笔/橡皮擦/retouch 共用）。"""
@@ -3970,6 +3998,75 @@ def scene_panel_group(shell, checker):
                   "差异像素 %d" % delta)
 
 
+
+def scene_layer_scroll(shell, checker):
+    """
+    图层列表滚动 + 可见滚动条。
+
+    此前图层面板**没有滚动**：所有行都画出来、超出面板的部分直接裁掉——层一多
+    就看不到底下的层。现在加了滚动与可见滚动条，这里验两件事：
+
+      1. 层多到装不下时，面板右缘出现**可见滚动条**（滑块颜色唯一）。
+      2. 滚轮能滚：滑块位置下移。
+
+    这条场景还守住一个交互底线：**滚轮滚动时不能把选中行拉回来**。
+    「选中行永远可见」若在每次渲染里做，用户往下滚，滚动位置会被立刻拽回
+    选中行——滚轮等于滚不动。所以 ensure 只在选中行**变了**时做。
+
+    量的都是**颜色唯一**的特征：滑块 (122,126,136) 与面板底色 (24,26,30)、
+    轨道 (38,40,46)、画布底色 (32,32,36) 都不冲突。
+    """
+    scene = "layer_scroll"
+    # 造足够的层，超过图层面板的可视行数（约 21 行：标题 30 + 提示 52 之后
+    # 每行 22）。按 40 次留足余量——按键偶尔会漏，不够就看不出滚动条。
+    for _ in range(40):
+        shell.press(ord("N"), ctrl=True, shift=True)
+    shell.wait(0.3)
+    layer = shell.layout["layer"]
+    before = shell.shot("157_layer_scroll_top")
+
+    # 滑块所在的那条窄带：面板右缘 8 px。
+    thumb_rect = (layer[2] - 9, layer[1] + 30, layer[2], layer[3])
+
+    def thumb_center(img):
+        """滑块像素的 y 质心（= 滑块位置）；没有滑块返回 -1。"""
+        region = img.crop(thumb_rect).convert("RGB")
+        data = region.tobytes()
+        total = 0
+        weighted = 0
+        for index in range(0, len(data), 3):
+            if (abs(data[index] - COL_SCROLL_THUMB[0]) <= 8 and
+                    abs(data[index + 1] - COL_SCROLL_THUMB[1]) <= 8 and
+                    abs(data[index + 2] - COL_SCROLL_THUMB[2]) <= 8):
+                total += 1
+                weighted += (index // 3) // region.width
+        return (weighted / total) if total else -1.0
+
+    center_before = thumb_center(before)
+    checker.check(scene, "图层装不下时右缘出现可见滚动条（滑块）", center_before >= 0,
+                  "滑块 y 质心 %.1f" % center_before)
+
+    # 滚轮往下滚两格（delta 负 = 朝用户 = 往下）。光标要落在图层面板里。
+    shell.wheel(layer[0] + 40, layer[1] + 200, -120)
+    shell.wheel(layer[0] + 40, layer[1] + 200, -120)
+    shell.wait(0.3)
+    after = shell.shot("158_layer_scroll_moved")
+    center_after = thumb_center(after)
+    checker.check(scene, "滚轮滚动后滑块位置下移（滚动真的生效）",
+                  center_after > center_before + 2,
+                  "滑块 y 质心 %.1f -> %.1f" % (center_before, center_after))
+
+    # 选中行必须**没有**被拽回来。
+    #
+    # 判据是「选中高亮消失」：新建的层是最上面一行，滚两格（6 行）后它就
+    # 出了视野。若「选中永远可见」在每帧都做，选中行会被顶回第一行，高亮
+    # 仍在画面里——用户往下滚，列表却弹回原处，滚轮等于滚不动。
+    highlight = count_matching(after, (layer[0], layer[1], layer[2], layer[3]),
+                               COL_HIGHLIGHT, 12)
+    checker.check(scene, "滚动后选中行没有被拽回顶部（滚轮能真的滚）", highlight == 0,
+                  "高亮像素 %d（应为 0：选中行已滚出视野）" % highlight)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -4011,6 +4108,7 @@ SCENES = [    ("start", scene_start, ()),
     ("filter_other", scene_filter_other, ()),
     ("filter_custom", scene_filter_custom, ()),
     ("panel_group", scene_panel_group, ()),
+    ("layer_scroll", scene_layer_scroll, ()),
 ]
 
 

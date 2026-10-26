@@ -578,6 +578,14 @@ struct DocumentContext {
    * 调整栏里的滑杆区 / 历史 / 通道都有滚动，只有图层列表漏了。
    */
   int32_t layer_scroll = 0;
+  /*
+   * 上次做「把选中行滚进可视区」时的选中行（-1 = 还没做过）。
+   *
+   * 为什么要有：把「选中永远可见」放在**每次渲染**里做的话，用户滚轮往下看
+   * 下面的层，滚动位置会被立刻拉回选中行——**滚轮根本滚不动**。
+   * 所以只在**选中行真的变了**时才 ensure，其余时候只夹取滚动量。
+   */
+  int32_t layer_scroll_anchor = -1;
   /* 正在拖动图层列表的滚动条滑块（拖动期间吃掉鼠标消息）。 */
   bool layer_scroll_drag = false;
   std::vector<int32_t> layer_display;

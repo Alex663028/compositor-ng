@@ -1052,7 +1052,9 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    * 人眼也分得清。滑块拖动见 shell_panel_hit.cpp。
    */
   {
-    const int viewport_h = panel_rect.h - (comp_ui::kLayerHeaderHeight + row_top);
+    /* 可视高度要减去底部提示行（两层提示字），否则滚动条轨道会压到提示上。 */
+    const int viewport_h =
+        panel_rect.h - (comp_ui::kLayerHeaderHeight + row_top) - comp_ui::kLayerPanelFooter;
     const int content_h = count * comp_ui::kLayerRowHeight;
     const int max_scroll = comp_ui::layer_scroll_max(panel_rect, count, row_top);
     const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(

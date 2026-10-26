@@ -5077,17 +5077,26 @@ inline int list_clamp_scroll(const Rect& panel, int count, int scroll, int top, 
 }
 
 /* ---------------------------------------------------------- 图层列表的滚动 */
+/*
+ * 图层面板**底部**的两行提示字（Del 删除 / Ctrl 点选多选 …）占的高度。
+ *
+ * 必须算进可视行数：不算的话滚到底时最后一行会被提示字盖住——用户看到的
+ * 是「明明还有层，点不到」。
+ */
+inline constexpr int kLayerPanelFooter = 52;
+
 inline int layer_visible_rows(const Rect& panel, int row_top) {
-  return list_visible_rows(panel, kLayerHeaderHeight + row_top, 0, kLayerRowHeight);
+  return list_visible_rows(panel, kLayerHeaderHeight + row_top, kLayerPanelFooter, kLayerRowHeight);
 }
 
 inline int layer_scroll_max(const Rect& panel, int layer_count, int row_top) {
-  return list_max_scroll(panel, layer_count, kLayerHeaderHeight + row_top, 0, kLayerRowHeight);
+  return list_max_scroll(panel, layer_count, kLayerHeaderHeight + row_top, kLayerPanelFooter,
+                          kLayerRowHeight);
 }
 
 inline int layer_scroll_clamp(const Rect& panel, int layer_count, int row_top, int scroll) {
-  return list_clamp_scroll(panel, layer_count, scroll, kLayerHeaderHeight + row_top, 0,
-                           kLayerRowHeight);
+  return list_clamp_scroll(panel, layer_count, scroll, kLayerHeaderHeight + row_top,
+                           kLayerPanelFooter, kLayerRowHeight);
 }
 
 /* 让 index 落进可视区（↑/↓ 选行、新项入列时用）：只滚到刚好够，不居中。 */
