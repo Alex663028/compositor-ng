@@ -25,6 +25,7 @@
 #include <cstring>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -65,6 +66,8 @@ comp_document g_document = nullptr;
 comp_layer_id g_top_layer = 0;
 uint32_t g_doc_width = 0;
 uint32_t g_doc_height = 0;
+/* 上次导入的返回码（诊断用：设备上那行小字直接显示，不用翻 hilog）。 */
+int32_t g_last_import_rc = -100;
 
 std::atomic<uint64_t> g_surface_generation{0};  // surface 重建计数（present 防野指针）
 uint32_t g_configured_width = 0;                // 窗口已配置的缓冲几何（只在变化时下发）
@@ -410,6 +413,349 @@ napi_value JsExportPng(napi_env env, napi_callback_info info) {
   if (g_document == nullptr || copied == 0) return MakeInt32(env, -1);
   return MakeInt32(env, static_cast<int32_t>(
                             comp_io_export(g_document, path, COMP_FORMAT_PNG, "{}")));
+}
+
+/*
+ * 导出到**固定的沙箱路径**（自动化用）。
+ *
+ * 为什么需要：上面那个 exportPng 要调用方给路径，而应用沙箱路径只有进程
+ * 内部知道（/data/storage/el2/base/cache/...），外部脚本拿不到、也没法
+ * 把它拉出来比对像素。这里固定落到一个已知路径，验证脚本用 hdc 拉回
+ * 就能逐像素核对——「图片真的进引擎了」这件事因此可以自动化验证，
+ * 而不是只能靠肉眼看屏幕（模拟器上屏那条路本来就不通，OPT-21b）。
+ */
+napi_value JsExportPngToSandbox(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  const char* path = "/data/storage/el2/base/cache/compositor_verify.png";
+  return MakeInt32(env, static_cast<int32_t>(
+                            comp_io_export(g_document, path, COMP_FORMAT_PNG, "{}")));
+}
+
+/*
+ * 导入 + **像素核对**（一次性自检入口）。
+ *
+ * 这一条把「鸿蒙壳能打开一张真实 PNG」这件事变成可自动化的断言：
+ *   1. 把一张内嵌的 8x8 PNG 落地成沙箱文件；
+ *   2. comp_io_import_layer 导进当前文档；
+ *   3. comp_layer_get_pixels 读回该图层的像素；
+ *   4. 与**期望图案**逐字节比对（左上红 / 右下绿 / 其余蓝）。
+ *
+ * 为什么用非对称图案：对称图案里「转置」「镜像」这类错误会因像素相同
+ * 而蒙混过关。非对称图案能查出方向错、通道错、位置错。
+ *
+ * 返回：0 = 全部通过；-1 = 无引擎/无文档；其它 = 失败阶段（见下）。
+ *   -2 = 落地失败；-3 = 导入失败（comp_result 取负）；-4 = 读回失败；
+ *   -5 = 尺寸不符；-6 = 像素不符（**错误像素数**放在 g_last_import_rc 里）。
+ */
+napi_value JsImportVerify(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (g_engine == nullptr || g_document == nullptr) {
+    g_last_import_rc = -1;
+    return MakeInt32(env, -1);
+  }
+  /* 期望图案：8x8，左上 2x2 红、右下 2x2 绿、其余蓝（全不透明）。 */
+  const int32_t side = 8;
+  std::vector<uint8_t> expected(static_cast<size_t>(side) * side * 4u, 0u);
+  for (int32_t y = 0; y < side; ++y) {
+    for (int32_t x = 0; x < side; ++x) {
+      const size_t index = (static_cast<size_t>(y) * side + x) * 4u;
+      if (x < side / 2 && y < side / 2) {
+        expected[index + 0] = 255;
+      } else if (x >= side / 2 && y >= side / 2) {
+        expected[index + 1] = 255;
+      } else {
+        expected[index + 2] = 255;
+      }
+      expected[index + 3] = 255;
+    }
+  }
+  /* 落地：8x8 PNG 的字节（与 ArkTS 侧那份同源，用固定 hex 避免两处不一致）。 */
+  static const char kHex[] =
+      "89504e470d0a1a0a0000000d4948445200000008000000080806000000c40fbe8b0000"
+      "001b4944415478da63f8cfc0f01f19a371ff33d04101161da890f60a0073277f819c26"
+      "6fe50000000049454e44ae426082";
+  std::vector<uint8_t> bytes;
+  bytes.reserve(sizeof(kHex) / 2u);
+  int high = -1;
+  for (const char* p = kHex; *p != '\0'; ++p) {
+    const char c = *p;
+    int digit = -1;
+    if (c >= '0' && c <= '9') {
+      digit = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      digit = c - 'a' + 10;
+    }
+    if (digit < 0) continue;
+    if (high < 0) {
+      high = digit;
+    } else {
+      bytes.push_back(static_cast<uint8_t>((high << 4) | digit));
+      high = -1;
+    }
+  }
+  const char* path = "/data/storage/el2/base/cache/imported_verify.png";
+  FILE* file = std::fopen(path, "wb");
+  if (file == nullptr) {
+    g_last_import_rc = -2;
+    return MakeInt32(env, -2);
+  }
+  const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file);
+  std::fclose(file);
+  if (written != bytes.size()) {
+    g_last_import_rc = -2;
+    return MakeInt32(env, -2);
+  }
+  comp_layer_id layer = 0;
+  const comp_result rc = comp_io_import_layer(g_document, path, &layer);
+  if (rc != COMP_OK) {
+    g_last_import_rc = -static_cast<int32_t>(rc);
+    return MakeInt32(env, -3);
+  }
+  g_top_layer = layer;
+
+  /* 读回像素。 */
+  std::vector<uint8_t> actual(static_cast<size_t>(side) * side * 4u, 0u);
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  if (comp_layer_get_pixels(g_document, layer, actual.data(), 4u * static_cast<size_t>(side),
+                            &width, &height, &format) != COMP_OK) {
+    g_last_import_rc = -4;
+    return MakeInt32(env, -4);
+  }
+  if (width != side || height != side) {
+    g_last_import_rc = -5;
+    return MakeInt32(env, -5);
+  }
+  int32_t wrong = 0;
+  for (size_t index = 0; index < expected.size(); ++index) {
+    if (actual[index] != expected[index]) ++wrong;
+  }
+  if (wrong != 0) {
+    g_last_import_rc = wrong;
+    return MakeInt32(env, -6);
+  }
+  g_last_import_rc = 0;
+  return MakeInt32(env, 0);
+}
+
+// ---------------------------------------------------------------------------
+// JS 导出：导入图片（P1-2 剩余项）
+//
+// 此前鸿蒙壳只能建纯色层，连自己的照片都打不开——「引擎很行、产品不行」
+// 的典型样本（引擎 215 个 ABI 里壳只用了十来个）。
+//
+// 两个入口，语义与 Windows 壳一致：
+//   importImage(path)         = 作为**新图层**放进当前文档（文档尺寸不变）
+//   importImageAsDocument(path) = 导入为**新文档**（画布尺寸 = 图像尺寸）
+//
+// 前置条件（comp_io_import_layer 的契约）：进入时不得有活动事务。壳侧
+// 不开显式事务，所以这条恒满足。
+// ---------------------------------------------------------------------------
+
+napi_value ImportImageImpl(napi_env env, napi_callback_info info, bool as_document) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  char path[1024] = {0};
+  size_t copied = 0;
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_get_value_string_utf8(env, argv[0], path, sizeof(path), &copied);
+  }
+  if (g_engine == nullptr || copied == 0) return MakeInt32(env, -1);
+  if (as_document) {
+    /* 导入为新文档：旧文档先销毁（壳只有一个文档槽位，与 newDocument 同款）。 */
+    comp_document document = nullptr;
+    const comp_result rc = comp_io_import(g_engine, path, &document);
+    if (rc != COMP_OK) {
+      LOGE("import as document failed rc=%{public}d path=%{public}s", static_cast<int>(rc), path);
+      return MakeInt32(env, static_cast<int32_t>(rc));
+    }
+    if (g_document != nullptr) comp_document_destroy(g_document);
+    g_document = document;
+    comp_size size{};
+    if (comp_document_size(g_document, &size) == COMP_OK) {
+      g_doc_width = static_cast<uint32_t>(size.width);
+      g_doc_height = static_cast<uint32_t>(size.height);
+    }
+    LOGI("import as document ok %{public}ux%{public}u", g_doc_width, g_doc_height);
+    return MakeInt32(env, 0);
+  }
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id layer = 0;
+  const comp_result rc = comp_io_import_layer(g_document, path, &layer);
+  if (rc != COMP_OK) {
+    LOGE("import layer failed rc=%{public}d path=%{public}s", static_cast<int>(rc), path);
+    return MakeInt32(env, static_cast<int32_t>(rc));
+  }
+  g_top_layer = layer;
+  LOGI("import layer ok id=%{public}llu", static_cast<unsigned long long>(layer));
+  return MakeInt32(env, 0);
+}
+
+napi_value JsImportImage(napi_env env, napi_callback_info info) {
+  return ImportImageImpl(env, info, false);
+}
+
+napi_value JsImportImageAsDocument(napi_env env, napi_callback_info info) {
+  return ImportImageImpl(env, info, true);
+}
+
+/*
+ * 桥接自检：把「导入」这条链路的状态读出来。
+ *
+ * 为什么需要它：P1-2 的验收是「打开一张真实 PNG 并正确显示」，而
+ * 「正确显示」在模拟器上验不了（OPT-21b 已定位：x86_64 模拟器不给
+ * XComponent surface 的 CPU 可写映射，上屏那条路走不通）。
+ * 所以这里把**桥接层**的状态做成可读的：导入返回码、图层数、文档尺寸、
+ * 顶层图层 id —— 设备上跑一遍就能确认「桥接通了、图片进引擎了」。
+ *
+ * 返回格式："rc=<n>;layers=<n>;doc=<w>x<h>;top=<id>"。
+ */
+napi_value JsImportState(napi_env env, napi_callback_info info) {
+  (void)info;
+  char buffer[160];
+  size_t layers = 0;
+  if (g_document != nullptr) comp_layer_count(g_document, &layers);
+  std::snprintf(buffer, sizeof(buffer), "layers=%zu;doc=%ux%u;top=%llu;last=%d",
+                layers, g_doc_width, g_doc_height,
+                static_cast<unsigned long long>(g_top_layer), g_last_import_rc);
+  return MakeString(env, buffer);
+}
+
+/*
+ * 从**内存字节**导入图片（不经文件路径）。
+ *
+ * 为什么要有这个入口：
+ *   1. 引擎的 comp_io_import_layer 只认**路径**，且格式按**扩展名**识别
+ *      （comp_io_format_from_path）。所以字节流必须先落盘成带正确扩展名的
+ *      文件，引擎才认得出——这是引擎侧的既有契约，不该在壳里改 ABI。
+ *   2. 有了「给字节就能导入」，鸿蒙侧就不必依赖文件选择器也能导入
+ *      （比如从相册取到 ArrayBuffer 的场景），自动化也能驱动。
+ *
+ * 参数：bytes(ArrayBuffer) + format(字符串，如 "png" / "jpg")。
+ * 落地路径：cacheDir/imported_bytes.<format>。
+ */
+/*
+ * 从**十六进制字符串**导入图片（不经文件路径、不依赖二进制类型识别）。
+ *
+ * 为什么用 hex 字符串而不是 ArrayBuffer / Uint8Array：
+ * 跨 NAPI 边界的二进制传递在 ArkTS 侧不稳定——实测 2026-10-26 模拟器上
+ * `napi_is_arraybuffer` 与 `napi_is_typedarray` 对 ArkTS 传来的字节对象
+ * 都返回 false，参数检查直接把导入挡下（表现为 rc=1）。
+ * hex 字符串是纯文本，跨边界没有这个问题；代价是长度翻倍，但一张
+ * 几 MB 的照片也就是十几 MB 的字符串，导入是一次性操作，可以接受。
+ *
+ * 参数：hex（十六进制字符串，可含空白）+ format（"png" / "jpg" / …）。
+ * 落地路径：应用沙箱 cacheDir 下的 imported_bytes.<format>。
+ */
+napi_value JsImportImageBytes(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  /*
+   * 失败码分段（便于在设备上**不看日志**就能定位卡在哪一步）：
+   *   -1 = 参数个数不对 / 参数为空
+   *   -2 = hex 文本读不出来
+   *   -3 = hex 解析失败（非法字符 / 奇数长度 / 空）
+   *   -4 = 临时文件写不出来
+   *   -5 = 落地成功但引擎导入失败（返回真正的 comp_result 取负偏移）
+   *   -6 = 无引擎 / 无文档
+   * 成功 = 0。
+   * 设备上那行小字直接显示这个码，比翻 hilog 快得多（实测 hilog 在模拟器上
+   * 抓不到 app 私有 tag）。
+   */
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
+    g_last_import_rc = -1;
+    return MakeInt32(env, -1);
+  }
+
+  /* 取 hex 文本。容量按 4 MB 原始数据算（hex 翻倍 + 空白）。 */
+  const size_t kHexCapacity = 16u * 1024u * 1024u;
+  std::vector<char> hex(kHexCapacity);
+  size_t hex_length = 0;
+  napi_get_value_string_utf8(env, argv[0], hex.data(), hex.size(), &hex_length);
+  if (hex_length == 0) {
+    g_last_import_rc = -2;
+    return MakeInt32(env, -2);
+  }
+
+  char format[16] = {0};
+  size_t copied = 0;
+  napi_get_value_string_utf8(env, argv[1], format, sizeof(format), &copied);
+  if (copied == 0) {
+    std::snprintf(format, sizeof(format), "png");
+  }
+  /* 只允许已知栅格扩展名：格式是按扩展名识别的，乱写会得到「未知格式」。 */
+  const std::string ext(format);
+  const bool known = ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "bmp" ||
+                     ext == "webp" || ext == "tga" || ext == "psd";
+  if (!known) {
+    g_last_import_rc = -1;
+    return MakeInt32(env, -1);
+  }
+
+  /* hex -> 字节。奇数位长度直接拒绝（截一半的字节流是坏数据）。 */
+  std::vector<uint8_t> bytes;
+  bytes.reserve(hex_length / 2u);
+  int high = -1;
+  for (size_t index = 0; index < hex_length; ++index) {
+    const char c = hex[index];
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == ',') continue;
+    int digit = -1;
+    if (c >= '0' && c <= '9') {
+      digit = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      digit = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      digit = c - 'A' + 10;
+    }
+    if (digit < 0) {
+      g_last_import_rc = -3;
+      return MakeInt32(env, -3);
+    }
+    if (high < 0) {
+      high = digit;
+    } else {
+      bytes.push_back(static_cast<uint8_t>((high << 4) | digit));
+      high = -1;
+    }
+  }
+  if (high >= 0 || bytes.empty()) {
+    g_last_import_rc = -3;
+    return MakeInt32(env, -3);
+  }
+
+  /* 落地：应用沙箱里的固定文件名（引擎按扩展名判格式，扩展名要保留）。 */
+  char path[512] = {0};
+  std::snprintf(path, sizeof(path), "/data/storage/el2/base/cache/imported_bytes.%s", ext.c_str());
+  FILE* file = std::fopen(path, "wb");
+  if (file == nullptr) {
+    g_last_import_rc = -4;
+    return MakeInt32(env, -4);
+  }
+  const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file);
+  std::fclose(file);
+  if (written != bytes.size()) {
+    g_last_import_rc = -4;
+    return MakeInt32(env, -4);
+  }
+
+  if (g_engine == nullptr || g_document == nullptr) {
+    g_last_import_rc = -6;
+    return MakeInt32(env, -6);
+  }
+  comp_layer_id layer = 0;
+  const comp_result rc = comp_io_import_layer(g_document, path, &layer);
+  if (rc != COMP_OK) {
+    /* 引擎的失败码（1..N）原样回传：设备上能直接看到 COMP_ERR_IO 之类。 */
+    g_last_import_rc = static_cast<int32_t>(rc);
+    return MakeInt32(env, static_cast<int32_t>(rc));
+  }
+  g_top_layer = layer;
+  g_last_import_rc = 0;
+  return MakeInt32(env, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +1249,18 @@ napi_value Init(napi_env env, napi_value exports) {
       {"canRedo", nullptr, JsCanRedo, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"exportPng", nullptr, JsExportPng, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"exportPngToSandbox", nullptr, JsExportPngToSandbox, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"importVerify", nullptr, JsImportVerify, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"importImage", nullptr, JsImportImage, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"importImageAsDocument", nullptr, JsImportImageAsDocument, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"importState", nullptr, JsImportState, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"importImageBytes", nullptr, JsImportImageBytes, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"present", nullptr, JsPresent, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"presentResult", nullptr, JsPresentResult, nullptr, nullptr, nullptr, napi_default,
        nullptr},

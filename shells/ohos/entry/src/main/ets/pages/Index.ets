@@ -10,8 +10,10 @@
 
 import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
-         backendName, exportPng,
+         backendName, exportPng, exportPngToSandbox, importImage, importImageAsDocument, importImageBytes,
+         importState, importVerify,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
+import { picker, fileIo } from '@kit.CoreFileKit';
 
 @Entry
 @Component
@@ -34,6 +36,7 @@ struct Index {
   @State undoState: string = '—';
   @State topOpacity: number = 0.5;
   @State exportState: string = '—';
+  @State importState: string = '—';
 
   private refresh(): void {
     this.backend = backendName();
@@ -53,6 +56,110 @@ struct Index {
     this.refresh();
   }
 
+  /*
+   * P1-2 剩余项：导入图片。
+   *
+   * 此前鸿蒙壳只能建纯色层，连自己的照片都打不开。
+   *
+   * 关键一步是**把选中的文件搬进沙箱**：文件选择器给的是 `file://` URI，
+   * 而引擎的 comp_io_import 只认**路径**（并且格式是按扩展名识别的——
+   * comp_io_format_from_path），所以必须复制成 cacheDir 下的同名文件，
+   * 扩展名要保留，否则引擎会判成「未知格式」直接拒绝。
+   */
+  private async pickAndImport(): Promise<void> {
+    this.importTo(false);
+  }
+
+  private async pickAndImportAsDocument(): Promise<void> {
+    this.importTo(true);
+  }
+
+  /*
+   * 选文件 -> 搬进沙箱 -> 导入。as_document = 导入为新文档（画布尺寸 =
+   * 图像尺寸），否则作为新图层放进当前文档。
+   */
+  private async importTo(asDocument: boolean): Promise<void> {
+    try {
+      const photoPicker = new picker.PhotoViewPicker();
+      const picked = await photoPicker.select({ maxSelectNumber: 1 });
+      if (picked.photoUris.length === 0) {
+        this.lastOp = '导入 取消';
+        return;
+      }
+      const uri = picked.photoUris[0];
+      /* 保留扩展名：引擎按扩展名判格式，丢了就认不出。 */
+      const tail = uri.substring(uri.lastIndexOf('.'));
+      const suffix = (tail.length >= 2 && tail.length <= 6) ? tail : '.png';
+      const target = getContext(this).cacheDir + '/imported' + suffix;
+      const source = await fileIo.open(uri, fileIo.OpenMode.READ_ONLY);
+      const dest = await fileIo.open(target, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE |
+                                            fileIo.OpenMode.TRUNC);
+      await fileIo.copyFile(source.fd, dest.fd);
+      await fileIo.close(source);
+      await fileIo.close(dest);
+
+      const rc: number = asDocument ? importImageAsDocument(target) : importImage(target);
+      this.importState = rc === 0 ? ('已导入 ' + target) : ('rc' + rc.toString());
+      this.do('导入', rc);
+    } catch {
+      this.importState = '失败';
+      this.lastOp = '导入 ✗';
+      this.refresh();
+    }
+  }
+
+  /*
+   * 链路自检：用一张**内嵌的 8x8 PNG** 走完整导入链路。
+   *
+   * 为什么要有这个按钮：P1-2 的验收是「打开一张真实 PNG 并正确显示」，
+   * 但「显示」在模拟器上验不了（OPT-21b：x86_64 模拟器不给 surface 的
+   * CPU 可写映射）。所以这里把**能验的部分**验掉：图片字节 -> 落盘 ->
+   * comp_io_import_layer -> 图层出现在文档里。图层数 +1 且导入状态里的
+   * 尺寸对得上，就说明桥接通了。
+   *
+   * 图案内嵌 8x8 PNG：左上红、右下绿、其余蓝（**非对称**——对称图案里
+   * 「转置」「镜像」这类错误会因像素相同而蒙混过关）。
+   *
+   * 字节以**十六进制字符串**传给 NAPI：跨 NAPI 边界的二进制传递在 ArkTS
+   * 侧不稳定（实测 napi_is_arraybuffer / napi_is_typedarray 都判 false），
+   * 纯文本没有这个问题。
+   */
+  private readonly probePngHex: string =
+    '89504e470d0a1a0a0000000d4948445200000008000000080806000000c40fbe8b0000' +
+    '001b4944415478da63f8cfc0f01f19a371ff33d04101161da890f60a0073277f819c26' +
+    '6fe50000000049454e44ae426082';
+
+  private runProbeImport(): void {
+    try {
+      const rc: number = importImageBytes(this.probePngHex, 'png');
+      /*
+       * 导出一份到固定沙箱路径：验证脚本用 hdc 拉回来逐像素核对。
+       * 模拟器上不了屏（OPT-21b），「图片真的进引擎且像素正确」只能靠这条路证明。
+       */
+      let exportRc: number = -1;
+      if (rc === 0) {
+        exportRc = exportPngToSandbox();
+      }
+      this.importState = '自检 rc=' + rc.toString() + ' exp=' + exportRc.toString() + ' ' +
+                         importState();
+      this.do('导入自检', rc);
+    } catch {
+      this.importState = '自检失败';
+      this.lastOp = '导入自检 ✗';
+      this.refresh();
+    }
+  }
+
+  /*
+   * 像素核对：导入内嵌 PNG 后**读回像素**与期望图案逐字节比对。
+   * 这是「打开一张真实 PNG 并正确显示」在模拟器上能做到的最强验证
+   * （显示那条路被 OPT-21b 的平台限制堵着，但像素对不对是能验的）。
+   */
+  private runPixelVerify(): void {
+    const rc: number = importVerify();
+    this.importState = '验像素 rc=' + rc.toString() + ' ' + importState();
+    this.do('验像素', rc);
+  }
   build() {
     Column({ space: 10 }) {
       Text('Compositor · PS 基础功能')
@@ -129,6 +236,25 @@ struct Index {
           this.exportState = rc === 0 ? path : ('rc' + rc.toString());
           this.do('导出', rc);
         })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.SpaceEvenly)
+
+      /* P1-2 剩余项：导入图片。此前鸿蒙壳只能建纯色层，照片打不开。 */
+      Row({ space: 8 }) {
+        Button('导入图片').onClick(() => {
+          this.pickAndImport();
+        })
+        Button('导入为文档').onClick(() => {
+          this.pickAndImportAsDocument();
+        })
+        Button('自检').onClick(() => {
+          this.runProbeImport();
+        })
+        Button('验像素').onClick(() => {
+          this.runPixelVerify();
+        })
+        Text(this.importState).fontSize(10).fontColor('#9aa4b2').layoutWeight(1)
       }
       .width('100%')
       .justifyContent(FlexAlign.SpaceEvenly)

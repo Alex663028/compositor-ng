@@ -70,6 +70,31 @@ NODE="$NODE_HOME/node.exe"
 HVIGOR="$(dirname "$DEVECO_SDK_HOME")/tools/hvigor/bin/hvigorw.js"
 [ -f "$HVIGOR" ] || HVIGOR="G:/DevEco Studio/tools/hvigor/bin/hvigorw.js"
 
+# JAVA_HOME：hvigor 的打包阶段要起 java（签名 / 打包工具链）。
+# 机器上常常**没有 java 在 PATH**（DevEco 自带 JBR，但不注册到系统 PATH），
+# 于是打包阶段报 `spawn java ENOENT` —— 那个错看着像打包器坏了，其实是
+# PATH 问题。这里优先用 DevEco 自带的 JBR，找不到再退回系统 java。
+#
+# 探测用 POSIX 路径（/g/...）：DEVECO_SDK_HOME 是 Windows 形式（G://...），
+# 拿它拼出来的候选路径带双斜杠与盘符，MSYS 下 [ -f ] 判不出来。
+if [ -z "${JAVA_HOME:-}" ]; then
+  DEVECO_ROOT_POSIX="$(cygpath -u "G:/DevEco Studio" 2>/dev/null || echo "/g/DevEco Studio")"
+  for candidate in "$DEVECO_ROOT_POSIX/jbr" "/c/Program Files/Huawei/DevEco Studio/jbr"; do
+    if [ -f "$candidate/bin/java.exe" ]; then
+      JAVA_HOME="$(cygpath -w "$candidate" 2>/dev/null || echo "$candidate")"
+      break
+    fi
+  done
+fi
+if [ -n "${JAVA_HOME:-}" ]; then
+  export JAVA_HOME
+  JAVA_BIN_POSIX="$(cygpath -u "$JAVA_HOME/bin" 2>/dev/null || echo "$JAVA_HOME/bin")"
+  PATH="$JAVA_BIN_POSIX:$PATH"
+  export PATH
+fi
+JAVA_BIN="$(command -v java || true)"
+[ -n "$JAVA_BIN" ] || echo "[hap] 警告：找不到 java（打包阶段可能报 spawn java ENOENT）" >&2
+
 cd "$APP_DIR" || exit 1
 "$NODE" "$HVIGOR" --mode module -p product=default -p module=entry@default \
   -p buildMode=debug --no-daemon assembleHap || exit 1

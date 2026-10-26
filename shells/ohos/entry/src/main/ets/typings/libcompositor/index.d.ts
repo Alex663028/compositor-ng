@@ -45,6 +45,46 @@ export const canRedo: () => number;
  * @returns 0 成功；-1 无文档；其余 comp_result
  */
 export const exportPng: (path_utf8: string) => number;
+/**
+ * 导出到固定沙箱路径（自动化验证用）：
+ * /data/storage/el2/base/cache/compositor_verify.png
+ * @returns 0 成功；-1 无文档
+ */
+export const exportPngToSandbox: () => number;
+/**
+ * 导入图片为**新图层**（文档尺寸不变）。
+ * @param path_utf8 应用沙箱内的完整路径（如 cacheDir + '/x.png'）
+ * @returns 0 成功；-1 无引擎/无文档/路径为空；其余 comp_result
+ */
+export const importImage: (path_utf8: string) => number;
+/**
+ * 导入图片为**新文档**（画布尺寸 = 图像尺寸；旧文档被关闭）。
+ * @param path_utf8 应用沙箱内的完整路径
+ * @returns 0 成功；-1 无引擎/路径为空；其余 comp_result
+ */
+export const importImageAsDocument: (path_utf8: string) => number;
+/**
+ * 从**十六进制字符串**导入图片为新图层（不经文件路径）。
+ *
+ * 用 hex 文本而不是二进制：跨 NAPI 边界的二进制传递在 ArkTS 侧不稳定
+ * （实测 napi_is_arraybuffer / napi_is_typedarray 都判 false）。
+ * 引擎按扩展名识别格式，所以必须给 format（"png" / "jpg" / …）。
+ * @param hex 图片字节的十六进制文本（可含空白）
+ * @param format 格式名（png / jpg / jpeg / bmp / webp / tga / psd）
+ * @returns 0 成功；1 参数错；-1 无引擎/无文档；-3 落地临时文件失败
+ */
+export const importImageBytes: (hex: string, format: string) => number;
+/**
+ * 导入链路状态（诊断用）："layers=<n>;doc=<w>x<h>;top=<id>"。
+ */
+export const importState: () => string;
+/**
+ * 导入 + 像素核对（一次性自检）：把内嵌 8x8 PNG 导进当前文档，
+ * 读回像素与期望图案（左上红 / 右下绿 / 其余蓝）逐字节比对。
+ * @returns 0 全部通过；-1 无引擎/无文档；-2 落地失败；-3 导入失败；
+ *          -4 读回失败；-5 尺寸不符；-6 像素不符（错误数见 importState 的 last）
+ */
+export const importVerify: () => number;
 
 /**
  * 上屏（OPT-21 CPU 通路，异步）：投递一帧合成到 XComponent 窗口缓冲，立即返回。
