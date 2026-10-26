@@ -80,6 +80,32 @@ mkdir -p "$OUT"
 DEFINES=""
 CPPFLAGS="-I$ROOT/engine -I$ROOT/engine/abi/include -I$ROOT/engine/abi/src"
 
+# libpng 的 ARM NEON 优化必须**显式关掉**（PNG_ARM_NEON_OPT=0）。
+#
+# 背景：本仓的 libpng 是**裁剪过的**（只留编解码必需的 .c，arm/ 整个目录
+# 不在仓里——见 engine/third_party 的裁剪约定）。但 libpng 的 pngpriv.h 里
+# 有这么一段自动判定：
+#
+#     #if (defined(__ARM_NEON__) || defined(__ARM_NEON)) && \
+#        defined(PNG_ALIGNED_MEMORY_SUPPORTED)
+#     #  define PNG_ARM_NEON_OPT 2      // 开 NEON
+#     #else
+#     #  define PNG_ARM_NEON_OPT 0
+#     #endif
+#
+# aarch64 上 __ARM_NEON__ **总是定义**的 → PNG_ARM_NEON_OPT=2 → pngpriv.h
+# 把 png_do_read_transformations 之类改写成调用 png_do_expand_palette_rgba8_neon
+# / png_init_filter_functions_neon —— 而这些函数定义在被裁掉的 arm/*.c 里，
+# 于是**链接期**报 undefined symbol。
+#
+# 这个坑只在真机（aarch64）上出现，模拟器（x86_64）没有 __ARM_NEON__，
+# PNG_ARM_NEON_OPT 自动为 0，所以之前一直「测过是好的」。
+#
+# pngpriv.h 第 126-128 行的注释本身就给了正解：把 -DPNG_ARM_NEON_OPT=0
+# 放进 CPPFLAGS。代价是 ARM 上 PNG 解码走纯 C 路径（比 NEON 慢一些），
+# 换来的是**不依赖被裁掉的源文件**——这正是裁剪 vendor 的前提。
+CPPFLAGS="$CPPFLAGS -DPNG_ARM_NEON_OPT=0"
+
 # 编解码后端（P2-4）：与 scripts/build.py 的 INCLUDE_DIRS 同一条口径——目录存在才加入。
 # 这些目录下的 .c 本来就被上面的 `find engine -name "*.c"` 编进静态库，此前只是没给
 # include 路径，导致 codec_lib.cpp 的 __has_include("png.h") / ("stb_image.h") 探测失败：

@@ -136,6 +136,50 @@ napi_value MakeNull(napi_env env) {
   return out;
 }
 
+namespace {
+
+/*
+ * JSON 字符串转义。
+ *
+ * 图层名是用户可改的任意 UTF-8，里面可能有引号、反斜杠、换行——直接拼进
+ * JSON 会让 ArkTS 侧的 JSON.parse 失败，整个图层面板都出不来。所以这里
+ * 必须转义，而不是「假设名字里没有奇怪字符」。
+ */
+void json_escape_into(std::string& out, const char* text) {
+  for (const char* p = text; *p != '\0'; ++p) {
+    const unsigned char c = static_cast<unsigned char>(*p);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buffer[8] = {0};
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+          out += buffer;
+        } else {
+          /* UTF-8 多字节原样保留（JSON 允许非 ASCII 直接出现）。 */
+          out += static_cast<char>(c);
+        }
+        break;
+    }
+  }
+}
+
+/* 从 NAPI 参数里取一个 uint64（图层 id）。 */
+bool read_layer_id(napi_env env, napi_value value, comp_layer_id* out) {
+  if (value == nullptr) return false;
+  double number = 0.0;
+  if (napi_get_value_double(env, value, &number) != napi_ok) return false;
+  if (number < 0.0) return false;
+  *out = static_cast<comp_layer_id>(number);
+  return true;
+}
+
+}  // namespace
+
 const char* BackendName(comp_backend backend) {
   switch (backend) {
     case (comp_backend)1:
@@ -340,6 +384,197 @@ napi_value JsLayerCount(napi_env env, napi_callback_info info) {
   size_t count = 0;
   if (comp_layer_count(g_document, &count) != 0) return MakeInt32(env, -1);
   return MakeInt32(env, static_cast<int32_t>(count));
+}
+
+/* ---------------------------------------------------------------- 图层面板 */
+
+/*
+ * 图层列表 -> JSON 数组。
+ *
+ * 格式：[{"id":3,"name":"背景","visible":1,"opacity":1.0}, ...]
+ * 顺序 = 引擎的堆叠序（comp_layer_list 给的顺序：上层在前）。
+ *
+ * 为什么一次返回整份 JSON 而不是逐层取：ArkTS 侧要画**列表**，逐层跨 NAPI
+ * 边界取会变成 N 次往返，层一多就明显卡。一次取一份，ArkTS 侧 JSON.parse
+ * 一次即可。
+ *
+ * 图层名走 JSON 转义（见 json_escape_into）——名字是用户可改的，里面可能
+ * 有引号/反斜杠，不转义会让整份 JSON 解析失败、图层面板整个出不来。
+ */
+napi_value JsLayerListJson(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (g_document == nullptr) return MakeString(env, "[]");
+  size_t count = 0;
+  if (comp_layer_count(g_document, &count) != COMP_OK || count == 0) {
+    return MakeString(env, "[]");
+  }
+  std::vector<comp_layer_id> ids(count);
+  size_t listed = 0;
+  if (comp_layer_list(g_document, ids.data(), ids.size(), &listed) != COMP_OK ||
+      listed == 0) {
+    return MakeString(env, "[]");
+  }
+  std::string json = "[";
+  for (size_t i = 0; i < listed; ++i) {
+    char name[256] = {0};
+    size_t required = 0;
+    if (comp_layer_get_name(g_document, ids[i], name, sizeof(name), &required) != COMP_OK) {
+      std::snprintf(name, sizeof(name), "%llu",
+                    static_cast<unsigned long long>(ids[i]));
+    }
+    int32_t visible = 1;
+    comp_layer_get_visible(g_document, ids[i], &visible);
+    float opacity = 1.0f;
+    comp_layer_get_opacity(g_document, ids[i], &opacity);
+    if (i > 0) json += ",";
+    json += "{\"id\":";
+    json += std::to_string(static_cast<unsigned long long>(ids[i]));
+    json += ",\"name\":\"";
+    json_escape_into(json, name);
+    json += "\",\"visible\":";
+    json += visible != 0 ? "1" : "0";
+    json += ",\"opacity\":";
+    char number[32] = {0};
+    std::snprintf(number, sizeof(number), "%.3f", static_cast<double>(opacity));
+    json += number;
+    json += "}";
+  }
+  json += "]";
+  return MakeString(env, json.c_str());
+}
+
+/* 设置图层可见性（id, visible: boolean）。 */
+napi_value JsSetLayerVisible(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) return MakeInt32(env, 1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, 1);
+  bool visible = false;
+  napi_get_value_bool(env, argv[1], &visible);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  return MakeInt32(env, static_cast<int32_t>(
+                            comp_layer_set_visible(g_document, id, visible ? 1 : 0)));
+}
+
+/* 设置图层不透明度（id, opacity: 0..1）。 */
+napi_value JsSetLayerOpacity(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) return MakeInt32(env, 1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, 1);
+  double opacity = 1.0;
+  napi_get_value_double(env, argv[1], &opacity);
+  if (opacity < 0.0) opacity = 0.0;
+  if (opacity > 1.0) opacity = 1.0;
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  return MakeInt32(env, static_cast<int32_t>(
+                            comp_layer_set_opacity(g_document, id,
+                                                   static_cast<float>(opacity))));
+}
+
+/* 删除图层（id）。 */
+napi_value JsRemoveLayer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return MakeInt32(env, 1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, 1);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  const comp_result rc = comp_layer_remove(g_document, id);
+  if (rc == COMP_OK && g_top_layer == id) g_top_layer = 0;
+  return MakeInt32(env, static_cast<int32_t>(rc));
+}
+
+/* 重命名图层（id, name: UTF-8 文本）。 */
+napi_value JsSetLayerName(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) return MakeInt32(env, 1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, 1);
+  size_t length = 0;
+  napi_get_value_string_utf8(env, argv[1], nullptr, 0, &length);
+  if (length == 0) return MakeInt32(env, 1);
+  std::vector<char> name(length + 1, 0);
+  size_t copied = 0;
+  napi_get_value_string_utf8(env, argv[1], name.data(), name.size(), &copied);
+  if (copied == 0) return MakeInt32(env, 1);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  return MakeInt32(env, static_cast<int32_t>(comp_layer_set_name(g_document, id, name.data())));
+}
+
+/*
+ * 图层面板自检：把「列表 / 显隐 / 透明度 / 改名 / 删除」这条链路在**引擎层**
+ * 跑一遍，每一步都**读回**校验，返回可读的诊断串。
+ *
+ * 为什么要有这个：模拟器上 XComponent 上不了屏（OPT-21b：x86_64 模拟器不给
+ * surface 的 CPU 可写映射），画布上看不到任何变化——「显隐有没有真的作用到
+ * 引擎」光看屏幕是验不了的。唯一能证明的办法是**读回引擎状态**：设了 visible
+ * 就得读回 0，设了 opacity 就得读回 0.5，改了名就得读回新名字。
+ *
+ * 测完把探针层删掉，文档回到测试前的层数（不留痕）。
+ */
+napi_value JsLayerPanelSelfTest(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (g_document == nullptr) return MakeString(env, "no-doc");
+  size_t before = 0;
+  comp_layer_count(g_document, &before);
+
+  comp_layer_desc desc;
+  std::memset(&desc, 0, sizeof(desc));
+  desc.name = "panel_probe";
+  comp_layer_id probe = 0;
+  if (comp_layer_add(g_document, &desc, &probe) != COMP_OK) {
+    return MakeString(env, "add-failed");
+  }
+
+  /* 1) 列表：探针层要能查出来。 */
+  size_t count = 0;
+  comp_layer_count(g_document, &count);
+  std::vector<comp_layer_id> ids(count);
+  size_t listed = 0;
+  comp_layer_list(g_document, ids.data(), ids.size(), &listed);
+  bool in_list = false;
+  for (size_t i = 0; i < listed; ++i) {
+    if (ids[i] == probe) {
+      in_list = true;
+      break;
+    }
+  }
+
+  /* 2) 显隐：设 0 读回 0。 */
+  comp_layer_set_visible(g_document, probe, 0);
+  int32_t visible = 1;
+  comp_layer_get_visible(g_document, probe, &visible);
+
+  /* 3) 透明度：设 0.5 读回 0.5。 */
+  comp_layer_set_opacity(g_document, probe, 0.5f);
+  float opacity = 0.0f;
+  comp_layer_get_opacity(g_document, probe, &opacity);
+
+  /* 4) 改名：设了新名读回新名。 */
+  comp_layer_set_name(g_document, probe, "renamed_probe");
+  char name[64] = {0};
+  size_t required = 0;
+  comp_layer_get_name(g_document, probe, name, sizeof(name), &required);
+
+  /* 5) 删除：层数回到测试前。 */
+  comp_layer_remove(g_document, probe);
+  size_t after = 0;
+  comp_layer_count(g_document, &after);
+
+  char buffer[192];
+  std::snprintf(buffer, sizeof(buffer),
+                "list=%d hide=%d opacity=%.2f name=%s del=%d layers=%zu->%zu",
+                in_list ? 1 : 0, visible, static_cast<double>(opacity), name,
+                after == before ? 1 : 0, before, after);
+  return MakeString(env, buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1476,18 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"layerCount", nullptr, JsLayerCount, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"layerListJson", nullptr, JsLayerListJson, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setLayerVisible", nullptr, JsSetLayerVisible, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setLayerOpacity", nullptr, JsSetLayerOpacity, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"removeLayer", nullptr, JsRemoveLayer, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setLayerName", nullptr, JsSetLayerName, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"layerPanelSelfTest", nullptr, JsLayerPanelSelfTest, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"applyVignette", nullptr, JsApplyVignette, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"undo", nullptr, JsUndo, nullptr, nullptr, nullptr, napi_default, nullptr},

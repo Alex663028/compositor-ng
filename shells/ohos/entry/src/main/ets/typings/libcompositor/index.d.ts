@@ -29,6 +29,40 @@ export const setTopBlend: (blend: number) => number;
 /** 当前文档图层数；-1 无文档。 */
 export const layerCount: () => number;
 
+/*
+ * 图层列表（JSON 数组字符串）。
+ *
+ * 每一项：{"id":<number>,"name":"<utf8>","visible":<0|1>,"opacity":<0..1>}
+ * 顺序 = 引擎的堆叠序（上层在前）。
+ *
+ * 为什么是字符串而不是数组：跨 NAPI 边界传数组在 ArkTS 侧类型不稳（实测
+ * ArrayBuffer / TypedArray 都不被识别），纯文本没这个问题；ArkTS 侧一次
+ * JSON.parse 即可。
+ */
+export const layerListJson: () => string;
+
+/** 设置图层可见性。@returns 0 成功；1 参数错；-1 无文档。 */
+export const setLayerVisible: (id: number, visible: boolean) => number;
+
+/** 设置图层不透明度（0..1，超范围会被夹住）。 */
+export const setLayerOpacity: (id: number, opacity: number) => number;
+
+/** 删除图层。 */
+export const removeLayer: (id: number) => number;
+
+/** 重命名图层（UTF-8）。 */
+export const setLayerName: (id: number, name_utf8: string) => number;
+
+/**
+ * 图层面板自检：把「列表 / 显隐 / 透明度 / 改名 / 删除」在引擎层跑一遍并读回校验。
+ *
+ * 模拟器上 XComponent 上不了屏（画布上看不到变化），所以「操作有没有真的作用到
+ * 引擎」只能靠读回引擎状态来证明。
+ *
+ * @returns "list=1 hide=0 opacity=0.50 name=renamed_probe del=1 layers=N->N"
+ */
+export const layerPanelSelfTest: () => string;
+
 /** 给顶层加暗角滤镜（comp_filter_apply Vignette）。@returns comp_result */
 export const applyVignette: (amount: number) => number;
 /** 撤销一步。@returns comp_result（2 = 无可撤销） */

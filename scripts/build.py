@@ -238,6 +238,20 @@ def compile_all(driver: str, shared: bool, gpu: bool = False, asan: bool = False
         if os.name != "nt":
             defines.append("-fPIC")
     msvc_defines = ["/DCOMP_SHARED", "/DCOMP_SHARED_BUILD"] if shared else []
+    # libpng 的 ARM NEON 优化必须**显式关掉**（PNG_ARM_NEON_OPT=0）。
+    #
+    # 本仓的 libpng 是裁剪过的（arm/ 目录不在仓里），而 libpng 的 pngpriv.h
+    # 会在检测到 __ARM_NEON__ 时自动开 NEON（aarch64 上该宏**总是**定义），
+    # 于是引用被裁掉的 arm/*.c 里的函数 → 链接期 undefined symbol。
+    #
+    # 宿主当前是 x86_64（无 __ARM_NEON__，自动为 0），加上这个宏只是为了：
+    #   a) 与 scripts/build_ohos.sh 保持**同一条口径**（两处构建对 libpng 的
+    #      配置必须一致，否则「宿主过、真机挂」这类分歧会再来一次）；
+    #   b) 将来做 ARM 宿主构建时不用再踩同一个坑。
+    #
+    # 代价：ARM 上 PNG 解码走纯 C 路径（慢一些，但结果一致）。
+    if os.name != "nt":
+        defines.append("-DPNG_ARM_NEON_OPT=0")
     # S13：D3D12 后端是 opt-in 构建；不定义 COMP_HAS_D3D12 时后端只有如实失败的桩。
     if gpu:
         defines.append("-DCOMP_HAS_D3D12")

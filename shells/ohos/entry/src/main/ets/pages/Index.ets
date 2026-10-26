@@ -12,8 +12,21 @@ import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setT
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
          backendName, exportPng, exportPngToSandbox, importImage, importImageAsDocument, importImageBytes,
          importState, importVerify,
+         layerListJson, setLayerVisible, setLayerOpacity, removeLayer, setLayerName, layerPanelSelfTest,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 import { picker, fileIo } from '@kit.CoreFileKit';
+
+/*
+ * 图层列表的一行（来自 napi 侧的 layerListJson）。
+ *
+ * 字段名与 JSON 里的键一一对应，visible 是 0/1 数字（JSON 里没有布尔量）。
+ */
+interface LayerRowItem {
+  id: number;
+  name: string;
+  visible: number;
+  opacity: number;
+}
 
 @Entry
 @Component
@@ -38,6 +51,13 @@ struct Index {
   @State exportState: string = '—';
   @State importState: string = '—';
 
+  /* 图层面板：与 Windows 壳的图层列表同语义（名字 / 显隐 / 透明度 / 删除 / 改名）。 */
+  @State layerRows: LayerRowItem[] = [];
+  @State selectedLayerId: number = 0;
+  @State selectedOpacity: number = 100;
+  @State renameText: string = '';
+  @State layerPanelState: string = '—';
+
   private refresh(): void {
     this.backend = backendName();
     this.surface = surfaceInfo();
@@ -48,7 +68,91 @@ struct Index {
     const rc: number = presentResult();
     this.presentState = rc === -100 ? '提交中' : (rc === 0 ? '上屏 OK' : ('rc=' + rc.toString()));
     this.diag = presentDiag();
+    this.refreshLayers();
     present();
+  }
+
+  /*
+   * 图层面板：从 napi 侧拿一份 JSON 列表（引擎的堆叠序：上层在前）。
+   *
+   * 为什么整份取而不是逐层问：ArkTS 侧要画**列表**，逐层跨 NAPI 边界取会变成
+   * N 次往返，层一多就明显卡。napi 侧已经把它拼成一份 JSON（名字做了转义）。
+   */
+  private refreshLayers(): void {
+    const raw: string = layerListJson();
+    try {
+      this.layerRows = JSON.parse(raw) as LayerRowItem[];
+    } catch {
+      this.layerRows = [];
+    }
+  }
+
+  private findLayer(id: number): LayerRowItem | undefined {
+    for (let i = 0; i < this.layerRows.length; i++) {
+      if (this.layerRows[i].id === id) {
+        return this.layerRows[i];
+      }
+    }
+    return undefined;
+  }
+
+  private selectLayer(id: number): void {
+    this.selectedLayerId = id;
+    const row: LayerRowItem | undefined = this.findLayer(id);
+    if (row !== undefined) {
+      this.selectedOpacity = Math.round(row.opacity * 100);
+      this.renameText = row.name;
+    }
+  }
+
+  private toggleLayer(id: number, on: boolean): void {
+    const rc: number = setLayerVisible(id, on);
+    this.do('显隐', rc);
+    this.refreshLayers();
+  }
+
+  private applySelectedOpacity(value: number): void {
+    this.selectedOpacity = Math.round(value);
+    if (this.selectedLayerId === 0) {
+      return;
+    }
+    const rc: number = setLayerOpacity(this.selectedLayerId, this.selectedOpacity / 100.0);
+    this.do('层透明度', rc);
+    this.refreshLayers();
+  }
+
+  private deleteSelectedLayer(): void {
+    if (this.selectedLayerId === 0) {
+      this.lastOp = '删除层：未选中';
+      this.refresh();
+      return;
+    }
+    const rc: number = removeLayer(this.selectedLayerId);
+    this.selectedLayerId = 0;
+    this.do('删除层', rc);
+    this.refreshLayers();
+  }
+
+  /*
+   * 图层面板自检：把「列表 / 显隐 / 透明度 / 改名 / 删除」在引擎层跑一遍并读回校验。
+   *
+   * 为什么需要：模拟器上 XComponent 上不了屏（OPT-21b），画布上看不到任何变化——
+   * 「显隐有没有真的作用到引擎」光看屏幕验不了，只能读回引擎状态。
+   */
+  private runLayerPanelSelfTest(): void {
+    this.layerPanelState = layerPanelSelfTest();
+    this.refresh();
+  }
+
+  private renameSelectedLayer(): void {
+    if (this.selectedLayerId === 0 || this.renameText.length === 0) {
+      this.lastOp = '改名：未选中或名字为空';
+      this.refresh();
+      return;
+    }
+    const rc: number = setLayerName(this.selectedLayerId, this.renameText);
+    this.do('改名', rc);
+    this.refreshLayers();
   }
 
   private do(label: string, code: number): void {
@@ -172,7 +276,7 @@ struct Index {
         libraryname: 'compositor'
       })
         .width('100%')
-        .height(300)
+        .height(200)
         .backgroundColor('#101418')
         /* surface 建好之后才读得到真实后端/尺寸；不在这里刷新，界面会一直停在
          * 硬编码的 'None' / 'absent'，看起来像初始化失败（2026-10-26 实测）。 */
@@ -182,6 +286,7 @@ struct Index {
           this.layers = layerCount();
           this.undoState = canUndo() > 0 ? '可撤销' : '空';
           this.brushText = brushInfo();
+          this.refreshLayers();
         })
 
       Text('后端 ' + this.backend + ' · 表面 ' + this.surface + ' · 上屏 ' + this.presentState)
@@ -193,6 +298,116 @@ struct Index {
         .fontColor('#8a8a8a')
         .width('100%')
         .textAlign(TextAlign.Center)
+
+      /*
+       * 图层面板自检按钮放在 **Scroll 之外**。
+       *
+       * 为什么：ArkUI 的 Scroll 会把落在它身上的触摸先当成滚动处理，按钮的
+       * onClick 常常不触发（实测「层自检」放在 Scroll 内的图层面板标题行上，
+       * 连点多次都点不动；移到 Scroll 外一按就响）。控件放在会被滚动容器
+       * 吞触摸的位置，等于放了个点不着的按钮。
+       */
+      Row({ space: 8 }) {
+        Button('层自检').fontSize(11).height(28)
+          .onClick(() => {
+            this.runLayerPanelSelfTest();
+          })
+        Text(this.layerPanelState).fontSize(9).fontColor('#8a8a8a').layoutWeight(1)
+      }
+      .width('100%')
+
+      /*
+       * 其余内容放进 Scroll：手机（尤其竖屏）窗口高度有限，内容总高很容易
+       * 超出——超出时 Column 末尾的元素会被**挤没**（2026-10-26 实测：图层面板
+       * 只剩 40px 高度，列表整块看不见）。放进 Scroll 后内容再长也能滚到。
+       */
+      Scroll() {
+        Column({ space: 8 }) {
+      /*
+       * 图层面板：鸿蒙侧此前只有按钮级演示，**没有图层列表**（与 Windows 壳的
+       * 差距）。这里补上与 Windows 侧同语义的一层：图层名、显隐、透明度、
+       * 删除、改名。
+       *
+       * 数据来自引擎（layerListJson 走 comp_layer_list + comp_layer_get_name），
+       * 不是壳自己记账——壳记账的话，导入图片加的层就不见了。
+       */
+      Column({ space: 4 }) {
+        Row({ space: 6 }) {
+          Text('图层').fontSize(12).fontColor('#9aa4b2')
+          TextInput({ text: this.renameText, placeholder: '图层名' })
+            .layoutWeight(1)
+            .fontSize(12)
+            .height(30)
+            .onChange((value: string) => {
+              this.renameText = value;
+            })
+          Button('改名').fontSize(11).height(28)
+            .onClick(() => {
+              this.renameSelectedLayer();
+            })
+          Button('删除').fontSize(11).height(28)
+            .onClick(() => {
+              this.deleteSelectedLayer();
+            })
+        }
+        .width('100%')
+
+        if (this.layerRows.length > 0) {
+          List({ space: 2 }) {
+            ForEach(this.layerRows, (item: LayerRowItem) => {
+              ListItem() {
+                Row({ space: 6 }) {
+                  Text(item.name)
+                    .fontSize(13)
+                    .fontColor(item.id === this.selectedLayerId ? '#7fb0ff' : '#d8d8de')
+                    .maxLines(1)
+                    .layoutWeight(1)
+                    .onClick(() => {
+                      this.selectLayer(item.id);
+                    })
+                  Toggle({ type: ToggleType.Switch, isOn: item.visible !== 0 })
+                    .width(40)
+                    .height(22)
+                    .selectedColor('#3f7fd0')
+                    .onChange((on: boolean) => {
+                      this.toggleLayer(item.id, on);
+                    })
+                }
+                .width('100%')
+                .padding({ left: 6, right: 6, top: 3, bottom: 3 })
+                .backgroundColor(item.id === this.selectedLayerId ? '#25334a' : '#1b1d22')
+              }
+            }, (item: LayerRowItem) => item.id.toString())
+          }
+          .width('100%')
+          .height(132)
+          .scrollBar(BarState.Auto)
+        } else {
+          Text('（无图层）').fontSize(12).fontColor('#6a7080').width('100%')
+        }
+
+        Row({ space: 6 }) {
+          Text('不透明度').fontSize(11).fontColor('#9aa4b2')
+          Slider({ value: this.selectedOpacity, min: 0, max: 100, step: 1 })
+            .layoutWeight(1)
+            .onChange((value: number) => {
+              this.applySelectedOpacity(value);
+            })
+          Text(this.selectedOpacity.toString() + '%').fontSize(11).fontColor('#9aa4b2')
+        }
+        .width('100%')
+      }
+      .width('100%')
+      .height(200)
+      .padding({ top: 6 })
+      .backgroundColor('#14161a')
+
+
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .scrollBar(BarState.Auto)
 
       Row({ space: 8 }) {
         Button('新建').onClick(() => {
@@ -296,6 +511,7 @@ struct Index {
       }
       .width('100%')
       .justifyContent(FlexAlign.Center)
+
     }
     .width('100%')
     .height('100%')
