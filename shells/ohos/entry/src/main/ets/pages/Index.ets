@@ -8,7 +8,7 @@
 //
 // napi_init.cpp 用 napi_define_properties 挂命名导出，这里必须用命名导入。
 
-import { newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
+import { presentStage, touchCount, newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
          backendName, exportPng } from 'libcompositor.so';
 
@@ -56,7 +56,7 @@ struct Index {
 
       Text('后端 ' + this.backend + ' · 表面 ' + this.surface + ' · 上屏 ' + this.presentState)
         .fontSize(12)
-      Text('图层 ' + this.layers.toString() + ' · 撤销 ' + this.undoState + ' · 最近 ' + this.lastOp + ' · 导出 ' + this.exportState)
+      Text('S' + presentStage().toString() + ' 触' + touchCount().toString() + ' · 图层 ' + this.layers.toString() + ' · 撤销 ' + this.undoState + ' · 最近 ' + this.lastOp + ' · 导出 ' + this.exportState)
         .fontSize(12)
 
       Row({ space: 8 }) {

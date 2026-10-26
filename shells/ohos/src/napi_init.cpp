@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <poll.h>
+#include <unistd.h>
 
 #define LOG_DOMAIN 0xD003F0
 #define LOG_TAG "compositor-ohos"
@@ -94,6 +95,10 @@ void OnSurfaceCreatedCB(OH_NativeXComponent* component, void* window) {
 
 void OnSurfaceChangedCB(OH_NativeXComponent* component, void* window) {
   RefreshSurfaceGeometry(component, window);
+  /* surface 变化（尺寸/重建，如 2030x456 -> 2038x570）会重建 BufferQueue——
+   * 已下发的 format/usage 随之失效，不重配则 RequestBuffer 拒绝（40601000，
+   * 2026-10-26 模拟器实测）。重置标志，下一帧 present 重新配置。 */
+  g_configured_width = 0;
 }
 
 void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
@@ -449,7 +454,8 @@ napi_value JsSurfaceInfo(napi_env env, napi_callback_info info) {
 
 std::mutex g_present_mutex;
 bool g_present_running = false;
-std::atomic<int32_t> g_present_last_rc{-100};  // -100 = 尚无结果（或进行中）
+std::atomic<int32_t> g_present_last_rc{-100};
+std::atomic<int> g_present_stage{0};  /* 诊断：0=未跑 1=SET_FORMAT 2=SET_USAGE 3=REQUEST 4=HANDLE 5=FLUSH 6=完成 */  // -100 = 尚无结果（或进行中）
 
 int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width,
                   uint32_t height, uint64_t generation) {
@@ -459,28 +465,36 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
    * 一致），任何几何改配都会触发缓冲队列与消费者的重配协商——首版撕裂画面与
    * 阻塞都源于此。格式与 usage 只在首帧下发一次。 */
   if (g_configured_width == 0) {
+    g_present_stage.store(1);
     int rc = OH_NativeWindow_NativeWindowHandleOpt(window, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
-    if (rc != 0) { LOGE("SET_FORMAT rc=%{public}d", rc); return 6; }
+    if (rc != 0) { return 6; }
+    g_present_stage.store(2);
     rc = OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE,
                                                NATIVEBUFFER_USAGE_CPU_READ |
                                                    NATIVEBUFFER_USAGE_CPU_WRITE);
-    if (rc != 0) { LOGE("SET_USAGE rc=%{public}d", rc); return 6; }
+    if (rc != 0) { return 6; }
     g_configured_width = 1;
     LOGI("window format/usage configured");
   }
 
   NativeWindowBuffer* buffer = nullptr;
   int32_t fence_fd = -1;
-  LOGI("request buffer begin");
-  int rc = OH_NativeWindow_NativeWindowRequestBuffer(window, &buffer, &fence_fd);
-  if (rc != 0 || buffer == nullptr) { LOGE("RequestBuffer rc=%{public}d", rc); return 6; }
+  g_present_stage.store(3);
+  /* RequestBuffer 在 surface 刚重建后可能短窗拒绝（40601000：consumer 尚未
+   * attach 完）。小间隔重试覆盖时序窗口——恒定拒绝才算真失败。 */
+  int rc = -1;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    rc = OH_NativeWindow_NativeWindowRequestBuffer(window, &buffer, &fence_fd);
+    if (rc == 0 && buffer != nullptr) break;
+    buffer = nullptr;
+    usleep(50 * 1000);
+  }
+  if (rc != 0 || buffer == nullptr) { return 6; }
   LOGI("request buffer ok, fence=%{public}d", fence_fd);
 
+  g_present_stage.store(4);
   BufferHandle* handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
-  if (handle == nullptr || handle->virAddr == nullptr) {
-    LOGE("buffer handle null");
-    return 6;
-  }
+  if (handle == nullptr || handle->virAddr == nullptr) { return 6; }
   WaitFence(fence_fd);
 
   if (g_surface_generation.load() != generation) return -1;  // surface 已销毁，放弃
@@ -496,9 +510,11 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
   rect.h = static_cast<uint32_t>(handle->height);
   damage.rects = &rect;
   damage.rectNumber = 1;
+  g_present_stage.store(5);
   rc = OH_NativeWindow_NativeWindowFlushBuffer(window, buffer, fence_fd, damage);
-  LOGI("flush rc=%{public}d", rc);
-  return rc == 0 ? 0 : 6;
+  if (rc != 0) { return 6; }
+  g_present_stage.store(6);
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +524,7 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
 // ---------------------------------------------------------------------------
 
 float g_stroke_color[3] = {255.0f, 220.0f, 40.0f};  /* 黄色，深底上醒目 */
+std::atomic<int> g_touch_events{0};  /* 诊断探针：回调入口计数 */
 bool g_stroke_active = false;
 float g_stroke_last_x = 0.0f;
 float g_stroke_last_y = 0.0f;
@@ -533,6 +550,7 @@ void PaintSegment(float x0, float y0, float x1, float y1) {
 }
 
 void DispatchTouchEventCB(OH_NativeXComponent* component, void* window) {
+  g_touch_events.fetch_add(1);
   if (component == nullptr || window == nullptr || g_document == nullptr) return;
   OH_NativeXComponent_TouchEvent event;
   if (OH_NativeXComponent_GetTouchEvent(component, window, &event) != 0) return;
@@ -719,6 +737,18 @@ napi_value Init(napi_env env, napi_value exports) {
       {"present", nullptr, JsPresent, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"presentResult", nullptr, JsPresentResult, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"presentStage", nullptr, [](napi_env env, napi_callback_info info) {
+        (void)info;
+        napi_value out = nullptr;
+        napi_create_int32(env, g_present_stage.load(), &out);
+        return out;
+      }, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"touchCount", nullptr, [](napi_env env, napi_callback_info info) {
+        (void)info;
+        napi_value out = nullptr;
+        napi_create_int32(env, g_touch_events.load(), &out);
+        return out;
+      }, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"flatten", nullptr, JsFlatten, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"surfaceInfo", nullptr, JsSurfaceInfo, nullptr, nullptr, nullptr, napi_default,
        nullptr},

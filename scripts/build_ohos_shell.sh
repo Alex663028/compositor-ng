@@ -1,3 +1,6 @@
+# hilog: OH_LOG_* needs libhilog_ndk.z.so at link -- without it dlopen relocation
+# fails and the WHOLE NAPI module fails to load (2026-10-26 emulator; the ArkTS error
+# 'module does not provide an export' is the misleading symptom).
 # AI生成
 #!/usr/bin/env bash
 # AI生成
@@ -64,7 +67,7 @@ fi
   "$ROOT/shells/ohos/src/napi_init.cpp" \
   "$ENGINE_LIB" \
   -L"$ARCH_LIB_DIR" \
-  -lace_napi.z -lace_ndk.z -lnative_window \
+  -lace_napi.z -lace_ndk.z -lnative_window -l:libhilog_ndk.z.so \
   -o "$SHELL_SO" || {
     echo "[ohos-shell] 链接失败" >&2
     exit 1
