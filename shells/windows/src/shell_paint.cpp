@@ -398,6 +398,156 @@ std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptio
   }
 }
 
+/* ---------------------------------------- P0-10 数字直输（选项栏数值区） */
+
+/*
+ * 数值区的整数值。只覆盖 Stepper 类：Choice 的「值」是档位名，不是数。
+ * 显示与键入态都从这里取，避免「框里显示 24、按回车变成 25」这种两位一体的错。
+ */
+int option_value_number(const ShellState& shell, comp_ui::ToolOptionId id) {
+  switch (id) {
+    case comp_ui::ToolOptionId::BrushSize:
+      return static_cast<int>(comp_ui::clamp_brush_size(shell.brush_size) + 0.5);
+    case comp_ui::ToolOptionId::BrushHardness:
+      return static_cast<int>(comp_ui::clamp_brush_hardness(shell.brush_hardness) * 100.0 + 0.5);
+    case comp_ui::ToolOptionId::BrushFlow:
+      return static_cast<int>(comp_ui::clamp_brush_flow(shell.brush_flow) * 100.0 + 0.5);
+    case comp_ui::ToolOptionId::WandTolerance:
+      return shell.wand_tolerance;
+    case comp_ui::ToolOptionId::SelectionFeather:
+      return shell.selection_feather;
+    case comp_ui::ToolOptionId::ShapeStrokeWidth:
+      return static_cast<int>(shell.shape_stroke_width + 0.5);
+    case comp_ui::ToolOptionId::TypeBoxWidth:
+      return static_cast<int>(shell.doc.type_box_width + 0.5);
+    case comp_ui::ToolOptionId::TypeBoxHeight:
+      return static_cast<int>(shell.doc.type_box_height + 0.5);
+    default:
+      return 0;
+  }
+}
+
+/*
+ * 直接写值（不是步进）。夹取一律复用 ui_core 的 clamp：横栏箭头、直输、右栏
+ * 三处改的是同一个字段，各写一份夹取迟早分叉（能用 600 但只许输入 500）。
+ * 返回 false = 这个选项不是数值型，调用方不该进键入态。
+ */
+bool set_tool_option_value(ShellState& shell, comp_ui::ToolOptionId id, int value) {
+  switch (id) {
+    case comp_ui::ToolOptionId::BrushSize:
+      shell.brush_size = comp_ui::clamp_brush_size(value);
+      shell.brush_preset = 0;
+      return true;
+    case comp_ui::ToolOptionId::BrushHardness:
+      shell.brush_hardness = comp_ui::clamp_brush_hardness(value / 100.0);
+      shell.brush_preset = 0;
+      return true;
+    case comp_ui::ToolOptionId::BrushFlow:
+      shell.brush_flow = comp_ui::clamp_brush_flow(value / 100.0);
+      shell.brush_preset = 0;
+      return true;
+    case comp_ui::ToolOptionId::WandTolerance:
+      shell.wand_tolerance = comp_ui::clamp_wand_tolerance(value);
+      return true;
+    case comp_ui::ToolOptionId::SelectionFeather:
+      shell.selection_feather = comp_ui::clamp_selection_feather(value);
+      return true;
+    case comp_ui::ToolOptionId::ShapeStrokeWidth:
+      shell.shape_stroke_width = comp_ui::clamp_shape_stroke_width(value);
+      return true;
+    case comp_ui::ToolOptionId::TypeBoxWidth:
+      shell.doc.type_box_width = value <= 0 ? 0.0 : static_cast<double>(value);
+      return true;
+    case comp_ui::ToolOptionId::TypeBoxHeight:
+      shell.doc.type_box_height = value <= 0 ? 0.0 : static_cast<double>(value);
+      return true;
+    default:
+      return false;
+  }
+}
+
+void option_input_cancel(ShellState& shell) {
+  shell.option_input_active = false;
+  shell.option_input_index = -1;
+  shell.option_input_id = comp_ui::ToolOptionId::None;
+  shell.option_input.clear();
+  shell.option_input_fresh = true;
+}
+
+/* 数值项判定：不试探、不写值。用 switch 而不是「试着 set 一次看返回值」——
+ * set 会顺手把 brush_preset 清零，点一下数值框就退出预设属于无意的副作用。 */
+bool tool_option_is_numeric(comp_ui::ToolOptionId id) {
+  switch (id) {
+    case comp_ui::ToolOptionId::BrushSize:
+    case comp_ui::ToolOptionId::BrushHardness:
+    case comp_ui::ToolOptionId::BrushFlow:
+    case comp_ui::ToolOptionId::WandTolerance:
+    case comp_ui::ToolOptionId::SelectionFeather:
+    case comp_ui::ToolOptionId::ShapeStrokeWidth:
+    case comp_ui::ToolOptionId::TypeBoxWidth:
+    case comp_ui::ToolOptionId::TypeBoxHeight:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void option_input_begin(ShellState& shell, int index) {
+  const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(shell.tool, index);
+  if (spec.kind != comp_ui::ToolOptionKind::Stepper) return;
+  if (!tool_option_is_numeric(spec.id)) return;
+  /*
+   * 空缓冲 = 光标在空框里等着输入。刻意**预填当前值**：PS 也是「全选当前值」，
+   * 想微调就得先把旧值删掉，那是多余的十几次退格。
+   */
+  wchar_t buffer[16];
+  wsprintfW(buffer, L"%d", option_value_number(shell, spec.id));
+  shell.option_input.assign(buffer);
+  shell.option_input_active = true;
+  shell.option_input_index = index;
+  shell.option_input_id = spec.id;
+  shell.option_input_fresh = true;
+  wchar_t line[128];
+  wsprintfW(line, L"%s：输入数字后回车（Esc 取消）", widen_ascii(spec.label).c_str());
+  set_status(shell, line);
+}
+
+void option_input_char(ShellState& shell, wchar_t character) {
+  if (!shell.option_input_active) return;
+  if (character < L'0' || character > L'9') return;
+  if (shell.option_input_fresh) {
+    /* 第一次输入 = 替换掉点开时的旧值（等价于 PS 的「全选后输入」）。 */
+    shell.option_input.clear();
+    shell.option_input_fresh = false;
+  }
+  if (shell.option_input.size() >= 6) return; /* 6 位足够（最大值 30000），再长也没意义 */
+  shell.option_input.push_back(character);
+}
+
+void option_input_backspace(ShellState& shell) {
+  if (!shell.option_input.empty()) shell.option_input.pop_back();
+}
+
+void option_input_commit(ShellState& shell) {
+  if (!shell.option_input_active) return;
+  const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(shell.tool, shell.option_input_index);
+  int value = 0;
+  for (const wchar_t digit : shell.option_input) {
+    value = value * 10 + static_cast<int>(digit - L'0');
+  }
+  const bool applied = set_tool_option_value(shell, shell.option_input_id, value);
+  wchar_t line[128];
+  if (applied) {
+    /* 报告夹取后的真值，不回报用户敲进去的数——夹取是可见行为，不能藏着。 */
+    wsprintfW(line, L"%s：%s", widen_ascii(spec.label).c_str(),
+              option_value_text(shell, spec).c_str());
+  } else {
+    wsprintfW(line, L"%s：不是数值项，已忽略", widen_ascii(spec.label).c_str());
+  }
+  option_input_cancel(shell);
+  set_status(shell, line);
+}
+
 /*
  * 点击选项栏：改的是**同一个** ShellState 字段，画笔下一笔就生效，不需要
  * 任何「应用」按钮。返回 false 表示这一下不是选项栏吃掉的（调用方继续派发）。
@@ -595,9 +745,31 @@ void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar
     DeleteObject(fill);
 
     RECT value{control.x, control.y, control.right(), control.bottom()};
-    SetTextColor(dc, RGB(228, 230, 236));
-    DrawTextW(dc, option_value_text(shell, spec).c_str(), -1, &value,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    const bool editing = shell.option_input_active && shell.option_input_index == i;
+    if (editing) {
+      /*
+       * P0-10 直输：数值区画成输入框（亮底 + 蓝框 + 尾随光标）。
+       * 只改这一格的绘制，箭头照旧画在两侧，用户能看出「现在在改这个数」。
+       */
+      const comp_ui::Rect field = comp_ui::option_value_rect(control);
+      if (field.w > 0) {
+        RECT field_rect{field.x, field.y, field.right(), field.bottom()};
+        HBRUSH field_fill = CreateSolidBrush(RGB(24, 26, 30));
+        FillRect(dc, &field_rect, field_fill);
+        DeleteObject(field_fill);
+        HBRUSH border = CreateSolidBrush(RGB(118, 168, 255));
+        FrameRect(dc, &field_rect, border);
+        DeleteObject(border);
+      }
+      std::wstring text = shell.option_input + L"|";
+      SetTextColor(dc, RGB(240, 244, 252));
+      DrawTextW(dc, text.c_str(), -1, &value,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+      SetTextColor(dc, RGB(228, 230, 236));
+      DrawTextW(dc, option_value_text(shell, spec).c_str(), -1, &value,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
 
     if (spec.kind == comp_ui::ToolOptionKind::Stepper) {
       /* Stepper 的箭头画在值两侧：命中测试按同样两条 18px 带子判断。 */
@@ -1239,7 +1411,10 @@ void draw_adjust_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pan
                                                                                     : slider_hints);
   int hint_y = height - 96;
   for (int i = 0; i < 5; ++i) {
-    TextOutW(dc, left + 10, hint_y, hints[i], lstrlenW(hints[i]));
+    /* 提示比面板宽：用 DrawTextW + 省略号收尾，而不是硬切一半单词
+     * （面板整体还有裁剪兜底，这里只负责「切得像有意为之」）。 */
+    RECT hint_box{left + 10, hint_y, panel_rect.right() - 10, hint_y + 18};
+    DrawTextW(dc, hints[i], -1, &hint_box, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     hint_y += 18;
   }
 }
@@ -3345,9 +3520,28 @@ void present(HWND window, ShellState& shell) {
    * draw_panel_toggles 画竖条。两者互斥，竖条上不会漏出半截图层行。
    */
   if (layout.layer_panel.w > 0 && !layout.layer_collapsed) {
+    /*
+     * 面板内容一律**裁进面板矩形**再画：面板底部的快捷键提示比面板宽（248px 里
+     * 放不下「Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除」），
+     * 不裁的话它会横穿到画布上，与画布自己的提示叠字。
+     * 面板停靠换边后这条更明显：提示从左栏挪到中间列，正好压在画布提示上。
+     */
+    const HRGN layer_clip = CreateRectRgn(layout.layer_panel.x, layout.layer_panel.y,
+                                          layout.layer_panel.right(), layout.layer_panel.bottom());
+    SelectClipRgn(memory_dc, layer_clip);
     draw_layer_panel(memory_dc, shell, layout.layer_panel);
+    SelectClipRgn(memory_dc, NULL);
+    DeleteObject(layer_clip);
   }
   if (layout.adjust_panel.w > 0 && !layout.adjust_collapsed) {
+    /*
+     * 右栏裁进面板矩形（与左栏同口径）：底部快捷键提示比 330px 宽，不裁会横穿到
+     * 画布上与画布提示叠字；面板停靠换边后提示落在中间列，这条更显眼。
+     */
+    const HRGN adjust_clip = CreateRectRgn(layout.adjust_panel.x, layout.adjust_panel.y,
+                                           layout.adjust_panel.right(),
+                                           layout.adjust_panel.bottom());
+    SelectClipRgn(memory_dc, adjust_clip);
     if (shell.doc.doc_dialog != comp_ui::DocDialogKind::None) {
       draw_doc_dialog(memory_dc, shell, layout.adjust_panel);
     } else if (path_panel_visible(shell)) {
@@ -3375,6 +3569,8 @@ void present(HWND window, ShellState& shell) {
     } else {
       draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
     }
+    SelectClipRgn(memory_dc, NULL);
+    DeleteObject(adjust_clip);
   }
   /* 分界线最后画：盖在面板底色之上，1px 线才不会被面板自己的填充吃掉。 */
   draw_panel_toggles(memory_dc, shell, layout);

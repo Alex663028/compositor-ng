@@ -276,6 +276,9 @@ struct Layout {
 struct LayoutPrefs {
   /* 文档标签数（P0-3）：>= 2 时才给标签栏留 26px。 */
   int tab_count = 1;
+  /* P0-10 面板停靠边：false = 调整面板在右（默认），true = 停到左边、图层栏让位。
+   * 只换列序，不换列宽与列高——面板内容全部是按矩形画的，列序一变它们就跟着走。 */
+  bool adjust_dock_left = false;
   int layer_panel_width = Layout::kLayerPanelWidth;
   int adjust_panel_width = Layout::kAdjustPanelWidth;
   /*
@@ -302,6 +305,11 @@ inline int clamp_adjust_panel_width(int width) {
  */
 inline int layer_panel_width_from_drag(int base_width, double dx) {
   return clamp_layer_panel_width(base_width + static_cast<int>(std::lround(dx)));
+}
+
+/* 停左时的拖宽：分界线在面板右缘，往右拖 = 变宽（与停右时的方向相反）。 */
+inline int adjust_panel_width_from_drag_left(int base_width, double dx) {
+  return clamp_adjust_panel_width(base_width + static_cast<int>(std::lround(dx)));
 }
 
 inline int adjust_panel_width_from_drag(int base_width, double dx) {
@@ -366,9 +374,19 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   out.options = Rect{0, toolbar_h, width, options_h};
   out.tabbar = Rect{0, toolbar_h + options_h, width, tab_h};
   out.tab_count = tab_h > 0 ? prefs.tab_count : 0;
-  out.layer_panel = Rect{0, body_top, layer_w, body_h};
-  out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
-  out.canvas = Rect{layer_w, body_top, width - layer_w - adjust_w, body_h};
+  /*
+   * P0-10 停靠边：默认「图层左 / 调整右」；切到左侧时两列换序，画布宽度不变
+   * （两列宽度之和一样）——所以换边不会改变缩放与 pan 的基准，画面不跳。
+   */
+  if (prefs.adjust_dock_left) {
+    out.adjust_panel = Rect{0, body_top, adjust_w, body_h};
+    out.layer_panel = Rect{adjust_w, body_top, layer_w, body_h};
+  } else {
+    out.layer_panel = Rect{0, body_top, layer_w, body_h};
+    out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
+  }
+  const int canvas_x = prefs.adjust_dock_left ? adjust_w + layer_w : layer_w;
+  out.canvas = Rect{canvas_x, body_top, width - layer_w - adjust_w, body_h};
   out.status = Rect{0, body_top + body_h, width, status_h};
   out.layer_collapsed = layer_w > 0 && prefs.layer_panel_collapsed;
   out.adjust_collapsed = adjust_w > 0 && prefs.adjust_panel_collapsed;
@@ -381,7 +399,10 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
                               Layout::kPanelSplitterWidth, body_h};
   }
   if (adjust_w > 0 && !out.adjust_collapsed) {
-    out.adjust_splitter = Rect{width - adjust_w, body_top, Layout::kPanelSplitterWidth, body_h};
+    /* 停左时拖的是右缘（往右拖变宽），停右时拖的是左缘（往左拖变宽）。 */
+    const int splitter_x =
+        prefs.adjust_dock_left ? adjust_w - Layout::kPanelSplitterWidth : width - adjust_w;
+    out.adjust_splitter = Rect{splitter_x, body_top, Layout::kPanelSplitterWidth, body_h};
   }
   if (layer_w > 0) {
     out.layer_toggle = out.layer_collapsed ? out.layer_panel : panel_toggle_rect(out.layer_panel);
@@ -3106,6 +3127,13 @@ inline Rect option_group_rect(const Rect& bar, int index) {
 }
 
 /* 控件盒：标签右侧的「− 值 +」，垂直居中于整条高度（上下各留 5px 手感边距）。 */
+/* Stepper 的「数值区」：控制块去掉左右两条箭头带。直输的点击范围与红框都取它。 */
+inline Rect option_value_rect(const Rect& control) {
+  if (control.w <= 2 * kOptionArrowWidth) return Rect{};
+  return Rect{control.x + kOptionArrowWidth, control.y, control.w - 2 * kOptionArrowWidth,
+              control.h};
+}
+
 inline Rect option_control_rect(const Rect& group) {
   if (group.empty()) return Rect{};
   const int height = std::min(kOptionControlHeight, group.h - 10);
@@ -3116,8 +3144,9 @@ inline Rect option_control_rect(const Rect& group) {
 
 /*
  * 命中：返回组下标（无命中 -1），*delta 给方向（-1 / +1 / 0）。
- *   - Stepper：只有左右两个箭头响应；点在数值上不动参数（PS 里数值区是文本输入，
- *     本仓的数值编辑在右栏，横栏里误触改参数比「点了没反应」更糟）。
+ *   - Stepper：左右两条 18px 带子是 -1 / +1；**中间数值区是 0**（P0-10 数字直输）。
+ *     调用方看到 delta == 0 就进入键入态，把这一格当成文本框——与 PS 同口径。
+ *     「点了没反应」和「点一下改了数值」都不如一个明确的输入框。
  *   - Choice：整块响应，一律 direction = +1（循环到下一档）。
  */
 inline int option_hit(const Rect& bar, ToolId tool, double x, double y, int* delta) {
@@ -3141,7 +3170,8 @@ inline int option_hit(const Rect& bar, ToolId tool, double x, double y, int* del
       if (delta != nullptr) *delta = 1;
       return i;
     }
-    return -1;
+    /* 中间：数值区。delta 保持 0 = 「进入直输」。 */
+    return i;
   }
   return -1;
 }

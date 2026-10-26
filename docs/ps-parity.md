@@ -122,7 +122,7 @@ ML 类（Select Subject / Remove Background / Neural Filters）与需要第三�
 
 | 项 | 结果 |
 |---|---|
-| `scripts/build.py` | **791 例 / 0 失败**（§6.117 新增 3 例：Custom 像素 1 例 + ABI 1 例 + `ui_core` 网格 1 例；778 → 781） |
+| `scripts/build.py` | **793 例 / 0 失败**（§6.117 新增 3 例：Custom 像素 1 例 + ABI 1 例 + `ui_core` 网格 1 例；778 → 781） |
 | `scripts/run_regression.py --require-ohos` | **6/6 PASS**（781 例、壳自检、编解码、`.comp` 双向、共享构建、OHOS aarch64） |
 | 壳自检 | **270 项 failures=0**，SHA256 `93f6a4bc30d7d69c…`（2026-10-26 P0-1/P0-3 末尾追加 3 项：位深落地 / 灰阶 flatten / 标签页生命周期；前 267 行逐字节未动） 与基线逐字节一致（§6.88 追加 6 项 PSD 分层入口断言后重新生成基线，变更经显式审批；其后 §6.94～§6.109 未改自检项，§6.110～§6.113 追加 4 项——面板过滤、图层复合、智能对象/智能滤镜、填充层——基线同步到 267 项；§6.114～§6.117 未改自检项，SHA256 不变） |
 | OHOS 交叉编译 | `compile ok=121 fail=0`（回归步骤 6 rc=0 复核；121 = 118 + 3 个新翻译单元 `fill_layer.cpp`、`comp_fill_abi.cpp`、`shell_fill.cpp`；复合与智能对象写进既有文件，不增单元） |

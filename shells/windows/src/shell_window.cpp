@@ -593,6 +593,7 @@ bool client_layout(const ShellState& shell, Layout* out) {
   comp_ui::LayoutPrefs prefs;
   /* P0-3：文档标签数。1 个文档时布局不给标签栏留位，历史基线因此不动。 */
   prefs.tab_count = static_cast<int>(shell.tabs.size());
+  prefs.adjust_dock_left = shell.adjust_dock_left;
   prefs.layer_panel_width = shell.layer_panel_width;
   prefs.adjust_panel_width = shell.adjust_panel_width;
   prefs.layer_panel_collapsed = shell.layer_panel_collapsed;
@@ -637,10 +638,15 @@ void panel_resize_extend(ShellState& shell, int mouse_x) {
   if (!client_layout(shell, &before)) return;
 
   const int dx = mouse_x - shell.panel_resize_start_x;
-  const int next =
-      shell.panel_resize_target == 1
-          ? comp_ui::layer_panel_width_from_drag(shell.panel_resize_base_width, dx)
-          : comp_ui::adjust_panel_width_from_drag(shell.panel_resize_base_width, dx);
+  int next = 0;
+  if (shell.panel_resize_target == 1) {
+    next = comp_ui::layer_panel_width_from_drag(shell.panel_resize_base_width, dx);
+  } else if (shell.adjust_dock_left) {
+    /* 停左时分界线在面板右缘，往右拖 = 变宽（与停右反向）。 */
+    next = comp_ui::adjust_panel_width_from_drag_left(shell.panel_resize_base_width, dx);
+  } else {
+    next = comp_ui::adjust_panel_width_from_drag(shell.panel_resize_base_width, dx);
+  }
   const int current = shell.panel_resize_target == 1 ? shell.layer_panel_width
                                                      : shell.adjust_panel_width;
   if (next == current) return;
@@ -1021,6 +1027,30 @@ void commit_color_input(ShellState& shell) {
 }
 
 void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shift, bool alt) {
+  /*
+   * P0-10 数值直输态：只认回车 / Esc / 退格，其余键一律吞掉。
+   * 不吞的话，「输入 40」的 4 会把工具切成吸管、0 会重置画笔大小——输入框还在，
+   * 状态却已经被别的快捷键改了两轮，这种失败最难解释。
+   */
+  if (shell.option_input_active) {
+    if (key == VK_RETURN) {
+      option_input_commit(shell);
+      InvalidateRect(window, nullptr, FALSE);
+      return;
+    }
+    if (key == VK_ESCAPE) {
+      option_input_cancel(shell);
+      set_status(shell, L"已取消输入（参数未变）");
+      InvalidateRect(window, nullptr, FALSE);
+      return;
+    }
+    if (key == VK_BACK) {
+      option_input_backspace(shell);
+      InvalidateRect(window, nullptr, FALSE);
+      return;
+    }
+    return;
+  }
   /*
    * P0-1：图层名 / 不透明度键入态是最高的模态。字符本体由 WM_CHAR 送进来
    * （CJK 走 WM_IME_CHAR），这里只处理编辑键；其余按键一律吞掉，理由同其它
@@ -2712,6 +2742,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
      * 编辑键（回车/退格/Esc）仍由 WM_KEYDOWN 处理，这里把控制字符挡掉。
      */
     case WM_CHAR:
+      /* P0-10：选项栏数值区键入态。它比图层改名轻，排在改名之前不影响模态层级。 */
+      if (shell != nullptr && shell->option_input_active) {
+        option_input_char(*shell, static_cast<wchar_t>(wparam));
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
       if (shell != nullptr && shell->doc.layer_input != LayerInput::None) {
         panel_layer_input_char(*shell, static_cast<wchar_t>(wparam));
         InvalidateRect(window, nullptr, FALSE);
@@ -2803,8 +2839,15 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             int delta = 0;
             const int option =
                 comp_ui::option_hit(layout.options, shell->tool, mouse_x, mouse_y, &delta);
+            if (option >= 0 && delta == 0) {
+              /* P0-10：点在数值区 = 进入直输（左右箭头的 delta 非 0，走下面那条）。 */
+              option_input_begin(*shell, option);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
             if (option >= 0) {
               const comp_ui::ToolOptionSpec spec = comp_ui::tool_option(shell->tool, option);
+              option_input_cancel(*shell); /* 点箭头 = 放弃未提交的键入 */
               if (apply_tool_option(*shell, spec.id, delta)) {
                 wchar_t line[128];
                 wsprintfW(line, L"%s：%s", widen_ascii(spec.label).c_str(),
@@ -3904,6 +3947,32 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
       }
       /*
+       * P0-10 光标模式（十字 / 隐藏）：只作用于画布内，且排在所有特殊光标之后 ——
+       * 选区手柄、分界线、缩放假镜头压在上面时，用户需要的是「接下来会发生什么」，
+       * 而不是「我把光标调成了十字」。
+       */
+      if (shell != nullptr && LOWORD(lparam) == HTCLIENT && !shell->panning &&
+          shell->cursor_mode != 0) {
+        POINT pt{};
+        if (GetCursorPos(&pt) != 0 && ScreenToClient(window, &pt) != 0) {
+          pt.x = dpi_logical(pt.x, shell_dpi(*shell));
+          pt.y = dpi_logical(pt.y, shell_dpi(*shell));
+          Layout layout{};
+          if (client_layout(*shell, &layout) && layout.canvas.contains(pt.x, pt.y)) {
+            if (shell->cursor_mode == 2) {
+              /* 隐藏：笔尖轮廓仍然画在画布上，定位不丢。 */
+              SetCursor(nullptr);
+              return TRUE;
+            }
+            HCURSOR cursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_CROSS));
+            if (cursor != nullptr) {
+              SetCursor(cursor);
+              return TRUE;
+            }
+          }
+        }
+      }
+      /*
        * 缩放工具在画布内显示自绘放大镜（Alt 按下 = 缩小形态）；平移中保持抓手，
        * 其它区域/工具交给 DefWindowProc 维持默认光标。
        */
@@ -4849,6 +4918,16 @@ HMENU build_menu() {
    */
   AppendMenuW(view_menu, MF_STRING, kCmdHistogramToggle, L"亮度直方图(&H)\tF6");
   AppendMenuW(view_menu, MF_STRING, kCmdHistogramReset, L"直方图区间复位(&R)\t双击图内");
+  /* P0-10：光标模式（画布内生效）+ 面板停靠边。两项都是纯视图开关，不进撤销栈。 */
+  HMENU cursor_menu = CreatePopupMenu();
+  AppendMenuW(cursor_menu, MF_STRING, kCmdCursorStandard, L"标准(&N)");
+  AppendMenuW(cursor_menu, MF_STRING, kCmdCursorCross, L"十字(&C)");
+  AppendMenuW(cursor_menu, MF_STRING, kCmdCursorHidden, L"隐藏(&H)");
+  AppendMenuW(view_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(cursor_menu), L"光标(&P)");
+  HMENU dock_menu = CreatePopupMenu();
+  AppendMenuW(dock_menu, MF_STRING, kCmdPanelDockRight, L"调整面板停靠右侧(&R)");
+  AppendMenuW(dock_menu, MF_STRING, kCmdPanelDockLeft, L"调整面板停靠左侧(&L)");
+  AppendMenuW(view_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(dock_menu), L"面板停靠(&D)");
   /*
    * §5.43 面板整块收起：F7 / F8 与 PS 同键位（Layers / Adjustments）。勾选态 =
    * 已收起，菜单里一眼能看出哪块现在是竖条。

@@ -400,6 +400,12 @@ constexpr UINT kCmdCloseDocument = 1734; /* 文件 > 关闭文档（Ctrl+W） */
 constexpr UINT kCmdNextTab = 1735;       /* 下一个文档（Ctrl+Tab） */
 constexpr UINT kCmdPrevTab = 1736;       /* 上一个文档（Ctrl+Shift+Tab） */
 constexpr UINT kCmdRecent = 1737;        /* 文件 > 最近打开…（Ctrl+Alt+O） */
+/* P0-10 界面基线 */
+constexpr UINT kCmdCursorStandard = 1738; /* 光标：标准 */
+constexpr UINT kCmdCursorCross = 1739;    /* 光标：十字 */
+constexpr UINT kCmdCursorHidden = 1740;   /* 光标：隐藏 */
+constexpr UINT kCmdPanelDockRight = 1741; /* 调整面板停靠右侧（默认） */
+constexpr UINT kCmdPanelDockLeft = 1742;  /* 调整面板停靠左侧 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*
@@ -905,6 +911,28 @@ struct ShellState {
   /* P0-1：新建面板的「记住上次设置」——与尺寸/分辨率/背景同一口径。 */
   int new_doc_pixel_format = 0;
   int new_doc_color_mode = 0;
+  /*
+   * P0-10 数字直输：点选项栏的数值区进入键入态。放会话态而不是文档态——
+   * 它改的是工具参数（跨文档保留），换标签不该把半截输入带走。
+   */
+  /*
+   * P0-10 光标模式：0 = 标准（画布内用系统箭头，笔尖轮廓由画布叠加层画）、
+   * 1 = 十字（大面积涂抹时看得见落点、又不会被箭头挡住像素）、2 = 隐藏
+   * （画笔预览已经足够定位时用）。只改画布内的光标，面板/工具条不受影响。
+   */
+  int cursor_mode = 0;
+  /* P0-10 面板停靠边：false = 调整面板在右，true = 停到左侧。 */
+  bool adjust_dock_left = false;
+  bool option_input_active = false;
+  int option_input_index = -1;  /* 组序号，绘制时用来判断哪一格画输入框 */
+  comp_ui::ToolOptionId option_input_id = comp_ui::ToolOptionId::None;
+  std::wstring option_input;    /* 键入缓冲（ASCII 数字） */
+  /*
+   * true = 缓冲里还是「点开时的旧值」，用户还没动过手。第一个数字键进来时把
+   * 旧值整段替换掉（PS 的做法是全选后输入）。没有这个标志的话，点开就是
+   * 「24」+ 敲「8」= 「248」——想改小得先按十几次退格。
+   */
+  bool option_input_fresh = true;
   bool camera_raw_tables_loaded = false;
   std::wstring window_title_cache;
   comp_ui::ColorRGB foreground{};

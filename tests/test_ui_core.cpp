@@ -414,7 +414,13 @@ COMP_TEST(ui_core_tool_options_bar) {
   COMP_CHECK(control.y >= group0.y && control.bottom() <= group0.bottom());
   COMP_CHECK(comp_ui::option_control_rect(comp_ui::Rect{}).empty());
 
-  /* 命中：Stepper 只有两侧箭头响应，数值区点了不动参数；Choice 整块响应。 */
+  /*
+   * 命中：Stepper 两侧箭头 = -1 / +1，**数值区 = 0**（P0-10 数字直输的入口）；
+   * Choice 整块响应。
+   *
+   * 这一条的旧口径是「数值区点了不动参数」（返回 -1）——P0-10 把它改成输入框，
+   * 所以断言跟着改；两侧箭头与 Choice 的行为一字未动。
+   */
   int delta = 99;
   const double mid_y = static_cast<double>(control.y + control.h / 2);
   COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.x + 4.0, mid_y, &delta) == 0);
@@ -424,8 +430,8 @@ COMP_TEST(ui_core_tool_options_bar) {
   COMP_CHECK(delta == 1);
   delta = 99;
   COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, control.x + control.w * 0.5, mid_y,
-                                 &delta) == -1);
-  COMP_CHECK(delta == 0);
+                                 &delta) == 0);
+  COMP_CHECK(delta == 0); /* 数值区：进键入态 */
   COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Brush, group0.right() + 4.0, mid_y, &delta) ==
              -1);
   COMP_CHECK(comp_ui::option_hit(bar, comp_ui::ToolId::Hand, control.x + 4.0, mid_y, &delta) == -1);
@@ -5065,3 +5071,86 @@ COMP_TEST(ui_core_rulers_and_snap_tolerance) {
                         400.0));
 }
 
+
+/*
+ * P0-3 标签栏 + P0-10 面板停靠：布局不变量。
+ *
+ * 这两条动的都是**全局布局**，一个写错就是「画布被面板压住」或「标签栏压住
+ * 画布」，所以几何关系必须钉死，而不是靠目视。
+ */
+COMP_TEST(ui_core_tabbar_and_dock_layout) {
+  /* 1. 单文档：标签栏高度 0，历史基线一个像素不动。 */
+  comp_ui::LayoutPrefs single;
+  single.tab_count = 1;
+  const comp_ui::Layout one = comp_ui::compute_layout(1280, 720, single);
+  COMP_CHECK(one.tabbar.h == 0);
+  COMP_CHECK(one.tab_count == 0);
+  COMP_CHECK(one.canvas.h == comp_ui::compute_layout(1280, 720).canvas.h);
+
+  /* 2. 多文档：标签栏占 26px，画布高度相应变矮，且标签栏在选项栏之下。 */
+  comp_ui::LayoutPrefs multi;
+  multi.tab_count = 3;
+  const comp_ui::Layout three = comp_ui::compute_layout(1280, 720, multi);
+  COMP_CHECK(three.tabbar.h == comp_ui::Layout::kTabBarHeight);
+  COMP_CHECK(three.tab_count == 3);
+  COMP_CHECK(three.tabbar.y == three.options.bottom());
+  COMP_CHECK(three.canvas.y == three.tabbar.bottom());
+  COMP_CHECK(three.canvas.h == one.canvas.h - comp_ui::Layout::kTabBarHeight);
+
+  /* 3. 标签矩形：等宽、互不重叠、全在标签栏内；命中与几何同源。 */
+  for (int index = 0; index < 3; ++index) {
+    const comp_ui::Rect tab = comp_ui::tab_rect(three, index, 3);
+    COMP_CHECK(tab.w > 0);
+    COMP_CHECK(tab.x >= three.tabbar.x && tab.right() <= three.tabbar.right());
+    COMP_CHECK(comp_ui::tab_at(three, 3, tab.x + 1, tab.y + 2) == index);
+  }
+  COMP_CHECK(comp_ui::tab_rect(three, 3, 3).w == 0);
+  COMP_CHECK(comp_ui::tab_at(three, 3, -5, 10) == -1);
+  /* 标签栏之外（画布区）不命中。 */
+  COMP_CHECK(comp_ui::tab_at(three, 3, three.canvas.x + 10, three.canvas.y + 10) == -1);
+
+  /* 4. 停靠换边：两列交换位置，但画布宽度与位置不变（换边不该让画面跳）。 */
+  comp_ui::LayoutPrefs left;
+  left.adjust_dock_left = true;
+  const comp_ui::Layout docked = comp_ui::compute_layout(1280, 720, left);
+  const comp_ui::Layout normal = comp_ui::compute_layout(1280, 720);
+  COMP_CHECK(docked.adjust_panel.x == 0);
+  COMP_CHECK(docked.layer_panel.x == docked.adjust_panel.right());
+  /* 画布**宽度**不变（两列宽度之和一样），但横向位置随列序移动——
+   * 换边必然移动画布，否则面板会压到画布上。 */
+  COMP_CHECK(docked.canvas.w == normal.canvas.w);
+  COMP_CHECK(docked.canvas.x == docked.layer_panel.right());
+  COMP_CHECK(docked.canvas.x > normal.canvas.x);
+  /* 停左时分界线在面板**右**缘，停右时在左缘。 */
+  COMP_CHECK(docked.adjust_splitter.right() <= docked.adjust_panel.right());
+  COMP_CHECK(normal.adjust_splitter.x >= normal.adjust_panel.x);
+  COMP_CHECK(docked.adjust_splitter.x != normal.adjust_splitter.x);
+}
+
+/*
+ * P0-10 数字直输：选项栏的命中分区。
+ *   左右箭头 = -1 / +1；中间数值区 = 0（进入键入态）。
+ */
+COMP_TEST(ui_core_option_value_area_hit) {
+  const comp_ui::Rect bar{0, 46, 600, 32};
+  const comp_ui::ToolId brush = comp_ui::ToolId::Brush;
+  const int count = comp_ui::tool_option_count(brush);
+  COMP_CHECK(count > 0);
+  const comp_ui::Rect group = comp_ui::option_group_rect(bar, 0);
+  const comp_ui::Rect control = comp_ui::option_control_rect(group);
+  COMP_CHECK(control.w > 0);
+
+  int delta = 99;
+  const int left_hit = comp_ui::option_hit(bar, brush, control.x + 2, control.y + 4, &delta);
+  COMP_CHECK(left_hit == 0 && delta == -1);
+  delta = 99;
+  const int right_hit = comp_ui::option_hit(bar, brush, control.right() - 2, control.y + 4, &delta);
+  COMP_CHECK(right_hit == 0 && delta == 1);
+  delta = 99;
+  const int mid_hit = comp_ui::option_hit(bar, brush, control.x + control.w / 2, control.y + 4, &delta);
+  COMP_CHECK(mid_hit == 0 && delta == 0);
+  /* 数值区几何必须落在控制块内部（绘制高亮与命中同一处）。 */
+  const comp_ui::Rect field = comp_ui::option_value_rect(control);
+  COMP_CHECK(field.x > control.x && field.right() < control.right());
+  COMP_CHECK(field.h == control.h);
+}

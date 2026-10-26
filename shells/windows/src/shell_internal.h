@@ -768,6 +768,14 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptionSpec& spec);
   bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta);
+  /* P0-10 数字直输：数值区的当前整数值 / 直接写值 / 键入态三件套。 */
+  int option_value_number(const ShellState& shell, comp_ui::ToolOptionId id);
+  bool set_tool_option_value(ShellState& shell, comp_ui::ToolOptionId id, int value);
+  void option_input_begin(ShellState& shell, int index);
+  void option_input_char(ShellState& shell, wchar_t character);
+  void option_input_backspace(ShellState& shell);
+  void option_input_commit(ShellState& shell);
+  void option_input_cancel(ShellState& shell);
   void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   /* P0-3：文档标签栏（只在多文档时出现，布局已保证 tabbar.h > 0）。 */
   void draw_tab_bar(HDC dc, const ShellState& shell, const Layout& layout);

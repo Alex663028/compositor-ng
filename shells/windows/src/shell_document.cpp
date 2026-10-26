@@ -2222,6 +2222,27 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdRecent:
       doc_dialog_begin(shell, comp_ui::DocDialogKind::RecentFiles);
       break;
+    /* ---- P0-10：光标模式与面板停靠（纯视图开关，不进撤销栈） ---- */
+    case kCmdCursorStandard:
+      shell.cursor_mode = 0;
+      set_status(shell, L"光标：标准");
+      break;
+    case kCmdCursorCross:
+      shell.cursor_mode = 1;
+      set_status(shell, L"光标：十字（画布内）");
+      break;
+    case kCmdCursorHidden:
+      shell.cursor_mode = 2;
+      set_status(shell, L"光标：隐藏（笔尖轮廓仍然可见）");
+      break;
+    case kCmdPanelDockRight:
+      shell.adjust_dock_left = false;
+      set_status(shell, L"调整面板已停靠右侧");
+      break;
+    case kCmdPanelDockLeft:
+      shell.adjust_dock_left = true;
+      set_status(shell, L"调整面板已停靠左侧");
+      break;
     /* ---- 图像 > 图像大小… / 画布大小…（对应上游 Image Size / Canvas Size） ---- */
     case kCmdImageSize:
       doc_dialog_begin(shell, comp_ui::DocDialogKind::ImageSize);
