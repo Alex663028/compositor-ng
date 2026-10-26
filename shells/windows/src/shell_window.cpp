@@ -2899,6 +2899,48 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             return 0;
           }
           /*
+           * P0-10 分组标签栏：点标签切换该列显示哪块面板。
+           * 必须先于面板内容命中——标签栏在面板内容矩形**之上**
+           * （内容矩形已经下移让开了它），两者不重叠，但顺序固定下来
+           * 免得以后改布局时踩坑。
+           */
+          if (layout.group_bar.w > 0) {
+            const int tab = comp_ui::group_tab_at(layout.group_bar, layout.group_count,
+                                                  mouse_x, mouse_y);
+            if (tab >= 0) {
+              panel_group_select(*shell, panel_group_side(*shell), tab);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
+          /*
+           * P0-10 拖出：按住面板**标题行**往外拖，越过阈值就浮成独立窗口
+           *（PS 的习惯动作）。必须在分界线之后、面板行之前——标题行与分界
+           * 线不重叠，但收起态下整条 24px 竖条都是标题行区域。
+           *
+           * 按下先只记「可能拖出」，不立刻浮窗：手抖 1px 不该凭空多一个窗口。
+           * 真正的浮窗在 WM_MOUSEMOVE 越过阈值时才建。
+           */
+          {
+            const int title_bottom = comp_ui::kLayerHeaderHeight;
+            const bool on_adjust_title =
+                layout.adjust_panel.w > 0 && mouse_y >= layout.adjust_panel.y &&
+                mouse_y < layout.adjust_panel.y + title_bottom &&
+                mouse_x >= layout.adjust_panel.x && mouse_x < layout.adjust_panel.right();
+            const bool on_layer_title =
+                layout.layer_panel.w > 0 && mouse_y >= layout.layer_panel.y &&
+                mouse_y < layout.layer_panel.y + title_bottom &&
+                mouse_x >= layout.layer_panel.x && mouse_x < layout.layer_panel.right();
+            if (on_adjust_title || on_layer_title) {
+              const comp_dock::PanelId id = on_adjust_title ? comp_dock::PanelId::Adjust
+                                                            : comp_dock::PanelId::Layers;
+              float_panel_begin_tear(*shell, id, mouse_x, mouse_y);
+              SetCapture(window);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
+          }
+          /*
            * 命中图层行：row_top 与 draw_layer_panel 共用同一个直方图偏移量。
            * 两处各写一个常量迟早不一致，而症状是「点不中要的那层」——不报错、
            * 只在面板开着直方图时偶现，极难复现。
@@ -3184,6 +3226,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       /* §6.60 面板分界线松手：宽度已在拖动中实时生效，这里只收尾捕获与状态栏。 */
       if (shell != nullptr && shell->panel_resize_target != 0) {
         panel_resize_end(*shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /*
+       * P0-10 拖出松手：落点在边缘热区就停回那侧，否则保持浮动。
+       * 必须排在分界线之后（两者都持有捕获），且早于面板拖动收尾
+       * （拖出期间没有面板内部的拖动状态，但顺序固定下来免得以后加东西时踩坑）。
+       */
+      if (shell != nullptr && shell->tear_panel != comp_dock::PanelId::Count) {
+        ReleaseCapture();
+        float_panel_tear_end(*shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
@@ -3507,6 +3560,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             panel_resize_extend(*shell, mouse_x);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          /*
+           * P0-10 拖出推进：按住标题行往外拖，越过阈值就浮成独立窗口并跟随指针。
+           * 必须排在分界线拖动之后——两者都在「按住面板」这一状态下发生，
+           * 但分界线命中带在面板**内侧**，标题行在顶部，两者不重叠。
+           */
+          if (shell->tear_panel != comp_dock::PanelId::Count) {
+            if (float_panel_tear_move(*shell, mouse_x, mouse_y)) {
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
           }
           /*
            * 分界线悬停高亮：5px 窄带 + 1px 分隔线，没有高亮用户找不到可拖的地方。
@@ -3972,11 +4036,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
       /* P0-10：退出前把停靠状态存回 workspace（下次启动沿用）。 */
       if (shell != nullptr) workspace_save(*shell);
-      /* 浮动面板是独立窗口：主窗口没了它必须一起走，否则会留一个孤儿窗口。 */
-      if (shell != nullptr && shell->float_window != nullptr) {
-        HWND float_window = shell->float_window;
-        shell->float_window = nullptr;
-        DestroyWindow(float_window);
+      /*
+       * 浮动面板是独立窗口：主窗口没了它必须一起走，否则会留一个孤儿窗口。
+       * 多块面板可同时浮动，逐块带走。
+       */
+      if (shell != nullptr) {
+        for (int i = 0; i < static_cast<int>(comp_dock::PanelId::Count); ++i) {
+          HWND float_window = shell->float_windows[i];
+          if (float_window == nullptr) continue;
+          shell->float_windows[i] = nullptr;
+          DestroyWindow(float_window);
+        }
       }
       PostQuitMessage(0);
       return 0;
@@ -4374,6 +4444,14 @@ HMENU build_menu() {
   AppendMenuW(float_menu, MF_STRING, kCmdFloatAdjust, L"调整面板(&A)");
   AppendMenuW(float_menu, MF_STRING, kCmdFloatLayers, L"图层面板(&L)");
   AppendMenuW(view_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(float_menu), L"浮动面板(&F)");
+  /*
+   * 面板分组（tab strip）：两块面板合并到同一列，列顶出现标签栏切换。
+   * 与 photocraft 的 craft-ui 同一结构（group + tab strip）。
+   */
+  HMENU group_menu = CreatePopupMenu();
+  AppendMenuW(group_menu, MF_STRING, kCmdPanelGroupMerge, L"合并成一组(&M)");
+  AppendMenuW(group_menu, MF_STRING, kCmdPanelGroupSplit, L"拆开分组(&S)");
+  AppendMenuW(view_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(group_menu), L"面板分组(&G)");
   /*
    * §5.43 面板整块收起：F7 / F8 与 PS 同键位（Layers / Adjustments）。勾选态 =
    * 已收起，菜单里一眼能看出哪块现在是竖条。

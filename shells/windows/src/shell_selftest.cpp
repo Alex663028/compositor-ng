@@ -2765,6 +2765,146 @@ int run_selftest(const wchar_t* out_path) {
     std::filesystem::remove(path, ignored);
     verify(ok, "P0-10 dock workspace round trip (width / collapsed / side)");
   }
+  {
+    /*
+     * P0-10 拖出停靠（一）：多块面板可**同时**浮动。
+     *
+     * 此前 dock 的不变式是「至多一块浮动」，理由是「两块都浮要两套命中与焦点
+     * 通路」。这条理由站不住：浮动窗口过程从 GWLP_USERDATA 取自己的 PanelId，
+     * 命中层是无状态函数，键盘统一转发主窗口。第二块浮动并不需要第二套通路。
+     *
+     * 这里钉的是三件事：
+     *   1. 两块都浮起来时，主窗口**一块都不留位**（画布因此变宽到极限）；
+     *   2. 停回一块，另一块仍在浮动（互不影响）；
+     *   3. 停回时回到各自的原位（不是都挤到右边）。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    dock.float_panel(comp_dock::PanelId::Adjust, 100, 120, 330, 560);
+    dock.float_panel(comp_dock::PanelId::Layers, 500, 140, 248, 480);
+    comp_ui::LayoutPrefs prefs{};
+    dock.apply_to(prefs);
+    const bool both_float = dock.floating_count() == 2 && !prefs.adjust_docked &&
+                            !prefs.layer_docked;
+    /* 停回一块：另一块仍在浮动。 */
+    dock.dock_panel(comp_dock::PanelId::Adjust);
+    comp_ui::LayoutPrefs after_one{};
+    dock.apply_to(after_one);
+    const bool one_left = dock.floating_count() == 1 && dock.is_floating(comp_dock::PanelId::Layers) &&
+                          after_one.adjust_docked && !after_one.layer_docked;
+    /* 停回原位：调整回右、图层回左（各自浮起来之前的位置）。 */
+    dock.dock_panel(comp_dock::PanelId::Layers);
+    const bool back_home = dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Right &&
+                           dock.area_of(comp_dock::PanelId::Layers) == comp_dock::DockArea::Left &&
+                           dock.floating_count() == 0;
+    verify(both_float && one_left && back_home,
+           "P0-10 dock state: two panels float at once / dock one keeps the other / each docks home");
+  }
+  {
+    /*
+     * P0-10 拖出停靠（二）：落点热区判定。
+     *
+     * 拖出来松手时，落在主窗口左边缘 → 停到左侧；右边缘 → 停到右侧；
+     * 画布中间 → **保持浮动**（拖出来就是要它浮着）；窗口外 → 保持浮动。
+     * 这条判定是纯函数，所以可以直接测，不必开窗口。
+     */
+    comp_dock::DropGeometry geo{};
+    geo.client_w = 1000;
+    geo.client_h = 700;
+    geo.edge_width = 48;
+    const bool left_hot = comp_dock::drop_zone_at(geo, 10, 300) == comp_dock::DropZone::Left;
+    const bool right_hot = comp_dock::drop_zone_at(geo, 980, 300) == comp_dock::DropZone::Right;
+    const bool middle_body = comp_dock::drop_zone_at(geo, 500, 300) == comp_dock::DropZone::Body;
+    const bool outside = comp_dock::drop_zone_at(geo, 1200, 300) == comp_dock::DropZone::None;
+    const bool above = comp_dock::drop_zone_at(geo, 10, -5) == comp_dock::DropZone::None;
+    const bool docks_left = comp_dock::drop_zone_docks_left(comp_dock::DropZone::Left) &&
+                            !comp_dock::drop_zone_docks_left(comp_dock::DropZone::Right) &&
+                            !comp_dock::drop_zone_docks_left(comp_dock::DropZone::Body);
+    verify(left_hot && right_hot && middle_body && outside && above && docks_left,
+           "P0-10 dock drop zones: left/right edge hot zones / body keeps floating / outside ignored");
+  }
+  {
+    /*
+     * P0-10 拖出停靠（三）：浮窗几何随窗口位置/尺寸变化写回 dock 状态。
+     *
+     * 这条链路是 workspace 存读的基础：存的是浮窗几何，重启要按同样的
+     * 几何把浮窗开回来。状态机侧只验「写回接口不丢字段」。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    dock.float_panel(comp_dock::PanelId::Adjust, 1440, 220, 320, 540);
+    const comp_dock::PanelState& state = dock.panel(comp_dock::PanelId::Adjust);
+    const bool ok = state.float_x == 1440 && state.float_y == 220 && state.float_w == 320 &&
+                    state.float_h == 540 && dock.is_floating(comp_dock::PanelId::Adjust);
+    verify(ok, "P0-10 float geometry round trip (x / y / width / height kept in dock state)");
+  }
+  {
+    /*
+     * P0-10 面板分组（tab strip）：两块面板合并到同一列 = 一组。
+     *
+     * 单一真源的体现：**分组关系由 panels[].area 推导**，不另存成员列表。
+     * 所以这里能直接断言「两块同列 = 组内两块」，也能断言「浮走一块 = 组解散」。
+     *
+     * 四件事各自会坏：
+     *   1. 合并后组内两块、标签栏出现（count=2）；
+     *   2. 合并后主窗口只占**一列**（另一列让位，画布因此变宽）；
+     *   3. 切标签不改变列宽（宽度属于列，不属于成员）；
+     *   4. 拆开后回到「各占一列」。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    /* 合并：图层栏挪到调整栏那一列（都在右 = 一组）。 */
+    dock.group_move(comp_dock::PanelId::Layers, comp_dock::DockArea::Right);
+    const bool merged = dock.group_count(comp_dock::DockArea::Right) == 2 &&
+                        dock.group_count(comp_dock::DockArea::Left) == 0;
+    comp_ui::LayoutPrefs prefs{};
+    dock.apply_to(prefs);
+    /* 组模式下布局只占一列：画布因此变宽到只剩组那一列。 */
+    comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, prefs);
+    const bool one_column = layout.group_count == 2 && layout.group_bar.h > 0 &&
+                            (layout.layer_panel.w == 0 || layout.adjust_panel.w == 0);
+    /* 切标签不改变列宽：宽度存在列上。 */
+    dock.set_group_width(comp_dock::DockArea::Right, 360);
+    comp_ui::LayoutPrefs after_width{};
+    dock.apply_to(after_width);
+    const int width_before = after_width.adjust_panel_width;
+    dock.group_set_active(comp_dock::DockArea::Right, 1);
+    comp_ui::LayoutPrefs after_switch{};
+    dock.apply_to(after_switch);
+    const bool width_stable = after_switch.adjust_panel_width == width_before &&
+                              dock.group_active_panel(comp_dock::DockArea::Right) ==
+                                  comp_dock::PanelId::Layers;
+    /* 拆开：两块各占一列，标签栏消失。 */
+    dock.group_ungroup(comp_dock::PanelId::Layers);
+    const bool split = dock.group_count(comp_dock::DockArea::Right) == 1 &&
+                       dock.group_count(comp_dock::DockArea::Left) == 1;
+    comp_ui::LayoutPrefs after_split{};
+    dock.apply_to(after_split);
+    comp_ui::Layout split_layout = comp_ui::compute_layout(1280, 720, after_split);
+    const bool no_bar = split_layout.group_bar.h == 0;
+    verify(merged && one_column && width_stable && split && no_bar,
+           "P0-10 panel group: merge into one column / tab strip shows / width stable / split back");
+  }
+  {
+    /*
+     * P0-10 分组的几何：标签栏与内容矩形。
+     *
+     * 标签栏**不占列宽**——它把面板内容矩形整体下移一行。列宽是用户拖出来的
+     * 偏好，若标签栏挤占列宽，分组瞬间画布宽度就会跳一下。
+     */
+    const comp_ui::Rect column{100, 50, 300, 600};
+    const comp_ui::Rect bar = comp_ui::group_bar_rect(column, 2);
+    const comp_ui::Rect content = comp_ui::group_content_rect(column, 2);
+    const bool same_width = bar.w == column.w && content.w == column.w;
+    const bool shifted = bar.y == column.y && content.y == column.y + bar.h &&
+                         content.bottom() == column.bottom();
+    /* 未分组时标签栏高度为 0，内容矩形就是原矩形。 */
+    const comp_ui::Rect plain_bar = comp_ui::group_bar_rect(column, 1);
+    const comp_ui::Rect plain_content = comp_ui::group_content_rect(column, 1);
+    /* 命中：点在标签上返回下标，点在栏**下方**（面板内容区）返回 -1。 */
+    const int hit = comp_ui::group_tab_at(bar, 2, 120, 55);
+    const int miss = comp_ui::group_tab_at(bar, 2, 120, bar.bottom() + 5);
+    verify(same_width && shifted && plain_bar.h == 0 && plain_content.y == column.y && hit >= 0 &&
+               miss < 0,
+           "P0-10 group bar geometry: bar does not eat column width / content shifts down / hit test");
+  }
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

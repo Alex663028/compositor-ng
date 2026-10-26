@@ -409,6 +409,9 @@ constexpr UINT kCmdPanelDockRight = 1741; /* 调整面板停靠右侧（默认�
 constexpr UINT kCmdPanelDockLeft = 1742;  /* 调整面板停靠左侧 */
 constexpr UINT kCmdFloatAdjust = 1743;    /* 浮动/停回 调整面板 */
 constexpr UINT kCmdFloatLayers = 1744;    /* 浮动/停回 图层面板 */
+/* P0-10 面板分组（tab strip）：两块面板合并到一列 / 拆开回各占一列 */
+constexpr UINT kCmdPanelGroupMerge = 1745; /* 合并成一组 */
+constexpr UINT kCmdPanelGroupSplit = 1746; /* 拆开分组 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*
@@ -945,9 +948,27 @@ struct ShellState {
    * （浮动）就要再散一层；收进一个状态机之后，窗口只负责「把状态画出来」。
    */
   comp_dock::DockState dock;
-  /* P0-10 浮动面板窗口（至多一个；dock 的不变式就是「至多一块浮动」）。 */
-  HWND float_window = nullptr;
-  comp_dock::PanelId float_panel = comp_dock::PanelId::Adjust;
+  /*
+   * P0-10 浮动面板窗口：**每块面板各一个**独立浮窗（2026-10-26 起放开「至多一块」）。
+   * 索引 = comp_dock::PanelId 的整数值；nullptr = 该面板没浮在外面。
+   *
+   * 此前是「一个 HWND + 一个 PanelId」，因为当时认定「两块都浮要两套命中与焦点
+   * 通路」。实际不需要：浮动窗口过程从 GWLP_USERDATA 取自己的 PanelId，命中层
+   * 是无状态函数（shell_panel_hit），键盘转发给主窗口即可。按面板索引存句柄
+   * 之后，「谁浮在外面」这件事不再有全局单例约束。
+   */
+  HWND float_windows[static_cast<int>(comp_dock::PanelId::Count)] = {nullptr, nullptr};
+  /*
+   * 拖出状态：按住面板标题行往外拖，越过阈值就浮成独立窗口。
+   * tear_panel = Count 表示当前没有拖出动作。
+   */
+  comp_dock::PanelId tear_panel = comp_dock::PanelId::Count;
+  int tear_grab_x = 0;
+  int tear_grab_y = 0;
+  int tear_last_x = 0;
+  int tear_last_y = 0;
+  bool tear_active = false;
+  bool tear_moved = false;
   int panel_resize_target = 0;
   int panel_resize_base_width = 0;
   int panel_resize_start_x = 0;

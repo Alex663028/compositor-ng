@@ -9,6 +9,7 @@
  */
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -226,6 +227,93 @@ COMP_TEST(codec_png_import_layer_appends_layer) {
   size_t after = 0;
   COMP_CHECK(comp_layer_count(target, &after) == COMP_OK);
   COMP_CHECK_MSG(after == before + 1u, "import_layer appends exactly one layer");
+
+  comp_document_destroy(target);
+  comp_engine_destroy(engine);
+}
+
+COMP_TEST(codec_import_layer_pixels_are_the_imported_ones) {
+  /*
+   * P1-2 剩余项（鸿蒙壳「打开图片」的引擎侧保证）：
+   * 导入的图层必须**像素正确**，不只是「多了一个图层」。
+   *
+   * 为什么单独钉这条：此前 codec_import_layer_appends_layer 只验了图层数，
+   * 「图层数对了但像素是空的 / 是背景层的 / 是上一次导入的」这类缺陷
+   * 全部能溜过去。鸿蒙壳靠这条导出真实照片给人看——像素错了等于功能没做。
+   *
+   * 源图故意用**非对称**图案（左上红、右下绿、其余蓝）：对称图案里
+   * 「整体转置」「整体镜像」这类错误会因像素相同而蒙混过关。
+   */
+  comp_engine_desc desc = codec_engine_desc();
+  comp_engine engine = nullptr;
+  COMP_CHECK(comp_engine_create(&desc, &engine) == COMP_OK);
+
+  const std::string path = codec_workspace_file("pixels_source.png");
+  const int32_t side = 8;
+  std::vector<uint8_t> source_pixels(static_cast<size_t>(side) * side * 4u, 0u);
+  for (int32_t y = 0; y < side; ++y) {
+    for (int32_t x = 0; x < side; ++x) {
+      const size_t index = (static_cast<size_t>(y) * side + x) * 4u;
+      if (x < side / 2 && y < side / 2) {
+        source_pixels[index + 0] = 255; /* 左上：红 */
+        source_pixels[index + 3] = 255;
+      } else if (x >= side / 2 && y >= side / 2) {
+        source_pixels[index + 1] = 255; /* 右下：绿 */
+        source_pixels[index + 3] = 255;
+      } else {
+        source_pixels[index + 2] = 255; /* 其余：蓝 */
+        source_pixels[index + 3] = 255;
+      }
+    }
+  }
+  {
+    comp_document_desc source_desc{};
+    source_desc.width = side;
+    source_desc.height = side;
+    comp_document source = nullptr;
+    COMP_CHECK(comp_document_create(engine, &source_desc, &source) == COMP_OK);
+    comp_image image{};
+    image.width = side;
+    image.height = side;
+    image.format = COMP_PIXEL_RGBA8;
+    image.stride = 4u * static_cast<size_t>(side);
+    image.pixels = source_pixels.data();
+    comp_layer_id first = 0;
+    size_t count = 0;
+    COMP_CHECK(comp_layer_list(source, &first, 1u, &count) == COMP_OK);
+    COMP_CHECK(comp_layer_set_pixels(source, first, &image) == COMP_OK);
+    COMP_CHECK(comp_io_export(source, path.c_str(), COMP_FORMAT_PNG, nullptr) == COMP_OK);
+    comp_document_destroy(source);
+  }
+
+  comp_document_desc target_desc{};
+  target_desc.width = side;
+  target_desc.height = side;
+  comp_document target = nullptr;
+  COMP_CHECK(comp_document_create(engine, &target_desc, &target) == COMP_OK);
+
+  comp_layer_id added = 0;
+  COMP_CHECK_MSG(comp_io_import_layer(target, path.c_str(), &added) == COMP_OK,
+                 "comp_io_import_layer(png)");
+
+  /* 读回导入图层的像素，逐字节与源比对。 */
+  std::vector<uint8_t> read_back(static_cast<size_t>(side) * side * 4u, 0u);
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  COMP_CHECK(comp_layer_get_pixels(target, added, read_back.data(),
+                                   4u * static_cast<size_t>(side), &width, &height,
+                                   &format) == COMP_OK);
+  COMP_CHECK_MSG(width == side && height == side, "imported layer keeps the image size");
+  COMP_CHECK_MSG(format == COMP_PIXEL_RGBA8, "imported layer is RGBA8");
+
+  int32_t worst = 0;
+  for (size_t index = 0; index < source_pixels.size(); ++index) {
+    const int delta = std::abs(static_cast<int>(read_back[index]) -
+                               static_cast<int>(source_pixels[index]));
+    if (delta > worst) worst = delta;
+  }
+  COMP_CHECK_MSG(worst == 0, "imported pixels match the source byte for byte");
 
   comp_document_destroy(target);
   comp_engine_destroy(engine);

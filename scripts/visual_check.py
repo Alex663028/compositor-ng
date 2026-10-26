@@ -134,6 +134,14 @@ OPTION_LABEL_W = 56
 OPTION_ARROW_W = 18
 OPTION_VALUE_W = 54
 OPTION_CONTROL_H = 22
+# P0-10 面板分组（tab strip）：标签栏高度与标签最小宽（与 ui_core 同值）。
+GROUP_BAR_H = 22
+GROUP_TAB_MIN_W = 56
+# 面板分组 / 浮动的命令号（与 shell_state.h 同值）。
+CMD_PANEL_GROUP_MERGE = 1745
+CMD_PANEL_GROUP_SPLIT = 1746
+CMD_FLOAT_ADJUST = 1743
+CMD_FLOAT_LAYERS = 1744
 
 # ui_core.h 的配色（断言用真值）
 COL_TOOLBAR_BG = (44, 46, 52)
@@ -3741,6 +3749,102 @@ def scene_layer_style_paste(shell, checker):
                   "画布差异像素 %d" % undo_delta)
 
 
+def scene_panel_group(shell, checker):
+    """P0-10 面板分组（tab strip）：两块面板合并到一列，列顶标签栏切换。
+
+    这条功能有三个各自会坏的环节，逐个量：
+      1. **合并**：合并后左栏消失（两块住进右列），列顶出现标签栏；
+         标签栏**不占列宽**——否则画布宽度会跳一下。
+      2. **切标签**：点第二个标签，当前列显示的面板内容换掉（用面板底色判别：
+         图层栏底色 (24,26,30) 与调整栏底色 (22,24,28) 不同）。
+      3. **拆开**：拆开后标签栏消失，左右两栏各归其位（与合并前逐像素相同）。
+    """
+    scene = "panel_group"
+    layer = shell.layout["layer"]
+    adjust = shell.layout["adjust"]
+    # 合并前的两栏底色采样点（面板内容区靠左上的位置，避开标题行与控件）。
+    layer_probe = (layer[0] + 40, layer[1] + 60)
+    adjust_probe = (adjust[0] + 40, adjust[1] + 60)
+
+    base = shell.shot("153_group_before")
+    checker.check(scene, "合并前两栏都在（左栏图层 / 右栏调整）",
+                  layer[2] - layer[0] > 0 and adjust[2] - adjust[0] > 0,
+                  "layer=%s adjust=%s" % (layer, adjust))
+
+    # ---- 合并 ----
+    shell.command(CMD_PANEL_GROUP_MERGE)
+    shell.wait(0.3)
+    merged = shell.shot("154_group_merged")
+    checker.check(scene, "合并后左栏让位（两块住进同一列，画布变宽）",
+                  near(mean_rgb(merged, (2, adjust[1] + 60, 6, adjust[1] + 70)),
+                       COL_APP_BG, 10),
+                  "左栏位置实测 %s" %
+                  (mean_rgb(merged, (2, adjust[1] + 60, 6, adjust[1] + 70)),))
+
+    # 标签栏：合并后列顶有一条 22px 高的带。判据用**激活标签的顶部 2px
+    # 强调线**（110,160,235）——它只在激活标签上出现，颜色唯一，不会与
+    # 面板底色或文字混淆。用「整条标签栏的平均色」判定不可靠：激活标签的
+    # 底色 (52,60,74) 会把均值拉偏。
+    tab_w = (adjust[2] - adjust[0]) // 2
+    first_accent = count_matching(merged, (adjust[0] + 4, adjust[1],
+                                            adjust[0] + tab_w - 4, adjust[1] + 3),
+                                   (110, 160, 235), 6)
+    second_accent = count_matching(merged, (adjust[0] + tab_w + 4, adjust[1],
+                                             adjust[2] - 4, adjust[1] + 3),
+                                    (110, 160, 235), 6)
+    checker.check(scene, "列顶出现标签栏且第一个标签是激活态（顶部强调线）",
+                  first_accent > 20 and second_accent == 0,
+                  "第一标签强调线 %d px / 第二标签 %d px" % (first_accent, second_accent))
+
+    # 标签栏里有两个标签，各自有字形。
+    labels = count_bright(merged, (adjust[0] + 4, adjust[1] + 4,
+                                   adjust[0] + tab_w - 4, adjust[1] + GROUP_BAR_H - 2), 110)
+    checker.check(scene, "标签栏里有标签文字", labels > 8, "浅色像素 %d" % labels)
+
+    # ---- 切标签：点第二个标签（切到图层面板）----
+    second_tab_x = adjust[0] + tab_w + tab_w // 2
+    second_tab_y = adjust[1] + GROUP_BAR_H // 2
+    shell.click(second_tab_x, second_tab_y)
+    shell.wait(0.3)
+    switched = shell.shot("155_group_switched")
+    # 切到图层后，强调线移到第二个标签上——这是「切了」的硬证据
+    # （比看内容底色可靠：面板底色两两相差只有 2，容差太宽会误判）。
+    switched_first = count_matching(switched, (adjust[0] + 4, adjust[1],
+                                                adjust[0] + tab_w - 4, adjust[1] + 3),
+                                     (110, 160, 235), 6)
+    switched_second = count_matching(switched, (adjust[0] + tab_w + 4, adjust[1],
+                                                 adjust[2] - 4, adjust[1] + 3),
+                                      (110, 160, 235), 6)
+    checker.check(scene, "点标签后激活态换到第二个标签（强调线移动）",
+                  switched_second > 20 and switched_first == 0,
+                  "第一标签 %d px / 第二标签 %d px" % (switched_first, switched_second))
+    # 且内容真的换成了图层面板：图层行的高亮底色 (56,76,120) —— 这条特征
+    # 在调整栏里不存在（调整栏没有这种高亮），是最可靠的判据。
+    # 不用「面板底色」判：图层栏 (24,26,30) 与调整栏 (22,24,28) 只差 2，
+    # 容差放宽就会误判，收紧又会因抗锯齿漏判。
+    row_highlight = count_matching(switched, (adjust[0] + 2, adjust[1] + GROUP_BAR_H + 14,
+                                               adjust[2] - 2, adjust[1] + GROUP_BAR_H + 36),
+                                   COL_HIGHLIGHT, 10)
+    checker.check(scene, "该列内容换成了图层面板（图层行高亮出现）", row_highlight > 40,
+                  "高亮像素 %d" % row_highlight)
+
+    # ---- 拆开 ----
+    shell.command(CMD_PANEL_GROUP_SPLIT)
+    shell.wait(0.3)
+    split = shell.shot("156_group_split")
+    after = shell.layout
+    checker.check(scene, "拆开后两栏各归其位（左图层 / 右调整）",
+                  after["layer"][2] - after["layer"][0] > 0 and
+                  after["adjust"][2] - after["adjust"][0] > 0,
+                  "layer=%s adjust=%s" % (after["layer"], after["adjust"]))
+    # 拆开后的画面应与合并前一致（组是纯显示层的变化）。
+    # 只比**画布与面板**：状态栏本来就会报当前状态（合并/拆开各报各的），
+    # 那条文字不同是正确行为，不是缺陷。
+    delta = pixel_diff(split, base, (0, layer[1], shell.client_w, layer[3]), 12)
+    checker.check(scene, "拆开后画布与面板与合并前一致（组只是显示形态的变化）", delta == 0,
+                  "差异像素 %d" % delta)
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -3781,6 +3885,7 @@ SCENES = [    ("start", scene_start, ()),
     ("layer_style_paste", scene_layer_style_paste, ()),
     ("filter_other", scene_filter_other, ()),
     ("filter_custom", scene_filter_custom, ()),
+    ("panel_group", scene_panel_group, ()),
 ]
 
 

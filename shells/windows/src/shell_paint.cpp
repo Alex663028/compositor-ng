@@ -3332,6 +3332,83 @@ void draw_panel_toggles(HDC dc, const ShellState& shell, const Layout& layout) {
   }
 }
 
+/* --------------------------------------------------------- 分组标签栏 */
+
+/*
+ * 分组标签栏（tab strip）：两块面板合并到同一列后，列顶出现这条。
+ *
+ * 画法与 PS 的面板组一致：当前激活的标签用**底色 + 顶部 2px 强调线**标出，
+ * 不是只改文字颜色——标签最窄时文字会被省略号截断，只变色看不出谁是当前。
+ *
+ * 标签文字用面板名（"图层" / "调整"）。组内成员由 dock 状态给出，
+ * 这里只按 group_member 取名字与激活态。
+ */
+namespace {
+
+const wchar_t* group_panel_name(comp_dock::PanelId id) {
+  return id == comp_dock::PanelId::Layers ? L"图层" : L"调整";
+}
+
+/* 画一条标签栏。side 决定用哪列的成员。 */
+void draw_group_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar,
+                    comp_dock::DockArea side) {
+  if (bar.w <= 0 || bar.h <= 0) return;
+  const int count = shell.dock.group_count(side);
+  if (count <= 1) return;
+  const comp_dock::PanelId active = shell.dock.group_active_panel(side);
+
+  /* 标签栏底色：比面板底色略深，让它与面板内容区有分界。 */
+  RECT bar_rect{bar.x, bar.y, bar.right(), bar.bottom()};
+  HBRUSH background = CreateSolidBrush(RGB(30, 32, 38));
+  FillRect(dc, &bar_rect, background);
+  DeleteObject(background);
+
+  SetBkMode(dc, TRANSPARENT);
+  for (int i = 0; i < count; ++i) {
+    const comp_dock::PanelId member = shell.dock.group_member(side, i);
+    if (member == comp_dock::PanelId::Count) continue;
+    const comp_ui::Rect tab = comp_ui::group_tab_rect(bar, i, count);
+    const bool is_active = member == active;
+    if (is_active) {
+      /* 激活态：底色 + 顶部 2px 强调线。 */
+      RECT tab_rect{tab.x, tab.y, tab.right(), tab.bottom()};
+      HBRUSH active_brush = CreateSolidBrush(RGB(52, 60, 74));
+      FillRect(dc, &tab_rect, active_brush);
+      DeleteObject(active_brush);
+      RECT accent{tab.x, tab.y, tab.right(), tab.y + 2};
+      HBRUSH accent_brush = CreateSolidBrush(RGB(110, 160, 235));
+      FillRect(dc, &accent, accent_brush);
+      DeleteObject(accent_brush);
+    }
+    const wchar_t* name = group_panel_name(member);
+    SetTextColor(dc, is_active ? RGB(245, 247, 252) : RGB(168, 174, 188));
+    /* 标签文字裁进标签矩形：组窄的时候文字比标签宽，不裁会串到隔壁标签上。 */
+    RECT text_rect{tab.x + 6, tab.y, tab.right() - 4, tab.bottom()};
+    DrawTextW(dc, name, -1, &text_rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS |
+                                  DT_NOPREFIX);
+  }
+  /* 标签栏底边一条 1px 分隔线，与面板内容区分开。 */
+  RECT underline{bar.x, bar.bottom() - 1, bar.right(), bar.bottom()};
+  HBRUSH line = CreateSolidBrush(RGB(16, 18, 22));
+  FillRect(dc, &underline, line);
+  DeleteObject(line);
+}
+
+}  // namespace
+
+void draw_panel_group_bars(HDC dc, const ShellState& shell, const Layout& layout) {
+  if (layout.group_bar.w <= 0) return;
+  /*
+   * 组只有一条标签栏。停在哪一侧由 dock 状态给出（组内两块面板的 area
+   * 相同即同组，那个 area 就是组所在的列）。
+   */
+  const comp_dock::PanelId first = shell.dock.group_member(comp_dock::DockArea::Left, 0);
+  const bool on_left = first != comp_dock::PanelId::Count &&
+                       shell.dock.area_of(first) == comp_dock::DockArea::Left;
+  draw_group_bar(dc, shell, layout.group_bar, on_left ? comp_dock::DockArea::Left
+                                                       : comp_dock::DockArea::Right);
+}
+
 /*
  * 标题栏：后端 + 文件名 + 脏标记（*）。present 每帧调用，但文本没变就不发
  * SetWindowTextW——缓存字符串的目的只是省消息，不是第二份真相：
@@ -3590,6 +3667,12 @@ void present(HWND window, ShellState& shell) {
   }
   /* 分界线最后画：盖在面板底色之上，1px 线才不会被面板自己的填充吃掉。 */
   draw_panel_toggles(memory_dc, shell, layout);
+  /*
+   * 分组标签栏在面板内容**之后**画：标签栏是列顶的一条独立带，
+   * 面板内容矩形已经下移让开了它（ui_core::group_content_rect），
+   * 所以两者不重叠，顺序只影响谁盖住谁——标签栏在上更符合视觉层级。
+   */
+  draw_panel_group_bars(memory_dc, shell, layout);
   draw_panel_dividers(memory_dc, shell, layout);
   draw_status_bar(memory_dc, shell, layout.status);
 

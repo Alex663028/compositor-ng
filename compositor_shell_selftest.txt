@@ -280,6 +280,11 @@
 [OK] P0-3 tabs: two documents park / switch / close without losing state
 [OK] P0-10 dock state: swap sides / float leaves no slot / dock back to origin
 [OK] P0-10 dock workspace round trip (width / collapsed / side)
+[OK] P0-10 dock state: two panels float at once / dock one keeps the other / each docks home
+[OK] P0-10 dock drop zones: left/right edge hot zones / body keeps floating / outside ignored
+[OK] P0-10 float geometry round trip (x / y / width / height kept in dock state)
+[OK] P0-10 panel group: merge into one column / tab strip shows / width stable / split back
+[OK] P0-10 group bar geometry: bar does not eat column width / content shifts down / hit test
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

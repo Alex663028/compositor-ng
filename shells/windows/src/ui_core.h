@@ -270,6 +270,20 @@ struct Layout {
   Rect adjust_toggle{};
   bool layer_collapsed = false;
   bool adjust_collapsed = false;
+  /*
+   * P0-10 面板分组（tab strip）：两块面板合并到**同一列**，列顶出现一条标签栏，
+   * 点标签切换显示哪一块。photocraft 的 craft-ui 就是这个结构（group + tab strip）。
+   *
+   * 只有两块面板，所以至多一组；组在哪一侧由 group_side 决定。
+   *
+   * 关键语义：**layer_panel / adjust_panel 各自仍然是「该面板内容的矩形」**，
+   * 但分组时同一时刻只有激活成员的那一块非空（另一块是空矩形）。
+   * 这样所有按「面板矩形」算几何的代码（行高、滑杆、命中）都不用改——
+   * 它们拿到的就是自己那块面板此刻真正的矩形。
+   */
+  Rect group_bar{};   /* 分组标签栏；未分组时为空矩形 */
+  int group_count = 0;
+  int group_active = 0;
 };
 
 /* 面板宽度偏好（§6.60）：用户拖到哪儿就记到哪儿，跨窗口尺寸沿用。 */
@@ -294,6 +308,19 @@ struct LayoutPrefs {
    */
   bool layer_docked = true;
   bool adjust_docked = true;
+  /*
+   * P0-10 面板分组（tab strip）：两块面板合并到**同一列**，列顶出现标签栏。
+   *
+   * enabled = 该列是组（两块面板共用一个矩形，同一时刻只显示激活的那块）。
+   * on_left = 组停在哪一侧。active = 组内当前显示第几块（组内顺序固定按
+   * PanelId 升序：0=Adjust，1=Layers——壳与布局对「第几块」的理解一致）。
+   *
+   * 未分组时 enabled = false：布局与改造前**逐像素相同**。
+   */
+  bool group_enabled = false;
+  bool group_on_left = false;
+  int group_count = 1;
+  int group_active = 0;
 };
 
 /* 宽度是整数像素，不存在 NaN 输入，夹取只需一次 min/max。 */
@@ -328,6 +355,54 @@ inline Rect panel_toggle_rect(const Rect& panel) {
   return Rect{panel.right() - Layout::kPanelToggleRightMargin - Layout::kPanelToggleSize,
               panel.y + Layout::kPanelToggleTop, Layout::kPanelToggleSize,
               Layout::kPanelToggleSize};
+}
+
+/* ---------------------------------------------------- P0-10 面板分组标签栏 */
+
+/*
+ * 分组标签栏（tab strip）的几何。
+ *
+ * 一列里叠了多块面板时，列顶部出现一条标签栏，点标签切换显示哪一块。
+ * 与 photocraft 的 craft-ui 同一结构（group + tab strip）。
+ *
+ * 高度常量 22 px：与面板标题行（30 px）同量级但更窄——标签栏不是标题，
+ * 它是「这一列里有哪几块」的指示器，够放下「图层」「调整」四个字即可。
+ *
+ * 标签栏**不占用面板的宽度**，而是把面板内容矩形整体下移一行。因此组内
+ * 面板的行几何（layer_row_rect / adjust_param_row_rect 等）完全不用改——
+ * 它们都由传入的面板矩形推导，面板矩形下移多少都一样。
+ */
+inline constexpr int kGroupBarHeight = 22;
+inline constexpr int kGroupTabMinWidth = 56;
+
+/* 标签栏矩形：列的顶部一条。未分组时高度为 0（空矩形）。 */
+inline Rect group_bar_rect(const Rect& panel, int group_count) {
+  if (group_count <= 1 || panel.w <= 0) return Rect{panel.x, panel.y, panel.w, 0};
+  return Rect{panel.x, panel.y, panel.w, kGroupBarHeight};
+}
+
+/* 面板内容矩形：去掉标签栏那一行之后的部分。 */
+inline Rect group_content_rect(const Rect& panel, int group_count) {
+  if (group_count <= 1 || panel.w <= 0) return panel;
+  return Rect{panel.x, panel.y + kGroupBarHeight, panel.w, panel.h - kGroupBarHeight};
+}
+
+/* 第 index 个标签的矩形（组内均分列宽，宽度不足时按最小宽夹取）。 */
+inline Rect group_tab_rect(const Rect& bar, int index, int group_count) {
+  if (group_count <= 0) return Rect{bar.x, bar.y, 0, 0};
+  const int slot = bar.w / group_count;
+  const int width = slot < kGroupTabMinWidth ? kGroupTabMinWidth : slot;
+  return Rect{bar.x + index * width, bar.y, width, bar.h};
+}
+
+/* 点在标签栏的哪个标签上：-1 = 没命中。 */
+inline int group_tab_at(const Rect& bar, int group_count, double x, double y) {
+  if (group_count <= 1 || bar.w <= 0 || bar.h <= 0) return -1;
+  if (!bar.contains(x, y)) return -1;
+  for (int i = 0; i < group_count; ++i) {
+    if (group_tab_rect(bar, i, group_count).contains(x, y)) return i;
+  }
+  return -1;
 }
 
 inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
@@ -403,6 +478,73 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   out.status = Rect{0, body_top + body_h, width, status_h};
   out.layer_collapsed = layer_w > 0 && prefs.layer_panel_collapsed;
   out.adjust_collapsed = adjust_w > 0 && prefs.adjust_panel_collapsed;
+  /*
+   * P0-10 面板分组（tab strip）。
+   *
+   * 组模式下：两块面板**共用同一列**，列顶出现标签栏切换显示哪一块。
+   *
+   * 实现方式是「谁激活谁拿内容矩形，另一个的矩形清空」——空矩形意味着
+   * 既不画也不参与命中（既有代码到处判 `rect.w > 0`，天然适配，
+   * 不需要逐处加分支）。
+   *
+   * 标签栏**不占列宽**，而是把面板内容矩形整体下移一行：列宽是用户拖出来的
+   * 偏好，不能因为多了一条标签栏就变窄（否则分组一次画布宽度就跳）。
+   * 面板内容矩形下移后，组内面板的所有行几何自动跟着走——行位置都由面板
+   * 矩形推导（layer_row_rect / adjust_param_row_rect），不需要额外偏移量。
+   */
+  if (prefs.group_enabled && prefs.group_count > 1) {
+    /*
+     * 组内成员下标：0 = Adjust，1 = Layers（组内顺序按 PanelId 升序）。
+     * 组的列在哪一侧由 group_on_left 决定。
+     */
+    const bool on_left = prefs.group_on_left;
+    const bool active_is_adjust = prefs.group_active == 0;
+    /* 激活成员在「左列 / 右列」这一组里的位置：组只占一列。 */
+    const bool active_on_left = on_left ? active_is_adjust : !active_is_adjust;
+    /*
+     * 组占的那一列的宽度：取**激活成员**的偏好宽度（dock 侧已把组宽写进
+     * 对应字段）。非激活成员不占位 → 画布因此变宽。
+     */
+    const int group_w = active_on_left ? layer_w : adjust_w;
+    const int group_x = on_left ? 0 : width - group_w;
+    const Rect column{group_x, body_top, group_w, body_h};
+
+    out.group_bar = group_bar_rect(column, prefs.group_count);
+    const Rect content = group_content_rect(column, prefs.group_count);
+    out.group_count = prefs.group_count;
+    out.group_active = prefs.group_active;
+
+    /* 激活成员拿内容矩形；另一块清空（不画、不命中）。 */
+    if (active_on_left) {
+      out.layer_panel = content;
+      out.adjust_panel = Rect{};
+    } else {
+      out.adjust_panel = content;
+      out.layer_panel = Rect{};
+    }
+    /* 画布：组列之外的全部空间。 */
+    out.canvas = Rect{on_left ? group_w : 0, body_top, width - group_w, body_h};
+    /* 收起态与分界线按组列重算：组的收起看激活成员的收起态。 */
+    out.layer_collapsed = out.layer_panel.w > 0 && prefs.layer_panel_collapsed;
+    out.adjust_collapsed = out.adjust_panel.w > 0 && prefs.adjust_panel_collapsed;
+    if (group_w > 0 && !out.layer_collapsed && !out.adjust_collapsed) {
+      const int splitter_x = on_left ? group_w - Layout::kPanelSplitterWidth : group_x;
+      if (active_on_left) {
+        out.layer_splitter = Rect{splitter_x, body_top, Layout::kPanelSplitterWidth, body_h};
+      } else {
+        out.adjust_splitter = Rect{splitter_x, body_top, Layout::kPanelSplitterWidth, body_h};
+      }
+    }
+    if (group_w > 0) {
+      if (active_on_left) {
+        out.layer_toggle = out.layer_collapsed ? out.layer_panel : panel_toggle_rect(out.layer_panel);
+      } else {
+        out.adjust_toggle =
+            out.adjust_collapsed ? out.adjust_panel : panel_toggle_rect(out.adjust_panel);
+      }
+    }
+    return out;
+  }
   /*
    * 收起条不提供拖宽：它只有 24px，拖动命中带（最右 5px）几乎占满整条，用户
    * 想在哪儿点「展开」都会变成「拉宽」。展开后分界线立刻恢复。

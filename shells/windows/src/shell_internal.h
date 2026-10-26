@@ -781,6 +781,12 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void draw_tab_bar(HDC dc, const ShellState& shell, const Layout& layout);
   /* P0-10：浮动面板（独立顶层窗口）的浮/停回切换。 */
   void toggle_float_panel(ShellState& shell, comp_dock::PanelId id);
+  /* P0-10：面板分组（tab strip）——合并/拆开/切标签。 */
+  void panel_group_merge(ShellState& shell);
+  void panel_group_split(ShellState& shell);
+  void panel_group_select(ShellState& shell, comp_dock::DockArea side, int index);
+  bool panel_group_active(const ShellState& shell);
+  comp_dock::DockArea panel_group_side(const ShellState& shell);
   /* P0-10：右栏内容（按当前子面板选画）；浮动面板窗口与主窗口共用。 */
   void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
   void draw_layer_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
@@ -808,6 +814,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void draw_toggle_chevron(HDC dc, int cx, int cy, int half, bool point_left, COLORREF color);
   void draw_panel_toggle(HDC dc, const comp_ui::Rect& box, bool collapsed, bool hot, bool panel_on_left, const wchar_t* row0, const wchar_t* row1);
   void draw_panel_toggles(HDC dc, const ShellState& shell, const Layout& layout);
+  /* P0-10 分组标签栏（tab strip）：一列里叠了多块面板时，列顶那条。 */
+  void draw_panel_group_bars(HDC dc, const ShellState& shell, const Layout& layout);
   void update_window_title(HWND window, ShellState& shell);
   void present(HWND window, ShellState& shell);
   void set_tool(ShellState& shell, comp_ui::ToolId id);

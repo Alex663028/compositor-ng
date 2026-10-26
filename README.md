@@ -502,9 +502,10 @@ typedef，故对契约零影响。
 | 项 | 当前值 |
 |---|---|
 | ABI 导出 | 215（212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`） |
-| 单元测试 | 793 例 0 失败（build.py 全量） |
-| 壳自检 | 272 项，SHA 基线 `b59fe41e07abf796` |
-| 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔） |
+| 单元测试 | 794 例 0 失败（build.py 全量） |
+| 壳自检 | 277 项，SHA 基线 `4ffee705da27c7d3` |
+| 视觉探针 | 254 项 0 失败（41 场景） |
+| 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔 + 图片导入像素核对） |
 
 ## 7. 许可
 

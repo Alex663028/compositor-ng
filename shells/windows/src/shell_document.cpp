@@ -2264,6 +2264,13 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdFloatLayers:
       toggle_float_panel(shell, comp_dock::PanelId::Layers);
       break;
+    /* ---- P0-10：面板分组（tab strip）---- */
+    case kCmdPanelGroupMerge:
+      panel_group_merge(shell);
+      break;
+    case kCmdPanelGroupSplit:
+      panel_group_split(shell);
+      break;
     /* ---- 图像 > 图像大小… / 画布大小…（对应上游 Image Size / Canvas Size） ---- */
     case kCmdImageSize:
       doc_dialog_begin(shell, comp_ui::DocDialogKind::ImageSize);
