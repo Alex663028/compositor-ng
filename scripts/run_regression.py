@@ -296,12 +296,20 @@ def step_present_bench(reg: Regression) -> bool:
     def fn():
         if not IS_WINDOWS:
             return "SKIP", "非 Windows 平台"
-        bench = os.path.join(BUILD, "present_bench.txt")
+        # 程序用相对路径写 present_bench.txt，落在 cwd（仓根）；此前脚本去 build/ 取，
+        # 即便跑成功也归档不到文件。这里改成从仓根取、归档到 build/。
+        bench = os.path.join(ROOT, "present_bench.txt")
         proc = reg.run_cmd([SHELL_EXE, "--present-bench=30"], capture=True)
+        # rc=2 是程序自己发起的「跳过」而不是失败：窗口直呈需要 D3D12 后端，
+        # 默认（CPU）构建下程序在报告里写 result=skipped 并返回 2。
+        # 把它算成 FAIL 会让每次默认构建的回归都挂一个红叉，久了就没人看了。
+        if proc.returncode == 2:
+            return "SKIP", "无 D3D12 后端（默认 CPU 构建），窗口直呈基准不适用"
         if proc.returncode != 0:
             return "FAIL", f"present-bench rc={proc.returncode}"
         import shutil as _shutil
-        _shutil.copyfile(bench, os.path.join(BUILD, "present_bench_last.txt"))             if os.path.isfile(bench) else None
+        if os.path.isfile(bench):
+            _shutil.copyfile(bench, os.path.join(BUILD, "present_bench_last.txt"))
         return "PASS", "趋势已记录 build/present_bench_last.txt（不门禁）"
 
     return reg.step("7. present-bench 性能趋势记录（不门禁）", fn)
