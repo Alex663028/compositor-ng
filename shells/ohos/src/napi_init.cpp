@@ -611,7 +611,12 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
 // 像素 = 文档像素，三方同尺寸，零换算）。抬起后自动投递一帧上屏。
 // ---------------------------------------------------------------------------
 
-float g_stroke_color[3] = {255.0f, 220.0f, 40.0f};  /* 黄色，深底上醒目 */
+/* 画笔当前设置（P1-2）：颜色 / 直径 / 硬度 / 是否橡皮擦。
+ * 此前全部写死（黄色 70px 实心），用户只能画一种笔，属于「引擎全有、壳没接」。 */
+float g_brush_color[3] = {255.0f, 220.0f, 40.0f};
+float g_brush_diameter = 70.0f;
+float g_brush_hardness = 0.85f;
+bool g_brush_erase = false;
 std::atomic<int> g_touch_events{0};  /* 诊断探针：回调入口计数 */
 bool g_stroke_active = false;
 float g_stroke_last_x = 0.0f;
@@ -624,14 +629,15 @@ void PaintSegment(float x0, float y0, float x1, float y1) {
   comp_tool_op_desc op;
   std::memset(&op, 0, sizeof(op));
   op.kind = COMP_TOOL_STROKE;  /* 冻结表 2：笔刷落笔到图层像素 */
-  op.brush.color[0] = (uint8_t)g_stroke_color[0];
-  op.brush.color[1] = (uint8_t)g_stroke_color[1];
-  op.brush.color[2] = (uint8_t)g_stroke_color[2];
-  op.brush.diameter = 70.0f;
+  op.brush.color[0] = (uint8_t)g_brush_color[0];
+  op.brush.color[1] = (uint8_t)g_brush_color[1];
+  op.brush.color[2] = (uint8_t)g_brush_color[2];
+  op.brush.diameter = g_brush_diameter;
   op.brush.pressure = 1.0f;
-  op.brush.hardness = 0.85f;
+  op.brush.hardness = g_brush_hardness;
   op.brush.flow = 1.0f;
   op.brush.seed = 1;
+  op.erase = g_brush_erase ? 1 : 0;  /* 橡皮擦：同一落笔通路，按 coverage 擦除 */
   op.stroke_points = points;
   op.stroke_point_count = 2;
   comp_tool_apply(g_document, g_top_layer, &op, nullptr, 0, nullptr);
@@ -784,6 +790,75 @@ napi_value JsFlatten(napi_env env, napi_callback_info info) {
 // 模块注册
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// JS 导出：画笔设置（P1-2）
+//
+// 同一套落笔通路（PaintSegment）读这几个全局量，所以调参不需要重开文档，
+// 下一笔就生效。取值范围在 JS 侧也夹一次，这里再夹一次——壳是 ABI 的唯一
+// 使用者，不该把非法值漏给引擎。
+// ---------------------------------------------------------------------------
+
+napi_value JsSetBrushColor(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 3) return MakeInt32(env, 1);
+  for (int i = 0; i < 3; ++i) {
+    int32_t v = 0;
+    if (napi_get_value_int32(env, argv[i], &v) != napi_ok) return MakeInt32(env, 1);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    g_brush_color[i] = static_cast<float>(v);
+  }
+  return MakeInt32(env, 0);
+}
+
+napi_value JsSetBrushDiameter(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  int32_t v = 0;
+  if (argc < 1 || napi_get_value_int32(env, argv[0], &v) != napi_ok) return MakeInt32(env, 1);
+  if (v < 1) v = 1;
+  if (v > 400) v = 400;
+  g_brush_diameter = static_cast<float>(v);
+  return MakeInt32(env, 0);
+}
+
+napi_value JsSetBrushHardness(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double v = 0.0;
+  if (argc < 1 || napi_get_value_double(env, argv[0], &v) != napi_ok) return MakeInt32(env, 1);
+  if (v < 0.0) v = 0.0;
+  if (v > 1.0) v = 1.0;
+  g_brush_hardness = static_cast<float>(v);
+  return MakeInt32(env, 0);
+}
+
+napi_value JsSetBrushErase(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  bool v = false;
+  if (argc < 1 || napi_get_value_bool(env, argv[0], &v) != napi_ok) return MakeInt32(env, 1);
+  g_brush_erase = v;
+  return MakeInt32(env, 0);
+}
+
+/* 给 UI 显示用的一行摘要；不参与任何判定。 */
+napi_value JsBrushInfo(napi_env env, napi_callback_info info) {
+  (void)info;
+  char text[128];
+  snprintf(text, sizeof(text), "%s #%02X%02X%02X · %d px · 硬度 %d%%",
+           g_brush_erase ? "橡皮" : "画笔", static_cast<int>(g_brush_color[0]),
+           static_cast<int>(g_brush_color[1]), static_cast<int>(g_brush_color[2]),
+           static_cast<int>(g_brush_diameter + 0.5),
+           static_cast<int>(g_brush_hardness * 100.0f + 0.5f));
+  return MakeString(env, text);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
   napi_value xcomponent_object = nullptr;
   if (napi_get_named_property(env, exports, OH_NATIVE_XCOMPONENT_OBJ,
@@ -832,6 +907,13 @@ napi_value Init(napi_env env, napi_value exports) {
       {"presentResult", nullptr, JsPresentResult, nullptr, nullptr, nullptr, napi_default,
        nullptr},
       {"presentDiag", nullptr, JsPresentDiag, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"setBrushColor", nullptr, JsSetBrushColor, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"setBrushDiameter", nullptr, JsSetBrushDiameter, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setBrushHardness", nullptr, JsSetBrushHardness, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setBrushErase", nullptr, JsSetBrushErase, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"brushInfo", nullptr, JsBrushInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"presentStage", nullptr, [](napi_env env, napi_callback_info info) {
         (void)info;
         napi_value out = nullptr;

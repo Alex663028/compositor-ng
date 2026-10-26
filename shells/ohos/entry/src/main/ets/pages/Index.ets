@@ -10,7 +10,8 @@
 
 import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
-         backendName, exportPng } from 'libcompositor.so';
+         backendName, exportPng,
+         setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 
 @Entry
 @Component
@@ -21,6 +22,15 @@ struct Index {
   @State lastOp: string = '—';
   @State presentState: string = '未上屏';
   @State diag: string = '—';
+  @State brushText: string = '';
+  @State diameter: number = 70;
+  @State softness: number = 85;
+  @State erasing: boolean = false;
+
+  /* 画笔参数改完立刻回读一次摘要，让用户看得见当前笔是什么样。 */
+  private syncBrush(): void {
+    this.brushText = brushInfo();
+  }
   @State undoState: string = '—';
   @State topOpacity: number = 0.5;
   @State exportState: string = '—';
@@ -64,6 +74,7 @@ struct Index {
           this.surface = surfaceInfo();
           this.layers = layerCount();
           this.undoState = canUndo() > 0 ? '可撤销' : '空';
+          this.brushText = brushInfo();
         })
 
       Text('后端 ' + this.backend + ' · 表面 ' + this.surface + ' · 上屏 ' + this.presentState)
@@ -121,6 +132,44 @@ struct Index {
       }
       .width('100%')
       .justifyContent(FlexAlign.SpaceEvenly)
+
+      /* P1-2 画笔可调：此前颜色写死黄、直径写死 70px、没有橡皮擦。
+       * 这四个色块 + 橡皮开关直接改 napi 侧的全局量，下一笔即生效。 */
+      Row({ space: 6 }) {
+        Button('黄').onClick(() => { setBrushColor(255, 220, 40); this.syncBrush(); })
+        Button('红').onClick(() => { setBrushColor(255, 72, 72); this.syncBrush(); })
+        Button('蓝').onClick(() => { setBrushColor(72, 136, 255); this.syncBrush(); })
+        Button('绿').onClick(() => { setBrushColor(72, 200, 128); this.syncBrush(); })
+        Button(this.erasing ? '橡皮 开' : '橡皮 关').onClick(() => {
+          this.erasing = !this.erasing;
+          setBrushErase(this.erasing);
+          this.syncBrush();
+        })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.SpaceEvenly)
+
+      Row({ space: 10 }) {
+        Text('粗细').fontSize(12)
+        Slider({ value: this.diameter, min: 1, max: 240, step: 1 })
+          .width(170)
+          .onChange((value: number) => {
+            this.diameter = Math.round(value);
+            setBrushDiameter(this.diameter);
+            this.syncBrush();
+          })
+        Text('硬度').fontSize(12)
+        Slider({ value: this.softness, min: 0, max: 100, step: 5 })
+          .width(130)
+          .onChange((value: number) => {
+            this.softness = Math.round(value);
+            setBrushHardness(this.softness / 100.0);
+            this.syncBrush();
+          })
+        Text(this.brushText).fontSize(11).fontColor('#9aa4b2')
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
     }
     .width('100%')
     .height('100%')
