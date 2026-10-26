@@ -287,6 +287,7 @@
 [OK] P0-10 panel group on the left column: content at left edge / width stable on tab switch
 [OK] P0-10 panel group column width is independent of which panel is active
 [OK] P0-10 panel group collapse is column level (24px strip) and restores the group width
+[OK] P0-10 panel group width is initialised on merge and does not change with the active tab
 [OK] P0-10 group bar geometry: bar does not eat column width / content shifts down / hit test
 
 [summary] failures = 0

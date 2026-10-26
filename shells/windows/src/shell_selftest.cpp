@@ -3009,6 +3009,42 @@ int run_selftest(const wchar_t* out_path) {
   }
   {
     /*
+     * P0-10 合并时组宽的**初始化**（2026-10-26 视觉探针抓到的真 bug）。
+     *
+     * 症状：合并后组宽是 0，于是回落成「激活成员的缺省宽」——
+     * 激活的是调整时是 330，切到图层变成 248，列宽跟着跳一次。
+     *
+     * 根因：合并时写的 `set_group_width(target, group_width(target))` 是
+     * 「把组宽设成它自己的当前值」= 没设。正确的初值是**目标列合并前**的
+     * 实际宽度（那一列当时停着谁，就用谁的缺省宽）。
+     *
+     * 这条断言量的是「组宽被显式设过」——合并后 group_width 必须是正数，
+     * 不能靠回落。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    /* 合并前：右列停着调整（缺省 330），左列停着图层（缺省 248）。 */
+    const int before_right = dock.group_width(comp_dock::DockArea::Right);
+    /* 合并：把图层栏并进调整栏那一列。 */
+    dock.group_merge(comp_dock::PanelId::Layers);
+    /*
+     * 组宽必须被**显式设过**：合并后 group_width 要是正数（目标列原本的
+     * 缺省宽 330），不能是 0 —— 0 会回落成「激活成员的缺省宽」，切标签时
+     * 列宽就跟着跳（2026-10-26 视觉探针抓到的真 bug）。
+     */
+    const int width_after = dock.group_width(comp_dock::DockArea::Right);
+    const bool initialised = before_right == 0 &&
+                             width_after == static_cast<int>(comp_ui::Layout::kAdjustPanelWidth);
+    /* 切标签后列宽不变（组宽是列的属性）。 */
+    dock.group_set_active(comp_dock::DockArea::Right, 1);
+    comp_ui::LayoutPrefs prefs{};
+    dock.apply_to(prefs);
+    const comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, prefs);
+    const int column_w = layout.layer_panel.w > 0 ? layout.layer_panel.w : layout.adjust_panel.w;
+    verify(initialised && column_w == width_after,
+           "P0-10 panel group width is initialised on merge and does not change with the active tab");
+  }
+  {
+    /*
      * P0-10 分组的几何：标签栏与内容矩形。
      *
      * 标签栏**不占列宽**——它把面板内容矩形整体下移一行。列宽是用户拖出来的

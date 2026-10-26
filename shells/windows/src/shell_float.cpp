@@ -366,17 +366,12 @@ void panel_group_merge(ShellState& shell) {
   /*
    * 合并 = 把图层栏挪到调整栏那一列（两块住进同一列 = 一组）。
    * 选调整栏那列是因为它是缺省下用户视线停留的地方（PS 的属性面板在右）。
+   *
+   * 组宽的初值由 dock 的 group_merge 负责（取目标列合并前的实际宽度）——
+   * 这里不重复算：宽度初值算错的后果是「切标签时列宽跳一次」
+   * （2026-10-26 视觉探针抓到的真 bug）。
    */
-  const comp_dock::DockArea target =
-      shell.dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Left
-          ? comp_dock::DockArea::Left
-          : comp_dock::DockArea::Right;
-  shell.dock.group_move(comp_dock::PanelId::Layers, target);
-  /*
-   * 组的宽度：沿用目标列原来的宽度（= 激活成员的偏好宽度），
-   * 这样合并瞬间画布宽度不变——否则画布会跳一下，用户正在看的图会被挤动。
-   */
-  shell.dock.set_group_width(target, shell.dock.group_width(target));
+  shell.dock.group_merge(comp_dock::PanelId::Layers);
   if (shell.window != nullptr) InvalidateRect(shell.window, nullptr, FALSE);
   set_status(shell, L"面板已合并成一组（点列顶标签切换；视图 > 面板分组可拆开）");
 }

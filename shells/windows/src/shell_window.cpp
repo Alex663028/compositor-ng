@@ -4081,23 +4081,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       break;
     case kMsgLayoutQuery:
       /*
-       * 布局查询（视觉探针用）：把当前布局的关键矩形写成 JSON 交回调用方。
+       * 布局查询（视觉探针用）：把当前布局写进**共享内存**，消息返回值带长度。
        *
-       * 为什么要有这个通道：探针原本靠 **Python 复算** ui_core 的布局公式，
-       * 那是**第二份真源**——壳里改了布局公式（新增面板分组就是一种），
-       * 探针的复算就跟不上了，于是「探针量到的位置」与「壳画出来的位置」
-       * 对不上，断言要么误报失败要么漏掉真缺陷。
-       * （本轮分组就栽在这上面：探针量的是标签位置与强调线，两者都不随列宽
-       *  变，所以「切标签时列宽跳变」这个真缺陷既没被自检抓到也没被探针抓到。）
+       * 为什么是共享内存而不是 WM_COPYDATA：WM_COPYDATA 是**单向**的——系统
+       * 在发送时把数据复制给接收方，接收方对缓冲的修改不会回传给发送方
+       * （实测 2026-10-26：壳写了 JSON、回填了 dwData 与 cbData，发送方读到的
+       * 仍是原值）。「问一句、答一句」的路子用 WM_COPYDATA 根本不成立。
        *
-       * 口径：调用方给一个输出缓冲（lParam 指向，wParam 是容量），
-       * 壳写一段 JSON 并返回写入的字节数（不含结尾 '\0'）；缓冲不够则返回
-       * 需要的字节数（调用方据此扩容重来）。
+       * 共享内存是双向的：探针创建命名映射，壳打开同名映射写入。
        */
-      if (shell != nullptr && lparam != 0) {
+      if (shell != nullptr) {
         Layout layout{};
         if (!client_layout(*shell, &layout)) return 0;
         char buffer[1024];
+        /*
+         * 矩形按 **(left, top, right, bottom)** 输出——与探针既有的 layout
+         * 约定一致（复算版也是这个形式）。写成 x,y,w,h 会让探针拿到一个
+         * 「宽当右缘」的矩形，裁剪区域直接算反。
+         */
         const int written = std::snprintf(
             buffer, sizeof(buffer),
             "{\"toolbar\":[%d,%d,%d,%d],\"options\":[%d,%d,%d,%d],"
@@ -4105,25 +4106,37 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             "\"adjust\":[%d,%d,%d,%d],\"canvas\":[%d,%d,%d,%d],"
             "\"status\":[%d,%d,%d,%d],\"group_bar\":[%d,%d,%d,%d],"
             "\"group_count\":%d,\"group_active\":%d}",
-            layout.toolbar.x, layout.toolbar.y, layout.toolbar.w, layout.toolbar.h,
-            layout.options.x, layout.options.y, layout.options.w, layout.options.h,
-            layout.tabbar.x, layout.tabbar.y, layout.tabbar.w, layout.tabbar.h,
-            layout.layer_panel.x, layout.layer_panel.y, layout.layer_panel.w,
-            layout.layer_panel.h,
-            layout.adjust_panel.x, layout.adjust_panel.y, layout.adjust_panel.w,
-            layout.adjust_panel.h,
-            layout.canvas.x, layout.canvas.y, layout.canvas.w, layout.canvas.h,
-            layout.status.x, layout.status.y, layout.status.w, layout.status.h,
-            layout.group_bar.x, layout.group_bar.y, layout.group_bar.w, layout.group_bar.h,
+            layout.toolbar.x, layout.toolbar.y, layout.toolbar.right(),
+            layout.toolbar.bottom(),
+            layout.options.x, layout.options.y, layout.options.right(),
+            layout.options.bottom(),
+            layout.tabbar.x, layout.tabbar.y, layout.tabbar.right(), layout.tabbar.bottom(),
+            layout.layer_panel.x, layout.layer_panel.y, layout.layer_panel.right(),
+            layout.layer_panel.bottom(),
+            layout.adjust_panel.x, layout.adjust_panel.y, layout.adjust_panel.right(),
+            layout.adjust_panel.bottom(),
+            layout.canvas.x, layout.canvas.y, layout.canvas.right(), layout.canvas.bottom(),
+            layout.status.x, layout.status.y, layout.status.right(), layout.status.bottom(),
+            layout.group_bar.x, layout.group_bar.y, layout.group_bar.right(),
+            layout.group_bar.bottom(),
             layout.group_count, layout.group_active);
         if (written <= 0) return 0;
-        const int capacity = static_cast<int>(wparam);
-        if (capacity > written + 1) {
-          char* out = reinterpret_cast<char*>(lparam);
-          std::memcpy(out, buffer, static_cast<size_t>(written) + 1u);
-          return written;
+        /*
+         * 打开探针建的同名映射并写入。映射不存在（探针没建 / 已关闭）时
+         * 返回 0 —— 探针据此知道「问不到」，而不是拿到半截数据。
+         */
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_WRITE, FALSE, kLayoutQueryMappingName);
+        if (mapping == nullptr) return 0;
+        void* view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
+        if (view == nullptr) {
+          CloseHandle(mapping);
+          return 0;
         }
-        return written + 1; /* 告诉调用方：需要这么多字节（含 '\0'） */
+        std::memcpy(view, buffer, static_cast<size_t>(written));
+        static_cast<char*>(view)[written] = '\0';
+        UnmapViewOfFile(view);
+        CloseHandle(mapping);
+        return written;
       }
       break;
     case WM_SIZE:

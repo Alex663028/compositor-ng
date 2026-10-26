@@ -335,6 +335,25 @@ void DockState::group_move(PanelId id, DockArea side) {
   }
 }
 
+void DockState::group_merge(PanelId id) {
+  /*
+   * 合并成一组：把 id 挪到**另一块面板**所在的列。
+   *
+   * 组宽的初值 = 目标列合并前的实际宽度。必须在移动**之前**取：移动之后
+   * 两块同列，「激活成员的宽度」就变成按激活标签变化的东西了。
+   */
+  const PanelId other = id == PanelId::Adjust ? PanelId::Layers : PanelId::Adjust;
+  const DockArea side = panels[index_of(other)].area;
+  if (side != DockArea::Left && side != DockArea::Right) return;
+  const int stored = group_width(side);
+  /* 目标列原本停着谁，就用谁的缺省宽。 */
+  const int fallback = other == PanelId::Layers ? static_cast<int>(comp_ui::Layout::kLayerPanelWidth)
+                                               : static_cast<int>(comp_ui::Layout::kAdjustPanelWidth);
+  const int initial = stored > 0 ? stored : fallback;
+  group_move(id, side);
+  set_group_width(side, initial);
+}
+
 void DockState::group_ungroup(PanelId id) {
   const int index = index_of(id);
   const DockArea current = panels[index].area;

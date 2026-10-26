@@ -414,17 +414,27 @@ constexpr UINT kCmdPanelGroupMerge = 1745; /* 合并成一组 */
 constexpr UINT kCmdPanelGroupSplit = 1746; /* 拆开分组 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 /*
- * 布局查询消息（视觉探针用，WM_APP 段）。
+ * 布局查询（视觉探针用）。
  *
  * 探针原本靠 Python 复算 ui_core 的布局公式，那是第二份真源——壳里改了布局
  * 公式（新增面板分组就是一种），复算就跟不上，探针量到的位置与壳画出来的
- * 位置对不上。这个消息让探针直接问壳要**真实**布局。
+ * 位置对不上。这个通道让探针直接问壳要**真实**布局。
  *
- * 口径：lParam = 输出缓冲指针，wParam = 缓冲容量（字节）；壳写入 JSON 文本
- * 并返回写入字节数（不含 '\0'）。缓冲不够时返回需要的总字节数（含 '\0'），
- * 调用方扩容后重发一次。
+ * 为什么用「共享内存 + WM_APP」而不是 WM_COPYDATA：
+ *   - WM_COPYDATA 是**单向**的：系统在发送时把数据复制给接收方，接收方对
+ *     COPYDATASTRUCT（含 lpData 指向的缓冲）的修改**不会回传给发送方**。
+ *     实测 2026-10-26：壳写了 JSON、也回填了 dwData/cbData，发送方读到的
+ *     仍是原值（缓冲还是全 0）。用它做「问一句、答一句」的路子根本不成立。
+ *   - 共享内存是双向的：探针创建命名映射，壳打开**同名**映射写入，探针随后
+ *     直接读映射内容。返回值只带「写了几字节」这个数。
+ *
+ * 口径：探针先 CreateFileMapping 一个 8 KB 的命名映射，再发消息；壳在消息
+ * 里 OpenFileMapping 打开同名映射并写入 JSON，把写入长度作为消息返回值。
+ * 探针按返回值读映射前 N 字节。壳打不开映射（探针没建）时返回 0。
  */
 constexpr UINT kMsgLayoutQuery = WM_APP + 1;
+/* 共享内存名（跨进程共享，命名不带 Local\ 前缀 = 会话内共享）。 */
+constexpr wchar_t kLayoutQueryMappingName[] = L"CompositorLayoutProbe";
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*
  * 面板动作号落在 1220 段：滤镜档位从 9 个涨到 11 个（尾追加 Sharpen /

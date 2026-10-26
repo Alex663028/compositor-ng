@@ -51,6 +51,7 @@ WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_COMMAND = 0x0111
 # 布局查询（kMsgLayoutQuery = WM_APP + 1，与 shell_state.h 同值）。
+# 布局数据走**共享内存**（见 Shell.query_layout），消息只带「写了几字节」。
 MSG_LAYOUT_QUERY = 0x8001
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
@@ -351,9 +352,21 @@ def glyph_bbox(img, rect, target=(255, 136, 0), tol=60):
 
 
 def pixel_diff(img_a, img_b, rect, threshold=24):
-    """两帧同一区域的像素差异数（用于「面板文字/数值变了」这类断言）。"""
-    a = img_a.crop(rect).convert("RGB").tobytes()
-    b = img_b.crop(rect).convert("RGB").tobytes()
+    """两帧同一区域的像素差异数（用于「面板文字/数值变了」这类断言）。
+
+    两帧**尺寸不同**时按公共区域比：窗口尺寸在两帧之间偶尔差 1 px（截图
+    661 vs 662），那不是内容变化，是窗口抖了一下。按整幅比会把那一行
+    的位移算成"几千像素差异"，让本该过的断言假失败。
+    """
+    # 裁剪区域先夹到两图都有的范围内。
+    width = min(img_a.width, img_b.width)
+    height = min(img_a.height, img_b.height)
+    left = max(0, min(rect[0], width))
+    top = max(0, min(rect[1], height))
+    right = max(left, min(rect[2], width))
+    bottom = max(top, min(rect[3], height))
+    a = img_a.crop((left, top, right, bottom)).convert("RGB").tobytes()
+    b = img_b.crop((left, top, right, bottom)).convert("RGB").tobytes()
     changed = 0
     for index in range(0, min(len(a), len(b)), 3):
         if (abs(a[index] - b[index]) + abs(a[index + 1] - b[index + 1]) +
@@ -404,6 +417,11 @@ def _clear_workspace():
         pass
 
 
+# 布局查询的共享内存名（与 shell_state.h 的 kLayoutQueryMappingName 同值）。
+LAYOUT_MAPPING_NAME = "CompositorLayoutProbe"
+LAYOUT_MAPPING_SIZE = 8192
+
+
 class Shell:
     def __init__(self, exe, out_dir, keep):
         self.exe = exe
@@ -415,6 +433,10 @@ class Shell:
         self.client_h = 0
         self.shots = []
         self._doc_rect = None
+        # 布局来源："shell" = 问壳要的真实布局；"fallback" = 退回了 Python 复算。
+        # 复算是第二份真源，壳里改了布局公式就会失真——所以退回复算这件事
+        # 必须**看得见**（否则断言会静默地量错地方，还报"通过"）。
+        self.layout_source = "unknown"
         os.makedirs(out_dir, exist_ok=True)
 
     # -- 生命周期 --------------------------------------------------
@@ -554,24 +576,61 @@ class Shell:
 
         壳不可问时（老 exe / 消息不被处理）返回 None，调用方退回 Python 复算。
         """
-        buffer = ctypes.create_string_buffer(4096)
-        needed = user32.SendMessageW(self.hwnd, MSG_LAYOUT_QUERY,
-                                      ctypes.c_size_t(buffer.value.__len__()),
-                                      ctypes.byref(buffer))
-        if needed <= 0:
+        # 共享内存通道：探针建映射 -> 问壳 -> 壳写进映射 -> 探针读。
+        #
+        # 为什么不是 WM_COPYDATA：它是**单向**的（系统把数据复制给接收方，
+        # 接收方的修改不回来）。为什么不是 WM_APP + 裸指针：跨进程传裸指针
+        # 必然读到野指针。共享内存是唯一能做到「问一句、答一句」的路子。
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileMappingW.restype = wintypes.HANDLE
+        kernel32.CreateFileMappingW.argtypes = [wintypes.LPVOID, wintypes.LPVOID,
+                                                wintypes.DWORD, wintypes.DWORD,
+                                                wintypes.DWORD, wintypes.LPCWSTR]
+        kernel32.MapViewOfFile.restype = ctypes.c_void_p
+        kernel32.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                           wintypes.DWORD, wintypes.DWORD,
+                                           ctypes.c_size_t]
+        kernel32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        PAGE_READWRITE = 0x04
+        FILE_MAP_WRITE = 0x0002
+        FILE_MAP_READ = 0x0004
+
+        mapping = kernel32.CreateFileMappingW(None, None, PAGE_READWRITE, 0,
+                                              LAYOUT_MAPPING_SIZE, LAYOUT_MAPPING_NAME)
+        if not mapping:
+            self.layout_source = "fallback"
             return None
-        if needed > buffer.value.__len__():
-            # 壳说「装不下」：按它要的大小重新分配再来一次。
-            buffer = ctypes.create_string_buffer(needed)
-            needed = user32.SendMessageW(self.hwnd, MSG_LAYOUT_QUERY,
-                                          ctypes.c_size_t(buffer.value.__len__()),
-                                          ctypes.byref(buffer))
-            if needed <= 0 or needed > buffer.value.__len__():
-                return None
+        view = kernel32.MapViewOfFile(mapping, FILE_MAP_WRITE | FILE_MAP_READ,
+                                       0, 0, LAYOUT_MAPPING_SIZE)
+        if not view:
+            kernel32.CloseHandle(mapping)
+            self.layout_source = "fallback"
+            return None
         try:
-            data = json.loads(buffer.value.decode("utf-8"))
+            # 先清零：壳写失败时探针不会读到上一次的残留 JSON。
+            ctypes.memset(view, 0, LAYOUT_MAPPING_SIZE)
+            # SendMessageW 必须显式声明签名：ctypes 默认按 32 位 int 传参。
+            send = user32.SendMessageW
+            send.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t,
+                             ctypes.c_void_p]
+            send.restype = ctypes.c_ssize_t
+            written = int(send(self.hwnd, MSG_LAYOUT_QUERY, 0, None))
+            if os.environ.get("COMPOSITOR_PROBE_DEBUG"):
+                print("   [debug] layout query written=%d" % written)
+            if written <= 0 or written >= LAYOUT_MAPPING_SIZE:
+                self.layout_source = "fallback"
+                return None
+            raw = ctypes.string_at(view, written)
+        finally:
+            kernel32.UnmapViewOfFile(view)
+            kernel32.CloseHandle(mapping)
+        try:
+            data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
+            self.layout_source = "fallback"
             return None
+        self.layout_source = "shell"
         return {key: tuple(value) if isinstance(value, list) else value
                 for key, value in data.items()}
 
@@ -3811,51 +3870,58 @@ def scene_panel_group(shell, checker):
     shell.command(CMD_PANEL_GROUP_MERGE)
     shell.wait(0.3)
     merged = shell.shot("154_group_merged")
-    # 合并后重新取布局：组列的位置/宽度与合并前不同（组宽由 dock 状态给，
-    # 不是两栏缺省宽的简单相加）。
-    adjust = shell.layout["adjust"]
+    # 合并后重新取布局（真实布局）：组列的位置/宽度与合并前不同（组宽由
+    # dock 状态给，不是两栏缺省宽的简单相加）。
+    #
+    # **标签栏与内容矩形是两个矩形**：标签栏（group_bar）在列顶，面板内容
+    # （layer / adjust 里非空的那个）在它下面。用真实布局时不能再拿
+    # adjust 矩形当整列——那会把内容区当成标签栏。
+    layout = shell.layout
+    bar = layout["group_bar"]
+    # 组列的内容矩形：激活的是调整 -> adjust 非空；激活的是图层 -> layer 非空。
+    content = layout["adjust"] if layout["adjust"][2] > layout["adjust"][0] else layout["layer"]
     checker.check(scene, "合并后左栏让位（两块住进同一列，画布变宽）",
-                  near(mean_rgb(merged, (2, adjust[1] + 60, 6, adjust[1] + 70)),
+                  near(mean_rgb(merged, (2, content[1] + 60, 6, content[1] + 70)),
                        COL_APP_BG, 10),
                   "左栏位置实测 %s" %
-                  (mean_rgb(merged, (2, adjust[1] + 60, 6, adjust[1] + 70)),))
+                  (mean_rgb(merged, (2, content[1] + 60, 6, content[1] + 70)),))
 
     # 标签栏：合并后列顶有一条 22px 高的带。判据用**激活标签的顶部 2px
     # 强调线**（110,160,235）——它只在激活标签上出现，颜色唯一，不会与
     # 面板底色或文字混淆。用「整条标签栏的平均色」判定不可靠：激活标签的
     # 底色 (52,60,74) 会把均值拉偏。
-    tab_w = (adjust[2] - adjust[0]) // 2
-    first_accent = count_matching(merged, (adjust[0] + 4, adjust[1],
-                                            adjust[0] + tab_w - 4, adjust[1] + 3),
+    tab_w = (bar[2] - bar[0]) // 2
+    first_accent = count_matching(merged, (bar[0] + 4, bar[1],
+                                            bar[0] + tab_w - 4, bar[1] + 3),
                                    (110, 160, 235), 6)
-    second_accent = count_matching(merged, (adjust[0] + tab_w + 4, adjust[1],
-                                             adjust[2] - 4, adjust[1] + 3),
+    second_accent = count_matching(merged, (bar[0] + tab_w + 4, bar[1],
+                                             bar[2] - 4, bar[1] + 3),
                                     (110, 160, 235), 6)
     checker.check(scene, "列顶出现标签栏且第一个标签是激活态（顶部强调线）",
                   first_accent > 20 and second_accent == 0,
                   "第一标签强调线 %d px / 第二标签 %d px" % (first_accent, second_accent))
 
     # 标签栏里有两个标签，各自有字形。
-    labels = count_bright(merged, (adjust[0] + 4, adjust[1] + 4,
-                                   adjust[0] + tab_w - 4, adjust[1] + GROUP_BAR_H - 2), 110)
+    labels = count_bright(merged, (bar[0] + 4, bar[1] + 4,
+                                   bar[0] + tab_w - 4, bar[1] + GROUP_BAR_H - 2), 110)
     checker.check(scene, "标签栏里有标签文字", labels > 8, "浅色像素 %d" % labels)
 
     # 切标签**前**的真实布局（组列左缘 = 画布右缘）。
     canvas_right_before = shell.layout["canvas"][2]
 
     # ---- 切标签：点第二个标签（切到图层面板）----
-    second_tab_x = adjust[0] + tab_w + tab_w // 2
-    second_tab_y = adjust[1] + GROUP_BAR_H // 2
+    second_tab_x = bar[0] + tab_w + tab_w // 2
+    second_tab_y = bar[1] + GROUP_BAR_H // 2
     shell.click(second_tab_x, second_tab_y)
     shell.wait(0.3)
     switched = shell.shot("155_group_switched")
     # 切到图层后，强调线移到第二个标签上——这是「切了」的硬证据
     # （比看内容底色可靠：面板底色两两相差只有 2，容差太宽会误判）。
-    switched_first = count_matching(switched, (adjust[0] + 4, adjust[1],
-                                                adjust[0] + tab_w - 4, adjust[1] + 3),
+    switched_first = count_matching(switched, (bar[0] + 4, bar[1],
+                                                bar[0] + tab_w - 4, bar[1] + 3),
                                      (110, 160, 235), 6)
-    switched_second = count_matching(switched, (adjust[0] + tab_w + 4, adjust[1],
-                                                 adjust[2] - 4, adjust[1] + 3),
+    switched_second = count_matching(switched, (bar[0] + tab_w + 4, bar[1],
+                                                 bar[2] - 4, bar[1] + 3),
                                       (110, 160, 235), 6)
     checker.check(scene, "点标签后激活态换到第二个标签（强调线移动）",
                   switched_second > 20 and switched_first == 0,
@@ -3864,8 +3930,11 @@ def scene_panel_group(shell, checker):
     # 在调整栏里不存在（调整栏没有这种高亮），是最可靠的判据。
     # 不用「面板底色」判：图层栏 (24,26,30) 与调整栏 (22,24,28) 只差 2，
     # 容差放宽就会误判，收紧又会因抗锯齿漏判。
-    row_highlight = count_matching(switched, (adjust[0] + 2, adjust[1] + GROUP_BAR_H + 14,
-                                               adjust[2] - 2, adjust[1] + GROUP_BAR_H + 36),
+    # 切到图层后，内容矩形在 **layer** 下（内容按面板身份分派）。
+    after_layout = shell.layout
+    layer_content = after_layout["layer"]
+    row_highlight = count_matching(switched, (layer_content[0] + 2, layer_content[1] + 14,
+                                               layer_content[2] - 2, layer_content[1] + 36),
                                    COL_HIGHLIGHT, 10)
     checker.check(scene, "该列内容换成了图层面板（图层行高亮出现）", row_highlight > 40,
                   "高亮像素 %d" % row_highlight)
@@ -3876,11 +3945,13 @@ def scene_panel_group(shell, checker):
     # = 列宽不动。这条曾经漏过：分组代码初版把列宽按面板身份夹取，切标签时
     # 列宽从组宽跳成另一栏的缺省宽，而标签位置与强调线都不随宽变——
     # 既没被自检抓到（当时测的是个恒量），也没被本场景抓到。
-    canvas_right_after = shell.layout["canvas"][2]
+    after_layout2 = shell.layout
+    canvas_right_after = after_layout2["canvas"][2]
     checker.check(scene, "切标签不改变列宽（组宽属于列，不属于成员）",
                   canvas_right_after == canvas_right_before and canvas_right_before > 0,
-                  "画布右缘（= 组列左缘）%d -> %d" %
-                  (canvas_right_before, canvas_right_after))
+                  "画布右缘（= 组列左缘）%d -> %d / layer=%s adjust=%s canvas=%s" %
+                  (canvas_right_before, canvas_right_after, after_layout2["layer"],
+                   after_layout2["adjust"], after_layout2["canvas"]))
 
     # ---- 拆开 ----
     shell.command(CMD_PANEL_GROUP_SPLIT)
@@ -3991,6 +4062,11 @@ def main():
                 if scene == name:
                     print("  [%s] %s%s" % ("PASS" if ok else "FAIL", check_name,
                                            "" if not detail else "  —— " + detail))
+            # 布局来源必须**看得见**：退回复算 = 探针在用第二份真源，
+            # 壳里改了布局公式时断言会量错地方却报「通过」。
+            if shell.layout_source != "shell":
+                print("  [WARN] 布局来源 = %s（问壳要真实布局失败，已退回 Python 复算）"
+                      % shell.layout_source)
             lines.append("%s: %d 项检查，%d 失败" % (
                 name, sum(1 for row in checker.rows if row[0] == name),
                 sum(1 for row in checker.rows if row[0] == name and not row[2])))
