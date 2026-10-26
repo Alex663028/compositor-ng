@@ -387,6 +387,14 @@ constexpr UINT kCmdLayerSmartPanelRemove = 1723;  /* 删除当前条 */
 constexpr UINT kCmdLayerSmartPanelRename = 1724;   /* 重命名当前条…（F2） */
 constexpr UINT kCmdLayerSmartPanelMoveUp = 1725;   /* 当前条上移一位（Alt+↑） */
 constexpr UINT kCmdLayerSmartPanelMoveDown = 1726; /* 当前条下移一位（Alt+↓） */
+
+/* 文件 > 新建预设（P0-1 收尾，2026-10-26）：四个高频画布直接建，不进对话框。
+ * 预设的语义是「马上要一张能画的白纸」，所以背景固定白；透明/前景色仍走
+ * 「新建文档…」对话框。 */
+constexpr UINT kCmdNewPresetHd = 1730;    /* 1920x1080 @72 */
+constexpr UINT kCmdNewPresetA4 = 1731;    /* A4 300dpi：2480x3508 */
+constexpr UINT kCmdNewPresetWeb = 1732;   /* 网页 1440x900 @72 */
+constexpr UINT kCmdNewPresetPhoto = 1733; /* 照片 4000x3000 @300 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*

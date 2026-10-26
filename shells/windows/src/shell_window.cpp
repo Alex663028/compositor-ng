@@ -4457,6 +4457,13 @@ HMENU build_menu() {
   HMENU file_menu = CreatePopupMenu();
   AppendMenuW(file_menu, MF_STRING, kCmdNew, L"新建(&N)\tCtrl+N");
   AppendMenuW(file_menu, MF_STRING, kCmdNewDocumentDialog, L"新建文档…(&W)\tCtrl+Alt+N");
+  /* 新建预设：四个高频画布一键建好，省掉「开对话框、改四个数、回车」。 */
+  HMENU preset_menu = CreatePopupMenu();
+  AppendMenuW(preset_menu, MF_STRING, kCmdNewPresetHd, L"全高清 1920 × 1080 @72");
+  AppendMenuW(preset_menu, MF_STRING, kCmdNewPresetA4, L"A4 打印 2480 × 3508 @300");
+  AppendMenuW(preset_menu, MF_STRING, kCmdNewPresetWeb, L"网页 1440 × 900 @72");
+  AppendMenuW(preset_menu, MF_STRING, kCmdNewPresetPhoto, L"照片 4000 × 3000 @300");
+  AppendMenuW(file_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(preset_menu), L"新建预设(&R)");
   AppendMenuW(file_menu, MF_STRING, kCmdOpen, L"打开(&O)...\tCtrl+O");
   AppendMenuW(file_menu, MF_STRING, kCmdSave, L"保存(&S)\tCtrl+S");
   AppendMenuW(file_menu, MF_STRING, kCmdSaveAs, L"另存为…(&A)\tCtrl+Alt+S");

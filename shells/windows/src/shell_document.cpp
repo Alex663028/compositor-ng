@@ -1792,6 +1792,21 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdNewDocumentDialog:
       doc_dialog_begin(shell, comp_ui::DocDialogKind::NewDocument);
       break;
+    /* ---- 文件 > 新建预设（P0-1 收尾）----
+     * 直接调到 create_document_with，不经过对话框；背景参数仍复用对话框那套
+     * 编码（0 白 / 1 透明 / 2 前景色），这里固定 0。 */
+    case kCmdNewPresetHd:
+      create_document_with(shell, 1920, 1080, 72, 0);
+      break;
+    case kCmdNewPresetA4:
+      create_document_with(shell, 2480, 3508, 300, 0);
+      break;
+    case kCmdNewPresetWeb:
+      create_document_with(shell, 1440, 900, 72, 0);
+      break;
+    case kCmdNewPresetPhoto:
+      create_document_with(shell, 4000, 3000, 300, 0);
+      break;
     case kCmdSaveAs:
       save_document_dialog(window, shell);
       break;
