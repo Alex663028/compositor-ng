@@ -501,9 +501,9 @@ typedef，故对契约零影响。
 
 | 项 | 当前值 |
 |---|---|
-| ABI 导出 | 212（tag `abi-212`） |
-| 单元测试 | 787 例 0 失败（build.py 全量） |
-| 壳自检 | 267 项，SHA 基线 `cae180809eed3ba4` |
+| ABI 导出 | 215（212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`） |
+| 单元测试 | 791 例 0 失败（build.py 全量） |
+| 壳自检 | 270 项，SHA 基线 `93f6a4bc30d7d69c` |
 | 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔） |
 
 ## 7. 许可

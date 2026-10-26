@@ -275,6 +275,9 @@
 [OK] smart object converts / adds a smart filter / refuses pixel writes / rasterizes
 [OK] fill layer creates / renders uniformly / refuses pixel writes / rasterizes
 [OK] shell open_path_as_document(.png) still opens one flattened layer
+[OK] P0-1 document bit depth 16 reaches the background layer buffer
+[OK] P0-1 grayscale document flattens to R=G=B (Rec.709 luma)
+[OK] P0-3 tabs: two documents park / switch / close without losing state
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

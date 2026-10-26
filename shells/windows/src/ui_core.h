@@ -198,6 +198,14 @@ struct Layout {
    */
   static constexpr int kMinBodyHeight = 96;
   static constexpr int kStatusHeight = 26;
+  /*
+   * P0-3 文档标签栏。只有在 **2 个以上文档**时才占位——单文档时高度为 0，
+   * 画布矩形与既有 40 个视觉场景一个像素都不动。多文档是增量功能，不该让
+   * 所有历史基线跟着平移 26px。
+   */
+  static constexpr int kTabBarHeight = 26;
+  static constexpr int kTabMaxWidth = 190;
+  static constexpr int kTabMinWidth = 92;
   static constexpr int kLayerPanelWidth = 248;
   static constexpr int kAdjustPanelWidth = 330;
   static constexpr int kMinCanvasWidth = 180;
@@ -244,6 +252,8 @@ struct Layout {
 
   Rect toolbar{};
   Rect options{}; /* §5.49 工具选项栏；高度不够时为空矩形 */
+  Rect tabbar{};  /* P0-3 文档标签栏；只有 1 个文档时为空矩形 */
+  int tab_count = 0;
   Rect layer_panel{};
   Rect adjust_panel{};
   Rect canvas{};
@@ -264,6 +274,8 @@ struct Layout {
 
 /* 面板宽度偏好（§6.60）：用户拖到哪儿就记到哪儿，跨窗口尺寸沿用。 */
 struct LayoutPrefs {
+  /* 文档标签数（P0-3）：>= 2 时才给标签栏留 26px。 */
+  int tab_count = 1;
   int layer_panel_width = Layout::kLayerPanelWidth;
   int adjust_panel_width = Layout::kAdjustPanelWidth;
   /*
@@ -318,8 +330,16 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   const int options_h = remainder_h >= Layout::kOptionsHeight + Layout::kMinBodyHeight
                             ? Layout::kOptionsHeight
                             : 0;
-  const int body_top = toolbar_h + options_h;
-  const int body_h = remainder_h - options_h;
+  /*
+   * P0-3 标签栏：只有多文档才占位，且必须给主体留够下限——窗口矮到放不下
+   * 就把标签栏整条收起（高度 0），命中测试因此自动失效，与选项栏同一口径。
+   */
+  const int tab_h = (prefs.tab_count >= 2 &&
+                     remainder_h - options_h >= Layout::kTabBarHeight + Layout::kMinBodyHeight)
+                        ? Layout::kTabBarHeight
+                        : 0;
+  const int body_top = toolbar_h + options_h + tab_h;
+  const int body_h = remainder_h - options_h - tab_h;
 
   /*
    * §5.43：收起态只把「想要的宽度」换成 24px 竖条，**收起口径不变**——仍按
@@ -344,6 +364,8 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   Layout out;
   out.toolbar = Rect{0, 0, width, toolbar_h};
   out.options = Rect{0, toolbar_h, width, options_h};
+  out.tabbar = Rect{0, toolbar_h + options_h, width, tab_h};
+  out.tab_count = tab_h > 0 ? prefs.tab_count : 0;
   out.layer_panel = Rect{0, body_top, layer_w, body_h};
   out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
   out.canvas = Rect{layer_w, body_top, width - layer_w - adjust_w, body_h};
@@ -373,6 +395,30 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
 
 inline Layout compute_layout(int width, int height) {
   return compute_layout(width, height, LayoutPrefs{});
+}
+
+/*
+ * 第 index 个标签的矩形（P0-3）。宽度按「可用宽度 / 标签数」均分，夹在
+ * [kTabMinWidth, kTabMaxWidth]；标签栏放不下就返回空矩形，命中测试自动失效。
+ * 标签少了不会被拉满整条（190px 上限），多了也不会窄到看不清文件名。
+ */
+inline Rect tab_rect(const Layout& layout, int index, int count) {
+  if (layout.tabbar.h <= 0 || count <= 0 || index < 0 || index >= count) return Rect{};
+  int width = layout.tabbar.w / count;
+  if (width > Layout::kTabMaxWidth) width = Layout::kTabMaxWidth;
+  if (width < Layout::kTabMinWidth) width = Layout::kTabMinWidth;
+  return Rect{layout.tabbar.x + index * width, layout.tabbar.y, width, layout.tabbar.h};
+}
+
+/* 命中：返回标签下标，-1 = 未命中。 */
+inline int tab_at(const Layout& layout, int count, double x, double y) {
+  if (layout.tabbar.h <= 0) return -1;
+  if (y < layout.tabbar.y || y >= layout.tabbar.bottom()) return -1;
+  for (int index = 0; index < count; ++index) {
+    const Rect rect = tab_rect(layout, index, count);
+    if (rect.w > 0 && x >= rect.x && x < rect.right()) return index;
+  }
+  return -1;
 }
 
 /* 分界线命中：0 = 未命中，1 = 图层面板分界线，2 = 调整面板分界线。 */
@@ -5518,11 +5564,22 @@ enum class DocDialogKind {
    * 刻意不做拖拽手柄：右栏只有两百多像素，拖拽精度不如 0.1% 的数值输入，而且
    * 会与现有「面板内按下 = 点行」的命中规则打架。数值表是等价能力的更稳实现。
    */
-  GradientStops
+  GradientStops,
+  /*
+   * P0-3：最近打开。历史条目是**动态**的（最多 kRecentLimit 条），静态行模型
+   * 表达不了，所以这里只摆一行「文件」，值 = 列表下标，←/→ 循环，回车打开。
+   *
+   * 为什么不做成「文件 > 最近打开」二级菜单：菜单只在启动时构建一次，动态项
+   * 要每次变更重建整棵菜单（析构旧句柄、SetMenu、菜单栏闪一下）。面板复用
+   * 已有的行模型与键盘通路，成本低得多，也和「不用系统弹窗」这条纪律一致。
+   */
+  RecentFiles
 };
 
 /* 可编辑色标面板的固定行序（下标是对外契约：测试与 visual_check 都按下标点）。 */
 inline constexpr int kGradientStopsRowCount = 8;
+/* P0-3：最近打开列表上限。行模型值域、壳侧裁剪、落盘截断三处共用这一个数。 */
+inline constexpr int kRecentLimit = 10;
 
 enum class DocRowKind { Number = 0, Choice = 1, Toggle = 2 };
 
@@ -5636,6 +5693,8 @@ inline const char* doc_dialog_title(DocDialogKind kind) {
       return "数值变换（Transform）";
     case DocDialogKind::GradientStops:
       return "可编辑色标（Gradient Stops）";
+    case DocDialogKind::RecentFiles:
+      return "最近打开（Recent）";
     default:
       return "";
   }
@@ -5661,6 +5720,8 @@ inline const char* doc_dialog_subtitle(DocDialogKind kind) {
       return "作用于选中图层 · 中心锚定 · Ctrl+Shift+T 再次变换";
     case DocDialogKind::GradientStops:
       return "改完回车应用为「自定义」色标表 · 首末固定在 0% / 100%";
+    case DocDialogKind::RecentFiles:
+      return "列表存在 %APPDATA%\\Compositor\\recent-files.txt";
     default:
       return "";
   }
@@ -5686,6 +5747,8 @@ inline const char* doc_dialog_hint(DocDialogKind kind) {
       return "Tab 切行 · 数字键输入 · 回车应用（Esc 不改）";
     case DocDialogKind::GradientStops:
       return "位置/中点按 % 值输入（可带 .5）· ←/→ = 5‰";
+    case DocDialogKind::RecentFiles:
+      return "←/→ 换一条 · 回车打开（在标签页里开）";
     default:
       return "";
   }
@@ -5711,6 +5774,8 @@ inline int doc_dialog_row_count(DocDialogKind kind) {
       return 3; /* 宽 / 高 / 角度 */
     case DocDialogKind::GradientStops:
       return kGradientStopsRowCount;
+    case DocDialogKind::RecentFiles:
+      return 1; /* 文件（枚举，值 = 列表下标） */
     default:
       return 0;
   }
@@ -5805,6 +5870,13 @@ inline DocRowSpec doc_dialog_row(DocDialogKind kind, int row) {
           return DocRowSpec{"角度 (°)", DocRowKind::Number, kTransformAngleMin,
                             kTransformAngleMax, kTransformAngleStep, 0};
         default: break;
+      }
+      break;
+    case DocDialogKind::RecentFiles:
+      /* 唯一一行：值 = 列表下标。choice_count 只是占位（真实条数是动态的），
+       * 越界裁剪在壳侧按列表长度取模。 */
+      if (row == 0) {
+        return DocRowSpec{"文件", DocRowKind::Choice, 0, kRecentLimit - 1, 1, 1};
       }
       break;
     case DocDialogKind::GradientStops:

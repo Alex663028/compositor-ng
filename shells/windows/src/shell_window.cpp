@@ -591,6 +591,8 @@ bool client_layout(const ShellState& shell, Layout* out) {
   RECT client{};
   if (shell.window == nullptr || !GetClientRect(shell.window, &client)) return false;
   comp_ui::LayoutPrefs prefs;
+  /* P0-3：文档标签数。1 个文档时布局不给标签栏留位，历史基线因此不动。 */
+  prefs.tab_count = static_cast<int>(shell.tabs.size());
   prefs.layer_panel_width = shell.layer_panel_width;
   prefs.adjust_panel_width = shell.adjust_panel_width;
   prefs.layer_panel_collapsed = shell.layer_panel_collapsed;
@@ -2161,6 +2163,16 @@ void handle_key(HWND window, ShellState& shell, WPARAM key, bool ctrl, bool shif
           return;
         }
         break;
+      /* ---- P0-3 多文档：Ctrl+W 关当前标签，Ctrl+Tab / Ctrl+Shift+Tab 换标签 ---- */
+      case 'W':
+        if (!shift) {
+          run_shell_command(window, shell, kCmdCloseDocument);
+          return;
+        }
+        break;
+      case VK_TAB:
+        run_shell_command(window, shell, shift ? kCmdPrevTab : kCmdNextTab);
+        return;
       case 'S':
         /* Ctrl+Shift+S 另存为位图，Ctrl+S 保存 .comp。 */
         run_shell_command(window, shell, shift ? kCmdExportImage : kCmdSave);
@@ -2769,6 +2781,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             if (info != nullptr) set_tool(*shell, info->id);
             InvalidateRect(window, nullptr, FALSE);
             return 0;
+          }
+          /*
+           * P0-3 标签栏：单文档时 layout.tabbar 高度为 0，tab_at 恒返回 -1，
+           * 因此这一条在单文档下不可能吃掉任何点击。
+           */
+          {
+            const int tab_index = comp_ui::tab_at(
+                layout, static_cast<int>(shell->tabs.size()), mouse_x, mouse_y);
+            if (tab_index >= 0) {
+              tab_activate(*shell, tab_index);
+              InvalidateRect(window, nullptr, FALSE);
+              return 0;
+            }
           }
           /*
            * §5.49 选项栏：排在工具按钮之后、面板开关之前。它在两者之间的一条
@@ -4418,22 +4443,24 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       break;
     case WM_CLOSE:
-      /* 关窗也收口：微调事务里的位移已经生效，不 commit 就丢掉那一步的撤销能力。 */
+      /*
+       * 关窗也收口：微调事务里的位移已经生效，不 commit 就丢掉那一步的撤销能力。
+       *
+       * P0-3：脏文档先问「保存 / 不保存 / 取消」。用右栏面板而不是 MessageBox——
+       * 自动化 stop() 是「post WM_CLOSE 后等几秒」，阻塞式弹窗只能等到超时，
+       * 面板则能用按键回答（S / D / Esc，见 handle_key）。
+       *
+       * 多文档之后这里走 close_flow_step：它逐个标签收口，只要还有一个脏标签
+       * 就把提示弹出来并返回 true（先别关窗），全部答完才真正销毁窗口。
+       */
       if (shell != nullptr) {
         nudge_flush(*shell);
-        /*
-         * P0-3：脏文档先问「保存 / 不保存 / 取消」。用右栏面板而不是 MessageBox——
-         * 自动化 stop() 是「post WM_CLOSE 后等几秒」，阻塞式弹窗只能等到超时，
-         * 面板则能用按键回答（S / D / Esc，见 handle_key）。
-         */
         if (shell->doc.doc_dialog == comp_ui::DocDialogKind::ClosePrompt) {
           /* 提示已经开着：再点一次关闭等同「取消」，不销毁，也不重置用户的选择。 */
           return 0;
         }
-        int32_t dirty = 0;
-        if (shell->doc.document != nullptr &&
-            comp_document_is_dirty(shell->doc.document, &dirty) == COMP_OK && dirty != 0) {
-          doc_dialog_begin(*shell, comp_ui::DocDialogKind::ClosePrompt);
+        shell->close_intent = 0;
+        if (close_flow_step(*shell)) {
           InvalidateRect(window, nullptr, FALSE);
           return 0;
         }
@@ -4467,6 +4494,11 @@ HMENU build_menu() {
   AppendMenuW(file_menu, MF_STRING, kCmdOpen, L"打开(&O)...\tCtrl+O");
   AppendMenuW(file_menu, MF_STRING, kCmdSave, L"保存(&S)\tCtrl+S");
   AppendMenuW(file_menu, MF_STRING, kCmdSaveAs, L"另存为…(&A)\tCtrl+Alt+S");
+  /* P0-3 多文档：新建/打开都是「另起一个标签」，关文档才有未保存提示。 */
+  AppendMenuW(file_menu, MF_STRING, kCmdCloseDocument, L"关闭文档(&C)\tCtrl+W");
+  AppendMenuW(file_menu, MF_STRING, kCmdRecent, L"最近打开…(&R)\tCtrl+Alt+O");
+  AppendMenuW(file_menu, MF_STRING, kCmdNextTab, L"下一个文档(&T)\tCtrl+Tab");
+  AppendMenuW(file_menu, MF_STRING, kCmdPrevTab, L"上一个文档\tCtrl+Shift+Tab");
   AppendMenuW(file_menu, MF_STRING, kCmdOpenImage, L"打开位图(&I)...\tCtrl+Shift+O");
   AppendMenuW(file_menu, MF_STRING, kCmdImportImage, L"置入(&P)...");
   AppendMenuW(file_menu, MF_SEPARATOR, 0, nullptr);

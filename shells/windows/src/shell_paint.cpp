@@ -515,6 +515,53 @@ bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta) {
  * 几何全部来自 ui_core 的 option_group_rect / option_control_rect，绘制与命中
  * 用同一份矩形——横栏只有 32px 高，差 1px 就会点错组（与面板分界线同一教训）。
  */
+/*
+ * P0-3 文档标签栏。只有多文档时布局才给它 26px（单文档高度 0，这里直接返回）。
+ *
+ * 激活态靠**底色 + 顶部 2px 强调线**区分，不靠文字颜色：标签最窄 92px，文件名
+ * 常被省略号截断，那时若只变色反而看不出哪条是当前文档。
+ */
+void draw_tab_bar(HDC dc, const ShellState& shell, const comp_ui::Layout& layout) {
+  if (layout.tabbar.h <= 0) return;
+  const int count = layout.tab_count;
+  if (count <= 0) return;
+
+  RECT bar{layout.tabbar.x, layout.tabbar.y, layout.tabbar.right(), layout.tabbar.bottom()};
+  HBRUSH bar_fill = CreateSolidBrush(RGB(30, 32, 37));
+  FillRect(dc, &bar, bar_fill);
+  DeleteObject(bar_fill);
+
+  SetBkMode(dc, TRANSPARENT);
+  for (int index = 0; index < count; ++index) {
+    const comp_ui::Rect tab = comp_ui::tab_rect(layout, index, count);
+    if (tab.w <= 0) break;
+    const bool active = index == shell.active_tab;
+
+    RECT body{tab.x, tab.y, tab.right(), tab.bottom()};
+    HBRUSH fill = CreateSolidBrush(active ? RGB(52, 56, 65) : RGB(34, 36, 42));
+    FillRect(dc, &body, fill);
+    DeleteObject(fill);
+
+    if (active) {
+      RECT accent{tab.x, tab.y, tab.right(), tab.y + 2};
+      HBRUSH accent_fill = CreateSolidBrush(RGB(118, 168, 255));
+      FillRect(dc, &accent, accent_fill);
+      DeleteObject(accent_fill);
+    }
+
+    /* 竖分隔线落在标签右缘，未激活时压暗一档：条与条之间不靠留白分辨。 */
+    RECT divider{tab.right() - 1, tab.y + 4, tab.right(), tab.bottom() - 4};
+    HBRUSH divider_fill = CreateSolidBrush(RGB(24, 26, 30));
+    FillRect(dc, &divider, divider_fill);
+    DeleteObject(divider_fill);
+
+    RECT text{tab.x + 10, tab.y, tab.right() - 8, tab.bottom()};
+    SetTextColor(dc, active ? RGB(240, 242, 248) : RGB(168, 172, 184));
+    DrawTextW(dc, tab_title(shell, index).c_str(), -1, &text,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  }
+}
+
 void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
   RECT background_rect{bar.x, bar.y, bar.right(), bar.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(38, 40, 46));
@@ -3291,6 +3338,8 @@ void present(HWND window, ShellState& shell) {
   if (layout.options.h > 0) {
     draw_tool_options(memory_dc, shell, layout.options);
   }
+  /* P0-3：单文档时 tabbar 高度为 0，这行是空操作。 */
+  draw_tab_bar(memory_dc, shell, layout);
   /*
    * §5.43：收起态只剩 24px 竖条，面板内容一列都排不下——整块不画，交给
    * draw_panel_toggles 画竖条。两者互斥，竖条上不会漏出半截图层行。

@@ -3,9 +3,9 @@
 > 基线：`cbbbec2`（2026-10-22）。范围：**功能面**（用户能做什么），不含性能优化、重构与文档债（文档漂移见 §8）。
 > 方法：按「一个 Photoshop 用户从新建文档到交付成片」的实际路径逐段对照，只记录**本仓当前确实做不到**的事，
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
-> 硬约束：ABI 导出只能**纯尾部追加**（当前 **212**，2026-10-26 create2）；回归 6/6、壳自检 267 项 SHA、视觉探针不得因新增功能而破（当前 **246 条 / 40 场景**；落地规则见 §6）。
+> 硬约束：ABI 导出只能**纯尾部追加**（当前 **215**：212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`，2026-10-26 P0-1）；回归 6/6、壳自检 270 项 SHA、视觉探针不得因新增功能而破（当前 **246 条 / 40 场景**；落地规则见 §6）。
 > 审计独立性（2026-10-26 起）：写代码与写审计不得同一会话署名；连续 ≤3 个批次未获独立审计即触发一轮跨 Agent 交叉全测（T2/S24 模式）。
-> 自检基线：**267 项 / SHA256 `cae180809eed3ba4…`**（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
+> 自检基线：**270 项 / SHA256 `93f6a4bc30d7d69c…`**（267 项 / `cae180809eed3ba4…` → 270 项：2026-10-26 在末尾追加 3 项——文档位深落到背景层、灰阶文档 flatten 恒 R=G=B、标签页 park/switch/close——其余 267 行逐字节未动；（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
 > 在末尾追加 4 项断言——面板过滤、图层复合、智能对象、填充层，其余逐字节未动；263 项那次是 2026-10-23 一次**显式审批**的
 > 附录式变更，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -176,6 +176,22 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
   画布 16:9、标题出现脏标记、图层面板 1 个 Background、状态栏「已新建文档」。
   至此 P0-1 只剩两项，且都是引擎边界：**颜色模式**（引擎 sRGB-only）、
   **位深**（需 `comp_document_desc` 尾部追加 `pixel_format`）。
+  **两项已落地（2026-10-26，+3 ABI 导出 / 212 → 215）**：
+  - 位深走 `comp_document_create_ex` + `comp_document_options`（带 `struct_size` 的
+    **新结构**，而不是给 `comp_document_desc` 追加字段——那份结构没有长度参数，
+    老宿主传短结构会被越界读，引擎头里 `comp_engine_create2` 的注释写的就是这件事）。
+    位深真的落到背景层与后续新建图层的像素格式上（此前 `ensure_background_layer`
+    写死 RGBA8：声明 16 位、实际 8 位）；8 位工具作用于 16 位图层仍走上游的
+    「笔尖内 8 位、笔尖外保 16 位」往返。
+  - 颜色模式支持 **RGB / 灰度**；CMYK 与 Lab 保留编号但明确回 `UNSUPPORTED`
+    （色彩管理是独立子系统，口径 C 已声明不做）。灰度的引擎契约是
+    **宿主可见的一切输出恒为 R=G=B**：`comp_render_flatten` 统一去色（flatten 是
+    上屏 / PNG / PSD / 16F 导出的唯一收口），`comp_layer_set_pixels` 写入侧同时转灰
+    （否则读回是彩色、输出是灰，同一个文档两套像素值）。权重 Rec.709。
+  - `.comp` 用 `enginePixelFormat` / `engineColorMode` 落盘，**仅非缺省时写键**：
+    旧包逐字节不变，双向都不用迁移。
+  - 壳：新建面板加「位深 / 颜色模式」两行（行序 4/5），标题栏非缺省时追加
+    `[16 位 灰度]`（每帧向引擎现问，不存副本）。
 
 
 ### P0-2 图像大小 / 画布大小：ABI 齐了，UI 一条都没有
@@ -228,7 +244,22 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
     （189 个文档态字段，换文档 = 整体替换一份 `doc`），main.cpp 也从 19,046 行单文件拆成
     13 个翻译单元（字体选择器落地后为 14 个，见 README §6.83 / §6.89）。多文档**本身**仍未做：缺的是「标签页 →
     `DocumentContext`」的实例管理与切换流程，`文件 > 新建 / 打开` 依然直接销毁旧文档。
-  - 最近文件未做。
+  - **多文档 + 最近文件已落地（2026-10-26，零 ABI）**：
+    - 标签页：`ShellState::doc` 仍是**前台**文档，后台文档放 `tabs` 里，换文档 =
+      整体 move 一份 `DocumentContext`。这样 34k 行里 189 处 `shell.doc.xxx` 一个都
+      不用改（改成 `tabs[i].doc.xxx` 是最容易漏字段的做法）。换文档前先跑
+      `doc_switch_finish` 收口跨帧交互——事务句柄不能挂在后台标签上。
+    - 新建 / 打开不再是「覆盖当前文档」，而是**另起一个标签**：P0-3 原本那个
+      「新建前要不要提示保存」的问题因此消失（旧文档一直活着）。
+    - 标签栏只在 **2 个以上文档**时占 26px（`Layout::kTabBarHeight`），单文档高度 0，
+      40 个视觉场景的基线一个像素都不用动。点击切标签，`Ctrl+Tab` / `Ctrl+Shift+Tab`
+      轮换，`Ctrl+W` 关闭当前标签（脏则弹 `ClosePrompt`）。
+    - 退出时逐标签收口（`close_flow_step`）：只要还有脏标签就再弹一次，全部答完
+      才销毁窗口——多文档之后「只问前台那一份就退出」等于把后台修改直接丢掉。
+    - 最近打开：`%APPDATA%\Compositor\recent-files.txt`（一行一个路径，上限 10，
+      去重按大小写不敏感 + 分隔符归一）。入口是右栏面板 `文件 > 最近打开…`
+      （Ctrl+Alt+O），不复用二级菜单——菜单只在启动时建一次，动态项要整棵重建。
+      打开失败会把该条从列表里摘掉，不留死链。
 
 
 ### P0-4 剪贴板：复制 / 剪切 / 粘贴 / 贴入 / 清除
@@ -747,4 +778,4 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **267 项** failures=0、SHA256 `cae18080…`（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **246/246 / 40 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`、`filter_custom`） |
+| 壳自检/视觉探针基线 | 壳自检 **270 项** failures=0、SHA256 `93f6a4bc…`（2026-10-26 P0-1/P0-3 末尾追加 3 项）（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **246/246 / 40 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`、`filter_custom`） |

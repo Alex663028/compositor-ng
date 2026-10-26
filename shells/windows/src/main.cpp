@@ -241,6 +241,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
       if (parsed >= 96 && parsed <= 480) shell.dpi = parsed;
     }
   }
+  /* P0-3：最近打开列表（%APPDATA%），读失败等于空列表，不影响启动。 */
+  recent_load(shell);
   create_document(shell);
   /*
    * P5-3：随仓字体在这里一次性加载（字体句柄独立于引擎，不需要文档）。

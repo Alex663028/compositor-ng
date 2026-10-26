@@ -395,6 +395,11 @@ constexpr UINT kCmdNewPresetHd = 1730;    /* 1920x1080 @72 */
 constexpr UINT kCmdNewPresetA4 = 1731;    /* A4 300dpi：2480x3508 */
 constexpr UINT kCmdNewPresetWeb = 1732;   /* 网页 1440x900 @72 */
 constexpr UINT kCmdNewPresetPhoto = 1733; /* 照片 4000x3000 @300 */
+/* P0-3 多文档 */
+constexpr UINT kCmdCloseDocument = 1734; /* 文件 > 关闭文档（Ctrl+W） */
+constexpr UINT kCmdNextTab = 1735;       /* 下一个文档（Ctrl+Tab） */
+constexpr UINT kCmdPrevTab = 1736;       /* 上一个文档（Ctrl+Shift+Tab） */
+constexpr UINT kCmdRecent = 1737;        /* 文件 > 最近打开…（Ctrl+Alt+O） */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*
@@ -845,9 +850,26 @@ struct DocumentContext {
 };
 
 /*
+ * 一个文档标签槽（P0-3）。
+ *
+ * 不变式：`tabs` 至少一项，且**恰好一项** front = true —— 那一项的内容不在这儿，
+ * 而在 `ShellState::doc`。前台文档始终只有一份副本，避免「两处都有内容、谁说了算」
+ * 这种最难查的双写。
+ *
+ * 槽里只放文档态，标题从 `doc.document_path` 现算：路径是唯一真源，另存一份
+ * title 迟早会跟路径分叉（另存为之后标签还顶着旧名字）。
+ */
+struct DocTabSlot {
+  bool front = false;
+  DocumentContext doc;
+};
+
+/*
  * 应用会话态：引擎、工具选择、笔刷/面板等跨文档保留的偏好，以及窗口句柄。
- * doc 目前只有一个实例；多文档落地时这里换成「文档标签页 -> DocumentContext」，
- * 本结构体其余字段保持不动。
+ *
+ * P0-3 起 doc 不再是唯一实例：`tabs` 里放**非前台**文档，前台那一份永远在
+ * `doc`。这样 34k 行里所有 `shell.doc.xxx` 一个都不用改，换文档 = 整体 move
+ * 一份 DocumentContext——比给 189 个字段改成 `shell.tabs[i].doc.xxx` 安全得多。
  */
 struct ShellState {
   comp_engine engine = nullptr;
@@ -987,6 +1009,26 @@ struct ShellState {
 
   /* 当前活动文档的上下文（本轮先内嵌一份，切换文档即整体替换）。 */
   DocumentContext doc;
+
+  /* ---------------------------------------------------------- P0-3 多文档 */
+  /*
+   * 标签槽：`tabs[active_tab]` 是前台（内容在 `doc`，槽里是空壳），其余槽各存
+   * 一份完整的 DocumentContext。懒初始化：第一次用到时补一个前台槽，不必改
+   * main() 的启动流程。
+   */
+  std::vector<DocTabSlot> tabs;
+  int active_tab = 0;
+  /* true = 当前文档已经停进 tabs，正在建/载入新文档（成功后插入新槽，失败则回滚）。 */
+  bool tab_parked = false;
+  /*
+   * 关闭流程的意图。0 = 关窗（退出）；1 = 只关闭当前标签。
+   * 退出时逐标签提示未保存：每答完一个就前进到下一个脏标签，直到全部收口。
+   */
+  int close_intent = 0;
+  /* 最近打开列表（UTF-8 全路径，最新在前，上限 kRecentLimit）。 */
+  std::vector<std::string> recent_files;
+  /* 最近文件面板里的当前选中项（行 0 的 Choice 值）。 */
+  int recent_index = 0;
 };
 
 extern ShellState* g_shell; /* 单窗口外壳，生命周期与窗口一致 */

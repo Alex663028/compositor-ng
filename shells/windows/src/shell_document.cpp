@@ -275,6 +275,9 @@ bool create_document_with(ShellState& shell, int width, int height, int dpi, int
  */
 bool create_document_opts(ShellState& shell, int width, int height, int dpi, int background,
                           int pixel_format, int color_mode) {
+  /* P0-3：新建 = 另起一个标签，不再覆盖当前文档（覆盖前要不要提示这个问题
+   * 随之消失——旧文档一直活着，用户随时切回去）。 */
+  tab_park_active(shell);
   comp_document_desc desc{};
   desc.width = comp_ui::clamp_doc_size(width);
   desc.height = comp_ui::clamp_doc_size(height);
@@ -288,12 +291,15 @@ bool create_document_opts(ShellState& shell, int width, int height, int dpi, int
   comp_document document = nullptr;
   const comp_result result = comp_document_create_ex(shell.engine, &desc, &options, &document);
   if (result != COMP_OK || document == nullptr) {
-    set_status(shell, L"新建文档失败");
+    set_status(shell, L"新建文档失败（当前文档未受影响）");
+    /* 建失败：把刚停进标签槽的旧文档搬回前台，窗口不能空着。 */
+    tab_restore_parked(shell);
     return false;
   }
   forget_color_range(shell);
   if (shell.doc.document != nullptr) comp_document_destroy(shell.doc.document);
   shell.doc.document = document;
+  tab_commit_new(shell);
   /* 新文档没有磁盘来源；dpi 记下来给标题栏用（引擎不提供回读口）。 */
   shell.doc.document_path.clear();
   shell.doc.document_dpi = static_cast<int>(desc.dpi);
@@ -350,9 +356,12 @@ bool load_document(ShellState& shell, const char* path_utf8) {
     set_status(shell, L"打开 .comp 失败");
     return false;
   }
+  /* 载入成功才停旧文档：load 失败时不必动标签，用户还留在原来那份上。 */
+  tab_park_active(shell);
   forget_color_range(shell);
   if (shell.doc.document != nullptr) comp_document_destroy(shell.doc.document);
   shell.doc.document = document;
+  tab_commit_new(shell);
 
   comp_size size{};
   if (comp_document_size(shell.doc.document, &size) == COMP_OK) {
@@ -386,6 +395,7 @@ bool load_document(ShellState& shell, const char* path_utf8) {
   /* 标题栏的文件名只在 .comp 上有意义：从位图打开的是「未命名文档」。 */
   shell.doc.document_path.assign(path_utf8);
   shell.doc.document_dpi = 0; /* 读盘没有 dpi 回读口：标题里省略，不瞎猜 72 */
+  recent_push(shell, path_utf8);
   refresh_history_status(shell, L"已打开 .comp");
   return true;
 }
@@ -396,6 +406,275 @@ bool save_document(ShellState& shell, const char* path_utf8) {
   if (ok) shell.doc.document_path.assign(path_utf8);
   set_status(shell, ok ? L"已保存 .comp" : L"保存 .comp 失败");
   return ok;
+}
+
+/* --------------------------------------------- P0-3：标签页 / 最近打开 */
+
+namespace {
+
+constexpr size_t kRecentLimit = 10;
+constexpr wchar_t kRecentFileName[] = L"recent-files.txt";
+
+/*
+ * 最近列表的落盘位置：%APPDATA%\Compositor\recent-files.txt，没有 APPDATA
+ * （精简环境 / 绿色包）时退到 exe 同级目录。**不写注册表**：绿色包不该在
+ * 用户机器上留下要专门清理的键，一个纯文本文件坏了删掉即可。
+ */
+std::wstring recent_config_path() {
+  wchar_t buffer[1024] = {0};
+  const DWORD length = GetEnvironmentVariableW(L"APPDATA", buffer, 1024);
+  if (length > 0 && length < 1024) {
+    std::wstring dir(buffer);
+    dir += L"\\Compositor";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\" + kRecentFileName;
+  }
+  const std::wstring exe = exe_directory();
+  return exe.empty() ? std::wstring() : exe + L"\\" + kRecentFileName;
+}
+
+bool write_lines(const std::wstring& path, const std::string& text) {
+  if (path.empty()) return false;
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"wb") != 0 || file == nullptr) return false;
+  const size_t written = text.empty() ? 0 : std::fwrite(text.data(), 1, text.size(), file);
+  std::fclose(file);
+  return written == text.size();
+}
+
+/* 路径去重用的键：Windows 路径大小写不敏感，\ 与 / 等价。 */
+std::string recent_key(const std::string& path) {
+  std::string key = path;
+  for (char& c : key) {
+    if (c == '/') c = '\\';
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return key;
+}
+
+}  // namespace
+
+void recent_load(ShellState& shell) {
+  shell.recent_files.clear();
+  std::vector<uint8_t> data;
+  if (!read_whole_file(recent_config_path(), &data) || data.empty()) return;
+  std::string text(data.begin(), data.end());
+  size_t start = 0;
+  while (start < text.size() && shell.recent_files.size() < kRecentLimit) {
+    size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    std::string line = text.substr(start, end - start);
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (!line.empty()) shell.recent_files.push_back(line);
+    start = end + 1;
+  }
+  if (shell.recent_index >= static_cast<int>(shell.recent_files.size())) shell.recent_index = 0;
+}
+
+void recent_save(const ShellState& shell) {
+  std::string text;
+  for (const std::string& path : shell.recent_files) {
+    text += path;
+    text += '\n';
+  }
+  write_lines(recent_config_path(), text);
+}
+
+void recent_push(ShellState& shell, const char* path_utf8) {
+  if (path_utf8 == nullptr || path_utf8[0] == '\0') return;
+  const std::string path(path_utf8);
+  const std::string key = recent_key(path);
+  std::vector<std::string> next;
+  next.push_back(path);
+  for (const std::string& existing : shell.recent_files) {
+    if (recent_key(existing) == key) continue;
+    if (next.size() >= kRecentLimit) break;
+    next.push_back(existing);
+  }
+  shell.recent_files = std::move(next);
+  shell.recent_index = 0;
+  recent_save(shell);
+}
+
+/* 换文档前收口所有跨帧交互：事务句柄不能在后台标签里挂着。
+ * 这批函数在 create_document_with 里也各调了一次，但那是在**新文档**上；
+ * 这里必须在旧文档还活着的时候先跑一遍。 */
+void doc_switch_finish(ShellState& shell) {
+  nudge_flush(shell);
+  stroke_cancel(shell);
+  move_cancel(shell);
+  eyedropper_cancel(shell);
+  marquee_cancel(shell);
+  selection_handle_cancel(shell);
+  lasso_cancel(shell);
+  pen_cancel(shell);
+  filter_preview_forget(shell);
+  guide_drag_forget(shell);
+  doc_dialog_close(shell, nullptr);
+}
+
+void tabs_ensure(ShellState& shell) {
+  if (shell.tabs.empty()) {
+    shell.tabs.push_back(DocTabSlot{});
+    shell.active_tab = 0;
+  }
+  if (shell.active_tab < 0 || shell.active_tab >= static_cast<int>(shell.tabs.size())) {
+    shell.active_tab = 0;
+  }
+  for (size_t i = 0; i < shell.tabs.size(); ++i) {
+    shell.tabs[i].front = static_cast<int>(i) == shell.active_tab;
+  }
+}
+
+int tab_count(ShellState& shell) {
+  tabs_ensure(shell);
+  return static_cast<int>(shell.tabs.size());
+}
+
+/* 标签标题：路径是唯一真源（另存为之后标签自动跟着改），脏标记向引擎现问。 */
+std::wstring tab_title(const ShellState& shell, int index) {
+  const std::string* path = nullptr;
+  comp_document document = nullptr;
+  if (index == shell.active_tab) {
+    path = &shell.doc.document_path;
+    document = shell.doc.document;
+  } else if (index >= 0 && index < static_cast<int>(shell.tabs.size())) {
+    path = &shell.tabs[index].doc.document_path;
+    document = shell.tabs[index].doc.document;
+  }
+  std::wstring title;
+  if (path != nullptr && !path->empty()) {
+    const size_t slash = path->find_last_of("/\\");
+    title = widen_utf8(slash == std::string::npos ? *path : path->substr(slash + 1));
+  } else {
+    title = document != nullptr ? L"未命名" : L"（空）";
+  }
+  int32_t dirty = 0;
+  if (document != nullptr && comp_document_is_dirty(document, &dirty) == COMP_OK && dirty != 0) {
+    title += L" *";
+  }
+  return title;
+}
+
+void tab_activate(ShellState& shell, int index) {
+  tabs_ensure(shell);
+  if (index < 0 || index >= static_cast<int>(shell.tabs.size()) || index == shell.active_tab) {
+    return;
+  }
+  doc_switch_finish(shell);
+  shell.tabs[shell.active_tab].doc = std::move(shell.doc);
+  shell.tabs[shell.active_tab].front = false;
+  shell.doc = std::move(shell.tabs[index].doc);
+  shell.tabs[index].doc = DocumentContext{};
+  shell.tabs[index].front = true;
+  shell.active_tab = index;
+  shell.doc.needs_render = true;
+  shell.window_title_cache.clear();
+  refresh_layers(shell);
+  refresh_selection(shell);
+  refresh_history_status(shell, L"已切换文档");
+}
+
+void tab_park_active(ShellState& shell) {
+  tabs_ensure(shell);
+  doc_switch_finish(shell);
+  if (shell.doc.document == nullptr) {
+    /* 启动后第一次建文档：没有可停的旧文档，直接复用当前槽。 */
+    shell.tab_parked = false;
+    return;
+  }
+  shell.tabs[shell.active_tab].doc = std::move(shell.doc);
+  shell.tabs[shell.active_tab].front = false;
+  shell.doc = DocumentContext{};
+  shell.tab_parked = true;
+}
+
+void tab_commit_new(ShellState& shell) {
+  tabs_ensure(shell);
+  if (!shell.tab_parked) {
+    /* 复用当前槽：第一次建文档就是它。 */
+    shell.tabs[shell.active_tab].front = true;
+    shell.window_title_cache.clear();
+    return;
+  }
+  DocTabSlot slot;
+  slot.front = true;
+  shell.tabs.insert(shell.tabs.begin() + shell.active_tab + 1, std::move(slot));
+  shell.active_tab += 1;
+  shell.tab_parked = false;
+  shell.window_title_cache.clear();
+}
+
+void tab_restore_parked(ShellState& shell) {
+  if (!shell.tab_parked) return;
+  if (shell.doc.document != nullptr) return;
+  if (shell.active_tab < 0 || shell.active_tab >= static_cast<int>(shell.tabs.size())) return;
+  if (shell.tabs[shell.active_tab].doc.document == nullptr) return;
+  shell.doc = std::move(shell.tabs[shell.active_tab].doc);
+  shell.tabs[shell.active_tab].doc = DocumentContext{};
+  shell.tabs[shell.active_tab].front = true;
+  shell.tab_parked = false;
+  shell.doc.needs_render = true;
+  shell.window_title_cache.clear();
+}
+
+bool tab_close_active(ShellState& shell) {
+  tabs_ensure(shell);
+  if (shell.doc.document != nullptr) comp_document_destroy(shell.doc.document);
+  shell.doc = DocumentContext{};
+  shell.tabs.erase(shell.tabs.begin() + shell.active_tab);
+  if (shell.tabs.empty()) {
+    shell.active_tab = 0;
+    shell.tab_parked = false;
+    shell.window_title_cache.clear();
+    return false;
+  }
+  if (shell.active_tab >= static_cast<int>(shell.tabs.size())) {
+    shell.active_tab = static_cast<int>(shell.tabs.size()) - 1;
+  }
+  shell.doc = std::move(shell.tabs[shell.active_tab].doc);
+  shell.tabs[shell.active_tab].doc = DocumentContext{};
+  shell.tabs[shell.active_tab].front = true;
+  shell.tab_parked = false;
+  shell.doc.needs_render = true;
+  shell.window_title_cache.clear();
+  refresh_layers(shell);
+  refresh_selection(shell);
+  return true;
+}
+
+void tab_step(ShellState& shell, int delta) {
+  tabs_ensure(shell);
+  const int count = static_cast<int>(shell.tabs.size());
+  if (count <= 1) {
+    set_status(shell, L"只有一个文档");
+    return;
+  }
+  int next = (shell.active_tab + delta) % count;
+  if (next < 0) next += count;
+  tab_activate(shell, next);
+}
+
+/*
+ * 关闭流程推进（退出时逐个收口）。
+ * 返回 true = 已经弹出未保存提示，等用户回答；false = 全部关完，可以关窗。
+ */
+bool close_flow_step(ShellState& shell) {
+  for (;;) {
+    tabs_ensure(shell);
+    if (shell.doc.document == nullptr) {
+      if (!tab_close_active(shell)) return false;
+      continue;
+    }
+    int32_t dirty = 0;
+    const bool is_dirty =
+        comp_document_is_dirty(shell.doc.document, &dirty) == COMP_OK && dirty != 0;
+    if (is_dirty) {
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::ClosePrompt);
+      return true;
+    }
+    if (!tab_close_active(shell)) return false;
+  }
 }
 
 /* ------------------------------------------------------------ 撤销 / 重做 */
@@ -581,6 +860,8 @@ int doc_dialog_row_value(const ShellState& shell, int row) {
     case comp_ui::DocDialogKind::ClosePrompt:
       if (row != 0) return 0;
       return shell.doc.doc_dialog_close_action;
+    case comp_ui::DocDialogKind::RecentFiles:
+      return row == 0 ? shell.recent_index : 0;
     case comp_ui::DocDialogKind::TransformSelection:
       switch (row) {
         case 0: return shell.doc.doc_dialog_width;
@@ -632,6 +913,18 @@ void doc_dialog_set_row_value(ShellState& shell, int row, int value) {
         default: break;
       }
       break;
+    case comp_ui::DocDialogKind::RecentFiles: {
+      /* 列表长度是动态的，在这里按条数取模——静态行模型的 max 只是个上界。 */
+      const int count = static_cast<int>(shell.recent_files.size());
+      if (count <= 0) {
+        shell.recent_index = 0;
+        break;
+      }
+      int next = value % count;
+      if (next < 0) next += count;
+      shell.recent_index = next;
+      break;
+    }
     case comp_ui::DocDialogKind::ImageSize:
       switch (row) {
         case 0:
@@ -836,6 +1129,17 @@ std::wstring doc_dialog_value_text(const ShellState& shell, int row) {
       if (shell.doc.doc_dialog == comp_ui::DocDialogKind::GradientStops) {
         return L"→ 插入 · ← 删除";
       }
+      if (shell.doc.doc_dialog == comp_ui::DocDialogKind::RecentFiles) {
+        const int count = static_cast<int>(shell.recent_files.size());
+        if (count == 0) return L"（列表为空）";
+        const int index = shell.recent_index < 0 || shell.recent_index >= count ? 0
+                                                                            : shell.recent_index;
+        const std::string& path = shell.recent_files[index];
+        const size_t slash = path.find_last_of("/\\");
+        const std::string leaf = slash == std::string::npos ? path : path.substr(slash + 1);
+        wsprintfW(buffer, L"%d/%d %s", index + 1, count, widen_utf8(leaf).c_str());
+        return buffer;
+      }
       return widen_utf8(comp_ui::doc_anchor_name(value));
     case comp_ui::DocRowKind::Number:
       break;
@@ -929,9 +1233,16 @@ void doc_dialog_begin(ShellState& shell, comp_ui::DocDialogKind kind) {
   if (kind == comp_ui::DocDialogKind::None) return;
   /* 新建不依赖当前文档；关闭提示的成立条件由 WM_CLOSE 那边先查（脏标记仍读引擎）。 */
   if (kind != comp_ui::DocDialogKind::NewDocument &&
-      kind != comp_ui::DocDialogKind::ClosePrompt && shell.doc.document == nullptr) {
+      kind != comp_ui::DocDialogKind::ClosePrompt &&
+      kind != comp_ui::DocDialogKind::RecentFiles && shell.doc.document == nullptr) {
     set_status(shell, L"文档：还没有打开任何文档");
     return;
+  }
+  if (kind == comp_ui::DocDialogKind::RecentFiles) {
+    /* 打开面板时现读一次盘：外部删了文件、或另一个进程往同一个列表里加过，
+     * 缓存一份就会点到已不存在的路径。 */
+    recent_load(shell);
+    shell.recent_index = 0;
   }
   /*
    * Camera Raw 是**图层级**的破坏性操作，入口条件比文档级对话框多两条：
@@ -1323,12 +1634,50 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
         }
       }
     }
-    /* 保存成功或「不保存」：关窗即退出（WM_DESTROY 里 PostQuitMessage）。 */
+    /*
+     * 保存成功或「不保存」：按 close_intent 决定关到哪儿。
+     *
+     *   1 = 只关当前标签（Ctrl+W）：关完还有别的标签就留着窗口；
+     *   0 = 退出：继续推进 —— 下一个标签若也脏，会再弹一次提示，
+     *       全部收口才 DestroyWindow。多文档之后「只问前台那一份就退出」
+     *       等于把后台标签的修改直接丢掉。
+     */
     doc_dialog_close(shell, nullptr);
-    DestroyWindow(window);
+    if (shell.close_intent == 1) {
+      shell.close_intent = 0;
+      if (!tab_close_active(shell)) DestroyWindow(window);
+      return;
+    }
+    if (!close_flow_step(shell)) {
+      shell.close_intent = 0;
+      DestroyWindow(window);
+    }
     return;
   }
 
+  if (kind == comp_ui::DocDialogKind::RecentFiles) {
+    const int count = static_cast<int>(shell.recent_files.size());
+    if (count == 0) {
+      doc_dialog_close(shell, L"最近列表为空（打开过 .comp 之后才会记录）");
+      return;
+    }
+    int index = shell.recent_index;
+    if (index < 0 || index >= count) index = 0;
+    const std::string path = shell.recent_files[index];
+    doc_dialog_close(shell, nullptr);
+    if (!load_document(shell, path.c_str())) {
+      /* 路径已经打不开：从列表里摘掉，免得下次又点它。 */
+      for (size_t i = 0; i < shell.recent_files.size(); ++i) {
+        if (shell.recent_files[i] == path) {
+          shell.recent_files.erase(shell.recent_files.begin() + static_cast<long>(i));
+          break;
+        }
+      }
+      recent_save(shell);
+      set_status(shell, L"打开失败：文件可能已被移动或删除（已从最近列表移除）");
+    }
+    return;
+  }
   if (kind == comp_ui::DocDialogKind::NewDocument) {
     const int width = shell.doc.doc_dialog_width;
     const int height = shell.doc.doc_dialog_height;
@@ -1847,6 +2196,31 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       break;
     case kCmdSaveAs:
       save_document_dialog(window, shell);
+      break;
+    /* ---- P0-3 多文档 ---- */
+    case kCmdCloseDocument: {
+      /* 关当前标签：脏则先问。最后一个标签关掉就等于关窗（与 PS 同口径）。 */
+      int32_t dirty = 0;
+      const bool is_dirty =
+          shell.doc.document != nullptr &&
+          comp_document_is_dirty(shell.doc.document, &dirty) == COMP_OK && dirty != 0;
+      if (is_dirty) {
+        shell.close_intent = 1;
+        doc_dialog_begin(shell, comp_ui::DocDialogKind::ClosePrompt);
+        break;
+      }
+      shell.close_intent = 0;
+      if (!tab_close_active(shell)) DestroyWindow(window);
+      break;
+    }
+    case kCmdNextTab:
+      tab_step(shell, 1);
+      break;
+    case kCmdPrevTab:
+      tab_step(shell, -1);
+      break;
+    case kCmdRecent:
+      doc_dialog_begin(shell, comp_ui::DocDialogKind::RecentFiles);
       break;
     /* ---- 图像 > 图像大小… / 画布大小…（对应上游 Image Size / Canvas Size） ---- */
     case kCmdImageSize:

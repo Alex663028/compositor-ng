@@ -714,6 +714,28 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   /* P0-1：位深 0=8 位 / 1=16 位；颜色模式 0=RGB / 1=灰度（取值即 ABI 枚举）。 */
   bool create_document_opts(ShellState& shell, int width, int height, int dpi, int background,
                             int pixel_format, int color_mode);
+
+  /* ------------------------------------------------------------ P0-3 多文档 */
+  /* 换文档前收口跨帧交互（事务句柄不能在后台标签里挂着）。 */
+  void doc_switch_finish(ShellState& shell);
+  /* 懒初始化：保证 tabs 至少一项、active_tab 合法、front 标记唯一。 */
+  void tabs_ensure(ShellState& shell);
+  int tab_count(ShellState& shell);
+  std::wstring tab_title(const ShellState& shell, int index);
+  void tab_activate(ShellState& shell, int index);
+  void tab_park_active(ShellState& shell);
+  void tab_commit_new(ShellState& shell);
+  void tab_restore_parked(ShellState& shell);
+  /* 关掉当前标签；true = 还有别的标签，false = 这是最后一个（调用方负责关窗）。 */
+  bool tab_close_active(ShellState& shell);
+  void tab_step(ShellState& shell, int delta);
+  /* 退出流程：返回 true = 已弹未保存提示，等用户回答。 */
+  bool close_flow_step(ShellState& shell);
+
+  /* 最近打开：%APPDATA%\Compositor\recent-files.txt，纯文本一行一个路径。 */
+  void recent_load(ShellState& shell);
+  void recent_save(const ShellState& shell);
+  void recent_push(ShellState& shell, const char* path_utf8);
   bool create_document(ShellState& shell);
   bool load_document(ShellState& shell, const char* path_utf8);
   bool save_document(ShellState& shell, const char* path_utf8);
@@ -747,6 +769,8 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   std::wstring option_value_text(const ShellState& shell, const comp_ui::ToolOptionSpec& spec);
   bool apply_tool_option(ShellState& shell, comp_ui::ToolOptionId id, int delta);
   void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
+  /* P0-3：文档标签栏（只在多文档时出现，布局已保证 tabbar.h > 0）。 */
+  void draw_tab_bar(HDC dc, const ShellState& shell, const Layout& layout);
   void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_channel_chip(HDC dc, const comp_ui::Rect& rect, const wchar_t* name, bool active);

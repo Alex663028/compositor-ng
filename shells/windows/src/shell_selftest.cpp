@@ -2609,6 +2609,113 @@ int run_selftest(const wchar_t* out_path) {
   }
   if (psd_source != nullptr) comp_document_destroy(psd_source);
 
+  /*
+   * P0-1：位深与颜色模式。
+   *
+   * 只查枚举等于只测了「宿主传什么我记什么」——真正会错的是 ensure_background_layer
+   * 里写死的 RGBA8（声明 16 位、实际 8 位），所以这里必须回读**背景层的像素格式**。
+   */
+  {
+    comp_document_desc depth_desc{};
+    depth_desc.width = 8;
+    depth_desc.height = 6;
+    comp_document_options depth_options{};
+    depth_options.struct_size = sizeof(depth_options);
+    depth_options.pixel_format = COMP_PIXEL_RGBA16;
+    depth_options.color_mode = COMP_COLOR_MODE_RGB;
+    comp_document depth_doc = nullptr;
+    const bool created =
+        comp_document_create_ex(engine, &depth_desc, &depth_options, &depth_doc) == COMP_OK &&
+        depth_doc != nullptr;
+    comp_pixel_format reported = COMP_PIXEL_RGBA8;
+    comp_pixel_format layer_format = COMP_PIXEL_RGBA8;
+    size_t layer_count = 0;
+    comp_layer_id first_layer = 0;
+    int32_t layer_width = 0;
+    int32_t layer_height = 0;
+    if (created) {
+      comp_document_pixel_format(depth_doc, &reported);
+      comp_layer_count(depth_doc, &layer_count);
+      comp_layer_list(depth_doc, &first_layer, 1, &layer_count);
+      comp_layer_get_pixels(depth_doc, first_layer, nullptr, 0, &layer_width, &layer_height,
+                            &layer_format);
+    }
+    verify(created && reported == COMP_PIXEL_RGBA16 && layer_format == COMP_PIXEL_RGBA16 &&
+               layer_width == 8 && layer_height == 6,
+           "P0-1 document bit depth 16 reaches the background layer buffer");
+    if (depth_doc != nullptr) comp_document_destroy(depth_doc);
+  }
+
+  /*
+   * P0-1：灰阶模式。写纯红进去，flatten 必须是 R=G=B 的 Rec.709 亮度。
+   * 这条同时钉住「只在输出转、读回还是彩色」那个半成品写法——存储侧也转了，
+   * 所以 get_pixels 读回来同样得是灰的。
+   */
+  {
+    comp_document_desc gray_desc{};
+    gray_desc.width = 4;
+    gray_desc.height = 4;
+    comp_document_options gray_options{};
+    gray_options.struct_size = sizeof(gray_options);
+    gray_options.color_mode = COMP_COLOR_MODE_GRAYSCALE;
+    comp_document gray_doc = nullptr;
+    bool gray_ok =
+        comp_document_create_ex(engine, &gray_desc, &gray_options, &gray_doc) == COMP_OK &&
+        gray_doc != nullptr;
+    if (gray_ok) {
+      comp_layer_id gray_layer = 0;
+      size_t gray_layers = 0;
+      comp_layer_count(gray_doc, &gray_layers);
+      comp_layer_list(gray_doc, &gray_layer, 1, &gray_layers);
+      std::vector<uint8_t> red(4u * 4u * 4u, 0u);
+      for (size_t i = 0; i + 3 < red.size(); i += 4) {
+        red[i + 0] = 255;
+        red[i + 3] = 255;
+      }
+      comp_image red_image{};
+      red_image.width = 4;
+      red_image.height = 4;
+      red_image.format = COMP_PIXEL_RGBA8;
+      red_image.stride = 4u * 4u;
+      red_image.pixels = red.data();
+      std::vector<uint8_t> canvas(4u * 4u * 4u, 0u);
+      const bool wrote = comp_layer_set_pixels(gray_doc, gray_layer, &red_image) == COMP_OK;
+      const bool flattened =
+          comp_render_flatten(gray_doc, canvas.data(), COMP_PIXEL_RGBA8, 4u * 4u) == COMP_OK;
+      bool all_gray = true;
+      for (size_t i = 0; i + 3 < canvas.size(); i += 4) {
+        if (canvas[i + 0] != canvas[i + 1] || canvas[i + 1] != canvas[i + 2]) all_gray = false;
+        if (canvas[i + 0] < 53 || canvas[i + 0] > 55) all_gray = false; /* 0.2126*255 ≈ 54 */
+      }
+      gray_ok = wrote && flattened && all_gray;
+    }
+    verify(gray_ok, "P0-1 grayscale document flattens to R=G=B (Rec.709 luma)");
+    if (gray_doc != nullptr) comp_document_destroy(gray_doc);
+  }
+
+  /*
+   * P0-3：多文档标签。新建 -> 两个槽；切回第一个 -> 句柄与尺寸都回到第一份；
+   * 关掉它 -> 前台切到第二份。整段不碰窗口，纯 ShellState 级的标签生命周期。
+   */
+  {
+    ShellState tabs_shell{};
+    tabs_shell.engine = engine;
+    const bool first_ok = create_document_with(tabs_shell, 8, 6, 72, 0);
+    comp_document first_document = tabs_shell.doc.document;
+    const bool second_ok = create_document_with(tabs_shell, 4, 3, 72, 0);
+    comp_document second_document = tabs_shell.doc.document;
+    const int opened = tab_count(tabs_shell);
+    tab_activate(tabs_shell, 0);
+    const bool switched_back =
+        tabs_shell.doc.document == first_document && tabs_shell.doc.width == 8 &&
+        tabs_shell.doc.height == 6;
+    const bool remains = tab_close_active(tabs_shell);
+    const bool fell_back = remains && tabs_shell.doc.document == second_document;
+    verify(first_ok && second_ok && opened == 2 && switched_back && fell_back,
+           "P0-3 tabs: two documents park / switch / close without losing state");
+    if (tabs_shell.doc.document != nullptr) comp_document_destroy(tabs_shell.doc.document);
+  }
+
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 
