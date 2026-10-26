@@ -30,6 +30,7 @@
 
 #include <poll.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #define LOG_DOMAIN 0xD003F0
 #define LOG_TAG "compositor-ohos"
@@ -99,6 +100,7 @@ void OnSurfaceChangedCB(OH_NativeXComponent* component, void* window) {
    * 已下发的 format/usage 随之失效，不重配则 RequestBuffer 拒绝（40601000，
    * 2026-10-26 模拟器实测）。重置标志，下一帧 present 重新配置。 */
   g_configured_width = 0;
+  g_configured_height = 0;
 }
 
 void OnSurfaceDestroyedCB(OH_NativeXComponent* component, void* window) {
@@ -456,25 +458,50 @@ std::mutex g_present_mutex;
 bool g_present_running = false;
 std::atomic<int32_t> g_present_last_rc{-100};
 std::atomic<int> g_present_stage{0};  /* 诊断：0=未跑 1=SET_FORMAT 2=SET_USAGE 3=REQUEST 4=HANDLE 5=FLUSH 6=完成 */  // -100 = 尚无结果（或进行中）
+char g_present_diag[384] = {0};  /* 诊断：配置读回 + RequestBuffer 结果（OPT-21b 排查） */
 
 int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width,
                   uint32_t height, uint64_t generation) {
   if (g_surface_generation.load() != generation || window == nullptr) return -1;
+  g_present_diag[0] = '\0';  /* 每帧重置诊断，避免无限累加 */
 
-  /* 不 SET_BUFFER_GEOMETRY：缓冲按表面原生尺寸分配（=文档尺寸，由 ArkTS 侧保证
-   * 一致），任何几何改配都会触发缓冲队列与消费者的重配协商——首版撕裂画面与
-   * 阻塞都源于此。格式与 usage 只在首帧下发一次。 */
-  if (g_configured_width == 0) {
+  /* 只在几何/尺寸变化时下发一次配置。
+   *
+   * SET_BUFFER_GEOMETRY 是 RequestBuffer 的**官方前置契约**（external_window.h:
+   * "Before calling this interface, you need to set the width and height of
+   * OHNativeWindow through SET_BUFFER_GEOMETRY"）。此前刻意不设、指望缓冲按表面
+   * 原生尺寸分配——surface 2030x456 时侥幸成立，改成 2038x570 后 RequestBuffer
+   * 恒定 NO_BUFFER(40601000)，即 OPT-21b（2026-10-26 模拟器实测）。
+   *
+   * 改配几何确实会触发缓冲队列与消费者的重配协商，所以严格按尺寸变化触发：
+   * 尺寸不变就一帧都不多设，避免每帧协商导致的阻塞与撕裂。 */
+  if (g_configured_width != width || g_configured_height != height) {
     g_present_stage.store(1);
     int rc = OH_NativeWindow_NativeWindowHandleOpt(window, SET_FORMAT, NATIVEBUFFER_PIXEL_FMT_RGBA_8888);
-    if (rc != 0) { return 6; }
+    if (rc != 0) { LOGE("SET_FORMAT rc=%{public}d", rc); return 6; }
     g_present_stage.store(2);
     rc = OH_NativeWindow_NativeWindowHandleOpt(window, SET_USAGE,
                                                NATIVEBUFFER_USAGE_CPU_READ |
-                                                   NATIVEBUFFER_USAGE_CPU_WRITE);
-    if (rc != 0) { return 6; }
-    g_configured_width = 1;
-    LOGI("window format/usage configured");
+                                                   NATIVEBUFFER_USAGE_CPU_WRITE |
+                                                   NATIVEBUFFER_USAGE_MEM_DMA);
+    if (rc != 0) { LOGE("SET_USAGE rc=%{public}d", rc); return 6; }
+    rc = OH_NativeWindow_NativeWindowHandleOpt(window, SET_BUFFER_GEOMETRY, width, height);
+    if (rc != 0) {
+      LOGE("SET_BUFFER_GEOMETRY %{public}ux%{public}u rc=%{public}d", width, height, rc);
+      return 6;
+    }
+    g_configured_width = width;
+    g_configured_height = height;
+    /* 诊断：配置后读回窗口真实几何/格式/usage，确认 SET_* 是否被接受。 */
+    int32_t back_w = 0, back_h = 0, back_fmt = 0;
+    uint64_t back_usage = 0;
+    OH_NativeWindow_NativeWindowHandleOpt(window, GET_BUFFER_GEOMETRY, &back_w, &back_h);
+    OH_NativeWindow_NativeWindowHandleOpt(window, GET_FORMAT, &back_fmt);
+    OH_NativeWindow_NativeWindowHandleOpt(window, GET_USAGE, &back_usage);
+    snprintf(g_present_diag, sizeof(g_present_diag),
+             "cfg %ux%u->%dx%d fmt%d usage0x%llx", width, height, back_w, back_h, back_fmt,
+             (unsigned long long)back_usage);
+    LOGI("window configured: %{public}ux%{public}u", width, height);
   }
 
   NativeWindowBuffer* buffer = nullptr;
@@ -489,18 +516,79 @@ int32_t DoPresent(OHNativeWindow* window, comp_document document, uint32_t width
     buffer = nullptr;
     usleep(50 * 1000);
   }
-  if (rc != 0 || buffer == nullptr) { return 6; }
+  if (rc != 0 || buffer == nullptr) {
+    const size_t used = strlen(g_present_diag);
+    if (used < sizeof(g_present_diag) - 1) {
+      snprintf(g_present_diag + used, sizeof(g_present_diag) - used, " | rb=%d buf=%p",
+               rc, reinterpret_cast<void*>(buffer));
+    }
+    return 6;
+  }
   LOGI("request buffer ok, fence=%{public}d", fence_fd);
 
   g_present_stage.store(4);
   BufferHandle* handle = OH_NativeWindow_GetBufferHandleFromNative(buffer);
-  if (handle == nullptr || handle->virAddr == nullptr) { return 6; }
+  /* 该平台 GetBufferHandleFromNative 不给 virAddr（实测恒为 0，加 MEM_DMA 也不给）；
+   * 直接 mmap(handle->fd) 也拿不到可写内存（写入不可见，读回恒 0）。
+   * 唯一有效路径是官方的 OH_NativeBuffer_Map：从 OHNativeWindowBuffer 取
+   * OH_NativeBuffer 再 Map（2026-10-26 模拟器逐条实测）。 */
+  void* pixels = handle != nullptr ? handle->virAddr : nullptr;
+  OH_NativeBuffer* mapped_buffer = nullptr;
+  bool mapped_by_us = false;
+  if (handle != nullptr && pixels == nullptr) {
+    OH_NativeBuffer* nb = nullptr;
+    if (OH_NativeBuffer_FromNativeWindowBuffer(buffer, &nb) == 0 && nb != nullptr) {
+      void* addr = nullptr;
+      if (OH_NativeBuffer_Map(nb, &addr) == 0 && addr != nullptr) {
+        pixels = addr;
+        mapped_buffer = nb;
+        mapped_by_us = true;
+      }
+    }
+  }
+  if (handle == nullptr || pixels == nullptr) {
+    const size_t used = strlen(g_present_diag);
+    if (used < sizeof(g_present_diag) - 1) {
+      snprintf(g_present_diag + used, sizeof(g_present_diag) - used,
+               " | h=%p v=%p fd=%d size=%d stride=%d", reinterpret_cast<void*>(handle),
+               handle != nullptr ? handle->virAddr : nullptr, handle != nullptr ? handle->fd : -1,
+               handle != nullptr ? handle->size : -1, handle != nullptr ? handle->stride : -1);
+    }
+    /* 关键：拿到 buffer 后任何提前返回都必须归还，否则 —— 官方文档原话 ——
+     * "otherwise buffer will be exhausted"。首次失败漏归还后，后续每一帧都
+     * 拿不到 buffer，表象就是 RequestBuffer 永远 NO_BUFFER / 长时间等待，
+     * 而失败现场已经被冲掉，极难定位（2026-10-26 模拟器实测）。 */
+    OH_NativeWindow_NativeWindowAbortBuffer(window, buffer);
+    return 6;
+  }
   WaitFence(fence_fd);
 
-  if (g_surface_generation.load() != generation) return -1;  // surface 已销毁，放弃
+  if (g_surface_generation.load() != generation) {  // surface 已销毁，放弃
+    if (mapped_by_us) OH_NativeBuffer_Unmap(mapped_buffer);
+    OH_NativeWindow_NativeWindowAbortBuffer(window, buffer);
+    return -1;
+  }
   const comp_result flatten_rc = comp_render_flatten(
-      document, handle->virAddr, COMP_PIXEL_RGBA8, static_cast<size_t>(handle->stride));
-  if (flatten_rc != 0) { LOGE("flatten rc=%{public}d", (int)flatten_rc); return (int32_t)flatten_rc; }
+      document, pixels, COMP_PIXEL_RGBA8, static_cast<size_t>(handle->stride));
+  if (flatten_rc != 0) {
+    if (mapped_by_us) OH_NativeBuffer_Unmap(mapped_buffer);
+    OH_NativeWindow_NativeWindowAbortBuffer(window, buffer);
+    return static_cast<int32_t>(flatten_rc);
+  }
+  {
+    const uint8_t* probe = static_cast<const uint8_t*>(pixels);
+    const size_t mid = static_cast<size_t>(handle->stride) * (handle->height / 2) +
+                       static_cast<size_t>(handle->width / 2) * 4;
+    const size_t used = strlen(g_present_diag);
+    if (used < sizeof(g_present_diag) - 1) {
+      snprintf(g_present_diag + used, sizeof(g_present_diag) - used,
+               " | ok hw=%d hh=%d st=%d sz=%d map=%d px0=%02x%02x%02x%02x pxm=%02x%02x%02x%02x",
+               handle->width, handle->height, handle->stride, handle->size, mapped_by_us ? 1 : 0,
+               probe[0], probe[1], probe[2], probe[3], probe[mid], probe[mid + 1], probe[mid + 2],
+               probe[mid + 3]);
+    }
+  }
+  if (mapped_by_us) OH_NativeBuffer_Unmap(mapped_buffer);
 
   Region damage;
   Region::Rect rect;
@@ -642,6 +730,12 @@ napi_value JsPresentResult(napi_env env, napi_callback_info info) {
   return MakeInt32(env, g_present_last_rc.load());
 }
 
+/* 诊断：上一次 present 的窗口配置读回与 RequestBuffer 原始返回码。 */
+napi_value JsPresentDiag(napi_env env, napi_callback_info info) {
+  (void)info;
+  return MakeString(env, g_present_diag);
+}
+
 // ---------------------------------------------------------------------------
 // JS 导出：离屏合成（临时文档，诊断用；保留旧签名）
 // ---------------------------------------------------------------------------
@@ -737,6 +831,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"present", nullptr, JsPresent, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"presentResult", nullptr, JsPresentResult, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"presentDiag", nullptr, JsPresentDiag, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"presentStage", nullptr, [](napi_env env, napi_callback_info info) {
         (void)info;
         napi_value out = nullptr;

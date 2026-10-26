@@ -8,7 +8,7 @@
 //
 // napi_init.cpp 用 napi_define_properties 挂命名导出，这里必须用命名导入。
 
-import { presentStage, touchCount, newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
+import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setTopOpacity, setTopBlend, layerCount,
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
          backendName, exportPng } from 'libcompositor.so';
 
@@ -20,6 +20,7 @@ struct Index {
   @State layers: number = 0;
   @State lastOp: string = '—';
   @State presentState: string = '未上屏';
+  @State diag: string = '—';
   @State undoState: string = '—';
   @State topOpacity: number = 0.5;
   @State exportState: string = '—';
@@ -29,9 +30,12 @@ struct Index {
     this.surface = surfaceInfo();
     this.layers = layerCount();
     this.undoState = canUndo() > 0 ? '可撤销' : '空';
-    present();  // 异步提交（主线程绝不阻塞）；真实 rc 由 presentResult 读取
+    /* 先读上一帧的结果与诊断，再提交新一帧：present 是异步的，先提交会把
+     * 诊断缓冲清空，读到的永远是空串（2026-10-26 实测踩过）。 */
     const rc: number = presentResult();
     this.presentState = rc === -100 ? '提交中' : (rc === 0 ? '上屏 OK' : ('rc=' + rc.toString()));
+    this.diag = presentDiag();
+    present();
   }
 
   private do(label: string, code: number): void {
@@ -53,11 +57,24 @@ struct Index {
         .width('100%')
         .height(300)
         .backgroundColor('#101418')
+        /* surface 建好之后才读得到真实后端/尺寸；不在这里刷新，界面会一直停在
+         * 硬编码的 'None' / 'absent'，看起来像初始化失败（2026-10-26 实测）。 */
+        .onLoad(() => {
+          this.backend = backendName();
+          this.surface = surfaceInfo();
+          this.layers = layerCount();
+          this.undoState = canUndo() > 0 ? '可撤销' : '空';
+        })
 
       Text('后端 ' + this.backend + ' · 表面 ' + this.surface + ' · 上屏 ' + this.presentState)
         .fontSize(12)
       Text('S' + presentStage().toString() + ' 触' + touchCount().toString() + ' · 图层 ' + this.layers.toString() + ' · 撤销 ' + this.undoState + ' · 最近 ' + this.lastOp + ' · 导出 ' + this.exportState)
         .fontSize(12)
+      Text(this.diag)
+        .fontSize(9)
+        .fontColor('#8a8a8a')
+        .width('100%')
+        .textAlign(TextAlign.Center)
 
       Row({ space: 8 }) {
         Button('新建').onClick(() => {
