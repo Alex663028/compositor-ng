@@ -1,0 +1,40 @@
+/* compositor_shell.rc — Windows 壳的资源脚本（图标 + 版本信息）
+ *
+ * 只放两样东西：程序图标（explorer / 任务栏 / Alt+Tab）和 VERSIONINFO
+ * （文件属性里能看到的版本、产品名、版权）。都属「发出去才需要」的元数据，
+ * 不影响任何行为。
+ *
+ * 编译：python -m ziglang rc /fo build/compositor_shell.res packaging/compositor_shell.rc
+ * 链接：把 .res 一并塞给 linker（见 scripts/build_windows_shell.py）。
+ */
+
+1 ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "compositor-ng"
+            VALUE "FileDescription",  "Compositor - image editor"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "compositor_shell"
+            VALUE "OriginalFilename", "compositor_shell.exe"
+            VALUE "ProductName",      "Compositor"
+            VALUE "ProductVersion",   "0.1.0.0"
+            VALUE "LegalCopyright",   "MIT License"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

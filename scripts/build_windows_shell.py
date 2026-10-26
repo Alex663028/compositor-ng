@@ -28,6 +28,46 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
+
+
+def compile_resource_script():
+    """把 packaging/compositor_shell.rc 编成 .res（程序图标 + VERSIONINFO）。
+
+    资源只影响「发出去之后长什么样」，不影响能否运行，因此任何一步失败都只打印
+    提示并返回 None，绝不阻塞构建。
+
+    rc 编译器优先级：DevEco NDK 的 llvm-rc（本机确定存在）→ PATH 上的 llvm-rc →
+    Windows SDK 的 rc.exe。zig 自带的 `zig rc` 在本机会因缓存目录限制直接失败，
+    所以不在候选里。
+    """
+    rc_script = os.path.join(ROOT, "packaging", "compositor_shell.rc")
+    if not os.path.isfile(rc_script):
+        print("[shell] 跳过资源：未找到 packaging/compositor_shell.rc")
+        return None
+    out = os.path.join(BUILD, "compositor_shell.res")
+    if os.path.isfile(out) and os.path.getmtime(out) > os.path.getmtime(rc_script):
+        return out
+
+    deveco_sdk = os.environ.get("DEVECO_SDK_HOME", "G:/DevEco Studio/sdk")
+    candidates = [
+        os.path.join(deveco_sdk, "default", "openharmony", "native", "llvm", "bin", "llvm-rc.exe"),
+        "llvm-rc",
+        "rc",
+    ]
+    compiler = next((c for c in candidates if c == "llvm-rc" or c == "rc" or os.path.isfile(c)), None)
+    if compiler is None:
+        print("[shell] 跳过资源：找不到 rc 编译器（llvm-rc / rc.exe）")
+        return None
+
+    print("[shell] resource: " + compiler)
+    # llvm-rc 只认 `-fo <out> <in>`；用 `/fo` 会被当成第二个输入文件。
+    result = subprocess.run([compiler, "-fo", out, rc_script],
+                            cwd=os.path.dirname(rc_script),
+                            capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.isfile(out):
+        print("[shell] 资源编译失败（不阻塞构建）：" + (result.stderr or "").strip()[:300])
+        return None
+    return out
 PYTHON = sys.executable
 SHELL_SRC = os.path.join(ROOT, "shells", "windows", "src")
 
@@ -126,7 +166,10 @@ def main():
         shell_objects.append(obj)
 
     exe = os.path.join(BUILD, "compositor_shell.exe")
+    resource = compile_resource_script()
     link = [PYTHON, "-m", "ziglang", "c++"] + shell_objects + engine_objects(args.gpu)
+    if resource is not None:
+        link.append(resource)
     link += ["-o", exe, "-mwindows", "-municode", "-luser32", "-lgdi32", "-lcomdlg32", "-pthread"]
     run(link)
 
