@@ -767,6 +767,17 @@ inline int layer_row_at(const Rect& panel, int layer_count, double x, double y, 
   return row;
 }
 
+/* 考虑滚动的图层行命中（scroll = 顶部被滚过去的行数）。 */
+inline int layer_row_at_scrolled(const Rect& panel, int layer_count, double x, double y,
+                                 int row_top, int scroll) {
+  if (layer_count <= 0 || !panel.contains(x, y)) return -1;
+  const double local = y - static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
+  if (local < 0.0) return -1;
+  const int row = scroll + static_cast<int>(std::floor(local / static_cast<double>(kLayerRowHeight)));
+  if (row < 0 || row >= layer_count) return -1;
+  return row;
+}
+
 /* 面板显示序：第 0 行 = 最上层图层（与引擎数组序相反，由调用方换算）。 */
 inline int layer_row_at(const Rect& panel, int layer_count, double x, double y) {
   return layer_row_at(panel, layer_count, x, y, 0);
@@ -779,6 +790,19 @@ inline Rect layer_row_rect(const Rect& panel, int row) {
 
 inline Rect layer_row_rect(const Rect& panel, int row, int row_top) {
   return Rect{panel.x, panel.y + kLayerHeaderHeight + row_top + row * kLayerRowHeight, panel.w,
+              kLayerRowHeight};
+}
+
+/*
+ * 考虑**滚动**的图层行矩形（scroll = 顶部被滚过去的行数）。
+ *
+ * 为什么要滚动：图层面板原先把**所有**行都画出来、超出面板的部分直接裁掉，
+ * 层一多就看不到底下的层——那不是「不方便」，是**看不到**。图层列表是
+ * 唯一没有滚动条也没有滚动能力的列表（调整栏里的滑杆区、历史、通道都有）。
+ */
+inline Rect layer_row_rect_scrolled(const Rect& panel, int row, int row_top, int scroll) {
+  return Rect{panel.x,
+              panel.y + kLayerHeaderHeight + row_top + (row - scroll) * kLayerRowHeight, panel.w,
               kLayerRowHeight};
 }
 
@@ -4987,11 +5011,83 @@ inline int list_max_scroll(const Rect& panel, int count, int top, int footer, in
   return count - visible;
 }
 
+/* ------------------------------------------------------------ 竖向滚动条 */
+/*
+ * 可见滚动条（PS 同款）：轨道贴在面板右缘，滑块按可视比例定位。
+ *
+ * 为什么要有：滚动此前**只能靠滚轮**——用户看不到「下面还有东西」。
+ * 调整栏里的历史 / 通道 / 滑杆区也都没有可见滚动条，这一并补上。
+ *
+ * 设施是通用的（任何列表都能算），具体列表只负责把内容高度传进来。
+ */
+inline constexpr int kScrollBarWidth = 8;
+inline constexpr int kScrollBarThumbMin = 24;
+
+struct ScrollBarGeometry {
+  Rect track;   /* 轨道 */
+  Rect thumb;   /* 滑块 */
+  bool visible = false;
+};
+
+/*
+ * 竖向滚动条几何。
+ *
+ * @param panel      面板矩形（滚动条贴在它的右缘内侧）
+ * @param top        内容区顶部相对面板顶部的偏移（标题行等）
+ * @param viewport_h 可视高度
+ * @param content_h  内容总高度（可视高度 + 最大滚动量对应的内容）
+ * @param scroll     当前滚动量
+ * @param max_scroll 最大滚动量（0 = 装得下，不画）
+ */
+inline ScrollBarGeometry scroll_bar_vertical(const Rect& panel, int top, int viewport_h,
+                                              int content_h, int scroll, int max_scroll) {
+  ScrollBarGeometry geo{};
+  if (max_scroll <= 0 || viewport_h <= 0 || content_h <= viewport_h) return geo;
+  geo.visible = true;
+  geo.track = Rect{panel.right() - kScrollBarWidth, panel.y + top, kScrollBarWidth, viewport_h};
+  /* 滑块高度按可视比例；下限 24 px——太小的滑块点不准，用户会拖不动。 */
+  int thumb_h = viewport_h * viewport_h / content_h;
+  if (thumb_h < kScrollBarThumbMin) thumb_h = kScrollBarThumbMin;
+  if (thumb_h > viewport_h) thumb_h = viewport_h;
+  const int travel = viewport_h - thumb_h;
+  const int offset = travel * scroll / max_scroll;
+  geo.thumb = Rect{geo.track.x, geo.track.y + offset, kScrollBarWidth, thumb_h};
+  return geo;
+}
+
+/* 拖滑块：指针位置 -> 新的滚动量（夹在 [0, max_scroll]）。 */
+inline int scroll_from_thumb_drag(const ScrollBarGeometry& geo, int mouse_y, int max_scroll) {
+  if (!geo.visible || geo.thumb.h <= 0 || max_scroll <= 0) return 0;
+  const int travel = geo.track.h - geo.thumb.h;
+  if (travel <= 0) return 0;
+  const int offset = mouse_y - geo.track.y - geo.thumb.h / 2;
+  if (offset <= 0) return 0;
+  if (offset >= travel) return max_scroll;
+  return offset * max_scroll / travel;
+}
+
+/* 点轨道空白处：翻一「页」。 */
+inline int scroll_page_step(int visible_rows) { return visible_rows > 1 ? visible_rows - 1 : 1; }
+
 inline int list_clamp_scroll(const Rect& panel, int count, int scroll, int top, int footer,
                              int row_height) {
   if (scroll < 0) scroll = 0;
   const int max_scroll = list_max_scroll(panel, count, top, footer, row_height);
   return scroll > max_scroll ? max_scroll : scroll;
+}
+
+/* ---------------------------------------------------------- 图层列表的滚动 */
+inline int layer_visible_rows(const Rect& panel, int row_top) {
+  return list_visible_rows(panel, kLayerHeaderHeight + row_top, 0, kLayerRowHeight);
+}
+
+inline int layer_scroll_max(const Rect& panel, int layer_count, int row_top) {
+  return list_max_scroll(panel, layer_count, kLayerHeaderHeight + row_top, 0, kLayerRowHeight);
+}
+
+inline int layer_scroll_clamp(const Rect& panel, int layer_count, int row_top, int scroll) {
+  return list_clamp_scroll(panel, layer_count, scroll, kLayerHeaderHeight + row_top, 0,
+                           kLayerRowHeight);
 }
 
 /* 让 index 落进可视区（↑/↓ 选行、新项入列时用）：只滚到刚好够，不居中。 */
@@ -5423,19 +5519,21 @@ inline int32_t layer_drag_insert_slot(int32_t from_shown, int32_t to_shown) {
  * 否则直方图一开指示线就整体上移 64px——「线在上一行、贴纸落到这一行」。
  */
 inline Rect layer_insert_line_rect(const Rect& panel, int row_top, int32_t to_shown,
-                                   int32_t count) {
+                                   int32_t count, int scroll = 0) {
   int32_t slot = to_shown;
   if (slot < 0) slot = 0;
   if (slot > count) slot = count;
-  const int y = panel.y + kLayerHeaderHeight + row_top + slot * kLayerRowHeight;
+  const int y = panel.y + kLayerHeaderHeight + row_top + (slot - scroll) * kLayerRowHeight;
   return Rect{panel.x + 4, y - 1, panel.w - 8, 2};
 }
 
 /* 落点行：把鼠标 y 换算成 0..count-1 的面板行（上/下越界夹到首/末行）。 */
-inline int32_t layer_drag_target_row(const Rect& panel, int32_t count, double y, int row_top) {
+inline int32_t layer_drag_target_row(const Rect& panel, int32_t count, double y, int row_top,
+                                     int scroll = 0) {
   if (count <= 0) return -1;
   const double top = static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
-  const double row = std::floor((y - top) / static_cast<double>(kLayerRowHeight));
+  const double row =
+      static_cast<double>(scroll) + std::floor((y - top) / static_cast<double>(kLayerRowHeight));
   if (row < 0.0) return 0;
   if (row >= static_cast<double>(count)) return count - 1;
   return static_cast<int32_t>(row);
@@ -5447,10 +5545,10 @@ inline int32_t layer_drag_target_row(const Rect& panel, int32_t count, double y,
  * 且指针在中间带时，才走跨父级 move；边缘拖拽仍是原来的同父插入。
  */
 inline bool layer_drag_inner_band(const Rect& panel, int32_t count, int32_t row, double y,
-                                  int row_top) {
+                                  int row_top, int scroll = 0) {
   if (row < 0 || row >= count) return false;
   const double top = static_cast<double>(panel.y + kLayerHeaderHeight + row_top);
-  const double local = y - top - static_cast<double>(row) * kLayerRowHeight;
+  const double local = y - top - static_cast<double>(row - scroll) * kLayerRowHeight;
   return local > kLayerRowHeight * 0.3 && local < kLayerRowHeight * 0.7;
 }
 

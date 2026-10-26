@@ -3978,6 +3978,28 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             InvalidateRect(window, nullptr, FALSE);
             return 0;
           }
+        } else if (client_layout(*shell, &layout) && layout.layer_panel.w > 0 &&
+                   !layout.layer_collapsed && layout.layer_panel.contains(cursor.x, cursor.y)) {
+          /*
+           * 图层列表滚轮：一格 3 行，夹取在 ui_core。
+           *
+           * 此前图层面板**完全没有滚动**：所有行都画出来、超出面板的部分直接裁掉，
+           * 层一多就看不到底下的层——那不是「不方便」，是看不到。调整栏里的
+           * 历史 / 通道 / 滑杆区都有滚动，只有图层列表漏了。
+           *
+           * 位置：直方图分支之后——直方图打开时光标在绘图区该缩放直方图，
+           * 在图层行区该滚列表，两件事不能互相抢。
+           */
+          const int delta = static_cast<short>(HIWORD(wparam));
+          if (delta != 0) {
+            const int row_top = comp_ui::layer_rows_top(shell->doc.histogram_open);
+            const int count = panel_row_count(*shell);
+            const int next = shell->doc.layer_scroll + (delta > 0 ? -3 : 3);
+            shell->doc.layer_scroll =
+                comp_ui::layer_scroll_clamp(layout.layer_panel, count, row_top, next);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+          }
         } else if (client_layout(*shell, &layout) && layout.adjust_panel.w > 0 &&
                    !layout.adjust_collapsed && history_panel_visible(*shell) &&
                    layout.adjust_panel.contains(cursor.x, cursor.y)) {

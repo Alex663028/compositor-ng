@@ -338,20 +338,40 @@ void DockState::group_move(PanelId id, DockArea side) {
 void DockState::group_merge(PanelId id) {
   /*
    * 合并成一组：把 id 挪到**另一块面板**所在的列。
-   *
-   * 组宽的初值 = 目标列合并前的实际宽度。必须在移动**之前**取：移动之后
-   * 两块同列，「激活成员的宽度」就变成按激活标签变化的东西了。
    */
   const PanelId other = id == PanelId::Adjust ? PanelId::Layers : PanelId::Adjust;
   const DockArea side = panels[index_of(other)].area;
+  group_merge_to(id, side);
+}
+
+void DockState::group_merge_to(PanelId id, DockArea side) {
   if (side != DockArea::Left && side != DockArea::Right) return;
+  const int index = index_of(id);
+  if (panels[index].area == side) return; /* 已经在那列，没什么可合并的 */
+  /*
+   * 组宽的初值 = 目标列合并前的**实际宽度**：那块面板用户拖出来的宽度
+   * （没有就用它的缺省宽）。
+   *
+   * 必须在移动**之前**取——移动之后两块同列，「激活成员的宽度」就变成
+   * 按激活标签变化的东西了（那正是要消除的依赖）。
+   *
+   * 用「实际宽度」而不是「缺省宽度」：用户把面板拖宽到 400 再合并，
+   * 组宽就该是 400，合并瞬间画布宽度不动。用缺省宽会让画布跳一下，
+   * 正在看的图被挤动。
+   */
   const int stored = group_width(side);
-  /* 目标列原本停着谁，就用谁的缺省宽。 */
-  const int fallback = other == PanelId::Layers ? static_cast<int>(comp_ui::Layout::kLayerPanelWidth)
-                                               : static_cast<int>(comp_ui::Layout::kAdjustPanelWidth);
-  const int initial = stored > 0 ? stored : fallback;
+  const PanelId occupant = group_member(side, 0);
+  const int fallback = occupant == PanelId::Layers
+                           ? static_cast<int>(comp_ui::Layout::kLayerPanelWidth)
+                           : static_cast<int>(comp_ui::Layout::kAdjustPanelWidth);
+  const int actual = occupant == PanelId::Count ? fallback : width_of(occupant, fallback);
+  const int initial = stored > 0 ? stored : actual;
   group_move(id, side);
   set_group_width(side, initial);
+}
+
+DockArea DockState::last_docked_area(PanelId id) const {
+  return last_docked_[index_of(id)];
 }
 
 void DockState::group_ungroup(PanelId id) {

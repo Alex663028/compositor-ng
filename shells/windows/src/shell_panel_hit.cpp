@@ -25,6 +25,42 @@ namespace comp_shell {
 /* 图层面板命中：直方图框选 + 图层行点击（含直方图拖拽起点）。 */
 bool layer_panel_click(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
           /*
+           * 图层列表的滚动条：滑块按下 = 开始拖动；轨道空白处按下 = 翻一页。
+           *
+           * 放在**最前面**：滚动条贴着面板右缘，点它绝不能被当成「点图层行」
+           * 或「直方图框选」。
+           */
+          {
+            const int row_top = comp_ui::layer_rows_top(shell.doc.histogram_open);
+            const int count = panel_row_count(shell);
+            const int viewport_h =
+                layout.layer_panel.h - (comp_ui::kLayerHeaderHeight + row_top);
+            const int content_h = count * comp_ui::kLayerRowHeight;
+            const int max_scroll =
+                comp_ui::layer_scroll_max(layout.layer_panel, count, row_top);
+            const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(
+                layout.layer_panel, comp_ui::kLayerHeaderHeight + row_top, viewport_h, content_h,
+                shell.doc.layer_scroll, max_scroll);
+            if (bar.visible && bar.track.contains(mouse_x, mouse_y)) {
+              if (bar.thumb.contains(mouse_x, mouse_y)) {
+                shell.doc.layer_scroll_drag = true;
+                SetCapture(window);
+                InvalidateRect(window, nullptr, FALSE);
+                return true;
+              }
+              /* 点轨道空白处：按点在滑块上方还是下方翻页。 */
+              const int step = comp_ui::scroll_page_step(
+                  comp_ui::layer_visible_rows(layout.layer_panel, row_top));
+              const int next = mouse_y < bar.thumb.y ? shell.doc.layer_scroll - step
+                                                      : shell.doc.layer_scroll + step;
+              shell.doc.layer_scroll =
+                  comp_ui::layer_scroll_clamp(layout.layer_panel, count, row_top, next);
+              SetCapture(window);
+              InvalidateRect(window, nullptr, FALSE);
+              return true;
+            }
+          }
+          /*
            * S24 直方图交互：绘图区按下 = 开始框选（松开超过 4px 才真的缩放）；
            * 标签行按下 = 复位全幅。放在图层行命中之前，两块几何互不重叠，但顺序
            * 固定后「图里拖」与「点图层行」不会互相吃掉点击。
@@ -49,8 +85,9 @@ bool layer_panel_click(ShellState& shell, const Layout& layout, int mouse_x, int
           }
           const int row_top = comp_ui::layer_rows_top(shell.doc.histogram_open);
           /* S44：行数用可见行数（折叠后子层不占行），行号经 display 换算成图层。 */
-          const int row = comp_ui::layer_row_at(layout.layer_panel, panel_row_count(shell),
-                                                mouse_x, mouse_y, row_top);
+          const int row = comp_ui::layer_row_at_scrolled(
+              layout.layer_panel, panel_row_count(shell), mouse_x, mouse_y, row_top,
+              shell.doc.layer_scroll);
           if (row >= 0) {
             const LayerRow* clicked_layer = layer_row_at(shell, row);
             if (clicked_layer != nullptr && clicked_layer->is_group != 0) {
@@ -58,8 +95,8 @@ bool layer_panel_click(ShellState& shell, const Layout& layout, int mouse_x, int
                * S44 组折叠：三角落在行首的固定槽位里，只对组行生效，且必须先于
                * 行选中与双击改名——否则点三角会顺手把该组选上/改起名来。
                */
-              const comp_ui::Rect row_rect = comp_ui::layer_row_rect(
-                  layout.layer_panel, row, row_top);
+              const comp_ui::Rect row_rect = comp_ui::layer_row_rect_scrolled(
+                  layout.layer_panel, row, row_top, shell.doc.layer_scroll);
               const int depth = row < static_cast<int>(shell.doc.layer_depth.size())
                                     ? shell.doc.layer_depth[static_cast<size_t>(row)]
                                     : 0;
@@ -510,6 +547,27 @@ bool adjust_panel_click(ShellState& shell, const Layout& layout, int mouse_x, in
 
 /* 面板拖动推进：曲线点 / 调整滑杆 / 填充滑杆 / 智能滤镜重排 / 图层拖行 / 直方图框选。 */
 bool panel_drag_move(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
+          /*
+           * 滚动条滑块拖动：优先级最高——拖动期间鼠标消息归它，
+           * 不能被曲线/滑杆/图层拖行抢走。
+           */
+          if (shell.doc.layer_scroll_drag) {
+            const int row_top = comp_ui::layer_rows_top(shell.doc.histogram_open);
+            const int count = panel_row_count(shell);
+            const int viewport_h =
+                layout.layer_panel.h - (comp_ui::kLayerHeaderHeight + row_top);
+            const int content_h = count * comp_ui::kLayerRowHeight;
+            const int max_scroll =
+                comp_ui::layer_scroll_max(layout.layer_panel, count, row_top);
+            const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(
+                layout.layer_panel, comp_ui::kLayerHeaderHeight + row_top, viewport_h, content_h,
+                shell.doc.layer_scroll, max_scroll);
+            const int next = comp_ui::scroll_from_thumb_drag(bar, mouse_y, max_scroll);
+            shell.doc.layer_scroll =
+                comp_ui::layer_scroll_clamp(layout.layer_panel, count, row_top, next);
+            InvalidateRect(window, nullptr, FALSE);
+            return true;
+          }
           /* P0-3 曲线拖动优先：几何用按下时冻结的绘图区，写入落在同一个事务里。 */
           if (shell.doc.curve_drag_point >= 0) {
             curve_drag_to(shell, shell.doc.curve_drag_plot, static_cast<double>(mouse_x),
@@ -569,7 +627,7 @@ bool panel_drag_move(ShellState& shell, const Layout& layout, int mouse_x, int m
               /* S44：目标行只在可见行里找——折叠掉的子层不该成为落点。 */
               shell.doc.layer_drag_target = comp_ui::layer_drag_target_row(
                   layout.layer_panel, panel_row_count(shell), static_cast<double>(mouse_y),
-                  comp_ui::layer_rows_top(shell.doc.histogram_open));
+                  comp_ui::layer_rows_top(shell.doc.histogram_open), shell.doc.layer_scroll);
               InvalidateRect(window, nullptr, FALSE);
               return true;
             }
@@ -585,6 +643,13 @@ bool panel_drag_move(ShellState& shell, const Layout& layout, int mouse_x, int m
 
 /* 面板拖动收尾：提交事务 / 落子 / 释放捕获。 */
 bool panel_drag_end(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
+      /* 滚动条滑块松手：结束拖动（其余拖动类型不受影响）。 */
+      if (shell.doc.layer_scroll_drag) {
+        shell.doc.layer_scroll_drag = false;
+        ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+      }
       /* P0-3 曲线松手：提交事务 = 一次拖动只占一步撤销。 */
       if (shell.doc.curve_drag_point >= 0) {
         curve_drag_finish(shell, true);
@@ -651,7 +716,8 @@ bool panel_drag_end(ShellState& shell, const Layout& layout, int mouse_x, int mo
                 target->is_group != 0 &&
                 comp_ui::layer_drag_inner_band(layout.layer_panel, rows, to_row,
                                                static_cast<double>(mouse_y),
-                                               comp_ui::layer_rows_top(shell.doc.histogram_open));
+                                               comp_ui::layer_rows_top(shell.doc.histogram_open),
+                                               shell.doc.layer_scroll);
           }
         }
         shell.doc.layer_drag_pending = false;

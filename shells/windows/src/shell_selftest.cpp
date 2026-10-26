@@ -2824,6 +2824,120 @@ int run_selftest(const wchar_t* out_path) {
   }
   {
     /*
+     * P0-10 拖放重排（四）：落点语义 —— 四种，各不相同。
+     *
+     *   - 拖回**自己原来那侧** → 停回原位（不是合并）。
+     *   - 拖到**另一侧、那列空着** → 直接停过去。
+     *   - 拖到**另一侧、那列有面板** → **合并成一组**（拖放重排）。
+     *   - 落在画布中间 / 窗口外 → 保持浮动。
+     *
+     * 判定是 dock 层的**纯函数**，壳侧与这里共用同一条——不在自检里复制
+     * 一遍壳侧逻辑（复制就会分叉，分叉就等于没测）。
+     */
+    using comp_dock::DockArea;
+    using comp_dock::DropAction;
+    using comp_dock::DropZone;
+    const bool back = comp_dock::drop_action_for(DropZone::Right, DockArea::Right,
+                                                  DockArea::Right, false) == DropAction::DockBack;
+    const bool merge = comp_dock::drop_action_for(DropZone::Right, DockArea::Left,
+                                                   DockArea::Right, true) == DropAction::MergeInto;
+    const bool move = comp_dock::drop_action_for(DropZone::Left, DockArea::Right,
+                                                  DockArea::Left, false) == DropAction::MoveTo;
+    const bool body_keeps_float = comp_dock::drop_action_for(DropZone::Body, DockArea::Left,
+                                                              DockArea::Right, true) ==
+                                  DropAction::StayFloating;
+    const bool outside_keeps_float = comp_dock::drop_action_for(DropZone::None, DockArea::Left,
+                                                                 DockArea::Right, true) ==
+                                     DropAction::StayFloating;
+    /* 目标列有面板、但拖回的是自己那侧 → 仍停回原位（不合并）。 */
+    const bool back_wins = comp_dock::drop_action_for(DropZone::Left, DockArea::Left,
+                                                      DockArea::Left, true) == DropAction::DockBack;
+    verify(back && merge && move && body_keeps_float && outside_keeps_float && back_wins,
+           "P0-10 drop actions: back to origin / merge into occupied column / move to empty column / body keeps floating");
+  }
+  {
+    /*
+     * P0-10 拖放重排（五）：合并到**指定**列 + 组宽初值 + 拆组复位。
+     *
+     * 组宽初值 = 目标列合并前的**实际宽度**（用户拖出来的宽度优先，
+     * 没有就用缺省）。用缺省宽的话，用户把右栏拖宽到 420 再合并，
+     * 组宽会变回 330 —— 合并瞬间画布宽度跳一下，正在看的图被挤动。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    /* 缺省：图层栏在左、调整栏在右。先把右栏拖宽到 420（用户拖出来的偏好）。 */
+    dock.set_width(comp_dock::PanelId::Adjust, 420);
+    /* 拖图层栏到右边缘 → 合并到右列。 */
+    dock.group_merge_to(comp_dock::PanelId::Layers, comp_dock::DockArea::Right);
+    const bool merged = dock.group_count(comp_dock::DockArea::Right) == 2 &&
+                        dock.group_count(comp_dock::DockArea::Left) == 0;
+    const bool width_kept = dock.group_width(comp_dock::DockArea::Right) == 420;
+    /* 拆组：两块各回合并前的列（图层左 / 调整右），而不是变成「图层右 / 调整左」。 */
+    dock.group_ungroup(comp_dock::PanelId::Layers);
+    const bool split = dock.group_count(comp_dock::DockArea::Right) == 1 &&
+                       dock.group_count(comp_dock::DockArea::Left) == 1 &&
+                       dock.area_of(comp_dock::PanelId::Layers) == comp_dock::DockArea::Left &&
+                       dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Right;
+    verify(merged && width_kept && split,
+           "P0-10 drop merge: merges into the chosen column / keeps that column width / splits back to the original sides");
+  }
+  {
+    /*
+     * 图层列表滚动：行几何与命中都跟着滚动量走，滚动量本身夹得住。
+     *
+     * 此前图层面板**没有滚动**：所有行都画出来、超出面板的部分直接裁掉，
+     * 层一多就看不到底下的层（调整栏里的历史 / 通道都有滚动，只有图层漏了）。
+     *
+     * 三条都要锁：行矩形跟着移、命中跟着移、滚动量夹在 [0, max]。
+     * 只锁前两条的话，滚动量越界时行会画到面板外——「看得到」但「点不准」。
+     */
+    const comp_ui::Rect panel{0, 0, 248, 300};
+    const int row_top = 0;
+    const int count = 40;
+    const int visible = comp_ui::layer_visible_rows(panel, row_top);
+    const int max_scroll = comp_ui::layer_scroll_max(panel, count, row_top);
+    const bool can_scroll = visible > 0 && visible < count && max_scroll == count - visible;
+    /* 滚 5 行：第 0 行的矩形应当上移 5 行高。 */
+    const comp_ui::Rect row0 = comp_ui::layer_row_rect_scrolled(panel, 0, row_top, 0);
+    const comp_ui::Rect row0_scrolled = comp_ui::layer_row_rect_scrolled(panel, 0, row_top, 5);
+    const bool moved = row0_scrolled.y == row0.y - 5 * comp_ui::kLayerRowHeight;
+    /* 命中：同一个 y，未滚动命中行 0，滚动 5 后命中行 5。 */
+    const double probe_y = static_cast<double>(row0.y) + 4.0;
+    const int hit0 = comp_ui::layer_row_at_scrolled(panel, count, 10, probe_y, row_top, 0);
+    const int hit5 = comp_ui::layer_row_at_scrolled(panel, count, 10, probe_y, row_top, 5);
+    const bool hit_moved = hit0 == 0 && hit5 == 5;
+    const bool clamped = comp_ui::layer_scroll_clamp(panel, count, row_top, -3) == 0 &&
+                         comp_ui::layer_scroll_clamp(panel, count, row_top, 9999) == max_scroll;
+    verify(can_scroll && moved && hit_moved && clamped,
+           "P0-10 layer list scrolls: rows and hit test follow the scroll offset / scroll amount clamped");
+  }
+  {
+    /*
+     * 可见滚动条：几何 + 拖动映射。
+     *
+     * 滚动此前只能靠滚轮——用户看不到「下面还有东西」，也就不知道能滚。
+     * 滚动条必须：装得下时**不画**（不白占地方）；装不下时画轨道 + 滑块，
+     * 滑块高度按可视比例；拖动滑块能换算出滚动量且两端夹住。
+     */
+    const comp_ui::Rect panel{0, 0, 248, 300};
+    const comp_ui::ScrollBarGeometry none =
+        comp_ui::scroll_bar_vertical(panel, 30, 270, 270, 0, 0);
+    const bool hidden_when_fit = !none.visible;
+    const comp_ui::ScrollBarGeometry bar =
+        comp_ui::scroll_bar_vertical(panel, 30, 270, 880, 0, 34);
+    const bool shown = bar.visible && bar.track.w == comp_ui::kScrollBarWidth &&
+                       bar.thumb.h > 0 && bar.thumb.h < bar.track.h;
+    /* 滑块在 scroll=0 时贴轨道顶，滚到底时贴轨道底。 */
+    const comp_ui::ScrollBarGeometry bottom =
+        comp_ui::scroll_bar_vertical(panel, 30, 270, 880, 34, 34);
+    const bool ends = bar.thumb.y == bar.track.y && bottom.thumb.bottom() == bottom.track.bottom();
+    const int dragged_down = comp_ui::scroll_from_thumb_drag(bar, bar.track.bottom() + 50, 34);
+    const int dragged_up = comp_ui::scroll_from_thumb_drag(bar, bar.track.y - 50, 34);
+    const bool maps = dragged_down == 34 && dragged_up == 0;
+    verify(hidden_when_fit && shown && ends && maps,
+           "P0-10 visible scroll bar: hidden when content fits / thumb sized by ratio / drag maps to scroll amount");
+  }
+  {
+    /*
      * P0-10 拖出停靠（三）：浮窗几何随窗口位置/尺寸变化写回 dock 状态。
      *
      * 这条链路是 workspace 存读的基础：存的是浮窗几何，重启要按同样的

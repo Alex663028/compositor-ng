@@ -128,6 +128,8 @@ LRESULT CALLBACK float_window_proc(HWND window, UINT message, WPARAM wparam, LPA
         const HRGN clip = CreateRectRgn(0, 0, logical_width, logical_height);
         SelectClipRgn(memory_dc, clip);
         if (panel_of(window) == comp_dock::PanelId::Layers) {
+          /* 浮窗的可见行数与主窗口不同，滚动量按浮窗自己的高度重新夹一次。 */
+          panel_sync_layer_scroll(*shell, panel);
           draw_layer_content(memory_dc, *shell, panel);
         } else {
           draw_adjust_content(memory_dc, *shell, panel);
@@ -492,15 +494,58 @@ void float_panel_tear_end(ShellState& shell) {
   geo.client_w = client.right - client.left;
   geo.client_h = client.bottom - client.top;
   const comp_dock::DropZone zone = comp_dock::drop_zone_at(geo, center.x, center.y);
-  if (zone == comp_dock::DropZone::Left || zone == comp_dock::DropZone::Right) {
-    const bool left = comp_dock::drop_zone_docks_left(zone);
-    float_panel_close(shell, id);
-    shell.dock.set_area(id, left ? comp_dock::DockArea::Left : comp_dock::DockArea::Right);
-    set_status(shell, left ? L"图层面板已停回左侧" : L"调整面板已停回右侧");
-    if (shell.window != nullptr) InvalidateRect(shell.window, nullptr, FALSE);
-  } else {
+  /*
+   * 落点判定走 dock 层的**纯函数** drop_action_for（壳与自检同一条判定）。
+   *
+   * 四种落点语义：
+   *   - 拖回**自己原来那侧** → 停回原位（不是合并）。
+   *   - 拖到**另一侧、那列空着** → 直接停过去。
+   *   - 拖到**另一侧、那列有面板** → **合并成一组**（拖放重排）。
+   *   - 落在画布中间或窗口外 → 保持浮动（PS 的手感：拖出来就是要它浮着）。
+   *
+   * 为什么「拖到有面板的那侧」是合并而不是「两块对调」：菜单里的
+   * 「面板停靠到右/左侧」是**独占**语义（那块过去、另一块让位），而把
+   * 面板**拖到另一块面板所在的位置**在 PS 里是「合成标签组」。两个入口
+   * 意图不同，结果就该不同——混成一样的话「停靠左侧」会把用户拖成组。
+   */
+  const comp_dock::DockArea origin = shell.dock.last_docked_area(id);
+  const comp_dock::DockArea target = comp_dock::drop_zone_docks_left(zone)
+                                         ? comp_dock::DockArea::Left
+                                         : comp_dock::DockArea::Right;
+  const bool target_used = shell.dock.group_count(target) > 0 &&
+                           shell.dock.group_member(target, 0) != id;
+  const comp_dock::DropAction action =
+      comp_dock::drop_action_for(zone, origin, target, target_used);
+
+  if (action == comp_dock::DropAction::StayFloating) {
     set_status(shell, L"面板已浮出（拖回窗口边缘可停靠）");
+    return;
   }
+
+  /* float_panel_close 会把面板停回浮起前的那一侧（origin）。 */
+  float_panel_close(shell, id);
+
+  const bool is_layers = id == comp_dock::PanelId::Layers;
+  const wchar_t* message = nullptr;
+  switch (action) {
+    case comp_dock::DropAction::DockBack:
+      message = is_layers ? L"图层面板已停回原位" : L"调整面板已停回原位";
+      break;
+    case comp_dock::DropAction::MergeInto:
+      shell.dock.group_merge_to(id, target);
+      message = is_layers ? L"图层面板已与调整面板合并成一组（点列顶标签切换）"
+                          : L"调整面板已与图层面板合并成一组（点列顶标签切换）";
+      break;
+    case comp_dock::DropAction::MoveTo:
+      shell.dock.set_area(id, target);
+      message = target == comp_dock::DockArea::Left ? L"图层面板已停到左侧"
+                                                   : L"调整面板已停到右侧";
+      break;
+    default:
+      break;
+  }
+  set_status(shell, message);
+  if (shell.window != nullptr) InvalidateRect(shell.window, nullptr, FALSE);
 }
 
 namespace {

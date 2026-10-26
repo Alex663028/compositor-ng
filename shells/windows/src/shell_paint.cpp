@@ -876,8 +876,19 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   const int row_top = comp_ui::layer_rows_top(shell.doc.histogram_open);
 
   const int32_t count = panel_row_count(shell);
-  for (int32_t line = 0; line < count; ++line) {
-    const comp_ui::Rect row_rect = comp_ui::layer_row_rect(panel_rect, line, row_top);
+  /*
+   * 滚动：只画**可视**的行。
+   *
+   * 此前这里画**全部**行，越界的部分被裁掉——层一多就看不到底下的层。
+   * 只画可视行还有个好处：行数多时不必白画几千行。
+   */
+  const int scroll = comp_ui::layer_scroll_clamp(panel_rect, count, row_top, shell.doc.layer_scroll);
+  const int visible = comp_ui::layer_visible_rows(panel_rect, row_top);
+  const int32_t first_line = scroll;
+  const int32_t last_line = count < first_line + visible ? count : first_line + visible;
+  for (int32_t line = first_line; line < last_line; ++line) {
+    const comp_ui::Rect row_rect =
+        comp_ui::layer_row_rect_scrolled(panel_rect, line, row_top, scroll);
     const LayerRow* layer = layer_row_at(shell, line);
     if (layer == nullptr) continue;
     const LayerRow& row = *layer;
@@ -1024,11 +1035,39 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     const int32_t slot =
         comp_ui::layer_drag_insert_slot(shell.doc.layer_drag_row, shell.doc.layer_drag_target);
     const comp_ui::Rect line_rect =
-        comp_ui::layer_insert_line_rect(panel_rect, row_top, slot, count);
+        comp_ui::layer_insert_line_rect(panel_rect, row_top, slot, count, scroll);
     RECT line{line_rect.x, line_rect.y, line_rect.right(), line_rect.bottom()};
     HBRUSH line_brush = CreateSolidBrush(RGB(120, 200, 255));
     FillRect(dc, &line, line_brush);
     DeleteObject(line_brush);
+  }
+
+  /*
+   * 可见滚动条（PS 同款）：内容装不下时贴面板右缘画一条。
+   *
+   * 此前滚动只能靠滚轮——用户**看不到**「下面还有东西」。滚轮是有的，
+   * 但没有可见的滚动条时，用户根本不知道能滚。
+   *
+   * 两层都画（轨道 + 滑块），颜色与面板底色明确不同：探针量得到，
+   * 人眼也分得清。滑块拖动见 shell_panel_hit.cpp。
+   */
+  {
+    const int viewport_h = panel_rect.h - (comp_ui::kLayerHeaderHeight + row_top);
+    const int content_h = count * comp_ui::kLayerRowHeight;
+    const int max_scroll = comp_ui::layer_scroll_max(panel_rect, count, row_top);
+    const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(
+        panel_rect, comp_ui::kLayerHeaderHeight + row_top, viewport_h, content_h, scroll,
+        max_scroll);
+    if (bar.visible) {
+      RECT track{bar.track.x, bar.track.y, bar.track.right(), bar.track.bottom()};
+      HBRUSH track_brush = CreateSolidBrush(RGB(38, 40, 46));
+      FillRect(dc, &track, track_brush);
+      DeleteObject(track_brush);
+      RECT thumb{bar.thumb.x, bar.thumb.y, bar.thumb.right(), bar.thumb.bottom()};
+      HBRUSH thumb_brush = CreateSolidBrush(RGB(122, 126, 136));
+      FillRect(dc, &thumb, thumb_brush);
+      DeleteObject(thumb_brush);
+    }
   }
 
   /*
@@ -3639,6 +3678,11 @@ void present(HWND window, ShellState& shell) {
    * draw_panel_toggles 画竖条。两者互斥，竖条上不会漏出半截图层行。
    */
   if (layout.layer_panel.w > 0 && !layout.layer_collapsed) {
+    /*
+     * 图层列表的滚动：先同步（夹取 + 选中行滚进可视区），再画。
+     * 放在绘制入口而不是各个选中路径里，保证「选中永远可见」是结构上的性质。
+     */
+    panel_sync_layer_scroll(shell, layout.layer_panel);
     /*
      * 面板内容一律**裁进面板矩形**再画：面板底部的快捷键提示比面板宽（248px 里
      * 放不下「Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除」），

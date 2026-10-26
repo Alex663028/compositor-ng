@@ -570,6 +570,16 @@ struct DocumentContext {
   std::vector<LayerRow> layers;
   std::vector<std::pair<comp_layer_id, uint8_t>> visibility; /* id -> visible */
   int32_t selected_layer = 0; /* 面板行索引（0 = 最上层显示行） */
+  /*
+   * 图层列表的滚动量（顶部被滚过去的行数）。
+   *
+   * 此前图层列表**没有滚动**：所有行都画出来、超出面板的部分直接裁掉，
+   * 层一多就看不到底下的层——不是「不方便」，是**看不到**。
+   * 调整栏里的滑杆区 / 历史 / 通道都有滚动，只有图层列表漏了。
+   */
+  int32_t layer_scroll = 0;
+  /* 正在拖动图层列表的滚动条滑块（拖动期间吃掉鼠标消息）。 */
+  bool layer_scroll_drag = false;
   std::vector<int32_t> layer_display;
   std::vector<int32_t> layer_depth;
   std::vector<comp_layer_id> collapsed_groups;

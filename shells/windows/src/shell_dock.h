@@ -169,6 +169,29 @@ struct DockState {
    */
   void group_merge(PanelId id);
   /*
+   * 合并到**指定**列（拖放重排用）。
+   *
+   * 与 group_merge 的区别：group_merge 合并到「另一块面板所在的列」，
+   * 这里是「拖到哪列就合并到哪列」——拖放时落点由用户的指针决定，不由
+   * 另一块面板的位置决定。
+   *
+   * 组宽的初值 = 目标列合并前的**实际宽度**（那块面板用户拖出来的宽度，
+   * 没有就用它的缺省宽）。合并瞬间画布宽度不变——否则画布会跳一下，
+   * 用户正在看的图会被挤动。
+   */
+  void group_merge_to(PanelId id, DockArea side);
+  /*
+   * 这块面板**浮起前**停在哪一侧。
+   *
+   * 拖放落点判定要用它区分两种情况：
+   *   - 拖回自己原来那侧 → 停回原位（不是合并）。
+   *   - 拖到另一侧 → 那列有面板就合并成一组，没有就停过去。
+   *
+   * 停靠状态下它等于该面板当前所在的那侧（set_area / float_panel 都会
+   * 同步维护），浮动状态下它是浮起前的那一侧。
+   */
+  DockArea last_docked_area(PanelId id) const;
+  /*
    * 把 id 从当前列摘出来：**两块回到合并前的归属**（各占一列）。
    *
    * 「合并前的归属」从 last_docked_ 取——group_move 合并时**不动**它，
@@ -249,6 +272,36 @@ inline DropZone drop_zone_at(const DropGeometry& geo, int x, int y) {
 
 /* 热区 → 停靠侧。Body / None 一律「保持浮动」。 */
 inline bool drop_zone_docks_left(DropZone zone) { return zone == DropZone::Left; }
+
+/*
+ * 拖放松手后要做什么（**纯函数**，壳与自检共用同一条判定）。
+ *
+ * 为什么要有它：拖放的语义有四种（停回原位 / 移到空列 / 合并成一组 /
+ * 保持浮动），它们互相纠缠，错一条就是「用户拖了一下，面板跑了别处」。
+ * 把判定放在 dock 层做成纯函数，壳只负责执行，自检直接测判定本身——
+ * **不在自检里复制一遍壳侧逻辑**（复制就会分叉，分叉就等于没测）。
+ */
+enum class DropAction {
+  StayFloating = 0, /* 落点在画布中间或窗口外：保持浮动 */
+  DockBack = 1,     /* 拖回**自己原来那侧**：停回原位（不是合并） */
+  MoveTo = 2,       /* 拖到另一侧、那列空着：直接停过去 */
+  MergeInto = 3,    /* 拖到另一侧、那列已有面板：合并成一组（拖放重排） */
+};
+
+/*
+ * 落点判定。
+ *
+ * @param zone         指针落在哪个热区
+ * @param origin       这块面板浮起前停在哪一侧
+ * @param target       落点对应的那一侧
+ * @param target_used  目标列是否已有别的面板
+ */
+inline DropAction drop_action_for(DropZone zone, DockArea origin, DockArea target,
+                                  bool target_used) {
+  if (zone != DropZone::Left && zone != DropZone::Right) return DropAction::StayFloating;
+  if (target == origin) return DropAction::DockBack;
+  return target_used ? DropAction::MergeInto : DropAction::MoveTo;
+}
 
 }  // namespace comp_dock
 

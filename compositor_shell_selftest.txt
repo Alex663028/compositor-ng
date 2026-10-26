@@ -282,6 +282,10 @@
 [OK] P0-10 dock workspace round trip (width / collapsed / side)
 [OK] P0-10 dock state: two panels float at once / dock one keeps the other / each docks home
 [OK] P0-10 dock drop zones: left/right edge hot zones / body keeps floating / outside ignored
+[OK] P0-10 drop actions: back to origin / merge into occupied column / move to empty column / body keeps floating
+[OK] P0-10 drop merge: merges into the chosen column / keeps that column width / splits back to the original sides
+[OK] P0-10 layer list scrolls: rows and hit test follow the scroll offset / scroll amount clamped
+[OK] P0-10 visible scroll bar: hidden when content fits / thumb sized by ratio / drag maps to scroll amount
 [OK] P0-10 float geometry round trip (x / y / width / height kept in dock state)
 [OK] P0-10 panel group: merge into one column / tab strip shows / width stable / split back
 [OK] P0-10 panel group on the left column: content at left edge / width stable on tab switch

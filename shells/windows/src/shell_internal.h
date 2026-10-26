@@ -216,6 +216,18 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void set_visible_cache(ShellState& shell, comp_layer_id id, uint8_t value);
   void rebuild_layer_display(ShellState& shell);
   int32_t panel_row_count(const ShellState& shell);
+  /*
+   * 图层列表的滚动同步：夹取滚动量，并把**选中行滚进可视区**。
+   *
+   * 为什么放在「渲染前」而不是各个选中路径里：选中行会因点选、键盘上下、
+   * 多选提升、撤销重做等很多条路径变化，每条都补一次 ensure 迟早漏一处；
+   * 在绘制入口统一做一次，「选中永远可见」就是**结构上**保证的。
+   *
+   * 滚动量存在 shell.doc 上，主窗口与浮动窗口**共用**（同一个文档同一批层，
+   * 两处各存一份反而会互相打架）。浮动窗口的可见行数与主窗口不同，
+   * 打开浮窗时滚动量会被它自己的高度重新夹一次——这正是想要的。
+   */
+  void panel_sync_layer_scroll(ShellState& shell, const comp_ui::Rect& panel);
   std::vector<comp_ui::LayerStackEntry> layer_stack_entries(const ShellState& shell);
   const LayerRow* layer_row_at(const ShellState& shell, int32_t row);
   int32_t panel_row_of_id(const ShellState& shell, comp_layer_id id);

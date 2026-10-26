@@ -228,6 +228,23 @@ int32_t panel_row_count(const ShellState& shell) {
   return static_cast<int32_t>(shell.doc.layer_display.size());
 }
 
+/* 图层列表的滚动同步：夹取 + 把选中行滚进可视区（详见 shell_internal.h 的说明）。 */
+void panel_sync_layer_scroll(ShellState& shell, const comp_ui::Rect& panel) {
+  const int row_top = comp_ui::layer_rows_top(shell.doc.histogram_open);
+  const int count = panel_row_count(shell);
+  int scroll = comp_ui::layer_scroll_clamp(panel, count, row_top, shell.doc.layer_scroll);
+  const int visible = comp_ui::layer_visible_rows(panel, row_top);
+  const int selected = shell.doc.selected_layer;
+  if (selected >= 0 && selected < count && visible > 0) {
+    if (selected < scroll) {
+      scroll = selected;
+    } else if (selected >= scroll + visible) {
+      scroll = selected - visible + 1;
+    }
+  }
+  shell.doc.layer_scroll = scroll;
+}
+
 /* 把面板镜像投影成 ui_core 的纯数据（数组序、自下而上），供纯函数规划用。 */
 std::vector<comp_ui::LayerStackEntry> layer_stack_entries(const ShellState& shell) {
   std::vector<comp_ui::LayerStackEntry> entries(shell.doc.layers.size());
