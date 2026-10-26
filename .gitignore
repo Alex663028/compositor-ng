@@ -85,3 +85,5 @@ present_bench.txt
 shells/ohos/.hvigor/
 shells/ohos/**/oh_modules/
 *.hap
+# zig 编译器缓存：与产物分开，--clean 不该牵连它（见 scripts/build.py child_env）
+.zig-cache/

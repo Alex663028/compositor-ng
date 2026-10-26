@@ -149,13 +149,20 @@ def collect_sources() -> tuple[list[str], list[str], list[str]]:
 def child_env() -> dict:
     """构造子进程环境。
 
-    两个坑：
+    三个坑：
       1. zig 需要全局缓存目录；若宿主环境缺 LOCALAPPDATA（部分 CI / 精简沙箱即如此），
          zig 会直接报 "unable to resolve zig cache directory: AppDataDirUnavailable"。
-      2. 因此显式把缓存目录钉在 build/ 下，既不污染用户目录，也保证可随 build/ 一起清理。
+         因此显式钉住缓存目录，并给 LOCALAPPDATA/APPDATA/USERPROFILE 兜底。
+      2. **缓存不能放在 build/ 下**（2026-10-26 实测）：`--clean` 会整目录删掉 build/，
+         缓存跟着没了，下一次全量构建就得让 zig 重新 sub-compile
+         libcxx / libubsan / libzigc；那一步在受限环境下会因读不到 site-packages
+         里的 zig 标准库而报 `unable to load 'std.zig': AccessDenied`，链接阶段整体失败。
+         症状极具误导性：`build.py --clean` 恒失败、`build.py` 增量却正常。
+         现在缓存钉在仓根 `.zig-cache/`（已 gitignore），clean 不再牵连它。
+      3. 缓存与产物要分开：产物可随时重建，缓存重建代价高得多。
     """
     env = dict(os.environ)
-    cache = os.path.join(BUILD, ".zig-cache")
+    cache = os.path.join(ROOT, ".zig-cache")
     fallback_profile = os.path.join(BUILD, ".appdata")
     os.makedirs(cache, exist_ok=True)
     os.makedirs(fallback_profile, exist_ok=True)
