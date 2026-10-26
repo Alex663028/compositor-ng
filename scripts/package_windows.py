@@ -32,7 +32,11 @@ README = """Compositor {version} — Windows 版快速上手
 
 【启动】
 双击 compositor_shell.exe。无需安装，但 resources\\ 目录必须与 exe 放在一起
-（Camera Raw 的色彩表和中文/日韩字体在那里）。
+（Camera Raw 的色彩表和中文/日韩字体在里面）。
+
+依赖：只有 Windows 系统 DLL 与系统自带的 Universal CRT（Windows 10 及以上）。
+不含 VC++ 运行库，也不硬依赖 Vulkan（GPU 后端在运行时探测，没有就回落 CPU）。
+实测导入表 18 项，全部是系统组件。
 
 【第一次上手】
 1. 文件 > 新建文档…（Ctrl+Alt+N）：填宽高、分辨率、背景
