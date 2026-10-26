@@ -99,9 +99,32 @@ cd "$APP_DIR" || exit 1
 "$NODE" "$HVIGOR" --mode module -p product=default -p module=entry@default \
   -p buildMode=debug --no-daemon assembleHap || exit 1
 
-HAP="$APP_DIR/entry/build/default/outputs/default/entry-default-unsigned.hap"
-[ -f "$HAP" ] || { echo "[hap] 未产出 $HAP" >&2; exit 1; }
-echo "[hap] OK -> $HAP（unsigned；模拟器可装，真机需 AGC 签名）"
+/*
+ * 找 HAP 产物。
+ *
+ * **优先用 signed 的**：工程配好 DevEco 自动签名后，hvigor 会额外产出
+ * entry-default-signed.hap——那个才能装到**真机**上（unsigned 的模拟器能装、
+ * 真机装不上：系统校验签名，profile 里还得含本机 UDID）。
+ * 没配签名时只有 unsigned 的，模拟器照常能跑。
+ */
+SIGNED_HAP="$APP_DIR/entry/build/default/outputs/default/entry-default-signed.hap"
+UNSIGNED_HAP="$APP_DIR/entry/build/default/outputs/default/entry-default-unsigned.hap"
+if [ -f "$SIGNED_HAP" ]; then
+  HAP="$SIGNED_HAP"
+  echo "[hap] OK -> $HAP（已签名；真机可装）"
+elif [ -f "$UNSIGNED_HAP" ]; then
+  HAP="$UNSIGNED_HAP"
+  echo "[hap] OK -> $HAP（unsigned；模拟器可装，**真机需要 DevEco 自动签名**）"
+  if [ "$TARGET_ID" != "127.0.0.1:5555" ]; then
+    echo "[hap] 提示：目标是真机（$TARGET_ID），unsigned HAP 装不上——请在 DevEco 里"
+    echo "      配置一次自动签名（File > Project Structure > Signing Configs >"
+    echo "      Automatically generate signature > 勾选本机设备 > Apply），之后本脚本"
+    echo "      会自动改用 signed 产物。" >&2
+  fi
+else
+  echo "[hap] 未产出 HAP（找过 $SIGNED_HAP 与 $UNSIGNED_HAP）" >&2
+  exit 1
+fi
 
 # ------------------------------------------------------------- 4. 装机 / 启动
 hdc_cmd() { MSYS_NO_PATHCONV=1 "$HDC" -t "$TARGET_ID" "$@"; }
