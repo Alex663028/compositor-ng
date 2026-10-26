@@ -287,6 +287,13 @@ struct LayoutPrefs {
    */
   bool layer_panel_collapsed = false;
   bool adjust_panel_collapsed = false;
+  /*
+   * P0-10 停靠子系统：这块面板**是否在主窗口里**。
+   * false = 它有自己的窗口（浮动）或被隐藏了 —— 主窗口完全不给它留位，
+   * 也不画收起按钮与分界线（那套控件属于主窗口的停靠列）。
+   */
+  bool layer_docked = true;
+  bool adjust_docked = true;
 };
 
 /* 宽度是整数像素，不存在 NaN 输入，夹取只需一次 min/max。 */
@@ -354,16 +361,20 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
    * 「想要的宽度 + 画布下限」判断放不放得下，放不下就整块不给。这样窄窗不会
    * 出现「一条 24px 的竖条把画布挤到 179px」的破例。
    */
-  const int layer_wanted = prefs.layer_panel_collapsed
-                               ? Layout::kCollapsedPanelWidth
-                               : clamp_layer_panel_width(prefs.layer_panel_width);
+  const int layer_wanted = !prefs.layer_docked
+                               ? 0
+                               : (prefs.layer_panel_collapsed
+                                      ? Layout::kCollapsedPanelWidth
+                                      : clamp_layer_panel_width(prefs.layer_panel_width));
   int layer_w = 0;
   if (width >= layer_wanted + Layout::kMinCanvasWidth) {
     layer_w = layer_wanted;
   }
-  const int adjust_wanted = prefs.adjust_panel_collapsed
-                                ? Layout::kCollapsedPanelWidth
-                                : clamp_adjust_panel_width(prefs.adjust_panel_width);
+  const int adjust_wanted = !prefs.adjust_docked
+                                ? 0
+                                : (prefs.adjust_panel_collapsed
+                                       ? Layout::kCollapsedPanelWidth
+                                       : clamp_adjust_panel_width(prefs.adjust_panel_width));
   int adjust_w = 0;
   if (width - layer_w >= adjust_wanted + Layout::kMinCanvasWidth) {
     adjust_w = adjust_wanted;
@@ -379,13 +390,15 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
    * （两列宽度之和一样）——所以换边不会改变缩放与 pan 的基准，画面不跳。
    */
   if (prefs.adjust_dock_left) {
+    /* 停左：调整面板贴左缘、图层栏贴右缘（两列各占一边，中间是画布）。
+     * 此前图层栏紧跟在调整面板后面（挤在中间），那不是「停靠」而是「换序」。 */
     out.adjust_panel = Rect{0, body_top, adjust_w, body_h};
-    out.layer_panel = Rect{adjust_w, body_top, layer_w, body_h};
+    out.layer_panel = Rect{width - layer_w, body_top, layer_w, body_h};
   } else {
     out.layer_panel = Rect{0, body_top, layer_w, body_h};
     out.adjust_panel = Rect{width - adjust_w, body_top, adjust_w, body_h};
   }
-  const int canvas_x = prefs.adjust_dock_left ? adjust_w + layer_w : layer_w;
+  const int canvas_x = prefs.adjust_dock_left ? adjust_w : layer_w;
   out.canvas = Rect{canvas_x, body_top, width - layer_w - adjust_w, body_h};
   out.status = Rect{0, body_top + body_h, width, status_h};
   out.layer_collapsed = layer_w > 0 && prefs.layer_panel_collapsed;

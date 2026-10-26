@@ -779,6 +779,11 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void draw_tool_options(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   /* P0-3：文档标签栏（只在多文档时出现，布局已保证 tabbar.h > 0）。 */
   void draw_tab_bar(HDC dc, const ShellState& shell, const Layout& layout);
+  /* P0-10：浮动面板（独立顶层窗口）的浮/停回切换。 */
+  void toggle_float_panel(ShellState& shell, comp_dock::PanelId id);
+  /* P0-10：右栏内容（按当前子面板选画）；浮动面板窗口与主窗口共用。 */
+  void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
+  void draw_layer_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
   void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_channel_chip(HDC dc, const comp_ui::Rect& rect, const wchar_t* name, bool active);

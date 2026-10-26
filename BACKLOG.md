@@ -5,7 +5,7 @@
 > 每条给出现状证据、缺口性质与验收口径。允许的例外（ML / 上游未做）单列 §5，不与缺口混计。
 > 硬约束：ABI 导出只能**纯尾部追加**（当前 **215**：212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`，2026-10-26 P0-1）；回归 6/6、壳自检 270 项 SHA、视觉探针不得因新增功能而破（当前 **246 条 / 40 场景**；落地规则见 §6）。
 > 审计独立性（2026-10-26 起）：写代码与写审计不得同一会话署名；连续 ≤3 个批次未获独立审计即触发一轮跨 Agent 交叉全测（T2/S24 模式）。
-> 自检基线：**270 项 / SHA256 `93f6a4bc30d7d69c…`**（267 项 / `cae180809eed3ba4…` → 270 项：2026-10-26 在末尾追加 3 项——文档位深落到背景层、灰阶文档 flatten 恒 R=G=B、标签页 park/switch/close——其余 267 行逐字节未动；（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
+> 自检基线：**272 项 / SHA256 `b59fe41e07abf796…`**（270 项 / `93f6a4bc30d7d69c…` → 272 项：2026-10-26 P0-10 停靠子系统末尾追加 2 项——dock 状态机（换边对调 / 浮起不留位 / 停回原位）与 workspace 存读往返——其余 270 行逐字节未动；（267 项 / `cae180809eed3ba4…` → 270 项：2026-10-26 在末尾追加 3 项——文档位深落到背景层、灰阶文档 flatten 恒 R=G=B、标签页 park/switch/close——其余 267 行逐字节未动；（263 项 / `2f3b81c4fc599cb7…` → 267 项：2026-10-25 §6.110～§6.113
 > 在末尾追加 4 项断言——面板过滤、图层复合、智能对象、填充层，其余逐字节未动；263 项那次是 2026-10-23 一次**显式审批**的
 > 附录式变更，见 README §6.88）。
 > **2026-10-22 第一批落地**（Claude，按 §7 阶段 A 往前推）：P0-1 新建对话框、P0-2 图像/画布大小、
@@ -452,9 +452,11 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
     「Ctrl+Shift+A 新增 · Ctrl+Shift+U 应用 · Ctrl+Shift+D 删除」），此前
     TextOutW 不裁剪，提示会横穿到画布上与画布提示叠字；停靠换边后这条更显眼。
     现在左右两栏都裁进面板矩形再画，提示行用省略号收尾。
-  - **仍未做**：真正的**浮动窗口**（把面板拖出来变成独立窗口）。本壳的面板交互
-    全部写在单一客户区的绘制与命中通路里，浮动窗口需要第二条消息通路（自己的
-    DC、命中、焦点），是一次独立的子系统工作，不是本条的尾巴。
+  - **浮动面板已落地（2026-10-26，零 ABI）**——做法是**把 dock 抽成独立子系统**，
+    再让浮动窗口复用主窗口的面板交互（详见 §P0-10 停靠子系统一节）。
+  - **仍未做**：把面板**拖**出成浮动（现在是菜单 / 双击标题行触发）、多个面板
+    **合并成一组标签**、浮动面板里的**滚轮**滚动。这三项都是 dock 子系统上的
+    增量功能，子系统本身已经就位。
 - **现状**：~~无工具选项栏~~ 已补（同上）；~~画笔无尺寸/圆形光标预览~~ **已过时**：笔尖轮廓早就有了（`main.cpp:12663-12682`，
   `comp_ui::tool_has_brush_tip` + `brush_tip_radius(brush_size, zoom)`，黑白双描边椭圆，随缩放变化），
   这一项只剩「十字/隐藏光标模式」没做；~~高 DPI 屏由系统位图拉伸~~ **已过时**：
@@ -464,6 +466,36 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 - **性质**：【壳层】S（选项栏/光标）+ ~~S（DPI awareness）~~ 已落地 +【架构】L（面板停靠系统）。
 - **验收**：200% 缩放下 1px 线条仍为 1 设备像素；触摸笔刷尺寸可见且不遮挡落点；窗口 resize 后布局不重叠（已由
   `ui_core_layout_never_overlaps_at_any_size` 覆盖选项栏）。
+
+### P0-10 停靠子系统（2026-10-26，零 ABI）
+
+浮动面板不是「加一个窗口」那么简单：面板交互过去内联在主窗口的
+WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP 里（那段 1200 行），浮起来的
+面板如果走另一份代码，就会变成「能看不能点」的摆设。因此按 photocraft 的路子
+（把 dock 抽成共享实现）分三步做：
+
+1. **共享命中层**（`shell_panel_hit.{h,cpp}`，新文件）：把图层行命中、直方图
+   框选、右栏各面板的行与滑杆、面板拖动推进与收尾整段搬到独立文件，**只做两处
+   机械改写**（`shell->`/`*shell` → `shell.`；`return 0;` → `return true;`）。
+   行几何、状态字段、撤销步一概没动 —— 抽完壳自检 270 项 SHA 逐字节不变。
+2. **停靠子系统**（`shell_dock.{h,cpp}`，新文件）：**纯数据、不依赖 windows.h**。
+   状态（停靠区 / 宽度 / 收起 / 浮动几何）、命令（换边 / 设宽 / 收起 / 浮起 /
+   停回）、布局求解（`apply_to` → `LayoutPrefs`）、workspace 存读
+   （`%APPDATA%\Compositor\workspace.ini`）。此前这 5 件事散成壳里的几个字段，
+   每加一种面板形态就要再散一层。
+3. **浮动窗口**（`shell_float.{h,cpp}`，新文件）：独立顶层窗口（可拖动、可缩放、
+   可单独关闭），绘制用 `draw_adjust_content` / `draw_layer_content`（与停靠时
+   同一份代码、同一套行几何），命中走第 1 步的共享层（面板矩形 = 浮动窗口客户区）。
+   键盘事件转发给主窗口，浮起来的面板不会变成「只能用鼠标」的次等面板。
+
+入口三处：`视图 > 浮动面板 > 调整面板 / 图层面板`（勾选 = 已浮出）、**双击面板
+标题行**（PS 的习惯动作）、关掉浮动窗口 = 停回原位。
+
+**浮起来的那块在主窗口里完全不留位**（`LayoutPrefs::docked = false`），画布因此
+变宽而不是被压窄。停回时回到**原来的那一侧**（`last_docked_` 记着）。
+
+**仍未做**（都是 dock 子系统上的增量）：拖拽停靠（把面板拖到边缘/拖出成浮动）、
+多个面板合并成一组标签（photocraft 的 group/tab strip）、浮动面板里的滚轮滚动。
 
 ---
 
@@ -798,4 +830,4 @@ P0-5 Grow/Similar、P1-1 图层样式三项、P1-7 渐变引擎与 P0-6③ 段�
 | 命令表仅 7 条 | `engine/abi/src/comp_command_abi.cpp:30-39` |
 | Camera Raw 无壳入口 | ~~`shells/windows/src/*` 内 `camera` 0 命中~~ → 2026-10-22 已接「滤镜 > Camera Raw」入口（`docs/camera-raw.md`）；**RAW 文件解码**仍无 |
 | DPI 感知 | 2026-10-23 已落地（`shells/windows/src/shell_dpi.cpp`，Per-Monitor V2 运行时设定 + `MM_ANISOTROPIC` 逻辑像素排版，README §6.93）；仍需 `.manifest` 管道的场景已不存在；**画布 zoom 口径**另见 P1-11 |
-| 壳自检/视觉探针基线 | 壳自检 **270 项** failures=0、SHA256 `93f6a4bc…`（2026-10-26 P0-1/P0-3 末尾追加 3 项）（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **246/246 / 40 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`、`filter_custom`） |
+| 壳自检/视觉探针基线 | 壳自检 **272 项** failures=0、SHA256 `b59fe41e…`（2026-10-26 P0-1/P0-3 末尾追加 3 项 + P0-10 停靠子系统追加 2 项）（2026-10-23 §6.88 追加 6 项 PSD 分层入口断言、附录式；2026-10-25 §6.110～§6.113 末尾追加 4 项）；视觉探针 **246/246 / 40 场景**（依次追加 `doc_dialog`、`camera_raw`、`clipboard`、`close_prompt`、`options_bar`、`selection_modify`、`text_layer`、`font_picker`、`sharpen_denoise`、`guides`、`destructive_adjust`、`selection_grow`、`brush_options`、`selection_transform`、`layer_transform_numeric`、`effect_pattern`、`gradient_stops`、`layer_lock`、`merge_visible`、`layer_link`、`layer_style_paste`、`filter_other`、`filter_custom`） |

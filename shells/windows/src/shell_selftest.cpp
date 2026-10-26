@@ -5,7 +5,10 @@
  * 从原 main.cpp 拆出（M3 拆分第二步），行为未变：状态在 shell_state.h，
  * 跨文件契约在 shell_internal.h。
  */
+#include <filesystem>
+
 #include "shell_internal.h"
+#include "shell_dock.h"
 
 namespace comp_shell {
 
@@ -2714,6 +2717,53 @@ int run_selftest(const wchar_t* out_path) {
     verify(first_ok && second_ok && opened == 2 && switched_back && fell_back,
            "P0-3 tabs: two documents park / switch / close without losing state");
     if (tabs_shell.doc.document != nullptr) comp_document_destroy(tabs_shell.doc.document);
+  }
+
+  /*
+   * P0-10 停靠子系统：状态机是纯逻辑，直接测（不用开窗口）。
+   *
+   * 三件事各自会坏：换边时两块**对调**（不对调就是两块挤在同一侧）、
+   * 浮起来时**主窗口不再给它留位**（留了就是画布被压窄）、停回时**回原位**
+   * （回错边就得再手动拖一次）。
+   */
+  {
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    bool ok = dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Right &&
+              dock.area_of(comp_dock::PanelId::Layers) == comp_dock::DockArea::Left;
+    /* 换到左侧：两块对调（图层让到右侧）。 */
+    dock.set_area(comp_dock::PanelId::Adjust, comp_dock::DockArea::Left);
+    ok = ok && dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Left &&
+         dock.area_of(comp_dock::PanelId::Layers) == comp_dock::DockArea::Right;
+    /* 浮起来：主窗口完全不给它留位；停回原位。 */
+    dock.float_panel(comp_dock::PanelId::Adjust, 100, 120, 330, 560);
+    comp_ui::LayoutPrefs prefs{};
+    dock.apply_to(prefs);
+    ok = ok && dock.is_floating(comp_dock::PanelId::Adjust) && !prefs.adjust_docked &&
+         prefs.layer_docked;
+    dock.dock_panel(comp_dock::PanelId::Adjust);
+    ok = ok && dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Left &&
+         !dock.is_floating(comp_dock::PanelId::Adjust);
+    verify(ok, "P0-10 dock state: swap sides / float leaves no slot / dock back to origin");
+  }
+  {
+    /* workspace 存读往返：宽度、收起态、停靠区都要能存回来。 */
+    const std::wstring path = (std::filesystem::temp_directory_path() /
+                               L"compositor_dock_workspace.ini").wstring();
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    dock.set_width(comp_dock::PanelId::Adjust, 400);
+    dock.toggle_collapsed(comp_dock::PanelId::Layers);
+    dock.set_area(comp_dock::PanelId::Adjust, comp_dock::DockArea::Left);
+    const bool saved = dock.save(path);
+    comp_dock::DockState loaded;
+    const bool read_ok = loaded.load(path);
+    const bool ok = saved && read_ok &&
+                    loaded.width_of(comp_dock::PanelId::Adjust, 0) == 400 &&
+                    loaded.panel(comp_dock::PanelId::Layers).collapsed &&
+                    loaded.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Left;
+    std::filesystem::remove(path, ignored);
+    verify(ok, "P0-10 dock workspace round trip (width / collapsed / side)");
   }
 
   comp_document_destroy(document);

@@ -5115,11 +5115,14 @@ COMP_TEST(ui_core_tabbar_and_dock_layout) {
   const comp_ui::Layout docked = comp_ui::compute_layout(1280, 720, left);
   const comp_ui::Layout normal = comp_ui::compute_layout(1280, 720);
   COMP_CHECK(docked.adjust_panel.x == 0);
-  COMP_CHECK(docked.layer_panel.x == docked.adjust_panel.right());
+  /* 停左 = 两列各贴一边：调整贴左缘、图层贴右缘（不是「挤在中间」）。 */
+  COMP_CHECK(docked.layer_panel.right() == 1280);
   /* 画布**宽度**不变（两列宽度之和一样），但横向位置随列序移动——
-   * 换边必然移动画布，否则面板会压到画布上。 */
+   * 换边必然移动画布，否则面板会压到画布上。
+   * 停左时两列各贴一边：调整贴左缘、图层贴右缘，画布在中间。 */
   COMP_CHECK(docked.canvas.w == normal.canvas.w);
-  COMP_CHECK(docked.canvas.x == docked.layer_panel.right());
+  COMP_CHECK(docked.canvas.x == docked.adjust_panel.right());
+  COMP_CHECK(docked.canvas.right() == docked.layer_panel.x);
   COMP_CHECK(docked.canvas.x > normal.canvas.x);
   /* 停左时分界线在面板**右**缘，停右时在左缘。 */
   COMP_CHECK(docked.adjust_splitter.right() <= docked.adjust_panel.right());

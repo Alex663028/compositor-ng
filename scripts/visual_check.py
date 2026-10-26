@@ -380,6 +380,19 @@ def pixel(img, x, y):
 
 # ---------------------------------------------------------------- 外壳驱动
 
+def _clear_workspace():
+    """删掉 %APPDATA%\Compositor\workspace.ini（停靠状态跨会话保留）。"""
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return
+    path = os.path.join(appdata, "Compositor", "workspace.ini")
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 class Shell:
     def __init__(self, exe, out_dir, keep):
         self.exe = exe
@@ -395,6 +408,10 @@ class Shell:
 
     # -- 生命周期 --------------------------------------------------
     def start(self, args=None):
+        # P0-10：启动前清掉上次的 workspace（停靠状态会跨会话保留）。
+        # 不清的话，上一次跑出来的「浮动面板」状态会带进这一次，右栏就不在
+        # 窗口里了，探针按「右栏在原位」做的断言会全线崩。
+        _clear_workspace()
         cmd = [self.exe] + list(args or [])
         self.proc = subprocess.Popen(cmd, cwd=BUILD)
         deadline = time.time() + 15.0

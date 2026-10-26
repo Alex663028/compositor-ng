@@ -50,7 +50,8 @@
 
 #include "ui_core.h" /* 平台无关的视图变换 / 布局 / 命中 / 工具表 */
 #include "shell_state.h" /* 状态定义（M3 拆分第一步） */
-#include "shell_internal.h" /* 跨翻译单元的内部契约（M3 拆分第二步） */
+#include "shell_internal.h"
+#include "shell_float.h" /* 跨翻译单元的内部契约（M3 拆分第二步） */
 
 namespace comp_shell {
 
@@ -243,6 +244,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   }
   /* P0-3：最近打开列表（%APPDATA%），读失败等于空列表，不影响启动。 */
   recent_load(shell);
+  /* P0-10：停靠状态（面板停靠边 / 宽度 / 收起 / 浮动几何）从上次退出继承。 */
+  workspace_load(shell);
   create_document(shell);
   /*
    * P5-3：随仓字体在这里一次性加载（字体句柄独立于引擎，不需要文档）。

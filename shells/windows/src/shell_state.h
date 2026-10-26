@@ -44,7 +44,8 @@
 #include <compositor/comp_selection.h>
 #include <compositor/comp_undo.h>
 
-#include "ui_core.h" /* 平台无关的视图变换 / 布局 / 命中 / 工具表 */
+#include "ui_core.h"
+#include "shell_dock.h" /* 平台无关的视图变换 / 布局 / 命中 / 工具表 */
 
 namespace comp_shell {
 
@@ -406,6 +407,8 @@ constexpr UINT kCmdCursorCross = 1739;    /* 光标：十字 */
 constexpr UINT kCmdCursorHidden = 1740;   /* 光标：隐藏 */
 constexpr UINT kCmdPanelDockRight = 1741; /* 调整面板停靠右侧（默认） */
 constexpr UINT kCmdPanelDockLeft = 1742;  /* 调整面板停靠左侧 */
+constexpr UINT kCmdFloatAdjust = 1743;    /* 浮动/停回 调整面板 */
+constexpr UINT kCmdFloatLayers = 1744;    /* 浮动/停回 图层面板 */
 constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
 /*
@@ -921,8 +924,6 @@ struct ShellState {
    * （画笔预览已经足够定位时用）。只改画布内的光标，面板/工具条不受影响。
    */
   int cursor_mode = 0;
-  /* P0-10 面板停靠边：false = 调整面板在右，true = 停到左侧。 */
-  bool adjust_dock_left = false;
   bool option_input_active = false;
   int option_input_index = -1;  /* 组序号，绘制时用来判断哪一格画输入框 */
   comp_ui::ToolOptionId option_input_id = comp_ui::ToolOptionId::None;
@@ -938,14 +939,19 @@ struct ShellState {
   comp_ui::ColorRGB foreground{};
   int32_t palette_index = 0; /* X 键循环到色板的哪一项 */
   std::wstring color_input;  /* Shift+X 的十六进制键入；非空 = 输入态 */
-  int layer_panel_width = comp_ui::Layout::kLayerPanelWidth;
-  int adjust_panel_width = comp_ui::Layout::kAdjustPanelWidth;
+  /*
+   * P0-10 停靠子系统：面板的停靠/收起/浮动状态全在这里（shell_dock.h）。
+   * 此前散成 5 个壳字段（两种宽度 + 两个收起标志 + 一个停靠边），每加一种形态
+   * （浮动）就要再散一层；收进一个状态机之后，窗口只负责「把状态画出来」。
+   */
+  comp_dock::DockState dock;
+  /* P0-10 浮动面板窗口（至多一个；dock 的不变式就是「至多一块浮动」）。 */
+  HWND float_window = nullptr;
+  comp_dock::PanelId float_panel = comp_dock::PanelId::Adjust;
   int panel_resize_target = 0;
   int panel_resize_base_width = 0;
   int panel_resize_start_x = 0;
   int panel_splitter_hover = 0;
-  bool layer_panel_collapsed = false;
-  bool adjust_panel_collapsed = false;
   int panel_toggle_hover = 0;
   int marquee_shape = comp_ui::kMarqueeRect;
   int wand_tolerance = comp_ui::kDefaultWandTolerance;

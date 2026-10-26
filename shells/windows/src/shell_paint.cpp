@@ -3380,6 +3380,48 @@ void update_window_title(HWND window, ShellState& shell) {
   SetWindowTextW(window, title.c_str());
 }
 
+/* 左栏内容（图层面板）：浮动面板窗口与主窗口共用同一份绘制。 */
+void draw_layer_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel) {
+  draw_layer_panel(dc, shell, panel);
+}
+
+/*
+ * 右栏内容：按「当前开着哪个子面板」选画哪一个。
+ *
+ * 抽成函数是为了让**浮动面板窗口**画同一份内容 —— 浮起来的调整面板必须跟
+ * 停靠时一模一样（同一批子面板、同一套行几何），否则「浮起来」就变成
+ * 「换个界面」。绘制与命中都按面板矩形走，浮动的矩形 = 浮动窗口客户区。
+ */
+void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel) {
+  if (shell.doc.doc_dialog != comp_ui::DocDialogKind::None) {
+    draw_doc_dialog(dc, shell, panel);
+  } else if (path_panel_visible(shell)) {
+    draw_path_panel(dc, shell, panel);
+  } else if (history_panel_visible(shell)) {
+    draw_history_panel(dc, shell, panel);
+  } else if (channel_panel_visible(shell)) {
+    draw_selection_channel_panel(dc, shell, panel);
+  } else if (font_panel_visible(shell)) {
+    draw_font_panel(dc, shell, panel);
+  } else if (shell.doc.color_range_open) {
+    draw_color_range_panel(dc, shell, panel);
+  } else if (shell.doc.trim_open) {
+    draw_trim_panel(dc, shell, panel);
+  } else if (shell.doc.effect_open) {
+    draw_effect_panel(dc, shell, panel);
+  } else if (shell.doc.filter_open) {
+    draw_filter_panel(dc, shell, panel);
+  } else if (shell.doc.fill_open) {
+    draw_fill_panel(dc, shell, panel);
+  } else if (shell.doc.smart_open) {
+    draw_smart_panel(dc, shell, panel);
+  } else if (shell.tool == comp_ui::ToolId::Type) {
+    draw_type_panel(dc, shell, panel);
+  } else {
+    draw_adjust_panel(dc, shell, panel);
+  }
+}
+
 void present(HWND window, ShellState& shell) {
   PAINTSTRUCT paint{};
   HDC dc = BeginPaint(window, &paint);
@@ -3542,33 +3584,7 @@ void present(HWND window, ShellState& shell) {
                                            layout.adjust_panel.right(),
                                            layout.adjust_panel.bottom());
     SelectClipRgn(memory_dc, adjust_clip);
-    if (shell.doc.doc_dialog != comp_ui::DocDialogKind::None) {
-      draw_doc_dialog(memory_dc, shell, layout.adjust_panel);
-    } else if (path_panel_visible(shell)) {
-      draw_path_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (history_panel_visible(shell)) {
-      draw_history_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (channel_panel_visible(shell)) {
-      draw_selection_channel_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (font_panel_visible(shell)) {
-      draw_font_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.color_range_open) {
-      draw_color_range_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.trim_open) {
-      draw_trim_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.effect_open) {
-      draw_effect_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.filter_open) {
-      draw_filter_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.fill_open) {
-      draw_fill_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.doc.smart_open) {
-      draw_smart_panel(memory_dc, shell, layout.adjust_panel);
-    } else if (shell.tool == comp_ui::ToolId::Type) {
-      draw_type_panel(memory_dc, shell, layout.adjust_panel);
-    } else {
-      draw_adjust_panel(memory_dc, shell, layout.adjust_panel);
-    }
+    draw_adjust_content(memory_dc, shell, layout.adjust_panel);
     SelectClipRgn(memory_dc, NULL);
     DeleteObject(adjust_clip);
   }

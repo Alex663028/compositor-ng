@@ -1648,6 +1648,20 @@ void doc_dialog_apply(HWND window, ShellState& shell) {
       if (!tab_close_active(shell)) DestroyWindow(window);
       return;
     }
+    /*
+     * 退出：先**关掉刚答完的那一份**（选「不保存」就是丢弃这一份），再继续收口
+     * 其余标签。
+     *
+     * 之前这里直接 close_flow_step —— 它会回头检查刚答完的那份，发现它还脏，
+     * 于是又弹一次提示：按「不保存」永远关不掉窗口（视觉探针 close_prompt 场景
+     * 抓到的就是这条）。答完即关，关完再问下一份。
+     */
+    const bool remains = tab_close_active(shell);
+    if (!remains) {
+      shell.close_intent = 0;
+      DestroyWindow(window);
+      return;
+    }
     if (!close_flow_step(shell)) {
       shell.close_intent = 0;
       DestroyWindow(window);
@@ -2236,12 +2250,19 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       set_status(shell, L"光标：隐藏（笔尖轮廓仍然可见）");
       break;
     case kCmdPanelDockRight:
-      shell.adjust_dock_left = false;
+      shell.dock.set_area(comp_dock::PanelId::Adjust, comp_dock::DockArea::Right);
       set_status(shell, L"调整面板已停靠右侧");
       break;
     case kCmdPanelDockLeft:
-      shell.adjust_dock_left = true;
+      shell.dock.set_area(comp_dock::PanelId::Adjust, comp_dock::DockArea::Left);
       set_status(shell, L"调整面板已停靠左侧");
+      break;
+    /* ---- P0-10：浮动面板（独立顶层窗口）---- */
+    case kCmdFloatAdjust:
+      toggle_float_panel(shell, comp_dock::PanelId::Adjust);
+      break;
+    case kCmdFloatLayers:
+      toggle_float_panel(shell, comp_dock::PanelId::Layers);
       break;
     /* ---- 图像 > 图像大小… / 画布大小…（对应上游 Image Size / Canvas Size） ---- */
     case kCmdImageSize:
