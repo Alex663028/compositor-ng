@@ -321,6 +321,21 @@ struct LayoutPrefs {
   bool group_on_left = false;
   int group_count = 1;
   int group_active = 0;
+  /*
+   * 组的**列宽**与**列收起态**。
+   *
+   * 这两项是**列的属性**，不随激活标签变——PS 的组就是这个语义（切标签时
+   * 组宽度不变，变的是组里的内容）。
+   *
+   * 为什么不用 layer_panel_width / adjust_panel_width：那两个字段各自按
+   * **面板身份**夹取（图层栏 168..520、调整栏 240..560）。组里两块面板的
+   * 缺省宽不同，同一个组宽经不同夹取会得到两个值——切一次标签列宽就跳
+   * 一次（2026-10-26 自查发现：360 在图层栏夹取下不变、在调整栏夹取下
+   * 也不变，但组宽 200 时两者分别夹到 200 / 240，差 40 px）。
+   * 所以组有自己的宽度区间（168..560，两者的并集）与自己的收起态。
+   */
+  int group_width = 0;
+  bool group_collapsed = false;
 };
 
 /* 宽度是整数像素，不存在 NaN 输入，夹取只需一次 min/max。 */
@@ -403,6 +418,19 @@ inline int group_tab_at(const Rect& bar, int group_count, double x, double y) {
     if (group_tab_rect(bar, i, group_count).contains(x, y)) return i;
   }
   return -1;
+}
+
+/*
+ * 组列宽的夹取区间：两块面板的**并集**。
+ *
+ * 组里可能装图层栏（168..520）也可能装调整栏（240..560），取并集
+ * （168..560）才不会因为组里换了一块面板就被夹到不同的值。
+ */
+inline constexpr int kGroupPanelMinWidth = Layout::kLayerPanelMinWidth; /* 168 */
+inline constexpr int kGroupPanelMaxWidth = Layout::kAdjustPanelMaxWidth; /* 560 */
+
+inline int clamp_group_panel_width(int width) {
+  return std::min(std::max(width, kGroupPanelMinWidth), kGroupPanelMaxWidth);
 }
 
 inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
@@ -495,52 +523,87 @@ inline Layout compute_layout(int width, int height, const LayoutPrefs& prefs) {
   if (prefs.group_enabled && prefs.group_count > 1) {
     /*
      * 组内成员下标：0 = Adjust，1 = Layers（组内顺序按 PanelId 升序）。
-     * 组的列在哪一侧由 group_on_left 决定。
+     *
+     * **组的位置只由 on_left 决定**——组只占一列，激活谁并不改变它在哪。
+     * 激活成员只决定「这一列画谁的内容」。
+     *
+     * （此前这里写的是 `on_left ? active_is_adjust : !active_is_adjust`，
+     *  算的是「激活成员属于左列吗」——那是把「组在哪」与「组里显示谁」
+     *  混成了一件事。后果：组在右列、切到图层标签时，列宽会从组宽
+     *  跳成左侧图层栏的缺省宽（248），画布宽度跟着抖一下。
+     *  视觉探针没抓到，因为探针量的标签位置与强调线都不随列宽变。）
      */
     const bool on_left = prefs.group_on_left;
     const bool active_is_adjust = prefs.group_active == 0;
-    /* 激活成员在「左列 / 右列」这一组里的位置：组只占一列。 */
-    const bool active_on_left = on_left ? active_is_adjust : !active_is_adjust;
     /*
-     * 组占的那一列的宽度：取**激活成员**的偏好宽度（dock 侧已把组宽写进
-     * 对应字段）。非激活成员不占位 → 画布因此变宽。
+     * 组列宽：**组自己的宽度**（prefs.group_width，独立的 168..560 区间）。
+     *
+     * 不取 layer_w / adjust_w：那两者的宽度区间按**面板身份**分（图层栏
+     * 168..520、调整栏 240..560），组里换一块面板，同一个组宽会被夹到
+     * 不同的值——切标签时列宽就跳了。组的宽度是列的属性，用自己的区间。
+     *
+     * 组收起时整列变成 24px 竖条（与单面板收起同款）。
      */
-    const int group_w = active_on_left ? layer_w : adjust_w;
+    const int group_w = prefs.group_collapsed
+                            ? Layout::kCollapsedPanelWidth
+                            : clamp_group_panel_width(prefs.group_width);
     const int group_x = on_left ? 0 : width - group_w;
     const Rect column{group_x, body_top, group_w, body_h};
 
-    out.group_bar = group_bar_rect(column, prefs.group_count);
-    const Rect content = group_content_rect(column, prefs.group_count);
+    /*
+     * 收起态下不画标签栏：24px 竖条放不下两个标签。与单面板收起一致。
+     */
+    out.group_bar = prefs.group_collapsed ? Rect{} : group_bar_rect(column, prefs.group_count);
+    const Rect content = prefs.group_collapsed
+                              ? column
+                              : group_content_rect(column, prefs.group_count);
     out.group_count = prefs.group_count;
     out.group_active = prefs.group_active;
 
-    /* 激活成员拿内容矩形；另一块清空（不画、不命中）。 */
-    if (active_on_left) {
-      out.layer_panel = content;
-      out.adjust_panel = Rect{};
+    /*
+     * 激活成员拿内容矩形；另一块清空（不画、不命中）。
+     * 矩形放在**组所在的那一列**（左列 = layer_panel，右列 = adjust_panel）。
+     */
+    if (on_left) {
+      out.layer_panel = active_is_adjust ? content : Rect{};
+      out.adjust_panel = active_is_adjust ? Rect{} : content;
     } else {
-      out.adjust_panel = content;
-      out.layer_panel = Rect{};
+      out.adjust_panel = active_is_adjust ? content : Rect{};
+      out.layer_panel = active_is_adjust ? Rect{} : content;
     }
     /* 画布：组列之外的全部空间。 */
     out.canvas = Rect{on_left ? group_w : 0, body_top, width - group_w, body_h};
-    /* 收起态与分界线按组列重算：组的收起看激活成员的收起态。 */
-    out.layer_collapsed = out.layer_panel.w > 0 && prefs.layer_panel_collapsed;
-    out.adjust_collapsed = out.adjust_panel.w > 0 && prefs.adjust_panel_collapsed;
-    if (group_w > 0 && !out.layer_collapsed && !out.adjust_collapsed) {
+    /*
+     * 收起态是**列级**的：组收起 = 整列收起，不看激活成员是谁。
+     * （此前这里取的是激活成员的收起标志——切标签时列会忽收忽展。）
+     */
+    out.layer_collapsed = on_left && prefs.group_collapsed;
+    out.adjust_collapsed = !on_left && prefs.group_collapsed;
+    if (group_w > 0 && !prefs.group_collapsed) {
       const int splitter_x = on_left ? group_w - Layout::kPanelSplitterWidth : group_x;
-      if (active_on_left) {
+      /*
+       * 分界线与收起按钮属于**组**（那一列），不属于「当前显示的那块面板」。
+       * 切标签时它们留在原位——否则按钮会跳到另一列去。
+       * 命中上靠 rect 位置区分，语义上仍归到该列的槽位。
+       */
+      if (on_left) {
         out.layer_splitter = Rect{splitter_x, body_top, Layout::kPanelSplitterWidth, body_h};
       } else {
         out.adjust_splitter = Rect{splitter_x, body_top, Layout::kPanelSplitterWidth, body_h};
       }
     }
     if (group_w > 0) {
-      if (active_on_left) {
-        out.layer_toggle = out.layer_collapsed ? out.layer_panel : panel_toggle_rect(out.layer_panel);
+      /*
+       * 收起按钮落在**组所在那一列**的槽位上，且用组列的矩形算位置——
+       * 不能用 out.adjust_panel / out.layer_panel：激活成员不在那一列时，
+       * 那个矩形是空的（w=0），按它算出来的按钮会跑到负坐标去。
+       */
+      if (on_left) {
+        out.layer_toggle =
+            prefs.group_collapsed ? column : panel_toggle_rect(column);
       } else {
         out.adjust_toggle =
-            out.adjust_collapsed ? out.adjust_panel : panel_toggle_rect(out.adjust_panel);
+            prefs.group_collapsed ? column : panel_toggle_rect(column);
       }
     }
     return out;

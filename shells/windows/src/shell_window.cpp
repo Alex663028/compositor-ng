@@ -9,6 +9,9 @@
 #include "shell_panel_hit.h"
 #include "shell_float.h"
 
+#include <cstdio>
+#include <cstring>
+
 #include <compositor/comp_guide.h> /* ROI #3：菜单里按参考线条数置灰「清除参考线」 */
 
 namespace comp_shell {
@@ -639,14 +642,32 @@ void panel_resize_begin(HWND window, ShellState& shell, int target, int mouse_x)
   if (target != 1 && target != 2) return;
   shell.panel_resize_target = target;
   shell.panel_resize_start_x = mouse_x;
-  shell.panel_resize_base_width =
-      target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
-                   : panel_width_of(shell, comp_dock::PanelId::Adjust);
+  /*
+   * 组模式下改的是**组宽**（列的属性），不是组里某块面板的宽度。
+   *
+   * target 是列的身份（1 = 左列，2 = 右列）——组模式下两块面板共用一列，
+   * 分界线也只有一个，跟着「哪块面板在显示」走会让拖宽对象在切标签时变化。
+   */
+  if (panel_group_active(shell)) {
+    const comp_dock::DockArea side =
+        target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+    shell.panel_resize_base_width = shell.dock.group_width(side);
+  } else {
+    shell.panel_resize_base_width =
+        target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
+                     : panel_width_of(shell, comp_dock::PanelId::Adjust);
+  }
   SetCapture(window);
   wchar_t buffer[160];
-  wsprintfW(buffer, L"%s：拖动调宽，双击分界线复位（%d px），Esc 取消",
-            target == 1 ? L"图层面板" : L"右侧面板",
-            target == 1 ? comp_ui::Layout::kLayerPanelWidth : comp_ui::Layout::kAdjustPanelWidth);
+  if (panel_group_active(shell)) {
+    wsprintfW(buffer, L"面板组：拖动调宽（%d px），双击分界线复位，Esc 取消",
+              shell.panel_resize_base_width);
+  } else {
+    wsprintfW(buffer, L"%s：拖动调宽，双击分界线复位（%d px），Esc 取消",
+              target == 1 ? L"图层面板" : L"右侧面板",
+              target == 1 ? comp_ui::Layout::kLayerPanelWidth
+                          : comp_ui::Layout::kAdjustPanelWidth);
+  }
   set_status(shell, buffer);
 }
 
@@ -657,7 +678,15 @@ void panel_resize_extend(ShellState& shell, int mouse_x) {
 
   const int dx = mouse_x - shell.panel_resize_start_x;
   int next = 0;
-  if (shell.panel_resize_target == 1) {
+  if (panel_group_active(shell)) {
+    /*
+     * 组列宽：方向取决于分界线在哪一侧（左列往右拖变宽，右列往左拖变宽）。
+     * 区间用组自己的（168..560），与 ui_core::clamp_group_panel_width 同一口径。
+     */
+    const bool on_left = shell.panel_resize_target == 1;
+    const int raw = shell.panel_resize_base_width + (on_left ? dx : -dx);
+    next = comp_ui::clamp_group_panel_width(raw);
+  } else if (shell.panel_resize_target == 1) {
     next = comp_ui::layer_panel_width_from_drag(shell.panel_resize_base_width, dx);
   } else if (shell.dock.area_of(comp_dock::PanelId::Adjust) == comp_dock::DockArea::Left) {
     /* 停左时分界线在面板右缘，往右拖 = 变宽（与停右反向）。 */
@@ -665,14 +694,22 @@ void panel_resize_extend(ShellState& shell, int mouse_x) {
   } else {
     next = comp_ui::adjust_panel_width_from_drag(shell.panel_resize_base_width, dx);
   }
-  const int current =
-      shell.panel_resize_target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
-                                     : panel_width_of(shell, comp_dock::PanelId::Adjust);
-  if (next == current) return;
-  if (shell.panel_resize_target == 1) {
-    shell.dock.set_width(comp_dock::PanelId::Layers, next);
+  if (panel_group_active(shell)) {
+    const comp_dock::DockArea side =
+        shell.panel_resize_target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+    const int current = shell.dock.group_width(side);
+    if (next == current) return;
+    shell.dock.set_group_width(side, next);
   } else {
-    shell.dock.set_width(comp_dock::PanelId::Adjust, next);
+    const int current =
+        shell.panel_resize_target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
+                                       : panel_width_of(shell, comp_dock::PanelId::Adjust);
+    if (next == current) return;
+    if (shell.panel_resize_target == 1) {
+      shell.dock.set_width(comp_dock::PanelId::Layers, next);
+    } else {
+      shell.dock.set_width(comp_dock::PanelId::Adjust, next);
+    }
   }
 
   Layout after{};
@@ -687,24 +724,37 @@ void panel_resize_extend(ShellState& shell, int mouse_x) {
   }
 
   wchar_t buffer[176];
-  wsprintfW(buffer, L"%s宽度 %d px%s", shell.panel_resize_target == 1 ? L"图层面板" : L"右侧面板",
-            next, shown ? L"" : L"（当前窗口放不下，已收起；放宽窗口后生效）");
+  if (panel_group_active(shell)) {
+    wsprintfW(buffer, L"面板组宽度 %d px%s", next,
+              shown ? L"" : L"（当前窗口放不下，已收起；放宽窗口后生效）");
+  } else {
+    wsprintfW(buffer, L"%s宽度 %d px%s", shell.panel_resize_target == 1 ? L"图层面板" : L"右侧面板",
+              next, shown ? L"" : L"（当前窗口放不下，已收起；放宽窗口后生效）");
+  }
   set_status(shell, buffer);
 }
 
 void panel_resize_end(ShellState& shell) {
   if (shell.panel_resize_target == 0) return;
   const int target = shell.panel_resize_target;
-  const int width = target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
-                                : panel_width_of(shell, comp_dock::PanelId::Adjust);
+  const bool grouped = panel_group_active(shell);
+  const comp_dock::DockArea side =
+      target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+  const int width = grouped ? shell.dock.group_width(side)
+                            : (target == 1 ? panel_width_of(shell, comp_dock::PanelId::Layers)
+                                           : panel_width_of(shell, comp_dock::PanelId::Adjust));
   /* 与滑杆同一顺序：先清状态再 ReleaseCapture，捕获变更会重入 cancel。 */
   shell.panel_resize_target = 0;
   shell.panel_resize_base_width = 0;
   ReleaseCapture();
 
   wchar_t buffer[176];
-  wsprintfW(buffer, L"%s宽度：%d px（双击分界线复位）",
-            target == 1 ? L"图层面板" : L"右侧面板", width);
+  if (grouped) {
+    wsprintfW(buffer, L"面板组宽度：%d px（双击分界线复位）", width);
+  } else {
+    wsprintfW(buffer, L"%s宽度：%d px（双击分界线复位）",
+              target == 1 ? L"图层面板" : L"右侧面板", width);
+  }
   set_status(shell, buffer);
 }
 
@@ -714,7 +764,11 @@ void panel_resize_cancel(ShellState& shell) {
   client_layout(shell, &before);
   const int target = shell.panel_resize_target;
   const int restore = shell.panel_resize_base_width;
-  if (target == 1) {
+  if (panel_group_active(shell)) {
+    const comp_dock::DockArea side =
+        target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+    shell.dock.set_group_width(side, restore);
+  } else if (target == 1) {
     shell.dock.set_width(comp_dock::PanelId::Layers, restore);
   } else {
     shell.dock.set_width(comp_dock::PanelId::Adjust, restore);
@@ -734,6 +788,28 @@ void panel_resize_cancel(ShellState& shell) {
 void panel_resize_reset(ShellState& shell, int target) {
   Layout before{};
   if (!client_layout(shell, &before)) return;
+  /*
+   * 组模式下复位的是**组宽**（列的属性）。复位到哪个缺省值？取组所在列
+   * 的缺省：右列 330（调整栏缺省）、左列 248（图层栏缺省）。
+   */
+  if (panel_group_active(shell)) {
+    const comp_dock::DockArea side =
+        target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+    const int reset = side == comp_dock::DockArea::Left
+                          ? comp_ui::Layout::kLayerPanelWidth
+                          : comp_ui::Layout::kAdjustPanelWidth;
+    shell.dock.set_group_width(side, reset);
+    Layout after{};
+    if (client_layout(shell, &after)) {
+      const comp_ui::Point was = comp_ui::CanvasView::canvas_center(before.canvas);
+      const comp_ui::Point now = comp_ui::CanvasView::canvas_center(after.canvas);
+      shell.doc.view.pan_by(was.x - now.x, was.y - now.y);
+    }
+    wchar_t group_buffer[128];
+    wsprintfW(group_buffer, L"面板组宽度已复位为 %d px", reset);
+    set_status(shell, group_buffer);
+    return;
+  }
   if (target == 1) {
     shell.dock.set_width(comp_dock::PanelId::Layers, comp_ui::Layout::kLayerPanelWidth);
   } else if (target == 2) {
@@ -766,7 +842,18 @@ void panel_toggle_collapsed(ShellState& shell, int target) {
   Layout before{};
   if (!client_layout(shell, &before)) return;
 
-  if (target == 1) {
+  /*
+   * 组模式下收起的是**整列**（两块面板住在一起，收起一列 = 收起两块）。
+   *
+   * target 是**列**的身份（1 = 图层栏那一列，2 = 调整栏那一列），
+   * 不是组里哪块面板正在显示——组模式下两者共用一列。
+   */
+  const bool grouped = panel_group_active(shell);
+  const comp_dock::DockArea side =
+      target == 1 ? comp_dock::DockArea::Left : comp_dock::DockArea::Right;
+  if (grouped) {
+    shell.dock.toggle_group_collapsed(side);
+  } else if (target == 1) {
     shell.dock.toggle_collapsed(comp_dock::PanelId::Layers);
   } else {
     shell.dock.toggle_collapsed(comp_dock::PanelId::Adjust);
@@ -781,8 +868,11 @@ void panel_toggle_collapsed(ShellState& shell, int target) {
     shown = target == 1 ? after.layer_panel.w > 0 : after.adjust_panel.w > 0;
   }
 
-  const bool collapsed = target == 1 ? panel_collapsed_of(shell, comp_dock::PanelId::Layers)
-                                       : panel_collapsed_of(shell, comp_dock::PanelId::Adjust);
+  const bool collapsed = grouped
+                             ? shell.dock.group_collapsed(side)
+                             : (target == 1
+                                    ? panel_collapsed_of(shell, comp_dock::PanelId::Layers)
+                                    : panel_collapsed_of(shell, comp_dock::PanelId::Adjust));
   const wchar_t* hint = L"";
   if (!shown) {
     hint = L"（当前窗口放不下，放宽窗口后生效）";
@@ -790,8 +880,12 @@ void panel_toggle_collapsed(ShellState& shell, int target) {
     hint = target == 1 ? L"（F7 或点竖条展开）" : L"（F8 或点竖条展开）";
   }
   wchar_t buffer[192];
-  wsprintfW(buffer, L"%s：%s%s", target == 1 ? L"图层面板" : L"调整面板",
-            collapsed ? L"已收起" : L"已展开", hint);
+  if (grouped) {
+    wsprintfW(buffer, L"面板组：%s%s", collapsed ? L"已收起" : L"已展开", hint);
+  } else {
+    wsprintfW(buffer, L"%s：%s%s", target == 1 ? L"图层面板" : L"调整面板",
+              collapsed ? L"已收起" : L"已展开", hint);
+  }
   set_status(shell, buffer);
 }
 
@@ -3983,6 +4077,53 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         }
         run_shell_command(window, *shell, LOWORD(wparam));
         return 0;
+      }
+      break;
+    case kMsgLayoutQuery:
+      /*
+       * 布局查询（视觉探针用）：把当前布局的关键矩形写成 JSON 交回调用方。
+       *
+       * 为什么要有这个通道：探针原本靠 **Python 复算** ui_core 的布局公式，
+       * 那是**第二份真源**——壳里改了布局公式（新增面板分组就是一种），
+       * 探针的复算就跟不上了，于是「探针量到的位置」与「壳画出来的位置」
+       * 对不上，断言要么误报失败要么漏掉真缺陷。
+       * （本轮分组就栽在这上面：探针量的是标签位置与强调线，两者都不随列宽
+       *  变，所以「切标签时列宽跳变」这个真缺陷既没被自检抓到也没被探针抓到。）
+       *
+       * 口径：调用方给一个输出缓冲（lParam 指向，wParam 是容量），
+       * 壳写一段 JSON 并返回写入的字节数（不含结尾 '\0'）；缓冲不够则返回
+       * 需要的字节数（调用方据此扩容重来）。
+       */
+      if (shell != nullptr && lparam != 0) {
+        Layout layout{};
+        if (!client_layout(*shell, &layout)) return 0;
+        char buffer[1024];
+        const int written = std::snprintf(
+            buffer, sizeof(buffer),
+            "{\"toolbar\":[%d,%d,%d,%d],\"options\":[%d,%d,%d,%d],"
+            "\"tabbar\":[%d,%d,%d,%d],\"layer\":[%d,%d,%d,%d],"
+            "\"adjust\":[%d,%d,%d,%d],\"canvas\":[%d,%d,%d,%d],"
+            "\"status\":[%d,%d,%d,%d],\"group_bar\":[%d,%d,%d,%d],"
+            "\"group_count\":%d,\"group_active\":%d}",
+            layout.toolbar.x, layout.toolbar.y, layout.toolbar.w, layout.toolbar.h,
+            layout.options.x, layout.options.y, layout.options.w, layout.options.h,
+            layout.tabbar.x, layout.tabbar.y, layout.tabbar.w, layout.tabbar.h,
+            layout.layer_panel.x, layout.layer_panel.y, layout.layer_panel.w,
+            layout.layer_panel.h,
+            layout.adjust_panel.x, layout.adjust_panel.y, layout.adjust_panel.w,
+            layout.adjust_panel.h,
+            layout.canvas.x, layout.canvas.y, layout.canvas.w, layout.canvas.h,
+            layout.status.x, layout.status.y, layout.status.w, layout.status.h,
+            layout.group_bar.x, layout.group_bar.y, layout.group_bar.w, layout.group_bar.h,
+            layout.group_count, layout.group_active);
+        if (written <= 0) return 0;
+        const int capacity = static_cast<int>(wparam);
+        if (capacity > written + 1) {
+          char* out = reinterpret_cast<char*>(lparam);
+          std::memcpy(out, buffer, static_cast<size_t>(written) + 1u);
+          return written;
+        }
+        return written + 1; /* 告诉调用方：需要这么多字节（含 '\0'） */
       }
       break;
     case WM_SIZE:

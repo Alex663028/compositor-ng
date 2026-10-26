@@ -23,6 +23,7 @@ PrintWindow 抓客户区像素，既落盘 PNG（供人肉眼复核），又对�
 
 import argparse
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -49,6 +50,8 @@ WM_IME_CHAR = 0x0286
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_COMMAND = 0x0111
+# 布局查询（kMsgLayoutQuery = WM_APP + 1，与 shell_state.h 同值）。
+MSG_LAYOUT_QUERY = 0x8001
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -540,8 +543,44 @@ class Shell:
         self.client_w = rect.right - rect.left
         self.client_h = rect.bottom - rect.top
 
+    def query_layout(self):
+        """问壳要**真实**布局（kMsgLayoutQuery）。
+
+        为什么必须问壳：这里的 Python 复算是 ui_core 布局公式的**第二份真源**。
+        壳里改了公式（新增面板分组就是一种），复算就跟不上——探针量到的位置
+        与壳画出来的位置对不上，断言要么误报失败、要么漏掉真缺陷。
+        本轮分组就栽在这上面：切标签时列宽跳变这个真缺陷，既没被自检抓到
+        （当时测的是个恒量），也没被探针抓到（量的标签位置与强调线都不随宽变）。
+
+        壳不可问时（老 exe / 消息不被处理）返回 None，调用方退回 Python 复算。
+        """
+        buffer = ctypes.create_string_buffer(4096)
+        needed = user32.SendMessageW(self.hwnd, MSG_LAYOUT_QUERY,
+                                      ctypes.c_size_t(buffer.value.__len__()),
+                                      ctypes.byref(buffer))
+        if needed <= 0:
+            return None
+        if needed > buffer.value.__len__():
+            # 壳说「装不下」：按它要的大小重新分配再来一次。
+            buffer = ctypes.create_string_buffer(needed)
+            needed = user32.SendMessageW(self.hwnd, MSG_LAYOUT_QUERY,
+                                          ctypes.c_size_t(buffer.value.__len__()),
+                                          ctypes.byref(buffer))
+            if needed <= 0 or needed > buffer.value.__len__():
+                return None
+        try:
+            data = json.loads(buffer.value.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return {key: tuple(value) if isinstance(value, list) else value
+                for key, value in data.items()}
+
     @property
     def layout(self):
+        """当前布局（客户区坐标）。优先问壳，问不到才用 Python 复算。"""
+        queried = self.query_layout()
+        if queried is not None:
+            return queried
         w, h = self.client_w, self.client_h
         toolbar_h = min(h, TOOLBAR_H)
         status_h = min(h - toolbar_h, STATUS_H)
@@ -3762,9 +3801,6 @@ def scene_panel_group(shell, checker):
     scene = "panel_group"
     layer = shell.layout["layer"]
     adjust = shell.layout["adjust"]
-    # 合并前的两栏底色采样点（面板内容区靠左上的位置，避开标题行与控件）。
-    layer_probe = (layer[0] + 40, layer[1] + 60)
-    adjust_probe = (adjust[0] + 40, adjust[1] + 60)
 
     base = shell.shot("153_group_before")
     checker.check(scene, "合并前两栏都在（左栏图层 / 右栏调整）",
@@ -3775,6 +3811,9 @@ def scene_panel_group(shell, checker):
     shell.command(CMD_PANEL_GROUP_MERGE)
     shell.wait(0.3)
     merged = shell.shot("154_group_merged")
+    # 合并后重新取布局：组列的位置/宽度与合并前不同（组宽由 dock 状态给，
+    # 不是两栏缺省宽的简单相加）。
+    adjust = shell.layout["adjust"]
     checker.check(scene, "合并后左栏让位（两块住进同一列，画布变宽）",
                   near(mean_rgb(merged, (2, adjust[1] + 60, 6, adjust[1] + 70)),
                        COL_APP_BG, 10),
@@ -3800,6 +3839,9 @@ def scene_panel_group(shell, checker):
     labels = count_bright(merged, (adjust[0] + 4, adjust[1] + 4,
                                    adjust[0] + tab_w - 4, adjust[1] + GROUP_BAR_H - 2), 110)
     checker.check(scene, "标签栏里有标签文字", labels > 8, "浅色像素 %d" % labels)
+
+    # 切标签**前**的真实布局（组列左缘 = 画布右缘）。
+    canvas_right_before = shell.layout["canvas"][2]
 
     # ---- 切标签：点第二个标签（切到图层面板）----
     second_tab_x = adjust[0] + tab_w + tab_w // 2
@@ -3827,6 +3869,18 @@ def scene_panel_group(shell, checker):
                                    COL_HIGHLIGHT, 10)
     checker.check(scene, "该列内容换成了图层面板（图层行高亮出现）", row_highlight > 40,
                   "高亮像素 %d" % row_highlight)
+
+    # 切标签时**列宽不变**（PS 的组：切标签变的是内容，不是组宽）。
+    #
+    # 判据用**真实布局**（问壳要，见 Shell.query_layout）：组列的左缘不动
+    # = 列宽不动。这条曾经漏过：分组代码初版把列宽按面板身份夹取，切标签时
+    # 列宽从组宽跳成另一栏的缺省宽，而标签位置与强调线都不随宽变——
+    # 既没被自检抓到（当时测的是个恒量），也没被本场景抓到。
+    canvas_right_after = shell.layout["canvas"][2]
+    checker.check(scene, "切标签不改变列宽（组宽属于列，不属于成员）",
+                  canvas_right_after == canvas_right_before and canvas_right_before > 0,
+                  "画布右缘（= 组列左缘）%d -> %d" %
+                  (canvas_right_before, canvas_right_after))
 
     # ---- 拆开 ----
     shell.command(CMD_PANEL_GROUP_SPLIT)

@@ -174,6 +174,15 @@ struct DockState {
    */
   int group_width(DockArea side) const;
   void set_group_width(DockArea side, int width);
+  /*
+   * 某列的收起态（组模式下整列收起）。
+   *
+   * 为什么单独存：组的收起是**列**的属性，不是某块面板的属性——
+   * 组里两块面板都住在这一列，收起的是列。若用「激活成员的收起标志」
+   * 来表达，切标签时列会忽收忽展。
+   */
+  bool group_collapsed(DockArea side) const;
+  void toggle_group_collapsed(DockArea side);
 
  private:
   /* 浮动前记住的停靠区：停回来时回到原位，而不是硬塞到右边。 */
@@ -182,6 +191,8 @@ struct DockState {
   PanelId group_active_[2] = {PanelId::Adjust, PanelId::Layers};
   /* 每列的宽度（0 = 用缺省）。宽度属于**列**，不随标签切换而变。 */
   int group_width_[2] = {0, 0};
+  /* 每列的收起态（组模式下整列收起）。 */
+  bool group_collapsed_[2] = {false, false};
 };
 
 /* ------------------------------------------------------------------ 拖拽停靠 */

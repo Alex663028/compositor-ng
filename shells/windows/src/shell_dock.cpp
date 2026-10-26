@@ -230,6 +230,18 @@ void DockState::apply_to(comp_ui::LayoutPrefs& prefs) const {
     prefs.group_count = group_on_left ? left_count : right_count;
     prefs.group_active = group_on_left ? group_active_index(DockArea::Left)
                                        : group_active_index(DockArea::Right);
+    /*
+     * 组的列宽与列收起态：都归**列**所有，与激活成员无关。
+     *
+     * 宽度用组自己的区间（168..560）而不是按面板身份夹取——组里换一块
+     * 面板，同一个组宽被夹到不同的值就意味着切标签时列宽跳一次。
+     * 收起态也是列级的：组收起 = 整列收起。
+     */
+    const DockArea side = group_on_left ? DockArea::Left : DockArea::Right;
+    const int width = group_width(side);
+    const int fallback = group_on_left ? left_default : right_default;
+    prefs.group_width = width > 0 ? width : fallback;
+    prefs.group_collapsed = group_collapsed(side);
   }
 }
 
@@ -282,6 +294,16 @@ int DockState::group_width(DockArea side) const {
 void DockState::set_group_width(DockArea side, int width) {
   const int slot = side == DockArea::Left ? 1 : 0;
   group_width_[slot] = width > 0 ? width : 0;
+}
+
+bool DockState::group_collapsed(DockArea side) const {
+  const int slot = side == DockArea::Left ? 1 : 0;
+  return group_collapsed_[slot];
+}
+
+void DockState::toggle_group_collapsed(DockArea side) {
+  const int slot = side == DockArea::Left ? 1 : 0;
+  group_collapsed_[slot] = !group_collapsed_[slot];
 }
 
 void DockState::group_move(PanelId id, DockArea side) {

@@ -2860,15 +2860,34 @@ int run_selftest(const wchar_t* out_path) {
     comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, prefs);
     const bool one_column = layout.group_count == 2 && layout.group_bar.h > 0 &&
                             (layout.layer_panel.w == 0 || layout.adjust_panel.w == 0);
-    /* 切标签不改变列宽：宽度存在列上。 */
+    /* 切标签不改变列宽：宽度存在列上。
+     *
+     * 这里量的是**布局算出来的列宽**（layer_panel.w / adjust_panel.w），
+     * 不是 prefs 里的宽度字段——后者由 group_width 决定，本来就不受
+     * group_active 影响，拿它断言等于什么都没测（2026-10-26 自查时
+     * 就是这么假绿着，害得切标签时列宽从组宽跳成另一列的缺省宽）。
+     *
+     * 组在右列：内容矩形落在 adjust_panel 那一侧；切到图层标签后，
+     * 仍然是**同一列**（右缘坐标不变），只是画的内容换成图层面板。
+     */
     dock.set_group_width(comp_dock::DockArea::Right, 360);
-    comp_ui::LayoutPrefs after_width{};
-    dock.apply_to(after_width);
-    const int width_before = after_width.adjust_panel_width;
+    dock.group_set_active(comp_dock::DockArea::Right, 0);
+    comp_ui::LayoutPrefs before_prefs{};
+    dock.apply_to(before_prefs);
+    const comp_ui::Layout before = comp_ui::compute_layout(1280, 720, before_prefs);
+    const int width_before = before.adjust_panel.w;
+    const int right_before = before.adjust_panel.right();
+
     dock.group_set_active(comp_dock::DockArea::Right, 1);
     comp_ui::LayoutPrefs after_switch{};
     dock.apply_to(after_switch);
-    const bool width_stable = after_switch.adjust_panel_width == width_before &&
+    const comp_ui::Layout after = comp_ui::compute_layout(1280, 720, after_switch);
+    /* 切到图层标签后：内容矩形挪到 layer_panel，但仍在**右列**（右缘不变）。 */
+    const int width_after = after.layer_panel.w;
+    const int right_after = after.layer_panel.right();
+    const bool width_stable = width_before > 0 && width_after == width_before &&
+                              right_after == right_before &&
+                              after.adjust_panel.w == 0 &&
                               dock.group_active_panel(comp_dock::DockArea::Right) ==
                                   comp_dock::PanelId::Layers;
     /* 拆开：两块各占一列，标签栏消失。 */
@@ -2881,6 +2900,112 @@ int run_selftest(const wchar_t* out_path) {
     const bool no_bar = split_layout.group_bar.h == 0;
     verify(merged && one_column && width_stable && split && no_bar,
            "P0-10 panel group: merge into one column / tab strip shows / width stable / split back");
+  }
+  {
+    /*
+     * P0-10 分组的**左列**分支。
+     *
+     * 上一条只测了组在右列。左列是**另一条代码路径**（矩形落在
+     * layer_panel 那一侧、组栏在左缘），必须单独测——「测了一条分支就
+     * 当作两条都对」是这条断言最初假绿的根因。
+     *
+     * 钉三件事：
+     *   1. 组在左列时，内容矩形落在左缘（右缘坐标 = 左缘 + 组宽）；
+     *   2. 切标签后列宽与右缘都不变（宽度属于列）；
+     *   3. 另一侧（右列）完全让位（宽 0，画布占满）。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    /* 合并到左列：调整面板挪到图层栏那一列。 */
+    dock.group_move(comp_dock::PanelId::Adjust, comp_dock::DockArea::Left);
+    dock.set_group_width(comp_dock::DockArea::Left, 300);
+    dock.group_set_active(comp_dock::DockArea::Left, 0); /* 激活调整 */
+    comp_ui::LayoutPrefs prefs{};
+    dock.apply_to(prefs);
+    const comp_ui::Layout before = comp_ui::compute_layout(1280, 720, prefs);
+    /*
+     * 内容矩形落在**哪个字段名下**取决于组里激活的是谁（内容按面板身份
+     * 分派：图层内容走 layer_panel，调整内容走 adjust_panel）。所以断言
+     * 要看「两者中非空的那个」，而不是钉死某一个字段——那才是「列」的
+     * 语义：一列一个矩形，激活谁换的是内容不是位置。
+     */
+    const int before_w = before.layer_panel.w > 0 ? before.layer_panel.w : before.adjust_panel.w;
+    const int before_right =
+        before.layer_panel.w > 0 ? before.layer_panel.right() : before.adjust_panel.right();
+    const int before_x = before.layer_panel.w > 0 ? before.layer_panel.x : before.adjust_panel.x;
+    /* 内容矩形在左缘、宽 300、另一侧完全让位（宽 0）。 */
+    const bool on_left_edge = before_w == 300 && before_x == 0;
+    const bool other_side_free = (before.layer_panel.w > 0 && before.adjust_panel.w == 0) ||
+                                 (before.adjust_panel.w > 0 && before.layer_panel.w == 0);
+
+    dock.group_set_active(comp_dock::DockArea::Left, 1); /* 切到图层 */
+    comp_ui::LayoutPrefs after_prefs{};
+    dock.apply_to(after_prefs);
+    const comp_ui::Layout after = comp_ui::compute_layout(1280, 720, after_prefs);
+    const int after_w = after.layer_panel.w > 0 ? after.layer_panel.w : after.adjust_panel.w;
+    const int after_right =
+        after.layer_panel.w > 0 ? after.layer_panel.right() : after.adjust_panel.right();
+    const bool stable = after_w == 300 && after_right == before_right;
+    const bool still_left = (after.layer_panel.w > 0 && after.layer_panel.x == 0) ||
+                            (after.adjust_panel.w > 0 && after.adjust_panel.x == 0);
+    verify(on_left_edge && other_side_free && stable && still_left,
+           "P0-10 panel group on the left column: content at left edge / width stable on tab switch");
+  }
+  {
+    /*
+     * P0-10 分组的列宽**独立于面板身份**（2026-10-26 自查发现的真 bug）。
+     *
+     * 症状：组宽 200 时，切到图层标签列宽是 200、切到调整标签是 240——
+     * 因为 layer_panel_width 与 adjust_panel_width 各自按**面板身份**夹取
+     * （图层栏 168..520、调整栏 240..560），同一个组宽被夹到不同值。
+     * 用户看到的是「切一下标签，画布宽度跳一下」。
+     *
+     * 修法：组有自己的宽度区间（168..560 = 两者的并集）与自己的宽度字段。
+     * 这条断言量的是**布局输出**（真正的列宽），不是 prefs 字段。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    dock.group_move(comp_dock::PanelId::Layers, comp_dock::DockArea::Right);
+    /* 200 落在图层栏区间内、落在调整栏区间外——正是能暴露夹取差异的值。 */
+    dock.set_group_width(comp_dock::DockArea::Right, 200);
+    int widths[2] = {0, 0};
+    for (int active = 0; active < 2; ++active) {
+      dock.group_set_active(comp_dock::DockArea::Right, active);
+      comp_ui::LayoutPrefs prefs{};
+      dock.apply_to(prefs);
+      const comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, prefs);
+      widths[active] = layout.adjust_panel.w > 0 ? layout.adjust_panel.w : layout.layer_panel.w;
+    }
+    verify(widths[0] == 200 && widths[1] == 200,
+           "P0-10 panel group column width is independent of which panel is active");
+  }
+  {
+    /*
+     * P0-10 分组的收起是**列级**的：组收起 = 整列变成 24px 竖条。
+     *
+     * 此前收起态取的是「激活成员的收起标志」——切标签时列会忽收忽展
+     * （切到没收起过的那块，整列就弹回来了）。
+     */
+    comp_dock::DockState dock = comp_dock::DockState::defaults();
+    dock.group_move(comp_dock::PanelId::Layers, comp_dock::DockArea::Right);
+    dock.set_group_width(comp_dock::DockArea::Right, 320);
+    dock.toggle_group_collapsed(comp_dock::DockArea::Right);
+    int widths[2] = {0, 0};
+    for (int active = 0; active < 2; ++active) {
+      dock.group_set_active(comp_dock::DockArea::Right, active);
+      comp_ui::LayoutPrefs prefs{};
+      dock.apply_to(prefs);
+      const comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, prefs);
+      widths[active] = layout.adjust_panel.w > 0 ? layout.adjust_panel.w : layout.layer_panel.w;
+    }
+    /* 两块都收起时列宽都是 24px 竖条，与激活的是谁无关。 */
+    const bool collapsed_both = widths[0] == 24 && widths[1] == 24;
+    /* 展开后列宽回到组宽。 */
+    dock.toggle_group_collapsed(comp_dock::DockArea::Right);
+    comp_ui::LayoutPrefs expanded{};
+    dock.apply_to(expanded);
+    const comp_ui::Layout layout = comp_ui::compute_layout(1280, 720, expanded);
+    const int expanded_w = layout.adjust_panel.w > 0 ? layout.adjust_panel.w : layout.layer_panel.w;
+    verify(collapsed_both && expanded_w == 320,
+           "P0-10 panel group collapse is column level (24px strip) and restores the group width");
   }
   {
     /*
