@@ -856,6 +856,116 @@ void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) 
 }
 
 /* 图层面板：GDI 文本绘制（外壳不读像素，只呈现引擎的属性查询结果）。 */
+/*
+ * 画一条可见滚动条（轨道 + 滑块）。
+ *
+ * 两层都画：轨道比面板底色略亮一档，滑块更亮。颜色**唯一**——视觉探针量得到
+ * （面板底色 (24,26,30)、轨道 (38,40,46)、画布底色 (32,32,36) 都不是它）。
+ */
+void draw_scroll_bar(HDC dc, const comp_ui::ScrollBarGeometry& bar) {
+  if (!bar.visible) return;
+  RECT track{bar.track.x, bar.track.y, bar.track.right(), bar.track.bottom()};
+  HBRUSH track_brush = CreateSolidBrush(RGB(38, 40, 46));
+  FillRect(dc, &track, track_brush);
+  DeleteObject(track_brush);
+  RECT thumb{bar.thumb.x, bar.thumb.y, bar.thumb.right(), bar.thumb.bottom()};
+  HBRUSH thumb_brush = CreateSolidBrush(RGB(122, 126, 136));
+  FillRect(dc, &thumb, thumb_brush);
+  DeleteObject(thumb_brush);
+}
+
+/*
+ * 调整栏当前子面板的可见滚动条几何。
+ *
+ * 三个可滚子面板（历史 / 通道 / 字体）各有自己的滚动量与行几何，滚动条按
+ * 各自的 top / footer 算可视高度——用错的话滑块位置会偏（内容区高度算大了，
+ * 滑块就比实际短）。
+ */
+comp_ui::ScrollBarGeometry adjust_panel_scroll_bar(const ShellState& shell,
+                                                  const comp_ui::Rect& panel) {
+  if (history_panel_visible(shell)) {
+    const int count = history_state_count(shell);
+    const int scroll = comp_ui::history_clamp_scroll(panel, count, shell.doc.history_scroll);
+    return comp_ui::scroll_bar_vertical(
+        panel, comp_ui::kHistoryRowsTop,
+        panel.h - comp_ui::kHistoryRowsTop - comp_ui::kHistoryPanelFooter,
+        count * comp_ui::kHistoryRowHeight, scroll, comp_ui::history_max_scroll(panel, count));
+  }
+  if (channel_panel_visible(shell)) {
+    const int count = channel_count(shell);
+    const int scroll = comp_ui::channel_clamp_scroll(panel, count, shell.doc.channel_scroll);
+    return comp_ui::scroll_bar_vertical(
+        panel, comp_ui::kChannelRowsTop,
+        panel.h - comp_ui::kChannelRowsTop - comp_ui::kChannelPanelFooter,
+        count * comp_ui::kChannelRowHeight, scroll, comp_ui::channel_max_scroll(panel, count));
+  }
+  if (font_panel_visible(shell)) {
+    const int count = font_row_count(shell);
+    const int scroll = comp_ui::font_clamp_scroll(panel, count, shell.font_scroll);
+    return comp_ui::scroll_bar_vertical(
+        panel, comp_ui::kFontRowsTop, panel.h - comp_ui::kFontRowsTop - comp_ui::kFontPanelFooter,
+        count * comp_ui::kFontRowHeight, scroll, comp_ui::font_max_scroll(panel, count));
+  }
+  return comp_ui::ScrollBarGeometry{};
+}
+
+ScrollDragTarget adjust_panel_scroll_target(const ShellState& shell) {
+  if (history_panel_visible(shell)) return ScrollDragTarget::History;
+  if (channel_panel_visible(shell)) return ScrollDragTarget::Channel;
+  if (font_panel_visible(shell)) return ScrollDragTarget::Font;
+  return ScrollDragTarget::None;
+}
+
+int adjust_panel_scroll_value(const ShellState& shell, ScrollDragTarget target) {
+  switch (target) {
+    case ScrollDragTarget::History: return shell.doc.history_scroll;
+    case ScrollDragTarget::Channel: return shell.doc.channel_scroll;
+    case ScrollDragTarget::Font: return shell.font_scroll;
+    default: return 0;
+  }
+}
+
+int adjust_panel_max_scroll(const ShellState& shell, ScrollDragTarget target,
+                            const comp_ui::Rect& panel) {
+  switch (target) {
+    case ScrollDragTarget::History:
+      return comp_ui::history_max_scroll(panel, history_state_count(shell));
+    case ScrollDragTarget::Channel:
+      return comp_ui::channel_max_scroll(panel, channel_count(shell));
+    case ScrollDragTarget::Font:
+      return comp_ui::font_max_scroll(panel, font_row_count(shell));
+    default: return 0;
+  }
+}
+
+int adjust_panel_visible_rows(const ShellState& shell, ScrollDragTarget target,
+                              const comp_ui::Rect& panel) {
+  switch (target) {
+    case ScrollDragTarget::History: return comp_ui::history_visible_rows(panel);
+    case ScrollDragTarget::Channel: return comp_ui::channel_visible_rows(panel);
+    case ScrollDragTarget::Font: return comp_ui::font_visible_rows(panel);
+    default: return 0;
+  }
+}
+
+void adjust_panel_set_scroll(ShellState& shell, ScrollDragTarget target, int value,
+                               const comp_ui::Rect& panel) {
+  switch (target) {
+    case ScrollDragTarget::History:
+      shell.doc.history_scroll =
+          comp_ui::history_clamp_scroll(panel, history_state_count(shell), value);
+      break;
+    case ScrollDragTarget::Channel:
+      shell.doc.channel_scroll =
+          comp_ui::channel_clamp_scroll(panel, channel_count(shell), value);
+      break;
+    case ScrollDragTarget::Font:
+      shell.font_scroll = comp_ui::font_clamp_scroll(panel, font_row_count(shell), value);
+      break;
+    default: break;
+  }
+}
+
 void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect) {
   RECT panel{panel_rect.x, panel_rect.y, panel_rect.right(), panel_rect.bottom()};
   HBRUSH background = CreateSolidBrush(RGB(24, 26, 30));
@@ -1091,16 +1201,7 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    * 两层都画（轨道 + 滑块），颜色与面板底色明确不同：探针量得到，
    * 人眼也分得清。滑块拖动见 shell_panel_hit.cpp。
    */
-  if (bar.visible) {
-    RECT track{bar.track.x, bar.track.y, bar.track.right(), bar.track.bottom()};
-    HBRUSH track_brush = CreateSolidBrush(RGB(38, 40, 46));
-    FillRect(dc, &track, track_brush);
-    DeleteObject(track_brush);
-    RECT thumb{bar.thumb.x, bar.thumb.y, bar.thumb.right(), bar.thumb.bottom()};
-    HBRUSH thumb_brush = CreateSolidBrush(RGB(122, 126, 136));
-    FillRect(dc, &thumb, thumb_brush);
-    DeleteObject(thumb_brush);
-  }
+  draw_scroll_bar(dc, bar);
 
   /*
    * S22 直方图：256 桶亮度分布，像素由引擎只读入口给（预乘先反预乘再取亮度）。
@@ -3541,6 +3642,20 @@ void draw_layer_content(HDC dc, const ShellState& shell, const comp_ui::Rect& pa
  * 「换个界面」。绘制与命中都按面板矩形走，浮动的矩形 = 浮动窗口客户区。
  */
 void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel) {
+  /*
+   * 可见滚动条：历史 / 通道 / 字体三个子面板的内容装不下时，右缘画一条。
+   *
+   * 子面板内容裁到滑块左侧，免得长行文字（字体名、路径）被滑块盖住。
+   * 裁剪**显式恢复成面板矩形**，不用 SelectClipRgn 的返回值——那个返回值
+   * 是「旧区域还是新区域」在不同实现上不一致，恢复错了滑块会被裁掉（这坑
+   * 图层列表那边已经踩过一次）。
+   */
+  const comp_ui::ScrollBarGeometry adjust_bar = adjust_panel_scroll_bar(shell, panel);
+  if (adjust_bar.visible) {
+    HRGN region = CreateRectRgn(panel.x, panel.y, adjust_bar.track.x, panel.bottom());
+    SelectClipRgn(dc, region);
+    DeleteObject(region);
+  }
   if (shell.doc.doc_dialog != comp_ui::DocDialogKind::None) {
     draw_doc_dialog(dc, shell, panel);
   } else if (path_panel_visible(shell)) {
@@ -3567,6 +3682,12 @@ void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& p
     draw_type_panel(dc, shell, panel);
   } else {
     draw_adjust_panel(dc, shell, panel);
+  }
+  if (adjust_bar.visible) {
+    HRGN region = CreateRectRgn(panel.x, panel.y, panel.right(), panel.bottom());
+    SelectClipRgn(dc, region);
+    DeleteObject(region);
+    draw_scroll_bar(dc, adjust_bar);
   }
 }
 

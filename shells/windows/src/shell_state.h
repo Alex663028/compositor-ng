@@ -923,7 +923,23 @@ struct DocTabSlot {
  * `doc`。这样 34k 行里所有 `shell.doc.xxx` 一个都不用改，换文档 = 整体 move
  * 一份 DocumentContext——比给 189 个字段改成 `shell.tabs[i].doc.xxx` 安全得多。
  */
+/* 调整栏里可拖动的滚动条（对应三个可滚子面板：历史 / 通道 / 字体）。 */
+enum class ScrollDragTarget {
+  None = 0,
+  History = 1,
+  Channel = 2,
+  Font = 3,
+};
+
 struct ShellState {
+  /*
+   * 调整栏里正在拖哪条滚动条（None = 没在拖）。
+   *
+   * 三个子面板各有自己的滚动量与可见滚动条，拖动期间要知道自己动的是哪一条
+   * —— 记在枚举里，不靠「当前显示的是哪个面板」反推（面板可能在拖动中途切换）。
+   */
+  ScrollDragTarget scroll_drag_target = ScrollDragTarget::None;
+
   comp_engine engine = nullptr;
   comp_backend backend = COMP_BACKEND_AUTO;
   std::wstring status;

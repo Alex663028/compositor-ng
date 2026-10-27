@@ -117,6 +117,7 @@ CMD_IMAGE_ADJUST_BASE = 1590
 CMD_EFFECT_BASE = 1510
 CMD_NEW_DOCUMENT_DIALOG = 1560
 CMD_SAVE_AS = 1561
+CMD_LAYER_FONTS = 1573  # 图层 > 字体…（打开字体列表面板）
 CMD_IMAGE_SIZE = 1562
 CMD_CANVAS_SIZE = 1563
 CMD_HISTORY_SETTINGS = 1564
@@ -790,7 +791,11 @@ class Shell:
                 user32.PostMessageW(self.hwnd, WM_SYSKEYUP, vk, 0xE0000001)
             else:
                 user32.PostMessageW(self.hwnd, WM_KEYDOWN, vk, 0)
-                self.wait(0.05)
+                # KEYDOWN 与 KEYUP 之间必须**等够**：壳还没处理完 KEYDOWN 就发
+                # KEYUP，壳看到的组合键没有修饰键（Ctrl+Z 变成普通 Z），撤销
+                # 之类的操作直接不生效。0.05s 在机器忙时不够（连跑时尤其容易
+                # 撞上），这里给 0.12s。
+                self.wait(0.12)
                 user32.PostMessageW(self.hwnd, WM_KEYUP, vk, 0xC0000001)
             self.wait(0.05)
         finally:
@@ -3791,7 +3796,9 @@ def scene_layer_link(shell, checker):
     left, top, right, bottom = doc
 
     row_y = layer[1] + 30
-    row_band = (layer[0], row_y, layer[2], row_y + 22 * 2)
+    # 右缘留出 8 px：那里是**可见滚动条**的位置。层数变化会让滚动条出现/
+    # 消失，那不是「面板行变了」，量进去就成了假失败。
+    row_band = (layer[0], row_y, layer[2] - 8, row_y + 22 * 2)
     row_x = layer[0] + 80
     top_row = row_y
     bottom_row = row_y + 22
@@ -4154,6 +4161,60 @@ def scene_layer_scroll(shell, checker):
                   "高亮像素 %d（应为 0：选中行已滚出视野）" % highlight)
 
 
+
+def scene_adjust_scroll(shell, checker):
+    """
+    调整栏可滚子面板的**可见滚动条**（字体面板最易触发：系统字体多）。
+
+    此前所有可滚列表都只能靠滚轮——用户**看不到**「下面还有东西」，也就
+    不知道能滚。图层列表先补上，这里验调整栏的三个子面板（历史 / 通道 /
+    字体）复用同一套设施。
+
+    量的判据与图层列表那条一致：滑块颜色 (122,126,136) 是**唯一**的
+    （面板底色 (22,24,28)、轨道 (38,40,46)、画布底色 (32,32,36) 都不是它）。
+    """
+    scene = "adjust_scroll"
+    # 图层 > 字体… 打开字体列表面板（系统字体数量远超可视行数，必然要滚）。
+    #
+    # 注意：T 键开的是「文字工具**参数**面板」（字号/行高/字距），不是字体
+    # **列表**面板 —— 两者都在右栏，长得也像。
+    shell.command(CMD_LAYER_FONTS)
+    shell.wait(0.8)
+    adjust = shell.layout["adjust"]
+    before = shell.shot("159_adjust_scroll")
+
+    def thumb_center(img):
+        """滑块像素的 y 质心（= 滑块位置）；没有滑块返回 -1。
+
+        测量范围从**列表区**起（字体列表从 RowsTop=80 开始）：调整栏右上角
+        有别的控件（参数面板的折叠按钮），颜色与滑块接近，量到它就误判。
+        """
+        region = img.crop((adjust[2] - 9, adjust[1] + 70, adjust[2], adjust[3])).convert("RGB")
+        data = region.tobytes()
+        total = 0
+        weighted = 0
+        for index in range(0, len(data), 3):
+            if (abs(data[index] - COL_SCROLL_THUMB[0]) <= 8 and
+                    abs(data[index + 1] - COL_SCROLL_THUMB[1]) <= 8 and
+                    abs(data[index + 2] - COL_SCROLL_THUMB[2]) <= 8):
+                total += 1
+                weighted += (index // 3) // region.width
+        return (weighted / total) if total else -1.0
+
+    center_before = thumb_center(before)
+    checker.check(scene, "字体面板右缘出现可见滚动条（滑块）", center_before >= 0,
+                  "滑块 y 质心 %.1f" % center_before)
+
+    # 滚轮滚一下：滑块位置必须跟着动（不然这条滚动条是摆设）。
+    shell.wheel(adjust[0] + 60, adjust[1] + 160, -120)
+    shell.wait(0.3)
+    after = shell.shot("160_adjust_scroll_moved")
+    center_after = thumb_center(after)
+    checker.check(scene, "滚轮滚动后滑块位置下移（滚动真的生效）",
+                  center_after > center_before + 2,
+                  "滑块 y 质心 %.1f -> %.1f" % (center_before, center_after))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -4196,6 +4257,7 @@ SCENES = [    ("start", scene_start, ()),
     ("filter_custom", scene_filter_custom, ()),
     ("panel_group", scene_panel_group, ()),
     ("layer_scroll", scene_layer_scroll, ()),
+    ("adjust_scroll", scene_adjust_scroll, ()),
 ]
 
 

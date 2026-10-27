@@ -5173,6 +5173,11 @@ inline int history_clamp_scroll(const Rect& panel, int count, int scroll) {
                            kHistoryRowHeight);
 }
 
+/* 最大滚动量（可见滚动条按它算滑块位置）。 */
+inline int history_max_scroll(const Rect& panel, int count) {
+  return list_max_scroll(panel, count, kHistoryRowsTop, kHistoryPanelFooter, kHistoryRowHeight);
+}
+
 inline int history_ensure_visible(const Rect& panel, int count, int index, int scroll) {
   return list_ensure_visible(panel, count, index, scroll, kHistoryRowsTop,
                              kHistoryPanelFooter, kHistoryRowHeight);
@@ -5206,6 +5211,11 @@ inline int channel_visible_rows(const Rect& panel) {
 inline int channel_clamp_scroll(const Rect& panel, int count, int scroll) {
   return list_clamp_scroll(panel, count, scroll, kChannelRowsTop, kChannelPanelFooter,
                            kChannelRowHeight);
+}
+
+/* 最大滚动量（可见滚动条按它算滑块位置）。 */
+inline int channel_max_scroll(const Rect& panel, int count) {
+  return list_max_scroll(panel, count, kChannelRowsTop, kChannelPanelFooter, kChannelRowHeight);
 }
 
 inline int channel_ensure_visible(const Rect& panel, int count, int index, int scroll) {
@@ -5279,6 +5289,11 @@ inline int font_visible_rows(const Rect& panel) {
 
 inline int font_clamp_scroll(const Rect& panel, int count, int scroll) {
   return list_clamp_scroll(panel, count, scroll, kFontRowsTop, kFontPanelFooter, kFontRowHeight);
+}
+
+/* 最大滚动量（可见滚动条按它算滑块位置）。 */
+inline int font_max_scroll(const Rect& panel, int count) {
+  return list_max_scroll(panel, count, kFontRowsTop, kFontPanelFooter, kFontRowHeight);
 }
 
 inline int font_ensure_visible(const Rect& panel, int count, int index, int scroll) {

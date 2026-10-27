@@ -802,6 +802,32 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   /* P0-10：右栏内容（按当前子面板选画）；浮动面板窗口与主窗口共用。 */
   void draw_adjust_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
   void draw_layer_content(HDC dc, const ShellState& shell, const comp_ui::Rect& panel);
+  /*
+   * 画一条可见滚动条（轨道 + 滑块）。通用：任何列表都能用。
+   *
+   * 此前所有可滚列表都**只能靠滚轮**——用户看不到「下面还有东西」，也就
+   * 不知道能滚。图层列表先补上，其余（历史 / 通道 / 字体）复用这条。
+   */
+  void draw_scroll_bar(HDC dc, const comp_ui::ScrollBarGeometry& bar);
+  /*
+   * 调整栏**当前子面板**的可见滚动条几何（没有可滚内容时 visible=false）。
+   *
+   * 绘制与命中共用这一条：两处各算一次必然有一天不一致（滑块画在一处、
+   * 命中算在另一处 = 点不动的滚动条）。
+   */
+  comp_ui::ScrollBarGeometry adjust_panel_scroll_bar(const ShellState& shell,
+                                                      const comp_ui::Rect& panel);
+  /* 调整栏当前子面板对应哪条滚动条（没有可滚内容时 None）。 */
+  ScrollDragTarget adjust_panel_scroll_target(const ShellState& shell);
+  /* 某条滚动条当前的滚动量 / 最大滚动量 / 可视行数（拖动与翻页都要用）。 */
+  int adjust_panel_scroll_value(const ShellState& shell, ScrollDragTarget target);
+  int adjust_panel_max_scroll(const ShellState& shell, ScrollDragTarget target,
+                              const comp_ui::Rect& panel);
+  int adjust_panel_visible_rows(const ShellState& shell, ScrollDragTarget target,
+                                const comp_ui::Rect& panel);
+  /* 写回某条滚动条的滚动量（越界夹住）。panel = 调整栏矩形（夹取要用）。 */
+  void adjust_panel_set_scroll(ShellState& shell, ScrollDragTarget target, int value,
+                               const comp_ui::Rect& panel);
   void draw_status_bar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar);
   void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& panel_rect);
   void draw_channel_chip(HDC dc, const comp_ui::Rect& rect, const wchar_t* name, bool active);

@@ -204,6 +204,34 @@ bool layer_panel_click(ShellState& shell, const Layout& layout, int mouse_x, int
 
 /* 右栏命中：文档对话框 / 效果 / 修边 / 滤镜 / 填充 / 智能滤镜 / 文字 / 字体 / 调整 / 色彩范围 / 路径 / 历史 / 通道各面板的行与滑杆。 */
 bool adjust_panel_click(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
+          /*
+           * 调整栏可滚子面板（历史 / 通道 / 字体）的可见滚动条：
+           * 点滑块 = 开始拖动；点轨道空白 = 翻一页。
+           *
+           * 放在最前面：滚动条贴在面板右缘，点它绝不能被当成「点某一行」。
+           */
+          if (layout.adjust_panel.w > 0 && !layout.adjust_collapsed) {
+            const comp_ui::ScrollBarGeometry bar =
+                adjust_panel_scroll_bar(shell, layout.adjust_panel);
+            if (bar.visible && bar.track.contains(mouse_x, mouse_y)) {
+              const ScrollDragTarget target = adjust_panel_scroll_target(shell);
+              if (bar.thumb.contains(mouse_x, mouse_y)) {
+                shell.scroll_drag_target = target;
+                SetCapture(window);
+                InvalidateRect(window, nullptr, FALSE);
+                return true;
+              }
+              /* 点轨道：按在滑块上方还是下方翻页。 */
+              const int visible = adjust_panel_visible_rows(shell, target, layout.adjust_panel);
+              const int step = comp_ui::scroll_page_step(visible);
+              const int current = adjust_panel_scroll_value(shell, target);
+              const int next = mouse_y < bar.thumb.y ? current - step : current + step;
+              adjust_panel_set_scroll(shell, target, next, layout.adjust_panel);
+              SetCapture(window);
+              InvalidateRect(window, nullptr, FALSE);
+              return true;
+            }
+          }
           if (shell.doc.doc_dialog != comp_ui::DocDialogKind::None && layout.adjust_panel.w > 0) {
             /* 点行 = 聚焦到该行；行几何与绘制共用 doc_dialog_row_rect。 */
             const int row = comp_ui::doc_dialog_row_at(
@@ -547,6 +575,17 @@ bool adjust_panel_click(ShellState& shell, const Layout& layout, int mouse_x, in
 
 /* 面板拖动推进：曲线点 / 调整滑杆 / 填充滑杆 / 智能滤镜重排 / 图层拖行 / 直方图框选。 */
 bool panel_drag_move(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
+          /* 调整栏滚动条滑块拖动：优先级最高——拖动期间鼠标消息归它。 */
+          if (shell.scroll_drag_target != ScrollDragTarget::None) {
+            const comp_ui::ScrollBarGeometry bar =
+                adjust_panel_scroll_bar(shell, layout.adjust_panel);
+            const int max_scroll =
+                adjust_panel_max_scroll(shell, shell.scroll_drag_target, layout.adjust_panel);
+            const int next = comp_ui::scroll_from_thumb_drag(bar, mouse_y, max_scroll);
+            adjust_panel_set_scroll(shell, shell.scroll_drag_target, next, layout.adjust_panel);
+            InvalidateRect(window, nullptr, FALSE);
+            return true;
+          }
           /*
            * 滚动条滑块拖动：优先级最高——拖动期间鼠标消息归它，
            * 不能被曲线/滑杆/图层拖行抢走。
@@ -643,6 +682,13 @@ bool panel_drag_move(ShellState& shell, const Layout& layout, int mouse_x, int m
 
 /* 面板拖动收尾：提交事务 / 落子 / 释放捕获。 */
 bool panel_drag_end(ShellState& shell, const Layout& layout, int mouse_x, int mouse_y, HWND window) {
+      /* 调整栏滚动条松手：结束拖动。 */
+      if (shell.scroll_drag_target != ScrollDragTarget::None) {
+        shell.scroll_drag_target = ScrollDragTarget::None;
+        ReleaseCapture();
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+      }
       /* 滚动条滑块松手：结束拖动（其余拖动类型不受影响）。 */
       if (shell.doc.layer_scroll_drag) {
         shell.doc.layer_scroll_drag = false;
