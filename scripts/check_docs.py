@@ -420,7 +420,34 @@ elif parity is not None:
         check(f"{name} 清单命中数 == 表格", claimed_h, h)
     print(f"  [INFO] 清单合计：{total_items} 条，命中 {total_hits} 条")
 
-    # ---------- §13 缺口表必须覆盖全部未命中项（含 ◐） ----------
+    # ---------- §12.0 必须真的逐条点名 117 项 ----------
+    s12 = secs.get(next((h for h in secs if h.startswith("## 12.")), ""), "")
+    named = re.findall(r"`([A-Z]\d{2})`", s12)
+    named_set = set(named)
+    # 表格声明的日常子集总数
+    daily_total = 0
+    for line in s12.split("\n"):
+        c = [x.strip() for x in line.strip().strip("|").split("|")] if line.strip().startswith("|") else []
+        if len(c) >= 3 and c[0] and not c[0].startswith("**") and c[0] not in ("维度", "------"):
+            m = re.fullmatch(r"(\d+)", c[2])
+            if m:
+                daily_total += int(m.group(1))
+    check("§12 逐条点名的项数 == 表格声明", daily_total, len(named_set))
+    # 点名项必须是清单里的真实条目
+    all_ids = set()
+    for prefix, key, name in dims:
+        head = next((h for h in secs if h.startswith(prefix)), None)
+        if head is None:
+            continue
+        all_ids |= {key + n for n in re.findall(r"^\|\s*" + key + r"(\d{2})\s*\|", secs[head], re.M)}
+    bogus = sorted(named_set - all_ids)
+    if bogus:
+        failures.append(f"§12 点名了不存在的条目：{'、'.join(bogus)}")
+        print(f"  [FAIL] §12 点名有效性: 存在 {len(bogus)} 个幽灵编号")
+    else:
+        print(f"  [PASS] §12 点名有效性: {len(named_set)} 个编号全部存在于清单")
+
+
     miss_ids = set()
     for prefix, key, name in dims:
         head = next((h for h in secs if h.startswith(prefix)), None)
@@ -431,7 +458,13 @@ elif parity is not None:
             if st != "✅":
                 miss_ids.add(key + num)
     s13 = secs.get(next((h for h in secs if h.startswith("## 13.")), ""), "")
-    listed = set(re.findall(r"^\|\s*([A-Z]\d{2})\s*\|", s13, re.M))
+    # 覆盖判定要认三种写法：
+    #   ① 表格行首 `| D18 |`；
+    #   ② 子项编号 `D20a`（父条目 D20 被拆开时，拆项的出现即视为已覆盖父条目）；
+    #   ③ 「原编号」映射表里的 `**D20**`（§13.1 末尾那张表）。
+    listed = set(re.findall(r"^\|\s*([A-Z]\d{2})[a-d]?\s*\|", s13, re.M))
+    listed |= set(re.findall(r"\*\*([A-Z]\d{2})\*\*", s13))
+    listed |= {m[:-1] for m in re.findall(r"^\|\s*([A-Z]\d{2}[a-d])\s*\|", s13, re.M)}
     check("§13 覆盖未命中项数", len(miss_ids), len(miss_ids & listed))
     missing = sorted(miss_ids - listed)
     if missing:
