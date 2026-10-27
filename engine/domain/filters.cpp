@@ -212,6 +212,16 @@ bool high_pass_valid(const HighPassSettings& s, std::string* error) {
   return true;
 }
 
+bool denoise_valid(const DenoiseSettings& s, int32_t max_threshold, std::string* error) {
+  if (!(s.radius == 0.0 || (std::isfinite(s.radius) && s.radius >= 1.0 && s.radius <= 50.0))) {
+    return set_error(error, "denoise radius must be 0 or in 1..50");
+  }
+  if (s.threshold < 0 || s.threshold > max_threshold) {
+    return set_error(error, "denoise threshold is out of range");
+  }
+  return true;
+}
+
 bool minimum_valid(const MinimumSettings& s, std::string* error) {
   /* 0 = 恒等；>0 时按上游量程 1..100。中间那段 (0, 1) 显式拒绝（零半径无意义）。 */
   if (s.radius != 0.0 && !in_range(s.radius, 1.0, 100.0)) {
@@ -894,6 +904,82 @@ void morphology_line(const uint8_t* values, int32_t count, int32_t radius, bool 
  * 图像时等价于覆盖全图，因此每轴再裁到 (维度 - 1)。横向一趟写进临时缓冲，
  * 纵向一趟写回图层，两趟都是 O(w * h)，不随半径变慢。
  */
+/*
+ * Median（中间值）与 Dust & Scratches（蒙尘与划痕）——A45（2026-10-27）。
+ *
+ * 两者都是**去噪**族：Median 取窗口内中位数，Dust & Scratches 只在「中心与
+ * 中位数的差超过阈值」时才用中位数替换（PS 的口径：threshold=0 时两者等价）。
+ * 实现上共用一份窗口采样，避免把同一段邻域遍历写两遍。
+ *
+ * 与 Minimum/Maximum 的关系：那两个是**排序的两端**（单调队列可 O(1) 摊销），
+ * 中位数必须真正取中（需要选择算法），所以不能复用 morphology_line。这里用
+ * 「复制窗口 + nth_element」：半径上限压到 50（PS 的中间值最大 100，但那是
+ * 直径口径；本仓半径口径下 50 已等价），单像素代价 O(r² log r) 但 r 很小。
+ */
+namespace {
+
+/* 逐通道取窗口中位数；threshold > 0 时只在超阈值处替换（Dust & Scratches）。 */
+comp_result median_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          double radius, double scale, int32_t threshold) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  int64_t requested = static_cast<int64_t>(std::llround(radius * scale));
+  if (requested < 1) requested = 1;
+  const int32_t rx = static_cast<int32_t>(std::min<int64_t>(requested, width - 1));
+  const int32_t ry = static_cast<int32_t>(std::min<int64_t>(requested, height - 1));
+  if (rx < 1 && ry < 1) return COMP_OK;
+
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+
+  /* 窗口最多 (2rx+1)*(2ry+1) 个样本；用固定容量向量避免每像素分配。 */
+  const size_t window_capacity = static_cast<size_t>(2 * rx + 1) * static_cast<size_t>(2 * ry + 1);
+  std::vector<uint8_t> samples(window_capacity);
+
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      const size_t center = static_cast<size_t>(y) * static_cast<size_t>(width) +
+                            static_cast<size_t>(x);
+      for (int c = 0; c < 4; ++c) {
+        size_t count = 0;
+        /* 边界用「夹取」而不是「跳过」：跳过会让靠边的像素样本数变少、中位数
+         * 偏移；夹取等同边缘延展，与 Minimum/Maximum 的处理一致。 */
+        for (int32_t dy = -ry; dy <= ry; ++dy) {
+          int32_t sy = y + dy;
+          if (sy < 0) sy = 0;
+          if (sy >= height) sy = height - 1;
+          const uint8_t* row = source.data() + static_cast<size_t>(sy) * row_bytes;
+          for (int32_t dx = -rx; dx <= rx; ++dx) {
+            int32_t sx = x + dx;
+            if (sx < 0) sx = 0;
+            if (sx >= width) sx = width - 1;
+            samples[count++] = row[static_cast<size_t>(sx) * 4u + static_cast<size_t>(c)];
+          }
+        }
+        const size_t mid = count / 2;
+        std::nth_element(samples.begin(), samples.begin() + static_cast<ptrdiff_t>(mid),
+                         samples.begin() + static_cast<ptrdiff_t>(count));
+        const uint8_t median = samples[mid];
+        const uint8_t original = source[center * 4u + static_cast<size_t>(c)];
+        uint8_t value = median;
+        if (threshold > 0) {
+          const int32_t diff = static_cast<int32_t>(original) - static_cast<int32_t>(median);
+          /* 超阈值才替换：这就是 Dust & Scratches 与 Median 的唯一差别。 */
+          if (diff <= threshold && diff >= -threshold) value = original;
+        }
+        rgba[static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4u +
+             static_cast<size_t>(c)] = value;
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+}  // namespace
+
 comp_result morphology_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                               double radius, double scale, bool dilate) {
   if (width <= 0 || height <= 0) return COMP_OK;
@@ -1079,6 +1165,11 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return reduce_noise_pixels(rgba, width, height, stride, settings.reduce_noise);
     case kFilterHighPass:
       return high_pass_pixels(rgba, width, height, stride, settings.high_pass, scale);
+    case kFilterMedian:
+      return median_pixels(rgba, width, height, stride, settings.median.radius, scale, 0);
+    case kFilterDustScratches:
+      return median_pixels(rgba, width, height, stride, settings.dust_scratches.radius, scale,
+                           settings.dust_scratches.threshold);
     case kFilterMinimum:
       return morphology_pixels(rgba, width, height, stride, settings.minimum.radius, scale, false);
     case kFilterMaximum:
@@ -1118,6 +1209,8 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterSharpen: return sharpen_valid(settings.sharpen, error);
     case kFilterReduceNoise: return reduce_noise_valid(settings.reduce_noise, error);
     case kFilterHighPass: return high_pass_valid(settings.high_pass, error);
+    case kFilterMedian: return denoise_valid(settings.median, 0, error);
+    case kFilterDustScratches: return denoise_valid(settings.dust_scratches, 255, error);
     case kFilterMinimum: return minimum_valid(settings.minimum, error);
     case kFilterMaximum: return maximum_valid(settings.maximum, error);
     case kFilterOffset: return offset_valid(settings.offset, error);
@@ -1145,6 +1238,8 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterSharpen: return settings.sharpen.amount == 0.0;
     case kFilterReduceNoise: return settings.reduce_noise.strength == 0.0;
     case kFilterHighPass: return settings.high_pass.radius == 0.0;
+    case kFilterMedian: return settings.median.radius == 0.0;
+    case kFilterDustScratches: return settings.dust_scratches.radius == 0.0;
     case kFilterMinimum: return settings.minimum.radius == 0.0;
     case kFilterMaximum: return settings.maximum.radius == 0.0;
     case kFilterOffset:
@@ -1204,6 +1299,11 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
              a.reduce_noise.preserve_details == b.reduce_noise.preserve_details &&
              a.reduce_noise.reduce_color_noise == b.reduce_noise.reduce_color_noise;
     case kFilterHighPass: return a.high_pass.radius == b.high_pass.radius;
+    case kFilterMedian:
+      return a.median.radius == b.median.radius;
+    case kFilterDustScratches:
+      return a.dust_scratches.radius == b.dust_scratches.radius &&
+             a.dust_scratches.threshold == b.dust_scratches.threshold;
     case kFilterMinimum: return a.minimum.radius == b.minimum.radius;
     case kFilterMaximum: return a.maximum.radius == b.maximum.radius;
     case kFilterOffset:
@@ -1232,6 +1332,8 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterMaximum: return "Maximum";
     case kFilterOffset: return "Offset";
     case kFilterCustom: return "Custom";
+    case kFilterMedian: return "Median";
+    case kFilterDustScratches: return "Dust & Scratches";
   }
   return "filter";
 }

@@ -2506,3 +2506,130 @@ COMP_TEST(filters_abi_maps_the_custom_kernel) {
   COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &custom, 1.0, &changed,
                                nullptr, 0, nullptr) == COMP_ERR_INVALID_ARGUMENT);
 }
+
+/*
+ * A45（2026-10-27）：Median（中间值）与 Dust & Scratches（蒙尘与划痕）。
+ *
+ * 三条承诺：
+ *   1. radius 0 = 恒等：不开事务、不落撤销步、像素逐字节不变；
+ *   2. Median 真的取中位数：3×3 窗口里 8 个 100 + 1 个 255 → 中心必为 100；
+ *   3. Dust & Scratches 的 threshold 只在超阈值处替换（阈值内保留、超阈值替换）。
+ */
+namespace {
+
+/* 8×8 灰图 + 可选两个噪点，直接铺进图层像素（domain 层，不走 ABI）。 */
+comp_layer_id add_gray_layer_with_specks(Document* document, int32_t size,
+                                         const std::vector<std::pair<int32_t, int32_t>>& small,
+                                         const std::vector<std::pair<int32_t, int32_t>>& big) {
+  comp_layer_desc desc{};
+  desc.name = "denoise";
+  desc.transform = comp_rect{0, 0, size, size};
+  comp_layer_id id = 0;
+  Layer* layer = document->create_layer(desc, &id);
+  if (layer == nullptr) return 0;
+  layer->pixels.resize(size, size, COMP_PIXEL_RGBA8);
+  uint8_t* bytes = layer->pixels.writable_pixels().data();
+  const size_t stride = static_cast<size_t>(size) * 4u;
+  for (int32_t y = 0; y < size; ++y) {
+    for (int32_t x = 0; x < size; ++x) {
+      const size_t at = static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4u;
+      uint8_t v = 100;
+      for (const auto& spot : small) {
+        if (spot.first == x && spot.second == y) v = 110;
+      }
+      for (const auto& spot : big) {
+        if (spot.first == x && spot.second == y) v = 255;
+      }
+      bytes[at] = v;
+      bytes[at + 1] = v;
+      bytes[at + 2] = v;
+      bytes[at + 3] = 255;
+    }
+  }
+  return id;
+}
+
+uint8_t gray_at(const Document& document, comp_layer_id id, int32_t size, int32_t x, int32_t y) {
+  const std::vector<uint8_t> bytes = pixels_of(document, id);
+  if (bytes.empty()) return 0;
+  return bytes[(static_cast<size_t>(y) * static_cast<size_t>(size) + static_cast<size_t>(x)) * 4u];
+}
+
+}  // namespace
+
+COMP_TEST(filters_median_removes_isolated_speck) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 32, 32, 72.0f, "sRGB");
+  constexpr int32_t kSize = 8;
+  const comp_layer_id id = add_gray_layer_with_specks(&document, kSize, {}, {{4, 4}});
+  COMP_CHECK(id != 0);
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 4, 4) == 255, "亮点就位");
+
+  FilterSettings settings;
+  settings.kind = kFilterMedian;
+  settings.median.radius = 1.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(changed, "Median 报告已改动");
+
+  /* 3×3 窗口：8 个邻居 100 + 中心 255 → 中位数 100，亮点被抹掉。 */
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 4, 4) == 100,
+                 "Median 抹掉孤立亮点（中位数 100）");
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 0, 0) == 100, "均匀区不受影响");
+}
+
+COMP_TEST(filters_median_zero_radius_is_identity) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 32, 32, 72.0f, "sRGB");
+  constexpr int32_t kSize = 8;
+  const comp_layer_id id = add_gray_layer_with_specks(&document, kSize, {}, {{3, 3}});
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const size_t undo_before = undo_depth(document);
+
+  FilterSettings settings;
+  settings.kind = kFilterMedian; /* radius 零初始化 = 0 = 恒等 */
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = true;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK_MSG(!changed, "radius 0 报告未改动");
+  COMP_CHECK_MSG(!document.txn_active(), "radius 0 不开事务");
+  COMP_CHECK_MSG(undo_depth(document) == undo_before, "radius 0 不落撤销步");
+  COMP_CHECK_MSG(pixels_of(document, id) == before, "radius 0 像素逐字节不变");
+}
+
+COMP_TEST(filters_dust_scratches_respects_threshold) {
+  /*
+   * 阈值 20：幅度 10 的噪点保留（10 <= 20），幅度 155 的被替换（155 > 20）。
+   * 一条测试同时验两侧，避免「阈值形同虚设」也能通过。
+   */
+  Engine engine(test_engine_desc());
+  Document document(&engine, 32, 32, 72.0f, "sRGB");
+  constexpr int32_t kSize = 8;
+  const comp_layer_id id =
+      add_gray_layer_with_specks(&document, kSize, {{1, 1}}, {{6, 6}});
+  COMP_CHECK(id != 0);
+
+  FilterSettings settings;
+  settings.kind = kFilterDustScratches;
+  settings.dust_scratches.radius = 1.0;
+  settings.dust_scratches.threshold = 20;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 1, 1) == 110,
+                 "阈值内的噪点保留原值（10 <= 20）");
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 6, 6) == 100,
+                 "超阈值的噪点被替换为中位数（155 > 20）");
+}

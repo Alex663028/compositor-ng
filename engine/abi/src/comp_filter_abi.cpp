@@ -122,6 +122,12 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
     for (int i = 0; i < 25; ++i) settings.custom.kernel[i] = desc.custom.kernel[i];
     settings.custom.scale = desc.custom.scale;
     settings.custom.offset = desc.custom.offset;
+
+  /* A45：去噪族两个 kind 的参数（尾部追加，老宿主零初始化 = 半径 0 = 恒等）。 */
+  settings.median.radius = desc.median.radius;
+  settings.median.threshold = desc.median.threshold;
+  settings.dust_scratches.radius = desc.dust_scratches.radius;
+  settings.dust_scratches.threshold = desc.dust_scratches.threshold;
   }
   return settings;
 }

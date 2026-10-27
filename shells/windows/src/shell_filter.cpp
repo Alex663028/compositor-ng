@@ -253,6 +253,13 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
       desc.custom.scale = panel.value(25);
       desc.custom.offset = panel.value(26);
       break;
+    case comp_ui::FilterId::Median:
+      desc.median.radius = panel.value(0);
+      break;
+    case comp_ui::FilterId::DustScratches:
+      desc.dust_scratches.radius = panel.value(0);
+      desc.dust_scratches.threshold = static_cast<int32_t>(std::llround(panel.value(1)));
+      break;
     default:
       break;
   }
@@ -372,6 +379,13 @@ void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& des
       for (int i = 0; i < 25; ++i) panel.set_value(i, desc.custom.kernel[i]);
       panel.set_value(25, desc.custom.scale);
       panel.set_value(26, desc.custom.offset);
+      break;
+    case COMP_FILTER_MEDIAN:
+      panel.set_value(0, desc.median.radius);
+      break;
+    case COMP_FILTER_DUST_SCRATCHES:
+      panel.set_value(0, desc.dust_scratches.radius);
+      panel.set_value(1, static_cast<double>(desc.dust_scratches.threshold));
       break;
     default:
       break;

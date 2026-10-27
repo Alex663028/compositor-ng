@@ -1309,6 +1309,8 @@ enum class FilterId : int {
   Maximum = 13,
   Offset = 14,
   Custom = 15,
+  Median = 16,        /* A45：中间值 */
+  DustScratches = 17, /* A45：蒙尘与划痕 */
   Count
 };
 
@@ -1521,6 +1523,16 @@ inline const FilterSpec* filter_table(size_t* out_count) {
         {"Offset", -999.0, 999.0, 1.0, 0.0}},
        5,
        25},
+    /* A45（2026-10-27）：去噪族两项，各一行半径（Dust & Scratches 多一行阈值）。 */
+    {FilterId::Median,
+     "Median",
+     1,
+     {{"Radius", 0.0, 50.0, 1.0, 0.0}}},
+    {FilterId::DustScratches,
+     "Dust & Scratches",
+     2,
+     {{"Radius", 0.0, 50.0, 1.0, 0.0},
+      {"Threshold", 0.0, 255.0, 1.0, 0.0}}},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kFilters) / sizeof(kFilters[0]);

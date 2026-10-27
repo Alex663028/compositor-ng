@@ -52,7 +52,10 @@ typedef enum comp_filter_kind {
   COMP_FILTER_MINIMUM          = 12,
   COMP_FILTER_MAXIMUM          = 13,
   COMP_FILTER_OFFSET           = 14,
-  COMP_FILTER_CUSTOM           = 15
+  COMP_FILTER_CUSTOM           = 15,
+  /* A45（2026-10-27）尾部追加：去噪族的两项。 */
+  COMP_FILTER_MEDIAN           = 16, /* 中间值：窗口取中位色 */
+  COMP_FILTER_DUST_SCRATCHES   = 17  /* 蒙尘与划痕：超阈值才替换为中位数 */
 } comp_filter_kind;
 
 /*
@@ -226,6 +229,17 @@ typedef struct comp_filter_maximum {
   double radius;
 } comp_filter_maximum;
 
+/*
+ * Median / Dust & Scratches 共用（A45，2026-10-27 尾部追加）。
+ *   radius     0 = 恒等（不开事务）；1..50 像素
+ *   threshold  仅 Dust & Scratches 使用：0 = 等同 Median；
+ *              1..255 = 「中心与中位数的差超过它才替换」
+ */
+typedef struct comp_filter_denoise {
+  double radius;
+  int32_t threshold;
+} comp_filter_denoise;
+
 /* Offset 的露出区域处理方式（数值即域层 `OffsetSettings.wrap`）。 */
 typedef enum comp_offset_wrap {
   COMP_OFFSET_TRANSPARENT = 0, /* 露出部分留空（不环绕） */
@@ -293,6 +307,8 @@ typedef struct comp_filter_desc {
   comp_filter_maximum          maximum;
   comp_filter_offset           offset;
   comp_filter_custom           custom;
+  comp_filter_denoise          median;         /* A45：kind == MEDIAN */
+  comp_filter_denoise          dust_scratches; /* A45：kind == DUST_SCRATCHES */
 } comp_filter_desc;
 
 /*

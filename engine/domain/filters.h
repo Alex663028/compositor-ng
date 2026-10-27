@@ -304,6 +304,16 @@ struct MaximumSettings {
 };
 
 /*
+ * Median / Dust & Scratches（A45，2026-10-27）。
+ *   radius     0 = 恒等；1..50 像素
+ *   threshold  仅 Dust & Scratches：0 = 等同 Median；1..255 = 超阈值才替换
+ */
+struct DenoiseSettings {
+  double radius = 0.0;
+  int32_t threshold = 0;
+};
+
+/*
  * Offset（上游 Filter > Other > Offset）。
  *
  * `horizontal` / `vertical` 是图层像素的整数位移（-10000..10000），四舍五入到
@@ -376,6 +386,8 @@ enum FilterKind {
   kFilterMaximum = 13,
   kFilterOffset = 14,
   kFilterCustom = 15,
+  kFilterMedian = 16,
+  kFilterDustScratches = 17,
 };
 
 /*
@@ -400,6 +412,8 @@ struct FilterSettings {
   MaximumSettings maximum;
   OffsetSettings offset;
   CustomSettings custom;
+  DenoiseSettings median;
+  DenoiseSettings dust_scratches;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */
