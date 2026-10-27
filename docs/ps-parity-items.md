@@ -77,7 +77,7 @@
 | L17 | 图层复合（Layer Comps） | ✅ | 10 个 `comp_layer_comp_*`；`engineLayerComps` |
 | L18 | 智能对象 + 智能滤镜 | ✅ | 8 个 `comp_layer_smart_object_*` / `smart_filter_*`（+3 收尾：`_move`/`_set_name`/`_name`） |
 | L19 | 填充图层（纯色/渐变/图案） | ✅ | 12 个 `comp_layer_*_fill`；`comp_layer_add_fill` |
-| L20 | 图层对齐与分布 | ❌ | 全仓无 `align_layers` / `distribute`（关键词反查为误命中，`分布` 只命中直方图注释）；仅多选层以此为前置 |
+| L20 | 图层对齐与分布 | ✅ | `panel_align_layers` / `panel_distribute_layers`（`shell_layers.cpp`）+ 图层 > 对齐与分布 子菜单；自检 5 条断言（左/顶对齐、分布等距、<3 层拒绝） |
 | L21 | 全局光角度（图层样式统一光源） | ❌ | 无 `global_light`；10 种样式的投影/内阴影各自存角度，无共享光源 |
 | L22 | 合并的图层样式对话框 | ❌ | 现在只能逐个效果进面板改参数，无 PS 那种单一面板列出全部效果 |
 
@@ -158,7 +158,7 @@
 | T11 | 渐变五类型（线性/径向/角度/对称/菱形） | ✅ | `comp_gradient_type` 0..4 |
 | T12 | 多色标渐变（≤32 标 + 中点 + 抖动） | ✅ | `comp_gradient_stop`；右栏 8 行色标表 |
 | T13 | 字体回退链 | ❌ | 单字体，缺字回落点阵；无回退链（BACKLOG P1-4） |
-| T14 | 粗体/斜体/基线偏移 | ❌ | `comp_type_style` 无 weight/slant/baseline |
+| T14 | 粗体/斜体/基线偏移 | ✅ | `comp_type_style` 尾追加 `bold`/`italic`/`baseline_offset`；双描+剪切后处理（两条渲染路径都接）；单测 4 条 |
 | T15 | 竖排 / 路径文字 / 文字变形 | ❌ | 全仓无实现（关键词反查仅命中 UI 竖排文字标签） |
 | T16 | 形状布尔运算 / 画布上手拖色标 | ❌ | 无布尔；色标只能数值编辑（`gradient_stops` 表） |
 
@@ -218,7 +218,7 @@
 | A42 | 像素化族（马赛克/彩色半调/晶格化…） | ❌ | 无 |
 | A43 | 风格化族（浮雕/查找边缘/等高线/油画…） | ❌ | 无 |
 | A44 | 渲染族（云彩/镜头光晕/纤维/分层云彩） | ❌ | 无 |
-| A45 | 杂色族其余（蒙尘与划痕/中间值） | ❌ | 只有添加杂色与降噪 |
+| A45 | 杂色族其余（蒙尘与划痕/中间值） | ✅ | `COMP_FILTER_MEDIAN` / `DUST_SCRATCHES`（尾追加 kind 16/17）；Filter 菜单两项；单测 3 条 |
 | A46 | 其他（位移之外：自定之外的高反差细节等） | ◐ | Other 组 5 项已做，PS「其他」子菜单还有 6 项未做（R2 计未命中） |
 | A47 | RAW 文件解码（非 Camera Raw 滤镜） | ❌ | 无 RAW 解码器（BACKLOG §5） |
 | A48 | 消失点（Vanishing Point） | ❌ | 无 |
