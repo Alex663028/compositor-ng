@@ -216,6 +216,11 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintyp
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(POINT)]
+# ScreenToClient 同样要显式声明：不声明时 ctypes 按 32 位 int 传参，64 位下
+# POINT 指针被截断，函数**静默失败**（返回 0、坐标原样不动）——量出来的浮窗
+# 位置就是屏幕坐标而不是客户区坐标，判热区全错（2026-10-27 踩过）。
+user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(POINT)]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
@@ -908,6 +913,49 @@ class Shell:
         user32.ClientToScreen(self.hwnd, ctypes.pointer(point))
         return int(point.x), int(point.y)
 
+    def find_window(self, class_name):
+        """按**类名**找窗口（浮窗用）。找不到返回 None。
+
+        显式声明签名：ctypes 默认把字符串参数当 32 位 int 传，64 位下指针会被
+        截断，FindWindowW 直接返回 0（看起来像「窗口不存在」）。
+        """
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        hwnd = user32.FindWindowW(class_name, None)
+        return hwnd if hwnd else None
+
+    def window_rect_in_client(self, hwnd):
+        """另一个窗口的矩形，**换算到本窗口（主窗口）的客户区坐标**。
+
+        浮窗是独立顶层窗口，它自己的 GetWindowRect 是屏幕坐标；主窗口的
+        拖放判定用客户区坐标（drop_zone_at 吃的就是这个口径）。不换算就会
+        拿屏幕坐标去判客户区热区——副屏或窗口挪过位置时全错。
+        """
+        rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        top_left = POINT(rect.left, rect.top)
+        bottom_right = POINT(rect.right, rect.bottom)
+        user32.ScreenToClient(self.hwnd, ctypes.pointer(top_left))
+        user32.ScreenToClient(self.hwnd, ctypes.pointer(bottom_right))
+        return (top_left.x, top_left.y, bottom_right.x, bottom_right.y)
+
+    def _sync_cursor(self, x, y):
+        """把**物理指针**挪到客户区坐标 (x, y) 对应的屏幕位置。
+
+        分步拖动（拖面板标题栏）**必须**调：壳按**增量**搬浮窗（收到一条
+        mousemove 就挪一个 delta），而真实指针每轮都会补一条 WM_MOUSEMOVE，
+        那条消息的坐标是物理指针位置，会把合成增量的效果**抵消**掉。
+
+        实测（2026-10-27，壳侧日志）：合成 +482/-133，紧接着真实 -482/+133，
+        浮窗回到原处，净位移为零——表现为「拖了没反应」。
+
+        一次性 drag() 能靠后续密集消息把位置拉回来，增量式的面板拖动不能：
+        位移丢一次就**永久**丢。所以这条路径上必须让物理指针与合成坐标一致。
+        """
+        screen_x, screen_y = self.client_to_screen(int(x), int(y))
+        user32.SetCursorPos(int(screen_x), int(screen_y))
+        self.wait(0.02)
+
     def drag_begin(self, x, y):
         """按下并开始拖动（**不松手**）。
 
@@ -916,23 +964,31 @@ class Shell:
         结束了。拖放重排的视觉验证要用它。
         """
         x, y = int(x), int(y)
+        # 物理指针先到位：拖动期间系统会持续补发真实 mousemove，坐标是物理指针
+        # 位置；不同步的话它会顶掉合成坐标（增量式拖动丢一次就永久丢）。
+        self._sync_cursor(x, y)
         user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
         user32.SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
         self.wait(0.05)
 
     def drag_move(self, x, y):
         """拖动中（按住状态，坐标是客户区坐标）。"""
+        self._sync_cursor(x, y)
         user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
         self.wait(0.03)
 
     def drag_end(self, x, y):
         """松手。"""
-        # 松手前**再补一次** mousemove 到目标坐标：真实指针可能在最后一步与
-        # 松手之间插进来（窗口激活/悬停时系统会补发），把落点顶到别处。
+        # 松手前把物理指针定到落点，并**再补一次** mousemove：真实指针可能在
+        # 最后一步与松手之间插进来，把落点顶到别处。
+        self._sync_cursor(x, y)
         user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
         user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
         user32.SendMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(int(x), int(y)))
         self.wait(0.25)
+        # 松手后把物理指针收回标题栏：留在画布上的话，笔尖轮廓会进后续截图的
+        # 量区（options_bar 那次误报就是这么来的）。
+        self._park_pointer()
 
     def stroke(self, points, steps=8):
         """折线落笔：逐段拖动（画笔/橡皮擦/retouch 共用）。"""
@@ -4215,6 +4271,118 @@ def scene_adjust_scroll(shell, checker):
                   "滑块 y 质心 %.1f -> %.1f" % (center_before, center_after))
 
 
+def scene_panel_drag_dock(shell, checker):
+    """把面板**拖**到另一列去合并（P0-10 的拖放重排）。
+
+    自检已经覆盖了落点**判定**（纯函数 drop_action_for），但没覆盖「拖」这件事
+    本身：标题栏按住 -> 拖出成浮窗 -> 移到目标列 -> 松手 -> 合并。这条链上任
+    一环断了（阈值判错 / 浮窗跟不上指针 / 松手判定用错坐标口径），用户看到的
+    就是「拖了没反应」或「面板跑到别处」，而纯函数自检照样全绿。
+
+    量的判据与 panel_group 同源（真实布局 + 激活标签的顶部强调线）：
+      1. 拖动标题栏后出现浮窗（面板真的脱离了）；
+      2. 拖到另一列边缘松手 -> 合并成一组：左栏让位（原位置变成应用底色）；
+      3. 列顶出现标签栏，第一个标签是激活态（2px 强调线，颜色唯一）。
+    """
+    scene = "panel_drag_dock"
+    layer = shell.layout["layer"]
+    adjust = shell.layout["adjust"]
+    checker.check(scene, "起始状态两栏都在（左栏图层 / 右栏调整）",
+                  layer[2] - layer[0] > 0 and adjust[2] - adjust[0] > 0,
+                  "layer=%s adjust=%s" % (layer, adjust))
+
+    # 抓标题栏**中间**。浮窗初始就出现在指针底下，偏移 = 抓取点在浮窗内的相对
+    # 位置；抓中间时偏移是半个窗宽，浮窗中心与指针 x 重合——后面「把浮窗中心
+    # 拖到热区」就等价于「把指针拖到热区」，好算。
+    grab_x = (layer[0] + layer[2]) // 2
+    grab_y = layer[1] + 12
+    shell.drag_begin(grab_x, grab_y)
+    # 越过拖出阈值（6px）才脱离；给 20px 留余量。
+    pen_x, pen_y = grab_x + 20, grab_y + 4
+    shell.drag_move(pen_x, pen_y)
+    shell.wait(0.3)
+
+    float_hwnd = shell.find_window("CompositorFloatPanel")
+    checker.check(scene, "拖过阈值后出现浮窗（面板已脱离成独立窗口）",
+                  bool(float_hwnd), "浮窗 hwnd=%s" % (float_hwnd,))
+    if not float_hwnd:
+        shell.drag_end(pen_x, pen_y)
+        return
+
+    # 把浮窗中心搬到**右边缘热区**（48px 内）。
+    #
+    # 用**量出来**的浮窗位置算还差多少，而不是假设几何：浮窗是被系统夹在工作区
+    # 内的（拖到屏幕外会被拉回），指针位置与浮窗位置不是简单等式；而且浮窗可能
+    # 因为尺寸变化被重新定位。逐轮补差，收敛即止。
+    target = (shell.client_w - 24, shell.client_h // 2)
+    moved = 0
+    for _ in range(10):
+        rect = shell.window_rect_in_client(float_hwnd)
+        center_x = (rect[0] + rect[2]) // 2
+        center_y = (rect[1] + rect[3]) // 2
+        delta_x = target[0] - center_x
+        delta_y = target[1] - center_y
+        if abs(delta_x) <= 6 and abs(delta_y) <= 6:
+            break
+        pen_x += delta_x
+        pen_y += delta_y
+        shell.drag_move(pen_x, pen_y)
+        shell.wait(0.12)
+        moved += 1
+        if os.environ.get("COMPOSITOR_PROBE_DEBUG"):
+            print("   [debug] pen=(%d,%d) rect=%s center=(%d,%d) delta=(%d,%d)" %
+                  (pen_x, pen_y, rect, center_x, center_y, delta_x, delta_y))
+    final_rect = shell.window_rect_in_client(float_hwnd)
+    final_center = ((final_rect[0] + final_rect[2]) // 2, (final_rect[1] + final_rect[3]) // 2)
+    checker.check(scene, "浮窗中心被搬到右边缘热区（48px 内）",
+                  final_center[0] >= shell.client_w - 48,
+                  "中心 %s / 客户区宽 %d（%d 轮移动）" %
+                  (final_center, shell.client_w, moved))
+
+    # 松手：落点判定用的是**浮窗中心**，不是指针——所以上面那步是关键。
+    shell.drag_end(pen_x, pen_y)
+    shell.wait(0.5)
+    merged = shell.shot("161_drag_merged")
+
+    layout = shell.layout
+    bar = layout.get("group_bar", (0, 0, 0, 0))
+    checker.check(scene, "松开后两栏合并（列顶出现标签栏）",
+                  bar[2] - bar[0] > 0, "group_bar=%s" % (bar,))
+
+    # 合并后左栏让位：原来图层栏的位置变成应用底色。
+    #
+    # 用「列顶标签栏下面 60px」那个高度取色：避开工具栏与状态栏，也避开标签栏
+    # 本身的激活底色。
+    if bar[2] - bar[0] > 0:
+        content_top = bar[3] + 60
+        left_px = mean_rgb(merged, (2, content_top, 6, content_top + 10))
+        checker.check(scene, "左栏让位（原位置变成应用底色，画布变宽）",
+                      near(left_px, COL_APP_BG, 10), "左栏位置实测 %s" % (left_px,))
+
+        # 激活标签的顶部强调线（110,160,235）：只在激活标签上出现，颜色唯一。
+        tab_w = (bar[2] - bar[0]) // 2
+        first_accent = count_matching(merged, (bar[0] + 4, bar[1],
+                                               bar[0] + tab_w - 4, bar[1] + 3),
+                                      (110, 160, 235), 6)
+        checker.check(scene, "合并后的列顶标签栏有激活态（顶部强调线）",
+                      first_accent > 20, "强调线像素 %d" % first_accent)
+
+    # 反向验证：拆开后两栏复原。不然「合并」可能是把面板弄丢了。
+    shell.command(CMD_PANEL_GROUP_SPLIT)
+    shell.wait(0.4)
+    restored = shell.shot("162_drag_restored")
+    layout_after = shell.layout
+    layer_after = layout_after["layer"]
+    checker.check(scene, "拆开后左栏复原（面板没被弄丢）",
+                  layer_after[2] - layer_after[0] > 0,
+                  "layer=%s" % (layer_after,))
+    if layer_after[2] - layer_after[0] > 0:
+        sample_y = layer_after[1] + 80
+        restored_px = mean_rgb(restored, (2, sample_y, 6, sample_y + 10))
+        checker.check(scene, "复原后左栏位置不再是应用底色",
+                      not near(restored_px, COL_APP_BG, 6), "实测 %s" % (restored_px,))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -4258,6 +4426,7 @@ SCENES = [    ("start", scene_start, ()),
     ("panel_group", scene_panel_group, ()),
     ("layer_scroll", scene_layer_scroll, ()),
     ("adjust_scroll", scene_adjust_scroll, ()),
+    ("panel_drag_dock", scene_panel_drag_dock, ()),
 ]
 
 
