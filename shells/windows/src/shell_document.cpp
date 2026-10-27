@@ -2644,6 +2644,22 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
     case kCmdLayerSendToBack:
       panel_reorder_layer(shell, 0);
       break;
+
+    /* ---- L20：对齐（6 档）与分布（2 档）。基准在 panel_align_layers 内判定 ---- */
+    case kCmdLayerAlignBase:
+    case kCmdLayerAlignBase + 1:
+    case kCmdLayerAlignBase + 2:
+    case kCmdLayerAlignBase + 3:
+    case kCmdLayerAlignBase + 4:
+    case kCmdLayerAlignBase + 5:
+      panel_align_layers(shell, static_cast<int32_t>(id - kCmdLayerAlignBase));
+      break;
+    case kCmdLayerDistributeH:
+      panel_distribute_layers(shell, 0);
+      break;
+    case kCmdLayerDistributeV:
+      panel_distribute_layers(shell, 1);
+      break;
     case kCmdHistogramToggle:
       panel_toggle_histogram(shell);
       break;

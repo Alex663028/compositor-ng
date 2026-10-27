@@ -3181,6 +3181,142 @@ int run_selftest(const wchar_t* out_path) {
            "P0-10 group bar geometry: bar does not eat column width / content shifts down / hit test");
   }
 
+  {
+    /*
+     * L20 图层对齐与分布（2026-10-27）。
+     *
+     * 这一组钉的是**几何算术**，不是入口存在性：三个 20×20 图层摆在不同位置，
+     * 左对齐后三者的画布左缘必须相等；分布后相邻间距必须相等。
+     * 走的是壳层真实函数 `panel_align_layers` / `panel_distribute_layers`，
+     * 不绕过任何一层——若把算法搬走，这条会因找不到函数而编译失败。
+     *
+     * 为什么不用 pixel diff：对齐只改 transform、不动像素，拿 flatten 比像素
+     * 会掩盖「transform 改了但位置算错」——两个错互相抵消也能过。这里直接读
+     * `comp_layer_get_transform` 的 x/y，是唯一能钉住算术的口径。
+     */
+    comp_engine align_engine = nullptr;
+    if (comp_engine_create(&engine_desc, &align_engine) == COMP_OK) {
+      comp_document align_doc = nullptr;
+      comp_document_desc align_doc_desc{};
+      align_doc_desc.width = 200;
+      align_doc_desc.height = 200;
+      align_doc_desc.dpi = 72;
+      align_doc_desc.color_space = "sRGB";
+      if (comp_document_create(align_engine, &align_doc_desc, &align_doc) == COMP_OK) {
+        ShellState align_shell{};
+        align_shell.doc.document = align_doc;
+        /* 三个 20×20 图层，故意错开。 */
+        const int32_t start_x[3] = {0, 37, 91};
+        const int32_t start_y[3] = {0, 55, 120};
+        comp_layer_id ids[3] = {0, 0, 0};
+        std::vector<uint8_t> pixels(20 * 20 * 4, 200);
+        for (int i = 0; i < 3; ++i) {
+          comp_image image{};
+          image.width = 20;
+          image.height = 20;
+          image.format = COMP_PIXEL_RGBA8;
+          image.stride = 20 * 4;
+          image.pixels = pixels.data();
+          comp_layer_desc desc{};
+          desc.name = "align-layer";
+          desc.blend = COMP_BLEND_NORMAL;
+          desc.opacity = 1.0f;
+          desc.transform = comp_rect{start_x[i], start_y[i], 20, 20};
+          desc.sampling = COMP_SAMPLING_HIGH_QUALITY;
+          if (comp_layer_add(align_doc, &desc, &ids[i]) != COMP_OK) break;
+          comp_layer_set_pixels(align_doc, ids[i], &image);
+        }
+        /*
+         * 选中三层。`selected_layer` 是**面板显示行**，不是图层 id；这里让
+         * refresh_layers 先建出显示序，再把另外两层塞进 extra_selection。
+         * 三层都在根级，显示序与添加顺序相反（新层在上），所以行 0 是最后一层。
+         */
+        refresh_layers(align_shell);
+        align_shell.doc.selected_layer = 0;
+        align_shell.doc.extra_selection.clear();
+        const LayerRow* top = layer_row_at(align_shell, 0);
+        for (int i = 0; i < 3; ++i) {
+          if (top != nullptr && ids[i] == top->id) continue;
+          align_shell.doc.extra_selection.push_back(ids[i]);
+        }
+
+        /* 左对齐（edge 0）：三层的左缘必须都等于画布左缘 0。 */
+        panel_align_layers(align_shell, 0);
+        int32_t aligned_x[3] = {-1, -1, -1};
+        int32_t after_left_y[3] = {-1, -1, -1};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect now{};
+          float rot = 0.0f;
+          if (comp_layer_get_transform(align_doc, ids[i], &now, &rot) == COMP_OK) {
+            aligned_x[i] = now.x;
+            after_left_y[i] = now.y;
+          }
+        }
+        verify(aligned_x[0] == aligned_x[1] && aligned_x[1] == aligned_x[2] && aligned_x[0] == 0,
+               "L20 align-left puts all selected layers on the same x (= canvas left)");
+        /* 左对齐只该动 x，y 必须原样。 */
+        verify(after_left_y[0] == 0 && after_left_y[1] == 55 && after_left_y[2] == 120,
+               "L20 align-left leaves y untouched");
+
+        /* 顶对齐（edge 3）：三层的 y 必须都等于 0。 */
+        panel_align_layers(align_shell, 3);
+        int32_t aligned_y[3] = {-1, -1, -1};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect now{};
+          float rot = 0.0f;
+          if (comp_layer_get_transform(align_doc, ids[i], &now, &rot) == COMP_OK) aligned_y[i] = now.y;
+        }
+        verify(aligned_y[0] == 0 && aligned_y[1] == 0 && aligned_y[2] == 0,
+               "L20 align-top puts all selected layers on y = 0");
+
+        /* 分布：不均匀初值 y = 0 / 20 / 130，中间层应被推到 55（等间距）。 */
+        const int32_t uneven_y[3] = {0, 20, 130};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect rect{0, uneven_y[i], 20, 20};
+          comp_layer_set_transform(align_doc, ids[i], rect, 0.0f);
+        }
+        panel_distribute_layers(align_shell, 1); /* 垂直分布 */
+        int32_t even_after[3] = {-1, -1, -1};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect now{};
+          float rot = 0.0f;
+          if (comp_layer_get_transform(align_doc, ids[i], &now, &rot) == COMP_OK) even_after[i] = now.y;
+        }
+        /*
+         * 首末不动（0 / 130）。间距按「末层底边 − 首层顶边 − 三层高」均分：
+         * span = 150 − 0 = 150，thickness = 60，gap = (150 − 60) / 2 = 45，
+         * 中间层顶边 = 0 + 20 + 45 = 65。（第一版我按 55 写断言，是算错了
+         * ——把首层 top 当成了末层 bottom 的基准，实测 65 才对。）
+         */
+        verify(even_after[0] == 0 && even_after[1] == 65 && even_after[2] == 130,
+               "L20 distribute makes gaps equal (0/20/130 -> middle moves to 65)");
+
+        /* 少于 3 层时分布必须拒绝（不动任何图层）。 */
+        align_shell.doc.extra_selection.clear();
+        int32_t before_refuse[3] = {-1, -1, -1};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect now{};
+          float rot = 0.0f;
+          if (comp_layer_get_transform(align_doc, ids[i], &now, &rot) == COMP_OK) before_refuse[i] = now.y;
+        }
+        panel_distribute_layers(align_shell, 1);
+        int32_t after_refuse[3] = {-1, -1, -1};
+        for (int i = 0; i < 3; ++i) {
+          comp_rect now{};
+          float rot = 0.0f;
+          if (comp_layer_get_transform(align_doc, ids[i], &now, &rot) == COMP_OK) after_refuse[i] = now.y;
+        }
+        verify(before_refuse[0] == after_refuse[0] && before_refuse[1] == after_refuse[1] &&
+                   before_refuse[2] == after_refuse[2],
+               "L20 distribute refuses with < 3 layers and leaves geometry untouched");
+
+        align_shell.doc.document = nullptr;
+        comp_document_destroy(align_doc);
+      }
+      comp_engine_destroy(align_engine);
+    }
+  }
+
   comp_document_destroy(document);
   comp_engine_destroy(engine);
 

@@ -293,6 +293,11 @@
 [OK] P0-10 panel group collapse is column level (24px strip) and restores the group width
 [OK] P0-10 panel group width is initialised on merge and does not change with the active tab
 [OK] P0-10 group bar geometry: bar does not eat column width / content shifts down / hit test
+[OK] L20 align-left puts all selected layers on the same x (= canvas left)
+[OK] L20 align-left leaves y untouched
+[OK] L20 align-top puts all selected layers on y = 0
+[OK] L20 distribute makes gaps equal (0/20/130 -> middle moves to 65)
+[OK] L20 distribute refuses with < 3 layers and leaves geometry untouched
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

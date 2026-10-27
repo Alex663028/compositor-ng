@@ -121,6 +121,10 @@ constexpr UINT kCmdEffectBase = 1510;          /* S24：+ 效果档位 0..9，�
 constexpr UINT kCmdEffectClear = 1520;         /* S24：清除选中图层的全部效果 */
 constexpr UINT kCmdHistogramReset = 1521;      /* S24：直方图区间复位（双击同效） */
 constexpr UINT kCmdEffectEdit = 1522;          /* P0-2：打开效果参数面板（Ctrl+Shift+E） */
+/* L20：图层对齐（6 档）+ 分布（2 档）。段号取 1560，避开 1500..1522 与 1530 已占用的区间。 */
+constexpr UINT kCmdLayerAlignBase = 1595;      /* +0..5 = 左/水平居中/右/顶/垂直居中/底 */
+constexpr UINT kCmdLayerDistributeH = 1601;    /* 水平分布（按间距均分） */
+constexpr UINT kCmdLayerDistributeV = 1602;    /* 垂直分布 */
 /*
  * P0-1 命令号（1530 段）：图层面板的四个「上游有、本壳没有」的动作。
  * 重命名与精确不透明度需要键入，沿用本壳既有的「状态栏输入态」而不是另开对话框

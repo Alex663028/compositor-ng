@@ -319,6 +319,9 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void panel_toggle_clipping(ShellState& shell);
   void panel_toggle_isolated(ShellState& shell);
   void panel_reorder_layer(ShellState& shell, int direction);
+  /* L20：图层对齐（edge 见 ui_core::LayerAlignEdge）与分布（mode 0=水平 1=垂直）。 */
+  void panel_align_layers(ShellState& shell, int32_t edge);
+  void panel_distribute_layers(ShellState& shell, int32_t mode);
   void panel_set_sampling(ShellState& shell, int mode);
   void refresh_histogram(ShellState& shell);
   void panel_toggle_histogram(ShellState& shell);

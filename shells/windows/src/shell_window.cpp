@@ -4682,6 +4682,23 @@ HMENU build_menu() {
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSendBackward, L"下移一层(&S)\tCtrl+Shift+↓");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerBringToFront, L"置于顶层(&T)\tCtrl+Shift+Home");
   AppendMenuW(layer_menu, MF_STRING, kCmdLayerSendToBack, L"置于底层(&B)\tCtrl+Shift+End");
+  /*
+   * L20 对齐与分布：PS 把它放在「图层 > 对齐」子菜单。这里用子菜单是因为
+   * 8 个条目平铺会挤占「图层」菜单一半空间，而本壳此前已有多级菜单（滤镜等）。
+   * 对齐基准按 PS 口径：有选区用选区，无选区用画布（panel_align_layers 里判定）。
+   */
+  {
+    HMENU align_menu = CreatePopupMenu();
+    const wchar_t* align_labels[6] = {L"左对齐(&L)", L"水平居中对齐(&C)", L"右对齐(&R)",
+                                      L"顶对齐(&T)", L"垂直居中对齐(&M)", L"底对齐(&B)"};
+    for (int edge = 0; edge < 6; ++edge) {
+      AppendMenuW(align_menu, MF_STRING, kCmdLayerAlignBase + edge, align_labels[edge]);
+    }
+    AppendMenuW(align_menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(align_menu, MF_STRING, kCmdLayerDistributeH, L"水平分布（按间距）");
+    AppendMenuW(align_menu, MF_STRING, kCmdLayerDistributeV, L"垂直分布（按间距）");
+    AppendMenuW(layer_menu, MF_POPUP, reinterpret_cast<UINT_PTR>(align_menu), L"对齐与分布(&A)");
+  }
   AppendMenuW(layer_menu, MF_SEPARATOR, 0, nullptr);
   /*
    * S22 蒙版三连：建（选区->蒙版）/读（蒙版->选区）/清。引擎侧蒙版早已参与

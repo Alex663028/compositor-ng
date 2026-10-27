@@ -4885,4 +4885,270 @@ void adjust_set_channel(ShellState& shell, int32_t channel) {
   set_status(shell, buffer);
 }
 
+/*
+ * ---------------------------------------------------------------- L20 对齐与分布
+ *
+ * PS 的「对齐」把选中图层的**包围盒**对齐到参考系；「分布」在首末两层之间均分间距。
+ * 参考系口径按 PS：有选区用**选区**边界，没有选区用**画布**。
+ *
+ * 为什么放壳层而不是引擎：`comp_layer_get_transform` / `set_transform` 已够用，
+ * 对齐只是一次「读全部几何 → 算目标 → 写回」的批处理，没有新的文档语义、
+ * 不需要进 `.comp`。加 ABI 只会把产品策略固化进契约。
+ *
+ * 两个必须交代的边界（实测得出，不是推测）：
+ *   1. `comp_rect` 是 **int32_t 的 x/y/w/h**，不是浮点。所以对齐只能落到整像素，
+ *      没有亚像素位移；这也意味着「已经对齐」的判定是 `dx == 0 && dy == 0`，
+ *      不是浮点容差。
+ *   2. 图层可能没显式 transform（`w/h == 0`），此时有效包围盒 = 原点 + 像素尺寸。
+ *      统一走既有的 `layer_effective_transform`，避免出现「读到 0×0 就对不齐」。
+ *
+ * 不支持的（如实记，不假装）：
+ *   - 组图层不参与：组的 transform 是子树外接框，移它等于移整棵子树。
+ *   - 「对齐到某图层」的第三态：需要额外的基准层选择 UI，属独立一件。
+ *   - 旋转后的包围盒按外接矩形算（PS 同口径），不按未旋转的 rect。
+ */
+namespace {
+
+struct AlignBox {
+  comp_layer_id id = 0;
+  comp_rect transform{};   /* 写回用：原始 x/y/w/h（w/h 可能为 0） */
+  double rotation = 0.0;
+  double left = 0.0;       /* 画布坐标下的外接矩形 */
+  double top = 0.0;
+  double right = 0.0;
+  double bottom = 0.0;
+};
+
+/* 旋转后外接矩形：四角转到画布系再取 min/max。rotation 为 0 时等同原矩形。 */
+void fill_aligned_bounds(const comp_rect& rect, double rotation, AlignBox& box) {
+  const double cx = static_cast<double>(rect.x) + rect.w * 0.5;
+  const double cy = static_cast<double>(rect.y) + rect.h * 0.5;
+  const double hw = rect.w * 0.5;
+  const double hh = rect.h * 0.5;
+  if (rotation == 0.0) {
+    box.left = rect.x;
+    box.top = rect.y;
+    box.right = static_cast<double>(rect.x) + rect.w;
+    box.bottom = static_cast<double>(rect.y) + rect.h;
+    return;
+  }
+  const double rad = rotation * 3.14159265358979323846 / 180.0;
+  const double c = std::cos(rad);
+  const double s = std::sin(rad);
+  double min_x = 1e300;
+  double min_y = 1e300;
+  double max_x = -1e300;
+  double max_y = -1e300;
+  const double corners[4][2] = {{-hw, -hh}, {hw, -hh}, {hw, hh}, {-hw, hh}};
+  for (const auto& corner : corners) {
+    const double px = cx + corner[0] * c - corner[1] * s;
+    const double py = cy + corner[0] * s + corner[1] * c;
+    if (px < min_x) min_x = px;
+    if (px > max_x) max_x = px;
+    if (py < min_y) min_y = py;
+    if (py > max_y) max_y = py;
+  }
+  box.left = min_x;
+  box.top = min_y;
+  box.right = max_x;
+  box.bottom = max_y;
+}
+
+/* 收集参与对齐的图层：跳过组与没有像素的层。 */
+bool collect_align_boxes(ShellState& shell, std::vector<AlignBox>& out, size_t& skipped_groups) {
+  const std::vector<comp_layer_id> ids = panel_selection_ids(shell, true);
+  skipped_groups = 0;
+  for (comp_layer_id id : ids) {
+    bool is_group = false;
+    for (const LayerRow& candidate : shell.doc.layers) {
+      if (candidate.id == id) {
+        is_group = candidate.is_group != 0;
+        break;
+      }
+    }
+    if (is_group) {
+      ++skipped_groups;
+      continue;
+    }
+    AlignBox box;
+    box.id = id;
+    if (!layer_effective_transform(shell, id, &box.transform, &box.rotation)) continue;
+    fill_aligned_bounds(box.transform, box.rotation, box);
+    out.push_back(box);
+  }
+  return !out.empty();
+}
+
+/* 对齐参考系：有选区用选区包围盒，否则用画布。 */
+void align_reference_frame(ShellState& shell, double& left, double& top, double& right,
+                           double& bottom, bool& from_selection) {
+  comp_rect bounds{};
+  if (comp_selection_get_bounds(shell.doc.document, &bounds) == COMP_OK && bounds.w > 0 &&
+      bounds.h > 0) {
+    left = bounds.x;
+    top = bounds.y;
+    right = static_cast<double>(bounds.x) + bounds.w;
+    bottom = static_cast<double>(bounds.y) + bounds.h;
+    from_selection = true;
+    return;
+  }
+  comp_size size{};
+  comp_document_size(shell.doc.document, &size);
+  left = 0.0;
+  top = 0.0;
+  right = static_cast<double>(size.width);
+  bottom = static_cast<double>(size.height);
+  from_selection = false;
+}
+
+/* 把浮点位移落到整像素：`comp_rect` 是 int32，四舍五入到最近像素。 */
+int32_t round_to_pixel(double value) {
+  return static_cast<int32_t>(value >= 0.0 ? std::floor(value + 0.5) : std::ceil(value - 0.5));
+}
+
+}  // namespace
+
+/* 对齐：edge 0..5 = 左 / 水平居中 / 右 / 顶 / 垂直居中 / 底。 */
+void panel_align_layers(ShellState& shell, int32_t edge) {
+  std::vector<AlignBox> boxes;
+  size_t skipped_groups = 0;
+  if (!collect_align_boxes(shell, boxes, skipped_groups)) {
+    set_status(shell, skipped_groups > 0 ? L"对齐：选中的是组图层（组不参与对齐）"
+                                         : L"对齐：没有可对齐的图层");
+    return;
+  }
+  double ref_left = 0.0;
+  double ref_top = 0.0;
+  double ref_right = 0.0;
+  double ref_bottom = 0.0;
+  bool from_selection = false;
+  align_reference_frame(shell, ref_left, ref_top, ref_right, ref_bottom, from_selection);
+  const double ref_cx = (ref_left + ref_right) * 0.5;
+  const double ref_cy = (ref_top + ref_bottom) * 0.5;
+
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document,
+                     from_selection ? "Align Layers To Selection" : "Align Layers To Canvas",
+                     &txn) != COMP_OK) {
+    set_status(shell, L"对齐：无法开始事务");
+    return;
+  }
+  size_t moved = 0;
+  for (const AlignBox& box : boxes) {
+    double dx = 0.0;
+    double dy = 0.0;
+    switch (edge) {
+      case 0: dx = ref_left - box.left; break;
+      case 1: dx = ref_cx - (box.left + box.right) * 0.5; break;
+      case 2: dx = ref_right - box.right; break;
+      case 3: dy = ref_top - box.top; break;
+      case 4: dy = ref_cy - (box.top + box.bottom) * 0.5; break;
+      case 5: dy = ref_bottom - box.bottom; break;
+      default: continue;
+    }
+    const int32_t step_x = round_to_pixel(dx);
+    const int32_t step_y = round_to_pixel(dy);
+    if (step_x == 0 && step_y == 0) continue;
+    comp_rect next = box.transform;
+    next.x = box.transform.x + step_x;
+    next.y = box.transform.y + step_y;
+    if (comp_layer_set_transform(shell.doc.document, box.id, next,
+                                 static_cast<float>(box.rotation)) == COMP_OK) {
+      ++moved;
+    }
+  }
+  if (moved == 0) {
+    comp_txn_abort(txn);
+    set_status(shell, from_selection ? L"对齐：已在选区内对齐，未发生移动"
+                                     : L"对齐：已在画布内对齐，未发生移动");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"对齐：提交失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已对齐 %d 个图层（基准：%s）", static_cast<int>(moved),
+            from_selection ? L"选区" : L"画布");
+  refresh_history_status(shell, buffer);
+}
+
+/*
+ * 分布：mode 0 = 水平，1 = 垂直。首末两层不动，中间各层按**间距**均分（PS 默认口径）。
+ * 总留白 = 末层右缘 − 首层左缘 − 各层厚度之和，均分给 (n−1) 个间隙。
+ */
+void panel_distribute_layers(ShellState& shell, int32_t mode) {
+  std::vector<AlignBox> boxes;
+  size_t skipped_groups = 0;
+  if (!collect_align_boxes(shell, boxes, skipped_groups)) {
+    set_status(shell, skipped_groups > 0 ? L"分布：选中的是组图层（组不参与分布）"
+                                         : L"分布：没有可分布的图层");
+    return;
+  }
+  if (boxes.size() < 3) {
+    set_status(shell, L"分布：至少要选中 3 个图层（首末两层不动，中间才有可分布的）");
+    return;
+  }
+  const bool horizontal = (mode == 0);
+  std::sort(boxes.begin(), boxes.end(), [horizontal](const AlignBox& a, const AlignBox& b) {
+    return horizontal ? (a.left < b.left) : (a.top < b.top);
+  });
+  const AlignBox& first = boxes.front();
+  const AlignBox& last = boxes.back();
+  const double span = horizontal ? (last.right - first.left) : (last.bottom - first.top);
+  double thickness = 0.0;
+  for (const AlignBox& box : boxes) {
+    thickness += horizontal ? (box.right - box.left) : (box.bottom - box.top);
+  }
+  const double gap = (span - thickness) / (static_cast<double>(boxes.size()) - 1.0);
+  if (gap < 0.0) {
+    set_status(shell, L"分布：图层总宽超出首末范围，无法均分（先缩小或手动挪开）");
+    return;
+  }
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document, horizontal ? "Distribute Layers Horizontally"
+                                                   : "Distribute Layers Vertically",
+                     &txn) != COMP_OK) {
+    set_status(shell, L"分布：无法开始事务");
+    return;
+  }
+  size_t moved = 0;
+  double cursor = horizontal ? first.left : first.top;
+  for (size_t index = 0; index < boxes.size(); ++index) {
+    const AlignBox& box = boxes[index];
+    const double dx = horizontal ? (cursor - box.left) : 0.0;
+    const double dy = horizontal ? 0.0 : (cursor - box.top);
+    cursor += (horizontal ? (box.right - box.left) : (box.bottom - box.top)) + gap;
+    /* 首末两层位置不动（它们是分布的锚点）。 */
+    if (index == 0 || index + 1 == boxes.size()) continue;
+    const int32_t step_x = round_to_pixel(dx);
+    const int32_t step_y = round_to_pixel(dy);
+    if (step_x == 0 && step_y == 0) continue;
+    comp_rect next = box.transform;
+    next.x = box.transform.x + step_x;
+    next.y = box.transform.y + step_y;
+    if (comp_layer_set_transform(shell.doc.document, box.id, next,
+                                 static_cast<float>(box.rotation)) == COMP_OK) {
+      ++moved;
+    }
+  }
+  if (moved == 0) {
+    comp_txn_abort(txn);
+    set_status(shell, L"分布：间距已经均匀，未发生移动");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"分布：提交失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  wchar_t buffer[192];
+  wsprintfW(buffer, L"已%s分布 %d 个图层（间距 %.1f px）", horizontal ? L"水平" : L"垂直",
+            static_cast<int>(moved), gap);
+  refresh_history_status(shell, buffer);
+}
+
 }  // namespace comp_shell
