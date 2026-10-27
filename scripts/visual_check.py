@@ -64,6 +64,18 @@ WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_MOUSELEAVE = 0x02A3
 WM_CLOSE = 0x0010
+# 窗口边框命中（2026-10-27）：问窗口「这个点算客户区还是缩放边框」。
+WM_NCHITTEST = 0x0084
+HTCLIENT = 1
+HTLEFT = 10
+HTRIGHT = 11
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+# 拖系统边框只能用**物理指针**：sizing loop 是 DefWindowProc 内部的模态循环，
+# 它读 GetCursorPos，不读消息队列里的合成坐标。
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
 
 PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
@@ -235,6 +247,13 @@ user32.GetKeyboardState.argtypes = [ctypes.c_void_p]
 user32.SetKeyboardState.argtypes = [ctypes.c_void_p]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 user32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wintypes.DWORD, ctypes.c_size_t]
+# 窗口几何（2026-10-27）：同样必须显式声明——不声明时 HWND 按 32 位 int 传，
+# 64 位下句柄被截断，SetWindowPos 静默失败（窗口纹丝不动，看着像「拖不动」）。
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = wintypes.BOOL
+user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, ctypes.c_size_t]
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
@@ -429,16 +448,22 @@ def pixel(img, x, y):
 # ---------------------------------------------------------------- 外壳驱动
 
 def _clear_workspace():
-    """删掉 %APPDATA%\Compositor\workspace.ini（停靠状态跨会话保留）。"""
+    """删掉 %APPDATA%\\Compositor 下的两份持久状态。
+
+    - `workspace.ini`：面板停靠状态（浮动的面板会带进下一个场景）；
+    - `window.ini`：窗口位置/大小/最大化（2026-10-27 新增）。不清的话，上一次
+      跑测时拖大的窗口会被下一次启动继承，探针按 1280×720 算的坐标全偏。
+    """
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
         return
-    path = os.path.join(appdata, "Compositor", "workspace.ini")
-    try:
-        if os.path.isfile(path):
-            os.remove(path)
-    except OSError:
-        pass
+    for name in ("workspace.ini", "window.ini"):
+        path = os.path.join(appdata, "Compositor", name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 # 布局查询的共享内存名（与 shell_state.h 的 kLayoutQueryMappingName 同值）。
@@ -467,11 +492,15 @@ class Shell:
         os.makedirs(out_dir, exist_ok=True)
 
     # -- 生命周期 --------------------------------------------------
-    def start(self, args=None):
+    def start(self, args=None, clear=True):
         # P0-10：启动前清掉上次的 workspace（停靠状态会跨会话保留）。
         # 不清的话，上一次跑出来的「浮动面板」状态会带进这一次，右栏就不在
         # 窗口里了，探针按「右栏在原位」做的断言会全线崩。
-        _clear_workspace()
+        #
+        # clear=False：**故意保留**两份持久状态。窗口几何的「退出记住、重启还原」
+        # 只能这么验（清了就等于验了个默认值）。
+        if clear:
+            _clear_workspace()
         cmd = [self.exe] + list(args or [])
         self.proc = subprocess.Popen(cmd, cwd=BUILD)
         deadline = time.time() + 15.0
@@ -955,6 +984,72 @@ class Shell:
         screen_x, screen_y = self.client_to_screen(int(x), int(y))
         user32.SetCursorPos(int(screen_x), int(screen_y))
         self.wait(0.02)
+
+    # -- 窗口几何（2026-10-27） -----------------------------------
+    def client_size(self):
+        rect = RECT()
+        user32.GetClientRect(self.hwnd, ctypes.byref(rect))
+        return (rect.right - rect.left, rect.bottom - rect.top)
+
+    def window_rect(self):
+        rect = RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
+        return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+    def nchittest(self, x, y):
+        """问窗口：(x,y) 是客户区还是缩放边框？
+
+        走 SendMessage 而不是合成消息——WM_NCHITTEST 是**同步问**的，壳的回答
+        就是用户按下去时系统会拿到的那个答案。
+        """
+        screen_x, screen_y = self.client_to_screen(int(x), int(y))
+        packed = (int(screen_y) << 16) | (int(screen_x) & 0xFFFF)
+        return int(user32.SendMessageW(self.hwnd, WM_NCHITTEST, 0, packed))
+
+    def drag_window_corner(self, dx, dy, grip=1):
+        """按住客户区右下角（grip 像素处）真实拖出 (dx, dy)。
+
+        必须用**物理指针**：系统 sizing loop 是 DefWindowProc 里的模态循环，
+        它每轮读 GetCursorPos，合成 WM_MOUSEMOVE 对它无效（这类失败的表现是
+        「鼠标动了，窗口没动」，很容易误判成壳的 bug）。
+        """
+        width, height = self.client_size()
+        screen_x, screen_y = self.client_to_screen(width - grip, height - grip)
+        user32.SetCursorPos(int(screen_x), int(screen_y))
+        self.wait(0.2)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.wait(0.12)
+        steps = 10
+        for step in range(1, steps + 1):
+            user32.SetCursorPos(int(screen_x + dx * step / steps),
+                                int(screen_y + dy * step / steps))
+            self.wait(0.03)
+        self.wait(0.15)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        self.wait(0.6)
+        self._park_pointer()
+
+    def resize_client(self, width, height):
+        """直接改窗口大小（按**客户区**尺寸给），用作「拖到某个尺寸」的捷径。
+
+        真实拖拽有系统的最小尺寸夹取与 DPI 换算，量「布局跟不跟得上」时反而
+        是噪声；这里只想把客户区摆成指定大小，边框差从当前窗口实测。
+        """
+        for _ in range(3):
+            self._read_client()
+            left, top, window_w, window_h = self.window_rect()
+            border_w = window_w - self.client_w
+            border_h = window_h - self.client_h
+            if border_w <= 0 or border_h <= 0:
+                self.wait(0.2)
+                continue
+            user32.SetWindowPos(self.hwnd, None, 0, 0, int(width) + border_w,
+                                int(height) + border_h, 0x0002 | 0x0004)  # NOMOVE | NOZORDER
+            self.wait(0.45)
+            self._read_client()
+            if abs(self.client_w - width) <= 2 and abs(self.client_h - height) <= 2:
+                return
+
 
     def drag_begin(self, x, y):
         """按下并开始拖动（**不松手**）。
@@ -4383,6 +4478,102 @@ def scene_panel_drag_dock(shell, checker):
                       not near(restored_px, COL_APP_BG, 6), "实测 %s" % (restored_px,))
 
 
+def scene_window_resize(shell, checker):
+    """
+    窗口可拖拽缩放（2026-10-27）。
+
+    老板的原话是「软件窗口大小可以像窗口一样自行拖拽大小」。查下来边框**本来
+    就能拖**（四条边、四个角、双击最大化全部正常），真正会让人以为「拖不动」
+    的是两件事：
+
+      1. **看不出哪里能拖**：深色 UI 把内容画到窗口最外沿，系统那圈 8px 边框
+         与内容没有分界，按偏 2px 就落进面板/画布。壳现在把缩放命中往客户区
+         内侧铺 3 逻辑像素——按在窗口内侧也算拖。
+      2. **没有下限**：此前能拖到客户区 0 高，布局各档连着降级，最后只剩一条
+         缝、面板全消失。那不是小窗口，是不可用。
+
+    顺带补了窗口几何的存读（像别的程序一样记住上次多大、在哪、是否最大化）。
+
+    断言：
+      1. 客户区内侧 1~2px 是缩放命中，5px 已是客户区（加宽只加 3px，不抢内容）；
+      2. 左下/右下角返回对角码（斜拖不会退化成单方向拉伸）；
+      3. 顶部 1px 仍是客户区（工具条/菜单贴顶边，不能让给缩放）；
+      4. 真实拖右下角后客户区变大，布局跟着长（画布变宽）；
+      5. 缩到极小被下限挡住，客户区不小于 600×360；
+      6. 退出前的大小记进 window.ini，重启原样回来。
+    """
+    scene = "window_resize"
+    width, height = shell.client_size()
+    checker.check(scene, "初始客户区是默认档（1280×720 窗口）",
+                  width >= 1200 and height >= 600, "客户区 %d×%d" % (width, height))
+
+    left_1 = shell.nchittest(1, height // 2)
+    left_2 = shell.nchittest(2, height // 2)
+    left_5 = shell.nchittest(5, height // 2)
+    checker.check(scene, "客户区内侧 1~2px 也算缩放（按偏了也能拖）",
+                  left_1 == HTLEFT and left_2 == HTLEFT,
+                  "1px->%d 2px->%d" % (left_1, left_2))
+    checker.check(scene, "5px 已是客户区（加宽只加 3px，不抢面板内容）",
+                  left_5 == HTCLIENT, "5px->%d" % left_5)
+
+    corner_left = shell.nchittest(1, height - 1)
+    corner_right = shell.nchittest(width - 1, height - 1)
+    checker.check(scene, "左下/右下角返回对角码（斜拖不退化）",
+                  corner_left == HTBOTTOMLEFT and corner_right == HTBOTTOMRIGHT,
+                  "左下->%d 右下->%d" % (corner_left, corner_right))
+
+    top_1 = shell.nchittest(width // 2, 1)
+    checker.check(scene, "顶部 1px 仍是客户区（菜单/工具条优先）",
+                  top_1 == HTCLIENT, "顶部->%d" % top_1)
+
+    # 布局矩形是 (left, top, right, bottom)——不是 (x, y, w, h)。
+    canvas_before = shell.layout["canvas"][2] - shell.layout["canvas"][0]
+    shell.drag_window_corner(180, 110)
+    width_after, height_after = shell.client_size()
+    checker.check(scene, "真实拖右下角后客户区变大",
+                  width_after > width + 100 and height_after > height + 60,
+                  "%d×%d -> %d×%d" % (width, height, width_after, height_after))
+
+    layout_after = shell.layout
+    canvas_rect = layout_after["canvas"]
+    canvas_after = canvas_rect[2] - canvas_rect[0]
+    checker.check(scene, "布局跟着长（画布变宽）",
+                  canvas_after > canvas_before + 100,
+                  "画布宽 %d -> %d" % (canvas_before, canvas_after))
+    img = shell.shot("70_window_resized")
+    status = layout_after["status"]
+    checker.check(scene, "缩放后状态栏仍贴底（没有被挤出窗口）",
+                  status[3] - status[1] > 0 and abs(status[3] - height_after) <= 2,
+                  "status=%s 客户区高 %d" % (status, height_after))
+
+    # 极小尺寸：下限必须挡住，否则布局各档连着降级成「只剩一条缝」。
+    shell.resize_client(200, 150)
+    tiny_w, tiny_h = shell.client_size()
+    checker.check(scene, "缩到 200×150 被下限挡住（客户区不小于 600×360）",
+                  tiny_w >= 596 and tiny_h >= 356,
+                  "实际客户区 %d×%d" % (tiny_w, tiny_h))
+    tiny_layout = shell.layout
+    tiny_canvas = tiny_layout["canvas"]
+    checker.check(scene, "最小尺寸下画布/面板仍在（不是「只剩一条缝」）",
+                  tiny_canvas[2] - tiny_canvas[0] > 150 and
+                  tiny_canvas[3] - tiny_canvas[1] > 200,
+                  "canvas=%s" % (tiny_canvas,))
+    tiny_img = shell.shot("71_window_min_size")
+    in_bounds = tiny_canvas[2] <= tiny_w + 2 and tiny_canvas[3] <= tiny_h + 2
+    checker.check(scene, "最小尺寸下布局矩形不越界（画布没被挤出窗口）", in_bounds,
+                  "canvas=%s 客户区 %d×%d" % (tiny_canvas, tiny_w, tiny_h))
+
+    # 几何记忆：摆成 1000×700 客户区，退出再起，尺寸原样回来。
+    shell.resize_client(1000, 700)
+    target = shell.client_size()
+    shell.stop()
+    shell.start(clear=False)  # 故意不清 window.ini：要验的就是它
+    restored = shell.client_size()
+    checker.check(scene, "退出前的大小记住，重启原样回来",
+                  abs(restored[0] - target[0]) <= 2 and abs(restored[1] - target[1]) <= 2,
+                  "退出前 %d×%d，重启 %d×%d" % (target[0], target[1], restored[0], restored[1]))
+
+
 SCENES = [    ("start", scene_start, ()),
     ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
@@ -4427,6 +4618,7 @@ SCENES = [    ("start", scene_start, ()),
     ("layer_scroll", scene_layer_scroll, ()),
     ("adjust_scroll", scene_adjust_scroll, ()),
     ("panel_drag_dock", scene_panel_drag_dock, ()),
+    ("window_resize", scene_window_resize, ()),
 ]
 
 

@@ -246,6 +246,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   recent_load(shell);
   /* P0-10：停靠状态（面板停靠边 / 宽度 / 收起 / 浮动几何）从上次退出继承。 */
   workspace_load(shell);
+  /*
+   * 窗口几何（位置 / 大小 / 上次是否最大化）从 window.ini 继承。放在 workspace_load
+   * 之后：两者都用 shell_dpi，而 --dpi 覆盖已经在上面生效；屏幕外的旧位置在这里
+   * 会被 MonitorFromRect 挡掉，退回系统给的缺省位置。
+   */
+  const bool restore_maximized = window_geometry_restore(window, shell);
   create_document(shell);
   /*
    * P5-3：随仓字体在这里一次性加载（字体句柄独立于引擎，不需要文档）。
@@ -267,6 +273,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);
   ShowWindow(window, show);
   UpdateWindow(window);
+  /*
+   * 上次是最大化：**必须在首次 ShowWindow 之后**再最大化。先前那次 ShowWindow
+   * 会把窗口摆成普通态（show 是 SW_SHOWDEFAULT），在这里补一次才不会被它抹掉。
+   */
+  if (restore_maximized) ShowWindow(window, SW_SHOWMAXIMIZED);
 
   /*
    * 命令行打开文件（compositor_shell.exe photo.png ／ *.comp）。

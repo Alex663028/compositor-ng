@@ -173,6 +173,30 @@ def status_line(device):
     return ""
 
 
+def layer_count(device):
+    """状态栏里的「图层 N」。-1 = 读不到。"""
+    for _, text, _ in device.texts():
+        if "图层" in text and text.startswith("S"):
+            match = re.search(r"图层 (-?\d+)", text)
+            if match:
+                return int(match.group(1))
+    return -1
+
+
+def fresh_document(device):
+    """重启应用 + 新建文档，回到**确定的**初始状态。
+
+    为什么每节都重启，而不是接着上一节：调试按钮在图层面板下方，面板一高一低
+    坐标就变；接着上一节跑会「有的节点得到、有的节点不到」，而点不到的 tap 只
+    返回 False 不报错，整节断言就落到错的对象上（2026-10-27 实测：图层攒到 6
+    层、列表里全是组，第六节开始全崩且看不出原因）。
+    重启 + 新建一共十秒，换来每节的起点可预测。
+    """
+    device.start()
+    device.tap("新建", 2)
+    return layer_count(device) == 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="鸿蒙壳图层验证（模拟器）")
     parser.add_argument("--hdc", default=DEFAULT_HDC)
@@ -187,7 +211,7 @@ def main():
     device.start()
 
     print("\n=== 一、图层分组与缩进 ===")
-    device.tap("新建", 2)
+    fresh_document(device)
     device.tap("蓝层", 2)
     device.tap("蓝层", 2)
     rows = device.layer_rows()
@@ -231,7 +255,7 @@ def main():
                  "active=1" in selftest and "del=1" in selftest, selftest)
 
     print("\n=== 四、折叠（组可收起） ===")
-    device.tap("新建", 2)
+    fresh_document(device)
     device.tap("蓝层", 2)
     device.tap("蓝层", 2)
     device.tap("建组", 3)
@@ -257,7 +281,7 @@ def main():
         report.check("折叠", False, "找不到 ▾ 图标")
 
     print("\n=== 五、多选与批量建组 ===")
-    device.tap("新建", 2)
+    fresh_document(device)
     device.tap("蓝层", 2)
     device.tap("蓝层", 2)
     marks = device.boxes_of("○")
@@ -285,8 +309,19 @@ def main():
         report.check("多选", False, "勾选点不足两个")
 
     print("\n=== 六、可编辑调整层 ===")
+    # 从确定的起点开始：重启 + 新建 + 两层，然后**点列表行**选中真正的图层
+    # （组没有像素，引擎不给它挂调整，症状是「新增 ✓ 但已有一直空」）。
+    fresh_document(device)
     device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if solids:
+        device.tap_box(solids[0][3], 2)
+    else:
+        report.check("选中一个图层", False,
+                     "列表里没有 solid 行：%s" % ([(r[0], r[1], r[2]) for r in rows],))
     device.tap("新增", 3)
+
     added = ""
     for _, value, _ in device.texts():
         if value.startswith("新增"):
@@ -338,6 +373,83 @@ def main():
                  "ok=1" in adjust, adjust)
     report.check("滤镜真的改了像素（rc=0 changed=1，不是 0.7% 的空操作）",
                  "rc=0" in adjust and "changed=1" in adjust, adjust)
+
+    print("\n=== 七、混合模式下拉 ===")
+    # 一律点**列表行**选中图层，不点调试区按钮（面板一高一低坐标就变，
+    # tap 会静默失败——第六节就是被这个坑过）。
+    fresh_document(device)
+    device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if solids:
+        device.tap_box(solids[0][3], 2)
+    blend_value = ""
+    for kind, value, _ in device.texts():
+        if kind == "Select" and value not in ("Hue/Saturation", ""):
+            blend_value = value
+    report.check("混合下拉显示选中层当前模式（缺省 Normal）",
+                 blend_value == "Normal", blend_value or "（没找到下拉）")
+    # 点开下拉 -> 选 Screen -> 应写回引擎且状态栏报出来
+    opened = device.tap(blend_value if blend_value else "Normal", 2)
+    picked = device.tap("Screen", 3) if opened else False
+    line = status_line(device)
+    report.check("选 Screen 写回引擎（状态栏报混合模式）",
+                 picked and "混合 Screen" in line, line)
+    mix_marks = device.boxes_of("混")
+    report.check("该行出现「混」标记（非 Normal 才显示）",
+                 len(mix_marks) >= 1, "标记 %d 个" % len(mix_marks))
+
+    print("\n=== 八、剪贴蒙版 ===")
+    fresh_document(device)
+    device.tap("蓝层", 2)
+    device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if len(solids) >= 2:
+        # 最上面那个 solid 是上层：它下面是同父的另一个 solid，正好剪贴。
+        device.tap_box(solids[0][3], 2)
+        device.tap("剪贴", 3)
+        clip_text = ""
+        for _, value, _ in device.texts():
+            if value.startswith("剪贴 →") or value in ("不剪贴", "下方没有同组图层",
+                                                      "下方图层不在同一组"):
+                clip_text = value
+        report.check("点「剪贴」挂到下方同父图层（基底由引擎规则算）",
+                     clip_text.startswith("剪贴 →"), clip_text or "（没有状态文本）")
+        clip_marks = device.boxes_of("剪")
+        report.check("该行出现「剪」标记", len(clip_marks) >= 1,
+                     "标记 %d 个" % len(clip_marks))
+        device.tap("剪贴", 3)
+        clip_after = ""
+        for _, value, _ in device.texts():
+            if value in ("不剪贴", "剪贴 →"):
+                clip_after = value
+        report.check("再点一次取消剪贴", clip_after == "不剪贴", clip_after)
+    else:
+        report.check("剪贴蒙版", False, "不足两层 solid，构造不出剪贴关系")
+
+    print("\n=== 九、调整层回填按 json_path ===")
+    fresh_document(device)
+    device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if solids:
+        device.tap_box(solids[0][3], 2)
+    device.tap("新增", 3)
+    entries = device.boxes_of("Hue/Saturation")
+    if len(entries) >= 2:
+        # 最后一个 y 最大的是「已有」行里的条目（第一个是类型下拉自己）。
+        device.tap_box(entries[-1], 2)
+        edit_state = ""
+        for _, value, _ in device.texts():
+            if value.startswith("编辑第"):
+                edit_state = value
+        # 「缺省」只在文档里读不到该参数时出现；能读到就说明路径匹配对上了。
+        report.check("回填按路径命中（提示里不出现「缺省」）",
+                     edit_state != "" and "缺省" not in edit_state,
+                     edit_state or "（没有回填提示）")
+    else:
+        report.check("回填按路径", False, "找不到「已有」条目（%d 个 Hue/Saturation）" % len(entries))
 
     if not args.keep:
         device.shell("aa force-stop %s" % BUNDLE)

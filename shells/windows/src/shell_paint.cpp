@@ -281,6 +281,12 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
     const comp_ui::ToolInfo* info = comp_ui::tool_info_at(i);
     if (info == nullptr) continue;
     const comp_ui::Rect rect = comp_ui::tool_button_rect(bar, i);
+    /*
+     * 窗口能拖小之后工具条会放不下（19 个按钮约 800px，最小宽度 600）。
+     * 超出的按钮**整块不画**：画半个按钮比看不见更糟——用户会以为那里有个
+     * 能点的东西，点下去却落到画布上。命中侧 tool_button_at 用同一条判据。
+     */
+    if (rect.right() > bar.right()) break;
     RECT button{rect.x, rect.y, rect.right(), rect.bottom()};
     const bool selected = info->id == shell.tool;
     HBRUSH fill = CreateSolidBrush(selected ? RGB(70, 104, 168) : RGB(58, 60, 68));
@@ -326,9 +332,32 @@ void draw_toolbar(HDC dc, const ShellState& shell, const comp_ui::Rect& bar) {
             static_cast<int>(shell.brush_size + 0.5),
             static_cast<int>(shell.brush_hardness * 100.0 + 0.5),
             backend_label(shell.backend), extra);
-  RECT info_rect{bar.right() - 520, bar.y, bar.right() - 10, bar.bottom()};
-  SetTextColor(dc, RGB(172, 176, 188));
-  DrawTextW(dc, info_text, -1, &info_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+  /*
+   * 右侧读数（缩放/笔刷/渲染）。
+   *
+   * 宽度是**让出来**的，不是固定的：原先是「从右边缘往里 520px」再右对齐，
+   * 窄窗口下直接压到工具按钮上——叠成「缩放 30%笔刷 24 px75%渲染 CPU」一团，
+   * 两边都读不出来。窗口能随意拖小之后这是常态（1280 宽就开始挤，900 宽已经
+   * 糊在一起）。
+   *
+   * 三档：够宽给完整读数；中等只留「缩放 %」；再窄整块不画。不画不丢关键
+   * 信息——状态栏一直有缩放百分比，而压在按钮上会让工具都点不准。
+   */
+  const comp_ui::Rect last_button =
+      comp_ui::tool_button_rect(bar, count > 0 ? count - 1 : 0);
+  const int buttons_right = last_button.right() + 12;
+  int info_left = bar.right() - 520;
+  if (info_left < buttons_right) info_left = buttons_right;
+  const int info_width = bar.right() - 10 - info_left;
+  if (info_width >= 70) {
+    if (info_width < 300) {
+      wsprintfW(info_text, L"缩放 %d%%", static_cast<int>(shell.doc.view.zoom * 100.0 + 0.5));
+    }
+    RECT info_rect{info_left, bar.y, bar.right() - 10, bar.bottom()};
+    SetTextColor(dc, RGB(172, 176, 188));
+    DrawTextW(dc, info_text, -1, &info_rect,
+              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  }
 }
 
 /* 选项栏的值文本：整数百分比与枚举名各走一条，绘制与状态反馈共用。 */

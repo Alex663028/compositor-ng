@@ -875,6 +875,21 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   int dpi_device(int logical_px, int dpi);
   int shell_dpi(const ShellState& shell);
   bool client_layout(const ShellState& shell, Layout* out);
+  /*
+   * 窗口边框与几何（2026-10-27）。
+   *
+   * 深色 UI 把客户区内容画到窗口最外沿，系统那圈边框在视觉上与内容没有分界——
+   * 用户「找不到能拖的地方」。这三条把窗口缩放变成壳自己的判断，并让窗口像别的
+   * 程序一样记住上次的大小与位置：
+   *   - window_min_track_size：WM_GETMINMAXINFO 的客户区下限（逻辑像素）；
+   *   - window_resize_hit：客户区边缘的缩放命中码（HTLEFT 等，0 = 不是边缘）；
+   *   - window_geometry_*：位置 / 尺寸 / 最大化状态的存读（window.ini）。
+   */
+  void window_min_track_size(const ShellState& shell, int* width, int* height);
+  int window_resize_hit(const ShellState& shell, int client_x, int client_y);
+  /* 返回 true = 上次退出时是最大化，调用方要在首次 ShowWindow 之后再最大化。 */
+  bool window_geometry_restore(HWND window, ShellState& shell);
+  void window_geometry_save(HWND window, const ShellState& shell);
   void panel_resize_begin(HWND window, ShellState& shell, int target, int mouse_x);
   void panel_resize_extend(ShellState& shell, int mouse_x);
   void panel_resize_end(ShellState& shell);

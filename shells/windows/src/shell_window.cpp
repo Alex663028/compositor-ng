@@ -628,6 +628,173 @@ bool client_layout(const ShellState& shell, Layout* out) {
   return true;
 }
 
+/* ------------------------------------------------------- 窗口边框与几何 */
+
+namespace {
+
+/*
+ * 客户区内侧的缩放抓取带（逻辑像素）。
+ *
+ * 系统的缩放边框只在**非客户区**，100% DPI 下宽 8 设备像素、150% 下 12。数字上
+ * 不算窄，但深色界面里客户区内容一直画到窗口最外沿，那圈边框与内容没有视觉分界，
+ * 用户实际是「凭感觉往边上按」——按偏 2px 就落进客户区，变成点面板或落笔。
+ *
+ * 3 是权衡值：再窄起不到纠偏作用，再宽就会开始吃掉图层面板最左侧的勾选圆点
+ * （那里离左缘 14px）与状态栏最下面一行字。**顶部不做**——工具条与菜单贴着窗口
+ * 顶边，顶上让出 3px 会把「文件」菜单第一行咬掉；顶边靠系统边框即可。
+ */
+constexpr int kResizeGrip = 3;
+
+/*
+ * window.ini：窗口几何单独一个文件。
+ *
+ * 不并进 dock 的 workspace.ini：那份文件由 DockState::save **整体重写**，两个写者
+ * 共用一个文件必然互相覆盖（谁后写谁赢），而且 dock 是「纯数据、不依赖 windows.h」
+ * 的独立子系统，塞进窗口几何会毁掉这条边界。窗口几何是壳的事，各存一份。
+ */
+std::wstring window_geometry_path() {
+  wchar_t buffer[1024] = {0};
+  const DWORD length = GetEnvironmentVariableW(L"APPDATA", buffer, 1024);
+  std::wstring dir;
+  if (length > 0 && length < 1024) {
+    dir = std::wstring(buffer) + L"\\Compositor";
+  } else {
+    /* 没有 APPDATA（精简环境）：退回 exe 同级，绿色包也能记住窗口。 */
+    wchar_t module[MAX_PATH] = {0};
+    const DWORD written = GetModuleFileNameW(nullptr, module, MAX_PATH);
+    if (written == 0 || written >= MAX_PATH) return std::wstring();
+    dir = module;
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return std::wstring();
+    dir.resize(slash);
+  }
+  if (dir.empty()) return std::wstring();
+  CreateDirectoryW(dir.c_str(), nullptr);
+  return dir + L"\\window.ini";
+}
+
+/* 「这个键没写过」的哨兵：窗口坐标/尺寸不可能等于 INT_MAX。 */
+constexpr UINT kGeometryMissing = 0x7FFFFFFFu;
+
+int geometry_read(const std::wstring& path, const wchar_t* key) {
+  const UINT value = GetPrivateProfileIntW(L"main", key, kGeometryMissing, path.c_str());
+  if (value == kGeometryMissing) return INT_MAX;
+  return static_cast<int>(value);
+}
+
+void geometry_write(const std::wstring& path, const wchar_t* key, int value) {
+  wchar_t text[32];
+  wsprintfW(text, L"%d", value);
+  WritePrivateProfileStringW(L"main", key, text, path.c_str());
+}
+
+}  // namespace
+
+void window_min_track_size(const ShellState& shell, int* width, int* height) {
+  (void)shell; /* 下限只由布局常量决定；留参数是为了与一族的窗口函数同签名。 */
+  if (width != nullptr) *width = comp_ui::Layout::kMinWindowWidth;
+  if (height != nullptr) *height = comp_ui::Layout::kMinWindowHeight;
+}
+
+int window_resize_hit(const ShellState& shell, int client_x, int client_y) {
+  if (shell.window == nullptr) return 0;
+  RECT client{};
+  if (!GetClientRect(shell.window, &client)) return 0;
+  const int dpi = shell_dpi(shell);
+  const int width = dpi_logical(client.right - client.left, dpi);
+  const int height = dpi_logical(client.bottom - client.top, dpi);
+  if (width <= 0 || height <= 0) return 0;
+  /*
+   * 只认客户区**之内**的点：窗口外的点（拖到边框外或拖出屏幕）交给
+   * DefWindowProc，那边本来就会给非客户区的命中码。这里若把负数也算进
+   * `x < 3`，窗口左上角外侧会变成「往左扩」，方向是错的。
+   */
+  if (client_x < 0 || client_y < 0 || client_x >= width || client_y >= height) return 0;
+  const bool left = client_x < kResizeGrip;
+  const bool right = client_x >= width - kResizeGrip;
+  const bool bottom = client_y >= height - kResizeGrip;
+  /* 角落先判：否则斜着拖会退化成单方向拉伸，手感是「拖了半天只变了一边」。 */
+  if (left && bottom) return HTBOTTOMLEFT;
+  if (right && bottom) return HTBOTTOMRIGHT;
+  if (left) return HTLEFT;
+  if (right) return HTRIGHT;
+  if (bottom) return HTBOTTOM;
+  return 0;
+}
+
+void window_geometry_save(HWND window, const ShellState& shell) {
+  (void)shell; /* 几何全在窗口对象里，状态机不参与。 */
+  if (window == nullptr) return;
+  const std::wstring path = window_geometry_path();
+  if (path.empty()) return;
+  /*
+   * 最大化/最小化时 GetWindowRect 给的是铺满屏幕（或缩成图标）的矩形，直接存下去
+   * 就丢了「还原后多大」。GetWindowPlacement 的 rcNormalPosition 正是还原矩形，
+   * showCmd 又给出「上次是不是最大化」——两者一起存，下次才能既回到原来的大小、
+   * 又保持最大化状态。
+   */
+  WINDOWPLACEMENT placement{};
+  placement.length = sizeof(placement);
+  if (!GetWindowPlacement(window, &placement)) return;
+  const RECT& normal = placement.rcNormalPosition;
+  geometry_write(path, L"x", normal.left);
+  geometry_write(path, L"y", normal.top);
+  geometry_write(path, L"width", normal.right - normal.left);
+  geometry_write(path, L"height", normal.bottom - normal.top);
+  geometry_write(path, L"maximized", placement.showCmd == SW_SHOWMAXIMIZED ? 1 : 0);
+}
+
+bool window_geometry_restore(HWND window, ShellState& shell) {
+  if (window == nullptr) return false;
+  const std::wstring path = window_geometry_path();
+  if (path.empty()) return false;
+  const int x = geometry_read(path, L"x");
+  const int y = geometry_read(path, L"y");
+  const int width = geometry_read(path, L"width");
+  const int height = geometry_read(path, L"height");
+  const bool maximized = geometry_read(path, L"maximized") == 1;
+  if (x == INT_MAX || y == INT_MAX || width == INT_MAX || height == INT_MAX) return false;
+  if (width <= 0 || height <= 0) return false;
+
+  /*
+   * 存下来的尺寸可能是「用旧版本拖变形的小窗」（那时还没有最小尺寸），也可能
+   * 是换过显示器之后不合适的值——一律先夹到当前下限，再决定摆在哪。
+   */
+  int min_width = 0;
+  int min_height = 0;
+  window_min_track_size(shell, &min_width, &min_height);
+  const int dpi = shell_dpi(shell);
+  RECT target{};
+  target.left = x;
+  target.top = y;
+  target.right = x + (std::max)(width, dpi_device(min_width, dpi));
+  target.bottom = y + (std::max)(height, dpi_device(min_height, dpi));
+  /*
+   * 可见性校验：拔掉显示器、改分辨率、换远程会话之后，存下来的位置可能整个落在
+   * 屏幕外——那样启动就是「窗口不见了」，用户只能去任务栏找。要求与某台显示器
+   * 至少有一块交集，否则位置不恢复（大小仍然照用）。
+   */
+  const int width_device = target.right - target.left;
+  const int height_device = target.bottom - target.top;
+  if (MonitorFromRect(&target, MONITOR_DEFAULTTONULL) == nullptr) {
+    /*
+     * 位置不可信：**只恢复大小**。不能把 CW_USEDEFAULT 塞进 SetWindowPos——那是
+     * CreateWindowEx 专用值（0x80000000），SetWindowPos 会当成坐标 -32768，
+     * 窗口直接飞到屏幕外（实测如此）。
+     */
+    SetWindowPos(window, nullptr, 0, 0, width_device, height_device,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    return maximized;
+  }
+  SetWindowPos(window, nullptr, target.left, target.top, width_device, height_device,
+               SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+  /*
+   * 最大化留到首次 ShowWindow 之后再应用：调用方马上会 ShowWindow(SW_SHOW)，
+   * 那一步会把最大化状态清掉，所以这里只回话，不在这里最大化。
+   */
+  return maximized;
+}
+
 /*
  * 面板分界线拖动（§6.60）。宽度偏好在 ShellState 里，**不进撤销栈**：布局不是
  * 文档状态，撤销一次不该把面板宽度回退（PS 亦然，`Ctrl+Z` 只动像素/图层）。
@@ -4185,6 +4352,85 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_SIZE:
       if (shell != nullptr) InvalidateRect(window, nullptr, FALSE);
       break;
+    /*
+     * 窗口缩放（2026-10-27）。
+     *
+     * 三条消息合起来解决「拖不动」：
+     *   - GETMINMAXINFO 给下限：此前能拖到客户区 0 高，布局各档连着降级，
+     *     最后只剩一条缝，看着像卡死；
+     *   - NCHITTEST 把抓取带往客户区内侧铺 3 逻辑像素：系统边框在深色界面里
+     *     与内容没有分界，按偏一点就落进面板/画布；
+     *   - ENTER/EXITSIZEMOVE 在拖动期间停掉蚂蚁线定时器：拖动时每帧都在重建
+     *     整幅位图，定时器再插一脚只会让手感发涩。
+     */
+    case WM_GETMINMAXINFO:
+      if (shell != nullptr) {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+        if (info != nullptr) {
+          int min_width = 0;
+          int min_height = 0;
+          window_min_track_size(*shell, &min_width, &min_height);
+          const int dpi = shell_dpi(*shell);
+          /*
+           * ptMinTrackSize 是**窗口整体**（含边框/标题栏/菜单）的设备像素，而
+           * 下限是客户区尺寸，所以要把非客户区那圈加回来。
+           *
+           * 不能用 AdjustWindowRectEx 现算：它是 DPI-unaware 的，在 DPI 感知
+           * 进程里返回的是老式 4px 边框，比实际窗口每边窄一半（实测客户区少了
+           * 8×19，正好把选项栏挤掉）。这里直接**量当前窗口**的
+           * WindowRect - ClientRect 差值——样式、菜单、DPI 全部天然算在内。
+           *
+           * 两个来源取大：实测值在「窗口正被改尺寸、菜单恰好折成两行」之类的
+           * 中间态会偏小，偏小的下限等于没有下限；系统度量是同一台机器的稳定
+           * 上界，兜住那一档抖动。
+           */
+          RECT window_rect{};
+          RECT client_rect{};
+          int measured_x = 0;
+          int measured_y = 0;
+          if (GetWindowRect(window, &window_rect) && GetClientRect(window, &client_rect)) {
+            measured_x =
+                (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+            measured_y =
+                (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+          }
+          const int metric_x =
+              2 * (GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER));
+          const int metric_y =
+              2 * (GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER)) +
+              GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYMENU);
+          const int extra_x = (std::max)(measured_x, metric_x);
+          const int extra_y = (std::max)(measured_y, metric_y);
+          info->ptMinTrackSize.x = dpi_device(min_width, dpi) + extra_x;
+          info->ptMinTrackSize.y = dpi_device(min_height, dpi) + extra_y;
+          /* 最大尺寸交给系统：这里只收紧下限，不碰 ptMaxSize / ptMaxPosition。 */
+          return 0;
+        }
+      }
+      break;
+    case WM_NCHITTEST: {
+      if (shell != nullptr) {
+        /* lParam 是**屏幕**坐标（负坐标合法：点在窗口左上方时为负）。 */
+        POINT point{static_cast<int>(static_cast<short>(LOWORD(lparam))),
+                    static_cast<int>(static_cast<short>(HIWORD(lparam)))};
+        if (ScreenToClient(window, &point) != 0) {
+          const int dpi = shell_dpi(*shell);
+          const int code = window_resize_hit(*shell, dpi_logical(point.x, dpi),
+                                             dpi_logical(point.y, dpi));
+          if (code != 0) return code;
+        }
+      }
+      break;
+    }
+    case WM_ENTERSIZEMOVE:
+      if (shell != nullptr) KillTimer(window, kAntsTimerId);
+      break;
+    case WM_EXITSIZEMOVE:
+      if (shell != nullptr) {
+        SetTimer(window, kAntsTimerId, kAntsTimerPeriodMs, nullptr);
+        InvalidateRect(window, nullptr, FALSE);
+      }
+      break;
     case WM_DPICHANGED:
       /*
        * ROI #7：跨屏或改显示缩放时 Windows 给出新 DPI 与**建议窗口矩形**。
@@ -4233,6 +4479,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
       /* P0-10：退出前把停靠状态存回 workspace（下次启动沿用）。 */
       if (shell != nullptr) workspace_save(*shell);
+      /*
+       * 窗口几何另外存一份（window.ini）：最大化时 GetWindowPlacement 的
+       * rcNormalPosition 是「还原后多大」，这正是下次启动要恢复的那个矩形。
+       * 在 WM_DESTROY 存而不是 WM_CLOSE，是因为关闭提示可能被用户取消
+       * （close_flow_step 返回 true 就不关窗），存早了会把「没关成」的那次
+       * 位置也记下来——用户下次启动会看到一个自己没调过的位置。
+       */
+      if (shell != nullptr) window_geometry_save(window, *shell);
       /*
        * 浮动面板是独立窗口：主窗口没了它必须一起走，否则会留一个孤儿窗口。
        * 多块面板可同时浮动，逐块带走。

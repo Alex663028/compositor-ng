@@ -95,6 +95,15 @@ struct LayerRowEntry {
   int32_t is_group = 0;
   double opacity = 1.0;
   std::string name;
+  /*
+   * 混合模式与剪贴基底（2026-10-27）。
+   *
+   * 两者都是**已参与像素求值**的属性（composite_ops 真的按它们算），面板上不显示
+   * 的话，用户看到的是「画面不对，但每一层的透明度都对」——最难查的那一类。
+   * 剪贴基底为 0 表示不剪贴。
+   */
+  int32_t blend = 0;
+  int64_t clipping = 0;
 };
 std::vector<LayerRowEntry> g_layer_rows;
 uint32_t g_doc_width = 0;
@@ -444,6 +453,175 @@ napi_value JsLayerCount(napi_env env, napi_callback_info info) {
   return MakeInt32(env, static_cast<int32_t>(count));
 }
 
+/* ------------------------------------------------ 混合模式 / 剪贴蒙版 */
+
+namespace {
+
+/*
+ * 引擎名 -> 界面名：`LINEAR_DODGE` -> `Linear Dodge`。
+ *
+ * 刻意**不维护一份名字表**：Windows 壳有一份手写表（blend_mode_name），引擎加
+ * 一个档位就得两边一起改，漏了就静默缺项。这里只做格式变换，名字的真相始终在
+ * 引擎（comp_blend_mode_name），枚举长度也由「名字变成 UNKNOWN」自动定界。
+ */
+std::string blend_display_name(const char* engine_name) {
+  std::string out;
+  bool start_of_word = true;
+  for (const char* p = engine_name; p != nullptr && *p != '\0'; ++p) {
+    char ch = *p;
+    if (ch == '_') {
+      out += ' ';
+      start_of_word = true;
+      continue;
+    }
+    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    if (start_of_word && ch >= 'a' && ch <= 'z') {
+      ch = static_cast<char>(ch - 'a' + 'A');
+    }
+    start_of_word = false;
+    out += ch;
+  }
+  return out;
+}
+
+}  // namespace
+
+/*
+ * 全部混合模式：`mode\x1fname`，行间 `\x1e`。
+ *
+ * 为什么不是 24 个常量：档位数由引擎枚举决定（名字变成 UNKNOWN 为止）。壳里
+ * 写死数字的话，引擎加「Vivid Light」之外的档位时下拉会少一项，而界面上看不
+ * 出少了什么。
+ */
+napi_value JsBlendModesText(napi_env env, napi_callback_info info) {
+  (void)info;
+  std::string out;
+  for (int mode = 0; mode < 256; ++mode) {
+    const char* name = comp_blend_mode_name(static_cast<comp_blend_mode>(mode));
+    if (name == nullptr || std::strcmp(name, "UNKNOWN") == 0) break;
+    if (!out.empty()) out += '\x1e';
+    out += std::to_string(mode);
+    out += '\x1f';
+    out += blend_display_name(name);
+  }
+  return MakeString(env, out.c_str());
+}
+
+/* 某层的混合模式；失败返回 -1。 */
+napi_value JsLayerBlend(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, -1);
+  comp_blend_mode blend = COMP_BLEND_NORMAL;
+  if (comp_layer_get_blend(g_document, id, &blend) != COMP_OK) return MakeInt32(env, -1);
+  return MakeInt32(env, static_cast<int32_t>(blend));
+}
+
+/* 设置某层的混合模式（id, mode）。 */
+napi_value JsSetLayerBlend(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 2) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  int32_t mode = 0;
+  if (!read_layer_id(env, argv[0], &id) ||
+      napi_get_value_int32(env, argv[1], &mode) != napi_ok || mode < 0) {
+    return MakeInt32(env, -1);
+  }
+  return MakeInt32(env, static_cast<int32_t>(comp_layer_set_blend(
+                            g_document, id, static_cast<comp_blend_mode>(mode))));
+}
+
+/* 某层的剪贴基底 id（0 = 不剪贴）；失败返回 -1。 */
+napi_value JsLayerClipping(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, -1);
+  int32_t is_group = 0;
+  comp_layer_id parent = 0;
+  comp_layer_id clipping = 0;
+  if (comp_layer_get_group_info(g_document, id, &is_group, &parent, &clipping) != COMP_OK) {
+    return MakeInt32(env, -1);
+  }
+  /* id 是 uint64，走 double（int32 会把大 id 截断成负数）。 */
+  return MakeDouble(env, static_cast<double>(clipping));
+}
+
+/*
+ * 切换剪贴蒙版。
+ *
+ * 语义与 Windows 壳的 panel_toggle_clipping 一致（那份判定在 ui_core.h 的
+ * plan_clipping_base_index，有表驱动单测）：
+ *   - 已剪贴 → 取消（一步撤销）；
+ *   - 未剪贴 → 挂到**下方紧邻的同父图层**。引擎的成栈条件是「基底在前、成员紧跟
+ *     其后、clipping_source 指向基底」，所以下方那一层才是基底。取上方会得到
+ *     「面板说有剪贴、画面毫无变化」的假成功（Windows 侧踩过）。
+ *   - 下方那层自己已经是成员时，直接挂到**同一个基底**上——并入已有剪贴栈，
+ *     而不是形成一个指向成员的错栈。
+ *
+ * 返回：0 成功；-2 下方没有同组图层；-3 下方图层的父级不同（跨组不剪贴）。
+ */
+napi_value JsToggleLayerClipping(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, -1);
+
+  int32_t self_is_group = 0;
+  comp_layer_id self_parent = 0;
+  comp_layer_id self_clipping = 0;
+  if (comp_layer_get_group_info(g_document, id, &self_is_group, &self_parent,
+                                &self_clipping) != COMP_OK) {
+    return MakeInt32(env, -1);
+  }
+  if (self_clipping != 0) {
+    return MakeInt32(env, static_cast<int32_t>(
+                              comp_layer_set_clipping_source(g_document, id, 0)));
+  }
+
+  size_t count = 0;
+  if (comp_layer_count(g_document, &count) != COMP_OK || count < 2) return MakeInt32(env, -2);
+  std::vector<comp_layer_id> ids(count);
+  size_t listed = 0;
+  if (comp_layer_list(g_document, ids.data(), ids.size(), &listed) != COMP_OK) {
+    return MakeInt32(env, -1);
+  }
+  ids.resize(listed);
+  size_t self_index = listed;
+  for (size_t i = 0; i < listed; ++i) {
+    if (ids[i] == id) {
+      self_index = i;
+      break;
+    }
+  }
+  if (self_index >= listed) return MakeInt32(env, -1);
+  /* 数组序自下而上：下标 0 是最底层，它没有「下方」可挂。 */
+  if (self_index == 0) return MakeInt32(env, -2);
+
+  const comp_layer_id neighbor = ids[self_index - 1];
+  int32_t neighbor_is_group = 0;
+  comp_layer_id neighbor_parent = 0;
+  comp_layer_id neighbor_clipping = 0;
+  if (comp_layer_get_group_info(g_document, neighbor, &neighbor_is_group, &neighbor_parent,
+                                &neighbor_clipping) != COMP_OK) {
+    return MakeInt32(env, -1);
+  }
+  if (neighbor_parent != self_parent) return MakeInt32(env, -3);
+  /* 邻居自己也是成员：并入它所在的那个栈，基底往下追一层。 */
+  const comp_layer_id base = neighbor_clipping != 0 ? neighbor_clipping : neighbor;
+  return MakeInt32(env, static_cast<int32_t>(
+                            comp_layer_set_clipping_source(g_document, id, base)));
+}
+
 /* ---------------------------------------------------------------- 图层面板 */
 
 /*
@@ -474,6 +652,7 @@ int32_t build_layer_rows() {
 
   std::vector<int64_t> parents(listed, 0);
   std::vector<uint8_t> groups(listed, 0);
+  std::vector<int64_t> clippings(listed, 0);
   for (size_t i = 0; i < listed; ++i) {
     int32_t is_group = 0;
     comp_layer_id parent = 0;
@@ -483,6 +662,7 @@ int32_t build_layer_rows() {
     if (group_rc == COMP_OK) {
       parents[i] = static_cast<int64_t>(parent);
       groups[i] = static_cast<uint8_t>(is_group != 0 ? 1 : 0);
+      clippings[i] = static_cast<int64_t>(clipping);
     }
   }
 
@@ -512,6 +692,7 @@ int32_t build_layer_rows() {
     row.parent = parents[index];
     row.level = level;
     row.is_group = groups[index];
+    row.clipping = clippings[index];
     char name[256] = {0};
     size_t required = 0;
     if (comp_layer_get_name(g_document, row.id, name, sizeof(name), &required) != COMP_OK) {
@@ -524,6 +705,10 @@ int32_t build_layer_rows() {
     float opacity = 1.0f;
     comp_layer_get_opacity(g_document, row.id, &opacity);
     row.opacity = static_cast<double>(opacity);
+    comp_blend_mode blend = COMP_BLEND_NORMAL;
+    if (comp_layer_get_blend(g_document, row.id, &blend) == COMP_OK) {
+      row.blend = static_cast<int32_t>(blend);
+    }
     g_layer_rows.push_back(row);
     for (size_t child : children[index]) self(self, child, level + 1);
   };
@@ -572,6 +757,10 @@ napi_value JsLayerTreeText(napi_env env, napi_callback_info info) {
     out += std::to_string(static_cast<long long>(row.parent));
     out += '\x1f';
     out += std::to_string(row.level);
+    out += '\x1f';
+    out += std::to_string(row.blend);
+    out += '\x1f';
+    out += std::to_string(static_cast<long long>(row.clipping));
   }
   return MakeString(env, out.c_str());
 }
@@ -1123,6 +1312,12 @@ napi_value JsLayerAdjustmentValuesText(napi_env env, napi_callback_info info) {
     if (comp_layer_adjustment_param_at(static_cast<uint32_t>(kind), i, &param) != COMP_OK) continue;
     double number = param.default_value;
     int32_t boolean = param.default_value != 0.0 ? 1 : 0;
+    /*
+     * used_default：文档里**没有**这个键（旧版本存的 settings、或引擎新加了参数），
+     * 于是退回缺省值。壳侧要把这件事显式说出来——否则用户看到的是一个「明明是
+     * 我调过的值，回填回来却变了」的滑块，没有任何解释。
+     */
+    int32_t used_default = 1;
     if (param.json_path != nullptr) {
       double read_number = 0.0;
       int32_t read_boolean = 0;
@@ -1130,13 +1325,23 @@ napi_value JsLayerAdjustmentValuesText(napi_env env, napi_callback_info info) {
                                            &read_boolean) == COMP_OK) {
         number = read_number;
         boolean = read_boolean;
+        used_default = 0;
       }
     }
     if (!out.empty()) out += '\x1e';
+    /*
+     * 每行带 **json_path**：壳按路径匹配回填，而不是按下标。
+     * 按下标的坑是隐性的——引擎调整参数顺序、或在中间插一个参数，滑块就会整体
+     * 错位一格，而每个值单看都「在范围内」，界面上看不出来。
+     */
+    out += param.json_path != nullptr ? param.json_path : "";
+    out += '\x1f';
     char value[40] = {0};
     std::snprintf(value, sizeof(value), "%.4f",
                   static_cast<double>(param.type == COMP_PARAM_BOOL ? boolean : number));
     out += value;
+    out += '\x1f';
+    out += used_default != 0 ? "1" : "0";
   }
   return MakeString(env, out.c_str());
 }
@@ -2182,6 +2387,16 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"layerCount", nullptr, JsLayerCount, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"blendModesText", nullptr, JsBlendModesText, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"layerBlend", nullptr, JsLayerBlend, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setLayerBlend", nullptr, JsSetLayerBlend, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"layerClipping", nullptr, JsLayerClipping, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"toggleLayerClipping", nullptr, JsToggleLayerClipping, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
       {"setLayerVisible", nullptr, JsSetLayerVisible, nullptr, nullptr, nullptr, napi_default,
        nullptr},
       {"setLayerOpacity", nullptr, JsSetLayerOpacity, nullptr, nullptr, nullptr, napi_default,

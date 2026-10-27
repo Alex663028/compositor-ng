@@ -18,6 +18,7 @@ import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setT
          layerTreeText, adjustKindsText, adjustParamsText, layerAdjustmentsText,
          addLayerAdjustment, updateLayerAdjustmentAt, removeLayerAdjustment,
          layerAdjustmentValuesText,
+         blendModesText, setLayerBlend, layerClipping, toggleLayerClipping,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 import { picker, fileIo } from '@kit.CoreFileKit';
 
@@ -48,6 +49,15 @@ interface LayerRowItem {
    */
   pp: number;
   lv: number;
+  /*
+   * 混合模式（引擎枚举值）与剪贴基底 id（0 = 不剪贴）。
+   *
+   * 两者都是**已参与像素求值**的属性——面板不显示的话，用户看到「画面不对，
+   * 但每层的透明度都对」，这类问题最难查。剪贴基底只用来显示标记，改它要走
+   * toggleLayerClipping（基底由引擎侧规则算，壳不指定）。
+   */
+  blend: number;
+  clip: number;
 }
 
 /* 一个调整类型（kind + 规范名）。 */
@@ -78,6 +88,12 @@ interface AdjustEntry {
   name: string;
 }
 
+/* 一个混合模式（引擎枚举值 + 界面名）。清单来自引擎，壳不维护枚举表。 */
+interface BlendModeItem {
+  mode: number;
+  name: string;
+}
+
 @Entry
 @Component
 struct Index {
@@ -101,6 +117,11 @@ struct Index {
    */
   aboutToAppear(): void {
     this.loadAdjustKinds();
+    /*
+     * 混合模式清单同样在这里载入：它也是引擎的静态表（comp_blend_mode_name），
+     * 不依赖文档。放 refresh 里的话首次进页面下拉是空的，看着像没做。
+     */
+    this.loadBlendModes();
   }
 
   /* 画笔参数改完立刻回读一次摘要，让用户看得见当前笔是什么样。 */
@@ -151,6 +172,18 @@ struct Index {
   /* Select 的选项表（只在载入类型时重建一次）。 */
   @State adjustKindOptions: SelectOption[] = [];
 
+  /*
+   * 混合模式（图层属性，已参与像素求值）。
+   *
+   * 此前鸿蒙侧只有一个写死「乘法」的演示按钮，用户没法把一层改成 Screen/Overlay，
+   * 也没法看出某层当前是什么模式。清单与名字都来自引擎（blendModesText），
+   * 壳不维护 24 个常量——引擎加档位时下拉自动多一项。
+   */
+  @State blendModes: BlendModeItem[] = [];
+  @State blendOptions: SelectOption[] = [];
+  @State blendIndex: number = 0;
+  @State clipState: string = '—';
+
   private refresh(): void {
     /*
      * 调整类型清单惰性载入（引擎起来之前调会拿到空串）。
@@ -160,6 +193,9 @@ struct Index {
      */
     if (this.adjustKinds.length === 0) {
       this.loadAdjustKinds();
+    }
+    if (this.blendModes.length === 0) {
+      this.loadBlendModes();
     }
     this.backend = backendName();
     this.surface = surfaceInfo();
@@ -208,7 +244,10 @@ struct Index {
           opacity: Number(fields[3]),
           isGroup: Number(fields[4]),
           pp: Number(fields[5]),
-          lv: Number(fields[6])
+          lv: Number(fields[6]),
+          /* 第 8/9 列是 2026-10-27 追加的：旧版本只给 7 列，缺列按「普通/不剪贴」。 */
+          blend: fields.length > 7 ? Number(fields[7]) : 0,
+          clip: fields.length > 8 ? Number(fields[8]) : 0
         };
         next.push(row);
       }
@@ -225,6 +264,8 @@ struct Index {
     this.collapsedGroups = alive;
     this.rebuildDisplayRows();
     this.refreshLayerAdjusts();
+    /* 混合模式下拉与列表同一份真相：列表刷完就把下拉对齐（别处改了模式也跟上）。 */
+    this.syncBlendIndex(this.selectedLayerId);
   }
 
   /* 折叠过滤：祖先链上只要有一个组是收起的，这一行就不显示。 */
@@ -302,6 +343,8 @@ struct Index {
      */
     setActiveLayer(id);
     this.refreshLayerAdjusts();
+    /* 混合模式下拉跟着选中层走（否则显示的是上一层的档位）。 */
+    this.syncBlendIndex(id);
   }
 
   /*
@@ -503,6 +546,119 @@ struct Index {
     this.refresh();
   }
 
+  /* ------------------------------------------------- 混合模式 / 剪贴蒙版 */
+
+  /*
+   * 载入全部混合模式（只做一次）。
+   *
+   * 清单与显示名都来自引擎（blendModesText -> comp_blend_mode_name），壳里没有
+   * 「24 档」这个数字：引擎加一种混合方式，这里的下拉自动多一项。此前鸿蒙侧只有
+   * 一个写死「乘法」的演示按钮——用户既改不了别的模式，也看不出某层当前是什么。
+   */
+  private loadBlendModes(): void {
+    if (this.blendModes.length > 0) {
+      return;
+    }
+    const raw: string = blendModesText();
+    const list: BlendModeItem[] = [];
+    if (raw.length > 0) {
+      const lines: string[] = raw.split('\x1e');
+      for (let i = 0; i < lines.length; i++) {
+        const fields: string[] = lines[i].split('\x1f');
+        if (fields.length < 2) {
+          continue;
+        }
+        const item: BlendModeItem = { mode: Number(fields[0]), name: fields[1] };
+        list.push(item);
+      }
+    }
+    this.blendModes = list;
+    const options: SelectOption[] = [];
+    for (let i = 0; i < list.length; i++) {
+      options.push({ value: list[i].name });
+    }
+    this.blendOptions = options;
+  }
+
+  private blendModeName(): string {
+    if (this.blendIndex >= 0 && this.blendIndex < this.blendModes.length) {
+      return this.blendModes[this.blendIndex].name;
+    }
+    return '';
+  }
+
+  /*
+   * 把下拉指到某一层**当前的**混合模式上。
+   *
+   * 不做这一步的话，选中层切换后下拉仍停在上一层的档位——用户以为这层就是那个
+   * 模式，一拖滑杆才发现改的是别的东西。
+   */
+  private syncBlendIndex(id: number): void {
+    const row: LayerRowItem | undefined = this.findLayer(id);
+    const mode: number = row !== undefined ? row.blend : 0;
+    let index = 0;
+    for (let i = 0; i < this.blendModes.length; i++) {
+      if (this.blendModes[i].mode === mode) {
+        index = i;
+        break;
+      }
+    }
+    this.blendIndex = index;
+  }
+
+  /* 改混合模式：与建组/移出/删除同一套批量语义（有多选就全改）。 */
+  private applyBlend(index: number): void {
+    if (index < 0 || index >= this.blendModes.length) {
+      return;
+    }
+    this.blendIndex = index;
+    const ids: number[] = this.targetLayerIds();
+    if (ids.length === 0) {
+      this.lastOp = '混合：未选中';
+      this.refresh();
+      return;
+    }
+    const mode: number = this.blendModes[index].mode;
+    let failed = 0;
+    for (let i = 0; i < ids.length; i++) {
+      if (setLayerBlend(ids[i], mode) !== 0) {
+        failed++;
+      }
+    }
+    this.do('混合 ' + this.blendModes[index].name + (failed === 0 ? '' : ' ✗' + failed.toString()),
+            failed === 0 ? 0 : -1);
+    this.refreshLayers();
+  }
+
+  /*
+   * 剪贴蒙版开关。
+   *
+   * 基底（挂到哪一层上）由 napi 侧按引擎的成栈规则算：**下方紧邻的同父图层**。
+   * 壳不指定 id——让用户从一堆 id 里挑是错的，让壳自己算又会与引擎规则分叉。
+   */
+  private toggleClipping(): void {
+    if (this.selectedLayerId === 0) {
+      this.clipState = '先选一个图层';
+      this.lastOp = '剪贴：未选中';
+      this.refresh();
+      return;
+    }
+    const rc: number = toggleLayerClipping(this.selectedLayerId);
+    if (rc === 0) {
+      const base: number = layerClipping(this.selectedLayerId);
+      this.clipState = base > 0 ? ('剪贴 → #' + base.toString()) : '不剪贴';
+    } else if (rc === -2) {
+      this.clipState = '下方没有同组图层';
+    } else if (rc === -3) {
+      this.clipState = '下方图层不在同一组';
+    } else {
+      this.clipState = '失败 rc' + rc.toString();
+    }
+    this.lastOp = '剪贴 ' + this.clipState;
+    this.refreshLayers();
+    this.refresh();
+  }
+
   /* ------------------------------------------------------------ 可编辑调整层 */
 
   /*
@@ -624,15 +780,48 @@ struct Index {
       this.adjustState = '回填失败（沿用缺省值）';
       return;
     }
-    const parts: string[] = raw.split('\x1e');
+    /*
+     * 按 **json_path** 匹配回填，不按下标。
+     *
+     * 按下标的坑是隐性的：引擎的调整参数表调整了顺序、或在中间插入一个新参数时，
+     * 回填值就会整体错位一格。每个值单看都在合法范围内，界面上完全看不出异常，
+     * 只有「调过的值怎么变了」这种模糊抱怨。
+     *
+     * 引擎回报的第三列是 used_default：文档里没有这个键（旧版本存的 settings、
+     * 或引擎新加了参数）时用了缺省值——这件事必须说出来，否则用户看到的是一个
+     * 凭空变了的滑块。
+     */
+    const lines: string[] = raw.split('\x1e');
+    const byPath: Map<string, string> = new Map<string, string>();
+    const defaults: Map<string, number> = new Map<string, number>();
+    for (let i = 0; i < lines.length; i++) {
+      const fields: string[] = lines[i].split('\x1f');
+      if (fields.length < 2) {
+        continue;
+      }
+      byPath.set(fields[0], fields[1]);
+      defaults.set(fields[0], fields.length > 2 && fields[2] === '1' ? 1 : 0);
+    }
     const values: number[] = [];
+    let defaulted = 0;
     for (let i = 0; i < this.adjustParams.length; i++) {
-      const text: string = i < parts.length ? parts[i] : '';
+      const param: AdjustParamItem = this.adjustParams[i];
+      const text: string | undefined = byPath.get(param.path);
+      if (text === undefined) {
+        /* 引擎里没有这个参数（版本不一致）：用缺省，并计入「走了缺省」。 */
+        values.push(param.def);
+        defaulted++;
+        continue;
+      }
       const parsed: number = Number(text);
-      values.push(Number.isFinite(parsed) ? parsed : this.adjustParams[i].def);
+      values.push(Number.isFinite(parsed) ? parsed : param.def);
+      if (defaults.get(param.path) === 1) {
+        defaulted++;
+      }
     }
     this.adjustValues = values;
-    this.adjustState = '编辑第 ' + (entry.index + 1).toString() + ' 条：' + entry.name;
+    this.adjustState = '编辑第 ' + (entry.index + 1).toString() + ' 条：' + entry.name +
+      (defaulted > 0 ? ('（' + defaulted.toString() + ' 项缺省）') : '');
   }
 
   /* 扁平值拼成 \x1f 分隔的串（空串 = 让引擎用缺省）。 */
@@ -1007,6 +1196,31 @@ struct Index {
         }
         .width('100%')
 
+        /*
+         * 混合模式 + 剪贴蒙版。
+         *
+         * 两者都是**已参与像素求值**的图层属性，此前鸿蒙侧完全没有入口：混合只有
+         * 一个写死「乘法」的演示按钮，剪贴根本没接（引擎的 set_clipping_source
+         * 早就能用）。用户遇到「画面不对但透明度都对」时无从下手。
+         */
+        Row({ space: 6 }) {
+          Text('混合').fontSize(11).fontColor('#9aa4b2')
+          Select(this.blendOptions)
+            .selected(this.blendIndex)
+            .value(this.blendModeName())
+            .font({ size: 11 })
+            .width(140)
+            .onSelect((index: number) => {
+              this.applyBlend(index);
+            })
+          Button('剪贴').fontSize(11).height(28)
+            .onClick(() => {
+              this.toggleClipping();
+            })
+          Text(this.clipState).fontSize(10).fontColor('#8a8a8a').layoutWeight(1).maxLines(1)
+        }
+        .width('100%')
+
         if (this.layerRows.length > 0) {
           List({ space: 2 }) {
             ForEach(this.displayRows, (item: LayerRowItem) => {
@@ -1056,6 +1270,22 @@ struct Index {
                     .onClick(() => {
                       this.selectLayer(item.id);
                     })
+                  /*
+                   * 行内标记：剪 = 这层是剪贴蒙版成员，混 = 混合模式不是 Normal。
+                   *
+                   * 固定宽度（不是按文字伸缩）：宽度一变行的对齐就跟着抖，而这一列
+                   * 的作用是「扫一眼看出哪几层特殊」，抖动的列反而更难扫。
+                   */
+                  Text(item.clip !== 0 ? '剪' : '')
+                    .fontSize(9)
+                    .fontColor('#e0a44a')
+                    .width(11)
+                    .textAlign(TextAlign.Center)
+                  Text(item.blend !== 0 ? '混' : '')
+                    .fontSize(9)
+                    .fontColor('#7fb0ff')
+                    .width(11)
+                    .textAlign(TextAlign.Center)
                   Toggle({ type: ToggleType.Switch, isOn: item.visible !== 0 })
                     .width(40)
                     .height(22)
@@ -1105,7 +1335,9 @@ struct Index {
             (item: LayerRowItem) =>
               item.id.toString() + '_' + item.lv.toString() + '_' + item.pp.toString() +
               '_' + item.name + '_c' + (this.isCollapsed(item.id) ? '1' : '0') +
-              '_m' + (this.multiIds.indexOf(item.id) >= 0 ? '1' : '0'))
+              '_m' + (this.multiIds.indexOf(item.id) >= 0 ? '1' : '0') +
+              /* 混合模式与剪贴标记同理：状态变了必须换节点，否则行内标记不更新。 */
+              '_b' + item.blend.toString() + '_k' + item.clip.toString())
           }
           .width('100%')
           /*
@@ -1210,8 +1442,14 @@ struct Index {
       .backgroundColor('#14161a')
 
       /*
-       * 调试按钮区放进 Scroll：图层面板与调整区已经占满屏幕，这一排排按钮
-       * 再固定就会把末尾的挤没（实测笔刷行直接消失）。它们不常用，可滚即可。
+       * 调试按钮区：**固定高度**（不再 layoutWeight(1)）。
+       *
+       * 为什么必须固定：Column 的内容一旦把高度吃满，`layoutWeight(1)` 的 Scroll
+       * 拿到的是 0 剩余空间——不是「变矮」，是「整个区块连一个按钮都不渲染」，
+       * 而且它不报错。2026-10-27 图层面板加了「混合/剪贴」一行（+34vp），
+       * 验证脚本从第六节起所有 tap 静默失败，界面上看不出任何异常。
+       *
+       * 固定 112vp 至少露出两行最常用的按钮，其余靠滚动。
        */
       Scroll() {
         Column({ space: 8 }) {
@@ -1367,7 +1605,7 @@ struct Index {
         }
         .width('100%')
       }
-      .layoutWeight(1)
+      .height(112)
       .scrollBar(BarState.Auto)
 
     }

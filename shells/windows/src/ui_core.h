@@ -233,6 +233,23 @@ struct Layout {
    * 最右 5px，两者留 3px 间隔，命中区永不重叠（重叠时「拖宽」会吃掉「收起」）。
    */
   static constexpr int kPanelToggleSize = 18;
+  /*
+   * 窗口最小尺寸（逻辑像素，2026-10-27）。
+   *
+   * 在这之前窗口没有下限：可以拖到客户区 0 高，布局的各档降级（选项栏 → 标签栏
+   * → 右栏 → 左栏）连着触发，最后画布只剩一条缝、面板全消失——那不是「小窗口」，
+   * 是「不可用」，用户除了把窗口再拉大没有别的出路。
+   *
+   * 宽度下限的**真正约束不是布局，是菜单栏**：9 个菜单项单行要 560 逻辑像素
+   * 左右，窄于此菜单会折成两行——非客户区凭空高 19px，客户区反而更矮，而且
+   * 「最小尺寸」变成一个自我指涉的量（夹得越窄，边框越高）。600 在这个基础上
+   * 留一档字体/DPI 差异的余量，同时仍容得下「一列面板 + 画布」。
+   *
+   * 高度 = 工具条 + 选项栏 + 256px 画布 + 状态栏：这一档选项栏仍显示，画布还有
+   * 256px（接近 kMinBodyHeight 的三倍），够看一屏缩略。改布局常量时高度自动跟走。
+   */
+  static constexpr int kMinWindowWidth = 600;
+  static constexpr int kMinWindowHeight = kToolbarHeight + kOptionsHeight + 256 + kStatusHeight;
   static constexpr int kPanelToggleRightMargin = 8;
   static constexpr int kPanelToggleTop = 6;
   /*
@@ -739,11 +756,16 @@ inline Rect tool_button_rect(const Rect& toolbar, int index) {
               kToolButtonSize};
 }
 
-/* 命中工具按钮；返回按钮序号，未命中返回 -1。 */
+/* 命中工具按钮；返回按钮序号，未命中返回 -1。
+ *
+ * 与绘制同一条判据：右边超出工具条的按钮**不参与命中**（那是被窗口截掉的
+ * 半个按钮，看得见画不出、点下去会落到画布上）。 */
 inline int tool_button_at(const Rect& toolbar, int button_count, double x, double y) {
   if (!toolbar.contains(x, y)) return -1;
   for (int i = 0; i < button_count; ++i) {
-    if (tool_button_rect(toolbar, i).contains(x, y)) return i;
+    const Rect rect = tool_button_rect(toolbar, i);
+    if (rect.right() > toolbar.right()) break;
+    if (rect.contains(x, y)) return i;
   }
   return -1;
 }
