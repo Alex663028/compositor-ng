@@ -21,6 +21,12 @@ export const closeDocument: () => number;
  * 叠加一张全画布纯色层（成为新的顶层）。
  * @returns 0 成功；-1 无文档
  */
+/*
+ * 新建纯色层。
+ *
+ * @returns **新层的 id**（>0，且已经设为活动层）/ 负的错误码
+ *          （以前返回 0/错误码，加入图层组后改成返回 id——壳侧要用它立刻选中新层）
+ */
 export const addSolidLayer: (r: number, g: number, b: number, a: number) => number;
 /** 设置顶层不透明度（0..1）。@returns comp_result */
 export const setTopOpacity: (opacity: number) => number;
@@ -30,16 +36,83 @@ export const setTopBlend: (blend: number) => number;
 export const layerCount: () => number;
 
 /*
- * 图层列表（JSON 数组字符串）。
+ * 图层列表（JSON 数组字符串），**树形前序**。
  *
- * 每一项：{"id":<number>,"name":"<utf8>","visible":<0|1>,"opacity":<0..1>}
- * 顺序 = 引擎的堆叠序（上层在前）。
+ * 每一项：{"id":<number>,"name":"<utf8>","visible":<0|1>,"opacity":<0..1>,
+ *          "isGroup":<0|1>,"parent":<number>,"nest":<number>}
+ *
+ * 顺序 = 树形前序（组后面**紧跟**它的子层），nest 是缩进层级（别叫 depth：
+ * 那个名字在 ArkTS 侧读出来恒为 0，值被内建属性吞掉）。不能直接把引擎
+ * 的堆叠序发给壳：引擎那边父组与子层混在一起、不保证相邻，照着重就是「子层
+ * 散落在列表各处」，用户看不出谁在谁里面、也拖不对。
  *
  * 为什么是字符串而不是数组：跨 NAPI 边界传数组在 ArkTS 侧类型不稳（实测
  * ArrayBuffer / TypedArray 都不被识别），纯文本没这个问题；ArkTS 侧一次
  * JSON.parse 即可。
  */
 export const layerListJson: () => string;
+
+/*
+ * 新建图层组。
+ *
+ * @param name 组名（空串用默认「组」）
+ * @param layerId 可选：把这一层移进新组（0 = 建空组）
+ * @returns 新组的 id（>0）；失败返回负的错误码
+ *
+ * 「原位建组」：组落在原层的**位置**上，原层成为组的第一个子层。
+ */
+/*
+ * 图层树的**标量接口**（配合 layerTreeBuild 使用）。
+ *
+ * 为什么不是一把 JSON：ArkTS 侧 `JSON.parse(raw) as Row[]` 会把 interface 里
+ * 靠后的字段**抹成 0**（实测：同一个字符串，直接 stringify 出来是 `"pp":4`，
+ * as 转换后读到的却是 0；只有前面几个字段正常）。标量没有类型转换这一步。
+ *
+ * 用法：行数 = layerTreeBuild()，然后 layerRowId(i) / layerRowName(i) / …
+ */
+/*
+ * 整棵图层树，**一次给完**，分隔符格式：
+ *   每行 `id\x1fname\x1fvisible\x1fopacity\x1fisGroup\x1fparent\x1flevel`，
+ *   行间 `\x1e`。
+ *
+ * 为什么不用 JSON：`JSON.parse(raw) as Row[]` 会把 interface 靠后的字段抹成 0
+ * （同一个字符串直接显示是对的）。字符串本身可靠，就在字符串里分好字段。
+ */
+export const layerTreeText: () => string;
+
+export const layerTreeBuild: () => number;
+export const layerRowId: (index: number) => number;
+export const layerRowName: (index: number) => string;
+export const layerRowVisible: (index: number) => number;
+export const layerRowOpacity: (index: number) => number;
+export const layerRowIsGroup: (index: number) => number;
+/** 父级 id（0 = 根级）。 */
+export const layerRowParent: (index: number) => number;
+/** 缩进层级（0 = 根级）。 */
+export const layerRowLevel: (index: number) => number;
+
+export const createGroup: (name: string, layerId?: number) => number;
+
+/*
+ * 移动图层：换父级 + 定位（拖行 / 拖进组 / 拖出组）。
+ *
+ * @param id 要移动的层
+ * @param parent 目标父组（0 = 根级）
+ * @param before 目标位置的前一个兄弟（0 = 同级末尾）
+ * @returns 0 成功；引擎侧拒绝成环 / 把组拖进自己
+ */
+export const moveLayer: (id: number, parent: number, before: number) => number;
+
+/*
+ * 设置当前选中层（图层面板点选即写回）。
+ *
+ * 同时写回引擎：.comp 的 activeLayerID 就是它，重开文档时选中的还是这一层。
+ * 「作用于选中层」的操作（applyVignette / 调整面板）都以它为目标。
+ */
+export const setActiveLayer: (id: number) => number;
+
+/** 当前选中层 id（0 = 没选）。 */
+export const activeLayer: () => number;
 
 /** 设置图层可见性。@returns 0 成功；1 参数错；-1 无文档。 */
 export const setLayerVisible: (id: number, visible: boolean) => number;
@@ -59,12 +132,24 @@ export const setLayerName: (id: number, name_utf8: string) => number;
  * 模拟器上 XComponent 上不了屏（画布上看不到变化），所以「操作有没有真的作用到
  * 引擎」只能靠读回引擎状态来证明。
  *
- * @returns "list=1 hide=0 opacity=0.50 name=renamed_probe del=1 layers=N->N"
+ * @returns "list=1 hide=0 opacity=0.50 name=renamed_probe group=1 ungroup=1
+ *           active=1 del=1 layers=N->N"
  */
 export const layerPanelSelfTest: () => string;
 
 /** 给顶层加暗角滤镜（comp_filter_apply Vignette）。@returns comp_result */
 export const applyVignette: (amount: number) => number;
+
+/**
+ * 调整目标自检：建两层纯色（红/蓝），选中红层打暗角，读回像素比。
+ *
+ * 为什么需要：模拟器上画布上不了屏，「暗角打在哪一层」光看屏幕验不了；
+ * 而这错误在真机上极难发现（选中 B 层、被改的是最上面那层 A，屏幕上看
+ * 「某个地方暗了」，很容易以为是对的）。
+ *
+ * @returns "target=red ok=1 red=R->R blue=R->R"（ok=1 表示只改了选中层）
+ */
+export const adjustTargetSelfTest: () => string;
 /** 撤销一步。@returns comp_result（2 = 无可撤销） */
 export const undo: () => number;
 /** 重做一步。@returns comp_result */

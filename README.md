@@ -504,8 +504,8 @@ typedef，故对契约零影响。
 | ABI 导出 | 215（212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`） |
 | 单元测试 | 794 例 0 失败（build.py 全量） |
 | 壳自检 | 285 项，SHA 基线 `72a07fbfed54bf7d`（末尾追加 13 项：多浮动 / 拖拽落点 / 浮窗几何 / 面板分组 / 左列分支 / 组列宽 / 组收起 / 组宽初始化 / 标签栏几何 / 拖放落点语义 / 拖放合并到指定列 / 图层列表滚动 / 可见滚动条） |
-| 视觉探针 | 260 项 0 失败（43 场景）；布局问壳要真实布局；连跑已稳定（见下注） |
-| 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔 + 图片导入像素核对 + **图层面板链路自检全绿**）；真机 aarch64 可链接（libpng NEON 已处理） |
+| 视觉探针 | 268 项 0 失败（44 场景）；布局问壳要真实布局；连跑已稳定（见下注） |
+| 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔 + 图片导入像素核对）；**图层面板树形/分组/拖行 + 调整联动**（`layerPanelSelfTest` group=1 ungroup=1 active=1、`adjustTargetSelfTest` 选中层 255->25 / 未选中层 40->40）；真机 aarch64 可链接（libpng NEON 已处理） |
 
 > **视觉探针的布局从哪来（2026-10-26 起）**：探针**问壳要真实布局**
 > （`kMsgLayoutQuery` = WM_APP+1，返回关键矩形的 JSON），不再用 Python 复算

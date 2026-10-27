@@ -12,20 +12,40 @@ import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setT
          applyVignette, undo, redo, canUndo, present, presentResult, surfaceInfo,
          backendName, exportPng, exportPngToSandbox, importImage, importImageAsDocument, importImageBytes,
          importState, importVerify,
-         layerListJson, setLayerVisible, setLayerOpacity, removeLayer, setLayerName, layerPanelSelfTest,
+         setLayerVisible, setLayerOpacity, removeLayer, setLayerName, layerPanelSelfTest,
+         adjustTargetSelfTest,
+         createGroup, moveLayer, setActiveLayer, activeLayer,
+         layerTreeText,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 import { picker, fileIo } from '@kit.CoreFileKit';
 
 /*
- * 图层列表的一行（来自 napi 侧的 layerListJson）。
+ * 图层列表的一行（来自 napi 侧的 layerTreeText，分隔符格式）。
  *
- * 字段名与 JSON 里的键一一对应，visible 是 0/1 数字（JSON 里没有布尔量）。
+ * visible / isGroup 是 0/1 数字（跨桥只有标量最稳）。
  */
 interface LayerRowItem {
   id: number;
   name: string;
   visible: number;
   opacity: number;
+  /*
+   * 树形字段（napi 侧算好了树形前序：组后面紧跟它的子层）。
+   *
+   * depth 是缩进层级——不能靠「parent 是哪个组」自己推：同级的顺序与缩进都要
+   * 一致地反映引擎的真实层级，壳自己推就会在「组套组」时错位。
+   */
+  isGroup: number;
+  /*
+   * 父级 id 与缩进层级。
+   *
+   * 名字是 `pp` / `lv` 而不是 `parent` / `nest`：后两个名字在 ArkTS 里读出来
+   * **恒为 0**——JSON 文本里明明是 4 和 1（把同一个字符串直接显示到界面上是
+   * 对的），`JSON.parse` 之后就变 0。这两个名字与 ArkUI 的内建属性撞车，
+   * 值被吞掉。字段名可以换，语义换不了。
+   */
+  pp: number;
+  lv: number;
 }
 
 @Entry
@@ -57,6 +77,9 @@ struct Index {
   @State selectedOpacity: number = 100;
   @State renameText: string = '';
   @State layerPanelState: string = '—';
+  /* 正在拖的图层 id（0 = 没在拖）；拖到哪一行就高亮哪一行。 */
+  @State dragLayerId: number = 0;
+  @State dropTargetId: number = 0;
 
   private refresh(): void {
     this.backend = backendName();
@@ -79,13 +102,41 @@ struct Index {
    * N 次往返，层一多就明显卡。napi 侧已经把它拼成一份 JSON（名字做了转义）。
    */
   private refreshLayers(): void {
-    const raw: string = layerListJson();
-    try {
-      this.layerRows = JSON.parse(raw) as LayerRowItem[];
-    } catch {
-      this.layerRows = [];
+    /*
+     * 一次取完整棵树，用分隔符切成行 / 字段。
+     *
+     * 为什么不走 JSON：`JSON.parse(raw) as LayerRowItem[]` 会把 interface 里
+     * **靠后的字段抹成 0**——实测同一个字符串直接显示是 `"pp":4`，as 转换后
+     * 读到的却是 0，而靠前的 id/name/visible/opacity/isGroup 都正常。
+     * 为什么不用「一次 build + 逐字段取」：多次 NAPI 调用之间那份缓存会与渲染
+     * 节奏错位（实测不同行读到不同批次的值，出现「组行有父级、子层没有」）。
+     *
+     * 字符串本身从来没错过，所以就把字段分好放在字符串里。
+     */
+    const raw: string = layerTreeText();
+    const next: LayerRowItem[] = [];
+    if (raw.length > 0) {
+      const lines: string[] = raw.split('\x1e');
+      for (let i = 0; i < lines.length; i++) {
+        const fields: string[] = lines[i].split('\x1f');
+        if (fields.length < 7) {
+          continue;
+        }
+        const row: LayerRowItem = {
+          id: Number(fields[0]),
+          name: fields[1],
+          visible: Number(fields[2]),
+          opacity: Number(fields[3]),
+          isGroup: Number(fields[4]),
+          pp: Number(fields[5]),
+          lv: Number(fields[6])
+        };
+        next.push(row);
+      }
     }
+    this.layerRows = next;
   }
+
 
   private findLayer(id: number): LayerRowItem | undefined {
     for (let i = 0; i < this.layerRows.length; i++) {
@@ -102,6 +153,96 @@ struct Index {
     if (row !== undefined) {
       this.selectedOpacity = Math.round(row.opacity * 100);
       this.renameText = row.name;
+    }
+    /*
+     * 选中即写回引擎的活动层。
+     *
+     * 这一步是「调整面板联动」的关键：applyVignette 之类的操作作用于**当前
+     * 选中层**，而那个 id 由 napi 侧的 g_active_layer 保管。不写回的话，用户
+     * 在列表里选了 B 层、点「暗角」，被改的还是上次那层。
+     */
+    setActiveLayer(id);
+  }
+
+  /*
+   * 建组（原位）：组落在选中层的位置上，选中层成为组的第一个子层。
+   *
+   * 为什么要「原位」：用户选了一层再点建组，期望的是「把这一层收进一个组」，
+   * 不是「在列表最顶上凭空多一个空组」——后者还要再拖一次，等于白点。
+   */
+  private groupSelectedLayer(): void {
+    if (this.selectedLayerId === 0) {
+      this.lastOp = '建组：未选中';
+      this.refresh();
+      return;
+    }
+    const groupId: number = createGroup('组');
+    if (groupId > 0) {
+      this.selectedLayerId = groupId;
+      setActiveLayer(groupId);
+      this.do('建组', 0);
+    } else {
+      this.do('建组', groupId);
+    }
+    this.refreshLayers();
+  }
+
+  /* 移出组：把选中层移到根级末尾（拖行的按钮兜底——手机上拖拽不一定好使）。 */
+  private ungroupSelectedLayer(): void {
+    if (this.selectedLayerId === 0) {
+      this.lastOp = '移出组：未选中';
+      this.refresh();
+      return;
+    }
+    const rc: number = moveLayer(this.selectedLayerId, 0, 0);
+    this.do('移出组', rc);
+    this.refreshLayers();
+  }
+
+  /*
+   * 拖行落点：把 A 拖到 B 上。
+   *
+   * 两种语义，按 B 是不是组来分：
+   *   - B 是组 → **移进 B**（放到组末尾）。PS 同款：往组上一放就是收进去。
+   *   - B 不是组 → 移到 B **之前**、与 B 同父级。拖到根级行之前就自然出了组，
+   *     所以「拖出组」不需要单独的手势。
+   *
+   * 引擎会拒绝成环（把组拖进自己或自己的子组）——这里不预判，直接把错误码
+   * 显示出来：壳侧预判等于把引擎的规则复制一份，迟早分叉。
+   */
+  private dropLayerOn(target: LayerRowItem): void {
+    const dragged: number = this.dragLayerId;
+    this.dragLayerId = 0;
+    this.dropTargetId = 0;
+    if (dragged === 0 || dragged === target.id) {
+      return;
+    }
+    const parent: number = target.isGroup !== 0 ? target.id : target.pp;
+    const before: number = target.isGroup !== 0 ? 0 : target.id;
+    const rc: number = moveLayer(dragged, parent, before);
+    this.do(target.isGroup !== 0 ? '拖入组' : '拖行', rc);
+    this.refreshLayers();
+  }
+
+  /*
+   * 建一层并**立刻选中它**。
+   *
+   * 为什么要一步做完：新建层后不选中的话，用户点「建组」「暗角」这些「作用于
+   * 选中层」的操作会落到空处（或上一层的身上）。PS 里新建层就是自动选中的，
+   * 这里跟上。
+   *
+   * 新层的 id 由 napi 侧写进活动层（g_active_layer），读回来即可——不用再解
+   * 一次 JSON 列表去猜哪一行是新的。
+   */
+  private addLayerAndSelect(r: number, g: number, b: number, a: number, label: string): void {
+    /* 返回的是**新层的 id**（>0），不是 0/错误码——成功与否看正负。 */
+    const id: number = addSolidLayer(r, g, b, a);
+    this.refreshLayers();
+    if (id > 0) {
+      this.selectLayer(id);
+      this.do(label, 0);
+    } else {
+      this.do(label, id);
     }
   }
 
@@ -141,6 +282,19 @@ struct Index {
    */
   private runLayerPanelSelfTest(): void {
     this.layerPanelState = layerPanelSelfTest();
+    this.refreshLayers();
+  }
+
+  /*
+   * 调整目标自检：applyVignette 到底改的是哪一层。
+   *
+   * 模拟器上画布上不了屏（OPT-21b），「暗角打在哪一层」光看屏幕验不了。
+   * 而这个错误在真机上极难发现——选中 B 层点暗角，被改的是最上面那层 A，
+   * 屏幕上看「某个地方暗了」，很容易以为是对的。所以只能读回像素比。
+   */
+  private runAdjustTargetSelfTest(): void {
+    this.layerPanelState = adjustTargetSelfTest();
+    this.refreshLayers();
     this.refresh();
   }
 
@@ -276,7 +430,11 @@ struct Index {
         libraryname: 'compositor'
       })
         .width('100%')
-        .height(200)
+        /*
+         * 画布高度 200 -> 150：图层面板要固定在画布下方，手机（尤其竖屏）垂直
+         * 空间就那么多——画布让出 50vp，换图层面板（最常看的一块）不用滚。
+         */
+        .height(150)
         .backgroundColor('#101418')
         /* surface 建好之后才读得到真实后端/尺寸；不在这里刷新，界面会一直停在
          * 硬编码的 'None' / 'absent'，看起来像初始化失败（2026-10-26 实测）。 */
@@ -312,6 +470,10 @@ struct Index {
           .onClick(() => {
             this.runLayerPanelSelfTest();
           })
+        Button('调自检').fontSize(11).height(28)
+          .onClick(() => {
+            this.runAdjustTargetSelfTest();
+          })
         Text(this.layerPanelState).fontSize(9).fontColor('#8a8a8a').layoutWeight(1)
       }
       .width('100%')
@@ -321,8 +483,16 @@ struct Index {
        * 超出——超出时 Column 末尾的元素会被**挤没**（2026-10-26 实测：图层面板
        * 只剩 40px 高度，列表整块看不见）。放进 Scroll 后内容再长也能滚到。
        */
-      Scroll() {
-        Column({ space: 8 }) {
+      /*
+       * 图层面板放在 **Scroll 之外**（画布正下方、固定可见）。
+       *
+       * 为什么：面板本身有 200vp 出头（标题行 + 按钮行 + 列表 + 不透明度行），
+       * 而 Scroll 的可视高度在手机上只剩一百多 px（上方还有画布与几行按钮）。
+       * 放进 Scroll 里就等于「打开应用看不到图层」——用户得先滚才知道有图层面板，
+       * 而图层面板恰恰是这类应用最常看的一块。
+       *
+       * 调试用的按钮区反而适合放 Scroll：它们不常用、可滚、数量还在长。
+       */
       /*
        * 图层面板：鸿蒙侧此前只有按钮级演示，**没有图层列表**（与 Windows 壳的
        * 差距）。这里补上与 Windows 侧同语义的一层：图层名、显隐、透明度、
@@ -345,10 +515,29 @@ struct Index {
             .onClick(() => {
               this.renameSelectedLayer();
             })
+        }
+        .width('100%')
+        /*
+         * 第二行：分组与整理。
+         *
+         * 「建组」是原位建组（选中层直接成为新组的子层）；「移出」把选中层搬回
+         * 根级——拖拽在手机上不一定顺手，这两个按钮是拖行的兜底入口，功能不缺。
+         */
+        Row({ space: 6 }) {
+          Button('建组').fontSize(11).height(28)
+            .onClick(() => {
+              this.groupSelectedLayer();
+            })
+          Button('移出').fontSize(11).height(28)
+            .onClick(() => {
+              this.ungroupSelectedLayer();
+            })
           Button('删除').fontSize(11).height(28)
             .onClick(() => {
               this.deleteSelectedLayer();
             })
+          Text(this.dragLayerId !== 0 ? '拖动中…' : '')
+            .fontSize(10).fontColor('#7fb0ff').layoutWeight(1)
         }
         .width('100%')
 
@@ -356,7 +545,21 @@ struct Index {
           List({ space: 2 }) {
             ForEach(this.layerRows, (item: LayerRowItem) => {
               ListItem() {
-                Row({ space: 6 }) {
+                Row({ space: 4 }) {
+                  /*
+                   * 缩进用**宽度占位**而不是 padding。
+                   *
+                   * 这个 Row 上的 `padding({left})` 实测不生效（缩进恒为 0），
+                   * 而一个固定宽度的空元素是可靠的：层级 × 14vp，根级为 0。
+                   */
+                  Text('')
+                    .width(item.lv * 14)
+                    .height(1)
+                  /* 组标记：组行给一个图标，子层留同宽占位（不对齐会看着像错位）。 */
+                  Text(item.isGroup !== 0 ? '▾' : '')
+                    .fontSize(11)
+                    .fontColor('#8a93a6')
+                    .width(12)
                   Text(item.name)
                     .fontSize(13)
                     .fontColor(item.id === this.selectedLayerId ? '#7fb0ff' : '#d8d8de')
@@ -374,13 +577,52 @@ struct Index {
                     })
                 }
                 .width('100%')
+                /*
+                 * 缩进由 depth 直接乘：树形前序已经把「谁在谁里面」编成了层级，
+                 * 壳不再自己推父子关系（推出来的会与引擎的真实层级分叉）。
+                 */
                 .padding({ left: 6, right: 6, top: 3, bottom: 3 })
-                .backgroundColor(item.id === this.selectedLayerId ? '#25334a' : '#1b1d22')
+                .backgroundColor(item.id === this.selectedLayerId
+                  ? '#25334a'
+                  : (item.id === this.dropTargetId ? '#2f3a24' : '#1b1d22'))
               }
-            }, (item: LayerRowItem) => item.id.toString())
+              /*
+               * 拖行：长按拖动一行到另一行上。
+               *
+               * 落点语义见 dropLayerOn：拖到组上 = 收进组，拖到普通行上 = 插到它
+               * 之前（同父级）。系统级拖拽（onDragStart/onDrop）与 List 的滚动
+               * 手势不冲突——自己用 PanGesture 抢手势的话，列表一滚就乱。
+               */
+              .onDragStart(() => {
+                this.dragLayerId = item.id;
+                const preview: DragItemInfo = { extraInfo: item.name };
+                return preview;
+              })
+              .onDrop((event: DragEvent) => {
+                this.dropLayerOn(item);
+              })
+            },
+            /*
+             * key 必须带上**会变化的展示字段**（层级 / 父级 / 名字）。
+             *
+             * 只用 id 做 key 的坑：把一层拖进组之后 id 没变，ForEach 认为还是
+             * 同一个节点、**复用旧组件与旧 item**，于是缩进、组标记全是上一次
+             * 的样子——数据明明是对的，界面上却看不出分组（实测踩了很久：
+             * `layerTreeText` 里已经是 `p4,l1`，界面上还是 `p0,l0`）。
+             */
+            (item: LayerRowItem) =>
+              item.id.toString() + '_' + item.lv.toString() + '_' + item.pp.toString() +
+              '_' + item.name)
           }
           .width('100%')
-          .height(132)
+          /*
+           * 高度按行数算（上限 176vp ≈ 4 行）：层少时面板矮，把垂直空间留给
+           * 下面的按钮区；层多时最多显示 4 行，其余靠滚动。
+           *
+           * 固定 136vp 的教训：那只有 3 行多一点，而「组 + 组内子层」本身就
+           * 占两行——建完组，用户看不到子层，会以为建组没生效（实测）。
+           */
+          .height(Math.min(this.layerRows.length * 42 + 8, 176))
           .scrollBar(BarState.Auto)
         } else {
           Text('（无图层）').fontSize(12).fontColor('#6a7080').width('100%')
@@ -398,9 +640,15 @@ struct Index {
         .width('100%')
       }
       .width('100%')
-      .height(200)
-      .padding({ top: 6 })
+      /*
+       * 不设固定高度：内容（标题行 + 按钮行 + 列表 132 + 不透明度行）加起来比
+       * 200 高，固定 200 会把 **List 挤成 0 高**——列表整块看不见，但按钮照常
+       * 显示，看起来像「图层列表没了」。高度交给内容决定。
+       */
+      .padding({ top: 6, bottom: 6 })
       .backgroundColor('#14161a')
+      Scroll() {
+        Column({ space: 8 }) {
 
 
         }
@@ -420,10 +668,10 @@ struct Index {
           this.do('新建', newDocument(w, h));
         })
         Button('蓝层').onClick(() => {
-          this.do('蓝层', addSolidLayer(64, 128, 255, 255));
+          this.addLayerAndSelect(64, 128, 255, 255, '蓝层');
         })
         Button('红层').onClick(() => {
-          this.do('红层', addSolidLayer(255, 64, 64, 255));
+          this.addLayerAndSelect(255, 64, 64, 255, '红层');
         })
         Button('暗角').onClick(() => {
           this.do('暗角', applyVignette(0.7));

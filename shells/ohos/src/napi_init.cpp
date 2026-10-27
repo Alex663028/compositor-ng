@@ -64,6 +64,39 @@ namespace {
 comp_engine g_engine = nullptr;
 comp_document g_document = nullptr;
 comp_layer_id g_top_layer = 0;
+/*
+ * 当前选中图层（「活动层」）。
+ *
+ * 为什么壳要自己记一份：引擎的 comp_layer_set_active 只有**写**没有**读**
+ * （ABI 里没有 getter，activeLayerID 只在 .comp 序列化时用）。壳侧所有
+ * 「作用于选中层」的操作（调整、vignette、改名…）都要一个 id，所以壳自己
+ * 保管，同时写回引擎让 .comp 里的 activeLayerID 正确。
+ */
+comp_layer_id g_active_layer = 0;
+
+/*
+ * 图层树的**显示序缓存**（树形前序：组后面紧跟它的子层）。
+ *
+ * 为什么要缓存而不是每次现算：树形排布要 O(n²) 找父级，而壳侧画一行要取
+ * 7 个字段（id / 名字 / 显隐 / 透明度 / 是否组 / 父级 / 层级）——每取一个
+ * 都重算一遍树，层一多就明显卡。build 一次、逐字段取，是同一份数据的
+ * 两个视图。
+ *
+ * 为什么不用 JSON 一把给：ArkTS 侧 `JSON.parse(raw) as Row[]` 会把
+ * **interface 里靠后的字段抹成 0**（实测：同一个字符串，直接 stringify 出来
+ * 是 `"pp":4`，as 转换后读到的却是 0；`isGroup` 之前的字段都正常）。
+ * 标量接口没有这个坑。
+ */
+struct LayerRowEntry {
+  comp_layer_id id = 0;
+  int64_t parent = 0;
+  int32_t level = 0;
+  int32_t visible = 1;
+  int32_t is_group = 0;
+  double opacity = 1.0;
+  std::string name;
+};
+std::vector<LayerRowEntry> g_layer_rows;
 uint32_t g_doc_width = 0;
 uint32_t g_doc_height = 0;
 /* 上次导入的返回码（诊断用：设备上那行小字直接显示，不用翻 hilog）。 */
@@ -127,6 +160,17 @@ napi_value MakeInt32(napi_env env, int32_t value) {
 napi_value MakeString(napi_env env, const char* text) {
   napi_value out = nullptr;
   napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &out);
+  return out;
+}
+
+/*
+ * 图层 id 走 double 而不是 int32：comp_layer_id 是 uint64，ArkTS 的 number 是
+ * double（精确到 2^53，够用）。用 int32 返回会把大 id 截断成负数——壳侧再拿
+ * 这个 id 去操作就「层不存在」。
+ */
+napi_value MakeDouble(napi_env env, double value) {
+  napi_value out = nullptr;
+  napi_create_double(env, value, &out);
   return out;
 }
 
@@ -325,6 +369,13 @@ napi_value JsAddSolidLayer(napi_env env, napi_callback_info info) {
   std::memset(&layer_desc, 0, sizeof(layer_desc));
   layer_desc.name = "solid";
   layer_desc.parent = 0;
+  /*
+   * opacity 必须显式给 1：memset 0 之后它是**完全透明**的层。
+   *
+   * 这个坑一直没暴露，是因为模拟器上画布上不了屏（OPT-21b）——建层看起来
+   * 「正常」，真机上一进来就是「建了层但什么都看不到」。
+   */
+  layer_desc.opacity = 1.0f;
   comp_layer_id id = 0;
   comp_result rc = comp_layer_add(g_document, &layer_desc, &id);
   if (rc != 0) return MakeInt32(env, static_cast<int32_t>(rc));
@@ -347,7 +398,14 @@ napi_value JsAddSolidLayer(napi_env env, napi_callback_info info) {
   rc = comp_layer_set_pixels(g_document, id, &image);
   if (rc != 0) return MakeInt32(env, static_cast<int32_t>(rc));
   g_top_layer = id;
-  return MakeInt32(env, 0);
+  /*
+   * 新建的层同时设成**活动层**：与 PS 一致（新建层立刻被选中），也让
+   * 「选中即作用对象」的调整操作有目标——否则用户新建一层、点暗角，
+   * 会因为「什么都没选」而打在上一次的层上。
+   */
+  g_active_layer = id;
+  comp_layer_set_active(g_document, id);
+  return MakeDouble(env, static_cast<double>(id));
 }
 
 napi_value JsSetTopOpacity(napi_env env, napi_callback_info info) {
@@ -401,46 +459,228 @@ napi_value JsLayerCount(napi_env env, napi_callback_info info) {
  * 图层名走 JSON 转义（见 json_escape_into）——名字是用户可改的，里面可能
  * 有引号/反斜杠，不转义会让整份 JSON 解析失败、图层面板整个出不来。
  */
-napi_value JsLayerListJson(napi_env env, napi_callback_info info) {
-  (void)info;
-  if (g_document == nullptr) return MakeString(env, "[]");
+/* 重算图层显示序（树形前序）。返回行数；没文档返回 0。 */
+int32_t build_layer_rows() {
+  g_layer_rows.clear();
+  if (g_document == nullptr) return 0;
   size_t count = 0;
-  if (comp_layer_count(g_document, &count) != COMP_OK || count == 0) {
-    return MakeString(env, "[]");
-  }
+  if (comp_layer_count(g_document, &count) != COMP_OK || count == 0) return 0;
   std::vector<comp_layer_id> ids(count);
   size_t listed = 0;
-  if (comp_layer_list(g_document, ids.data(), ids.size(), &listed) != COMP_OK ||
-      listed == 0) {
-    return MakeString(env, "[]");
+  if (comp_layer_list(g_document, ids.data(), ids.size(), &listed) != COMP_OK || listed == 0) {
+    return 0;
   }
-  std::string json = "[";
+  ids.resize(listed);
+
+  std::vector<int64_t> parents(listed, 0);
+  std::vector<uint8_t> groups(listed, 0);
   for (size_t i = 0; i < listed; ++i) {
+    int32_t is_group = 0;
+    comp_layer_id parent = 0;
+    comp_layer_id clipping = 0;
+    const comp_result group_rc =
+        comp_layer_get_group_info(g_document, ids[i], &is_group, &parent, &clipping);
+    if (group_rc == COMP_OK) {
+      parents[i] = static_cast<int64_t>(parent);
+      groups[i] = static_cast<uint8_t>(is_group != 0 ? 1 : 0);
+    }
+  }
+
+  std::vector<std::vector<size_t>> children(listed);
+  std::vector<size_t> roots;
+  for (size_t i = 0; i < listed; ++i) {
+    size_t parent_index = listed;
+    for (size_t j = 0; j < listed; ++j) {
+      if (ids[j] == static_cast<comp_layer_id>(parents[i])) {
+        parent_index = j;
+        break;
+      }
+    }
+    if (parent_index == listed) {
+      roots.push_back(i);
+    } else {
+      children[parent_index].push_back(i);
+    }
+  }
+
+  std::vector<uint8_t> visited(listed, 0);
+  auto emit = [&](auto&& self, size_t index, int32_t level) -> void {
+    if (index >= listed || level > 64 || visited[index] != 0) return;
+    visited[index] = 1;
+    LayerRowEntry row;
+    row.id = ids[index];
+    row.parent = parents[index];
+    row.level = level;
+    row.is_group = groups[index];
     char name[256] = {0};
     size_t required = 0;
-    if (comp_layer_get_name(g_document, ids[i], name, sizeof(name), &required) != COMP_OK) {
-      std::snprintf(name, sizeof(name), "%llu",
-                    static_cast<unsigned long long>(ids[i]));
+    if (comp_layer_get_name(g_document, row.id, name, sizeof(name), &required) != COMP_OK) {
+      std::snprintf(name, sizeof(name), "%llu", static_cast<unsigned long long>(row.id));
     }
+    row.name = name;
     int32_t visible = 1;
-    comp_layer_get_visible(g_document, ids[i], &visible);
+    comp_layer_get_visible(g_document, row.id, &visible);
+    row.visible = visible != 0 ? 1 : 0;
     float opacity = 1.0f;
-    comp_layer_get_opacity(g_document, ids[i], &opacity);
-    if (i > 0) json += ",";
-    json += "{\"id\":";
-    json += std::to_string(static_cast<unsigned long long>(ids[i]));
-    json += ",\"name\":\"";
-    json_escape_into(json, name);
-    json += "\",\"visible\":";
-    json += visible != 0 ? "1" : "0";
-    json += ",\"opacity\":";
-    char number[32] = {0};
-    std::snprintf(number, sizeof(number), "%.3f", static_cast<double>(opacity));
-    json += number;
-    json += "}";
+    comp_layer_get_opacity(g_document, row.id, &opacity);
+    row.opacity = static_cast<double>(opacity);
+    g_layer_rows.push_back(row);
+    for (size_t child : children[index]) self(self, child, level + 1);
+  };
+  for (size_t root : roots) emit(emit, root, 0);
+  /* 环 / 断链剩下的补在末尾：宁可顺序怪，也不能让层在面板上消失。 */
+  for (size_t i = 0; i < listed; ++i) {
+    if (visited[i] == 0) emit(emit, i, 0);
   }
-  json += "]";
-  return MakeString(env, json.c_str());
+  return static_cast<int32_t>(g_layer_rows.size());
+}
+
+
+/*
+ * 整棵图层树，**一次给完**，用分隔符而不是 JSON。
+ *
+ * 格式：每行 `id\x1fname\x1fvisible\x1fopacity\x1fisGroup\x1fparent\x1flevel`，
+ * 行间用 `\x1e`。
+ *
+ * 为什么不用 JSON：ArkTS 侧 `JSON.parse(raw) as Row[]` 会把 interface 里靠后的
+ * 字段**抹成 0**（实测：同一个字符串直接显示是 `"pp":4`，as 转换后读到的却是 0，
+ * 靠前的字段却正常）。为什么不用「build 一次 + 逐字段取」：多次 NAPI 调用之间
+ * 那份缓存会与调用方的渲染节奏错位（实测不同行读到不同批次的值）。
+ *
+ * 字符串本身是可靠的（同一份 raw 直接显示从来没错过），所以就在字符串里
+ * 把字段分好，壳侧一次 split 到底。
+ */
+napi_value JsLayerTreeText(napi_env env, napi_callback_info info) {
+  (void)info;
+  build_layer_rows();
+  std::string out;
+  for (size_t i = 0; i < g_layer_rows.size(); ++i) {
+    const LayerRowEntry& row = g_layer_rows[i];
+    if (i > 0) out += '\x1e';
+    out += std::to_string(static_cast<unsigned long long>(row.id));
+    out += '\x1f';
+    out += row.name;
+    out += '\x1f';
+    out += row.visible != 0 ? "1" : "0";
+    out += '\x1f';
+    char opacity[32] = {0};
+    std::snprintf(opacity, sizeof(opacity), "%.3f", row.opacity);
+    out += opacity;
+    out += '\x1f';
+    out += row.is_group != 0 ? "1" : "0";
+    out += '\x1f';
+    out += std::to_string(static_cast<long long>(row.parent));
+    out += '\x1f';
+    out += std::to_string(row.level);
+  }
+  return MakeString(env, out.c_str());
+}
+
+/*
+ * 新建图层组（name: 可选，layerId: 可选 = 把这一层移进去）。
+ *
+ * 返回新组的 id（double）；失败返回负的错误码。
+ *
+ * 「原位建组」= 组落在原层的**位置**上、原层成为组的第一个子层。顺序很重要：
+ * 先把组移到原层之前（同级），再把原层移进组——反过来的话组会跑到原层下面，
+ * 用户看到「点了建组，图层跑到组上面去了」。
+ */
+napi_value JsCreateGroup(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+
+  char name[128] = "组";
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, argv[0], &type);
+    if (type == napi_string) {
+      size_t length = 0;
+      napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length);
+      if (length > 0 && length < sizeof(name)) {
+        napi_get_value_string_utf8(env, argv[0], name, sizeof(name), nullptr);
+      }
+    }
+  }
+  /*
+   * 作用对象 = **当前活动层**（不靠第二个参数）。
+   *
+   * 为什么不用参数：从 ArkTS 传第二个 number 参数过来，NAPI 侧读到的恒为 0
+   * （实测：ArkTS 侧 selectedLayerId 明明是 3，createGroup 里读 argv[1] 却是 0，
+   * 于是「建组」只建了个空组、什么也没收进去）。而活动层本来就是壳侧维护的
+   * 单一真源（点选即写回），直接读它不会错位。
+   *
+   * layerId 参数保留但仅作覆盖用：传了非 0 就优先用它。
+   */
+  comp_layer_id layer_id = g_active_layer;
+  if (argc >= 2 && argv[1] != nullptr) {
+    comp_layer_id explicit_id = 0;
+    if (read_layer_id(env, argv[1], &explicit_id) && explicit_id != 0) layer_id = explicit_id;
+  }
+
+  comp_layer_desc desc;
+  std::memset(&desc, 0, sizeof(desc));
+  desc.name = name;
+  desc.is_group = 1;
+  desc.opacity = 1.0f;
+  comp_layer_id group_id = 0;
+  comp_result rc = comp_layer_add(g_document, &desc, &group_id);
+  if (rc != COMP_OK) return MakeInt32(env, static_cast<int32_t>(rc));
+  if (layer_id != 0) {
+    comp_layer_move(g_document, group_id, 0, layer_id);
+    comp_layer_move(g_document, layer_id, group_id, 0);
+  }
+  return MakeDouble(env, static_cast<double>(group_id));
+}
+
+/*
+ * 移动图层：换父级 + 定位（拖行 / 拖进组 / 拖出组）。
+ * parent = 0 表示根级；before = 0 表示同级末尾。
+ * 引擎侧拒绝成环、拒绝把组拖进自己（INVALID_ARGUMENT）。
+ */
+napi_value JsMoveLayer(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  comp_layer_id parent = 0;
+  comp_layer_id before = 0;
+  if (argc < 1 || !read_layer_id(env, argv[0], &id) || id == 0) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  if (argc >= 2 && argv[1] != nullptr) read_layer_id(env, argv[1], &parent);
+  if (argc >= 3 && argv[2] != nullptr) read_layer_id(env, argv[2], &before);
+  return MakeInt32(env,
+                   static_cast<int32_t>(comp_layer_move(g_document, id, parent, before)));
+}
+
+/*
+ * 设置当前选中层（图层面板点选即写回）。
+ *
+ * 同时写引擎（comp_layer_set_active）：.comp 的 activeLayerID 就是它，重开文档
+ * 时选中的还是这一层。引擎侧 id 不存在返回 NOT_FOUND——壳不把它当错误上报，
+ * 因为选中是个纯 UI 动作，闪一下不该弹错。
+ */
+napi_value JsSetActiveLayer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (argc < 1 || argv[0] == nullptr || !read_layer_id(env, argv[0], &id)) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  g_active_layer = id;
+  comp_layer_set_active(g_document, id);
+  return MakeInt32(env, 0);
+}
+
+/* 当前选中层 id（0 = 没选）。 */
+napi_value JsActiveLayer(napi_env env, napi_callback_info info) {
+  (void)info;
+  return MakeDouble(env, static_cast<double>(g_active_layer));
 }
 
 /* 设置图层可见性（id, visible: boolean）。 */
@@ -564,16 +804,176 @@ napi_value JsLayerPanelSelfTest(napi_env env, napi_callback_info info) {
   size_t required = 0;
   comp_layer_get_name(g_document, probe, name, sizeof(name), &required);
 
-  /* 5) 删除：层数回到测试前。 */
+  /*
+   * 6) 分组：新建组 + 把探针层移进去，读回 parent 必须是这个组。
+   *
+   * 验的是**引擎真的记住了父子关系**，而不是壳自己记账——壳记账的话，重开
+   * 文档（父子关系从 .comp 读回）就会全丢。
+   */
+  comp_layer_desc group_desc;
+  std::memset(&group_desc, 0, sizeof(group_desc));
+  group_desc.name = "panel_group_probe";
+  group_desc.is_group = 1;
+  group_desc.opacity = 1.0f;
+  comp_layer_id group = 0;
+  int32_t grouped = 0;
+  if (comp_layer_add(g_document, &group_desc, &group) == COMP_OK) {
+    /* 原位建组：组落到探针层之前，探针层再移进组（与 createGroup 同一顺序）。 */
+    comp_layer_move(g_document, group, 0, probe);
+    comp_layer_move(g_document, probe, group, 0);
+    int32_t is_group = 0;
+    comp_layer_id parent = 0;
+    comp_layer_id clipping = 0;
+    comp_layer_get_group_info(g_document, probe, &is_group, &parent, &clipping);
+    grouped = parent == group ? 1 : 0;
+  }
+
+  /* 7) 拖行（换父级）：把探针层移回根级，parent 必须变回 0。 */
+  int32_t ungrouped = 0;
+  if (group != 0) {
+    comp_layer_move(g_document, probe, 0, 0);
+    int32_t is_group = 0;
+    comp_layer_id parent = 0;
+    comp_layer_id clipping = 0;
+    comp_layer_get_group_info(g_document, probe, &is_group, &parent, &clipping);
+    ungrouped = parent == 0 ? 1 : 0;
+  }
+
+  /* 8) 活动层：设进去要能读回来（调整面板作用于它）。 */
+  g_active_layer = probe;
+  comp_layer_set_active(g_document, probe);
+  const int32_t active_ok = g_active_layer == probe ? 1 : 0;
+
+  /* 9) 删除：先删组（子树一并删），再删探针层；层数回到测试前。 */
+  if (group != 0) comp_layer_remove(g_document, group);
   comp_layer_remove(g_document, probe);
   size_t after = 0;
   comp_layer_count(g_document, &after);
 
+  char buffer[288];
+  std::snprintf(buffer, sizeof(buffer),
+                "list=%d hide=%d opacity=%.2f name=%s group=%d ungroup=%d active=%d "
+                "del=%d layers=%zu->%zu",
+                in_list ? 1 : 0, visible, static_cast<double>(opacity), name, grouped,
+                ungrouped, active_ok, after == before ? 1 : 0, before, after);
+  return MakeString(env, buffer);
+}
+
+/*
+ * 调整面板联动自检：applyVignette 到底改的是哪一层。
+ *
+ * 为什么需要这个自检：模拟器上画布上不了屏（OPT-21b），「暗角打在哪一层」
+ * 光看屏幕验不了。而这个错误**在真机上极难发现**——用户选中 B 层点暗角，
+ * 被改的是最上面那层 A，屏幕上看到「某个地方暗了」，很容易以为是对的。
+ *
+ * 判据：两层纯色（红 / 蓝），选中红层后打暗角，**红层中心像素必须变暗、
+ * 蓝层必须一个字节都不动**。
+ *
+ * @returns "target=red ok=1 red=..->.. blue=..->.."
+ */
+napi_value JsAdjustTargetSelfTest(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (g_document == nullptr) return MakeString(env, "no-doc");
+  if (g_doc_width == 0 || g_doc_height == 0) return MakeString(env, "no-size");
+
+  const comp_layer_id prev_active = g_active_layer;
+  const size_t stride = static_cast<size_t>(g_doc_width) * 4u;
+
+  auto make_solid = [&](uint8_t r, uint8_t g, uint8_t b, comp_layer_id* out) -> bool {
+    comp_layer_desc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.name = "adjust_probe";
+    desc.opacity = 1.0f;
+    if (comp_layer_add(g_document, &desc, out) != COMP_OK) return false;
+    std::vector<uint8_t> pixels(stride * g_doc_height);
+    for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+      pixels[i + 0] = r;
+      pixels[i + 1] = g;
+      pixels[i + 2] = b;
+      pixels[i + 3] = 255;
+    }
+    comp_image image;
+    std::memset(&image, 0, sizeof(image));
+    image.width = static_cast<int32_t>(g_doc_width);
+    image.height = static_cast<int32_t>(g_doc_height);
+    image.format = COMP_PIXEL_RGBA8;
+    image.stride = stride;
+    image.pixels = pixels.data();
+    return comp_layer_set_pixels(g_document, *out, &image) == COMP_OK;
+  };
+
+  /*
+   * 读**角落**像素的 R 通道。
+   *
+   * 为什么不是中心：暗角（vignette）的语义就是「中心不动、边缘压暗」——
+   * 量中心的话，既看不出打没打上，也分不清是「没生效」还是「打对了」。
+   * 取 (2,2) 而不是 (0,0)：最外圈可能是边界采样，往里两个像素在各尺寸下都安全。
+   * 也不要取 1/8 处——实测那里暗化只有 255->253，两个数值的差判不出真假。
+   */
+  auto corner_red = [&](comp_layer_id id) -> int32_t {
+    std::vector<uint8_t> pixels(stride * g_doc_height);
+    int32_t width = 0;
+    int32_t height = 0;
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    if (comp_layer_get_pixels(g_document, id, pixels.data(), stride, &width, &height, &format) !=
+        COMP_OK) {
+      return -1;
+    }
+    if (width <= 0 || height <= 0) return -1;
+    const size_t offset = 2u * stride + 2u * 4u;
+    if (offset + 3 >= pixels.size()) return -1;
+    return static_cast<int32_t>(pixels[offset]);
+  };
+
+  comp_layer_id red = 0;
+  comp_layer_id blue = 0;
+  if (!make_solid(255, 40, 40, &red)) return MakeString(env, "add-red-failed");
+  if (!make_solid(40, 40, 255, &blue)) return MakeString(env, "add-blue-failed");
+
+  const int32_t red_before = corner_red(red);
+  const int32_t blue_before = corner_red(blue);
+
+  /* 选中**红**层（蓝层是后建的、在更上面——打错层就会被立刻发现）。 */
+  g_active_layer = red;
+  comp_layer_set_active(g_document, red);
+
+  comp_filter_desc desc;
+  std::memset(&desc, 0, sizeof(desc));
+  desc.kind = COMP_FILTER_VIGNETTE;
+  /* 与 JsApplyVignette 同一口径：0..100 的百分比（域层再映射成压暗）。 */
+  desc.vignette.amount = 90.0;
+  desc.vignette.midpoint = 20.0;
+  desc.vignette.feather = 60.0;
+  const comp_layer_id target = g_active_layer != 0 ? g_active_layer : g_top_layer;
+  int32_t changed = 0;
+  size_t note_size = 0;
+  const comp_result filter_rc =
+      comp_filter_apply(g_document, target, &desc, 1.0, &changed, nullptr, 0, &note_size);
+
+  const int32_t red_after = corner_red(red);
+  const int32_t blue_after = corner_red(blue);
+
+  /* 清理：先删探针层，再恢复原来的活动层。 */
+  comp_layer_remove(g_document, blue);
+  comp_layer_remove(g_document, red);
+  g_active_layer = prev_active;
+  if (prev_active != 0) comp_layer_set_active(g_document, prev_active);
+
+  /*
+   * 判据两条都要成立：
+   *   1. 红层角落**变暗**（暗角真的作用到它）；
+   *   2. 蓝层角落**一个字节没动**（没打到未选中的层）。
+   */
+  /* 红层角落要**变暗**，且蓝层一个字节都不动。 */
+  const int32_t ok = (red_after >= 0 && red_after < red_before &&
+                      blue_after == blue_before)
+                         ? 1
+                         : 0;
   char buffer[192];
   std::snprintf(buffer, sizeof(buffer),
-                "list=%d hide=%d opacity=%.2f name=%s del=%d layers=%zu->%zu",
-                in_list ? 1 : 0, visible, static_cast<double>(opacity), name,
-                after == before ? 1 : 0, before, after);
+                "target=red ok=%d red=%d->%d blue=%d->%d rc=%d changed=%d note=%zu", ok,
+                red_before, red_after, blue_before, blue_after,
+                static_cast<int>(filter_rc), changed, note_size);
   return MakeString(env, buffer);
 }
 
@@ -589,17 +989,41 @@ napi_value JsApplyVignette(napi_env env, napi_callback_info info) {
   if (argc >= 1 && argv[0] != nullptr) {
     napi_get_value_double(env, argv[0], &amount);
   }
-  if (g_document == nullptr || g_top_layer == 0) return MakeInt32(env, -1);
+  /*
+   * 作用对象 = **当前选中层**（不是顶层）。
+   *
+   * 之前固定打顶层：用户在面板上选中某一层、点「暗角」，被改的却是最上面那层
+   * ——「选中的层」与「被改的层」不是同一个，这是最糟的一类交互错误（用户会
+   * 以为操作丢了，其实是打到别处去了，而且撤销一次才发现改错了层）。
+   *
+   * 没选任何层时退回顶层：单层文档（新建后直接试）不至于点了没反应。
+   */
+  const comp_layer_id target = g_active_layer != 0 ? g_active_layer : g_top_layer;
+  if (g_document == nullptr || target == 0) return MakeInt32(env, -1);
 
+  /*
+   * 参数值域换算：ArkTS 侧传的是 **0..1 的强度**，而 ABI 的 vignette 参数是
+   * **0..100 的百分比**（域层校验 `in_range(amount, 0, 100)`，再映射成内核的
+   * 负值压暗）。
+   *
+   * 此前直接把 0.7 传进去 = **0.7%**，等于什么都没做——「暗角」按钮一直是
+   * 空操作。而模拟器上画布上不了屏（OPT-21b），屏幕上根本看不出没生效，
+   * 这个 bug 一直藏着（2026-10-27 查出来的）。
+   *
+   * midpoint / feather 同样是 0..100 的百分比，不是 0..1。
+   */
+  double strength = amount;
+  if (strength < 0.0) strength = 0.0;
+  if (strength > 1.0) strength = 1.0;
   comp_filter_desc desc;
   std::memset(&desc, 0, sizeof(desc));
   desc.kind = COMP_FILTER_VIGNETTE;
-  desc.vignette.amount = amount;
-  desc.vignette.midpoint = 0.5;
-  desc.vignette.feather = 0.5;
+  desc.vignette.amount = strength * 100.0;
+  desc.vignette.midpoint = 50.0;
+  desc.vignette.feather = 50.0;
   int32_t changed = 0;
   size_t note_size = 0;
-  const comp_result rc = comp_filter_apply(g_document, g_top_layer, &desc, 1.0, &changed,
+  const comp_result rc = comp_filter_apply(g_document, target, &desc, 1.0, &changed,
                                            nullptr, 0, &note_size);
   return MakeInt32(env, static_cast<int32_t>(rc));
 }
@@ -1476,8 +1900,6 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"layerCount", nullptr, JsLayerCount, nullptr, nullptr, nullptr, napi_default,
        nullptr},
-      {"layerListJson", nullptr, JsLayerListJson, nullptr, nullptr, nullptr, napi_default,
-       nullptr},
       {"setLayerVisible", nullptr, JsSetLayerVisible, nullptr, nullptr, nullptr, napi_default,
        nullptr},
       {"setLayerOpacity", nullptr, JsSetLayerOpacity, nullptr, nullptr, nullptr, napi_default,
@@ -1486,7 +1908,19 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"setLayerName", nullptr, JsSetLayerName, nullptr, nullptr, nullptr, napi_default,
        nullptr},
+      {"layerTreeText", nullptr, JsLayerTreeText, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"createGroup", nullptr, JsCreateGroup, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"moveLayer", nullptr, JsMoveLayer, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"setActiveLayer", nullptr, JsSetActiveLayer, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"activeLayer", nullptr, JsActiveLayer, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
       {"layerPanelSelfTest", nullptr, JsLayerPanelSelfTest, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"adjustTargetSelfTest", nullptr, JsAdjustTargetSelfTest, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"applyVignette", nullptr, JsApplyVignette, nullptr, nullptr, nullptr,
        napi_default, nullptr},
