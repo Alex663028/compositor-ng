@@ -2778,6 +2778,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     case WM_KEYDOWN:
       if (shell != nullptr) {
         /*
+         * ESC 取消「按住鼠标」的临时态：滚动条滑块的拖动。
+         *
+         * 不松手就按 ESC，之后鼠标一动仍被当成拖滚动条（拖动状态只由松手
+         * 结束）。与失焦 / 捕获被抢走那两条同源——都是「松手事件收不到」的
+         * 场景，标志必须在这里清掉。
+         */
+        if (wparam == VK_ESCAPE) {
+          shell->doc.layer_scroll_drag = false;
+          shell->scroll_drag_target = ScrollDragTarget::None;
+        }
+        /*
          * S22 F6：亮度直方图开关。放在字母键处理之前——它与任何工具快捷键都
          * 不冲突，且面板类快捷键统一走 run_shell_command 分发，菜单与键不分叉。
          */
@@ -3455,6 +3466,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         /* S24：拖行/框选是「按住鼠标」的临时态，失焦必须取消，否则指示线一直挂着。 */
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /*
+         * 滚动条滑块的拖动同样是「按住鼠标」的临时态：失焦后收不到松手事件，
+         * 标志不复位的话**之后所有鼠标移动都被当成拖滚动条**——界面像卡住了一样。
+         */
+        shell->doc.layer_scroll_drag = false;
+        shell->scroll_drag_target = ScrollDragTarget::None;
         /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
         shell->doc.smart_drag_pending = false;
         shell->doc.smart_drag_active = false;
@@ -3496,6 +3513,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         guide_drag_cancel(*shell);
         shell->doc.layer_drag_pending = false;
         shell->doc.layer_drag_active = false;
+        /* 滚动条滑块拖动同理：捕获被抢走就收不到松手，标志必须清（否则鼠标一动
+         * 就被当成拖滚动条）。 */
+        shell->doc.layer_scroll_drag = false;
+        shell->scroll_drag_target = ScrollDragTarget::None;
         /* 智能滤镜拖拽同理：没有落点就不该留下悬挂的高亮/指示。 */
         shell->doc.smart_drag_pending = false;
         shell->doc.smart_drag_active = false;
