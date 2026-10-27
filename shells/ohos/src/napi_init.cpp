@@ -859,6 +859,288 @@ napi_value JsLayerPanelSelfTest(napi_env env, napi_callback_info info) {
   return MakeString(env, buffer);
 }
 
+// ---------------------------------------------------------------------------
+// 可编辑调整层（P1-2 收尾）：加 / 列 / 改 / 删
+//
+// 引擎侧接口早就齐了（comp_layer_add_adjustment / adjustment_at /
+// update_adjustment_at / remove_adjustment，外加参数元数据与 build_settings /
+// read_value）。壳这边**不写 JSON**：参数扁平值交给引擎拼，回填也走引擎。
+//
+// 传值一律用分隔符字符串而不是 JSON 数组：跨 NAPI 传数组在 ArkTS 侧类型不稳，
+// 而 parse 成 interface 数组还会把靠后的字段抹成 0（本轮踩过，见 layerTreeText）。
+// ---------------------------------------------------------------------------
+
+/* 所有合法的调整类型：`kind\x1fname`，行间 `\x1e`。 */
+napi_value JsAdjustKindsText(napi_env env, napi_callback_info info) {
+  (void)info;
+  std::string out;
+  for (uint32_t kind = 0; kind < COMP_ADJUSTMENT_KIND_COUNT; ++kind) {
+    const char* name = nullptr;
+    if (comp_layer_adjustment_kind_name(kind, &name) != COMP_OK || name == nullptr) continue;
+    if (!out.empty()) out += '\x1e';
+    out += std::to_string(kind);
+    out += '\x1f';
+    out += name;
+  }
+  return MakeString(env, out.c_str());
+}
+
+/*
+ * 某个调整类型的可编辑参数：`json_path\x1flabel\x1ftype\x1fmin\x1fmax\x1fdefault`。
+ *
+ * type 0 = 数值（滑杆）/ 1 = 布尔（开关）。壳据此生成控件——引擎给了范围与缺省，
+ * 壳不需要（也不该）自己维护一份参数表。
+ */
+napi_value JsAdjustParamsText(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return MakeString(env, "");
+  int32_t kind = -1;
+  if (napi_get_value_int32(env, argv[0], &kind) != napi_ok || kind < 0) return MakeString(env, "");
+
+  size_t count = 0;
+  if (comp_layer_adjustment_param_count(static_cast<uint32_t>(kind), &count) != COMP_OK) {
+    return MakeString(env, "");
+  }
+  std::string out;
+  for (size_t i = 0; i < count; ++i) {
+    comp_adjustment_param param;
+    std::memset(&param, 0, sizeof(param));
+    if (comp_layer_adjustment_param_at(static_cast<uint32_t>(kind), i, &param) != COMP_OK) continue;
+    if (!out.empty()) out += '\x1e';
+    out += param.json_path != nullptr ? param.json_path : "";
+    out += '\x1f';
+    out += param.label != nullptr ? param.label : "";
+    out += '\x1f';
+    out += std::to_string(static_cast<int>(param.type));
+    out += '\x1f';
+    char number[40] = {0};
+    std::snprintf(number, sizeof(number), "%.4f", param.min_value);
+    out += number;
+    out += '\x1f';
+    std::snprintf(number, sizeof(number), "%.4f", param.max_value);
+    out += number;
+    out += '\x1f';
+    std::snprintf(number, sizeof(number), "%.4f", param.default_value);
+    out += number;
+  }
+  return MakeString(env, out.c_str());
+}
+
+/* 图层上已有的调整：`index\x1fkind\x1fname`，行间 `\x1e`。 */
+napi_value JsLayerAdjustmentsText(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeString(env, "");
+  comp_layer_id id = 0;
+  if (argc < 1 || argv[0] == nullptr || !read_layer_id(env, argv[0], &id)) {
+    return MakeString(env, "");
+  }
+  size_t count = 0;
+  if (comp_layer_adjustment_count(g_document, id, &count) != COMP_OK) return MakeString(env, "");
+  std::string out;
+  for (size_t i = 0; i < count; ++i) {
+    uint32_t kind = 0;
+    size_t size = 0;
+    if (comp_layer_adjustment_at(g_document, id, i, &kind, nullptr, 0, &size) != COMP_OK) continue;
+    const char* name = nullptr;
+    if (comp_layer_adjustment_kind_name(kind, &name) != COMP_OK || name == nullptr) name = "?";
+    if (!out.empty()) out += '\x1e';
+    out += std::to_string(i);
+    out += '\x1f';
+    out += std::to_string(kind);
+    out += '\x1f';
+    out += name;
+  }
+  return MakeString(env, out.c_str());
+}
+
+/* 把 `\x1f` 分隔的扁平值拆成字符串数组（空串 = 沿用缺省）。 */
+static std::vector<std::string> split_values(const char* text) {
+  std::vector<std::string> values;
+  if (text == nullptr) return values;
+  std::string current;
+  for (const char* p = text; *p != '\0'; ++p) {
+    if (*p == '\x1f') {
+      values.push_back(current);
+      current.clear();
+    } else {
+      current += *p;
+    }
+  }
+  values.push_back(current);
+  return values;
+}
+
+/*
+ * 给图层加一条调整（id, kind, values 用 `\x1f` 分隔，按 param 顺序）。
+ *
+ * JSON 由引擎的 comp_layer_adjustment_build_settings 组装——壳拼 JSON 的话，
+ * 键名/转义/范围校验都得再实现一遍，迟早与引擎分叉。
+ */
+napi_value JsAddLayerAdjustment(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  int32_t kind = -1;
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr ||
+      !read_layer_id(env, argv[0], &id) ||
+      napi_get_value_int32(env, argv[1], &kind) != napi_ok || kind < 0) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  char values_text[512] = {0};
+  if (argc >= 3 && argv[2] != nullptr) {
+    size_t copied = 0;
+    napi_get_value_string_utf8(env, argv[2], values_text, sizeof(values_text), &copied);
+  }
+  const std::vector<std::string> values = split_values(values_text);
+  std::vector<const char*> pointers;
+  pointers.reserve(values.size());
+  for (const std::string& value : values) pointers.push_back(value.c_str());
+
+  size_t need = 0;
+  comp_layer_adjustment_build_settings(static_cast<uint32_t>(kind), pointers.data(),
+                                       pointers.size(), nullptr, 0, &need);
+  if (need == 0) return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  /*
+   * 缓冲区要给 NUL 留一位：引擎的 out_size **不含** NUL，而写回时按
+   * `capacity - 1` 截断。按 need 分配的话 JSON 会少最后一个字符（`}`），
+   * 后续 add 直接报 INVALID_ARGUMENT——症状是「点新增永远是 rc1」。
+   */
+  std::string json(need + 1, '\0');
+  if (comp_layer_adjustment_build_settings(static_cast<uint32_t>(kind), pointers.data(),
+                                           pointers.size(), &json[0], json.size(),
+                                           &need) != COMP_OK) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  return MakeInt32(env, static_cast<int32_t>(
+                            comp_layer_add_adjustment(g_document, id,
+                                                      static_cast<uint32_t>(kind),
+                                                      json.c_str())));
+}
+
+/* 按索引替换一条调整（kind 与 settings 一并替换）。 */
+napi_value JsUpdateLayerAdjustmentAt(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  int32_t index = -1;
+  int32_t kind = -1;
+  if (argc < 3 || argv[0] == nullptr || !read_layer_id(env, argv[0], &id) ||
+      napi_get_value_int32(env, argv[1], &index) != napi_ok || index < 0 ||
+      napi_get_value_int32(env, argv[2], &kind) != napi_ok || kind < 0) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  char values_text[512] = {0};
+  if (argc >= 4 && argv[3] != nullptr) {
+    size_t copied = 0;
+    napi_get_value_string_utf8(env, argv[3], values_text, sizeof(values_text), &copied);
+  }
+  const std::vector<std::string> values = split_values(values_text);
+  std::vector<const char*> pointers;
+  pointers.reserve(values.size());
+  for (const std::string& value : values) pointers.push_back(value.c_str());
+
+  size_t need = 0;
+  comp_layer_adjustment_build_settings(static_cast<uint32_t>(kind), pointers.data(),
+                                       pointers.size(), nullptr, 0, &need);
+  if (need == 0) return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  /* 同 add：out_size 不含 NUL，缓冲区要多一位。 */
+  std::string json(need + 1, '\0');
+  if (comp_layer_adjustment_build_settings(static_cast<uint32_t>(kind), pointers.data(),
+                                           pointers.size(), &json[0], json.size(),
+                                           &need) != COMP_OK) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  return MakeInt32(env, static_cast<int32_t>(comp_layer_update_adjustment_at(
+                            g_document, id, static_cast<size_t>(index),
+                            static_cast<uint32_t>(kind), json.c_str())));
+}
+
+/* 删掉第 index 条调整。 */
+napi_value JsRemoveLayerAdjustment(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  int32_t index = -1;
+  if (argc < 2 || argv[0] == nullptr || !read_layer_id(env, argv[0], &id) ||
+      napi_get_value_int32(env, argv[1], &index) != napi_ok || index < 0) {
+    return MakeInt32(env, static_cast<int32_t>(COMP_ERR_INVALID_ARGUMENT));
+  }
+  return MakeInt32(env, static_cast<int32_t>(comp_layer_remove_adjustment(
+                            g_document, id, static_cast<size_t>(index))));
+}
+
+/*
+ * 回填某条调整的当前值：按 param 顺序输出 `value\x1e...`。
+ *
+ * 走引擎的 comp_layer_adjustment_read_value（按 json_path 取值），壳不解析 JSON。
+ * 路径缺失时给缺省值——面板打开时滑块必须有个合理位置，不能是 0。
+ */
+napi_value JsLayerAdjustmentValuesText(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr) return MakeString(env, "");
+  comp_layer_id id = 0;
+  int32_t index = -1;
+  int32_t kind = -1;
+  if (argc < 3 || argv[0] == nullptr || !read_layer_id(env, argv[0], &id) ||
+      napi_get_value_int32(env, argv[1], &index) != napi_ok || index < 0 ||
+      napi_get_value_int32(env, argv[2], &kind) != napi_ok || kind < 0) {
+    return MakeString(env, "");
+  }
+  size_t size = 0;
+  uint32_t stored_kind = 0;
+  if (comp_layer_adjustment_at(g_document, id, static_cast<size_t>(index), &stored_kind,
+                              nullptr, 0, &size) != COMP_OK ||
+      size == 0) {
+    return MakeString(env, "");
+  }
+  /* 同 build_settings：out_size 不含 NUL，缓冲区多一位。 */
+  std::string json(size + 1, '\0');
+  if (comp_layer_adjustment_at(g_document, id, static_cast<size_t>(index), &stored_kind,
+                              &json[0], json.size(), &size) != COMP_OK) {
+    return MakeString(env, "");
+  }
+
+  size_t count = 0;
+  if (comp_layer_adjustment_param_count(static_cast<uint32_t>(kind), &count) != COMP_OK) {
+    return MakeString(env, "");
+  }
+  std::string out;
+  for (size_t i = 0; i < count; ++i) {
+    comp_adjustment_param param;
+    std::memset(&param, 0, sizeof(param));
+    if (comp_layer_adjustment_param_at(static_cast<uint32_t>(kind), i, &param) != COMP_OK) continue;
+    double number = param.default_value;
+    int32_t boolean = param.default_value != 0.0 ? 1 : 0;
+    if (param.json_path != nullptr) {
+      double read_number = 0.0;
+      int32_t read_boolean = 0;
+      if (comp_layer_adjustment_read_value(json.c_str(), param.json_path, &read_number,
+                                           &read_boolean) == COMP_OK) {
+        number = read_number;
+        boolean = read_boolean;
+      }
+    }
+    if (!out.empty()) out += '\x1e';
+    char value[40] = {0};
+    std::snprintf(value, sizeof(value), "%.4f",
+                  static_cast<double>(param.type == COMP_PARAM_BOOL ? boolean : number));
+    out += value;
+  }
+  return MakeString(env, out.c_str());
+}
+
 /*
  * 调整面板联动自检：applyVignette 到底改的是哪一层。
  *
@@ -1922,6 +2204,20 @@ napi_value Init(napi_env env, napi_value exports) {
        napi_default, nullptr},
       {"adjustTargetSelfTest", nullptr, JsAdjustTargetSelfTest, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"adjustKindsText", nullptr, JsAdjustKindsText, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"adjustParamsText", nullptr, JsAdjustParamsText, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"layerAdjustmentsText", nullptr, JsLayerAdjustmentsText, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"addLayerAdjustment", nullptr, JsAddLayerAdjustment, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"updateLayerAdjustmentAt", nullptr, JsUpdateLayerAdjustmentAt, nullptr, nullptr,
+       nullptr, napi_default, nullptr},
+      {"removeLayerAdjustment", nullptr, JsRemoveLayerAdjustment, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"layerAdjustmentValuesText", nullptr, JsLayerAdjustmentValuesText, nullptr, nullptr,
+       nullptr, napi_default, nullptr},
       {"applyVignette", nullptr, JsApplyVignette, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"undo", nullptr, JsUndo, nullptr, nullptr, nullptr, napi_default, nullptr},

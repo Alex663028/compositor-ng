@@ -15,7 +15,9 @@ import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setT
          setLayerVisible, setLayerOpacity, removeLayer, setLayerName, layerPanelSelfTest,
          adjustTargetSelfTest,
          createGroup, moveLayer, setActiveLayer, activeLayer,
-         layerTreeText,
+         layerTreeText, adjustKindsText, adjustParamsText, layerAdjustmentsText,
+         addLayerAdjustment, updateLayerAdjustmentAt, removeLayerAdjustment,
+         layerAdjustmentValuesText,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 import { picker, fileIo } from '@kit.CoreFileKit';
 
@@ -48,6 +50,34 @@ interface LayerRowItem {
   lv: number;
 }
 
+/* 一个调整类型（kind + 规范名）。 */
+interface AdjustKindItem {
+  kind: number;
+  name: string;
+}
+
+/*
+ * 调整的一个可编辑参数。
+ *
+ * 范围与缺省**来自引擎**（comp_adjustment_param），壳不做参数表——壳自己维护
+ * 一份的话，引擎加了参数/改了范围就会分叉。
+ */
+interface AdjustParamItem {
+  path: string;
+  label: string;
+  type: number; /* 0 = 数值（滑杆）/ 1 = 布尔（开关） */
+  min: number;
+  max: number;
+  def: number;
+}
+
+/* 图层上已有的一条调整。 */
+interface AdjustEntry {
+  index: number;
+  kind: number;
+  name: string;
+}
+
 @Entry
 @Component
 struct Index {
@@ -61,6 +91,17 @@ struct Index {
   @State diameter: number = 70;
   @State softness: number = 85;
   @State erasing: boolean = false;
+
+  /*
+   * 页面出现时载入**调整类型清单**。
+   *
+   * 这份清单是引擎的静态表（comp_layer_adjustment_kind_name），不依赖文档，
+   * 所以可以在这里载入。不在这里载的话，用户得先点一次按钮才会出现——
+   * 「调整」区的下拉一直是空的，看着像没做。
+   */
+  aboutToAppear(): void {
+    this.loadAdjustKinds();
+  }
 
   /* 画笔参数改完立刻回读一次摘要，让用户看得见当前笔是什么样。 */
   private syncBrush(): void {
@@ -81,7 +122,45 @@ struct Index {
   @State dragLayerId: number = 0;
   @State dropTargetId: number = 0;
 
+  /*
+   * 折叠的组 id。
+   *
+   * 折叠是**纯 UI 状态**：层级的真相在引擎里，这里只决定「哪些行不显示」。
+   * 所以不写回引擎、不进撤销栈——收起一个组不该能被撤销。
+   */
+  @State collapsedGroups: number[] = [];
+  /* 折叠过滤后的显示行。ForEach 遍历这个，而不是 layerRows（全量树）。 */
+  @State displayRows: LayerRowItem[] = [];
+
+  /*
+   * 多选集合（不含主选中 selectedLayerId）。
+   *
+   * 手机上没有 Shift/Ctrl，所以行首放一个勾选点：点它 = 加入/移出多选，
+   * 点名字 = 单选（并清空多选）。长按不能用来做多选——长按已经归拖行了。
+   */
+  @State multiIds: number[] = [];
+
+  /* 可编辑调整层。 */
+  @State adjustKinds: AdjustKindItem[] = [];
+  @State adjustKindIndex: number = 0;
+  @State adjustParams: AdjustParamItem[] = [];
+  @State adjustValues: number[] = [];
+  @State layerAdjusts: AdjustEntry[] = [];
+  @State editingAdjustIndex: number = -1;
+  @State adjustState: string = '—';
+  /* Select 的选项表（只在载入类型时重建一次）。 */
+  @State adjustKindOptions: SelectOption[] = [];
+
   private refresh(): void {
+    /*
+     * 调整类型清单惰性载入（引擎起来之前调会拿到空串）。
+     *
+     * 放在 refresh 里而不是 aboutToAppear：这份清单要等引擎就绪，而且只需要
+     * 成功一次（loadAdjustKinds 内部有「已有就不重复」的判断）。
+     */
+    if (this.adjustKinds.length === 0) {
+      this.loadAdjustKinds();
+    }
     this.backend = backendName();
     this.surface = surfaceInfo();
     this.layers = layerCount();
@@ -135,6 +214,66 @@ struct Index {
       }
     }
     this.layerRows = next;
+    /* 组被删掉后它的 id 还留在折叠集合里：不清掉的话，哪天 id 被复用会「凭空收起」。 */
+    const alive: number[] = [];
+    for (let i = 0; i < this.collapsedGroups.length; i++) {
+      const id: number = this.collapsedGroups[i];
+      if (this.findLayer(id) !== undefined) {
+        alive.push(id);
+      }
+    }
+    this.collapsedGroups = alive;
+    this.rebuildDisplayRows();
+    this.refreshLayerAdjusts();
+  }
+
+  /* 折叠过滤：祖先链上只要有一个组是收起的，这一行就不显示。 */
+  private rebuildDisplayRows(): void {
+    const out: LayerRowItem[] = [];
+    for (let i = 0; i < this.layerRows.length; i++) {
+      if (!this.hasCollapsedAncestor(this.layerRows[i])) {
+        out.push(this.layerRows[i]);
+      }
+    }
+    this.displayRows = out;
+  }
+
+  private hasCollapsedAncestor(row: LayerRowItem): boolean {
+    let parent: number = row.pp;
+    let guard = 0;
+    while (parent !== 0 && guard < 64) {
+      if (this.collapsedGroups.indexOf(parent) >= 0) {
+        return true;
+      }
+      const ancestor: LayerRowItem | undefined = this.findLayer(parent);
+      if (ancestor === undefined) {
+        break;
+      }
+      parent = ancestor.pp;
+      guard++;
+    }
+    return false;
+  }
+
+  private isCollapsed(id: number): boolean {
+    return this.collapsedGroups.indexOf(id) >= 0;
+  }
+
+  private toggleCollapse(id: number): void {
+    const next: number[] = [];
+    let removed = false;
+    for (let i = 0; i < this.collapsedGroups.length; i++) {
+      if (this.collapsedGroups[i] === id) {
+        removed = true;
+      } else {
+        next.push(this.collapsedGroups[i]);
+      }
+    }
+    if (!removed) {
+      next.push(id);
+    }
+    this.collapsedGroups = next;
+    this.rebuildDisplayRows();
   }
 
 
@@ -162,6 +301,7 @@ struct Index {
      * 在列表里选了 B 层、点「暗角」，被改的还是上次那层。
      */
     setActiveLayer(id);
+    this.refreshLayerAdjusts();
   }
 
   /*
@@ -244,6 +384,324 @@ struct Index {
     } else {
       this.do(label, id);
     }
+  }
+
+  /*
+   * 多选：行首的勾选点切换。
+   *
+   * 为什么不用长按：长按已经归拖行了（拖拽起手就是长按）。同一个手势不能既做
+   * 拖行又做多选——用户拖到一半发现自己"选中"了一堆层，是最糟的体验。
+   */
+  private toggleMulti(id: number): void {
+    const next: number[] = [];
+    let removed = false;
+    for (let i = 0; i < this.multiIds.length; i++) {
+      if (this.multiIds[i] === id) {
+        removed = true;
+      } else {
+        next.push(this.multiIds[i]);
+      }
+    }
+    if (!removed) {
+      next.push(id);
+    }
+    this.multiIds = next;
+  }
+
+  private clearMulti(): void {
+    this.multiIds = [];
+  }
+
+  /* 批量操作的「作用对象」：有多选就用多选，否则就主选中那一个。 */
+  private targetLayerIds(): number[] {
+    if (this.multiIds.length > 0) {
+      return this.multiIds;
+    }
+    return this.selectedLayerId !== 0 ? [this.selectedLayerId] : [];
+  }
+
+  /*
+   * 批量收进新建的组（原位）。
+   *
+   * 顺序：以第一个层原地建组（组落在它的位置上），再把其余的逐个移进组。
+   * 建组读的是**活动层**，所以先把活动层设成第一个——否则建出来是个空组。
+   */
+  private batchGroup(): void {
+    const ids: number[] = this.targetLayerIds();
+    if (ids.length === 0) {
+      this.lastOp = '建组：没有目标';
+      this.refresh();
+      return;
+    }
+    setActiveLayer(ids[0]);
+    const groupId: number = createGroup('组');
+    if (groupId <= 0) {
+      this.do('建组', groupId);
+      return;
+    }
+    let failed = 0;
+    for (let i = 1; i < ids.length; i++) {
+      if (moveLayer(ids[i], groupId, 0) !== 0) {
+        failed++;
+      }
+    }
+    this.selectedLayerId = groupId;
+    setActiveLayer(groupId);
+    this.clearMulti();
+    this.lastOp = '建组 ' + (ids.length - failed).toString() + '/' + ids.length.toString() +
+      (failed === 0 ? ' ✓' : ' ✗');
+    this.refreshLayers();
+    this.refresh();
+  }
+
+  /* 批量移出到根级末尾。 */
+  private batchUngroup(): void {
+    const ids: number[] = this.targetLayerIds();
+    if (ids.length === 0) {
+      this.lastOp = '移出：没有目标';
+      this.refresh();
+      return;
+    }
+    let failed = 0;
+    for (let i = 0; i < ids.length; i++) {
+      if (moveLayer(ids[i], 0, 0) !== 0) {
+        failed++;
+      }
+    }
+    this.clearMulti();
+    this.lastOp = '移出 ' + (ids.length - failed).toString() + '/' + ids.length.toString() +
+      (failed === 0 ? ' ✓' : ' ✗');
+    this.refreshLayers();
+    this.refresh();
+  }
+
+  /*
+   * 批量删除。
+   *
+   * 从**后往前**删：删一个组会连子树一起删，先删后面的层可以避免「按 id 删到
+   * 一半发现前面的树已经没了」。结果只报成功数——部分失败比假成功好，但把
+   * 每一层的错误码刷在状态栏没人看。
+   */
+  private batchDelete(): void {
+    const ids: number[] = this.targetLayerIds();
+    if (ids.length === 0) {
+      this.lastOp = '删除：没有目标';
+      this.refresh();
+      return;
+    }
+    let failed = 0;
+    for (let i = ids.length - 1; i >= 0; i--) {
+      if (removeLayer(ids[i]) !== 0) {
+        failed++;
+      }
+    }
+    this.selectedLayerId = 0;
+    this.clearMulti();
+    this.lastOp = '删除 ' + (ids.length - failed).toString() + '/' + ids.length.toString() +
+      (failed === 0 ? ' ✓' : ' ✗');
+    this.refreshLayers();
+    this.refresh();
+  }
+
+  /* ------------------------------------------------------------ 可编辑调整层 */
+
+  /*
+   * 载入全部调整类型（只做一次；失败就留空，UI 自然不显示选择器）。
+   *
+   * 类型清单**来自引擎**（comp_layer_adjustment_kind_name 能报出名字的就是合法
+   * kind），壳不维护枚举表——上游加一种调整，壳不用改。
+   */
+  private loadAdjustKinds(): void {
+    if (this.adjustKinds.length > 0) {
+      return;
+    }
+    const raw: string = adjustKindsText();
+    const list: AdjustKindItem[] = [];
+    if (raw.length > 0) {
+      const lines: string[] = raw.split('\x1e');
+      for (let i = 0; i < lines.length; i++) {
+        const fields: string[] = lines[i].split('\x1f');
+        if (fields.length < 2) {
+          continue;
+        }
+        const item: AdjustKindItem = { kind: Number(fields[0]), name: fields[1] };
+        list.push(item);
+      }
+    }
+    this.adjustKinds = list;
+    const options: SelectOption[] = [];
+    for (let i = 0; i < list.length; i++) {
+      options.push({ value: list[i].name });
+    }
+    this.adjustKindOptions = options;
+    if (list.length > 0) {
+      this.selectAdjustKind(0);
+    }
+  }
+
+  /* 切到第 index 个调整类型：拉参数元数据 + 用缺省值填满滑块。 */
+  private selectAdjustKind(index: number): void {
+    if (index < 0 || index >= this.adjustKinds.length) {
+      return;
+    }
+    this.adjustKindIndex = index;
+    this.editingAdjustIndex = -1;
+    const kind: number = this.adjustKinds[index].kind;
+    const raw: string = adjustParamsText(kind);
+    const params: AdjustParamItem[] = [];
+    const values: number[] = [];
+    if (raw.length > 0) {
+      const lines: string[] = raw.split('\x1e');
+      for (let i = 0; i < lines.length; i++) {
+        const fields: string[] = lines[i].split('\x1f');
+        if (fields.length < 6) {
+          continue;
+        }
+        const item: AdjustParamItem = {
+          path: fields[0],
+          label: fields[1],
+          type: Number(fields[2]),
+          min: Number(fields[3]),
+          max: Number(fields[4]),
+          def: Number(fields[5])
+        };
+        params.push(item);
+        values.push(item.def);
+      }
+    }
+    this.adjustParams = params;
+    this.adjustValues = values;
+  }
+
+  /* 刷新选中层已有的调整列表。 */
+  private refreshLayerAdjusts(): void {
+    const id: number = this.selectedLayerId;
+    if (id === 0) {
+      this.layerAdjusts = [];
+      return;
+    }
+    const raw: string = layerAdjustmentsText(id);
+    const list: AdjustEntry[] = [];
+    if (raw.length > 0) {
+      const lines: string[] = raw.split('\x1e');
+      for (let i = 0; i < lines.length; i++) {
+        const fields: string[] = lines[i].split('\x1f');
+        if (fields.length < 3) {
+          continue;
+        }
+        const item: AdjustEntry = {
+          index: Number(fields[0]),
+          kind: Number(fields[1]),
+          name: fields[2]
+        };
+        list.push(item);
+      }
+    }
+    this.layerAdjusts = list;
+  }
+
+  /*
+   * 点已有调整 = 进入编辑：切到它的 kind，并把当前值回填到滑块。
+   *
+   * 回填走引擎的 read_value（按 json_path 取值），壳不解析 settings JSON。
+   */
+  private editExistingAdjust(entry: AdjustEntry): void {
+    let target = -1;
+    for (let i = 0; i < this.adjustKinds.length; i++) {
+      if (this.adjustKinds[i].kind === entry.kind) {
+        target = i;
+        break;
+      }
+    }
+    if (target < 0) {
+      this.adjustState = '这个调整类型当前不可编辑';
+      return;
+    }
+    this.selectAdjustKind(target);
+    this.editingAdjustIndex = entry.index;
+    const raw: string = layerAdjustmentValuesText(this.selectedLayerId, entry.index, entry.kind);
+    if (raw.length === 0) {
+      this.adjustState = '回填失败（沿用缺省值）';
+      return;
+    }
+    const parts: string[] = raw.split('\x1e');
+    const values: number[] = [];
+    for (let i = 0; i < this.adjustParams.length; i++) {
+      const text: string = i < parts.length ? parts[i] : '';
+      const parsed: number = Number(text);
+      values.push(Number.isFinite(parsed) ? parsed : this.adjustParams[i].def);
+    }
+    this.adjustValues = values;
+    this.adjustState = '编辑第 ' + (entry.index + 1).toString() + ' 条：' + entry.name;
+  }
+
+  /* 扁平值拼成 \x1f 分隔的串（空串 = 让引擎用缺省）。 */
+  /* 滑杆步长：把范围切成 200 格（整数范围也不至于拖不动）。 */
+  private adjustStep(param: AdjustParamItem): number {
+    const span: number = param.max - param.min;
+    return span > 0 ? span / 200 : 1;
+  }
+
+  private adjustKindName(): string {
+    if (this.adjustKindIndex >= 0 && this.adjustKindIndex < this.adjustKinds.length) {
+      return this.adjustKinds[this.adjustKindIndex].name;
+    }
+    return '';
+  }
+
+  /*
+   * 改一个参数值。
+   *
+   * 必须**整体替换数组**（`this.adjustValues = next`）而不是 `this.adjustValues[i] = v`：
+   * 后者在 ArkUI 里不一定触发重渲染，滑块会「拖了不跟手」。
+   */
+  private setAdjustValue(index: number, value: number): void {
+    const next: number[] = this.adjustValues.slice();
+    next[index] = value;
+    this.adjustValues = next;
+  }
+
+  private adjustValuesText(): string {
+    let text = '';
+    for (let i = 0; i < this.adjustValues.length; i++) {
+      if (i > 0) {
+        text += '\x1f';
+      }
+      text += this.adjustValues[i].toString();
+    }
+    return text;
+  }
+
+  private applyAdjustment(): void {
+    if (this.selectedLayerId === 0) {
+      this.adjustState = '先选一个图层';
+      return;
+    }
+    if (this.adjustParams.length === 0) {
+      this.adjustState = '这个类型没有可编辑参数';
+      return;
+    }
+    const kind: number = this.adjustKinds[this.adjustKindIndex].kind;
+    const values: string = this.adjustValuesText();
+    const rc: number = this.editingAdjustIndex >= 0
+      ? updateLayerAdjustmentAt(this.selectedLayerId, this.editingAdjustIndex, kind, values)
+      : addLayerAdjustment(this.selectedLayerId, kind, values);
+    this.adjustState = (this.editingAdjustIndex >= 0 ? '更新' : '新增') +
+      (rc === 0 ? ' ✓' : (' ✗rc' + rc.toString()));
+    this.editingAdjustIndex = -1;
+    this.refreshLayers();
+    this.refresh();
+  }
+
+  private removeAdjustmentAt(entry: AdjustEntry): void {
+    if (this.selectedLayerId === 0) {
+      return;
+    }
+    const rc: number = removeLayerAdjustment(this.selectedLayerId, entry.index);
+    this.adjustState = '删除' + (rc === 0 ? ' ✓' : (' ✗rc' + rc.toString()));
+    this.editingAdjustIndex = -1;
+    this.refreshLayers();
+    this.refresh();
   }
 
   private toggleLayer(id: number, on: boolean): void {
@@ -524,26 +982,34 @@ struct Index {
          * 根级——拖拽在手机上不一定顺手，这两个按钮是拖行的兜底入口，功能不缺。
          */
         Row({ space: 6 }) {
+          /*
+           * 三个按钮都走**批量**语义：有多选就作用于多选，否则作用于主选中。
+           * 这样「选几个层一起建组」不需要额外的模式开关。
+           */
           Button('建组').fontSize(11).height(28)
             .onClick(() => {
-              this.groupSelectedLayer();
+              this.batchGroup();
             })
           Button('移出').fontSize(11).height(28)
             .onClick(() => {
-              this.ungroupSelectedLayer();
+              this.batchUngroup();
             })
           Button('删除').fontSize(11).height(28)
             .onClick(() => {
-              this.deleteSelectedLayer();
+              this.batchDelete();
             })
-          Text(this.dragLayerId !== 0 ? '拖动中…' : '')
-            .fontSize(10).fontColor('#7fb0ff').layoutWeight(1)
+          Text(this.dragLayerId !== 0 ? '拖动中…'
+            : (this.multiIds.length > 0 ? ('多选 ' + this.multiIds.length.toString() + ' 层')
+              : '单层'))
+            .fontSize(10)
+            .fontColor(this.multiIds.length > 0 ? '#7fb0ff' : '#6a7080')
+            .layoutWeight(1)
         }
         .width('100%')
 
         if (this.layerRows.length > 0) {
           List({ space: 2 }) {
-            ForEach(this.layerRows, (item: LayerRowItem) => {
+            ForEach(this.displayRows, (item: LayerRowItem) => {
               ListItem() {
                 Row({ space: 4 }) {
                   /*
@@ -555,11 +1021,33 @@ struct Index {
                   Text('')
                     .width(item.lv * 14)
                     .height(1)
-                  /* 组标记：组行给一个图标，子层留同宽占位（不对齐会看着像错位）。 */
-                  Text(item.isGroup !== 0 ? '▾' : '')
+                  /*
+                   * 多选勾选点。
+                   *
+                   * 手机上没有 Shift/Ctrl，长按又被拖行占了，所以单独给一个可点的
+                   * 圆点：点它加入/移出多选，点名字才是单选。
+                   */
+                  Text(this.multiIds.indexOf(item.id) >= 0 ? '●' : '○')
+                    .fontSize(12)
+                    .fontColor(this.multiIds.indexOf(item.id) >= 0 ? '#7fb0ff' : '#5a6070')
+                    .width(16)
+                    .textAlign(TextAlign.Center)
+                    .onClick(() => {
+                      this.toggleMulti(item.id);
+                    })
+                  /*
+                   * 组标记兼折叠开关：▾ 展开 / ▸ 收起。子层留同宽占位（不对齐会
+                   * 看着像错位）。点图标才算折叠，点空白不折叠——避免误触。
+                   */
+                  Text(item.isGroup !== 0 ? (this.isCollapsed(item.id) ? '▸' : '▾') : '')
                     .fontSize(11)
                     .fontColor('#8a93a6')
                     .width(12)
+                    .onClick(() => {
+                      if (item.isGroup !== 0) {
+                        this.toggleCollapse(item.id);
+                      }
+                    })
                   Text(item.name)
                     .fontSize(13)
                     .fontColor(item.id === this.selectedLayerId ? '#7fb0ff' : '#d8d8de')
@@ -610,9 +1098,14 @@ struct Index {
              * 的样子——数据明明是对的，界面上却看不出分组（实测踩了很久：
              * `layerTreeText` 里已经是 `p4,l1`，界面上还是 `p0,l0`）。
              */
+            /*
+             * key 还要带上**折叠与多选状态**：这两个变了图标和颜色就得换，
+             * 只用 id 的话 ArkUI 会复用旧节点（本轮踩过：拖进组后缩进不更新）。
+             */
             (item: LayerRowItem) =>
               item.id.toString() + '_' + item.lv.toString() + '_' + item.pp.toString() +
-              '_' + item.name)
+              '_' + item.name + '_c' + (this.isCollapsed(item.id) ? '1' : '0') +
+              '_m' + (this.multiIds.indexOf(item.id) >= 0 ? '1' : '0'))
           }
           .width('100%')
           /*
@@ -647,9 +1140,229 @@ struct Index {
        */
       .padding({ top: 6, bottom: 6 })
       .backgroundColor('#14161a')
+      /*
+       * 调整区（可编辑调整层）放进 Scroll：参数可能十几个，屏幕放不下。
+       *
+       * 这里本来是空的（上一轮把图层面板搬出去固定显示了），正好留给它。
+       */
+      /*
+       * 调整区（可编辑调整层）**固定在画布面板下方**，不放进 Scroll。
+       *
+       * 放 Scroll 里被挤成 0 高（上方画布 + 图层面板 + 四行按钮之后只剩一百多 px），
+       * 「调整」两个字都看不见——等于这个功能没做。宁可让下面的调试按钮去滚，
+       * 也得让调整区露出来。
+       */
+      Column({ space: 6 }) {
+          Row({ space: 6 }) {
+            Text('调整').fontSize(12).fontColor('#9aa4b2')
+            Select(this.adjustKindOptions)
+              .selected(this.adjustKindIndex)
+              .value(this.adjustKindName())
+              .font({ size: 11 })
+              .width(150)
+              .onSelect((index: number) => {
+                this.selectAdjustKind(index);
+              })
+            Button(this.editingAdjustIndex >= 0 ? '更新' : '新增')
+              .fontSize(11)
+              .height(26)
+              .onClick(() => {
+                this.applyAdjustment();
+              })
+            Text(this.adjustState).fontSize(9).fontColor('#8a8a8a').layoutWeight(1).maxLines(1)
+          }
+          .width('100%')
+
+          /*
+           * 选中层已有的调整放在**参数区上面**：放下面会被参数区挡在滚动内容里，
+           * 看得见点不着（实测点击落到了下方的按钮区）。
+           * 点一下进入编辑，点 ✕ 删掉。
+           */
+          /* 选中层已有的调整：点一下进入编辑，点 ✕ 删掉。 */
+          if (this.layerAdjusts.length > 0) {
+            Row({ space: 6 }) {
+              Text('已有').fontSize(10).fontColor('#9aa4b2')
+              ForEach(this.layerAdjusts, (entry: AdjustEntry) => {
+                Row({ space: 3 }) {
+                  Text(entry.name)
+                    .fontSize(10)
+                    .fontColor(this.editingAdjustIndex === entry.index ? '#7fb0ff' : '#c8ccd6')
+                    .onClick(() => {
+                      this.editExistingAdjust(entry);
+                    })
+                  Text('✕')
+                    .fontSize(10)
+                    .fontColor('#c96a6a')
+                    .onClick(() => {
+                      this.removeAdjustmentAt(entry);
+                    })
+                }
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                .backgroundColor('#22262e')
+                .borderRadius(4)
+              }, (entry: AdjustEntry) => entry.index.toString() + '_' + entry.kind.toString())
+            }
+            .width('100%')
+          }
+      }
+      .width('100%')
+      .padding({ top: 4, bottom: 4 })
+      .backgroundColor('#14161a')
+
+      /*
+       * 调试按钮区放进 Scroll：图层面板与调整区已经占满屏幕，这一排排按钮
+       * 再固定就会把末尾的挤没（实测笔刷行直接消失）。它们不常用，可滚即可。
+       */
       Scroll() {
         Column({ space: 8 }) {
+        Row({ space: 8 }) {
+          Button('新建').onClick(() => {
+            // 文档尺寸 = 表面原生尺寸（"WxH|ready"）：present 零几何改配、零缩放，
+            // 撕裂与协商阻塞的根源都在「文档 ≠ 缓冲」的错配上。
+            const info: string = surfaceInfo();
+            const match: RegExpMatchArray | null = info.match(/^(\d+)x(\d+)\|ready$/);
+            const w: number = match !== null ? Number(match[1]) : 2030;
+            const h: number = match !== null ? Number(match[2]) : 456;
+            this.do('新建', newDocument(w, h));
+          })
+          Button('蓝层').onClick(() => {
+            this.addLayerAndSelect(64, 128, 255, 255, '蓝层');
+          })
+          Button('红层').onClick(() => {
+            this.addLayerAndSelect(255, 64, 64, 255, '红层');
+          })
+          Button('暗角').onClick(() => {
+            this.do('暗角', applyVignette(0.7));
+          })
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.SpaceEvenly)
+  
+        Row({ space: 8 }) {
+          Button('撤销').onClick(() => {
+            this.do('撤销', undo());
+          })
+          Button('重做').onClick(() => {
+            this.do('重做', redo());
+          })
+          Button('半透明').onClick(() => {
+            this.do('透明度', setTopOpacity(this.topOpacity));
+          })
+          Button('乘法').onClick(() => {
+            this.do('混合', setTopBlend(2) /* COMP_BLEND_MULTIPLY */);
+          })
+          Button('导出PNG').onClick(() => {
+            const path: string = getContext(this).cacheDir + '/compositor_export.png';
+            const rc: number = exportPng(path);
+            this.exportState = rc === 0 ? path : ('rc' + rc.toString());
+            this.do('导出', rc);
+          })
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.SpaceEvenly)
+  
+        /* P1-2 剩余项：导入图片。此前鸿蒙壳只能建纯色层，照片打不开。 */
+        Row({ space: 8 }) {
+          Button('导入图片').onClick(() => {
+            this.pickAndImport();
+          })
+          Button('导入为文档').onClick(() => {
+            this.pickAndImportAsDocument();
+          })
+          Button('自检').onClick(() => {
+            this.runProbeImport();
+          })
+          Button('验像素').onClick(() => {
+            this.runPixelVerify();
+          })
+          Text(this.importState).fontSize(10).fontColor('#9aa4b2').layoutWeight(1)
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.SpaceEvenly)
+  
+        /* P1-2 画笔可调：此前颜色写死黄、直径写死 70px、没有橡皮擦。
+         * 这四个色块 + 橡皮开关直接改 napi 侧的全局量，下一笔即生效。 */
+        Row({ space: 6 }) {
+          Button('黄').onClick(() => { setBrushColor(255, 220, 40); this.syncBrush(); })
+          Button('红').onClick(() => { setBrushColor(255, 72, 72); this.syncBrush(); })
+          Button('蓝').onClick(() => { setBrushColor(72, 136, 255); this.syncBrush(); })
+          Button('绿').onClick(() => { setBrushColor(72, 200, 128); this.syncBrush(); })
+          Button(this.erasing ? '橡皮 开' : '橡皮 关').onClick(() => {
+            this.erasing = !this.erasing;
+            setBrushErase(this.erasing);
+            this.syncBrush();
+          })
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.SpaceEvenly)
+  
+        Row({ space: 10 }) {
+          Text('粗细').fontSize(12)
+          Slider({ value: this.diameter, min: 1, max: 240, step: 1 })
+            .width(170)
+            .onChange((value: number) => {
+              this.diameter = Math.round(value);
+              setBrushDiameter(this.diameter);
+              this.syncBrush();
+            })
+          Text('硬度').fontSize(12)
+          Slider({ value: this.softness, min: 0, max: 100, step: 5 })
+            .width(130)
+            .onChange((value: number) => {
+              this.softness = Math.round(value);
+              setBrushHardness(this.softness / 100.0);
+              this.syncBrush();
+            })
+          Text(this.brushText).fontSize(11).fontColor('#9aa4b2')
+          }
+          .width('100%')
 
+          /*
+           * 参数控件由**引擎的元数据**生成：范围、缺省、类型都来自
+           * comp_adjustment_param，壳不维护参数表。
+           */
+          Scroll() {
+            Column({ space: 4 }) {
+              ForEach(this.adjustParams, (param: AdjustParamItem, index: number) => {
+                Row({ space: 6 }) {
+                  Text(param.label)
+                    .fontSize(10)
+                    .fontColor('#9aa4b2')
+                    .width(86)
+                    .maxLines(1)
+                  if (param.type === 1) {
+                    Toggle({ type: ToggleType.Switch, isOn: this.adjustValues[index] > 0.5 })
+                      .width(38)
+                      .height(20)
+                      .selectedColor('#3f7fd0')
+                      .onChange((on: boolean) => {
+                        this.setAdjustValue(index, on ? 1 : 0);
+                      })
+                  } else {
+                    Slider({
+                      value: this.adjustValues[index],
+                      min: param.min,
+                      max: param.max,
+                      step: this.adjustStep(param)
+                    })
+                      .layoutWeight(1)
+                      .onChange((value: number) => {
+                        this.setAdjustValue(index, value);
+                      })
+                  }
+                  Text(this.adjustValues[index].toFixed(2))
+                    .fontSize(10)
+                    .fontColor('#9aa4b2')
+                    .width(46)
+                }
+                .width('100%')
+              }, (param: AdjustParamItem, index: number) => param.path + '_' + index.toString())
+            }
+            .width('100%')
+          }
+          /* 参数多时内部滚动（外层不给它无限长：它下面还有按钮区）。 */
+          .height(88)
+          .scrollBar(BarState.Auto)
 
         }
         .width('100%')
@@ -657,110 +1370,8 @@ struct Index {
       .layoutWeight(1)
       .scrollBar(BarState.Auto)
 
-      Row({ space: 8 }) {
-        Button('新建').onClick(() => {
-          // 文档尺寸 = 表面原生尺寸（"WxH|ready"）：present 零几何改配、零缩放，
-          // 撕裂与协商阻塞的根源都在「文档 ≠ 缓冲」的错配上。
-          const info: string = surfaceInfo();
-          const match: RegExpMatchArray | null = info.match(/^(\d+)x(\d+)\|ready$/);
-          const w: number = match !== null ? Number(match[1]) : 2030;
-          const h: number = match !== null ? Number(match[2]) : 456;
-          this.do('新建', newDocument(w, h));
-        })
-        Button('蓝层').onClick(() => {
-          this.addLayerAndSelect(64, 128, 255, 255, '蓝层');
-        })
-        Button('红层').onClick(() => {
-          this.addLayerAndSelect(255, 64, 64, 255, '红层');
-        })
-        Button('暗角').onClick(() => {
-          this.do('暗角', applyVignette(0.7));
-        })
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceEvenly)
-
-      Row({ space: 8 }) {
-        Button('撤销').onClick(() => {
-          this.do('撤销', undo());
-        })
-        Button('重做').onClick(() => {
-          this.do('重做', redo());
-        })
-        Button('半透明').onClick(() => {
-          this.do('透明度', setTopOpacity(this.topOpacity));
-        })
-        Button('乘法').onClick(() => {
-          this.do('混合', setTopBlend(2) /* COMP_BLEND_MULTIPLY */);
-        })
-        Button('导出PNG').onClick(() => {
-          const path: string = getContext(this).cacheDir + '/compositor_export.png';
-          const rc: number = exportPng(path);
-          this.exportState = rc === 0 ? path : ('rc' + rc.toString());
-          this.do('导出', rc);
-        })
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceEvenly)
-
-      /* P1-2 剩余项：导入图片。此前鸿蒙壳只能建纯色层，照片打不开。 */
-      Row({ space: 8 }) {
-        Button('导入图片').onClick(() => {
-          this.pickAndImport();
-        })
-        Button('导入为文档').onClick(() => {
-          this.pickAndImportAsDocument();
-        })
-        Button('自检').onClick(() => {
-          this.runProbeImport();
-        })
-        Button('验像素').onClick(() => {
-          this.runPixelVerify();
-        })
-        Text(this.importState).fontSize(10).fontColor('#9aa4b2').layoutWeight(1)
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceEvenly)
-
-      /* P1-2 画笔可调：此前颜色写死黄、直径写死 70px、没有橡皮擦。
-       * 这四个色块 + 橡皮开关直接改 napi 侧的全局量，下一笔即生效。 */
-      Row({ space: 6 }) {
-        Button('黄').onClick(() => { setBrushColor(255, 220, 40); this.syncBrush(); })
-        Button('红').onClick(() => { setBrushColor(255, 72, 72); this.syncBrush(); })
-        Button('蓝').onClick(() => { setBrushColor(72, 136, 255); this.syncBrush(); })
-        Button('绿').onClick(() => { setBrushColor(72, 200, 128); this.syncBrush(); })
-        Button(this.erasing ? '橡皮 开' : '橡皮 关').onClick(() => {
-          this.erasing = !this.erasing;
-          setBrushErase(this.erasing);
-          this.syncBrush();
-        })
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceEvenly)
-
-      Row({ space: 10 }) {
-        Text('粗细').fontSize(12)
-        Slider({ value: this.diameter, min: 1, max: 240, step: 1 })
-          .width(170)
-          .onChange((value: number) => {
-            this.diameter = Math.round(value);
-            setBrushDiameter(this.diameter);
-            this.syncBrush();
-          })
-        Text('硬度').fontSize(12)
-        Slider({ value: this.softness, min: 0, max: 100, step: 5 })
-          .width(130)
-          .onChange((value: number) => {
-            this.softness = Math.round(value);
-            setBrushHardness(this.softness / 100.0);
-            this.syncBrush();
-          })
-        Text(this.brushText).fontSize(11).fontColor('#9aa4b2')
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.Center)
-
     }
+    .justifyContent(FlexAlign.Center)
     .width('100%')
     .height('100%')
     .padding(14)

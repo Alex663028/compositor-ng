@@ -150,6 +150,46 @@ export const applyVignette: (amount: number) => number;
  * @returns "target=red ok=1 red=R->R blue=R->R"（ok=1 表示只改了选中层）
  */
 export const adjustTargetSelfTest: () => string;
+
+/* ---------------------------------------------------------- 可编辑调整层 */
+
+/*
+ * 所有合法的调整类型：`kind\x1fname`，行间 `\x1e`。
+ *
+ * 类型清单**来自引擎**（comp_layer_adjustment_kind_name 能报出名字的就是合法
+ * kind），壳不维护枚举表。
+ */
+export const adjustKindsText: () => string;
+
+/*
+ * 某类型的可编辑参数：
+ *   `json_path\x1flabel\x1ftype\x1fmin\x1fmax\x1fdefault`，行间 `\x1e`
+ *
+ * type：0 = 数值（滑杆）/ 1 = 布尔（开关）。范围与缺省来自引擎的参数元数据。
+ */
+export const adjustParamsText: (kind: number) => string;
+
+/** 图层上已有的调整：`index\x1fkind\x1fname`，行间 `\x1e`。 */
+export const layerAdjustmentsText: (id: number) => string;
+
+/**
+ * 加一条调整。values 是 `\x1f` 分隔的扁平值（按 param 顺序，空串 = 用缺省）。
+ * settings JSON 由引擎组装（壳不写 JSON）。
+ */
+export const addLayerAdjustment: (id: number, kind: number, values: string) => number;
+
+/** 按索引替换一条调整（kind 与值一并替换）。 */
+export const updateLayerAdjustmentAt: (id: number, index: number, kind: number,
+                                       values: string) => number;
+
+/** 删掉第 index 条调整。 */
+export const removeLayerAdjustment: (id: number, index: number) => number;
+
+/**
+ * 回填某条调整的当前值（按 param 顺序，`\x1e` 分隔）。
+ * 走引擎的 read_value（按 json_path 取值），壳不解析 settings JSON。
+ */
+export const layerAdjustmentValuesText: (id: number, index: number, kind: number) => string;
 /** 撤销一步。@returns comp_result（2 = 无可撤销） */
 export const undo: () => number;
 /** 重做一步。@returns comp_result */

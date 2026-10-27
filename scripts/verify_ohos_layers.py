@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""鸿蒙壳的图层验证（模拟器）：分组 / 缩进 / 拖行 / 调整目标。
+"""鸿蒙壳的图层验证（模拟器）：分组 / 缩进 / 拖行 / 折叠 / 多选 / 调整层。
 
 为什么要有这个脚本：鸿蒙侧的验证此前是「手敲 hdc 命令 + 硬编码屏幕坐标」，
 布局一改坐标就全错——实测把「蓝层」点到了「导入图片」上（弹出文件选择器把
@@ -8,6 +8,9 @@
 
 另一条教训：模拟器上画布上不了屏（OPT-21b），所以「分组有没有生效」「暗角
 打在哪个层」这些事**光看屏幕验不了**，只能读回引擎状态 / 像素来比。
+
+覆盖（16 项）：分组与缩进 / 拖进组 / 引擎侧自检 / 折叠 / 多选批量建组 /
+可编辑调整层（新增·编辑·删除）/ 调整只作用于选中层。
 
 用法（模拟器已启动、HAP 已装）：
 
@@ -110,6 +113,18 @@ class Device:
                    ((source[0] + source[2]) // 2, (source[1] + source[3]) // 2,
                     (target[0] + target[2]) // 2, (target[1] + target[3]) // 2))
         time.sleep(wait)
+
+    def tap_box(self, box, wait=2.0):
+        """按 bounds 点中心（同一个文本出现多次时，用坐标指定点哪一个）。"""
+        self.shell("uitest uiInput click %d %d" % ((box[0] + box[2]) // 2,
+                                                  (box[1] + box[3]) // 2))
+        time.sleep(wait)
+
+    def boxes_of(self, text):
+        """某个文本出现的全部位置，按 y 排序（上到下）。"""
+        out = [box for _, value, box in self.texts() if value == text]
+        out.sort(key=lambda item: item[1])
+        return out
 
     def layer_rows(self):
         """图层列表里的行：[(name, x, y, box)]，按 y 排序（x 反映缩进）。
@@ -214,6 +229,105 @@ def main():
     report.check("图层面板自检全绿（列表/显隐/透明度/改名/分组/拖行/活动层/删除）",
                  "group=1" in selftest and "ungroup=1" in selftest and
                  "active=1" in selftest and "del=1" in selftest, selftest)
+
+    print("\n=== 四、折叠（组可收起） ===")
+    device.tap("新建", 2)
+    device.tap("蓝层", 2)
+    device.tap("蓝层", 2)
+    device.tap("建组", 3)
+    rows = device.layer_rows()
+    collapsed_before = len(rows)
+    icons = device.boxes_of("▾")
+    if icons:
+        device.tap_box(icons[0], 2)
+        rows_collapsed = device.layer_rows()
+        report.check("点组行的 ▾ 收起子层（行数变少）",
+                     len(rows_collapsed) < collapsed_before,
+                     "收起前 %d 行 -> 收起后 %d 行" % (collapsed_before, len(rows_collapsed)))
+        expand = device.boxes_of("▸")
+        if expand:
+            device.tap_box(expand[0], 2)
+            rows_expanded = device.layer_rows()
+            report.check("点 ▸ 展开（子层回来）",
+                         len(rows_expanded) == collapsed_before,
+                         "%d 行 -> %d 行" % (len(rows_collapsed), len(rows_expanded)))
+        else:
+            report.check("点 ▸ 展开", False, "找不到 ▸ 图标")
+    else:
+        report.check("折叠", False, "找不到 ▾ 图标")
+
+    print("\n=== 五、多选与批量建组 ===")
+    device.tap("新建", 2)
+    device.tap("蓝层", 2)
+    device.tap("蓝层", 2)
+    marks = device.boxes_of("○")
+    if len(marks) >= 2:
+        device.tap_box(marks[0], 1.5)
+        # 勾一个之后圆点变 ●，剩下的 ○ 会前移，重新取
+        rest_marks = device.boxes_of("○")
+        if rest_marks:
+            device.tap_box(rest_marks[0], 2)
+        multi_text = ""
+        for _, value, _ in device.texts():
+            if "多选" in value:
+                multi_text = value
+        report.check("勾选两个层后提示「多选 2 层」", "多选 2" in multi_text, multi_text)
+        before = len(device.layer_rows())
+        device.tap("建组", 3)
+        rows_after = device.layer_rows()
+        base_x = min([row[1] for row in rows_after]) if rows_after else 0
+        indented = [row for row in rows_after if row[1] > base_x + 10]
+        line = status_line(device)
+        report.check("批量建组：两个层一起收进新组",
+                     "建组 2/2" in line and len(indented) >= 2,
+                     "%s / 缩进 %d 行" % (line, len(indented)))
+    else:
+        report.check("多选", False, "勾选点不足两个")
+
+    print("\n=== 六、可编辑调整层 ===")
+    device.tap("蓝层", 2)
+    device.tap("新增", 3)
+    added = ""
+    for _, value, _ in device.texts():
+        if value.startswith("新增"):
+            added = value
+    report.check("新增一条调整（引擎拼 JSON，rc=0）", "✓" in added, added)
+    has_existing = False
+    for _, value, _ in device.texts():
+        if value == "已有":
+            has_existing = True
+    report.check("该层「已有」列表里出现这条调整", has_existing, "")
+    entries = device.boxes_of("Hue/Saturation")
+    if len(entries) >= 2:
+        device.tap_box(entries[-1], 2)
+        edit_state = ""
+        button_text = ""
+        for _, value, _ in device.texts():
+            if value.startswith("编辑第"):
+                edit_state = value
+            if value in ("更新", "新增"):
+                button_text = value
+        report.check("点已有条目进入编辑（按钮变「更新」+ 回填提示）",
+                     button_text == "更新" and edit_state != "",
+                     "%s / %s" % (button_text, edit_state))
+        # 删掉这条调整（点「已有」行里的 ✕，不是图层面板那个「删除」按钮）
+        crosses = device.boxes_of("✕")
+        if crosses:
+            device.tap_box(crosses[0], 3)
+            removed = ""
+            for _, value, _ in device.texts():
+                if value.startswith("删除"):
+                    removed = value
+            still_there = False
+            for _, value, _ in device.texts():
+                if value == "已有":
+                    still_there = True
+            report.check("点 ✕ 删掉这条调整（引擎里也没了）",
+                         "✓" in removed and not still_there, removed)
+        else:
+            report.check("删除调整", False, "找不到 ✕")
+    else:
+        report.check("已有条目可点", False, "找不到两条 Hue/Saturation")
 
     device.tap("调自检", 3)
     adjust = ""
