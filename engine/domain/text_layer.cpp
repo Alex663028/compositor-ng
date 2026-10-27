@@ -152,6 +152,9 @@ void text_layer_validate(const TextObject& text, TextLayerReport* report) {
   style.line_height = text.style.line_height;
   style.letter_spacing = text.style.letter_spacing;
   style.antialias = text.style.antialias;
+  style.bold = text.style.bold != 0;
+  style.italic = text.style.italic != 0;
+  style.baseline_offset = text.style.baseline_offset;
   /* 文本与样式的参数闸完全复用 type_raster 的判定（两轨同一把尺子），
    * 这里只借 measure 拿错误码，不关心量出来的宽高。 */
   /*
@@ -223,6 +226,9 @@ TextLayerReport text_layer_render(const TextObject& text, int32_t canvas_width,
   style.line_height = text.style.line_height;
   style.letter_spacing = text.style.letter_spacing;
   style.antialias = text.style.antialias;
+  style.bold = text.style.bold != 0;
+  style.italic = text.style.italic != 0;
+  style.baseline_offset = text.style.baseline_offset;
 
   /*
    * 段落模式（P0-6 ③）：三个字段任一非默认就按段落走；全默认时下面的代码与

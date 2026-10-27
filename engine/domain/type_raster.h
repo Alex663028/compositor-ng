@@ -61,6 +61,12 @@ struct TypeRasterStyle {
   double letter_spacing = 0.0;
   /* 非 0 = 抗锯齿（逐像素精确面积覆盖率）；0 = 像素中心一票（硬边）。 */
   bool antialias = true;
+  /* ---- T14（2026-10-27）：合成粗体 / 斜体 / 基线偏移 ----
+   * 三者都为 0 时渲染路径与 T14 之前逐字节相同（有护栏）。
+   * 不引真实粗斜字体：bold 用双描、italic 用剪切，与 PS 的「合成」同思路。 */
+  bool bold = false;
+  bool italic = false;
+  double baseline_offset = 0.0; /* 文档像素 */
 };
 
 /* 文本度量（文档像素；width/height 是文本框尺寸）。 */

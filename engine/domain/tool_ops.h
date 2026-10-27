@@ -437,6 +437,10 @@ struct TypeStyle {
   double letter_spacing = 0.0;
   /* 非 0 = 抗锯齿（精确面积覆盖率）；0 = 像素中心一票（硬边）。 */
   int32_t antialias = 1;
+  /* T14（2026-10-27）：合成粗体 / 斜体 / 基线偏移；全 0 时渲染逐字节不变。 */
+  int32_t bold = 0;
+  int32_t italic = 0;
+  double baseline_offset = 0.0;
 };
 
 /*

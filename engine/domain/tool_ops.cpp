@@ -1138,6 +1138,9 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       style.line_height = type.style.line_height;
       style.letter_spacing = type.style.letter_spacing;
       style.antialias = type.style.antialias != 0;
+      style.bold = type.style.bold != 0;
+      style.italic = type.style.italic != 0;
+      style.baseline_offset = type.style.baseline_offset;
       TypeMeasure measure;
       const TypeRasterReport report =
           type.font != nullptr
@@ -2064,6 +2067,9 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
       style.line_height = type.style.line_height;
       style.letter_spacing = type.style.letter_spacing;
       style.antialias = type.style.antialias != 0;
+      style.bold = type.style.bold != 0;
+      style.italic = type.style.italic != 0;
+      style.baseline_offset = type.style.baseline_offset;
 
       TypeCoverage raster;
       int64_t missing_glyphs = 0;

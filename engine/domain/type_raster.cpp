@@ -602,6 +602,90 @@ TypeRasterReport type_measure_text(const char* text, size_t size, const TypeRast
   return report;
 }
 
+/*
+ * T14（2026-10-27）：合成粗体 / 斜体 / 基线偏移的后处理。
+ *
+ * 为什么做成**后处理**而不是改光栅化内核：两条渲染路径（点阵 AA / 字体轨道）
+ * 各有自己的覆盖度累加循环，改内核等于把「字形几何」的知识复制两份。而粗体
+ * （双描向右偏一点点再叠一次最大值）与斜体（逐行横向剪切）本质上都是**对已渲染
+ * 覆盖度图的整体变换**，一次后处理即可覆盖两条路径，且 bold=italic=offset=0 时
+ * 可以整段跳过——护栏断言「三者全 0 时逐字节等同 T14 之前」因此天然成立。
+ *
+ * 代价（如实记）：斜体是逐行整数像素剪切，边缘会有 1px 台阶，不是真斜体字形；
+ * 粗体是双描，笔画端点比真粗体钝。两者与 PS 的「合成」口径同级，不是替代真字体。
+ */
+namespace {
+
+/* 把覆盖度图按「逐行横向剪切」重采样：x' = x + round(-shear * (y - anchor))。
+ * shear 取 1/4（约 14°），与 PS 合成斜体的观感接近。 */
+void shear_coverage(TypeCoverage& coverage, double shear, int64_t anchor_y) {
+  if (coverage.w <= 0 || coverage.h <= 0) return;
+  std::vector<uint8_t> source = coverage.coverage;
+  std::fill(coverage.coverage.begin(), coverage.coverage.end(), static_cast<uint8_t>(0));
+  for (int32_t row = 0; row < coverage.h; ++row) {
+    const int64_t absolute_y = static_cast<int64_t>(coverage.y) + row + anchor_y;
+    const int64_t shift = static_cast<int64_t>(std::llround(-shear * static_cast<double>(absolute_y)));
+    const size_t src_base = static_cast<size_t>(row) * static_cast<size_t>(coverage.w);
+    for (int32_t column = 0; column < coverage.w; ++column) {
+      const uint8_t value = source[src_base + static_cast<size_t>(column)];
+      if (value == 0) continue;
+      const int64_t target = static_cast<int64_t>(column) + shift;
+      if (target < 0 || target >= coverage.w) continue;
+      uint8_t& slot = coverage.coverage[src_base + static_cast<size_t>(target)];
+      if (value > slot) slot = value;
+    }
+  }
+}
+
+/* 合成粗体：整幅向右平移 `step` 像素再按最大值叠回去（双描）。 */
+void embolden_coverage(TypeCoverage& coverage, int32_t step) {
+  if (step <= 0 || coverage.w <= 0 || coverage.h <= 0) return;
+  std::vector<uint8_t> source = coverage.coverage;
+  for (int32_t row = 0; row < coverage.h; ++row) {
+    const size_t base = static_cast<size_t>(row) * static_cast<size_t>(coverage.w);
+    for (int32_t column = 0; column + step < coverage.w; ++column) {
+      const uint8_t value = source[base + static_cast<size_t>(column)];
+      if (value == 0) continue;
+      uint8_t& slot = coverage.coverage[base + static_cast<size_t>(column) + static_cast<size_t>(step)];
+      if (value > slot) slot = value;
+    }
+  }
+}
+
+/* T14 后处理入口：两条渲染路径（点阵 / 字体轨道）都在最后调用它。
+ *
+ * 为什么必须抽出来：字体轨道有**自己的**字形绘制循环（type_rasterize_with_font），
+ * 我第一版只在点阵路径的 return 前接了后处理，结果「用了随仓字体就完全没效果」——
+ * 测试里 bold 前后像素逐字节相同。这正是「两条路径各写一份」的经典陷阱。 */
+void apply_synthetic_style(TypeCoverage& coverage, const TypeRasterStyle& style,
+                           double origin_y) {
+  if (style.italic) {
+    shear_coverage(coverage, 0.25, static_cast<int64_t>(std::llround(origin_y)));
+  }
+  if (style.bold) {
+    /* 双描位移按字号取 1/12 em，至少 1 像素（太小看不出，太大变胖）。 */
+    const int32_t step = std::max(1, static_cast<int32_t>(std::llround(style.font_size / 12.0)));
+    embolden_coverage(coverage, step);
+  }
+  if (style.baseline_offset != 0.0 && coverage.h > 0 && coverage.w > 0) {
+    const int32_t shift = static_cast<int32_t>(std::llround(style.baseline_offset));
+    if (shift != 0) {
+      std::vector<uint8_t> source = coverage.coverage;
+      std::fill(coverage.coverage.begin(), coverage.coverage.end(), static_cast<uint8_t>(0));
+      const size_t row_bytes = static_cast<size_t>(coverage.w);
+      for (int32_t row = 0; row < coverage.h; ++row) {
+        const int32_t target = row - shift;
+        if (target < 0 || target >= coverage.h) continue;
+        std::copy(source.begin() + static_cast<size_t>(row) * row_bytes,
+                  source.begin() + static_cast<size_t>(row + 1) * row_bytes,
+                  coverage.coverage.begin() + static_cast<size_t>(target) * row_bytes);
+      }
+    }
+  }
+}
+
+}  // namespace
+
 TypeRasterReport type_rasterize(const char* text, size_t size, const TypeRasterStyle& style,
                                 double origin_x, double origin_y, int32_t layer_x, int32_t layer_y,
                                 int32_t layer_width, int32_t layer_height, TypeCoverage* out) {
@@ -635,6 +719,8 @@ TypeRasterReport type_rasterize(const char* text, size_t size, const TypeRasterS
   } else {
     rasterize_hard_edged(layout, origin_x, origin_y, win_x0, win_y0, win_x1, win_y1, out);
   }
+  /* T14：粗体 / 斜体 / 基线偏移的后处理（三条全 0 时内部整段跳过）。 */
+  apply_synthetic_style(*out, style, origin_y);
   return make_report(TypeRasterStatus::kOk, "");
 }
 
@@ -742,6 +828,9 @@ TypeRasterReport type_rasterize_with_font(const char* text, size_t size,
   }
 
   if (out_missing_glyphs != nullptr) *out_missing_glyphs = missing;
+  /* T14：字体轨道走自己的绘制循环，后处理必须在这里再调一次——
+   * 只在点阵路径接会得到「换成随仓字体后粗体完全没反应」。 */
+  apply_synthetic_style(*out, style, origin_y);
   return make_report(TypeRasterStatus::kOk, "");
 }
 

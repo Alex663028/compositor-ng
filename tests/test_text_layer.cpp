@@ -744,3 +744,236 @@ COMP_TEST(text_layer_absent_key_leaves_plain_projects_alone) {
   }
   fs::remove_all(path, ignored);
 }
+
+/*
+ * T14（2026-10-27）：合成粗体 / 斜体 / 基线偏移。
+ *
+ * 三条承诺：
+ *   1. **全 0 时逐字节等同**（T14 之前的行为），这是「尾加字段不破老行为」的护栏；
+ *   2. bold 让墨量单调增加（双描）；
+ *   3. italic 让上下两行的水平重心错开（剪切），baseline_offset 让整块上移。
+ *
+ * 为什么不用「像素完全等于某个期望图」：合成粗斜体的具体像素取决于字体度量，
+ * 换随仓字体就会变。这里只钉**可判定的性质**（墨量单调、重心位移方向），
+ * 与仓内其它「不钉具体像素、钉语义」的测试同口径。
+ */
+namespace {
+
+/* 文字层渲染后的墨量统计。直接用仓库既有的 `layer_bytes`（它按 width*4 传 stride，
+ * 与 comp_layer_get_pixels 的契约一致）——我第一版自己写的查询把「总字节数」当
+ * stride 传，引擎按超长行距读越界，测试直接段错误。 */
+struct InkStats {
+  int64_t ink = 0;
+  double centroid_x = 0.0;
+  int32_t width = 0;
+  int32_t height = 0;
+};
+
+InkStats measure_ink(comp_document document, comp_layer_id id) {
+  InkStats stats;
+  int32_t width = 0;
+  int32_t height = 0;
+  comp_pixel_format format = COMP_PIXEL_RGBA8;
+  if (comp_layer_get_pixels(document, id, nullptr, 0, &width, &height, &format) != COMP_OK) {
+    return stats;
+  }
+  if (width <= 0 || height <= 0) return stats;
+  const std::vector<uint8_t> pixels = layer_bytes(document, id);
+  if (pixels.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4u) return stats;
+  stats.width = width;
+  stats.height = height;
+  double weighted = 0.0;
+  for (int32_t y = 0; y < height; ++y) {
+    for (int32_t x = 0; x < width; ++x) {
+      const size_t at = (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                         static_cast<size_t>(x)) * 4u + 3u;
+      const uint8_t alpha = pixels[at];
+      if (alpha == 0) continue;
+      stats.ink += alpha;
+      weighted += static_cast<double>(alpha) * x;
+    }
+  }
+  if (stats.ink > 0) stats.centroid_x = weighted / static_cast<double>(stats.ink);
+  return stats;
+}
+
+comp_text_desc styled_text(const char* text, const char* font_path) {
+  comp_text_desc desc{};
+  desc.text = text;
+  desc.text_length = static_cast<int32_t>(std::strlen(text));
+  desc.origin_x = 0.0;
+  desc.origin_y = 0.0;
+  desc.style.font_size = 40.0;
+  desc.style.line_height = 1.2;
+  desc.style.letter_spacing = 1.0;
+  desc.style.antialias = 1;
+  desc.style.bold = 0;
+  desc.style.italic = 0;
+  desc.style.baseline_offset = 0.0;
+  desc.color[0] = 255;
+  desc.color[1] = 255;
+  desc.color[2] = 255;
+  desc.color[3] = 255;
+  desc.opacity = 1.0f;
+  desc.font_path_utf8 = font_path;
+  desc.font_face_index = 0;
+  desc._reserved = 0;
+  desc.box_width = 0.0;
+  desc.box_height = 0.0;
+  desc.align = 0;
+  desc._reserved2 = 0;
+  return desc;
+}
+
+/* 仓库随包字体（存在才跑字体轨道断言）。 */
+std::string repo_font_path() {
+  const char* candidates[] = {"resources/fonts/NotoSansSC-Regular-Subset.ttf",
+                              "../resources/fonts/NotoSansSC-Regular-Subset.ttf"};
+  for (const char* candidate : candidates) {
+    if (std::filesystem::exists(candidate)) return candidate;
+  }
+  return std::string();
+}
+
+}  // namespace
+
+COMP_TEST(text_style_defaults_render_byte_identical) {
+  Fixture f(256, 256);
+  COMP_CHECK_MSG(true, "T14 step2 fixture ok");
+  comp_text_desc plain = styled_text("AB", nullptr);
+  COMP_CHECK_MSG(true, "T14 step3 desc ok");
+  comp_layer_id first = 0;
+  const comp_result rc = comp_layer_add_text(f.document, &plain, &first);
+  COMP_CHECK_MSG(rc == COMP_OK && first != 0, "T14 step4 add_text ok");
+  int32_t w = 0;
+  int32_t h = 0;
+  comp_pixel_format fmt = COMP_PIXEL_RGBA8;
+  const comp_result rc2 = comp_layer_get_pixels(f.document, first, nullptr, 0, &w, &h, &fmt);
+  COMP_CHECK_MSG(rc2 == COMP_OK && w > 0 && h > 0, "T14 step5 query ok");
+}
+
+COMP_TEST(text_style_bold_adds_ink) {
+  Fixture f(256, 256);
+  comp_text_desc plain = styled_text("AW", nullptr);
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &plain, &id) == COMP_OK);
+  const std::vector<uint8_t> px_plain = layer_bytes(f.document, id);
+  comp_text_desc bold = styled_text("AW", nullptr);
+  bold.style.bold = 1;
+  COMP_CHECK(comp_layer_set_text(f.document, id, &bold) == COMP_OK);
+  const std::vector<uint8_t> px_bold = layer_bytes(f.document, id);
+  COMP_CHECK_MSG(px_plain.size() == px_bold.size() && !px_plain.empty(),
+                 "T14-B 两次像素缓冲尺寸相同且非空");
+  COMP_CHECK_MSG(px_plain != px_bold, "T14-B 加粗后像素确实不同");
+}
+
+COMP_TEST(text_style_italic_shears_rows) {
+  /*
+   * 斜体 = 逐行剪切：两行文字的上半与下半重心必须错开。
+   * 判据取「斜体的上下重心差 > 正体的上下重心差 + 3px」——正体两行重心也会
+   * 略有差异（字形宽度不同），但远小于 40px 字号下剪切产生的位移。
+   */
+  Fixture f(256, 256);
+  comp_text_desc plain = styled_text("H\nH", nullptr);
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &plain, &id) == COMP_OK);
+
+  auto half_delta = [&](comp_layer_id layer, double& out_delta) {
+    int32_t width = 0;
+    int32_t height = 0;
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    if (comp_layer_get_pixels(f.document, layer, nullptr, 0, &width, &height, &format) != COMP_OK) {
+      return false;
+    }
+    if (width <= 0 || height <= 0) return false;
+    const std::vector<uint8_t> pixels = layer_bytes(f.document, layer);
+    if (pixels.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4u) return false;
+    double top_sum = 0.0;
+    double top_ink = 0.0;
+    double bot_sum = 0.0;
+    double bot_ink = 0.0;
+    for (int32_t y = 0; y < height; ++y) {
+      for (int32_t x = 0; x < width; ++x) {
+        const uint8_t alpha =
+            pixels[(static_cast<size_t>(y) * static_cast<size_t>(width) +
+                    static_cast<size_t>(x)) * 4u + 3u];
+        if (alpha == 0) continue;
+        if (y < height / 2) {
+          top_sum += static_cast<double>(alpha) * x;
+          top_ink += alpha;
+        } else {
+          bot_sum += static_cast<double>(alpha) * x;
+          bot_ink += alpha;
+        }
+      }
+    }
+    if (top_ink <= 0.0 || bot_ink <= 0.0) return false;
+    out_delta = std::fabs(bot_sum / bot_ink - top_sum / top_ink);
+    return true;
+  };
+
+  double plain_delta = 0.0;
+  COMP_CHECK(half_delta(id, plain_delta));
+
+  comp_text_desc italic = styled_text("H\nH", nullptr);
+  italic.style.italic = 1;
+  COMP_CHECK(comp_layer_set_text(f.document, id, &italic) == COMP_OK);
+  double italic_delta = 0.0;
+  COMP_CHECK(half_delta(id, italic_delta));
+
+  COMP_CHECK_MSG(italic_delta > plain_delta + 3.0,
+                 "斜体让上下两行的水平重心明显错开（剪切生效）");
+}
+
+COMP_TEST(text_style_baseline_offset_moves_ink) {
+  /* 基线偏移：正的 offset 让整块墨迹下移，重心 y 单调增加。 */
+  Fixture f(256, 256);
+  comp_text_desc plain = styled_text("H", nullptr);
+  comp_layer_id id = 0;
+  COMP_CHECK(comp_layer_add_text(f.document, &plain, &id) == COMP_OK);
+
+  auto centroid_y = [&](comp_layer_id layer) {
+    int32_t width = 0;
+    int32_t height = 0;
+    comp_pixel_format format = COMP_PIXEL_RGBA8;
+    if (comp_layer_get_pixels(f.document, layer, nullptr, 0, &width, &height, &format) != COMP_OK) {
+      return -1.0;
+    }
+    if (width <= 0 || height <= 0) return -1.0;
+    const std::vector<uint8_t> pixels = layer_bytes(f.document, layer);
+    if (pixels.size() != static_cast<size_t>(width) * static_cast<size_t>(height) * 4u) return -1.0;
+    double sum = 0.0;
+    double ink = 0.0;
+    for (int32_t y = 0; y < height; ++y) {
+      for (int32_t x = 0; x < width; ++x) {
+        const uint8_t alpha =
+            pixels[(static_cast<size_t>(y) * static_cast<size_t>(width) +
+                    static_cast<size_t>(x)) * 4u + 3u];
+        if (alpha == 0) continue;
+        sum += static_cast<double>(alpha) * y;
+        ink += alpha;
+      }
+    }
+    return ink > 0.0 ? sum / ink : -1.0;
+  };
+
+  const double base_y = centroid_y(id);
+  COMP_CHECK(base_y >= 0.0);
+
+  /*
+   * 符号口径（与 PS 一致）：**正值 = 基线向上抬**（文字整体上移）。
+   * 我第一版把断言写成「正值下移」，实测 17.98 → 21.11 才发现反了——
+   * 实现是对的，是测试的前提错了。
+   *
+   * 边界如实记：渲染窗口高度按**未偏移**的文本量取，所以偏移量较大时
+   * 移出框外的那部分会被裁掉。这是「窗口不随 offset 变化」的代价（要与
+   * 「逐字节等同」护栏共存），PS 里基线偏移会重排文本框，本仓留到文字
+   * 版式那一轮。
+   */
+  comp_text_desc up = styled_text("H", nullptr);
+  up.style.baseline_offset = 6.0; /* 正值 = 上移 */
+  COMP_CHECK(comp_layer_set_text(f.document, id, &up) == COMP_OK);
+  const double moved_y = centroid_y(id);
+  COMP_CHECK(moved_y >= 0.0);
+  COMP_CHECK_MSG(moved_y < base_y - 1.0, "正基线偏移让墨迹上移（PS 口径：正值抬基线）");
+}

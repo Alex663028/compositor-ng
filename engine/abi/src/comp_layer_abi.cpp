@@ -203,6 +203,11 @@ bool text_desc_to_object(const comp_text_desc* desc, compositor::TextObject* out
   out->style.line_height = desc->style.line_height;
   out->style.letter_spacing = desc->style.letter_spacing;
   out->style.antialias = desc->style.antialias != 0;
+  /* T14：三个尾部追加字段必须在这里搬到内部结构，否则「宿主设了、引擎不知道」——
+   * 我第一版漏了这三行，测试表现为「bold 前后像素逐字节相同」。 */
+  out->style.bold = desc->style.bold != 0;
+  out->style.italic = desc->style.italic != 0;
+  out->style.baseline_offset = desc->style.baseline_offset;
   for (int i = 0; i < 4; ++i) out->color[i] = desc->color[i];
   out->opacity = desc->opacity;
   out->font_path = desc->font_path_utf8 != nullptr ? desc->font_path_utf8 : "";
@@ -2303,6 +2308,9 @@ comp_result comp_layer_get_text(comp_document document, comp_layer_id id,
     out_desc->style.line_height = text.style.line_height;
     out_desc->style.letter_spacing = text.style.letter_spacing;
     out_desc->style.antialias = text.style.antialias ? 1 : 0;
+    out_desc->style.bold = text.style.bold ? 1 : 0;
+    out_desc->style.italic = text.style.italic ? 1 : 0;
+    out_desc->style.baseline_offset = text.style.baseline_offset;
     for (int i = 0; i < 4; ++i) out_desc->color[i] = text.color[i];
     out_desc->opacity = text.opacity;
     out_desc->font_path_utf8 = text.font_path.empty() ? nullptr : text.font_path.c_str();
