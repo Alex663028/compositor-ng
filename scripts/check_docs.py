@@ -443,17 +443,29 @@ elif parity is not None:
 
 print("[7] ps-parity 证据基准 HEAD（WARN 级）")
 if parity is not None:
-    try:
-        head_now = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
-                                  capture_output=True, text=True, timeout=10).stdout.strip()
-    except Exception:
-        head_now = ""
-    mh = re.search(r"HEAD\s*`([0-9a-f]{7,40})`", parity[:1600])
+    def _last_source_commit() -> str:
+        """最近一次改动源码（engine/ shells/ tests/）的提交。
+
+        文档记的是**代码基线**，不是「当前 HEAD」：只改文档的提交不应让它过期，
+        否则每提交一次文档就要重算一次分数，反而逼人改数字。
+        """
+        try:
+            out = subprocess.run(
+                ["git", "-C", ROOT, "log", "-1", "--format=%h", "--",
+                 "engine", "shells", "tests"],
+                capture_output=True, text=True, timeout=10).stdout.strip()
+            return out
+        except Exception:
+            return ""
+
+    head_now = _last_source_commit()
+    mh = re.search(r"(?:代码基线|HEAD)\s*\**\s*`([0-9a-f]{7,40})`", parity[:1800])
     if mh and head_now:
         if not head_now.startswith(mh.group(1)[:7]):
-            warn("ps-parity 证据基准", f"文档 HEAD={mh.group(1)[:7]}，当前 HEAD={head_now}（宜重算）")
+            warn("ps-parity 代码基线",
+                 f"文档={mh.group(1)[:7]}，最近源码提交={head_now}（代码变了，宜重算）")
         else:
-            print(f"  [PASS] ps-parity 证据基准 HEAD: {mh.group(1)[:7]} == 当前")
+            print(f"  [PASS] ps-parity 代码基线: {mh.group(1)[:7]} == 最近源码提交")
 
 # ------------------------------------------------------------------ 汇总
 print()
