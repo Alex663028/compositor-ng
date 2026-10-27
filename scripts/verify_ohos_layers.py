@@ -120,6 +120,29 @@ class Device:
                                                   (box[1] + box[3]) // 2))
         time.sleep(wait)
 
+    def scroll_page(self, dy=500):
+        """把整页往下滚一段（dy > 0 = 内容上移，露出屏幕下面的东西）。
+
+        为什么需要：页面内容（画布 + 状态 + 常用按钮 + 图层面板 + 调整区 + 调试区）
+        比一屏高，整页是一个 Scroll。`dumpLayout` **只回可视节点**——参数区、
+        「已有」行在屏幕外时 `find` 直接找不到，于是断言会拿到空列表、点击会静默
+        返回 False，看起来像功能坏了（2026-10-27 实测）。
+
+        起点选 (2700, 1100)：屏幕右侧、图层标题上方的空白带，不落在内层 List 与
+        参数区 Scroll 上，滑动不会被它们抢走。
+        """
+        self.shell("uitest uiInput swipe 2700 1100 2700 %d" % (1100 - dy))
+        time.sleep(0.9)
+
+    def find_scrolled(self, needle, tries=3):
+        """先直接找；找不到就整页往下滚再找。返回 box 或 None。"""
+        for _ in range(tries + 1):
+            box = self.find(needle)
+            if box is not None:
+                return box
+            self.scroll_page()
+        return None
+
     def boxes_of(self, text):
         """某个文本出现的全部位置，按 y 排序（上到下）。"""
         out = [box for _, value, box in self.texts() if value == text]
@@ -129,16 +152,21 @@ class Device:
     def layer_rows(self):
         """图层列表里的行：[(name, x, y, box)]，按 y 排序（x 反映缩进）。
 
-        只取**列表区域**（「图层」标题之下、「不透明度」行之上）里的非输入框文本：
-        改名输入框里的层名、状态栏里的文字都不能算作列表行。
+        行范围的判据用**行首勾选点 ○ 的 y 区间**，不用「图层标题 → 不透明度行」：
+        整页改成可滚动之后，不透明度行在层多时会滚出屏幕，`dumpLayout` 只回可视
+        节点，那个下边界会读成 None，整个列表被判成空——而界面上行明明都在。
         """
         rows = self.texts()
-        title = self.find("图层", rows)
-        opacity = self.find("不透明度", rows)
-        if title is None or opacity is None:
-            return []
-        top = title[1] + 20
-        bottom = opacity[1]
+        marks = [box for kind, text, box in rows if text == "○"]
+        if marks:
+            top = min(box[1] for box in marks) - 12
+            bottom = max(box[3] for box in marks) + 12
+        else:
+            title = self.find("图层", rows)
+            if title is None:
+                return []
+            top = title[1] + 20
+            bottom = 1 << 20
         out = []
         for kind, text, box in rows:
             if kind == "TextInput":
@@ -327,6 +355,8 @@ def main():
         if value.startswith("新增"):
             added = value
     report.check("新增一条调整（引擎拼 JSON，rc=0）", "✓" in added, added)
+    # 「已有」行在参数区下面：整页往下滚一段才在可视区（dumpLayout 只回可视节点）。
+    device.scroll_page()
     has_existing = False
     for _, value, _ in device.texts():
         if value == "已有":
@@ -436,6 +466,7 @@ def main():
     if solids:
         device.tap_box(solids[0][3], 2)
     device.tap("新增", 3)
+    device.scroll_page()
     entries = device.boxes_of("Hue/Saturation")
     if len(entries) >= 2:
         # 最后一个 y 最大的是「已有」行里的条目（第一个是类型下拉自己）。
@@ -450,6 +481,71 @@ def main():
                      edit_state or "（没有回填提示）")
     else:
         report.check("回填按路径", False, "找不到「已有」条目（%d 个 Hue/Saturation）" % len(entries))
+
+    print("\n=== 十、图层蒙版 ===")
+    fresh_document(device)
+    device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if solids:
+        device.tap_box(solids[0][3], 2)
+    device.tap("蒙版", 4)
+    line = status_line(device)
+    mask_marks = device.boxes_of("蒙")
+    report.check("从透明度建立蒙版（图层 alpha -> 选区 -> coverage -> mask）",
+                 "已从透明度建立蒙版" in line, line)
+    report.check("该行出现「蒙」标记", len(mask_marks) >= 1, "标记 %d 个" % len(mask_marks))
+    device.tap("蒙版", 4)
+    line_after = status_line(device)
+    marks_after = device.boxes_of("蒙")
+    report.check("再点一次清除蒙版", "蒙版已清除" in line_after, line_after)
+    report.check("清除后「蒙」标记消失", len(marks_after) == 0, "标记 %d 个" % len(marks_after))
+
+    print("\n=== 十一、色阶通道分页 ===")
+    fresh_document(device)
+    device.tap("蓝层", 2)
+    rows = device.layer_rows()
+    solids = [row for row in rows if row[0].startswith("solid")]
+    if solids:
+        device.tap_box(solids[0][3], 2)
+    # 打开调整类型下拉 -> 选 Levels
+    device.tap("Hue/Saturation", 2)
+    levels_box = None
+    for _, text, box in device.texts():
+        if text == "Levels":
+            levels_box = box
+            break
+    if levels_box is not None:
+        device.tap_box(levels_box, 3)
+    # 参数区在通道条下面，整页往下滚一段才看得见（否则 dump 里一条参数都没有）。
+    device.scroll_page()
+
+    def adjust_labels():
+        """当前页显示出来的参数标签（引擎给的 label，形如 "RGB Black"）。"""
+        out = []
+        for kind, text, _ in device.texts():
+            if kind == "Text" and any(key in text for key in
+                                      ("Black", "Gamma", "White", "OutLo", "OutHi")):
+                out.append(text)
+        return out
+
+    channels = []
+    for kind, text, _ in device.texts():
+        if kind == "Text" and text in ("RGB", "R", "G", "B"):
+            channels.append(text)
+    report.check("色阶出现 4 个通道页（RGB / R / G / B）",
+                 channels == ["RGB", "R", "G", "B"], "%s" % (channels,))
+    default_labels = adjust_labels()
+    report.check("默认页只显示当前通道的参数（不是 20 条全平铺）",
+                 len(default_labels) <= 5 and
+                 any(label.startswith("RGB ") for label in default_labels),
+                 "%s" % (default_labels,))
+    device.tap("R", 2)
+    red_labels = adjust_labels()
+    report.check("切到 R 通道后参数换成 R 那一组",
+                 any(label.startswith("R ") for label in red_labels) and
+                 not any(label.startswith("RGB ") for label in red_labels),
+                 "%s" % (red_labels,))
 
     if not args.keep:
         device.shell("aa force-stop %s" % BUNDLE)

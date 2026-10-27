@@ -49,6 +49,7 @@
 #include "compositor/comp_io.h"
 #include "compositor/comp_layer.h"
 #include "compositor/comp_render.h"
+#include "compositor/comp_selection.h"
 #include "compositor/comp_undo.h"
 
 namespace {
@@ -104,6 +105,9 @@ struct LayerRowEntry {
    */
   int32_t blend = 0;
   int64_t clipping = 0;
+  /* 有没有图层蒙版（2026-10-27）。蒙版已在引擎里参与合成，面板不显示的话，
+   * 用户会看到「这层有一部分是透明的，但透明度是 100%」——最难查的那类。 */
+  int32_t has_mask = 0;
 };
 std::vector<LayerRowEntry> g_layer_rows;
 uint32_t g_doc_width = 0;
@@ -622,6 +626,105 @@ napi_value JsToggleLayerClipping(napi_env env, napi_callback_info info) {
                             comp_layer_set_clipping_source(g_document, id, base)));
 }
 
+/* ---------------------------------------------------------------- 图层蒙版 */
+
+/*
+ * 某层有没有蒙版：返回 `"w,h"`（有）或空串（没有）。
+ *
+ * 为什么不回传像素：蒙版是一张 8 位灰度图，文档大时几 MB，而跨 NAPI 边界传
+ * 二进制在 ArkTS 侧不稳定（见 importImageBytes 的注释）。面板要的只是「有没有、
+ * 多大」，像素只走引擎内部。
+ */
+napi_value JsLayerMask(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeString(env, "");
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeString(env, "");
+  int32_t has_mask = 0;
+  int32_t width = 0;
+  int32_t height = 0;
+  if (comp_layer_get_mask(g_document, id, &has_mask, &width, &height) != COMP_OK ||
+      has_mask == 0) {
+    return MakeString(env, "");
+  }
+  char text[48] = {0};
+  std::snprintf(text, sizeof(text), "%d,%d", width, height);
+  return MakeString(env, text);
+}
+
+/*
+ * 从图层自身的透明度建立蒙版（PS 的 Layer > Layer Mask > From Transparency）。
+ *
+ * 走「图层 alpha -> 选区 -> coverage -> 图层蒙版」这条路，而不是自己读像素再按
+ * transform 合成：图层可能有缩放/旋转/翻转，自己合成等于把引擎的坐标映射再实现
+ * 一遍（Windows 侧同一个坑踩过——映射错了蒙版与画面错位，而屏幕上只表现为
+ * 「蒙版边缘有点怪」，很难归因）。
+ *
+ * 代价是中途改了一次文档选区，所以**无论成败最后都 deselect**：鸿蒙壳没有选区
+ * UI，留着它会让后续操作（滤镜、裁剪）莫名其妙只作用于那一块。
+ *
+ * 返回：0 成功；-2 图层没有可用像素（组 / 空层）；-3 拿不到 coverage；
+ *       -4 建立蒙版失败；-5 图层完全透明（拒绝建一张全黑蒙版——那等于「点一下
+ *       这层就没了」，用户无法理解）。
+ */
+napi_value JsMaskFromTransparency(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, -1);
+  if (g_doc_width == 0 || g_doc_height == 0) return MakeInt32(env, -1);
+
+  int32_t changed = 0;
+  if (comp_selection_load_layer(g_document, id, COMP_SELECTION_LOAD_PIXELS,
+                                COMP_SELECTION_REPLACE, 0, &changed) != COMP_OK) {
+    return MakeInt32(env, -2);
+  }
+
+  const size_t pixel_count = static_cast<size_t>(g_doc_width) * g_doc_height;
+  std::vector<uint8_t> coverage(pixel_count, 0);
+  comp_mask mask{};
+  mask.width = static_cast<int32_t>(g_doc_width);
+  mask.height = static_cast<int32_t>(g_doc_height);
+  mask.stride = static_cast<size_t>(g_doc_width);
+  mask.pixels = coverage.data();
+
+  int32_t result = 0;
+  if (comp_selection_get_coverage(g_document, &mask) != COMP_OK) {
+    result = -3;
+  } else {
+    bool any = false;
+    for (size_t i = 0; i < pixel_count; ++i) {
+      if (coverage[i] != 0) {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      result = -5;
+    } else if (comp_layer_set_mask(g_document, id, &mask) != COMP_OK) {
+      result = -4;
+    }
+  }
+  /* 收尾一定要清：这次选区只是建蒙版的中转物，不该留给用户。 */
+  comp_selection_deselect(g_document, &changed);
+  return MakeInt32(env, result);
+}
+
+/* 清除图层蒙版。没有蒙版时也返回 0（幂等——面板上按一下不该报错）。 */
+napi_value JsRemoveLayerMask(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (g_document == nullptr || argc < 1) return MakeInt32(env, -1);
+  comp_layer_id id = 0;
+  if (!read_layer_id(env, argv[0], &id)) return MakeInt32(env, -1);
+  return MakeInt32(env, static_cast<int32_t>(comp_layer_set_mask(g_document, id, nullptr)));
+}
+
 /* ---------------------------------------------------------------- 图层面板 */
 
 /*
@@ -709,6 +812,12 @@ int32_t build_layer_rows() {
     if (comp_layer_get_blend(g_document, row.id, &blend) == COMP_OK) {
       row.blend = static_cast<int32_t>(blend);
     }
+    int32_t has_mask = 0;
+    int32_t mask_w = 0;
+    int32_t mask_h = 0;
+    if (comp_layer_get_mask(g_document, row.id, &has_mask, &mask_w, &mask_h) == COMP_OK) {
+      row.has_mask = has_mask != 0 ? 1 : 0;
+    }
     g_layer_rows.push_back(row);
     for (size_t child : children[index]) self(self, child, level + 1);
   };
@@ -761,6 +870,8 @@ napi_value JsLayerTreeText(napi_env env, napi_callback_info info) {
     out += std::to_string(row.blend);
     out += '\x1f';
     out += std::to_string(static_cast<long long>(row.clipping));
+    out += '\x1f';
+    out += row.has_mask != 0 ? "1" : "0";
   }
   return MakeString(env, out.c_str());
 }
@@ -2397,6 +2508,11 @@ napi_value Init(napi_env env, napi_value exports) {
        nullptr},
       {"toggleLayerClipping", nullptr, JsToggleLayerClipping, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"layerMask", nullptr, JsLayerMask, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"maskFromTransparency", nullptr, JsMaskFromTransparency, nullptr, nullptr, nullptr,
+       napi_default, nullptr},
+      {"removeLayerMask", nullptr, JsRemoveLayerMask, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
       {"setLayerVisible", nullptr, JsSetLayerVisible, nullptr, nullptr, nullptr, napi_default,
        nullptr},
       {"setLayerOpacity", nullptr, JsSetLayerOpacity, nullptr, nullptr, nullptr, napi_default,

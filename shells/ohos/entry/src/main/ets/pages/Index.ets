@@ -19,6 +19,7 @@ import { presentStage, presentDiag, touchCount, newDocument, addSolidLayer, setT
          addLayerAdjustment, updateLayerAdjustmentAt, removeLayerAdjustment,
          layerAdjustmentValuesText,
          blendModesText, setLayerBlend, layerClipping, toggleLayerClipping,
+         maskFromTransparency, removeLayerMask,
          setBrushColor, setBrushDiameter, setBrushHardness, setBrushErase, brushInfo } from 'libcompositor.so';
 import { picker, fileIo } from '@kit.CoreFileKit';
 
@@ -58,6 +59,13 @@ interface LayerRowItem {
    */
   blend: number;
   clip: number;
+  /*
+   * 有没有图层蒙版（0/1）。
+   *
+   * 蒙版已在引擎里参与合成，面板不显示的话，用户看到的是「这层有一部分是透明的，
+   * 但透明度明明是 100%」——那类问题几乎没有用户能自己定位。
+   */
+  mask: number;
 }
 
 /* 一个调整类型（kind + 规范名）。 */
@@ -86,6 +94,13 @@ interface AdjustEntry {
   index: number;
   kind: number;
   name: string;
+}
+
+/* 调整参数区当前页的一条（存的是参数在 adjustParams 里的全局下标）。
+ * 用对象而不是裸 number：本页其它 ForEach 都是对象数组，形状统一后行为可预期，
+ * 也方便以后往里加「这一行是否禁用」之类的字段。 */
+interface AdjustPageItem {
+  index: number;
 }
 
 /* 一个混合模式（引擎枚举值 + 界面名）。清单来自引擎，壳不维护枚举表。 */
@@ -182,7 +197,26 @@ struct Index {
   @State blendModes: BlendModeItem[] = [];
   @State blendOptions: SelectOption[] = [];
   @State blendIndex: number = 0;
-  @State clipState: string = '—';
+  /* 图层属性行的状态文本（剪贴 / 蒙版共用一行显示）。 */
+  @State propState: string = '—';
+
+  /*
+   * 调整参数的**通道分页**。
+   *
+   * 色阶有 4 通道 × 5 参 = 20 条滑杆，全平铺在一个 88vp 高的 Scroll 里等于没有
+   * （一屏只能看到两条，还得滚）。Windows 壳早就是「按通道分页」，鸿蒙这边一直
+   * 是平铺。
+   *
+   * 分组依据是参数路径里的 `ranges.<数字>`，**不是硬编码「4 通道 / 每通道 5 条」**：
+   * 那组数字在引擎的参数表里，引擎加通道或加参数时，壳跟着改就会漏。
+   */
+  @State adjustChannelKeys: string[] = [''];
+  @State adjustChannelLabels: string[] = [];
+  @State adjustChannelIndex: number = 0;
+  /* 当前页显示的参数（对象数组，见 AdjustPageItem 的说明）。 */
+  @State adjustPageItems: AdjustPageItem[] = [];
+  /* 每个参数属于哪个通道键（切页时按它重算当前页）。 */
+  @State adjustParamChannel: string[] = [];
 
   private refresh(): void {
     /*
@@ -245,9 +279,10 @@ struct Index {
           isGroup: Number(fields[4]),
           pp: Number(fields[5]),
           lv: Number(fields[6]),
-          /* 第 8/9 列是 2026-10-27 追加的：旧版本只给 7 列，缺列按「普通/不剪贴」。 */
+          /* 第 8/9/10 列是 2026-10-27 追加的：旧版本只给 7 列，缺列按「普通/不剪贴/无蒙版」。 */
           blend: fields.length > 7 ? Number(fields[7]) : 0,
-          clip: fields.length > 8 ? Number(fields[8]) : 0
+          clip: fields.length > 8 ? Number(fields[8]) : 0,
+          mask: fields.length > 9 ? Number(fields[9]) : 0
         };
         next.push(row);
       }
@@ -638,7 +673,7 @@ struct Index {
    */
   private toggleClipping(): void {
     if (this.selectedLayerId === 0) {
-      this.clipState = '先选一个图层';
+      this.propState = '先选一个图层';
       this.lastOp = '剪贴：未选中';
       this.refresh();
       return;
@@ -646,15 +681,51 @@ struct Index {
     const rc: number = toggleLayerClipping(this.selectedLayerId);
     if (rc === 0) {
       const base: number = layerClipping(this.selectedLayerId);
-      this.clipState = base > 0 ? ('剪贴 → #' + base.toString()) : '不剪贴';
+      this.propState = base > 0 ? ('剪贴 → #' + base.toString()) : '不剪贴';
     } else if (rc === -2) {
-      this.clipState = '下方没有同组图层';
+      this.propState = '下方没有同组图层';
     } else if (rc === -3) {
-      this.clipState = '下方图层不在同一组';
+      this.propState = '下方图层不在同一组';
     } else {
-      this.clipState = '失败 rc' + rc.toString();
+      this.propState = '剪贴 ✗rc' + rc.toString();
     }
-    this.lastOp = '剪贴 ' + this.clipState;
+    this.lastOp = '剪贴 ' + this.propState;
+    this.refreshLayers();
+    this.refresh();
+  }
+
+  /*
+   * 图层蒙版开关。
+   *
+   * 「从透明度建立」是 PS 的 Layer > Layer Mask > From Transparency：图层 alpha
+   * 非零的地方留白、透明的地方留黑。鸿蒙侧没有选区工具，这是唯一能凭空造出蒙版
+   * 的入口（Windows 侧那条「从选区建立蒙版」在这里缺前置条件）。
+   */
+  private toggleMask(): void {
+    if (this.selectedLayerId === 0) {
+      this.propState = '先选一个图层';
+      this.lastOp = '蒙版：未选中';
+      this.refresh();
+      return;
+    }
+    const row: LayerRowItem | undefined = this.findLayer(this.selectedLayerId);
+    const has: boolean = row !== undefined && row.mask !== 0;
+    if (has) {
+      const rc: number = removeLayerMask(this.selectedLayerId);
+      this.propState = rc === 0 ? '蒙版已清除' : ('清蒙版 ✗rc' + rc.toString());
+    } else {
+      const rc: number = maskFromTransparency(this.selectedLayerId);
+      if (rc === 0) {
+        this.propState = '已从透明度建立蒙版';
+      } else if (rc === -2) {
+        this.propState = '这层没有像素（组不能建蒙版）';
+      } else if (rc === -5) {
+        this.propState = '这层完全透明，建蒙版会整层消失';
+      } else {
+        this.propState = '建蒙版 ✗rc' + rc.toString();
+      }
+    }
+    this.lastOp = '蒙版 ' + this.propState;
     this.refreshLayers();
     this.refresh();
   }
@@ -727,6 +798,82 @@ struct Index {
     }
     this.adjustParams = params;
     this.adjustValues = values;
+    this.adjustChannelIndex = 0;
+    this.rebuildAdjustPages();
+  }
+
+  /*
+   * 按参数路径里的 `ranges.<数字>` 把参数分成通道页。
+   *
+   * 只认这一条**结构**，不认具体数字：色阶是 4×5，别的 kind 可能没有这个维度
+   * （路径里没有 ranges → 只有一页）。引擎加通道或改每通道参数个数时，这里自动跟上。
+   *
+   * 通道名取该组第一条参数的 label 首词（引擎给的是 "RGB Black" / "R Black" …），
+   * 壳不维护第二份通道名表——中文名要改只改引擎一处。
+   */
+  private rebuildAdjustPages(): void {
+    const keys: string[] = [];
+    for (let i = 0; i < this.adjustParams.length; i++) {
+      const match: RegExpMatchArray | null = this.adjustParams[i].path.match(/ranges\.(\d+)\./);
+      keys.push(match !== null ? match[1] : '');
+    }
+    this.adjustParamChannel = keys;
+
+    const unique: string[] = [];
+    for (let i = 0; i < keys.length; i++) {
+      if (unique.indexOf(keys[i]) < 0) {
+        unique.push(keys[i]);
+      }
+    }
+    if (unique.length === 0) {
+      unique.push('');
+    }
+    const labels: string[] = [];
+    for (let i = 0; i < unique.length; i++) {
+      let label = 'CH' + i.toString();
+      for (let j = 0; j < keys.length; j++) {
+        if (keys[j] === unique[i]) {
+          const words: string[] = this.adjustParams[j].label.split(' ');
+          if (words.length > 0 && words[0].length > 0) {
+            label = words[0];
+          }
+          break;
+        }
+      }
+      labels.push(label);
+    }
+    this.adjustChannelKeys = unique;
+    this.adjustChannelLabels = labels;
+    if (this.adjustChannelIndex < 0 || this.adjustChannelIndex >= unique.length) {
+      this.adjustChannelIndex = 0;
+    }
+    this.applyAdjustPage();
+  }
+
+  /* 按当前通道重算这一页显示哪些参数（存的是**全局下标**，值仍写回 adjustValues）。 */
+  private applyAdjustPage(): void {
+    const current: string = this.adjustChannelIndex < this.adjustChannelKeys.length
+      ? this.adjustChannelKeys[this.adjustChannelIndex] : '';
+    const page: AdjustPageItem[] = [];
+    for (let i = 0; i < this.adjustParamChannel.length; i++) {
+      if (this.adjustParamChannel[i] === current) {
+        page.push({ index: i });
+      }
+    }
+    if (page.length === 0) {
+      for (let i = 0; i < this.adjustParams.length; i++) {
+        page.push({ index: i });
+      }
+    }
+    this.adjustPageItems = page;
+  }
+
+  private selectAdjustChannel(index: number): void {
+    if (index === this.adjustChannelIndex) {
+      return;
+    }
+    this.adjustChannelIndex = index;
+    this.applyAdjustPage();
   }
 
   /* 刷新选中层已有的调整列表。 */
@@ -1066,10 +1213,11 @@ struct Index {
     this.do('验像素', rc);
   }
   build() {
-    Column({ space: 10 }) {
+    Scroll() {
+      Column({ space: 10 }) {
       Text('Compositor · PS 基础功能')
-        .fontSize(20)
-        .fontWeight(FontWeight.Medium)
+        .fontSize(14)
+        .fontColor('#9aa4b2')
 
       XComponent({
         id: 'compositor_surface',
@@ -1078,10 +1226,12 @@ struct Index {
       })
         .width('100%')
         /*
-         * 画布高度 200 -> 150：图层面板要固定在画布下方，手机（尤其竖屏）垂直
-         * 空间就那么多——画布让出 50vp，换图层面板（最常看的一块）不用滚。
+         * 画布高度 200 -> 150 -> 120：整页内容（画布 + 状态 + 常用按钮 + 图层面板
+         * + 调整区 + 调试区）在竖屏上放不下，Column 会把可压缩的子元素按比例压扁
+         * ——调整参数区被压成 0 高，色阶的滑杆一条都看不见。画布再让 30vp 出来，
+         * 把空间还给参数区（2026-10-27 实测）。
          */
-        .height(150)
+        .height(120)
         .backgroundColor('#101418')
         /* surface 建好之后才读得到真实后端/尺寸；不在这里刷新，界面会一直停在
          * 硬编码的 'None' / 'absent'，看起来像初始化失败（2026-10-26 实测）。 */
@@ -1094,10 +1244,9 @@ struct Index {
           this.refreshLayers();
         })
 
-      Text('后端 ' + this.backend + ' · 表面 ' + this.surface + ' · 上屏 ' + this.presentState)
-        .fontSize(12)
-      Text('S' + presentStage().toString() + ' 触' + touchCount().toString() + ' · 图层 ' + this.layers.toString() + ' · 撤销 ' + this.undoState + ' · 最近 ' + this.lastOp + ' · 导出 ' + this.exportState)
-        .fontSize(12)
+      /* 两行状态并成一行：竖屏高度很紧，这一条信息量足够，省下的一行给参数区。 */
+      Text('S' + presentStage().toString() + ' · 触' + touchCount().toString() + ' · 图层 ' + this.layers.toString() + ' · 撤销 ' + this.undoState + ' · 最近 ' + this.lastOp + ' · 上屏 ' + this.presentState)
+        .fontSize(11)
       Text(this.diag)
         .fontSize(9)
         .fontColor('#8a8a8a')
@@ -1105,14 +1254,38 @@ struct Index {
         .textAlign(TextAlign.Center)
 
       /*
-       * 图层面板自检按钮放在 **Scroll 之外**。
+       * 常用操作行（新建 / 加层 / 暗角）。
        *
-       * 为什么：ArkUI 的 Scroll 会把落在它身上的触摸先当成滚动处理，按钮的
-       * onClick 常常不触发（实测「层自检」放在 Scroll 内的图层面板标题行上，
-       * 连点多次都点不动；移到 Scroll 外一按就响）。控件放在会被滚动容器
-       * 吞触摸的位置，等于放了个点不着的按钮。
+       * 从底部调试区**搬到这里**：整页可滚之后，调试区落在屏幕最下沿，加一层
+       * 之后图层面板长高、按钮再往下走，最后两次点击只生效一次（验证脚本实测
+       * 只加到 1 层）。新建与加层是最高频的两个动作，不该需要先滚一下才点得到。
+       *
+       * 放在 Scroll 之外的固定区，与下面自检行同一层。
        */
       Row({ space: 8 }) {
+        Button('新建').onClick(() => {
+          // 文档尺寸 = 表面原生尺寸（"WxH|ready"）：present 零几何改配、零缩放，
+          // 撕裂与协商阻塞的根源都在「文档 ≠ 缓冲」的错配上。
+          const info: string = surfaceInfo();
+          const match: RegExpMatchArray | null = info.match(/^(\d+)x(\d+)\|ready$/);
+          const w: number = match !== null ? Number(match[1]) : 2030;
+          const h: number = match !== null ? Number(match[2]) : 456;
+          this.do('新建', newDocument(w, h));
+        })
+        Button('蓝层').onClick(() => {
+          this.addLayerAndSelect(64, 128, 255, 255, '蓝层');
+        })
+        Button('红层').onClick(() => {
+          this.addLayerAndSelect(255, 64, 64, 255, '红层');
+        })
+        Button('暗角').onClick(() => {
+          this.do('暗角', applyVignette(0.7));
+        })
+        /*
+         * 两个自检按钮并进同一行：它们原本单独占一行，竖屏高度紧，这一行让给
+         * 调整参数区更值。放在这里（而不是底部 Scroll 里）的理由是——ArkUI 的
+         * Scroll 会把落在它身上的触摸先当滚动处理，按钮常常点不动。
+         */
         Button('层自检').fontSize(11).height(28)
           .onClick(() => {
             this.runLayerPanelSelfTest();
@@ -1197,11 +1370,11 @@ struct Index {
         .width('100%')
 
         /*
-         * 混合模式 + 剪贴蒙版。
+         * 图层属性行：混合模式 / 剪贴蒙版 / 图层蒙版。
          *
-         * 两者都是**已参与像素求值**的图层属性，此前鸿蒙侧完全没有入口：混合只有
-         * 一个写死「乘法」的演示按钮，剪贴根本没接（引擎的 set_clipping_source
-         * 早就能用）。用户遇到「画面不对但透明度都对」时无从下手。
+         * 三者都是**已参与像素求值**的属性，此前鸿蒙侧完全没有入口：混合只有
+         * 一个写死「乘法」的演示按钮，剪贴与蒙版根本没接（引擎早就能用）。
+         * 用户遇到「画面不对但透明度都对」时无从下手。
          */
         Row({ space: 6 }) {
           Text('混合').fontSize(11).fontColor('#9aa4b2')
@@ -1209,7 +1382,7 @@ struct Index {
             .selected(this.blendIndex)
             .value(this.blendModeName())
             .font({ size: 11 })
-            .width(140)
+            .width(132)
             .onSelect((index: number) => {
               this.applyBlend(index);
             })
@@ -1217,7 +1390,11 @@ struct Index {
             .onClick(() => {
               this.toggleClipping();
             })
-          Text(this.clipState).fontSize(10).fontColor('#8a8a8a').layoutWeight(1).maxLines(1)
+          Button('蒙版').fontSize(11).height(28)
+            .onClick(() => {
+              this.toggleMask();
+            })
+          Text(this.propState).fontSize(10).fontColor('#8a8a8a').layoutWeight(1).maxLines(1)
         }
         .width('100%')
 
@@ -1281,6 +1458,11 @@ struct Index {
                     .fontColor('#e0a44a')
                     .width(11)
                     .textAlign(TextAlign.Center)
+                  Text(item.mask !== 0 ? '蒙' : '')
+                    .fontSize(9)
+                    .fontColor('#c98ae0')
+                    .width(11)
+                    .textAlign(TextAlign.Center)
                   Text(item.blend !== 0 ? '混' : '')
                     .fontSize(9)
                     .fontColor('#7fb0ff')
@@ -1336,8 +1518,9 @@ struct Index {
               item.id.toString() + '_' + item.lv.toString() + '_' + item.pp.toString() +
               '_' + item.name + '_c' + (this.isCollapsed(item.id) ? '1' : '0') +
               '_m' + (this.multiIds.indexOf(item.id) >= 0 ? '1' : '0') +
-              /* 混合模式与剪贴标记同理：状态变了必须换节点，否则行内标记不更新。 */
-              '_b' + item.blend.toString() + '_k' + item.clip.toString())
+              /* 混合模式 / 剪贴 / 蒙版标记同理：状态变了必须换节点，否则行内标记不更新。 */
+              '_b' + item.blend.toString() + '_k' + item.clip.toString() +
+              '_x' + item.mask.toString())
           }
           .width('100%')
           /*
@@ -1436,6 +1619,77 @@ struct Index {
             }
             .width('100%')
           }
+
+          /*
+           * 通道分页条：只在参数确实按通道分组时出现（色阶是这样，色相/饱和度不是）。
+           *
+           * 不分页的话，色阶的 20 条滑杆全挤在下面那个 88vp 的 Scroll 里——一屏
+           * 只能看到两条，「调一个参数要滚半天」，等于这个功能不可用。
+           */
+          if (this.adjustChannelLabels.length > 1) {
+            Row({ space: 4 }) {
+              ForEach(this.adjustChannelLabels, (label: string, index: number) => {
+                Text(label)
+                  .fontSize(10)
+                  .fontColor(this.adjustChannelIndex === index ? '#0d0f13' : '#9aa4b2')
+                  .backgroundColor(this.adjustChannelIndex === index ? '#7fb0ff' : '#22262e')
+                  .padding({ left: 9, right: 9, top: 3, bottom: 3 })
+                  .borderRadius(3)
+                  .onClick(() => {
+                    this.selectAdjustChannel(index);
+                  })
+              }, (label: string, index: number) => label + '_' + index.toString())
+              Text('通道').fontSize(9).fontColor('#6a7080').layoutWeight(1).textAlign(TextAlign.End)
+            }
+            .width('100%')
+          }
+
+          /*
+           * 参数控件由**引擎的元数据**生成：范围、缺省、类型都来自
+           * comp_adjustment_param，壳不维护参数表。
+           *
+           * 遍历的是当前通道页（adjustPageItems，存全局下标），不是全部参数：
+           * 值仍写回 adjustValues[全局下标]，提交时一次序列化整份，分页只是"看得见
+           * 哪几条"，不影响写回格式。
+           */
+          Column({ space: 4 }) {
+              ForEach(this.adjustPageItems, (pageItem: AdjustPageItem) => {
+                Row({ space: 6 }) {
+                  Text(this.adjustParams[pageItem.index].label)
+                    .fontSize(10)
+                    .fontColor('#9aa4b2')
+                    .width(86)
+                    .maxLines(1)
+                  if (this.adjustParams[pageItem.index].type === 1) {
+                    Toggle({ type: ToggleType.Switch, isOn: this.adjustValues[pageItem.index] > 0.5 })
+                      .width(38)
+                      .height(20)
+                      .selectedColor('#3f7fd0')
+                      .onChange((on: boolean) => {
+                        this.setAdjustValue(pageItem.index, on ? 1 : 0);
+                      })
+                  } else {
+                    Slider({
+                      value: this.adjustValues[pageItem.index],
+                      min: this.adjustParams[pageItem.index].min,
+                      max: this.adjustParams[pageItem.index].max,
+                      step: this.adjustStep(this.adjustParams[pageItem.index])
+                    })
+                      .layoutWeight(1)
+                      .onChange((value: number) => {
+                        this.setAdjustValue(pageItem.index, value);
+                      })
+                  }
+                  Text(this.adjustValues[pageItem.index].toFixed(2))
+                    .fontSize(10)
+                    .fontColor('#9aa4b2')
+                    .width(46)
+                }
+                .width('100%')
+              }, (pageItem: AdjustPageItem) =>
+                pageItem.index.toString() + '_' + this.adjustParams[pageItem.index].path)
+            }
+            .width('100%')
       }
       .width('100%')
       .padding({ top: 4, bottom: 4 })
@@ -1453,29 +1707,6 @@ struct Index {
        */
       Scroll() {
         Column({ space: 8 }) {
-        Row({ space: 8 }) {
-          Button('新建').onClick(() => {
-            // 文档尺寸 = 表面原生尺寸（"WxH|ready"）：present 零几何改配、零缩放，
-            // 撕裂与协商阻塞的根源都在「文档 ≠ 缓冲」的错配上。
-            const info: string = surfaceInfo();
-            const match: RegExpMatchArray | null = info.match(/^(\d+)x(\d+)\|ready$/);
-            const w: number = match !== null ? Number(match[1]) : 2030;
-            const h: number = match !== null ? Number(match[2]) : 456;
-            this.do('新建', newDocument(w, h));
-          })
-          Button('蓝层').onClick(() => {
-            this.addLayerAndSelect(64, 128, 255, 255, '蓝层');
-          })
-          Button('红层').onClick(() => {
-            this.addLayerAndSelect(255, 64, 64, 255, '红层');
-          })
-          Button('暗角').onClick(() => {
-            this.do('暗角', applyVignette(0.7));
-          })
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.SpaceEvenly)
-  
         Row({ space: 8 }) {
           Button('撤销').onClick(() => {
             this.do('撤销', undo());
@@ -1555,53 +1786,6 @@ struct Index {
           }
           .width('100%')
 
-          /*
-           * 参数控件由**引擎的元数据**生成：范围、缺省、类型都来自
-           * comp_adjustment_param，壳不维护参数表。
-           */
-          Scroll() {
-            Column({ space: 4 }) {
-              ForEach(this.adjustParams, (param: AdjustParamItem, index: number) => {
-                Row({ space: 6 }) {
-                  Text(param.label)
-                    .fontSize(10)
-                    .fontColor('#9aa4b2')
-                    .width(86)
-                    .maxLines(1)
-                  if (param.type === 1) {
-                    Toggle({ type: ToggleType.Switch, isOn: this.adjustValues[index] > 0.5 })
-                      .width(38)
-                      .height(20)
-                      .selectedColor('#3f7fd0')
-                      .onChange((on: boolean) => {
-                        this.setAdjustValue(index, on ? 1 : 0);
-                      })
-                  } else {
-                    Slider({
-                      value: this.adjustValues[index],
-                      min: param.min,
-                      max: param.max,
-                      step: this.adjustStep(param)
-                    })
-                      .layoutWeight(1)
-                      .onChange((value: number) => {
-                        this.setAdjustValue(index, value);
-                      })
-                  }
-                  Text(this.adjustValues[index].toFixed(2))
-                    .fontSize(10)
-                    .fontColor('#9aa4b2')
-                    .width(46)
-                }
-                .width('100%')
-              }, (param: AdjustParamItem, index: number) => param.path + '_' + index.toString())
-            }
-            .width('100%')
-          }
-          /* 参数多时内部滚动（外层不给它无限长：它下面还有按钮区）。 */
-          .height(88)
-          .scrollBar(BarState.Auto)
-
         }
         .width('100%')
       }
@@ -1609,9 +1793,21 @@ struct Index {
       .scrollBar(BarState.Auto)
 
     }
-    .justifyContent(FlexAlign.Center)
+    /*
+     * 整页可滚，不再用 `justifyContent(Center)` + `height('100%')` 硬塞。
+     *
+     * 为什么必须滚：内容（画布 + 状态 + 图层面板 + 调整区 + 调试区）总高已经超过
+     * 手机竖屏，Column 会把**可压缩的子元素按比例压扁**——调整参数区（88vp）被压成
+     * 0 高，色阶的滑杆一条都看不见，而界面上没有任何报错，看起来就像「分页没做」。
+     * 2026-10-27 实测：切到 Levels 后下拉已经显示 Levels，参数区却是空的一片。
+     *
+     * 用 Scroll 包住之后每个区块回到自然高度，够不着的往上滚一下就有。
+     */
     .width('100%')
-    .height('100%')
     .padding(14)
+  }
+  .width('100%')
+  .height('100%')
+  .scrollBar(BarState.Auto)
   }
 }

@@ -223,6 +223,17 @@ LRESULT CALLBACK float_window_proc(HWND window, UINT message, WPARAM wparam, LPA
         InvalidateRect(window, nullptr, FALSE);
       }
       break;
+    case WM_EXITSIZEMOVE:
+      /*
+       * 拖完/缩放完浮窗：落在可见区之外就拉回来。
+       *
+       * 只在这个时机判：WM_MOVE 是拖动过程中连续发的，每帧都拉会让窗口「粘在
+       * 屏幕边上拖不动」——用户想把它挪到副屏边缘时手感会变得很怪。
+       */
+      if (shell != nullptr && float_panel_clamp_visible(*shell, panel_of(window))) {
+        set_status(*shell, L"浮动面板已在可见区域之外，已拉回屏幕内");
+      }
+      break;
     case WM_CLOSE:
       /* 关掉浮动窗口 = 面板停回原位（不是「隐藏面板」）。 */
       if (shell != nullptr) {
@@ -526,7 +537,12 @@ void float_panel_tear_end(ShellState& shell) {
       comp_dock::drop_action_for(zone, origin, target, target_used);
 
   if (action == comp_dock::DropAction::StayFloating) {
-    set_status(shell, L"面板已浮出（拖回窗口边缘可停靠）");
+    /* 落点在屏幕外（拖到窗口外边很远）就拉回来——否则松手后这块面板就抓不到了。 */
+    if (float_panel_clamp_visible(shell, id)) {
+      set_status(shell, L"面板已浮出（落点在屏幕外，已拉回可见区）");
+    } else {
+      set_status(shell, L"面板已浮出（拖回窗口边缘可停靠）");
+    }
     return;
   }
 
@@ -600,8 +616,78 @@ void workspace_load(ShellState& shell) {
                      state.float_w * scale, state.float_h * scale,
                      SWP_NOZORDER | SWP_NOACTIVATE);
       }
+      /*
+       * 恢复完再判一次可见性：拔掉一块显示器、或改了分辨率之后，存下来的几何
+       * 可能整个落在不存在的区域——不拉回来的话，下次启动就是「面板不见了」，
+       * 用户既看不到也不知道为什么。
+       */
+      float_panel_clamp_visible(shell, id);
     }
   }
+}
+
+/*
+ * 把浮窗拉回可见区（2026-10-27）。
+ *
+ * 判据是**与显示器工作区的交集面积**，不是「中心点在某块屏上」：
+ *   - 窗口 90% 在屏外时，中心点可能仍在屏内，但用户看到的只剩一条边；
+ *   - 窗口正好卡在两块屏之间的缝里时，中心点又可能落在无效区域。
+ * 两种都会让「按中心点判」得出「一切都好」。
+ *
+ * 两个阈值：绝对下限 40×40（还看得出是个窗口），以及自身面积的 1/4
+ * （大窗口露出一个角也算「抓得住」）。低于任一就拉回。
+ *
+ * 拉回位置贴**主窗口客户区右下角**：应用范围内一定可见，且离用户刚才操作
+ * 的区域最近；再夹进主窗口所在显示器的工作区，小屏上也不会拉出边界。
+ */
+bool float_panel_clamp_visible(ShellState& shell, comp_dock::PanelId id) {
+  const int index = static_cast<int>(id);
+  if (index < 0 || index >= static_cast<int>(comp_dock::PanelId::Count)) return false;
+  HWND window = shell.float_windows[index];
+  if (window == nullptr || shell.window == nullptr) return false;
+
+  RECT rect{};
+  if (!GetWindowRect(window, &rect)) return false;
+  const long long width = rect.right - rect.left;
+  const long long height = rect.bottom - rect.top;
+  if (width <= 0 || height <= 0) return false;
+
+  long long overlap = 0;
+  HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONULL);
+  if (monitor != nullptr) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) {
+      RECT intersection{};
+      if (IntersectRect(&intersection, &rect, &info.rcWork)) {
+        overlap = static_cast<long long>(intersection.right - intersection.left) *
+                  static_cast<long long>(intersection.bottom - intersection.top);
+      }
+    }
+  }
+  const long long minimum = 40LL * 40LL;
+  if (overlap >= minimum && overlap * 4 >= width * height) return false;
+
+  RECT client{};
+  if (!GetClientRect(shell.window, &client)) return false;
+  POINT anchor{client.right, client.bottom};
+  ClientToScreen(shell.window, &anchor);
+
+  int x = anchor.x - static_cast<int>(width) - 20;
+  int y = anchor.y - static_cast<int>(height) - 20;
+  MONITORINFO owner{};
+  owner.cbSize = sizeof(owner);
+  const HMONITOR owner_monitor = MonitorFromWindow(shell.window, MONITOR_DEFAULTTOPRIMARY);
+  if (owner_monitor != nullptr && GetMonitorInfoW(owner_monitor, &owner)) {
+    const RECT& work = owner.rcWork;
+    if (x < work.left) x = work.left + 20;
+    if (y < work.top) y = work.top + 20;
+    if (x + static_cast<int>(width) > work.right) x = work.right - static_cast<int>(width);
+    if (y + static_cast<int>(height) > work.bottom) y = work.bottom - static_cast<int>(height);
+  }
+  SetWindowPos(window, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  float_panel_sync(shell);
+  return true;
 }
 
 void float_panel_sync(ShellState& shell) {

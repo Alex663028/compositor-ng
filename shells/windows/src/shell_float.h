@@ -43,6 +43,15 @@ void float_panel_begin_tear(ShellState& shell, comp_dock::PanelId id, int grab_d
 bool float_panel_tear_move(ShellState& shell, int mouse_x, int mouse_y);
 /* 拖出收尾：松手。落在边缘热区就停回，否则保持浮动。 */
 void float_panel_tear_end(ShellState& shell);
+/*
+ * 把浮窗拉回可见区（2026-10-27）。
+ *
+ * 拖到屏幕外就再也抓不回来——多显示器拔掉一块之后更糟：存下来的几何整个落在
+ * 不存在的区域，下次启动就是「面板不见了」，用户只能去删 workspace.ini。
+ * 判据是与显示器工作区的**交集面积**（见实现），拉回位置贴主窗口右下角。
+ * 返回 true = 确实拉回了（调用方决定状态栏怎么说，避免与「面板已浮出」互相覆盖）。
+ */
+bool float_panel_clamp_visible(ShellState& shell, comp_dock::PanelId id);
 /* 当前是否正在拖出。 */
 bool float_panel_is_tearing(const ShellState& shell);
 /* ------------------------------------------------ 分组（tab strip） */

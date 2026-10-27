@@ -76,6 +76,12 @@ HTBOTTOMRIGHT = 17
 # 它读 GetCursorPos，不读消息队列里的合成坐标。
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+# 浮窗出屏吸回（2026-10-27）：结束移动时系统会发这条，手动补一条即可触发钳制。
+WM_EXITSIZEMOVE = 0x0232
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+CMD_PANEL_FLOAT_ADJUST = 1743  # 与 shell_state.h 的 kCmdFloatAdjust 同值
 
 PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
@@ -254,6 +260,10 @@ user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctyp
 user32.SetWindowPos.restype = wintypes.BOOL
 user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
                                wintypes.DWORD, ctypes.c_size_t]
+# 浮窗可见性判据：与显示器有交集才算「看得见」。MONITOR_DEFAULTTONULL = 0
+# 表示「找不到就返回 NULL」，正是我们要的语义（而不是退到主显示器）。
+user32.MonitorFromRect.argtypes = [ctypes.POINTER(RECT), wintypes.DWORD]
+user32.MonitorFromRect.restype = wintypes.HANDLE
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
@@ -995,6 +1005,18 @@ class Shell:
         rect = RECT()
         user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
         return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+    def screen_rect(self, hwnd):
+        """任意窗口的**屏幕坐标**矩形 (left, top, w, h)。"""
+        rect = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+    def move_window(self, hwnd, x, y):
+        """把窗口挪到屏幕坐标 (x, y)，尺寸不变、不抢焦点。"""
+        user32.SetWindowPos(hwnd, None, int(x), int(y), 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        self.wait(0.4)
 
     def nchittest(self, x, y):
         """问窗口：(x,y) 是客户区还是缩放边框？
@@ -4574,8 +4596,54 @@ def scene_window_resize(shell, checker):
                   "退出前 %d×%d，重启 %d×%d" % (target[0], target[1], restored[0], restored[1]))
 
 
-SCENES = [    ("start", scene_start, ()),
-    ("brush", scene_brush, ()),
+def scene_float_clamp(shell, checker):
+    """
+    浮窗拖到屏幕外要能拉回来（2026-10-27）。
+
+    面板浮出来之后可以拖到任意位置，拖到屏幕外就再也抓不回来。多显示器拔掉一块
+    之后更糟：存下来的几何整个落在不存在的区域，下次启动就是「面板不见了」——
+    界面没有任何提示，用户只能去删 workspace.ini。
+
+    判据用**与显示器工作区的交集面积**，不是「中心点在某块屏上」：窗口 90% 在
+    屏外时中心点可能仍在屏内，但用户看到的只剩一条边。
+
+    断言：
+      1. 命令浮起后有独立浮窗；
+      2. 先确认它真被挪到了屏幕外（否则下一条是空断言）；
+      3. 结束移动（WM_EXITSIZEMOVE）后回到某台显示器上；
+      4. 拉回位置贴着主窗口（不是随便丢在屏幕角落）。
+    """
+    scene = "float_clamp"
+    shell.command(CMD_PANEL_FLOAT_ADJUST)
+    shell.wait(0.9)
+    float_hwnd = shell.find_window("CompositorFloatPanel")
+    checker.check(scene, "命令浮起后有独立浮窗", bool(float_hwnd), "hwnd=%s" % (float_hwnd,))
+    if not float_hwnd:
+        return
+
+    # 挪到任何显示器之外（坐标远超常见多屏布局）。
+    shell.move_window(float_hwnd, 9000, 6000)
+    rect = shell.screen_rect(float_hwnd)
+    checker.check(scene, "（前置）窗口确实落在了屏幕外", rect[0] >= 4000,
+                  "rect=%s" % (rect,))
+
+    # 结束移动：真实拖拽松手时系统会发这条；这里手动补一条，等价于「松手」。
+    user32.SendMessageW(float_hwnd, WM_EXITSIZEMOVE, 0, 0)
+    shell.wait(0.7)
+    rect = shell.screen_rect(float_hwnd)
+    monitor = user32.MonitorFromRect(ctypes.byref(RECT(rect[0], rect[1],
+                                                       rect[0] + rect[2], rect[1] + rect[3])), 0)
+    checker.check(scene, "松手后自动拉回可见区（与显示器有交集）", bool(monitor),
+                  "rect=%s" % (rect,))
+
+    main = shell.window_rect()
+    near_main = (abs(rect[0] - main[0]) < main[2] + rect[2] and
+                 abs(rect[1] - main[1]) < main[3] + rect[3])
+    checker.check(scene, "拉回位置贴着主窗口（不是丢在屏幕角落）", near_main,
+                  "浮窗 %s / 主窗口 %s" % (rect, main))
+
+
+SCENES = [    ("start", scene_start, ()),    ("brush", scene_brush, ()),
     ("selection", scene_selection, ()),
     ("wand", scene_wand, ()),
     ("gradient", scene_gradient, ()),
@@ -4619,6 +4687,7 @@ SCENES = [    ("start", scene_start, ()),
     ("adjust_scroll", scene_adjust_scroll, ()),
     ("panel_drag_dock", scene_panel_drag_dock, ()),
     ("window_resize", scene_window_resize, ()),
+    ("float_clamp", scene_float_clamp, ()),
 ]
 
 
