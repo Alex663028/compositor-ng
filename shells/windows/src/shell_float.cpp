@@ -128,8 +128,16 @@ LRESULT CALLBACK float_window_proc(HWND window, UINT message, WPARAM wparam, LPA
         const HRGN clip = CreateRectRgn(0, 0, logical_width, logical_height);
         SelectClipRgn(memory_dc, clip);
         if (panel_of(window) == comp_dock::PanelId::Layers) {
-          /* 浮窗的可见行数与主窗口不同，滚动量按浮窗自己的高度重新夹一次。 */
-          panel_sync_layer_scroll(*shell, panel);
+          /*
+           * 这里**不**调 panel_sync_layer_scroll：它会按**本面板**的高度去夹
+           * 滚动量，而滚动量是主窗口与浮窗**共用**的一份。浮窗比主窗口矮 →
+           * 夹一次就把主窗口的滚动位置改了，用户在主窗口里看到的图层列表
+           * 会莫名跳位。
+           *
+           * 滚动量只在主窗口绘制时同步（那里才有主窗口的面板尺寸）。
+           * 浮窗里的滚轮本来就转发给主窗口的滚动通路，改的是同一份滚动量，
+           * 两边一致。
+           */
           draw_layer_content(memory_dc, *shell, panel);
         } else {
           draw_adjust_content(memory_dc, *shell, panel);

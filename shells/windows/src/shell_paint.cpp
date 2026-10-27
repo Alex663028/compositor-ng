@@ -886,6 +886,29 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
   const int visible = comp_ui::layer_visible_rows(panel_rect, row_top);
   const int32_t first_line = scroll;
   const int32_t last_line = count < first_line + visible ? count : first_line + visible;
+
+  /*
+   * 滚动条几何**先算**：行内容要避开它。
+   *
+   * 行文本是「[o] 图层名 混合模式 标记 100%」一长串，图层名长了就会伸到
+   * 面板右缘——那里正好是滚动条的位置，不避开的话末尾的字被滑块盖住。
+   * 所以行内容裁到滑块左侧，滚动条画在最上层。
+   */
+  /* 可视高度要减去底部提示行（两层提示字），否则滚动条轨道会压到提示上。 */
+  const int scroll_viewport_h =
+      panel_rect.h - (comp_ui::kLayerHeaderHeight + row_top) - comp_ui::kLayerPanelFooter;
+  const int scroll_content_h = count * comp_ui::kLayerRowHeight;
+  const int scroll_max = comp_ui::layer_scroll_max(panel_rect, count, row_top);
+  const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(
+      panel_rect, comp_ui::kLayerHeaderHeight + row_top, scroll_viewport_h, scroll_content_h,
+      scroll, scroll_max);
+
+  /* 行内容的裁剪区：滑块可见时右侧留出滑块的宽度。 */
+  const int row_clip_right =
+      bar.visible ? bar.track.x : panel_rect.right();
+  HRGN row_clip = CreateRectRgn(panel_rect.x, panel_rect.y, row_clip_right, panel_rect.bottom());
+  SelectClipRgn(dc, row_clip);
+
   for (int32_t line = first_line; line < last_line; ++line) {
     const comp_ui::Rect row_rect =
         comp_ui::layer_row_rect_scrolled(panel_rect, line, row_top, scroll);
@@ -1042,6 +1065,23 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
     DeleteObject(line_brush);
   }
 
+  /* 行内容画完，恢复裁剪（下面画的滚动条不受行裁剪影响）。 */
+  /*
+   * 行内容画完，把裁剪**显式恢复成面板矩形**，不用 SelectClipRgn 的返回值。
+   *
+   * 为什么不用返回值：那是个 GDI 句柄，但**返回的是哪个区域**（旧的还是新的）
+   * 在不同实现上不一致——按「旧区域」理解时恢复成 row_clip 自己，滑块正好落在
+   * 裁剪区外被裁掉，现象是「滚动条凭空消失」。
+   *
+   * 恢复成面板矩形：既让滑块画得出来，又保持了「面板内容不溢出到画布上」
+   * 这个原有的约束（外层 present 里也是按面板矩形裁的）。
+   */
+  HRGN panel_region = CreateRectRgn(panel_rect.x, panel_rect.y, panel_rect.right(),
+                                    panel_rect.bottom());
+  SelectClipRgn(dc, panel_region);
+  DeleteObject(panel_region);
+  DeleteObject(row_clip);
+
   /*
    * 可见滚动条（PS 同款）：内容装不下时贴面板右缘画一条。
    *
@@ -1051,25 +1091,15 @@ void draw_layer_panel(HDC dc, const ShellState& shell, const comp_ui::Rect& pane
    * 两层都画（轨道 + 滑块），颜色与面板底色明确不同：探针量得到，
    * 人眼也分得清。滑块拖动见 shell_panel_hit.cpp。
    */
-  {
-    /* 可视高度要减去底部提示行（两层提示字），否则滚动条轨道会压到提示上。 */
-    const int viewport_h =
-        panel_rect.h - (comp_ui::kLayerHeaderHeight + row_top) - comp_ui::kLayerPanelFooter;
-    const int content_h = count * comp_ui::kLayerRowHeight;
-    const int max_scroll = comp_ui::layer_scroll_max(panel_rect, count, row_top);
-    const comp_ui::ScrollBarGeometry bar = comp_ui::scroll_bar_vertical(
-        panel_rect, comp_ui::kLayerHeaderHeight + row_top, viewport_h, content_h, scroll,
-        max_scroll);
-    if (bar.visible) {
-      RECT track{bar.track.x, bar.track.y, bar.track.right(), bar.track.bottom()};
-      HBRUSH track_brush = CreateSolidBrush(RGB(38, 40, 46));
-      FillRect(dc, &track, track_brush);
-      DeleteObject(track_brush);
-      RECT thumb{bar.thumb.x, bar.thumb.y, bar.thumb.right(), bar.thumb.bottom()};
-      HBRUSH thumb_brush = CreateSolidBrush(RGB(122, 126, 136));
-      FillRect(dc, &thumb, thumb_brush);
-      DeleteObject(thumb_brush);
-    }
+  if (bar.visible) {
+    RECT track{bar.track.x, bar.track.y, bar.track.right(), bar.track.bottom()};
+    HBRUSH track_brush = CreateSolidBrush(RGB(38, 40, 46));
+    FillRect(dc, &track, track_brush);
+    DeleteObject(track_brush);
+    RECT thumb{bar.thumb.x, bar.thumb.y, bar.thumb.right(), bar.thumb.bottom()};
+    HBRUSH thumb_brush = CreateSolidBrush(RGB(122, 126, 136));
+    FillRect(dc, &thumb, thumb_brush);
+    DeleteObject(thumb_brush);
   }
 
   /*

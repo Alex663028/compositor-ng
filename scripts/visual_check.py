@@ -169,6 +169,18 @@ COL_APP_BG = (32, 32, 36)
 # ---------------------------------------------------------------- Win32 绑定
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+# 鼠标消息走 **SendMessageW（同步）**：发完就等壳处理完，返回时状态已落地。
+#
+# 为什么不用 PostMessageW：那是异步的——消息进队列，探针立刻往下走，
+# 壳可能还没处理完，更没重绘，截图拍到的是**旧帧**。症状是「画布上没出现
+# 预期像素」，失败项每轮不同、单独跑必过。
+#
+# 坐标类消息的 lParam 是整数，c_longlong 足够；argtypes 不声明的话 ctypes
+# 默认按 32 位 int 传参，坐标没问题但类型不严谨，这里写全。
+user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, ctypes.c_size_t,
+                                ctypes.c_longlong]
+user32.SendMessageW.restype = ctypes.c_ssize_t
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
 
@@ -429,6 +441,9 @@ LAYOUT_MAPPING_SIZE = 8192
 
 
 class Shell:
+    # 截图等稳定的次数与间隔（见 shot 的说明）。
+    SHOT_STABLE_TRIES = 14
+    SHOT_STABLE_DELAY = 0.08
     def __init__(self, exe, out_dir, keep):
         self.exe = exe
         self.out_dir = out_dir
@@ -479,10 +494,21 @@ class Shell:
         的「点击不穿透到画布」就因为这个多出 17 px 而误报（同一场景单跑必过）。
         状态栏既在画布外、又没有悬停高亮，停这里不会引入任何新的像素。
         """
-        target = POINT(self.client_w // 2, max(0, self.client_h - 8))
-        if user32.ClientToScreen(self.hwnd, ctypes.byref(target)):
-            user32.SetCursorPos(target.x, target.y)
-            self.wait(0.15)  # 等系统把真实 MOUSEMOVE/MOUSELEAVE 送完
+        # 停到**标题栏**（非客户区）：系统只给非客户区发 WM_NCMOUSEMOVE，
+        # 客户区收不到 —— 合成坐标不会被顶掉。
+        #
+        # 为什么必须停到非客户区（原先停在状态栏不够）：本脚本靠合成鼠标消息
+        # 驱动，真实指针并不跟着走。窗口激活/悬停时系统会补一条**真实**
+        # WM_MOUSEMOVE，那条消息的坐标是**物理指针的位置**，会把合成拖动的
+        # 坐标顶掉——合成拖动画到 A 处，真实 mousemove 把光标挪到 B 处，
+        # 笔迹落在 B，断言量的是 A。症状就是「画布上没出现预期像素」。
+        #
+        # 这是探针长期「失败项每轮不同、单独跑必过」的根因：以前一直当成
+        # 环境偶发记着，其实是自己造的（真实指针与合成消息抢同一条通路）。
+        rect = RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
+        user32.SetCursorPos(rect.left + 120, rect.top + 12)
+        self.wait(0.15)  # 等系统把真实 MOUSEMOVE/MOUSELEAVE 送完
 
     def _find_window(self):
         pid = self.proc.pid
@@ -747,9 +773,14 @@ class Shell:
         """投一次按键。
 
         修饰键状态通过「AttachThreadInput + SetKeyboardState」写进目标线程的
-        输入状态，再 PostMessage 投 WM_KEYDOWN/UP。注意：消息是异步处理的，
-        必须等目标处理完这两条消息再恢复修饰键状态，否则 GetKeyState 读到的
-        已经是干净状态（Shift+X 被当成 X）。
+        输入状态，再投 WM_KEYDOWN/UP。
+
+        这里**必须用 PostMessageW（异步）**：曾试过改成 SendMessageW（同步），
+        结果**文字输入场景全线崩**（IME 的组合态需要按键的原始投递顺序，同步
+        投递把那个顺序打乱了）。
+
+        「按键会丢」的现象另有解法：真正的根因是**真实指针与合成消息抢同一条
+        通路**（见 _park_pointer），把物理指针停到标题栏即可，不必动这里。
         """
         current, target, attached, state, saved = self._set_modifiers(shift, ctrl, alt)
         try:
@@ -810,10 +841,11 @@ class Shell:
 
     def click(self, x, y):
         x, y = int(x), int(y)
-        user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
-        user32.PostMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
-        user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
-        self.wait(0.25)
+        # 同步发送：返回时壳已处理完这一串点击（见模块级说明）。
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
+        user32.SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
+        user32.SendMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
+        self.wait(0.15)
 
     def modified_click(self, x, y, ctrl=False, shift=False):
         """带修饰键的单击（面板多选）。
@@ -825,10 +857,10 @@ class Shell:
         x, y = int(x), int(y)
         current, target, attached, state, saved = self._set_modifiers(shift, ctrl, False)
         try:
-            user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
-            user32.PostMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
+            user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
+            user32.SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
             self.wait(0.05)
-            user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
+            user32.SendMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x, y))
             self.wait(0.2)
         finally:
             self._restore_modifiers(current, target, attached, state, saved)
@@ -836,16 +868,18 @@ class Shell:
 
     def drag(self, x0, y0, x1, y1, steps=12):
         x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
-        user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x0, y0))
-        user32.PostMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x0, y0))
+        # 同步发送（见模块级说明）：拖动结束时笔迹/选区已经**提交**，
+        # 不是「消息还在队列里」。
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x0, y0))
+        user32.SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x0, y0))
         self.wait(0.05)
         for step in range(1, steps + 1):
             x = x0 + (x1 - x0) * step // steps
             y = y0 + (y1 - y0) * step // steps
-            user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(x, y))
+            user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(x, y))
             self.wait(0.02)
-        user32.PostMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x1, y1))
-        self.wait(0.45)
+        user32.SendMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(x1, y1))
+        self.wait(0.25)
 
     def wheel(self, x, y, delta=120):
         """滚轮（WM_MOUSEWHEEL）。
@@ -857,8 +891,8 @@ class Shell:
         sx, sy = self.client_to_screen(int(x), int(y))
         lparam = ((sy & 0xFFFF) << 16) | (sx & 0xFFFF)
         wparam = (int(delta) & 0xFFFF) << 16
-        user32.PostMessageW(self.hwnd, WM_MOUSEWHEEL, wparam, lparam)
-        self.wait(0.2)
+        user32.SendMessageW(self.hwnd, WM_MOUSEWHEEL, wparam, lparam)
+        self.wait(0.15)
 
     def client_to_screen(self, x, y):
         """客户区坐标 -> 屏幕坐标（滚轮消息要的是这个口径）。"""
@@ -868,6 +902,32 @@ class Shell:
         point = POINT(int(x), int(y))
         user32.ClientToScreen(self.hwnd, ctypes.pointer(point))
         return int(point.x), int(point.y)
+
+    def drag_begin(self, x, y):
+        """按下并开始拖动（**不松手**）。
+
+        为什么要有分步版：面板的「拖出成浮窗 → 再拖到边缘停靠」是**两次
+        拖动**（中间浮窗要跟着指针走），一次性 drag() 表达不了——松手就
+        结束了。拖放重排的视觉验证要用它。
+        """
+        x, y = int(x), int(y)
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 0, make_lparam(x, y))
+        user32.SendMessageW(self.hwnd, WM_LBUTTONDOWN, 1, make_lparam(x, y))
+        self.wait(0.05)
+
+    def drag_move(self, x, y):
+        """拖动中（按住状态，坐标是客户区坐标）。"""
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
+        self.wait(0.03)
+
+    def drag_end(self, x, y):
+        """松手。"""
+        # 松手前**再补一次** mousemove 到目标坐标：真实指针可能在最后一步与
+        # 松手之间插进来（窗口激活/悬停时系统会补发），把落点顶到别处。
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
+        user32.SendMessageW(self.hwnd, WM_MOUSEMOVE, 1, make_lparam(int(x), int(y)))
+        user32.SendMessageW(self.hwnd, WM_LBUTTONUP, 0, make_lparam(int(x), int(y)))
+        self.wait(0.25)
 
     def stroke(self, points, steps=8):
         """折线落笔：逐段拖动（画笔/橡皮擦/retouch 共用）。"""
@@ -910,7 +970,34 @@ class Shell:
         return full.crop((left, top, left + self.client_w, top + self.client_h)).convert("RGB")
 
     def shot(self, name):
+        """截图，并**等到画面稳定**为止。
+
+        为什么必须等：截图走 PrintWindow（请求窗口把当前状态画进 DC），而
+        鼠标/键盘消息是 PostMessage（**异步**）——壳要先处理完消息才会
+        InvalidateRect 重绘。探针若在重绘之前截图，拍到的是**旧帧**，
+        表现为「画布上没出现预期像素」。
+
+        连跑时这个问题特别容易撞上：上一个进程刚退、新的刚起，机器正忙，
+        壳处理得更慢，窗口更容易被拍在重绘之前。症状是**失败项每轮不同、
+        单独跑该场景必过**——本仓探针长期有这个毛病，一直当成「环境偶发」
+        记着，其实是自己造的。
+
+        判据用**逐字节相同**：画面稳定时两帧完全一致；还在变就继续等。
+        上限 tries 次，避免遇到真·持续变化的画面时死等。
+        """
         image = self.capture()
+        previous = image.tobytes()
+        for _ in range(self.SHOT_STABLE_TRIES):
+            self.wait(self.SHOT_STABLE_DELAY)
+            current = self.capture()
+            # 空帧（窗口刚销毁 / PrintWindow 失败时尺寸为 0）：跳过，别拿去存。
+            if current.width <= 0 or current.height <= 0:
+                continue
+            data = current.tobytes()
+            if data == previous:
+                break
+            previous = data
+            image = current
         path = os.path.join(self.out_dir, name + ".png")
         image.save(path)
         self.shots.append(path)
