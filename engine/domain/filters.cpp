@@ -281,6 +281,49 @@ bool custom_equal(const CustomSettings& a, const CustomSettings& b) {
   return a.scale == b.scale && a.offset == b.offset;
 }
 
+/* A46：扭曲 / 像素化 / 风格化三组的参数闸（0 = 恒等；非 0 按上游量程，越界拒绝）。 */
+bool spherize_valid(const SpherizeSettings& s, std::string* error) {
+  if (s.amount != 0.0 && !in_range(s.amount, -100.0, 100.0)) {
+    return set_error(error, "spherize amount must be 0 or in -100..100");
+  }
+  return true;
+}
+
+bool pinch_valid(const PinchSettings& s, std::string* error) {
+  if (s.amount != 0.0 && !in_range(s.amount, -100.0, 100.0)) {
+    return set_error(error, "pinch amount must be 0 or in -100..100");
+  }
+  return true;
+}
+
+bool twirl_valid(const TwirlSettings& s, std::string* error) {
+  if (s.angle != 0.0 && !in_range(s.angle, -999.0, 999.0)) {
+    return set_error(error, "twirl angle must be 0 or in -999..999");
+  }
+  return true;
+}
+
+bool mosaic_valid(const MosaicSettings& s, std::string* error) {
+  /* 0 = 恒等；(0,2) 之间没有可用的方格（PS 最小 2），显式拒绝而不是夹到 2。 */
+  if (s.cell_size != 0.0 && !in_range(s.cell_size, 2.0, 200.0)) {
+    return set_error(error, "mosaic cell size must be 0 or in 2..200");
+  }
+  return true;
+}
+
+bool emboss_valid(const EmbossSettings& s, std::string* error) {
+  if (s.amount != 0.0 && !in_range(s.amount, 1.0, 500.0)) {
+    return set_error(error, "emboss amount must be 0 or in 1..500");
+  }
+  if (!in_range(s.angle, -360.0, 360.0)) {
+    return set_error(error, "emboss angle out of -360..360");
+  }
+  if (!in_range(s.height, 0.0, 10.0)) {
+    return set_error(error, "emboss height out of 0..10");
+  }
+  return true;
+}
+
 /* ------------------------------------------------------------ 像素算子 */
 
 /* Vignette：帧 = 图层自身像素矩形（上游非空图层 `job.canvas == nil` 的分支）。
@@ -1135,6 +1178,217 @@ comp_result custom_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t s
   return COMP_OK;
 }
 
+/* ============================================================ A46：扭曲 / 像素化 / 风格化
+ *
+ * 扭曲三兄弟（Spherize / Pinch / Twirl）共用同一套「以图层中心为原点、半短边
+ * 归一」的径向重映射 + 双线性采样；Mosaic 是格内预乘均值；Emboss 是方向导数。
+ * 重采样口径与 lens_distort 一致：源坐标落在图像外按**透明**参与（不复制边缘），
+ * 输出是预乘 RGBA8、满足 out_color <= out_alpha。
+ */
+
+/* 双线性采样：返回**直通** RGB（0..255）与覆盖率 alpha（0..255）。
+ * 越界格子按透明（alpha 0）计入权重，所以贴边像素不会把窗外当成黑。 */
+void sample_bilinear_raw(const uint8_t* src, int32_t width, int32_t height, size_t row_bytes,
+                         double px, double py, double rgb[3], double* out_alpha) {
+  const int32_t x0 = static_cast<int32_t>(std::floor(px));
+  const int32_t y0 = static_cast<int32_t>(std::floor(py));
+  const double fx = px - static_cast<double>(x0);
+  const double fy = py - static_cast<double>(y0);
+  double acc_rgb[3] = {0.0, 0.0, 0.0};
+  double acc_a = 0.0;
+  double acc_w = 0.0;
+  for (int j = 0; j < 2; ++j) {
+    for (int i = 0; i < 2; ++i) {
+      const double w = (i ? fx : 1.0 - fx) * (j ? fy : 1.0 - fy);
+      acc_w += w;
+      const int32_t sx = x0 + i;
+      const int32_t sy = y0 + j;
+      if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
+      const uint8_t* q = src + static_cast<size_t>(sy) * row_bytes + static_cast<size_t>(sx) * 4u;
+      const double a = static_cast<double>(q[3]);
+      acc_a += a * w;
+      for (int c = 0; c < 3; ++c) {
+        const double straight =
+            a > 0.0 ? std::min(255.0, static_cast<double>(q[c]) * 255.0 / a) : 0.0;
+        acc_rgb[c] += straight * a * w;
+      }
+    }
+  }
+  for (int c = 0; c < 3; ++c) rgb[c] = acc_a > 0.0 ? acc_rgb[c] / acc_a : 0.0;
+  *out_alpha = acc_w > 0.0 ? acc_a / acc_w : 0.0;
+}
+
+/* 通用径向重映射。map 把目标像素的归一坐标 (dx, dy) 映射到源归一坐标 (sx, sy)；
+ * 归一坐标以图层中心为原点、半短边为 1。Spherize / Pinch / Twirl 共用。 */
+template <typename MapFn>
+comp_result distort_remap(uint8_t* rgba, int32_t width, int32_t height, size_t stride, MapFn map) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  const double cx = (static_cast<double>(width) - 1.0) * 0.5;
+  const double cy = (static_cast<double>(height) - 1.0) * 0.5;
+  const double half = std::max(1.0, static_cast<double>(std::min(width, height)) * 0.5);
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const double dy = (static_cast<double>(y) - cy) / half;
+    for (int32_t x = 0; x < width; ++x) {
+      const double dx = (static_cast<double>(x) - cx) / half;
+      double sx = dx;
+      double sy = dy;
+      map(dx, dy, &sx, &sy);
+      double rgb[3];
+      double a = 0.0;
+      sample_bilinear_raw(source.data(), width, height, row_bytes, cx + sx * half, cy + sy * half,
+                          rgb, &a);
+      if (a < 0.0) a = 0.0;
+      if (a > 255.0) a = 255.0;
+      const uint8_t aq = static_cast<uint8_t>(std::lround(a));
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 3; ++c) {
+        double premul = rgb[c] * a / 255.0;
+        if (premul < 0.0) premul = 0.0;
+        if (premul > a) premul = a;
+        p[c] = static_cast<uint8_t>(std::lround(premul));
+      }
+      p[3] = aq;
+    }
+  }
+  return COMP_OK;
+}
+
+comp_result spherize_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                            const SpherizeSettings& s) {
+  if (s.amount == 0.0) return COMP_OK;
+  const double k = s.amount / 100.0;
+  return distort_remap(
+      rgba, width, height, stride,
+      [k](double dx, double dy, double* sx, double* sy) {
+        const double r2 = dx * dx + dy * dy;
+        const double scale = 1.0 - k * (1.0 - r2);
+        *sx = dx * scale;
+        *sy = dy * scale;
+      });
+}
+
+comp_result pinch_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                         const PinchSettings& s) {
+  if (s.amount == 0.0) return COMP_OK;
+  const double k = s.amount / 100.0;
+  return distort_remap(
+      rgba, width, height, stride,
+      [k](double dx, double dy, double* sx, double* sy) {
+        const double r2 = dx * dx + dy * dy;
+        const double scale = 1.0 + k * (1.0 - r2);
+        *sx = dx * scale;
+        *sy = dy * scale;
+      });
+}
+
+comp_result twirl_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                         const TwirlSettings& s) {
+  if (s.angle == 0.0) return COMP_OK;
+  const double radians = s.angle * 3.14159265358979323846 / 180.0;
+  return distort_remap(
+      rgba, width, height, stride,
+      [radians](double dx, double dy, double* sx, double* sy) {
+        const double r = std::sqrt(dx * dx + dy * dy);
+        double falloff = 1.0 - r;
+        if (falloff < 0.0) falloff = 0.0;
+        const double theta = std::atan2(dy, dx) - radians * falloff;
+        *sx = r * std::cos(theta);
+        *sy = r * std::sin(theta);
+      });
+}
+
+/* Mosaic：格内预乘分量的算术均值（满足 out_color <= out_alpha）。 */
+comp_result mosaic_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          const MosaicSettings& s, double scale) {
+  if (s.cell_size <= 0.0 || width <= 0 || height <= 0) return COMP_OK;
+  int64_t cell = std::llround(s.cell_size * scale);
+  if (cell < 2) cell = 2;
+  const int32_t step = static_cast<int32_t>(cell);
+  for (int32_t by = 0; by < height; by += step) {
+    for (int32_t bx = 0; bx < width; bx += step) {
+      const int32_t ex = static_cast<int32_t>(std::min<int64_t>(bx + cell, width));
+      const int32_t ey = static_cast<int32_t>(std::min<int64_t>(by + cell, height));
+      uint64_t sum[4] = {0u, 0u, 0u, 0u};
+      int64_t n = 0;
+      for (int32_t y = by; y < ey; ++y) {
+        const uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+        for (int32_t x = bx; x < ex; ++x) {
+          const uint8_t* p = row + static_cast<size_t>(x) * 4u;
+          for (int c = 0; c < 4; ++c) sum[c] += p[c];
+          ++n;
+        }
+      }
+      if (n == 0) continue;
+      uint8_t avg[4];
+      const uint64_t denom = static_cast<uint64_t>(n);
+      for (int c = 0; c < 4; ++c) {
+        avg[c] = static_cast<uint8_t>((sum[c] + denom / 2u) / denom);
+      }
+      for (int32_t y = by; y < ey; ++y) {
+        uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+        for (int32_t x = bx; x < ex; ++x) {
+          uint8_t* p = row + static_cast<size_t>(x) * 4u;
+          p[0] = avg[0];
+          p[1] = avg[1];
+          p[2] = avg[2];
+          p[3] = avg[3];
+        }
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* Emboss：`128 + amount/100 * (A - B)`，A / B 沿 angle 方向 ±step 处采样的直通色。
+ * 平坦区域落 128 底灰；alpha 逐字节不变。 */
+comp_result emboss_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          const EmbossSettings& s, double scale) {
+  if (s.amount == 0.0 || width <= 0 || height <= 0) return COMP_OK;
+  const double strength = s.amount / 100.0;
+  const double radians = s.angle * 3.14159265358979323846 / 180.0;
+  double step = std::round(s.height * scale);
+  if (step < 1.0) step = 1.0;
+  /* 逆时针为正、y 向下：方向 = (cos, -sin)。 */
+  const double ox = std::cos(radians) * step;
+  const double oy = -std::sin(radians) * step;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      const double alpha = p[3];
+      if (alpha <= 0.0) continue;
+      double a_rgb[3];
+      double a_a = 0.0;
+      double b_rgb[3];
+      double b_a = 0.0;
+      sample_bilinear_raw(source.data(), width, height, row_bytes, x + ox, y + oy, a_rgb, &a_a);
+      sample_bilinear_raw(source.data(), width, height, row_bytes, x - ox, y - oy, b_rgb, &b_a);
+      for (int c = 0; c < 3; ++c) {
+        double value = 128.0 + strength * (a_rgb[c] - b_rgb[c]);
+        if (value < 0.0) value = 0.0;
+        if (value > 255.0) value = 255.0;
+        double premul = std::lround(value * alpha / 255.0);
+        if (premul > alpha) premul = alpha;
+        p[c] = static_cast<uint8_t>(premul);
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -1179,6 +1433,16 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
     case kFilterCustom:
       /* 核没有连续的「半径」语义：预览不缩放核（见 filters.h 的边界说明）。 */
       return custom_pixels(rgba, width, height, stride, settings.custom);
+    case kFilterSpherize:
+      return spherize_pixels(rgba, width, height, stride, settings.spherize);
+    case kFilterPinch:
+      return pinch_pixels(rgba, width, height, stride, settings.pinch);
+    case kFilterTwirl:
+      return twirl_pixels(rgba, width, height, stride, settings.twirl);
+    case kFilterMosaic:
+      return mosaic_pixels(rgba, width, height, stride, settings.mosaic, scale);
+    case kFilterEmboss:
+      return emboss_pixels(rgba, width, height, stride, settings.emboss, scale);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -1215,6 +1479,11 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterMaximum: return maximum_valid(settings.maximum, error);
     case kFilterOffset: return offset_valid(settings.offset, error);
     case kFilterCustom: return custom_valid(settings.custom, error);
+    case kFilterSpherize: return spherize_valid(settings.spherize, error);
+    case kFilterPinch: return pinch_valid(settings.pinch, error);
+    case kFilterTwirl: return twirl_valid(settings.twirl, error);
+    case kFilterMosaic: return mosaic_valid(settings.mosaic, error);
+    case kFilterEmboss: return emboss_valid(settings.emboss, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -1246,6 +1515,11 @@ bool filter_settings_identity(const FilterSettings& settings) {
       return std::llround(settings.offset.horizontal) == 0 &&
              std::llround(settings.offset.vertical) == 0;
     case kFilterCustom: return custom_identity(settings.custom);
+    case kFilterSpherize: return settings.spherize.amount == 0.0;
+    case kFilterPinch: return settings.pinch.amount == 0.0;
+    case kFilterTwirl: return settings.twirl.angle == 0.0;
+    case kFilterMosaic: return settings.mosaic.cell_size == 0.0;
+    case kFilterEmboss: return settings.emboss.amount == 0.0;
   }
   return true;
 }
@@ -1310,6 +1584,13 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
       return a.offset.horizontal == b.offset.horizontal &&
              a.offset.vertical == b.offset.vertical && a.offset.wrap == b.offset.wrap;
     case kFilterCustom: return custom_equal(a.custom, b.custom);
+    case kFilterSpherize: return a.spherize.amount == b.spherize.amount;
+    case kFilterPinch: return a.pinch.amount == b.pinch.amount;
+    case kFilterTwirl: return a.twirl.angle == b.twirl.angle;
+    case kFilterMosaic: return a.mosaic.cell_size == b.mosaic.cell_size;
+    case kFilterEmboss:
+      return a.emboss.amount == b.emboss.amount && a.emboss.angle == b.emboss.angle &&
+             a.emboss.height == b.emboss.height;
   }
   return false;
 }
@@ -1334,6 +1615,11 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterCustom: return "Custom";
     case kFilterMedian: return "Median";
     case kFilterDustScratches: return "Dust & Scratches";
+    case kFilterSpherize: return "Spherize";
+    case kFilterPinch: return "Pinch";
+    case kFilterTwirl: return "Twirl";
+    case kFilterMosaic: return "Mosaic";
+    case kFilterEmboss: return "Emboss";
   }
   return "filter";
 }

@@ -8189,6 +8189,48 @@ divisor = (scale == 0 ? 1 : scale)        // 面板允许把除数清成 0，引
 - 预览不缩放核：全分辨率预览与最终落墨一致，但比别的滤镜慢（每像素 25 次采样，
   与核里的零无关，不做稀疏跳过）。
 
+### 6.118 滤镜 A46：扭曲 / 像素化 / 风格化三项纯 CPU 尾部追加（P1-5，2026-10-28，deepseek-v4.1-flash）
+
+**缺口。** BACKLOG 的「滤镜」行明列「扭曲 / 像素化 / 风格化」三组未做；PS 常用的
+球面化 / 挤压 / 旋转扭曲 / 马赛克 / 浮雕在引擎里没有通路。本批把这三组补上。
+
+**做法（全部尾部追加，冻结面不动）：**
+
+- `domain/filters.h`：新增 `SpherizeSettings` / `PinchSettings` / `TwirlSettings` /
+  `MosaicSettings` / `EmbossSettings` 五个结构；`FilterKind` 尾追加
+  `kFilterSpherize = 18` … `kFilterEmboss = 22`；`FilterSettings` 尾追加五个字段。
+- `domain/filters.cpp`：五组的参数闸（0 = 恒等；非 0 按上游量程，越界拒绝）、
+  identity / equal / label、内核（扭曲共用径向重映射 + 双线性；马赛克为格内预乘
+  分量均值；浮雕为方向导数）与 dispatch。
+- ABI（`comp_filter.h` / `comp_filter_abi.cpp`）：`comp_filter_kind` 尾追加 18..22；
+  新增 `comp_filter_spherize` / `_pinch` / `_twirl` / `_mosaic` / `_emboss` 结构
+  （A45 的 `comp_filter_denoise` 已在上一批落地）与 `comp_filter_desc` 对应字段；
+  `to_domain` / `from_domain` 双向补齐。
+
+**顺带修掉的缺陷（本批实测发现）：**
+
+- `comp_filter_abi.cpp` 的 `to_domain` 把 A45 的 median / dust 参数拷贝误缩进进了
+  `if (custom_touched)` 分支——**只调 Median、不碰 Custom 时半径被丢成 0、滤镜静默
+  变恒等**。已改为先闭合 custom 分支再无条件拷贝；`from_domain` 原先也未回写
+  median / dust（智能滤镜往返丢参数），一并补上。回归锁见
+  `test_filters.cpp` 的 `filters_abi_maps_the_a46_fields_without_touching_custom`。
+
+**验证：**
+
+- `scripts/build.py`：**810 cases / 1 failed / 5 check failures**——用例数 804 → 810
+  （新增 6 例，全部通过）；唯一的 failed 是**既存**的
+  `ui_core_tool_shortcuts_match_upstream`（与本批无关，改动前工作树干净时即为红）。
+- 新增 6 例：`filters_a46_new_kinds_are_identity_at_zero_initialisation`、
+  `filters_a46_reject_out_of_range_before_the_transaction`、
+  `filters_mosaic_averages_each_cell`、`filters_emboss_flattens_a_flat_field_to_mid_grey`、
+  `filters_spherize_pinch_twirl_change_pixels_and_are_one_step_undo`、
+  `filters_abi_maps_the_a46_fields_without_touching_custom`。
+- ABI 导出数不变（纯尾部追加 kind 与子结构）。
+
+**已知边界：** 三项扭曲都会在贴边处采到窗外 → 边缘半透明（「窗外按透明参与」的
+直接结果，与 §3.4 一致）；马赛克吃掉了格内的高频，是像素化滤镜的预期行为；浮雕
+无「结构 / 纹理 / 不透明区域」三个 PS 高级参数。
+
 
 
 

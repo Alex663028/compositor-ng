@@ -701,7 +701,9 @@ COMP_TEST(ui_core_layer_rows_hit_test_top_down) {
 COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
   size_t count = 0;
   comp_ui::tool_table(&count);
-  COMP_CHECK(count == 20);
+  /* 20 个带默认键的工具 + 3 个无默认键（Quick Selection / Magic Eraser /
+   * Background Eraser，S17/P18 追加，shortcut 0）= 23。 */
+  COMP_CHECK(count == 23);
   COMP_CHECK(static_cast<int>(ToolId::Count) == static_cast<int>(count));
 
   /* 逐条对齐上游 KeyboardShortcuts.swift 的工具默认键。 */
@@ -719,7 +721,12 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
                   {'o', ToolId::Tone},
                   {'c', ToolId::Crop},       {'p', ToolId::Pen},
                   {'y', ToolId::HistoryBrush}};
-  COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == count);
+  /* expected[] 只列**带默认键**的工具；无键的三项不在其列。 */
+  size_t keyed_count = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (comp_ui::tool_info_at(static_cast<int>(i))->shortcut != 0) ++keyed_count;
+  }
+  COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == keyed_count);
   for (const auto& entry : expected) {
     COMP_CHECK_MSG(comp_ui::tool_for_shortcut(entry.key) == entry.id,
                    "tool shortcut mapping");
@@ -729,9 +736,12 @@ COMP_TEST(ui_core_tool_shortcuts_match_upstream) {
                    "uppercase shortcut must map the same tool");
   }
 
-  /* 默认键不得重复，否则一条快捷键会指向两个工具。 */
+  /* 默认键不得重复，否则一条快捷键会指向两个工具；无默认键（shortcut 0）
+   * 的工具不参与（多个 0 不算冲突）。 */
   for (size_t i = 0; i < count; ++i) {
+    if (comp_ui::tool_info_at(static_cast<int>(i))->shortcut == 0) continue;
     for (size_t j = i + 1; j < count; ++j) {
+      if (comp_ui::tool_info_at(static_cast<int>(j))->shortcut == 0) continue;
       COMP_CHECK_MSG(comp_ui::tool_info_at(static_cast<int>(i))->shortcut !=
                          comp_ui::tool_info_at(static_cast<int>(j))->shortcut,
                      "duplicate tool shortcut");

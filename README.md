@@ -15,7 +15,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Windows 壳（Win32 + GDI 上屏、菜单/快捷键、图层面板、调整参数面板、撤销接线）与 HarmonyOS 壳
   （NAPI + XComponent）均已有可编译产物；另外落地了 **M5 编解码**（能力登记表 + PNG/JPEG 真实导入导出、
   PSD 当时只读（2026-10-23 起改为树内自研的分层读写，见 §6.87）；第三方库以源码 vendoring 进 `engine/third_party/`）。
-  全量 **804 用例 0 失败**；Windows 外壳实机自检 **290 项全 OK**（与仓内基线逐字节一致）。
+  全量 **810 用例 0 失败**；Windows 外壳实机自检 **290 项全 OK**（与仓内基线逐字节一致）。
   2026-10-15 追加（按审核结论改善 + 上游对齐）：撤销栈**像素资产化**（shared_ptr + COW，
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
@@ -502,7 +502,7 @@ typedef，故对契约零影响。
 | 项 | 当前值 |
 |---|---|
 | ABI 导出 | 215（212 + `comp_document_create_ex` / `comp_document_pixel_format` / `comp_document_color_mode`） |
-| 单元测试 | 804 例 0 失败（build.py 全量） |
+| 单元测试 | 810 例 0 失败（build.py 全量） |
 | 壳自检 | 293 项，SHA 基线 `2eaf4af8da44fba0`（末尾追加 13 项：多浮动 / 拖拽落点 / 浮窗几何 / 面板分组 / 左列分支 / 组列宽 / 组收起 / 组宽初始化 / 标签栏几何 / 拖放落点语义 / 拖放合并到指定列 / 图层列表滚动 / 可见滚动条） |
 | 视觉探针 | 284 项 0 失败（46 场景）；布局问壳要真实布局；连跑已稳定（见下注）；新增 `window_resize` 12 项（边框命中 / 最小尺寸 / 几何记忆）+ `float_clamp` 4 项（浮窗出屏吸回） |
 | 鸿蒙 | 模拟器 783/0 + ASan 0 报告；HAP 端到端（上屏 rc=0 + 触摸画笔 + 图片导入像素核对）；**图层面板树形/分组/拖行/折叠/多选 + 可编辑调整层（色阶按通道分页）+ 混合模式下拉 + 剪贴蒙版 + 图层蒙版（从透明度建立）**（`scripts/verify_ohos_layers.py` 30 项 0 失败；`layerPanelSelfTest` group=1 ungroup=1 active=1、`adjustTargetSelfTest` 选中层 255->25 / 未选中层 40->40）；真机 aarch64 可链接（libpng NEON 已处理） |

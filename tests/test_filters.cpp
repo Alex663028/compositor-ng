@@ -2633,3 +2633,242 @@ COMP_TEST(filters_dust_scratches_respects_threshold) {
   COMP_CHECK_MSG(gray_at(document, id, kSize, 6, 6) == 100,
                  "超阈值的噪点被替换为中位数（155 > 20）");
 }
+
+/*
+ * A46（2026-10-28）：扭曲（Spherize / Pinch / Twirl）、像素化（Mosaic）、
+ * 风格化（Emboss）三组的入口契约。三条承诺与 A45 同款：
+ *   1. 零初始化（各 amount / angle / cell_size = 0）= 真 no-op：不开事务、
+ *      不落撤销步、像素逐字节不变；
+ *   2. 参数闸先于事务：越界参数 -> INVALID_ARGUMENT，不进撤销栈；
+ *   3. 非零参数必须可观察地改像素、各恰好一步撤销、alpha 逐字节不变。
+ */
+
+namespace {
+
+/* x 方向线性渐变（0..255），alpha 全 255：给扭曲组的重映射一个确定的输入。 */
+std::vector<uint8_t> gradient_layer_bytes(int32_t size) {
+  std::vector<uint8_t> out(static_cast<size_t>(size) * static_cast<size_t>(size) * 4u, 0u);
+  for (int32_t y = 0; y < size; ++y) {
+    for (int32_t x = 0; x < size; ++x) {
+      uint8_t* p = out.data() + (static_cast<size_t>(y) * static_cast<size_t>(size) +
+                                 static_cast<size_t>(x)) * 4u;
+      const uint8_t v = static_cast<uint8_t>(x * 255 / (size - 1));
+      p[0] = p[1] = p[2] = v;
+      p[3] = 255;
+    }
+  }
+  return out;
+}
+
+bool all_alpha_are(const std::vector<uint8_t>& bytes, uint8_t value) {
+  for (size_t i = 3; i < bytes.size(); i += 4) {
+    if (bytes[i] != value) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+COMP_TEST(filters_a46_new_kinds_are_identity_at_zero_initialisation) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 30, 90, 150);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const FilterKind kinds[] = {kFilterSpherize, kFilterPinch, kFilterTwirl, kFilterMosaic,
+                              kFilterEmboss};
+  for (FilterKind kind : kinds) {
+    FilterSettings settings;
+    settings.kind = kind; /* 其余字段零初始化 */
+    const size_t undo_before = undo_depth(document);
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = true;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(!changed, "零初始化 = 恒等（未改动）");
+    COMP_CHECK_MSG(!document.txn_active(), "零初始化不开事务");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before, "零初始化不落撤销步");
+    COMP_CHECK_MSG(pixels_of(document, id) == before, "零初始化像素逐字节不变");
+  }
+}
+
+COMP_TEST(filters_a46_reject_out_of_range_before_the_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 10, 20, 30);
+  const size_t undo_before = undo_depth(document);
+  auto expect_invalid = [&](const FilterSettings& s) {
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(!filter_apply(&document, id, s, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  };
+  FilterSettings s;
+  s.kind = kFilterSpherize;
+  s.spherize.amount = 101.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterPinch;
+  s.pinch.amount = -150.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterTwirl;
+  s.twirl.angle = 1000.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterMosaic;
+  s.mosaic.cell_size = 1.0; /* (0,2) 之间没有可用方格 */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterEmboss;
+  s.emboss.amount = 501.0;
+  expect_invalid(s);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before, "越界参数不留撤销步");
+  COMP_CHECK_MSG(pixels_of(document, id) != std::vector<uint8_t>{}, "图层仍在");
+}
+
+COMP_TEST(filters_mosaic_averages_each_cell) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 8;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  std::vector<uint8_t> bytes(static_cast<size_t>(size) * static_cast<size_t>(size) * 4u, 0u);
+  for (size_t i = 0; i < static_cast<size_t>(size) * static_cast<size_t>(size); ++i) {
+    bytes[i * 4u + 0u] = 100;
+    bytes[i * 4u + 1u] = 100;
+    bytes[i * 4u + 2u] = 100;
+    bytes[i * 4u + 3u] = 255;
+  }
+  bytes[0] = bytes[1] = bytes[2] = 255; /* (0,0) 是亮像素 */
+  const comp_layer_id id = add_layer_with(&document, bytes, comp_rect{0, 0, size, size});
+  COMP_CHECK(id != 0);
+  const size_t undo_before = undo_depth(document);
+
+  FilterSettings settings;
+  settings.kind = kFilterMosaic;
+  settings.mosaic.cell_size = 4.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  /* 左上格：16 像素里 1 个 255 + 15 个 100 -> (255 + 1500) / 16 = 109.6875 -> 110。 */
+  for (int32_t y = 0; y < 4; ++y) {
+    for (int32_t x = 0; x < 4; ++x) {
+      COMP_CHECK_MSG(channel_at(after, size, x, y, 0) == 110, "左上格 = 16 像素均值 110");
+    }
+  }
+  COMP_CHECK_MSG(channel_at(after, size, 5, 5, 0) == 100, "均匀格保持 100");
+  COMP_CHECK_MSG(all_alpha_are(after, 255), "alpha 均值仍是 255");
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "马赛克恰好一步撤销");
+}
+
+COMP_TEST(filters_emboss_flattens_a_flat_field_to_mid_grey) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 128, 128, 128);
+
+  FilterSettings settings;
+  settings.kind = kFilterEmboss;
+  settings.emboss.amount = 100.0;
+  settings.emboss.angle = 0.0;
+  settings.emboss.height = 2.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(pixel_is(after, size, 8, 8, 128, 128, 128, 255),
+                 "平坦场内部（A == B）落 128 底灰");
+  COMP_CHECK_MSG(all_alpha_are(after, 255), "浮雕不改 alpha");
+}
+
+COMP_TEST(filters_spherize_pinch_twirl_change_pixels_and_are_one_step_undo) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  struct Case {
+    FilterKind kind;
+    double value;
+  };
+  const Case cases[] = {{kFilterSpherize, 50.0}, {kFilterPinch, -50.0}, {kFilterTwirl, 90.0}};
+  for (const Case& c : cases) {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id =
+        add_layer_with(&document, gradient_layer_bytes(size), comp_rect{0, 0, size, size});
+    COMP_CHECK(id != 0);
+    const std::vector<uint8_t> before = pixels_of(document, id);
+    const size_t undo_before = undo_depth(document);
+
+    FilterSettings settings;
+    settings.kind = c.kind;
+    if (c.kind == kFilterSpherize) {
+      settings.spherize.amount = c.value;
+    } else if (c.kind == kFilterPinch) {
+      settings.pinch.amount = c.value;
+    } else {
+      settings.twirl.angle = c.value;
+    }
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(changed, "扭曲报告已改动");
+    const std::vector<uint8_t> after = pixels_of(document, id);
+    COMP_CHECK_MSG(changed_pixels(before, after) > 0, "重映射确实改了些像素");
+    /* 重采样会在贴边处采到窗外（透明），所以 alpha 会变——这里只锁定
+     * 「中心像素仍不透明」：中心在径向映射下原地不动，采样必然落在图像内。 */
+    COMP_CHECK_MSG(channel_at(after, size, size / 2, size / 2, 3) == 255,
+                   "centre pixel stays opaque");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "扭曲恰好一步撤销");
+  }
+}
+
+COMP_TEST(filters_abi_maps_the_a46_fields_without_touching_custom) {
+  /*
+   * 回归锁：早前 comp_filter_abi.cpp 的 to_domain 把 A45 的 median/dust 参数
+   * 拷贝误缩进进了 `if (custom_touched)`，于是「ABI 只传 Median、不填 Custom」
+   * 时半径被丢成 0、滤镜静默变恒等。这里用 ABI 路径直接把它钉死。
+   */
+  Engine engine(test_engine_desc());
+  Document document(&engine, 32, 32, 72.0f, "sRGB");
+  constexpr int32_t kSize = 8;
+  const comp_layer_id id = add_gray_layer_with_specks(&document, kSize, {}, {{4, 4}});
+  COMP_CHECK(id != 0);
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 4, 4) == 255, "亮点就位");
+
+  comp_filter_desc median{};
+  median.kind = COMP_FILTER_MEDIAN;
+  median.median.radius = 1.0; /* 不碰 custom */
+  int32_t changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &median, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "ABI 传 Median 报告已改动");
+  COMP_CHECK_MSG(gray_at(document, id, kSize, 4, 4) == 100,
+                 "ABI 只传 Median（custom 未填）时半径不再被丢成 0");
+
+  /* 扭曲 / 像素化字段也过 ABI：Spherize amount 生效。 */
+  Document doc2(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id gid =
+      add_layer_with(&doc2, gradient_layer_bytes(16), comp_rect{0, 0, 16, 16});
+  const std::vector<uint8_t> before = pixels_of(doc2, gid);
+  comp_filter_desc spherize{};
+  spherize.kind = COMP_FILTER_SPHERIZE;
+  spherize.spherize.amount = 60.0;
+  changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&doc2), gid, &spherize, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "Spherize amount 过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(before, pixels_of(doc2, gid)) > 0, "球面化确实改了像素");
+}

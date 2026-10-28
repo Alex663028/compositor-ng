@@ -55,7 +55,13 @@ typedef enum comp_filter_kind {
   COMP_FILTER_CUSTOM           = 15,
   /* A45（2026-10-27）尾部追加：去噪族的两项。 */
   COMP_FILTER_MEDIAN           = 16, /* 中间值：窗口取中位色 */
-  COMP_FILTER_DUST_SCRATCHES   = 17  /* 蒙尘与划痕：超阈值才替换为中位数 */
+  COMP_FILTER_DUST_SCRATCHES   = 17, /* 蒙尘与划痕：超阈值才替换为中位数 */
+  /* A46（2026-10-28）尾部追加：扭曲 / 像素化 / 风格化三组。 */
+  COMP_FILTER_SPHERIZE         = 18, /* 球面化：amount -100..100，0 = 恒等 */
+  COMP_FILTER_PINCH            = 19, /* 挤压：amount -100..100，0 = 恒等 */
+  COMP_FILTER_TWIRL            = 20, /* 旋转扭曲：angle -999..999，0 = 恒等 */
+  COMP_FILTER_MOSAIC           = 21, /* 马赛克：cell_size 0 = 恒等，否则 2..200 */
+  COMP_FILTER_EMBOSS           = 22  /* 浮雕：amount 0 = 恒等，否则 1..500 */
 } comp_filter_kind;
 
 /*
@@ -240,6 +246,50 @@ typedef struct comp_filter_denoise {
   int32_t threshold;
 } comp_filter_denoise;
 
+/*
+ * Spherize（上游 Filter > Distort > Spherize）。
+ *   amount  -100..100，0 = 恒等；正值 = 球面（中心放大），负值 = 凹面。
+ */
+typedef struct comp_filter_spherize {
+  double amount;
+} comp_filter_spherize;
+
+/*
+ * Pinch（上游 Filter > Distort > Pinch）。
+ *   amount  -100..100，0 = 恒等；正值 = 向内挤压，负值 = 向外扩张。
+ */
+typedef struct comp_filter_pinch {
+  double amount;
+} comp_filter_pinch;
+
+/*
+ * Twirl（上游 Filter > Distort > Twirl）。
+ *   angle  -999..999（度），0 = 恒等；边缘（r >= 1）不转。
+ */
+typedef struct comp_filter_twirl {
+  double angle;
+} comp_filter_twirl;
+
+/*
+ * Mosaic（上游 Filter > Pixelate > Mosaic）。
+ *   cell_size  0 = 恒等；否则 2..200（方格边长，图层像素；预览再乘 scale）。
+ */
+typedef struct comp_filter_mosaic {
+  double cell_size;
+} comp_filter_mosaic;
+
+/*
+ * Emboss（上游 Filter > Stylize > Emboss）。
+ *   amount  0 = 恒等；否则 1..500（百分比）
+ *   angle   -360..360（光照方向，度）
+ *   height  0..10（采样间距，图层像素；预览再乘 scale 后至少 1）
+ */
+typedef struct comp_filter_emboss {
+  double amount;
+  double angle;
+  double height;
+} comp_filter_emboss;
+
 /* Offset 的露出区域处理方式（数值即域层 `OffsetSettings.wrap`）。 */
 typedef enum comp_offset_wrap {
   COMP_OFFSET_TRANSPARENT = 0, /* 露出部分留空（不环绕） */
@@ -309,6 +359,13 @@ typedef struct comp_filter_desc {
   comp_filter_custom           custom;
   comp_filter_denoise          median;         /* A45：kind == MEDIAN */
   comp_filter_denoise          dust_scratches; /* A45：kind == DUST_SCRATCHES */
+  /* A46 尾部追加：扭曲 / 像素化 / 风格化三组。旧宿主按旧头文件编译时描述符更小，
+   * 新宿主必须用同一份头文件（两端同源构建，不提供跨版本结构体协商）。 */
+  comp_filter_spherize         spherize;       /* kind == SPHERIZE */
+  comp_filter_pinch            pinch;          /* kind == PINCH */
+  comp_filter_twirl            twirl;          /* kind == TWIRL */
+  comp_filter_mosaic           mosaic;         /* kind == MOSAIC */
+  comp_filter_emboss           emboss;         /* kind == EMBOSS */
 } comp_filter_desc;
 
 /*

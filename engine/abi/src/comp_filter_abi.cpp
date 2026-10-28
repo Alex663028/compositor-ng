@@ -122,13 +122,25 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
     for (int i = 0; i < 25; ++i) settings.custom.kernel[i] = desc.custom.kernel[i];
     settings.custom.scale = desc.custom.scale;
     settings.custom.offset = desc.custom.offset;
+  }
 
-  /* A45：去噪族两个 kind 的参数（尾部追加，老宿主零初始化 = 半径 0 = 恒等）。 */
+  /* A45：去噪族两个 kind 的参数（尾部追加，老宿主零初始化 = 半径 0 = 恒等）。
+   * 注意：这两行**不在**上面的 custom 分支里——早前误缩进把 median/dust 的参数
+   * 拷贝关进了 `if (custom_touched)`，导致「只调 Median 不碰 Custom」时半径被丢
+   * 成 0、滤镜静默变恒等。A46 修正为先闭合 custom 分支再无条件拷贝。 */
   settings.median.radius = desc.median.radius;
   settings.median.threshold = desc.median.threshold;
   settings.dust_scratches.radius = desc.dust_scratches.radius;
   settings.dust_scratches.threshold = desc.dust_scratches.threshold;
-  }
+
+  /* A46：扭曲 / 像素化 / 风格化组的参数（尾部追加，老宿主零初始化 = 恒等）。 */
+  settings.spherize.amount = desc.spherize.amount;
+  settings.pinch.amount = desc.pinch.amount;
+  settings.twirl.angle = desc.twirl.angle;
+  settings.mosaic.cell_size = desc.mosaic.cell_size;
+  settings.emboss.amount = desc.emboss.amount;
+  settings.emboss.angle = desc.emboss.angle;
+  settings.emboss.height = desc.emboss.height;
   return settings;
 }
 
@@ -253,6 +265,19 @@ comp_filter_desc from_domain(const FilterSettings& s) {
   desc.offset.horizontal = s.offset.horizontal;
   desc.offset.vertical = s.offset.vertical;
   desc.offset.wrap = s.offset.wrap;
+
+  desc.median.radius = s.median.radius;
+  desc.median.threshold = s.median.threshold;
+  desc.dust_scratches.radius = s.dust_scratches.radius;
+  desc.dust_scratches.threshold = s.dust_scratches.threshold;
+
+  desc.spherize.amount = s.spherize.amount;
+  desc.pinch.amount = s.pinch.amount;
+  desc.twirl.angle = s.twirl.angle;
+  desc.mosaic.cell_size = s.mosaic.cell_size;
+  desc.emboss.amount = s.emboss.amount;
+  desc.emboss.angle = s.emboss.angle;
+  desc.emboss.height = s.emboss.height;
   return desc;
 }
 

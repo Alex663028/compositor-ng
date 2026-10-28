@@ -349,6 +349,51 @@ divisor = (scale == 0 ? 1 : scale)
 - 预览（`scale < 1`）**不缩小卷积核**：核没有连续的「半径」语义，降采样预览
   会比全尺寸偏强（见 §5 第 14 条）。
 
+### 3.17 去噪族：Median / Dust & Scratches（`COMP_FILTER_MEDIAN` / `COMP_FILTER_DUST_SCRATCHES`）
+
+A45（2026-10-27）尾部追加的两项，共用一份设置（ABI 里叫 `comp_filter_denoise`）。
+
+| 字段 | 量程 | 上游默认 | 含义 |
+|------|------|---------|------|
+| `radius` | 0 = 恒等；否则 1..50 | 0 | 方形窗口半径（整数像素） |
+| `threshold` | `int32`，0..255（仅 Dust & Scratches） | 0 | 0 = 等同 Median；1..255 = 中心与中位数的差超过它才替换 |
+
+- Median（`COMP_FILTER_MEDIAN = 16`）：窗口取**中位色**（直通色逐通道中位数），
+  alpha 逐字节不变；孤立噪点（亮点 / 暗点）被窗口多数色替换掉。
+- Dust & Scratches（`COMP_FILTER_DUST_SCRATCHES = 17`）：中心像素与窗口中位数的
+  逐通道差**超过 `threshold`** 才替换为中位数，否则原样保留——只压孤立划痕，
+  不动阈值内的温和细节（一条测试同时验两侧：阈值内保留、超阈值替换）。
+- 两者共用同一窗口实现；`threshold == 0` 时 Dust 退化为 Median。
+- 恒等判据：`radius == 0`。零初始化 `comp_filter_denoise` 因此是恒等（不开事务）。
+
+### 3.18 扭曲 / 像素化 / 风格化：Spherize / Pinch / Twirl / Mosaic / Emboss（A46）
+
+A46（2026-10-28）尾部追加的五项（`COMP_FILTER_SPHERIZE = 18` …
+`COMP_FILTER_EMBOSS = 22`）。三项扭曲（Spherize / Pinch / Twirl）共用一套
+**以图层中心为原点、半短边归一**的径向重映射 + 双线性采样；采样落在图像外按
+**透明**参与（与 §3.4 Lens Correction 的窗外口径一致），输出为预乘 RGBA8
+（`out_color <= out_alpha`）。
+
+| 滤镜 | kind | 参数 | 量程 / 恒等 | 映射口径 |
+|------|------|------|-------------|----------|
+| Spherize | 18 | `amount` | -100..100，0 = 恒等 | `r_src = r * (1 - s * (1 - r²))`，`s = amount / 100`；正 = 球面（中心放大），负 = 凹面 |
+| Pinch | 19 | `amount` | -100..100，0 = 恒等 | `r_src = r * (1 + s * (1 - r²))`；正 = 向内挤压，负 = 向外扩张 |
+| Twirl | 20 | `angle` | -999..999（度），0 = 恒等 | `theta_src = theta_dst - angle * max(0, 1 - r)`；`r >= 1`（边缘）不转 |
+| Mosaic | 21 | `cell_size` | 0 = 恒等；否则 2..200 | 方格边长；格内取**预乘分量**算术均值（alpha 也一起平均） |
+| Emboss | 22 | `amount` / `angle` / `height` | 0 = 恒等；否则 1..500 / -360..360（度）/ 0..10 | `128 + amount / 100 * (A - B)` |
+
+- 扭曲三者的 `r` 是**归一半径**（图层中心为 0，半短边为 1）；采样用双线性，
+  重复映射是连续的，不做最近邻的硬边。贴边像素会因为采样落到窗外而变半透明——
+  这是「窗外按透明参与」的直接结果，**不是 bug**。
+- Mosaic 的 `cell_size` 在预览时乘 `scale` 后取整、下限 2；(0, 2) 之间没有可用
+  方格，显式拒绝而不是夹到 2。恒等时 `cell_size == 0`，不开事务。
+- Emboss 的 `A` / `B` 是沿 `angle` 方向 ±`height`（预览乘 `scale` 后至少 1 像素）
+  处的**直通色**；`angle` 逆时针为正（图层 y 向下，方向向量 `(cos, -sin)`）。结果
+  逐通道夹 0..255 后乘回**原** alpha——平坦区域落 128 底灰，alpha 不变。
+- 越界参数（如 `amount = 101`、`cell_size = 1`、`angle = 1000`）一律
+  `COMP_ERR_INVALID_ARGUMENT`，参数闸先于事务；非零参数恰好一步撤销。
+- 与 A45 一样，A46 只追加 kind 与子结构，ABI 导出数不变（见 §5 尾部追加清单）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage

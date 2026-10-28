@@ -368,6 +368,69 @@ struct CustomSettings {
   double offset = 0.0;
 };
 
+/*
+ * Spherize（上游 Filter > Distort > Spherize 球面化）。
+ *
+ * `amount` -100..100，**0 = 恒等**：正值 = 球面（中心放大、像贴到球上），
+ * 负值 = 凹面。半径按图层**半短边**归一（r = 到中心的距离 / 半短边），
+ * 映射为 `r_src = r * (1 - s * (1 - r²))`（s = amount/100）：中心不动、
+ * 边缘不动、中间按 s 向心或离心偏移，所以 0 之外都真的重采样。
+ * 与 Lens Correction 共用双线性径向重采样口径，但映射不是同一个 k。
+ */
+struct SpherizeSettings {
+  double amount = 0.0;
+};
+
+/*
+ * Pinch（上游 Filter > Distort > Pinch 挤压）。
+ *
+ * `amount` -100..100，**0 = 恒等**：正值 = 向内挤压（Pinch），负值 = 向外
+ * 扩张（Punch）。映射 `r_src = r * (1 + s * (1 - r²))`，与 Spherize 同族、
+ * 符号相反（两者在 ±s 下互为对方的映射方向）。
+ */
+struct PinchSettings {
+  double amount = 0.0;
+};
+
+/*
+ * Twirl（上游 Filter > Distort > Twirl 旋转扭曲）。
+ *
+ * `angle` -999..999（度），**0 = 恒等**：绕图层中心旋转，离中心越近转角越大、
+ * 边缘（r >= 1）不转：`θ_src = θ_dst - angle * max(0, 1 - r)`。转角超过 ±360
+ * 会绕成多圈、出现径向条纹——这是旋转扭曲的正常观感，不做夹取。
+ */
+struct TwirlSettings {
+  double angle = 0.0;
+};
+
+/*
+ * Mosaic（上游 Filter > Pixelate > Mosaic 马赛克）。
+ *
+ * `cell_size` **0 = 恒等**；否则 2..200（方格边长，图层像素；预览再乘 scale、
+ * 取整但至少 2）。方格取窗口内**预乘**分量的算术均值（与盒式下采样同一口径：
+ * 预乘均值天然满足 out_color <= out_alpha，不会把透明区颜色渗进不透明格）。
+ */
+struct MosaicSettings {
+  double cell_size = 0.0;
+};
+
+/*
+ * Emboss（上游 Filter > Stylize > Emboss 浮雕）。
+ *
+ * `amount` **0 = 恒等**；否则 1..500（= 上游百分比）。
+ * `angle` -360..360（光照方向，度；0 = 正右、逆时针为正）。
+ * `height` 0..10（采样间距，图层像素；预览再乘 scale 后至少 1）。
+ *
+ * 口径 = `128 + amount/100 * (A - B)`，A / B 是沿 angle 方向 ±height 处采到的
+ * **直通**色；结果逐通道夹到 0..255、乘回原 alpha（alpha 逐字节不变）。
+ * 平坦区域落 128 底灰，与 High Pass 同一「边缘以中灰为轴」的约定。
+ */
+struct EmbossSettings {
+  double amount = 0.0;
+  double angle = 0.0;
+  double height = 0.0;
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -388,6 +451,12 @@ enum FilterKind {
   kFilterCustom = 15,
   kFilterMedian = 16,
   kFilterDustScratches = 17,
+  /* A46（2026-10-28）尾部追加：扭曲 / 像素化 / 风格化三组各若干。 */
+  kFilterSpherize = 18,
+  kFilterPinch = 19,
+  kFilterTwirl = 20,
+  kFilterMosaic = 21,
+  kFilterEmboss = 22,
 };
 
 /*
@@ -414,6 +483,11 @@ struct FilterSettings {
   CustomSettings custom;
   DenoiseSettings median;
   DenoiseSettings dust_scratches;
+  SpherizeSettings spherize;
+  PinchSettings pinch;
+  TwirlSettings twirl;
+  MosaicSettings mosaic;
+  EmbossSettings emboss;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

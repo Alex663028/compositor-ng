@@ -12,7 +12,7 @@
 > | 项 | 当前值 | 校验方式 |
 > |---|---|---|
 > | ABI 导出 | **215** | `scripts/check_docs.py` 第 1 项（与本节数字比对） |
-> | 单元测试 | **804 例 / 0 失败** | `build.py` 全量 |
+> | 单元测试 | **810 例 / 0 失败** | `build.py` 全量 |
 > | 壳自检 | **293 项 / failures=0**，SHA `2eaf4af8da44fba0…` | `check_docs.py` 第 2 项 |
 > | 视觉探针 | **284 条 / 46 场景 / 0 失败** | `check_docs.py` 第 4 项（按执行次数计，含循环内重复） |
 > | 对标 PS | 日常路径 **≈96%** / 全功能面 **≈80%**（155/197） | `check_docs.py` 第 5–6、9 项（表格加权 == 算式 == 自称分数；清单命中 == 表格） |
@@ -46,7 +46,7 @@
 | 混合模式 | **24**（`comp_core.h:126-150`） | 27 + 组「穿透」 | 缺 Dissolve / Darker Color / Lighter Color；组混合与隔离已可往返（`comp_file.cpp` 的 `engineIsolated`/`engineBlendMode`） |
 | 调整种类 | **25**（前 12 种对齐上游，后 13 种为本仓追加） | 调整菜单 20+ | 破坏性 `Image > Adjustments` 已落地 20 种；仍缺外部 LUT 文件与 RAW 解码 |
 | 图层样式 | **10**（描边/投影/颜色叠加/内阴影/外发光/内发光/斜面和浮雕/缎光/渐变叠加/图案叠加） | 10 | 十种样式已齐；仍无合并的样式对话框与全局光角度设置，图案只有四种内置 |
-| 滤镜 | **16**（`comp_filter.h`） | 100+ | 无模糊画廊 / 扭曲 / 像素化 / 风格化 / 渲染；锐化（USM）、降噪与 Other 组（高反差保留/最小/最大/位移/自定）已进 Filter 菜单 |
+| 滤镜 | **23**（`comp_filter.h`） | 100+ | 无模糊画廊 / 渲染；锐化（USM）、降噪（中间值/蒙尘与划痕，A45）、扭曲（球面化/挤压/旋转扭曲，A46）、像素化（马赛克，A46）、风格化（浮雕，A46）与 Other 组（高反差保留/最小/最大/位移/自定）已进 Filter 菜单 |
 | 可用格式 | 导入 PNG/JPEG/PSD(分层)/HDR/EXR；导出 PNG/JPEG/**PSD(分层)**/EXR + `.comp` | 20+ | PSD 是常用子集（8/16 位 RGB(A)；PSB/CMYK/32 位/智能对象/文字/效果具名拒绝）；无 TIFF、WebP、HEIF、PDF、SVG、RAW |
 | 文档 | **多标签**（`tabs` / `DocTabSlot`）+ 最近打开 | 多标签 | 新建/打开会先 park 当前文档，关闭与退出逐标签提示未保存；仍无崩溃恢复 |
 | 面板 | **12 个**（图层/调整/曲线/裁剪/滤镜/效果/色彩范围/路径/历史/通道/文字/智能滤镜栈） | 15+ | 已有停靠/浮动/分组与工作区存读；无导航器 / 色板 / 属性 / 动作 |
@@ -790,7 +790,7 @@ WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP 里（那段 1200 行），浮起�
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | ~~渐变仅两色标~~ → 多色标（2..32）与每段中点已支持 | `engine/abi/include/compositor/comp_layer.h:688-692`（`comp_gradient_stop`）、同文件 `comp_tool_op_desc` 尾部 `gradient_stops` / `gradient_stop_count` / `gradient_dither`；壳侧可编辑表见 README §6.105 |
 | 10 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 / §6.104 |
-| 16 种滤镜 | `engine/abi/include/compositor/comp_filter.h:40-55`（`COMP_FILTER_VIGNETTE` … `COMP_FILTER_CUSTOM = 15`） |
+| 23 种滤镜 | `engine/abi/include/compositor/comp_filter.h:40-64`（`COMP_FILTER_VIGNETTE` … `COMP_FILTER_EMBOSS = 22`；A45 追加 `MEDIAN`/`DUST_SCRATCHES`，A46 追加 `SPHERIZE`/`PINCH`/`TWIRL`/`MOSAIC`/`EMBOSS`） |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
 | 组 blendMode 仍写 Normal | `engine/format/comp_file.cpp:364-365`（上游兼容）；组自己的模式走 `engineBlendMode` / `engineIsolated`（同文件 :416-421、:990-1002，2026-10-23 §6.87 已支持） |
