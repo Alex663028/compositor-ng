@@ -263,7 +263,7 @@ bool blend_adjusted_in_blend_mode(const ImageBuffer& adjusted, const ImageBuffer
                                  below_row[static_cast<size_t>(x) * 4 + 1],
                                  below_row[static_cast<size_t>(x) * 4 + 2], 255};
       uint8_t mixed[4] = {opaque_below[0], opaque_below[1], opaque_below[2], 255};
-      blend_pixels(mixed, opaque_above, mode, 1.0);
+      blend_pixels(mixed, opaque_above, mode, 1.0, x, y);
       px[0] = mixed[0];
       px[1] = mixed[1];
       px[2] = mixed[2];
@@ -325,7 +325,7 @@ bool blend_adjusted_in_blend_mode_hdr(const ImageBuffer& adjusted, const ImageBu
       const uint16_t* below_px = below_row + static_cast<size_t>(x) * 4u;
       uint16_t opaque_above[4] = {adj[0], adj[1], adj[2], one};
       uint16_t mixed[4] = {below_px[0], below_px[1], below_px[2], one};
-      blend_pixels_half(mixed, opaque_above, mode, 1.0);
+      blend_pixels_half(mixed, opaque_above, mode, 1.0, x, y);
       px[0] = mixed[0];
       px[1] = mixed[1];
       px[2] = mixed[2];
@@ -650,14 +650,14 @@ bool build_clipping_stack_surface(const Document& doc, const FilterGraph& graph,
           const double member_alpha = static_cast<double>(deep_half_value(src[3]));
           if (!(member_alpha > 0.0)) continue;
           blend_pixels_half(reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * bpp),
-                            src, mode, member_alpha);
+                            src, mode, member_alpha, x, y);
         }
       } else {
         for (int32_t x = 0; x < surface.width; ++x) {
           const uint8_t* src = src_row + static_cast<size_t>(x) * bpp;
           const double member_alpha = static_cast<double>(src[3]) / 255.0;
           if (member_alpha <= 0.0) continue;
-          blend_pixels(dst_row + static_cast<size_t>(x) * bpp, src, mode, member_alpha);
+          blend_pixels(dst_row + static_cast<size_t>(x) * bpp, src, mode, member_alpha, x, y);
         }
       }
     }

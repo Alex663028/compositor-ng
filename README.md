@@ -307,7 +307,7 @@ compositor-ng/
 │   │   ├── document.h/.cpp        # Document：图层树、事务、撤销、脏标记
 │   │   └── history.h/.cpp         # History：整篇快照式撤销栈（默认 200 步）
 │   ├── compositing/
-│   │   ├── blend.h/.cpp           # W3C 24 种混合模式 + 上游规范字符串映射
+│   │   ├── blend.h/.cpp           # W3C 24 种混合模式 + 本仓扩展 3 种（A50）+ 上游规范字符串映射
 │   │   ├── composite_ops.h/.cpp   # ★ 合成基础算子：预乘/直通换算、蒙版、剪贴、单像素混合
 │   │   ├── filter_graph.h/.cpp    # ★ 合成有向图：图层树求值、组穿透/隔离语义（见 §4）
 │   │   ├── resample.h/.cpp        # ★ 仿射重采样：逆映射取样 + 蒙版烘焙（见 §4）

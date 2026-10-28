@@ -317,14 +317,21 @@ COMP_TEST(rhi_shaders_match_abi_blend_table) {
   const bool valid = gpu_kernel_validate(&error);
   COMP_CHECK_MSG(valid, error.c_str());
   COMP_CHECK(error.empty());
-  COMP_CHECK(gpu_kernel_blend_case_count() == 24);
+  /* A50：24 对齐上游 + 3 本仓扩展（Dissolve / Darker Color / Lighter Color）= 27。 */
+  COMP_CHECK(gpu_kernel_blend_case_count() == 27);
 
   const std::string hlsl(gpu_kernel_hlsl());
   const std::string glsl(gpu_kernel_glsl());
   COMP_CHECK(hlsl.find("SV_DispatchThreadID") != std::string::npos);
   COMP_CHECK(hlsl.find("Linear Dodge (Add)") != std::string::npos);
+  COMP_CHECK(hlsl.find("Dissolve") != std::string::npos);
+  COMP_CHECK(hlsl.find("Darker Color") != std::string::npos);
+  COMP_CHECK(hlsl.find("Lighter Color") != std::string::npos);
   COMP_CHECK(glsl.find("gl_GlobalInvocationID") != std::string::npos);
   COMP_CHECK(glsl.find("Luminosity") != std::string::npos);
+  COMP_CHECK(glsl.find("Dissolve") != std::string::npos);
+  COMP_CHECK(glsl.find("Darker Color") != std::string::npos);
+  COMP_CHECK(glsl.find("Lighter Color") != std::string::npos);
 }
 
 COMP_TEST(rhi_gpu_kernel_matches_cpu_blend) {

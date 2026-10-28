@@ -93,10 +93,10 @@ constexpr UINT kCmdLayerOpacityDown = 1012;
 constexpr UINT kCmdLayerOpacityUp = 1013;
 constexpr UINT kCmdLayerBlendPrev = 1034; /* S21：混合模式按菜单序后退一步 */
 constexpr UINT kCmdLayerBlendNext = 1035; /* S21：混合模式按菜单序前进一步 */
-constexpr UINT kCmdBlendBase = 1300;      /* S21：+ 混合模式档位 0..23，菜单直达 */
+constexpr UINT kCmdBlendBase = 1300;      /* S21：+ 混合模式档位 0..26，菜单直达 */
 /*
- * S22 命令 id 段（1400 起，避开 1001..1046 单体、1100..1116 工具、1200..1222 滤镜、
- * 1300..1323 混合模式四段已占用区间）。
+ * S22 命令 id 段（1400 起，避开 1001..1046 单体、1100..1116 工具、1200..1292 滤镜、
+ * 1300..1326 混合模式四段已占用区间）。
  * 这一组接的是「引擎早已实现、壳一直没调」的像素级图层能力：蒙版 / 剪贴蒙版 /
  * 组隔离 / 采样 / 重排 / 直方图。它们与混合模式的差别只在于壳没开口子。
  */
@@ -456,7 +456,7 @@ constexpr UINT kCmdFilterClose = 1292;
 struct LayerRow {
   comp_layer_id id = 0;
   float opacity = 1.0f;
-  int32_t blend = 0;   /* comp_blend_mode 数值，0..23（ABI 冻结表） */
+  int32_t blend = 0;   /* comp_blend_mode 数值，0..26（ABI 冻结表 + A50 扩展） */
   uint8_t visible = 1; /* 壳侧自持：ABI 无可见性 getter */
   /*
    * S22 新增的三个面板可见状态。三者都不是「壳的第二种真相」——全部由 ABI 回读，

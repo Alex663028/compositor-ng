@@ -59,6 +59,28 @@ static void store_premultiplied(uint8_t* p, const double premul_rgb[3], double a
 namespace {
 
 /*
+ * A50 Dissolve：按文档坐标的确定性哈希决定该像素是否落墨。
+ * 口径与 PS 一致：有效 alpha >= 1 恒落墨；否则 hash01(px,py) < alpha 时落墨。
+ * 哈希必须与 GPU 着色器逐式一致（GPU == CPU，<=1 LSB）；见 gpu_kernel.cpp。
+ */
+uint32_t blend_dissolve_hash(int32_t x, int32_t y) {
+  uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B1u ^ static_cast<uint32_t>(y) * 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  h ^= h >> 16;
+  return h;
+}
+
+/* Dissolve 的有效 alpha 二值化；非 Dissolve 模式原样返回 src_alpha。 */
+double blend_dissolve_coverage(comp_blend_mode mode, double src_alpha, int32_t px, int32_t py) {
+  if (mode != COMP_BLEND_DISSOLVE) return src_alpha;
+  if (src_alpha >= 1.0) return 1.0;
+  if (src_alpha <= 0.0) return 0.0;
+  const double t = static_cast<double>(blend_dissolve_hash(px, py)) / 4294967296.0;
+  return (t < src_alpha) ? 1.0 : 0.0;
+}
+
+/*
  * W3C 合成公式（Compositing and Blending Level 1，9.1.4）。
  *
  * 8 位与 half 两条路共用这一份：两处各写一遍的话，改一处参数（例如漏掉
@@ -103,18 +125,23 @@ void store_half_premultiplied(uint16_t* p, const double premul_rgb[3], double al
 
 }  // namespace
 
-void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, double src_alpha) {
+void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, double src_alpha,
+                  int32_t px, int32_t py) {
   const StraightPixel src = to_straight(src_px);
   const StraightPixel base = to_straight(dst_px);
 
+  /* Dissolve 在进入 W3C 合成前把有效 alpha 二值化，并按 Normal 语义做 source-over。 */
+  const comp_blend_mode effective = (mode == COMP_BLEND_DISSOLVE) ? COMP_BLEND_NORMAL : mode;
+  const double coverage = blend_dissolve_coverage(mode, src_alpha, px, py);
+
   double out_rgb[3];
   double out_alpha = 0.0;
-  blend_straight(mode, src.rgb, base.alpha, base.rgb, src_alpha, out_rgb, &out_alpha);
+  blend_straight(effective, src.rgb, base.alpha, base.rgb, coverage, out_rgb, &out_alpha);
   store_premultiplied(dst_px, out_rgb, out_alpha);
 }
 
 void blend_pixels_half(uint16_t* dst_px, const uint16_t* src_px, comp_blend_mode mode,
-                       double src_alpha) {
+                       double src_alpha, int32_t px, int32_t py) {
   double src_rgb[3];
   double base_rgb[3];
   double src_alpha_px = 0.0;
@@ -122,16 +149,19 @@ void blend_pixels_half(uint16_t* dst_px, const uint16_t* src_px, comp_blend_mode
   half_to_straight(src_px, src_rgb, &src_alpha_px);
   half_to_straight(dst_px, base_rgb, &base_alpha);
 
+  const comp_blend_mode effective = (mode == COMP_BLEND_DISSOLVE) ? COMP_BLEND_NORMAL : mode;
+  const double coverage = blend_dissolve_coverage(mode, src_alpha, px, py);
+
   double out_rgb[3];
   double out_alpha = 0.0;
-  blend_straight(mode, src_rgb, base_alpha, base_rgb, src_alpha, out_rgb, &out_alpha);
+  blend_straight(effective, src_rgb, base_alpha, base_rgb, coverage, out_rgb, &out_alpha);
   store_half_premultiplied(dst_px, out_rgb, out_alpha);
 }
 
 /* 外部可链接的公共入口：薄包装，语义与 blend_pixels 完全一致（不做任何额外换算）。 */
 void compositor_blend_pixel_scalar(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode,
-                                   double src_alpha) {
-  blend_pixels(dst_px, src_px, mode, src_alpha);
+                                   double src_alpha, int32_t px, int32_t py) {
+  blend_pixels(dst_px, src_px, mode, src_alpha, px, py);
 }
 
 double clipping_factor(const Document& doc, const Layer& layer, int32_t x, int32_t y) {
@@ -426,7 +456,7 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
         /* dst 行用字节指针推进，按 half 像素（8 字节）换算；src 已是 half 单元。 */
         blend_pixels_half(
             reinterpret_cast<uint16_t*>(dst_row + static_cast<size_t>(x) * 8u),
-            reinterpret_cast<const uint16_t*>(src_px), layer.blend, alpha);
+            reinterpret_cast<const uint16_t*>(src_px), layer.blend, alpha, x, y);
       }
     }
     return true;
@@ -447,7 +477,7 @@ bool blend_layer_into(ImageBuffer* dst, const Document& doc, const Layer& layer,
       alpha *= clipping_factor(doc, layer, x, y);
       if (alpha <= 0.0) continue;
 
-      blend_pixels(dst_row + static_cast<size_t>(x) * 4, src_px, layer.blend, alpha);
+      blend_pixels(dst_row + static_cast<size_t>(x) * 4, src_px, layer.blend, alpha, x, y);
     }
   }
   return true;
@@ -509,7 +539,7 @@ bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode
         const double alpha =
             (static_cast<double>(deep_half_value(src_px[3]))) * clamped_opacity;
         if (alpha <= 0.0) continue;
-        blend_pixels_half(dst_row + static_cast<size_t>(x) * 4u, src_px, mode, alpha);
+        blend_pixels_half(dst_row + static_cast<size_t>(x) * 4u, src_px, mode, alpha, x, y);
       }
     }
     return true;
@@ -523,7 +553,7 @@ bool blend_buffer_into(ImageBuffer* dst, const ImageBuffer& src, comp_blend_mode
       const uint8_t* src_px = src_row + static_cast<size_t>(x) * 4;
       const double alpha = (static_cast<double>(src_px[3]) / 255.0) * clamped_opacity;
       if (alpha <= 0.0) continue;
-      blend_pixels(dst_row + static_cast<size_t>(x) * 4, src_px, mode, alpha);
+      blend_pixels(dst_row + static_cast<size_t>(x) * 4, src_px, mode, alpha, x, y);
     }
   }
   return true;

@@ -13,7 +13,7 @@
 
 | 规则 | 内容 |
 |------|------|
-| **R1 一条是什么** | 「用户能直接触发的一个功能动作」。变体不重复计：24 种混合模式算 1 条「混合模式」，25 种调整算 1 条「调整层」，16 种滤镜算 1 条「滤镜菜单」。 |
+| **R1 一条是什么** | 「用户能直接触发的一个功能动作」。变体不重复计：27 种混合模式算 1 条「混合模式」，25 种调整算 1 条「调整层」，31 种滤镜算 1 条「滤镜菜单」。 |
 | **R2 命中的门槛** | 必须有**用户可达的入口**（菜单项 / 快捷键 / 面板）且**后端真的实现**。只有 ABI 没有 UI 入口的，记「部分」并在证据列写明缺哪一半；「部分」在计分时按**未命中**处理（保守）。 |
 | **R3 证据怎么写** | 写可 grep 的符号（ABI 名、`kCmd*`、函数名、文件路径）。写不出证据的一律记未命中。 |
 | **R4 ML 与外部解码器** | 依赖 ML 模型（Select Subject / Remove Background / Neural Filters）与需第三方解码器的格式（HEIF/WebP/TIFF/RAW），按 `BACKLOG.md` §5 计未命中，不设豁免。 |
@@ -62,7 +62,7 @@
 | L02 | 图层组与嵌套 | ✅ | `comp_layer_group` 族；树形 6 级缩进；`children` |
 | L03 | 组穿透 / 隔离语义 | ✅ | `engineIsolated` / `engineBlendMode`（`comp_file.cpp`） |
 | L04 | 不透明度 | ✅ | `comp_layer_set_opacity` |
-| L05 | 混合模式（24 种） | ✅ | `COMP_BLEND_*` 24 个（`comp_core.h:126-150`） |
+| L05 | 混合模式（24 对齐上游 + 3 本仓扩展 = 27） | ✅ | `COMP_BLEND_*` 27 个（`comp_core.h`；A50 尾部追加 Dissolve / Darker Color / Lighter Color） |
 | L06 | 图层蒙版 | ✅ | `comp_layer_mask*`；贴入选区建蒙版（`shell_clipboard.cpp`） |
 | L07 | 剪贴蒙版 | ✅ | `COMP_CLIP_*` + `ClippingTarget`（`ui_core.h:4594`） |
 | L08 | 调整图层（25 种） | ✅ | `COMP_ADJUSTMENT_*` 24 kind + COUNT（`comp_layer.h`） |

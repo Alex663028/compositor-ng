@@ -3964,16 +3964,19 @@ inline int step_wand_radius(int radius, int direction) {
 /* ------------------------------------------------------------ 混合模式（S21） */
 
 /*
- * 混合模式档位与名称：数值即 comp_blend_mode 枚举（0..23，ABI 冻结表），
- * 顺序逐字对齐上游 LayerAppearance.swift 的 `LayerBlendMode.allCases` 声明序——
+ * 混合模式档位与名称：数值即 comp_blend_mode 枚举（ABI 冻结表）。
+ * 0..23 顺序逐字对齐上游 LayerAppearance.swift 的 `LayerBlendMode.allCases` 声明序——
  * 上游 Shift++ / Shift+− 就是按这个序循环、一步一撤销，可直接移植。
+ *
+ * A50（2026-10-28）：24..26 是本仓超出上游的三种（Dissolve / Darker Color /
+ * Lighter Color；PS 有、上游刻意未实现），纯尾部追加，排在 23 之后、同一菜单序。
  *
  * 名称取上游 rawValue 的规范拼写（含 "Linear Dodge (Add)" 的全称）；分组沿用
  * 上游 `LayerBlendMode.groups`（Normal / 加深 / 减淡 / 对比 / 比较 / 分量），
- * 状态栏与菜单据此显示分组归属。
+ * 扩展三种另立第 7 组「扩展」，状态栏与菜单据此显示分组归属。
  */
 inline constexpr int kBlendNormal = 0;
-inline constexpr int kBlendCount = 24;
+inline constexpr int kBlendCount = 27;
 
 inline int clamp_blend_mode(int mode) {
   if (mode < 0) return 0;
@@ -4018,6 +4021,9 @@ inline const char* blend_mode_name(int mode) {
     case 21: return "Saturation";
     case 22: return "Color";
     case 23: return "Luminosity";
+    case 24: return "Dissolve";
+    case 25: return "Darker Color";
+    case 26: return "Lighter Color";
     default: return "Normal";
   }
 }
@@ -4025,6 +4031,7 @@ inline const char* blend_mode_name(int mode) {
 /*
  * 上游分组编号（同 LayerBlendMode.groups）：0 Normal / 1 加深 / 2 减淡 /
  * 3 对比 / 4 比较 / 5 分量。菜单在同一组内不画分隔线。
+ * 第 6 组「扩展」是本仓超出上游的三种（24..26），不与上游分组混排。
  */
 inline constexpr int kBlendGroups[7][8] = {
     {0, -1, -1, -1, -1, -1, -1, -1},
@@ -4033,8 +4040,9 @@ inline constexpr int kBlendGroups[7][8] = {
     {9, 10, 11, 12, 13, 14, 15, -1},
     {16, 17, 18, 19, -1, -1, -1, -1},
     {20, 21, 22, 23, -1, -1, -1, -1},
+    {24, 25, 26, -1, -1, -1, -1, -1},
 };
-inline constexpr int kBlendGroupCount = 6;
+inline constexpr int kBlendGroupCount = 7;
 
 inline int blend_group_of(int mode) {
   const int value = clamp_blend_mode(mode);
@@ -4055,6 +4063,7 @@ inline const char* blend_group_name(int group) {
     case 3: return "对比";
     case 4: return "比较";
     case 5: return "分量";
+    case 6: return "扩展";
     default: return "";
   }
 }

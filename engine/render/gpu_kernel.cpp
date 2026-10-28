@@ -20,7 +20,7 @@ const char* const kHlsl = R"HLSL(
 // 与 engine/compositing/blend.cpp 使用同一套 W3C Compositing and Blending Level 1 公式。
 // 每个 case 后的注释即 comp_blend_mode 的上游规范名（ABI 冻结表，顺序与枚举数值一致）。
 // 资源：u0 = 目标（预乘 RGBA8，读写），u1 = 源（预乘 RGBA8）。
-#define COMP_BLEND_COUNT 24
+#define COMP_BLEND_COUNT 27
 
 RWTexture2D<float4> Dst : register(u0);
 RWTexture2D<float4> Src : register(u1);
@@ -104,6 +104,11 @@ float3 blend_rgb3(uint m, float3 cb, float3 cs) {
     case 21: /* Saturation */ { float3 t = cb; set_sat(t, sat3(cs)); set_lum(t, lum3(cb)); return t; }
     case 22: /* Color */      { float3 t = cs; set_lum(t, lum3(cb)); return t; }
     case 23: /* Luminosity */ { float3 t = cb; set_lum(t, lum3(cs)); return t; }
+    /* A50：本仓超出上游的三种（PS 有、上游刻意未实现）。Dissolve 在 main() 里按坐标把
+     * 有效 alpha 二值化，这里返回 cs 占位；Darker/Lighter Color 是整像素亮度择色。 */
+    case 24: /* Dissolve */      { return cs; }
+    case 25: /* Darker Color */  { return lum3(cb) <= lum3(cs) ? cb : cs; }
+    case 26: /* Lighter Color */ { return lum3(cb) >= lum3(cs) ? cb : cs; }
     default: break;
   }
   return float3(blend_channel(m, cb.r, cs.r), blend_channel(m, cb.g, cs.g), blend_channel(m, cb.b, cs.b));
@@ -126,6 +131,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
   // 有效源 alpha = 像素 alpha × 图层有效不透明度（含组穿透/蒙版/剪贴）。
   float alpha = s.a * asfloat(g_tail.x);
   float ab = d.a;
+
+  // A50 Dissolve：按文档坐标的确定性哈希把有效 alpha 二值化（与 CPU
+  // blend_dissolve_coverage 同一套公式；跨后端必须逐式一致）。
+  if (g_head.x == 24u) {
+    uint h = (tid.x * 0x9E3779B1u) ^ (tid.y * 0x85EBCA6Bu);
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    float t = (float)h / 4294967296.0;
+    alpha = (alpha >= 1.0) ? 1.0 : ((alpha > 0.0 && t < alpha) ? 1.0 : 0.0);
+  }
 
   float3 B = blend_rgb3(g_head.x, Cb, Cs);
 
@@ -152,7 +168,7 @@ const char* const kGlsl = R"GLSL(
 // 与 D3D12 版（render/gpu_kernel.cpp 的 HLSL）及 CPU 基准 blend.cpp 语义一一对应。
 // 每个 case 后的注释即 comp_blend_mode 的上游规范名（ABI 冻结表）。
 #version 450
-#define COMP_BLEND_COUNT 24
+#define COMP_BLEND_COUNT 27
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(rgba8, set = 0, binding = 0) uniform image2D g_dst;
@@ -240,6 +256,11 @@ vec3 blend_rgb3(uint m, vec3 cb, vec3 cs) {
     case 21: /* Saturation */ { vec3 t = cb; set_sat(t, sat3(cs)); set_lum(t, lum3(cb)); return t; }
     case 22: /* Color */      { vec3 t = cs; set_lum(t, lum3(cb)); return t; }
     case 23: /* Luminosity */ { vec3 t = cb; set_lum(t, lum3(cs)); return t; }
+    /* A50：本仓超出上游的三种（PS 有、上游刻意未实现）。Dissolve 在 main() 里按坐标把
+     * 有效 alpha 二值化，这里返回 cs 占位；Darker/Lighter Color 是整像素亮度择色。 */
+    case 24: /* Dissolve */      { return cs; }
+    case 25: /* Darker Color */  { return lum3(cb) <= lum3(cs) ? cb : cs; }
+    case 26: /* Lighter Color */ { return lum3(cb) >= lum3(cs) ? cb : cs; }
     default: break;
   }
   return vec3(blend_channel(m, cb.r, cs.r), blend_channel(m, cb.g, cs.g), blend_channel(m, cb.b, cs.b));
@@ -257,6 +278,17 @@ void main() {
 
   float alpha = s.a * pc.alpha;
   float ab = d.a;
+
+  // A50 Dissolve：按文档坐标的确定性哈希把有效 alpha 二值化（与 CPU
+  // blend_dissolve_coverage 同一套公式；跨后端必须逐式一致）。
+  if (pc.mode == 24u) {
+    uint h = (tid.x * 0x9E3779B1u) ^ (tid.y * 0x85EBCA6Bu);
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    float t = float(h) / 4294967296.0;
+    alpha = (alpha >= 1.0) ? 1.0 : ((alpha > 0.0 && t < alpha) ? 1.0 : 0.0);
+  }
 
   vec3 B = blend_rgb3(pc.mode, Cb, Cs);
   vec3 co = alpha * (1.0 - ab) * Cs + alpha * ab * B + (1.0 - alpha) * ab * Cb;
@@ -322,7 +354,7 @@ std::vector<CaseEntry> parse_cases(const char* source) {
 const char* gpu_kernel_hlsl() { return kHlsl; }
 const char* gpu_kernel_glsl() { return kGlsl; }
 
-int gpu_kernel_blend_case_count() { return 24; }
+int gpu_kernel_blend_case_count() { return 27; }
 
 bool gpu_kernel_validate(std::string* error) {
   const int expected = gpu_kernel_blend_case_count();
@@ -360,7 +392,7 @@ bool gpu_kernel_validate(std::string* error) {
 }
 
 void gpu_kernel_blend_pixel(uint8_t* dst_premultiplied, const uint8_t* src_premultiplied,
-                            comp_blend_mode mode, double layer_opacity) {
+                            comp_blend_mode mode, double layer_opacity, int32_t px, int32_t py) {
   if (dst_premultiplied == nullptr || src_premultiplied == nullptr) return;
 
   /* 直通化（镜像 to_straight）。 */
@@ -374,10 +406,27 @@ void gpu_kernel_blend_pixel(uint8_t* dst_premultiplied, const uint8_t* src_premu
   }
 
   /* 有效源 alpha：像素 alpha × 图层不透明度（镜像着色器 s.a * g_alpha）。 */
-  const double alpha = sa * layer_opacity;
+  double alpha = sa * layer_opacity;
+
+  /* A50 Dissolve：按文档坐标的确定性哈希把有效 alpha 二值化（镜像着色器 main()）。 */
+  if (mode == COMP_BLEND_DISSOLVE) {
+    if (alpha >= 1.0) {
+      alpha = 1.0;
+    } else if (alpha <= 0.0) {
+      alpha = 0.0;
+    } else {
+      uint32_t h =
+          static_cast<uint32_t>(px) * 0x9E3779B1u ^ static_cast<uint32_t>(py) * 0x85EBCA6Bu;
+      h ^= h >> 13;
+      h *= 0xC2B2AE35u;
+      h ^= h >> 16;
+      const double t = static_cast<double>(h) / 4294967296.0;
+      alpha = (t < alpha) ? 1.0 : 0.0;
+    }
+  }
 
   double blended[3];
-  blend_rgb(mode, Cb, Cs, blended);
+  blend_rgb(mode == COMP_BLEND_DISSOLVE ? COMP_BLEND_NORMAL : mode, Cb, Cs, blended);
 
   const double out_alpha = alpha + ab * (1.0 - alpha);
   for (int i = 0; i < 3; ++i) {

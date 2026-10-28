@@ -159,6 +159,10 @@ const BlendName kBlendNames[] = {
     {COMP_BLEND_SATURATION, "Saturation"},
     {COMP_BLEND_COLOR, "Color"},
     {COMP_BLEND_LUMINOSITY, "Luminosity"},
+    /* A50：本仓扩展（超出上游 24）。名字取 PS 拼音规范名；上游无对应 rawValue。 */
+    {COMP_BLEND_DISSOLVE, "Dissolve"},
+    {COMP_BLEND_DARKER_COLOR, "Darker Color"},
+    {COMP_BLEND_LIGHTER_COLOR, "Lighter Color"},
 };
 
 constexpr size_t kBlendNameCount = sizeof(kBlendNames) / sizeof(kBlendNames[0]);
@@ -248,6 +252,25 @@ void blend_rgb(comp_blend_mode mode, const double base[3], const double src[3],
       out[2] = t[2];
       return;
     }
+    /*
+     * A50：本仓超出上游的两种。Darker Color / Lighter Color 是**整像素**亮度择色
+     * （不是逐通道 min/max），走不了 blend_separable，只能在这里整像素挑一颗。
+     * 与 PS / W3C 非分离型口径一致：按相对亮度（Rec.601 权重）比较，取整颗像素。
+     */
+    case COMP_BLEND_DARKER_COLOR: {
+      const double* pick = (lum(base) <= lum(src)) ? base : src;
+      out[0] = pick[0];
+      out[1] = pick[1];
+      out[2] = pick[2];
+      return;
+    }
+    case COMP_BLEND_LIGHTER_COLOR: {
+      const double* pick = (lum(base) >= lum(src)) ? base : src;
+      out[0] = pick[0];
+      out[1] = pick[1];
+      out[2] = pick[2];
+      return;
+    }
     default: {
       out[0] = blend_separable(mode, base[0], src[0]);
       out[1] = blend_separable(mode, base[1], src[1]);
@@ -258,7 +281,11 @@ void blend_rgb(comp_blend_mode mode, const double base[3], const double src[3],
 }
 
 bool is_blend_supported(comp_blend_mode mode) {
-  return mode >= COMP_BLEND_NORMAL && mode <= COMP_BLEND_LUMINOSITY;
+  /*
+   * A50：上界抬到 LIGHTER_COLOR。三种扩展模式同样是需要真实求值的合法模式；
+   * 若沿用旧上界（LUMINOSITY），它们会被判为「越界」而静默退回 Normal。
+   */
+  return mode >= COMP_BLEND_NORMAL && mode <= COMP_BLEND_LIGHTER_COLOR;
 }
 
 }  // namespace compositor

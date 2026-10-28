@@ -2784,8 +2784,11 @@ COMP_TEST(ui_core_type_paragraph_box_steps_and_alignment) {
  * 数值同时是 comp_blend_mode 枚举，ABI 冻结，不能重排。
  */
 COMP_TEST(ui_core_blend_table_matches_upstream_all_cases) {
-  /* 24 档：0 = Normal .. 23 = Luminosity（ABI comp_blend_mode 冻结表）。 */
-  COMP_CHECK(comp_ui::kBlendCount == 24);
+  /*
+   * 27 档：0 = Normal .. 23 = Luminosity 逐字对齐上游冻结表；24..26 是本仓
+   * A50 纯尾部追加的扩展三档（Dissolve / Darker Color / Lighter Color）。
+   */
+  COMP_CHECK(comp_ui::kBlendCount == 27);
   COMP_CHECK(comp_ui::kBlendNormal == 0);
 
   const struct {
@@ -2817,6 +2820,10 @@ COMP_TEST(ui_core_blend_table_matches_upstream_all_cases) {
       {21, "Saturation", 5},
       {22, "Color", 5},
       {23, "Luminosity", 5},
+      /* A50 扩展：上游无对应 rawValue，名字取 PS 规范名，归入「扩展」组（组号 6）。 */
+      {24, "Dissolve", 6},
+      {25, "Darker Color", 6},
+      {26, "Lighter Color", 6},
   };
   COMP_CHECK(sizeof(expected) / sizeof(expected[0]) == comp_ui::kBlendCount);
 
@@ -2827,7 +2834,7 @@ COMP_TEST(ui_core_blend_table_matches_upstream_all_cases) {
                    "blend group assignment");
   }
 
-  /* 分组表本身必须自洽：组号连续、组内档位严格递增、全体恰好覆盖 0..23 一次。 */
+  /* 分组表本身必须自洽：组号连续、组内档位严格递增、全体恰好覆盖 0..26 一次。 */
   bool seen[comp_ui::kBlendCount] = {};
   for (int group = 0; group < comp_ui::kBlendGroupCount; ++group) {
     int previous = -1;
@@ -2854,14 +2861,16 @@ COMP_TEST(ui_core_blend_mode_steps_and_wraps_like_upstream) {
   COMP_CHECK(comp_ui::clamp_blend_mode(-5) == 0);
   COMP_CHECK(comp_ui::clamp_blend_mode(0) == 0);
   COMP_CHECK(comp_ui::clamp_blend_mode(23) == 23);
-  COMP_CHECK(comp_ui::clamp_blend_mode(24) == 23);
-  COMP_CHECK(comp_ui::clamp_blend_mode(999) == 23);
+  COMP_CHECK(comp_ui::clamp_blend_mode(24) == 24);
+  COMP_CHECK(comp_ui::clamp_blend_mode(26) == 26);
+  COMP_CHECK(comp_ui::clamp_blend_mode(27) == 26);
+  COMP_CHECK(comp_ui::clamp_blend_mode(999) == 26);
   COMP_CHECK(comp_ui::clamp_blend_mode(comp_ui::kBlendNormal) == comp_ui::kBlendNormal);
 
-  /* 步进回绕（对齐上游 cycleBlendMode 的取模）：Normal 后退到 Luminosity。 */
-  COMP_CHECK(comp_ui::step_blend_mode(0, -1) == 23);
+  /* 步进回绕（对齐上游 cycleBlendMode 的取模，含 A50 扩展档）：Normal 后退到 Lighter Color。 */
+  COMP_CHECK(comp_ui::step_blend_mode(0, -1) == 26);
   COMP_CHECK(comp_ui::step_blend_mode(0, 1) == 1);
-  COMP_CHECK(comp_ui::step_blend_mode(23, 1) == 0);
+  COMP_CHECK(comp_ui::step_blend_mode(23, 1) == 24);
   COMP_CHECK(comp_ui::step_blend_mode(23, -1) == 22);
 
   /* direction = 0 是幂等查询，不应改动档位。 */

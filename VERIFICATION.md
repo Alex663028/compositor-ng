@@ -8330,6 +8330,72 @@ A49 追加 26..30）。
 **面板边界：** 上游是在画布上拖几何（中心 / 椭圆 / 中轴 / 端点）；本仓面板 v1
 只承载标量幅度，几何默认居中、画布交互留待后续 UI 轮次。
 
+### 6.121 混合模式 A50：Dissolve / Darker Color / Lighter Color 纯尾部追加（P1-5，2026-10-28，deepseek-v4.1-flash）
+
+**缺口。** BACKLOG 的「混合模式」行原列 **24**，差 Dissolve / Darker Color / Lighter Color
+三者——上游 Compositor 明确拒绝这三者（源码注释见 `LayerAppearance.swift` /
+`PSDTypes.swift`），本批在**不改 0..23 上游不变量**的前提下把它们补上。
+
+**做法（纯尾部追加；0..23 逐字不动）：**
+
+- ABI（`engine/abi/include/compositor/comp_core.h`）：`comp_blend_mode` 尾追加 `COMP_BLEND_DISSOLVE = 24` /
+  `COMP_BLEND_DARKER_COLOR = 25` / `COMP_BLEND_LIGHTER_COLOR = 26`。既有枚举值与导出数不变。
+- `blend.cpp`：`kBlendNames` 尾追加三条规范名；`blend_rgb` 加 `DARKER_COLOR` /
+  `LIGHTER_COLOR` 两个**整像素**亮度择色分支（按 Rec.601 权重比 `lum()`，取整颗像素，
+  非逐通道 min/max，与 PS / W3C 非分离型口径一致）；`is_blend_supported` 上界从
+  `LUMINOSITY` 抬到 `LIGHTER_COLOR`（否则三者会被判越界而静默退回 Normal）。
+- Dissolve 是**按位置抖动**：`composite_ops.{h,cpp}` 新增 `blend_dissolve_hash(px,py)`
+  （`h = x*0x9E3779B1 ^ y*0x85EBCA6B; h^=h>>13; h*=0xC2B2AE35; h^=h>>16`）与
+  `blend_dissolve_coverage`；逐像素入口 `blend_pixels` / `blend_pixels_half` /
+  `compositor_blend_pixel_scalar` 尾部加 `int32_t px = 0, int32_t py = 0`（默认参数，
+  既有调用零改动），DISSOLVE 时按 `hash01 < alpha` 二值化后再走 Normal。
+- 坐标穿透：`blend_layer_into` / `blend_buffer_into`（`composite_ops.cpp`）与
+  `filter_graph.cpp` 的 4 处调用点传真实 `x, y`。
+- GPU 三份同源（`gpu_kernel.h` / `gpu_kernel.cpp`）：`blend_rgb3` 追加 case 24/25/26，
+  HLSL/GLSL 两份 main 各加 Dissolve 二值化块（同 hash 公式，用 `tid.xy`）；
+  `COMP_BLEND_COUNT` 24→27，`gpu_kernel_blend_case_count()`→27，镜像
+  `gpu_kernel_blend_pixel` 加 `px, py` 并接 Dissolve。**GLSL 改动后已重编 SPIR-V**
+  （`scripts/build_spirv.sh`：`gpu_kernel_spv.h` 19,052 → 20,680 字节 / 5,170 words）。
+- 外壳：`ui_core.h` `kBlendCount` 24→27、`blend_mode_name` +3、`kBlendGroups` 加第 7 组
+  「扩展」{24, 25, 26}、`kBlendGroupCount` 6→7、`blend_group_name` 加 `case 6: return "扩展";`；
+  `shell_state.h` 注释与档位区间更新为 0..26 / 1300..1326（1300+26=1326 < S22 段 1400，无冲突）。
+
+**护栏（`tests/`）：** `blend_mode_matches_upstream_enum` 改为「前 24 逐字对齐上游 +
+24..26 规范名固定 + 越界 27 为 nullptr」；`blend_mode_manifest_round_trip` 补扩展名往返；
+`ui_core_blend_table_matches_upstream_all_cases` 表补 24..26（组 6）与 `kBlendCount == 27`；
+`ui_core_blend_mode_steps_and_wraps_like_upstream` 的 clamp / step 断言按 27 档回绕更新；
+`rhi_shaders_match_abi_blend_table` 的 `gpu_kernel_blend_case_count()` 24→27，并补
+HLSL/GLSL 均含 Dissolve / Darker Color / Lighter Color 的存在性断言。
+
+**本批改掉的硬编码欠账：** 上一批遗留的 `tests/test_rhi.cpp:320` 仍断言
+`gpu_kernel_blend_case_count() == 24`，加档后直接暴露（821 cases / 1 failed），本批改为 27。
+
+**验证：**
+
+- `scripts/build.py`：**821 cases / 0 failed / 0 check failures**。本批为既有用例的护栏
+  增强，不新增 `COMP_TEST`，用例数维持 821。
+- ABI 导出数不变（纯尾部追加枚举值，`^COMP_API` 计数 216 不变）。
+- 外壳自检：**293 项 / failures = 0 / SHA256 `2eaf4af8da44fba0…` 与基线逐字节一致**
+  （自检走 ABI 直连，不枚举 `blend_mode` 表，故加档不改基线）。
+- `scripts/check_docs.py`：**PASS**（清单命中数一致性、§N 引用无裸编号悬空全过；
+  ps-parity 代码基线 WARN 为既有欠账，非本批引入）。
+- 文档同步：README 目录树 blend 行、BACKLOG §1 混合模式 24→27（并顺带把上批漏改的
+  滤镜行 26→31 补齐）、`docs/ps-parity.md` 与 `docs/ps-parity-items.md` 的 24→27。
+
+**已知边界：**
+
+- 上游 `.comp` 规范只定义 0..23；本仓 24..26 是**扩展**，互通以 0..23 为准（已写进
+  `comp_core.h` 注释）。含 24..26 的 `.comp` 被上游读回时会视为未知模式。
+- Dissolve 的 CPU 哈希对 `px` 走 `static_cast<uint32_t>(px)`，负画布坐标与 GPU 的非负
+  `tid.xy` 不一致——**GPU ≡ CPU 仅在非负画布坐标成立**；既有 ≤1 LSB 护栏用例
+  （`rhi_gpu_kernel_matches_cpu_blend` / `gpu_kernel_mirror_matches_cpu_scalar_blend`）
+  仍只扫 0..23 分离型，**未把 Dissolve 纳入逐字节比对**。
+- Darker / Lighter Color 为整像素择色；HDR（直通色 >1）下按 `lum()` 比较，与 PS 一致，
+  但不声称对超白像素逐字节等同。
+
+**工具链杂字符自查：** 本批编辑 `tests/test_ui_core.cpp`、`tests/test_compositing.cpp`
+后自查无 U+00AC / 残留反斜杠注入（上批 §6.120 记过的杂字符问题未复现）。
+
 
 
 

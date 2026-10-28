@@ -28,11 +28,11 @@ const char* gpu_kernel_hlsl();
 /* Vulkan / GLSL 450 计算着色器源码（与 HLSL 语义一一对应）。 */
 const char* gpu_kernel_glsl();
 
-/* 着色器内混合模式分支数，应等于 comp_blend_mode 的取值个数（24）。 */
+/* 着色器内混合模式分支数，应等于 comp_blend_mode 的取值个数（27）。 */
 int gpu_kernel_blend_case_count();
 
 /*
- * 校验两份着色器源码：非空、恰好 24 个 `case N:` 分支、编号 0..23 连续、
+ * 校验两份着色器源码：非空、恰好 27 个 `case N:` 分支、编号 0..26 连续、
  * 且每个分支注释里的上游规范名与 blend_mode_manifest_name(N) 逐字相同。
  * 不一致时写入 error 并返回 false。
  */
@@ -47,9 +47,13 @@ bool gpu_kernel_validate(std::string* error);
  *   函数内部按 `sa = src[3]/255` 再乘一次，得到有效 alpha（镜像 `s.a * g_alpha`）。
  *   CPU 标量入口的 `src_alpha` 则是**已含像素 alpha 的有效 alpha**。
  * 两侧语义等价，但入参口径不同；混用会让 alpha 被乘两次（结果被压暗）。
+ *
+ * A50：px/py 是**文档坐标**，仅 Dissolve 需要（镜像着色器 main() 里对 tid.xy 做同一
+ * 套确定性哈希）。其余模式忽略；缺省 0,0 时 Dissolve 退化为「整幅同一判定」。
  */
 void gpu_kernel_blend_pixel(uint8_t* dst_premultiplied, const uint8_t* src_premultiplied,
-                            comp_blend_mode mode, double layer_opacity);
+                            comp_blend_mode mode, double layer_opacity, int32_t px = 0,
+                            int32_t py = 0);
 
 }  // namespace compositor
 

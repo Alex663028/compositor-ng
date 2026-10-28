@@ -37,7 +37,8 @@ void write_premultiplied(uint8_t* p, const double rgb[3], double alpha);
  * 单像素混合：把 src_px 按 src_alpha 混合进 dst_px。
  * src_alpha 为 0..1，已包含图层不透明度、组穿透系数、蒙版与剪贴的综合结果。
  */
-void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, double src_alpha);
+void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, double src_alpha,
+                  int32_t px = 0, int32_t py = 0);
 
 /*
  * 单像素混合的**外部可链接公共入口**（薄包装，直接转调 blend_pixels）。
@@ -46,9 +47,13 @@ void blend_pixels(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode, 
  * 在链接期找不到符号（曾出现 `lld-link: error: undefined symbol: blend_pixels(...)`）。
  * 统一走本入口后，「预乘修正」这类逐字节语义断言可以稳定地钉在实现上，
  * 无需依赖内部符号的链接可见性。
+ *
+ * A50：px/py 是**文档坐标**，仅 Dissolve 需要（按位置哈希决定该像素是否落墨）。
+ * 其余模式忽略这两个参数，缺省 0,0 时 Dissolve 退化为「整幅同一判定」——
+ * 逐像素调用方应传真实坐标。
  */
 void compositor_blend_pixel_scalar(uint8_t* dst_px, const uint8_t* src_px, comp_blend_mode mode,
-                                   double src_alpha);
+                                   double src_alpha, int32_t px = 0, int32_t py = 0);
 
 /*
  * C5：半精度（COMP_PIXEL_RGBA16F）表面的单像素混合。
@@ -63,7 +68,7 @@ void compositor_blend_pixel_scalar(uint8_t* dst_px, const uint8_t* src_px, comp_
  * 项仍保留原始亮度。这是**有据可查的边界**，不是静默夹白。
  */
 void blend_pixels_half(uint16_t* dst_px, const uint16_t* src_px, comp_blend_mode mode,
-                       double src_alpha);
+                       double src_alpha, int32_t px = 0, int32_t py = 0);
 
 /* 取剪贴基底图层在文档坐标处的 alpha（找不到返回 1.0，表现为不裁剪）。 */
 double clipping_factor(const Document& doc, const Layer& layer, int32_t x, int32_t y);

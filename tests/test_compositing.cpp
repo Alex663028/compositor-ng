@@ -62,8 +62,23 @@ COMP_TEST(blend_mode_matches_upstream_enum) {
     COMP_CHECK_MSG(name != nullptr && std::strcmp(name, kUpstreamNames[i]) == 0,
                    kUpstreamNames[i]);
   }
-  /* 越界必须是 nullptr，不得回落到 Normal。 */
-  COMP_CHECK(blend_mode_manifest_name(static_cast<comp_blend_mode>(24)) == nullptr);
+  /*
+   * A50：24..26 是本仓超出上游的三种（PS 有、上游刻意未实现），纯尾部追加，
+   * 规范名固定且不得与上游 0..23 撞名。
+   */
+  COMP_CHECK(COMP_BLEND_DISSOLVE == 24);
+  COMP_CHECK(COMP_BLEND_DARKER_COLOR == 25);
+  COMP_CHECK(COMP_BLEND_LIGHTER_COLOR == 26);
+  {
+    const char* dn = blend_mode_manifest_name(COMP_BLEND_DISSOLVE);
+    COMP_CHECK_MSG(dn != nullptr && std::strcmp(dn, "Dissolve") == 0, "Dissolve");
+    const char* dk = blend_mode_manifest_name(COMP_BLEND_DARKER_COLOR);
+    COMP_CHECK_MSG(dk != nullptr && std::strcmp(dk, "Darker Color") == 0, "Darker Color");
+    const char* lt = blend_mode_manifest_name(COMP_BLEND_LIGHTER_COLOR);
+    COMP_CHECK_MSG(lt != nullptr && std::strcmp(lt, "Lighter Color") == 0, "Lighter Color");
+  }
+  /* 越界（27 及以后）必须是 nullptr，不得回落到 Normal。 */
+  COMP_CHECK(blend_mode_manifest_name(static_cast<comp_blend_mode>(27)) == nullptr);
 }
 
 COMP_TEST(blend_mode_manifest_round_trip) {
@@ -72,6 +87,16 @@ COMP_TEST(blend_mode_manifest_round_trip) {
     comp_blend_mode parsed = COMP_BLEND_NORMAL;
     COMP_CHECK(blend_mode_from_manifest_name(name, std::strlen(name), &parsed));
     COMP_CHECK(static_cast<size_t>(parsed) == i);
+  }
+
+  /* A50：扩展三种的规范名同样可解析回数值。 */
+  {
+    comp_blend_mode ext = COMP_BLEND_NORMAL;
+    COMP_CHECK(blend_mode_from_manifest_name("Dissolve", 8, &ext) && ext == COMP_BLEND_DISSOLVE);
+    COMP_CHECK(blend_mode_from_manifest_name("Darker Color", 12, &ext) &&
+               ext == COMP_BLEND_DARKER_COLOR);
+    COMP_CHECK(blend_mode_from_manifest_name("Lighter Color", 13, &ext) &&
+               ext == COMP_BLEND_LIGHTER_COLOR);
   }
 
   comp_blend_mode parsed = COMP_BLEND_NORMAL;

@@ -146,7 +146,15 @@ typedef enum comp_blend_mode {
   COMP_BLEND_HUE           = 20,
   COMP_BLEND_SATURATION    = 21,
   COMP_BLEND_COLOR         = 22,
-  COMP_BLEND_LUMINOSITY    = 23
+  COMP_BLEND_LUMINOSITY    = 23,
+  /*
+   * A50（2026-10-28）：PS 有、上游 Compositor 刻意未实现的三种，纯尾部追加。
+   * 0..23 逐字保持与上游 LayerBlendMode 对齐；24..26 是本仓超出上游的扩展，
+   * `.comp` 清单互通以 0..23 为准（24..26 不会出现在上游产出的清单里）。
+   */
+  COMP_BLEND_DISSOLVE      = 24,
+  COMP_BLEND_DARKER_COLOR  = 25,
+  COMP_BLEND_LIGHTER_COLOR = 26
 } comp_blend_mode;
 
 /* ------------------------------------------------------------ 采样模式 */
