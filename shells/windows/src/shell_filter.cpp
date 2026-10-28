@@ -260,6 +260,48 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
       desc.dust_scratches.radius = panel.value(0);
       desc.dust_scratches.threshold = static_cast<int32_t>(std::llround(panel.value(1)));
       break;
+    /* A48：接线轮补齐 A46/A47 的 8 个 kind（面板行序 = filter_table 的 params 顺序）。 */
+    case comp_ui::FilterId::Spherize:
+      desc.spherize.amount = panel.value(0);
+      break;
+    case comp_ui::FilterId::Pinch:
+      desc.pinch.amount = panel.value(0);
+      break;
+    case comp_ui::FilterId::Twirl:
+      desc.twirl.angle = panel.value(0);
+      break;
+    case comp_ui::FilterId::Mosaic:
+      desc.mosaic.cell_size = panel.value(0);
+      break;
+    case comp_ui::FilterId::Emboss:
+      desc.emboss.amount = panel.value(0);
+      desc.emboss.angle = panel.value(1);
+      desc.emboss.height = panel.value(2);
+      break;
+    case comp_ui::FilterId::Clouds:
+      desc.clouds.amount = panel.value(0);
+      desc.clouds.size = panel.value(1);
+      desc.clouds.seed = static_cast<uint32_t>(std::llround(panel.value(2)));
+      /* 端色不在面板行里：固定域层缺省（低=黑、高=白），与 Vignette 边缘色同口径。 */
+      desc.clouds.color_low[0] = 0.0;
+      desc.clouds.color_low[1] = 0.0;
+      desc.clouds.color_low[2] = 0.0;
+      desc.clouds.color_high[0] = 1.0;
+      desc.clouds.color_high[1] = 1.0;
+      desc.clouds.color_high[2] = 1.0;
+      break;
+    case comp_ui::FilterId::DifferenceClouds:
+      desc.difference_clouds.amount = panel.value(0);
+      desc.difference_clouds.size = panel.value(1);
+      desc.difference_clouds.seed = static_cast<uint32_t>(std::llround(panel.value(2)));
+      break;
+    case comp_ui::FilterId::PictureFrame:
+      desc.picture_frame.width = panel.value(0);
+      /* 画框色不在面板行里：固定黑（与域层缺省一致）。 */
+      desc.picture_frame.color[0] = 0.0;
+      desc.picture_frame.color[1] = 0.0;
+      desc.picture_frame.color[2] = 0.0;
+      break;
     default:
       break;
   }
@@ -292,6 +334,19 @@ void build_filter_desc_patched(const ShellState& shell, comp_filter_desc* out) {
           desc.progressive_blur.start_y = base.progressive_blur.start_y;
           desc.progressive_blur.end_x = base.progressive_blur.end_x;
           desc.progressive_blur.end_y = base.progressive_blur.end_y;
+        }
+        break;
+      /* A48：Clouds 的端色、Picture Frame 的框色不在面板行里，单条编辑写回时
+       * 必须从底稿原样带回，否则一次回车把它们抹成缺省（与 Vignette 边缘色同款防御）。 */
+      case COMP_FILTER_CLOUDS:
+        for (int channel = 0; channel < 3; ++channel) {
+          desc.clouds.color_low[channel] = base.clouds.color_low[channel];
+          desc.clouds.color_high[channel] = base.clouds.color_high[channel];
+        }
+        break;
+      case COMP_FILTER_PICTURE_FRAME:
+        for (int channel = 0; channel < 3; ++channel) {
+          desc.picture_frame.color[channel] = base.picture_frame.color[channel];
         }
         break;
       default:
@@ -386,6 +441,37 @@ void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& des
     case COMP_FILTER_DUST_SCRATCHES:
       panel.set_value(0, desc.dust_scratches.radius);
       panel.set_value(1, static_cast<double>(desc.dust_scratches.threshold));
+      break;
+    /* A48：接线轮补齐 A46/A47 的 8 个 kind。 */
+    case COMP_FILTER_SPHERIZE:
+      panel.set_value(0, desc.spherize.amount);
+      break;
+    case COMP_FILTER_PINCH:
+      panel.set_value(0, desc.pinch.amount);
+      break;
+    case COMP_FILTER_TWIRL:
+      panel.set_value(0, desc.twirl.angle);
+      break;
+    case COMP_FILTER_MOSAIC:
+      panel.set_value(0, desc.mosaic.cell_size);
+      break;
+    case COMP_FILTER_EMBOSS:
+      panel.set_value(0, desc.emboss.amount);
+      panel.set_value(1, desc.emboss.angle);
+      panel.set_value(2, desc.emboss.height);
+      break;
+    case COMP_FILTER_CLOUDS:
+      panel.set_value(0, desc.clouds.amount);
+      panel.set_value(1, desc.clouds.size);
+      panel.set_value(2, static_cast<double>(desc.clouds.seed));
+      break;
+    case COMP_FILTER_DIFFERENCE_CLOUDS:
+      panel.set_value(0, desc.difference_clouds.amount);
+      panel.set_value(1, desc.difference_clouds.size);
+      panel.set_value(2, static_cast<double>(desc.difference_clouds.seed));
+      break;
+    case COMP_FILTER_PICTURE_FRAME:
+      panel.set_value(0, desc.picture_frame.width);
       break;
     default:
       break;

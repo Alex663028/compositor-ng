@@ -439,18 +439,18 @@ constexpr UINT kCmdToolBase = 1100; /* + 工具序号，范围 1100..1118 */
 constexpr UINT kMsgLayoutQuery = WM_APP + 1;
 /* 共享内存名（跨进程共享，命名不带 Local\ 前缀 = 会话内共享）。 */
 constexpr wchar_t kLayoutQueryMappingName[] = L"CompositorLayoutProbe";
-constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..15（1200..1215） */
+constexpr UINT kCmdFilterBase = 1200; /* + 滤镜序号 0..89（1200..1289） */
 /*
- * 面板动作号落在 1220 段：滤镜档位从 9 个涨到 11 个（尾追加 Sharpen /
- * Reduce Noise）后，1200..1210 已被档位占满，原先放在 1210..1212 的
- * 应用/重置/关闭会与 Sharpen 抢同一个 id（菜单项永远打不开锐化）。
- * 1220 起给档位留下 1211..1219 的余量，后续再加滤镜不需要再搬家。
- * 现在档位用到 14（Filter > Other 组追加 High Pass / Minimum / Maximum /
- * Offset），仍在余量内，动作号不动。
+ * 面板动作号落在 1290 段：滤镜档位从 11 涨到 26（A45/A46/A47 尾追加
+ * Median / Dust & Scratches、球面化 / 挤压 / 旋转扭曲 / 马赛克 / 浮雕、
+ * 云彩 / 分层云彩 / 画框）后，1200..1225 已被档位占满，原先放在
+ * 1220..1222 的应用/重置/关闭会与档位抢同一个 id（点了永远打不开那些滤镜）。
+ * 1290 起给档位留下 1200..1289 的余量，后续再加滤镜不需要再搬家。
+ * （kCmdBlendBase=1300 是混合模式栏，这里不越界。）
  */
-constexpr UINT kCmdFilterApply = 1220;
-constexpr UINT kCmdFilterReset = 1221;
-constexpr UINT kCmdFilterClose = 1222;
+constexpr UINT kCmdFilterApply = 1290;
+constexpr UINT kCmdFilterReset = 1291;
+constexpr UINT kCmdFilterClose = 1292;
 
 /* ===== 面板行 / 键入态 ===== */
 struct LayerRow {

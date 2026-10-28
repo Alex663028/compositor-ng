@@ -203,6 +203,27 @@ static_assert(static_cast<int>(comp_ui::FilterId::Offset) == COMP_FILTER_OFFSET,
               "FilterId::Offset must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
               "FilterId::Custom must match comp_filter_kind");
+/* A48（2026-10-28）：接线轮补齐 A45/A46/A47 已进引擎的 10 个 kind 的编译期断言。 */
+static_assert(static_cast<int>(comp_ui::FilterId::Median) == COMP_FILTER_MEDIAN,
+              "FilterId::Median must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::DustScratches) == COMP_FILTER_DUST_SCRATCHES,
+              "FilterId::DustScratches must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Spherize) == COMP_FILTER_SPHERIZE,
+              "FilterId::Spherize must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Pinch) == COMP_FILTER_PINCH,
+              "FilterId::Pinch must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Twirl) == COMP_FILTER_TWIRL,
+              "FilterId::Twirl must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Mosaic) == COMP_FILTER_MOSAIC,
+              "FilterId::Mosaic must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Emboss) == COMP_FILTER_EMBOSS,
+              "FilterId::Emboss must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::Clouds) == COMP_FILTER_CLOUDS,
+              "FilterId::Clouds must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::DifferenceClouds) == COMP_FILTER_DIFFERENCE_CLOUDS,
+              "FilterId::DifferenceClouds must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::PictureFrame) == COMP_FILTER_PICTURE_FRAME,
+              "FilterId::PictureFrame must match comp_filter_kind");
 /* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
  * 按真实面板矩形夹滚动位置。 */
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：

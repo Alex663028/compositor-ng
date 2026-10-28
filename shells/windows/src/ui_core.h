@@ -1336,6 +1336,16 @@ enum class FilterId : int {
   Custom = 15,
   Median = 16,        /* A45：中间值 */
   DustScratches = 17, /* A45：蒙尘与划痕 */
+  /* A48（2026-10-28）：接线轮——把 A46/A47 已进引擎但 UI 不可达的 8 个 kind
+   * 纳入面板 / 菜单表（数值与 comp_filter_kind 一一对应，尾部追加）。 */
+  Spherize = 18,         /* A46：球面化 */
+  Pinch = 19,            /* A46：挤压 */
+  Twirl = 20,            /* A46：旋转扭曲 */
+  Mosaic = 21,           /* A46：马赛克 */
+  Emboss = 22,           /* A46：浮雕 */
+  Clouds = 23,           /* A47：云彩 */
+  DifferenceClouds = 24, /* A47：分层云彩 */
+  PictureFrame = 25,     /* A47：画框 */
   Count
 };
 
@@ -1558,6 +1568,47 @@ inline const FilterSpec* filter_table(size_t* out_count) {
      2,
      {{"Radius", 0.0, 50.0, 1.0, 0.0},
       {"Threshold", 0.0, 255.0, 1.0, 0.0}}},
+    /* A48（2026-10-28）：接线轮——A46 扭曲 / 像素化 / 风格化 + A47 渲染组。
+     * 量程与 comp_filter.h / filters.h 的参数闸逐项对齐；面板行序 = build_filter_desc
+     * 的映射序（shell_filter.cpp）。缺省值取「恒等」或上游常用默认。 */
+    {FilterId::Spherize,
+     "Spherize",
+     1,
+     {{"Amount", -100.0, 100.0, 1.0, 0.0}}},
+    {FilterId::Pinch,
+     "Pinch",
+     1,
+     {{"Amount", -100.0, 100.0, 1.0, 0.0}}},
+    {FilterId::Twirl,
+     "Twirl",
+     1,
+     {{"Angle", -999.0, 999.0, 1.0, 0.0}}},
+    {FilterId::Mosaic,
+     "Mosaic",
+     1,
+     {{"Cell Size", 0.0, 200.0, 1.0, 0.0}}},
+    {FilterId::Emboss,
+     "Emboss",
+     3,
+     {{"Amount", 0.0, 500.0, 1.0, 0.0},
+      {"Angle", -360.0, 360.0, 1.0, 135.0},
+      {"Height", 0.0, 10.0, 1.0, 3.0}}},
+    {FilterId::Clouds,
+     "Clouds",
+     3,
+     {{"Amount", 0.0, 100.0, 1.0, 0.0},
+      {"Size", 2.0, 1000.0, 1.0, 200.0},
+      {"Seed", 0.0, 4294967295.0, 1.0, 0.0}}},
+    {FilterId::DifferenceClouds,
+     "Difference Clouds",
+     3,
+     {{"Amount", 0.0, 100.0, 1.0, 0.0},
+      {"Size", 2.0, 1000.0, 1.0, 200.0},
+      {"Seed", 0.0, 4294967295.0, 1.0, 0.0}}},
+    {FilterId::PictureFrame,
+     "Picture Frame",
+     1,
+     {{"Width", 0.0, 500.0, 1.0, 0.0}}},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kFilters) / sizeof(kFilters[0]);
