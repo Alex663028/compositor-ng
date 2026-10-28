@@ -555,7 +555,27 @@ typedef enum comp_tool_op {
    * 历史状态里取样（同一 id 的图层），按 `stroke_points` 折线与 `brush` 几何
    * 刷回**当前**图层。语义见 `comp_tool_history_brush`。
    */
-  COMP_TOOL_HISTORY_BRUSH = 19
+  COMP_TOOL_HISTORY_BRUSH = 19,
+  /*
+   * S17 尾部追加：快速选择（上游 QuickSelectionTool）。不走 comp_tool_apply ——
+   * 快速选择产出**文档选区**（不是图层蒙版），落在 comp_selection_quick_select
+   * （comp_selection.h，S17）。这里只占号，保持 kind 数值表与 PS 工具箱次序一致。
+   */
+  COMP_TOOL_QUICK_SELECT = 20,
+  /*
+   * P18 尾部追加：魔术橡皮擦（上游 MagicEraserTool）。单击一次泛洪：
+   * 在目标图层上以折线第一点为种子、按 `select` 的 tolerance/radius/contiguous
+   * 做魔棒泛洪，被选中的像素预乘 RGBA 清零（destination-out 全覆盖）。
+   * 活动选区裁切擦除范围；0 个匹配 = 成功无操作。见 docs/tool-ops.md §魔术橡皮擦。
+   */
+  COMP_TOOL_MAGIC_ERASER = 21,
+  /*
+   * P18 尾部追加：背景橡皮擦（上游 BackgroundEraserTool）。沿 `points` 折线逐
+   * dab 取样中心像素为参考色（中心 alpha==0 沿用上一 dab 的参考色），dab 圆盘内
+   * 与参考色 RGB 逐通道距离 <= `select.tolerance` 的像素按笔刷 coverage 做
+   * destination-out。见 docs/tool-ops.md §背景橡皮擦。
+   */
+  COMP_TOOL_BG_ERASER = 22
 } comp_tool_op;
 
 /* 选区参数（魔棒 / 色彩范围）。取值语义逐字对齐 WandPixels.h。 */

@@ -1936,3 +1936,67 @@ COMP_TEST(selection_transform_rejects_non_finite_and_out_of_range) {
   /* 无效文档句柄也不崩。 */
   COMP_CHECK(comp_selection_transform(nullptr, transform, &changed) == COMP_ERR_INVALID_ARGUMENT);
 }
+
+/* ------------------------------------------------- S17：快速选择 */
+
+namespace {
+
+/* 8 x 6：左半红右半蓝，alpha 全 255。快速选择沿红区拖一笔应选中整个红区。 */
+std::vector<uint8_t> half_split_pixels() {
+  std::vector<uint8_t> pixels(8u * 6u * 4u, 0u);
+  for (int32_t y = 0; y < 6; ++y) {
+    for (int32_t x = 0; x < 8; ++x) {
+      uint8_t* px = pixels.data() + (static_cast<size_t>(y) * 8u + static_cast<size_t>(x)) * 4u;
+      px[0] = x < 4 ? 200 : 0;
+      px[1] = 0;
+      px[2] = x < 4 ? 0 : 200;
+      px[3] = 255;
+    }
+  }
+  return pixels;
+}
+
+comp_result quick_select(comp_document document, comp_layer_id layer, const float* points,
+                         int32_t count, comp_selection_combine combine, int32_t* out_changed) {
+  return comp_selection_quick_select(document, layer, COMP_SELECTION_WAND_LAYER, points, count,
+                                     24.0f, 0, 1, 0, combine, out_changed);
+}
+
+}  // namespace
+
+COMP_TEST(selection_quick_select_accumulates_a_stroke_and_supports_subtract) {
+  Fixture fixture;
+  const comp_layer_id id = add_source_layer(fixture.document, comp_rect{10, 6, 8, 6});
+  std::vector<uint8_t> pixels = half_split_pixels();
+  set_layer_pixels(fixture.document, id, 8, 6, pixels);
+
+  /* 一笔横穿红区（文档坐标）：REPLACE 后选区应恰是红半区。 */
+  float red_stroke[4] = {10.5f, 9.5f, 13.5f, 9.5f};
+  int32_t changed = -1;
+  COMP_CHECK(quick_select(fixture.document, id, red_stroke, 2, COMP_SELECTION_REPLACE,
+                          &changed) == COMP_OK);
+  COMP_CHECK(changed == 1);
+  comp_rect bounds{};
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.x == 10 && bounds.y == 6 && bounds.w == 4 && bounds.h == 6);
+
+  /* 再一笔横穿蓝区（ADD）：并成整层。 */
+  float blue_stroke[4] = {14.5f, 9.5f, 17.5f, 9.5f};
+  COMP_CHECK(quick_select(fixture.document, id, blue_stroke, 2, COMP_SELECTION_ADD,
+                          &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.x == 10 && bounds.w == 8);
+
+  /* SUBTRACT 一笔抹掉红区：只剩蓝半区。 */
+  COMP_CHECK(quick_select(fixture.document, id, red_stroke, 2, COMP_SELECTION_SUBTRACT,
+                          &changed) == COMP_OK);
+  COMP_CHECK(comp_selection_get_bounds(fixture.document, &bounds) == COMP_OK);
+  COMP_CHECK(bounds.x == 14 && bounds.w == 4);
+
+  /* 全部种子 0 匹配（tolerance 0 且种子已被 subtract 出去？——改用画布外一笔：
+   * 点全部落在画布外被跳过 -> changed = 0，选区不动。 */
+  float outside[2] = {-3.0f, -3.0f};
+  COMP_CHECK(quick_select(fixture.document, id, outside, 1, COMP_SELECTION_REPLACE,
+                          &changed) == COMP_OK);
+  COMP_CHECK(changed == 0);
+}

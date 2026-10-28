@@ -609,6 +609,9 @@ enum ToolOpKind {
   kToolOpBurn = 17,       /* 加深 -> 按笔迹压暗（P1 尾部追加） */
   kToolOpSponge = 18,     /* 海绵 -> 按笔迹去色/加色（P1 尾部追加） */
   kToolOpHistoryBrush = 19, /* 历史记录画笔 -> 从第 N 个历史状态取样刷回当前层（P1 尾部追加） */
+  kToolOpQuickSelect = 20,  /* 快速选择 -> 占号（与 ABI 数值表对齐；实现在选区 ABI，S17） */
+  kToolOpMagicEraser = 21,  /* 魔术橡皮擦 -> 种子泛洪选中像素 alpha 清零（P18 尾部追加） */
+  kToolOpBgEraser = 22,     /* 背景橡皮擦 -> 沿折线按取样色容差擦除（P18 尾部追加） */
 };
 
 /* 全部工具操作。宿主按需填参数结构，零初始化即可调用（缺省即「什么都不改」）。 */

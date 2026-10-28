@@ -345,6 +345,22 @@ comp_rect selection_bounds(const SelectionState& selection);
 /* 基础蒙版是否没有任何非零像素（显式空选区 / 未初始化）。 */
 bool selection_is_empty(const SelectionState& selection);
 
+/*
+ * 快速选择（S17）：折线逐点魔棒泛洪并入文档选区。语义/错误码见
+ * comp_selection.h 的 comp_selection_quick_select；points 为文档像素坐标
+ * 折线（x,y 成对），diameter 只做合法性校验（> 0），泛洪不受它限制。
+ * combine 见 kSelectionReplace..kSelectionSubtract；所有种子都 0 匹配时
+ * 选区不动（changed = false）。一次调用 = 一步撤销（由 ABI 层事务承载）。
+ */
+comp_result selection_apply_quick_select(SelectionState* selection, int32_t canvas_width,
+                                         int32_t canvas_height, const Document& document,
+                                         comp_layer_id layer, int32_t source,
+                                         const float* points, int32_t point_count,
+                                         float diameter, int32_t tolerance, int32_t contiguous,
+                                         int32_t radius, int32_t combine, bool* changed,
+                                         std::string* error);
+
+
 }  // namespace compositor
 
 #endif /* COMPOSITOR_DOMAIN_SELECTION_H */

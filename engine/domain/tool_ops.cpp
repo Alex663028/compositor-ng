@@ -311,6 +311,146 @@ class StrokeShape {
   float peak_ = 0.0f;
 };
 
+/*
+ * P18 魔术橡皮擦：种子泛洪（与魔棒同一 wand_mask 内核、同一容差口径）选中的
+ * 像素预乘 RGBA 清零。selection_coverage 非 null 时（画布尺寸，步长 canvas_width）
+ * 只清覆盖非 0 的像素——活动选区裁切擦除范围。
+ * 返回实际清零的像素数；0 = 种子不匹配（调用方按 noop 处理），负数 = OOM。
+ */
+long magic_eraser_erase(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
+                        size_t seed_x, size_t seed_y, size_t radius, int32_t tolerance,
+                        int32_t contiguous, const uint8_t* selection_coverage,
+                        int32_t canvas_width, int32_t origin_x, int32_t origin_y) {
+  std::vector<uint8_t> mask(static_cast<size_t>(width) * static_cast<size_t>(height), 0);
+  const long selected =
+      wand_mask(rgba, static_cast<size_t>(width), static_cast<size_t>(height), stride, seed_x,
+                seed_y, radius, tolerance, contiguous, mask.data());
+  if (selected <= 0) return selected;
+  long erased = 0;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const uint8_t* mrow = mask.data() + static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int32_t x = 0; x < width; ++x) {
+      if (mrow[x] == 0) continue;
+      if (selection_coverage != nullptr) {
+        const int64_t cx = static_cast<int64_t>(origin_x) + x;
+        const int64_t cy = static_cast<int64_t>(origin_y) + y;
+        if (cx < 0 || cy < 0 || cx >= canvas_width) continue;
+        if (selection_coverage[static_cast<size_t>(cy) * static_cast<size_t>(canvas_width) +
+                               static_cast<size_t>(cx)] == 0) {
+          continue;
+        }
+      }
+      uint8_t* px = row + static_cast<size_t>(x) * 4;
+      if (px[3] == 0) continue; /* 已经全透明：不计入 changed */
+      px[0] = px[1] = px[2] = px[3] = 0;
+      ++erased;
+    }
+  }
+  return erased;
+}
+
+/*
+ * P18 背景橡皮擦：沿折线以 diameter/4 步距（含全部折点）逐 dab 取样。
+ * 参考色 = dab 中心像素（图层网格坐标，越界跳过该 dab）；中心 alpha == 0 时
+ * 沿用上一 dab 的参考色（首 dab 即透明则跳过——擦已透明像素本就是无操作）。
+ * dab 圆盘内与参考色 **RGB** 逐通道距离都 <= tolerance 的像素按笔刷 coverage
+ * （StrokeShape 同款硬度衰减）destination-out。RGB 不含 alpha：软边上的
+ * 半透明像素若把 alpha 参与比较会被容差直接排除，橡皮就啃不动光晕了。
+ * selection_coverage 同魔术橡皮擦。返回 alpha 实际有变化的像素数。
+ */
+long bg_eraser_stamp(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
+                     const float* points, int32_t point_count, const BrushStrokeParams& brush,
+                     int32_t tolerance, const uint8_t* selection_coverage,
+                     int32_t canvas_width, int32_t origin_x, int32_t origin_y) {
+  if (point_count < 1 || brush.diameter <= 0.0f) return 0;
+  const float radius = brush.diameter * 0.5f;
+  const float step = radius <= 4.0f ? 1.0f : radius * 0.25f;
+
+  /* dab 中心序列：折点必在，段内按 step 插值。 */
+  std::vector<std::pair<float, float>> dabs;
+  for (int32_t i = 0; i < point_count; ++i) {
+    const float x = points[static_cast<size_t>(i) * 2];
+    const float y = points[static_cast<size_t>(i) * 2 + 1];
+    if (dabs.empty() || dabs.back().first != x || dabs.back().second != y) {
+      dabs.emplace_back(x, y);
+    }
+    if (i + 1 >= point_count) break;
+    const float nx = points[static_cast<size_t>(i + 1) * 2];
+    const float ny = points[static_cast<size_t>(i + 1) * 2 + 1];
+    const float dx = nx - x;
+    const float dy = ny - y;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (len <= step) continue;
+    const int32_t sub = static_cast<int32_t>(len / step);
+    for (int32_t k = 1; k < sub; ++k) {
+      const float t = static_cast<float>(k) / static_cast<float>(sub);
+      dabs.emplace_back(x + dx * t, y + dy * t);
+    }
+  }
+
+  long erased = 0;
+  bool has_reference = false;
+  uint8_t reference[3] = {0, 0, 0};
+  for (const auto& dab : dabs) {
+    const int32_t cxi = static_cast<int32_t>(std::floor(dab.first));
+    const int32_t cyi = static_cast<int32_t>(std::floor(dab.second));
+    if (cxi < 0 || cyi < 0 || cxi >= width || cyi >= height) continue;
+    const uint8_t* center =
+        rgba + static_cast<size_t>(cyi) * stride + static_cast<size_t>(cxi) * 4;
+    if (center[3] != 0) {
+      reference[0] = center[0];
+      reference[1] = center[1];
+      reference[2] = center[2];
+      has_reference = true;
+    }
+    if (!has_reference) continue;
+
+    const StrokeShape shape(&dab.first, 1, brush.diameter, brush.hardness,
+                            brush.pressure * brush.flow);
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (!shape.bounds(width, height, &x0, &y0, &x1, &y1)) continue;
+    for (int32_t y = y0; y <= y1; ++y) {
+      uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+      for (int32_t x = x0; x <= x1; ++x) {
+        const float cov =
+            shape.coverage_at(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+        if (cov <= 0.0f) continue;
+        if (selection_coverage != nullptr) {
+          const int64_t cx = static_cast<int64_t>(origin_x) + x;
+          const int64_t cy = static_cast<int64_t>(origin_y) + y;
+          if (cx < 0 || cy < 0 || cx >= canvas_width) continue;
+          if (selection_coverage[static_cast<size_t>(cy) * static_cast<size_t>(canvas_width) +
+                                 static_cast<size_t>(cx)] == 0) {
+            continue;
+          }
+        }
+        uint8_t* px = row + static_cast<size_t>(x) * 4;
+        if (px[3] == 0) continue;
+        if (std::abs(static_cast<int>(px[0]) - static_cast<int>(reference[0])) > tolerance ||
+            std::abs(static_cast<int>(px[1]) - static_cast<int>(reference[1])) > tolerance ||
+            std::abs(static_cast<int>(px[2]) - static_cast<int>(reference[2])) > tolerance) {
+          continue;
+        }
+        const double keep = 1.0 - static_cast<double>(cov);
+        uint8_t next[4];
+        for (int c = 0; c < 4; ++c) {
+          next[c] = static_cast<uint8_t>(
+              std::lround(std::min(std::max(static_cast<double>(px[c]) * keep, 0.0), 255.0)));
+        }
+        if (next[3] != px[3] || next[0] != px[0] || next[1] != px[1] || next[2] != px[2]) {
+          px[0] = next[0];
+          px[1] = next[1];
+          px[2] = next[2];
+          px[3] = next[3];
+          ++erased;
+        }
+      }
+    }
+  }
+  return erased;
+}
+
 /* 笔刷落笔：按 coverage 把笔色（直通 sRGB）盖到图层像素上。 */
 void stamp_polyline(uint8_t* rgba, size_t stride, int32_t width, int32_t height,
                     const float* points, int32_t point_count, const BrushStrokeParams& brush) {
@@ -793,6 +933,34 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
         if (!seed_to_layer(*layer, params.seed_x, params.seed_y, &seed_x, &seed_y)) {
           return bad_arg("wand seed lies outside the layer");
         }
+      }
+      break;
+    }
+
+    case kToolOpMagicEraser: {
+      if (params.point_count < 1 || params.points == nullptr) {
+        return bad_arg("magic eraser needs a seed point");
+      }
+      if (!std::isfinite(params.points[0]) || !std::isfinite(params.points[1])) {
+        return bad_arg("magic eraser seed is not finite");
+      }
+      int32_t seed_x = 0, seed_y = 0;
+      if (!seed_to_layer(*layer, params.points[0], params.points[1], &seed_x, &seed_y)) {
+        return bad_arg("magic eraser seed lies outside the layer");
+      }
+      break;
+    }
+
+    case kToolOpBgEraser: {
+      if (params.point_count < 1 || params.point_count > kMaxStrokePoints ||
+          params.points == nullptr) {
+        return bad_arg("background eraser needs 1..65536 points");
+      }
+      if (params.select.tolerance < 0 || params.select.tolerance > 255) {
+        return bad_arg("background eraser tolerance out of 0..255");
+      }
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        if (!std::isfinite(params.points[i])) return bad_arg("stroke point is not finite");
       }
       break;
     }
@@ -1373,6 +1541,63 @@ bool run_tool_op(Document* document, comp_layer_id target, const ToolOpParams& p
        * 把整层蒙成透明——这与上游「无选中即不改变」一致。 */
       if (selected > 0) accumulate_mask(target_layer, mask);
       if (note != nullptr) *note += "selected pixels are accumulated into the layer mask (add)";
+      break;
+    }
+
+    case kToolOpMagicEraser: {
+      /* 种子 = 折线第一点（文档像素），预校验已保证落在图层内。 */
+      int32_t seed_x = 0, seed_y = 0;
+      seed_to_layer(*target_layer, params.points[0], params.points[1], &seed_x, &seed_y);
+      std::vector<uint8_t> selection_coverage;
+      if (document->selection().active) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+      }
+      const comp_rect b = target_layer->effective_bounds();
+      const long erased = magic_eraser_erase(
+          target_layer->pixels.writable_pixels().data(), target_layer->pixels.stride(),
+          target_layer->pixels.width, target_layer->pixels.height,
+          static_cast<size_t>(seed_x), static_cast<size_t>(seed_y),
+          static_cast<size_t>(params.select.radius), params.select.tolerance,
+          params.select.contiguous,
+          selection_coverage.empty() ? nullptr : selection_coverage.data(),
+          document->state().width, b.x, b.y);
+      if (erased < 0) {
+        ok = oom("magic eraser ran out of memory");
+        break;
+      }
+      if (erased == 0) noop = true; /* 种子不匹配或全部已透明：成功无操作 */
+      if (note != nullptr && erased > 0) {
+        *note += "magic eraser clears the flooded pixels to transparent (premultiplied zero)";
+      }
+      break;
+    }
+
+    case kToolOpBgEraser: {
+      std::vector<uint8_t> selection_coverage;
+      if (document->selection().active) {
+        selection_effective_coverage(document->selection(), &selection_coverage);
+      }
+      const comp_rect b = target_layer->effective_bounds();
+      std::vector<float> local(static_cast<size_t>(params.point_count) * 2u);
+      for (int32_t i = 0; i < params.point_count * 2; ++i) {
+        const int32_t coordinate = static_cast<int32_t>(params.points[i]);
+        local[i] = static_cast<float>(coordinate - ((i & 1) ? b.y : b.x));
+      }
+      const long erased = bg_eraser_stamp(
+          target_layer->pixels.writable_pixels().data(), target_layer->pixels.stride(),
+          target_layer->pixels.width, target_layer->pixels.height, local.data(),
+          params.point_count, params.brush, params.select.tolerance,
+          selection_coverage.empty() ? nullptr : selection_coverage.data(),
+          document->state().width, b.x, b.y);
+      if (erased < 0) {
+        ok = oom("background eraser ran out of memory");
+        break;
+      }
+      if (erased == 0) noop = true;
+      if (note != nullptr && erased > 0) {
+        *note += "background eraser samples the dab centre and erases similar pixels "
+                 "(RGB channels, per-dab reference)";
+      }
       break;
     }
 

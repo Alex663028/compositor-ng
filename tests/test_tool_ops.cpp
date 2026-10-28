@@ -144,6 +144,12 @@ uint8_t green_at(const std::vector<uint8_t>& buf, int32_t x, int32_t y) {
   return buf[(static_cast<size_t>(y) * kW + x) * 4 + 1];
 }
 
+size_t undo_depth_of(comp_document doc) {
+  size_t undo = 0, redo = 0;
+  COMP_CHECK(comp_document_history_stats(doc, &undo, &redo) == COMP_OK);
+  return undo;
+}
+
 /* 应用一次操作（note 丢弃）。 */
 comp_result apply(comp_document doc, comp_layer_id id, const comp_tool_op_desc& desc) {
   return comp_tool_apply(doc, id, &desc, nullptr, 0, nullptr);
@@ -2073,4 +2079,69 @@ COMP_TEST(tool_ops_type_rejects_bad_text_and_noops_off_canvas) {
   COMP_CHECK(apply(fx.doc, fx.layer, legal) == COMP_OK);
   COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
   COMP_CHECK_MSG(flatten(fx.doc) == before, "the legal text undoes exactly");
+}
+/* ------------------------------------------------- P18：魔术/背景橡皮擦 */
+
+COMP_TEST(magic_eraser_clears_the_contiguous_similar_region) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = band_pixels();
+  set_pixels(fx.doc, fx.layer, pixels);
+  const size_t base_depth = undo_depth_of(fx.doc);
+
+  /* 种子落在左侧红区：tolerance 0 只吞掉与种子逐字节相同的红区。 */
+  comp_tool_op_desc desc = base(COMP_TOOL_MAGIC_ERASER);
+  float seed[2] = {1.5f, 1.5f};
+  desc.select.tolerance = 0;
+  desc.select.radius = 0;
+  desc.select.contiguous = 1;
+  desc.stroke_points = seed;
+  desc.stroke_point_count = 1;
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
+
+  std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(alpha_at(after, 0, 0) == 0 && alpha_at(after, 5, 15) == 0,
+                 "the whole contiguous red band is erased");
+  COMP_CHECK_MSG(alpha_at(after, 6, 8) == 255 && alpha_at(after, 15, 0) == 255,
+                 "green and blue bands are untouched");
+
+  /* 一次操作 = 一步撤销，撤销后逐字节复原。 */
+  COMP_CHECK(undo_depth_of(fx.doc) == base_depth + 1);
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  std::vector<uint8_t> restored = flatten(fx.doc);
+  COMP_CHECK(restored == pixels);
+
+  /* 全透明图层上再点：0 匹配 = 成功无操作（不留空撤销步）。 */
+  comp_tool_op_desc again = desc;
+  COMP_CHECK(apply(fx.doc, fx.layer, again) == COMP_OK);
+  COMP_CHECK(undo_depth_of(fx.doc) == base_depth + 1);
+}
+
+COMP_TEST(background_eraser_erases_only_similar_pixels_under_the_stroke) {
+  Fixture fx;
+  std::vector<uint8_t> pixels = band_pixels();
+  set_pixels(fx.doc, fx.layer, pixels);
+
+  /* 折线横穿红区（x 1..5, y 8），diameter 6 的圆盘会探进绿区——
+   * 但绿区颜色与取样参考（红）差距远超容差，必须原样存活。 */
+  comp_tool_op_desc desc = base(COMP_TOOL_BG_ERASER);
+  float points[4] = {1.0f, 8.0f, 5.0f, 8.0f};
+  desc.stroke_points = points;
+  desc.stroke_point_count = 2;
+  desc.brush.diameter = 6.0f;
+  desc.brush.pressure = 1.0f;
+  desc.brush.hardness = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.select.tolerance = 10;
+  COMP_CHECK(apply(fx.doc, fx.layer, desc) == COMP_OK);
+
+  std::vector<uint8_t> after = flatten(fx.doc);
+  COMP_CHECK_MSG(alpha_at(after, 1, 8) == 0 && alpha_at(after, 5, 8) == 0,
+                 "red pixels under the stroke are erased");
+  COMP_CHECK_MSG(alpha_at(after, 6, 8) == 255,
+                 "green pixels inside the disc survive the colour gate");
+  COMP_CHECK_MSG(alpha_at(after, 2, 0) == 255 && alpha_at(after, 2, 3) == 255,
+                 "pixels outside the brush discs are untouched");
+  COMP_CHECK(comp_document_undo(fx.doc) == COMP_OK);
+  std::vector<uint8_t> restored = flatten(fx.doc);
+  COMP_CHECK(restored == pixels);
 }

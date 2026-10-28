@@ -1132,6 +1132,146 @@ comp_result selection_apply_wand(SelectionState* selection, int32_t canvas_width
   return COMP_OK;
 }
 
+comp_result selection_apply_quick_select(SelectionState* selection, int32_t canvas_width,
+                                        int32_t canvas_height, const Document& document,
+                                        comp_layer_id layer, int32_t source,
+                                        const float* points, int32_t point_count,
+                                        float diameter, int32_t tolerance, int32_t contiguous,
+                                        int32_t radius, int32_t combine, bool* changed,
+                                        std::string* error) {
+  if (changed != nullptr) *changed = false;
+  const auto fail = [error](comp_result code, const char* text) {
+    if (error != nullptr) *error = text;
+    return code;
+  };
+
+  if (selection == nullptr) return fail(COMP_ERR_INVALID_ARGUMENT, "selection is null");
+  if (canvas_width <= 0 || canvas_height <= 0) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "quick select needs a non-empty canvas");
+  }
+  if (points == nullptr || point_count < 1) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "quick select needs a non-empty stroke");
+  }
+  if (!std::isfinite(diameter) || diameter <= 0.0f) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "quick select diameter must be positive");
+  }
+  if (combine < kSelectionReplace || combine > kSelectionSubtract) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if (source != kSelectionWandLayer && source != kSelectionWandMerged) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "unknown wand source");
+  }
+  if (tolerance < 0 || tolerance > 255) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand tolerance out of 0..255");
+  }
+  if (radius < 0 || radius > kMaxSelectionWandRadius) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand radius out of range");
+  }
+  if (contiguous != 0 && contiguous != 1) {
+    return fail(COMP_ERR_INVALID_ARGUMENT, "wand contiguous must be 0 or 1");
+  }
+
+  /* 取样面（图层网格或整篇合成）：与 selection_apply_wand 同一套来源管线。 */
+  ImageBuffer composite;
+  ImageBuffer scratch;
+  const std::vector<uint8_t>* pixels = nullptr;
+  size_t stride = 0;
+  int32_t grid_width = 0;
+  int32_t grid_height = 0;
+  int64_t origin_x = 0;
+  int64_t origin_y = 0;
+  if (source == kSelectionWandMerged) {
+    std::string compose_error;
+    if (!composite_document(document, &composite, &compose_error)) {
+      return fail(COMP_ERR_INTERNAL, "quick select could not composite the document");
+    }
+    if (!wand_rgba8_view(composite, &scratch, &pixels, &stride)) {
+      return fail(COMP_ERR_INTERNAL, "quick select could not build an 8-bit composite");
+    }
+    grid_width = canvas_width;
+    grid_height = canvas_height;
+  } else {
+    const Layer* target = document.find(layer);
+    if (target == nullptr) return fail(COMP_ERR_NOT_FOUND, "quick select layer was not found");
+    if (target->is_group) {
+      return fail(COMP_ERR_STATE, "group layers have no pixels to sample");
+    }
+    if (target->pixels.empty()) {
+      return fail(COMP_ERR_STATE, "quick select source layer has no pixels");
+    }
+    if (!wand_rgba8_view(target->pixels, &scratch, &pixels, &stride)) {
+      return fail(COMP_ERR_STATE, "quick select layer could not be sampled as 8-bit RGBA");
+    }
+    const comp_rect bounds = target->effective_bounds();
+    if (bounds.w != target->pixels.width || bounds.h != target->pixels.height) {
+      return fail(COMP_ERR_STATE, "quick select needs a layer with a 1:1 transform");
+    }
+    grid_width = target->pixels.width;
+    grid_height = target->pixels.height;
+    origin_x = bounds.x;
+    origin_y = bounds.y;
+  }
+
+  /* 折线逐点泛洪；stroke_coverage 是本次折线的并集（画布尺寸），种子去重
+   * 就在它上查——密集折线的相邻点泛洪出同一片连通域时只付一次洪水成本。 */
+  std::vector<uint8_t> stroke_coverage(
+      static_cast<size_t>(canvas_width) * static_cast<size_t>(canvas_height), 0);
+  std::vector<uint8_t> flood(static_cast<size_t>(grid_width) * static_cast<size_t>(grid_height),
+                             0);
+  long total = 0;
+  for (int32_t i = 0; i < point_count; ++i) {
+    if (!std::isfinite(points[static_cast<size_t>(i) * 2]) ||
+        !std::isfinite(points[static_cast<size_t>(i) * 2 + 1])) {
+      return fail(COMP_ERR_INVALID_ARGUMENT, "quick select point is not finite");
+    }
+    const int64_t doc_x = static_cast<int64_t>(std::floor(points[static_cast<size_t>(i) * 2]));
+    const int64_t doc_y =
+        static_cast<int64_t>(std::floor(points[static_cast<size_t>(i) * 2 + 1]));
+    if (doc_x < 0 || doc_y < 0 || doc_x >= canvas_width || doc_y >= canvas_height) {
+      continue; /* 画布外的点跳过（PS 快速选择拖出画布不炸也不选） */
+    }
+    const int64_t grid_x = doc_x - origin_x;
+    const int64_t grid_y = doc_y - origin_y;
+    if (grid_x < 0 || grid_y < 0 || grid_x >= grid_width || grid_y >= grid_height) {
+      continue;
+    }
+    uint8_t& union_bit =
+        stroke_coverage[static_cast<size_t>(doc_y) * static_cast<size_t>(canvas_width) +
+                        static_cast<size_t>(doc_x)];
+    if (union_bit != 0) continue; /* 该种子已被先前洪水的并集覆盖 */
+    std::fill(flood.begin(), flood.end(), 0);
+    const long matched =
+        wand_mask(pixels->data(), static_cast<size_t>(grid_width),
+                  static_cast<size_t>(grid_height), stride, static_cast<size_t>(grid_x),
+                  static_cast<size_t>(grid_y), static_cast<size_t>(radius), tolerance,
+                  contiguous, flood.data());
+    if (matched < 0) return fail(COMP_ERR_OUT_OF_MEMORY, "quick select ran out of memory");
+    if (matched == 0) continue;
+    const int64_t left = std::max<int64_t>(0, origin_x);
+    const int64_t top = std::max<int64_t>(0, origin_y);
+    const int64_t right = std::min<int64_t>(canvas_width, origin_x + grid_width);
+    const int64_t bottom = std::min<int64_t>(canvas_height, origin_y + grid_height);
+    for (int64_t y = top; y < bottom; ++y) {
+      uint8_t* row =
+          stroke_coverage.data() + static_cast<size_t>(y) * static_cast<size_t>(canvas_width);
+      const uint8_t* src = flood.data() +
+                           static_cast<size_t>(y - origin_y) * static_cast<size_t>(grid_width) +
+                           static_cast<size_t>(left - origin_x);
+      for (int64_t x = left; x < right; ++x) {
+        row[x] = static_cast<uint8_t>(row[x] | src[x - left]);
+      }
+    }
+    total += matched;
+  }
+  if (total == 0) return COMP_OK; /* 全部种子 0 匹配：选区不动（changed = false） */
+
+  if (!apply_coverage_mask(selection, canvas_width, canvas_height, std::move(stroke_coverage),
+                           combine, changed)) {
+    return fail(COMP_ERR_INTERNAL, "selection coverage could not be updated");
+  }
+  return COMP_OK;
+}
+
 bool selection_translate(SelectionState* selection, int32_t dx, int32_t dy, bool* changed) {
   if (changed != nullptr) *changed = false;
   if (selection == nullptr) return false;

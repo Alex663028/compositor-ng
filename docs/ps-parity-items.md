@@ -105,7 +105,7 @@
 | S14 | 移动/复制选区内像素 | ✅ | `comp_selection_move_pixels`；`V` 拖拽、Alt 复制 |
 | S15 | 变换选区（数值宽高 + 旋转） | ✅ | `comp_selection_transform`（§6.102） |
 | S16 | 手柄缩放选区 | ✅ | `transform_frame` 绘制 + 手柄命中（S46） |
-| S17 | 磁性套索 / 快速选择 / 对象选择 | ❌ | 无 `magnetic` / `quick_select` 实现；对象选择属 ML（R4） |
+| S17 | 磁性套索 / 快速选择 / 对象选择 | ◐ | 快速选择已落地：`comp_selection_quick_select`（折线泛洪累积，tests/test_selection.cpp）；磁性套索、对象选择（ML，R4）未做 |
 | S18 | 快速蒙版 / 选择并遮住 | ❌ | 无 `quick_mask` / `select_and_mask`（BACKLOG P0-5 剩余） |
 
 **本维命中：16 / 18**
@@ -133,7 +133,7 @@
 | P15 | 压感 | ◐ | `WM_POINTER` 笔压已接（整笔取平均），但**无 WinTab**、无逐 dab 压感曲线（R2 记未命中） |
 | P16 | 画笔动态/纹理/间距/圆度/角度 | ❌ | `comp_tool_brush` 只有 diameter/pressure/hardness/flow/grain/seed |
 | P17 | 图案图章 / 油漆桶图案填充 | ❌ | 无 `pattern_stamp`；填充层有图案但工具无 |
-| P18 | 背景橡皮擦 / 魔术橡皮擦 | ❌ | 只有普通橡皮 |
+| P18 | 背景橡皮擦 / 魔术橡皮擦 | ✅ | `COMP_TOOL_MAGIC_ERASER=21` / `COMP_TOOL_BG_ERASER=22`（复用魔棒 wand_mask 容差口径，tests/test_tool_ops.cpp 两用例） |
 | P19 | 混合器画笔 / 艺术历史画笔 | ❌ | 无实现 |
 | P20 | 完整液化（膨胀/褶皱/重建）与修复画笔变体 | ❌ | 只有 Push 一种形变 |
 

@@ -621,3 +621,24 @@ coverage 把样本盖回当前像素。
   `comp_canvas.h` 同步写清「trim 清活动选区」「invert 把 16 位永久降为 8 位」，
   `comp_selection.h` 写清 `point_count` 数的是点不是 float。基线 523 → **525 用例**，
   回归 6/6、导出仍 123、壳自检 219 项 SHA256 零变化。
+
+
+## P18 魔术橡皮擦（COMP_TOOL_MAGIC_ERASER = 21，2026-10-26）
+
+- 种子 = `stroke_points[0]`（文档像素，亚像素取整到所在像素；预校验保证落在图层内）。
+- 泛洪与魔棒同一 `wand_mask` 内核：`select.tolerance`（0..255）、`select.radius`
+  （参考色邻域）、`select.contiguous`（1 = 4-连通）。
+- 命中像素**预乘 RGBA 清零**（destination-out 全覆盖）；已是全透明的像素不计入。
+- 活动选区裁切擦除范围（文档坐标，与减淡/加深同口径）。
+- 0 个命中 = 成功无操作（`out_changed` 不置位，不留空撤销步）。
+- 16 位图层按落笔族既定口径降为 8 位工作副本（上游 `sixteenBit()` 边界）。
+
+## P18 背景橡皮擦（COMP_TOOL_BG_ERASER = 22，2026-10-26）
+
+- 沿 `stroke_points` 折线以 `diameter/4` 步距（含全部折点）逐 dab 取样。
+- 参考色 = dab 中心像素；中心 alpha == 0 时沿用上一 dab 的参考色（首 dab 即
+  透明则跳过该 dab）。
+- dab 圆盘内与参考色 **RGB** 逐通道距离都 <= `select.tolerance` 的像素按笔刷
+  coverage（`brush.hardness` 衰减，`pressure*flow` 封顶）destination-out。
+  RGB 不含 alpha：软边半透明像素若把 alpha 参与容差会被直接排除，啃不动光晕。
+- 活动选区裁切；0 擦除 = 成功无操作。

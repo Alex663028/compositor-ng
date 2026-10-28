@@ -451,6 +451,61 @@ comp_result comp_selection_apply_wand(comp_document document, comp_layer_id laye
   COMP_ABI_CATCH(engine)
 }
 
+comp_result comp_selection_quick_select(comp_document document, comp_layer_id layer_id,
+                                        comp_selection_wand_source source, const float* points,
+                                        int32_t point_count, float diameter, int32_t tolerance,
+                                        int32_t contiguous, int32_t radius,
+                                        comp_selection_combine combine, int32_t* out_changed) {
+  Document* doc = nullptr;
+  Engine* engine = nullptr;
+  if (compositor::abi::guard_document(document, &doc, &engine) != COMP_OK) {
+    return COMP_ERR_INVALID_ARGUMENT;
+  }
+  COMP_ABI_TRY(engine)
+  /* 轻量参数闸在 ImplicitTxn 之前：非法参数不留半成品、不进撤销栈。 */
+  if (source != COMP_SELECTION_WAND_LAYER && source != COMP_SELECTION_WAND_MERGED) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown wand source");
+  }
+  if (combine < COMP_SELECTION_REPLACE || combine > COMP_SELECTION_SUBTRACT) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "unknown selection combine");
+  }
+  if (points == nullptr || point_count < 1) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "quick select needs a non-empty stroke");
+  }
+  if (!std::isfinite(diameter) || diameter <= 0.0f) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "quick select diameter must be positive");
+  }
+  if (tolerance < 0 || tolerance > 255) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "wand tolerance out of 0..255");
+  }
+  if (contiguous != 0 && contiguous != 1) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT,
+                                 "wand contiguous must be 0 or 1");
+  }
+  if (radius < 0 || radius > compositor::kMaxSelectionWandRadius) {
+    return compositor::abi::fail(engine, COMP_ERR_INVALID_ARGUMENT, "wand radius out of range");
+  }
+
+  const DocumentState& state = doc->state();
+  compositor::abi::ImplicitTxn txn(doc, "Quick Selection");
+  bool changed = false;
+  std::string error;
+  const comp_result code = compositor::selection_apply_quick_select(
+      &doc->selection(), state.width, state.height, *doc, layer_id,
+      source == COMP_SELECTION_WAND_MERGED ? compositor::kSelectionWandMerged
+                                           : compositor::kSelectionWandLayer,
+      points, point_count, diameter, tolerance, contiguous, radius, combine, &changed, &error);
+  if (code != COMP_OK) {
+    return compositor::abi::fail(
+        engine, code, error.empty() ? "quick selection failed" : error);
+  }
+  return finish(engine, &txn, changed, out_changed);
+  COMP_ABI_CATCH(engine)
+}
+
 comp_result comp_selection_apply_color_range(comp_document document, const uint8_t* include,
                                              size_t include_count, const uint8_t* exclude,
                                              size_t exclude_count, int32_t fuzziness,

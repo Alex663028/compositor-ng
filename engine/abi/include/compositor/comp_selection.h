@@ -465,6 +465,34 @@ COMP_API comp_result comp_selection_transform(comp_document document,
                                               comp_selection_transform_desc transform,
                                               int32_t* out_changed);
 
+/* ------------------------------------------------------------ 快速选择（S17） */
+
+/*
+ * 快速选择（PS Quick Selection Tool）：沿折线逐点做魔棒泛洪并按 combine 并入
+ * **文档选区**。折线的每个折点是取样种子（文档像素坐标，亚像素取所在像素）；
+ * 种子落在画布/取样面之外、或种子已被本次折线选中的点被跳过（密集折线的
+ * 去重，语义中性）。tolerance/contiguous/radius 与魔棒同一套口径。
+ *
+ * 与 `comp_selection_apply_wand` 的区别：一次调用吃**一整条折线**、产出一次
+ * 一步撤销（魔棒是每点一次调用一步撤销）；`diameter` 是宿主笔刷直径，本入口
+ * 只校验 > 0——泛洪会越过笔刷范围长到整个相似连通域（PS 快速选择的实际观感，
+ * 笔刷限制取样点密度而非选区边界，见 docs/tool-ops.md）。
+ *
+ * 语义与错误码（与魔棒一致）：
+ *   - 折线上所有种子都 0 匹配时**不改选区**（out_changed = 0）；
+ *   - 图层来源要求 1:1 变换；组/无像素 -> COMP_ERR_STATE；图层不存在 -> NOT_FOUND；
+ *   - point_count < 1、points 为 NULL、diameter 非有限或 <= 0、枚举/容差/半径
+ *     非法、种子全部落在画布外 -> COMP_ERR_INVALID_ARGUMENT；
+ *   - 一步撤销（加入调用方已开启的显式事务，或自成一个隐式步）。
+ */
+COMP_API comp_result comp_selection_quick_select(comp_document document, comp_layer_id layer,
+                                                 comp_selection_wand_source source,
+                                                 const float* points, int32_t point_count,
+                                                 float diameter, int32_t tolerance,
+                                                 int32_t contiguous, int32_t radius,
+                                                 comp_selection_combine combine,
+                                                 int32_t* out_changed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
