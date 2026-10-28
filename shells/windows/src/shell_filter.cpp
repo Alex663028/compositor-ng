@@ -302,6 +302,40 @@ void build_filter_desc(const ShellState& shell, comp_filter_desc* out) {
       desc.picture_frame.color[1] = 0.0;
       desc.picture_frame.color[2] = 0.0;
       break;
+    /* A49：模糊画廊 5 子模式（面板行序 = filter_table 的 params 顺序）。几何量
+     * （锚点 / 中心椭圆 / 轴线 / 中心 / 端点）留 0 = 引擎按图层自动，面板不定位。 */
+    case comp_ui::FilterId::FieldBlur:
+      desc.field_blur.radius = panel.value(0);
+      /* 锚点场需画布交互，面板 v1 不暴露：pin_count 保持 0 → 全场半径。 */
+      break;
+    case comp_ui::FilterId::IrisBlur:
+      desc.iris_blur.radius = panel.value(0);
+      desc.iris_blur.feather = panel.value(1);
+      desc.iris_blur.rx = panel.value(2);
+      desc.iris_blur.ry = panel.value(3);
+      /* 中心与半轴 0 = 引擎自动（图层中心 / 四分之一宽高）。 */
+      break;
+    case comp_ui::FilterId::TiltShift:
+      desc.tilt_shift.radius = panel.value(0);
+      desc.tilt_shift.band = panel.value(1);
+      desc.tilt_shift.feather = panel.value(2);
+      /* 轴线端点全 0 = 引擎自动（过图层中心的水平线）。 */
+      break;
+    case comp_ui::FilterId::SpinBlur:
+      desc.spin_blur.radius = panel.value(0);
+      /* 中心 0 = 引擎自动（图层中心）。 */
+      break;
+    case comp_ui::FilterId::PathBlur:
+      desc.path_blur.radius = panel.value(0);
+      {
+        const double kPi = 3.14159265358979323846;
+        const double angle = panel.value(1) * kPi / 180.0;
+        desc.path_blur.x0 = -std::cos(angle);
+        desc.path_blur.y0 = -std::sin(angle);
+        desc.path_blur.x1 = std::cos(angle);
+        desc.path_blur.y1 = std::sin(angle);
+      }
+      break;
     default:
       break;
   }
@@ -349,6 +383,31 @@ void build_filter_desc_patched(const ShellState& shell, comp_filter_desc* out) {
           desc.picture_frame.color[channel] = base.picture_frame.color[channel];
         }
         break;
+      /* A49：模糊画廊的面板行只承载标量幅度，几何量（锚点 / 中心椭圆 / 轴线 /
+       * 中心）必须从底稿原样带回，否则一次回车把画布定位抹成缺省。 */
+      case COMP_FILTER_FIELD_BLUR:
+        desc.field_blur.pin_count = base.field_blur.pin_count;
+        for (int j = 0; j < 4; ++j) {
+          desc.field_blur.pin_x[j] = base.field_blur.pin_x[j];
+          desc.field_blur.pin_y[j] = base.field_blur.pin_y[j];
+          desc.field_blur.pin_radius[j] = base.field_blur.pin_radius[j];
+        }
+        break;
+      case COMP_FILTER_IRIS_BLUR:
+        desc.iris_blur.center_x = base.iris_blur.center_x;
+        desc.iris_blur.center_y = base.iris_blur.center_y;
+        break;
+      case COMP_FILTER_TILT_SHIFT:
+        desc.tilt_shift.x0 = base.tilt_shift.x0;
+        desc.tilt_shift.y0 = base.tilt_shift.y0;
+        desc.tilt_shift.x1 = base.tilt_shift.x1;
+        desc.tilt_shift.y1 = base.tilt_shift.y1;
+        break;
+      case COMP_FILTER_SPIN_BLUR:
+        desc.spin_blur.center_x = base.spin_blur.center_x;
+        desc.spin_blur.center_y = base.spin_blur.center_y;
+        break;
+      /* Path Blur 的端点由面板角度行现算，无附带几何可带；不动。 */
       default:
         break;
     }
@@ -472,6 +531,33 @@ void filter_load_values(comp_ui::FilterPanel& panel, const comp_filter_desc& des
       break;
     case COMP_FILTER_PICTURE_FRAME:
       panel.set_value(0, desc.picture_frame.width);
+      break;
+    /* A49：模糊画廊 5 子模式。 */
+    case COMP_FILTER_FIELD_BLUR:
+      panel.set_value(0, desc.field_blur.radius);
+      break;
+    case COMP_FILTER_IRIS_BLUR:
+      panel.set_value(0, desc.iris_blur.radius);
+      panel.set_value(1, desc.iris_blur.feather);
+      panel.set_value(2, desc.iris_blur.rx);
+      panel.set_value(3, desc.iris_blur.ry);
+      break;
+    case COMP_FILTER_TILT_SHIFT:
+      panel.set_value(0, desc.tilt_shift.radius);
+      panel.set_value(1, desc.tilt_shift.band);
+      panel.set_value(2, desc.tilt_shift.feather);
+      break;
+    case COMP_FILTER_SPIN_BLUR:
+      panel.set_value(0, desc.spin_blur.radius);
+      break;
+    case COMP_FILTER_PATH_BLUR:
+      panel.set_value(0, desc.path_blur.radius);
+      {
+        const double kPi = 3.14159265358979323846;
+        const double angle =
+            std::atan2(desc.path_blur.y1 - desc.path_blur.y0, desc.path_blur.x1 - desc.path_blur.x0);
+        panel.set_value(1, angle * 180.0 / kPi);
+      }
       break;
     default:
       break;

@@ -790,7 +790,7 @@ WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP 里（那段 1200 行），浮起�
 | 随包字体 + 枚举 | `shells/windows/src/shell_internal.h:89`（`kShellFontFileName`，启动时加载的子集）；枚举/选择已于 2026-10-23 落地（`shell_fonts.cpp`，README §6.89），无回退链（P1-4） |
 | ~~渐变仅两色标~~ → 多色标（2..32）与每段中点已支持 | `engine/abi/include/compositor/comp_layer.h:688-692`（`comp_gradient_stop`）、同文件 `comp_tool_op_desc` 尾部 `gradient_stops` / `gradient_stop_count` / `gradient_dither`；壳侧可编辑表见 README §6.105 |
 | 10 种效果 / 25 种调整 | `engine/abi/include/compositor/comp_layer.h`（`COMP_EFFECT_KIND_COUNT` / 调整 kind）、`docs/adjustment-json-keys.md`（键名表）、README §6.94 / §6.95 / §6.97 / §6.104 |
-| 26 种滤镜 | `engine/abi/include/compositor/comp_filter.h:40-67`（`COMP_FILTER_VIGNETTE` … `COMP_FILTER_PICTURE_FRAME = 25`；A45 追加 `MEDIAN`/`DUST_SCRATCHES`，A46 追加 `SPHERIZE`/`PINCH`/`TWIRL`/`MOSAIC`/`EMBOSS`，A47 追加 `CLOUDS`/`DIFFERENCE_CLOUDS`/`PICTURE_FRAME`） |
+| 31 种滤镜 | `engine/abi/include/compositor/comp_filter.h:40-72`（`COMP_FILTER_VIGNETTE` … `COMP_FILTER_PATH_BLUR = 30`；A45 追加 `MEDIAN`/`DUST_SCRATCHES`，A46 追加 `SPHERIZE`/`PINCH`/`TWIRL`/`MOSAIC`/`EMBOSS`，A47 追加 `CLOUDS`/`DIFFERENCE_CLOUDS`/`PICTURE_FRAME`，A49 追加 `FIELD_BLUR`/`IRIS_BLUR`/`TILT_SHIFT`/`SPIN_BLUR`/`PATH_BLUR`） |
 | 格式可用性 | `docs/format-import-matrix.md:44-51` |
 | 仅 sRGB | `engine/format/comp_file.cpp:653-656` |
 | 组 blendMode 仍写 Normal | `engine/format/comp_file.cpp:364-365`（上游兼容）；组自己的模式走 `engineBlendMode` / `engineIsolated`（同文件 :416-421、:990-1002，2026-10-23 §6.87 已支持） |

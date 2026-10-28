@@ -159,6 +159,34 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.picture_frame.color[0] = desc.picture_frame.color[0];
   settings.picture_frame.color[1] = desc.picture_frame.color[1];
   settings.picture_frame.color[2] = desc.picture_frame.color[2];
+  settings.field_blur.radius = desc.field_blur.radius;
+  settings.field_blur.pin_count = desc.field_blur.pin_count;
+  for (int j = 0; j < 4; ++j) {
+    settings.field_blur.pin_x[j] = desc.field_blur.pin_x[j];
+    settings.field_blur.pin_y[j] = desc.field_blur.pin_y[j];
+    settings.field_blur.pin_radius[j] = desc.field_blur.pin_radius[j];
+  }
+  settings.iris_blur.radius = desc.iris_blur.radius;
+  settings.iris_blur.center_x = desc.iris_blur.center_x;
+  settings.iris_blur.center_y = desc.iris_blur.center_y;
+  settings.iris_blur.rx = desc.iris_blur.rx;
+  settings.iris_blur.ry = desc.iris_blur.ry;
+  settings.iris_blur.feather = desc.iris_blur.feather;
+  settings.tilt_shift.radius = desc.tilt_shift.radius;
+  settings.tilt_shift.x0 = desc.tilt_shift.x0;
+  settings.tilt_shift.y0 = desc.tilt_shift.y0;
+  settings.tilt_shift.x1 = desc.tilt_shift.x1;
+  settings.tilt_shift.y1 = desc.tilt_shift.y1;
+  settings.tilt_shift.band = desc.tilt_shift.band;
+  settings.tilt_shift.feather = desc.tilt_shift.feather;
+  settings.spin_blur.radius = desc.spin_blur.radius;
+  settings.spin_blur.center_x = desc.spin_blur.center_x;
+  settings.spin_blur.center_y = desc.spin_blur.center_y;
+  settings.path_blur.radius = desc.path_blur.radius;
+  settings.path_blur.x0 = desc.path_blur.x0;
+  settings.path_blur.y0 = desc.path_blur.y0;
+  settings.path_blur.x1 = desc.path_blur.x1;
+  settings.path_blur.y1 = desc.path_blur.y1;
   return settings;
 }
 
@@ -315,6 +343,34 @@ comp_filter_desc from_domain(const FilterSettings& s) {
   desc.picture_frame.color[0] = s.picture_frame.color[0];
   desc.picture_frame.color[1] = s.picture_frame.color[1];
   desc.picture_frame.color[2] = s.picture_frame.color[2];
+  desc.field_blur.radius = s.field_blur.radius;
+  desc.field_blur.pin_count = s.field_blur.pin_count;
+  for (int j = 0; j < 4; ++j) {
+    desc.field_blur.pin_x[j] = s.field_blur.pin_x[j];
+    desc.field_blur.pin_y[j] = s.field_blur.pin_y[j];
+    desc.field_blur.pin_radius[j] = s.field_blur.pin_radius[j];
+  }
+  desc.iris_blur.radius = s.iris_blur.radius;
+  desc.iris_blur.center_x = s.iris_blur.center_x;
+  desc.iris_blur.center_y = s.iris_blur.center_y;
+  desc.iris_blur.rx = s.iris_blur.rx;
+  desc.iris_blur.ry = s.iris_blur.ry;
+  desc.iris_blur.feather = s.iris_blur.feather;
+  desc.tilt_shift.radius = s.tilt_shift.radius;
+  desc.tilt_shift.x0 = s.tilt_shift.x0;
+  desc.tilt_shift.y0 = s.tilt_shift.y0;
+  desc.tilt_shift.x1 = s.tilt_shift.x1;
+  desc.tilt_shift.y1 = s.tilt_shift.y1;
+  desc.tilt_shift.band = s.tilt_shift.band;
+  desc.tilt_shift.feather = s.tilt_shift.feather;
+  desc.spin_blur.radius = s.spin_blur.radius;
+  desc.spin_blur.center_x = s.spin_blur.center_x;
+  desc.spin_blur.center_y = s.spin_blur.center_y;
+  desc.path_blur.radius = s.path_blur.radius;
+  desc.path_blur.x0 = s.path_blur.x0;
+  desc.path_blur.y0 = s.path_blur.y0;
+  desc.path_blur.x1 = s.path_blur.x1;
+  desc.path_blur.y1 = s.path_blur.y1;
   return desc;
 }
 

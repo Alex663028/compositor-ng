@@ -8275,6 +8275,61 @@ divisor = (scale == 0 ? 1 : scale)        // 面板允许把除数清成 0，引
 「分形云纹 / 可复现 / 端色可控」三条可观察口径，**不声称逐像素等同**
 Core Image 的 `CIRandomGenerator`。
 
+### 6.120 滤镜 A49：模糊画廊五子模式纯 CPU 尾部追加 + 面板接线（P1-5，2026-10-28，deepseek-v4.1-flash）
+
+**缺口。** BACKLOG 的「滤镜」行原列「无模糊画廊」；本批补上 5 个共引擎子模式，
+并把 A46/A47/A49 已进引擎的 kind 一并接到外壳滤镜面板（A48 把 18..25 接线，
+A49 追加 26..30）。
+
+**做法（全部尾部追加，冻结面不动）：**
+
+- `domain/filters.h`：新增 `FieldBlurSettings` / `IrisBlurSettings` /
+  `TiltShiftSettings` / `SpinBlurSettings` / `PathBlurSettings` 五个结构；
+  `FilterKind` 尾追加 `kFilterFieldBlur = 26` … `kFilterPathBlur = 30`；
+  `FilterSettings` 尾追加五个字段。
+- `domain/filters.cpp`：**离散模糊阶梯**（`kBlurGalleryLevels = 8`，整幅图逐档
+  `blur_rgba8_copy` 得 9 档，像素按半径场在相邻档间三角加权；全场同半径时与
+  单一 sigma 逐字节一致）、三个场构造（field / iris / tilt-shift）、两个方向性
+  内核（spin 绕中心角度模糊、path 沿端点方向盒式线积分）；五组的参数闸
+  （`radius` 0 = 恒等；非 0 按上游量程，越界拒绝）、identity / equal / label、
+  dispatch 与 `filter_settings_valid` switch。**几何量 0 = 按图层自动**
+  （中心 → 图层中心；椭圆半轴 → 四分之一宽高；倾斜端点全 0 → 过中心水平线）。
+- ABI（`comp_filter.h` / `comp_filter_abi.cpp`）：`comp_filter_kind` 尾追加 26..30；
+  新增 `comp_filter_field_blur` / `_iris_blur` / `_tilt_shift` / `_spin_blur` /
+  `_path_blur` 与 `comp_filter_desc` 对应字段；`to_domain` / `from_domain` 双向补齐。
+- 外壳：`ui_core.h` `FilterId` 尾追加 26..30（`Count` 31）、`kFilters[]` +5 条；
+  `shell_internal.h` +5 条 static_assert；`shell_filter.cpp` 三 switch
+  （`build_filter_desc` / `build_filter_desc_patched` / `filter_load_values`）
+  各 +5。命令号复查：档位 0..30 → `kCmdFilterBase+30 = 1230 < 1290`，与
+  Apply/Reset/Close（1290/1291/1292）无冲突。
+
+**顺带修掉的环境坑（本批实测发现）：** 编辑工具在 `tests/test_filters.cpp`
+注入 5 处 U+00AC（`unexpected character <U+00AC>`，编译失败）。用 PowerShell
+`[System.IO.File]::ReadAllText/WriteAllText` + `UTF8Encoding($false)` 直改修回
+（残留 U+00AC = 0、残留反斜杠-`&` = 0）。非系统性，涉及本文件后续编辑需自查杂字符。
+
+**验证：**
+
+- `scripts/build.py`：**821 cases / 0 failed / 0 check failures**——用例数 816 → 821
+  （新增 5 例，全部通过）。上批 816 全绿。
+- 新增 5 例：`filters_a49_blur_gallery_identity_at_zero_initialisation`、
+  `filters_a49_reject_out_of_range_before_the_transaction`、
+  `filters_spin_blur_is_deterministic_and_keeps_alpha`、
+  `filters_tilt_shift_keeps_the_clear_band_sharp`、
+  `filters_abi_maps_the_a49_fields`。
+- ABI 导出数不变（纯尾部追加 kind 与子结构）。
+- 外壳自检：**293 项 / failures = 0 / SHA256 与基线逐字节一致**（自检走
+  `comp_filter_apply` 直连 ABI，不枚举 `filter_table`，故接线不改基线）。
+- `scripts/check_docs.py`：**PASS**（清单命中数一致性、§N 引用无裸编号悬空全过；
+  ps-parity 代码基线 WARN 为既有欠账，非本批引入）。
+
+**已知边界：** 上游模糊画廊走 Core Image 的连续半径掩膜与真实光学模糊；本仓是
+**8 档离散阶梯**，过渡带内不声称逐像素等同。Path Blur 只做直线方向模糊，上游的
+**曲率（弯路径）不实现**。
+
+**面板边界：** 上游是在画布上拖几何（中心 / 椭圆 / 中轴 / 端点）；本仓面板 v1
+只承载标量幅度，几何默认居中、画布交互留待后续 UI 轮次。
+
 
 
 

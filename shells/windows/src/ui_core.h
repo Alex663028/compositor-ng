@@ -1346,6 +1346,13 @@ enum class FilterId : int {
   Clouds = 23,           /* A47：云彩 */
   DifferenceClouds = 24, /* A47：分层云彩 */
   PictureFrame = 25,     /* A47：画框 */
+  /* A49（2026-10-28）：接线轮——把模糊画廊 5 子模式纳入面板 / 菜单表（数值与
+   * comp_filter_kind 一一对应，尾部追加）。 */
+  FieldBlur = 26, /* A49：场景模糊 */
+  IrisBlur = 27,  /* A49：光圈模糊 */
+  TiltShift = 28, /* A49：倾斜偏移 */
+  SpinBlur = 29,  /* A49：旋转模糊 */
+  PathBlur = 30,  /* A49：路径模糊 */
   Count
 };
 
@@ -1609,6 +1616,35 @@ inline const FilterSpec* filter_table(size_t* out_count) {
      "Picture Frame",
      1,
      {{"Width", 0.0, 500.0, 1.0, 0.0}}},
+    /* A49：模糊画廊 5 子模式。几何（场景锚点 / 光圈中心椭圆 / 倾斜轴线 / 旋转中心 /
+     * 路径端点）需画布交互定位，面板 v1 不暴露——中心 / 半轴 / 端点留 0 = 引擎按图层
+     * 自动（图层中心 / 四分之一宽高 / 过中心水平线），面板只给标量幅度。 */
+    {FilterId::FieldBlur,
+     "Field Blur",
+     1,
+     {{"Radius", 0.0, 1000.0, 1.0, 0.0}}},
+    {FilterId::IrisBlur,
+     "Iris Blur",
+     4,
+     {{"Radius", 0.0, 1000.0, 1.0, 0.0},
+      {"Feather", 0.0, 100.0, 1.0, 50.0},
+      {"Ellipse Width", 0.0, 2000.0, 1.0, 0.0},
+      {"Ellipse Height", 0.0, 2000.0, 1.0, 0.0}}},
+    {FilterId::TiltShift,
+     "Tilt-Shift",
+     3,
+     {{"Radius", 0.0, 1000.0, 1.0, 0.0},
+      {"Band", 0.0, 1000.0, 1.0, 20.0},
+      {"Feather", 0.0, 1000.0, 1.0, 40.0}}},
+    {FilterId::SpinBlur,
+     "Spin Blur",
+     1,
+     {{"Radius", 0.0, 1000.0, 1.0, 0.0}}},
+    {FilterId::PathBlur,
+     "Path Blur",
+     2,
+     {{"Radius", 0.0, 2000.0, 1.0, 0.0},
+      {"Angle", -180.0, 180.0, 1.0, 0.0}}},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kFilters) / sizeof(kFilters[0]);

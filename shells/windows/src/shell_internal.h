@@ -224,6 +224,16 @@ static_assert(static_cast<int>(comp_ui::FilterId::DifferenceClouds) == COMP_FILT
               "FilterId::DifferenceClouds must match comp_filter_kind");
 static_assert(static_cast<int>(comp_ui::FilterId::PictureFrame) == COMP_FILTER_PICTURE_FRAME,
               "FilterId::PictureFrame must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::FieldBlur) == COMP_FILTER_FIELD_BLUR,
+              "FilterId::FieldBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::IrisBlur) == COMP_FILTER_IRIS_BLUR,
+              "FilterId::IrisBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::TiltShift) == COMP_FILTER_TILT_SHIFT,
+              "FilterId::TiltShift must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::SpinBlur) == COMP_FILTER_SPIN_BLUR,
+              "FilterId::SpinBlur must match comp_filter_kind");
+static_assert(static_cast<int>(comp_ui::FilterId::PathBlur) == COMP_FILTER_PATH_BLUR,
+              "FilterId::PathBlur must match comp_filter_kind");
 /* 定义在窗口过程一节（下面才用到完整 Layout 口径），这里先声明：面板开合要
  * 按真实面板矩形夹滚动位置。 */
 /* 视图 / 工具类命令的实现在窗口过程之后，这里先给出声明：

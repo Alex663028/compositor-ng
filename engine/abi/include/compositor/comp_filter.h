@@ -65,7 +65,13 @@ typedef enum comp_filter_kind {
   /* A47（2026-10-28）尾部追加：渲染（Render）组三项。 */
   COMP_FILTER_CLOUDS           = 23, /* 云彩：amount 0 = 恒等，否则 1..100 */
   COMP_FILTER_DIFFERENCE_CLOUDS = 24, /* 分层云彩：amount 0 = 恒等，否则 1..100 */
-  COMP_FILTER_PICTURE_FRAME    = 25  /* 画框：width 0 = 恒等，否则 1..500 */
+  COMP_FILTER_PICTURE_FRAME    = 25, /* 画框：width 0 = 恒等，否则 1..500 */
+  /* A49（2026-10-28）尾部追加：模糊画廊 5 子模式。 */
+  COMP_FILTER_FIELD_BLUR       = 26, /* 场景模糊：radius 0 = 恒等 */
+  COMP_FILTER_IRIS_BLUR        = 27, /* 光圈模糊：radius 0 = 恒等 */
+  COMP_FILTER_TILT_SHIFT       = 28, /* 倾斜偏移：radius 0 = 恒等 */
+  COMP_FILTER_SPIN_BLUR        = 29, /* 旋转模糊：radius 0 = 恒等 */
+  COMP_FILTER_PATH_BLUR        = 30  /* 路径模糊：radius 0 = 恒等 */
 } comp_filter_kind;
 
 /*
@@ -341,6 +347,58 @@ typedef struct comp_filter_picture_frame {
   double color[3];
 } comp_filter_picture_frame;
 
+/*
+ * 模糊画廊（A49，2026-10-28）—— PS Filter > Blur Gallery 的 5 个子模式。
+ *
+ * 共用口径：离散模糊阶梯（8 档）+ 逐像素半径场混合，与 Progressive Blur 同手法
+ * （「全场同一半径」时与单一 sigma 逐字节一致）。所有几何（锚点 / 中心 / 半轴 /
+ * 带半宽 / 端点）与半径一律按**图层像素**解释（与 Custom 的核同一口径），不按文档
+ * 坐标；预览再乘 `scale`。`radius` 一律 0 = 恒等、越界拒绝（不静默夹取）。
+ *
+ * 上游 Blur Gallery 走 Core Image 的连续半径掩膜与真实光学模糊；本仓是 8 档混合，
+ * 过渡带内不声称逐像素等同（各模式差异如实记入 note / docs）。
+ */
+typedef struct comp_filter_field_blur { /* 场景模糊 */
+  double radius;                        /* pin_count == 0 时的全场半径 */
+  int32_t pin_count;                    /* 0..4；>0 时用锚点半径反距离插值 */
+  double pin_x[4];
+  double pin_y[4];
+  double pin_radius[4];
+} comp_filter_field_blur;
+
+typedef struct comp_filter_iris_blur { /* 光圈模糊 */
+  double radius;
+  double center_x;
+  double center_y;
+  double rx;      /* 半轴（|值| 且至少 1） */
+  double ry;
+  double feather; /* 0..100（占椭圆半径的比例） */
+} comp_filter_iris_blur;
+
+typedef struct comp_filter_tilt_shift { /* 倾斜偏移 */
+  double radius;
+  double x0;
+  double y0;
+  double x1;
+  double y1; /* 清晰带中轴线两端 */
+  double band;    /* 清晰带半宽 */
+  double feather; /* 羽化带宽（>= 0） */
+} comp_filter_tilt_shift;
+
+typedef struct comp_filter_spin_blur { /* 旋转模糊 */
+  double radius;                         /* 外缘弧长模糊量 */
+  double center_x;
+  double center_y;
+} comp_filter_spin_blur;
+
+typedef struct comp_filter_path_blur { /* 路径模糊（沿端点方向） */
+  double radius;                       /* 模糊长度 */
+  double x0;
+  double y0;
+  double x1;
+  double y1;
+} comp_filter_path_blur;
+
 /* Offset 的露出区域处理方式（数值即域层 `OffsetSettings.wrap`）。 */
 typedef enum comp_offset_wrap {
   COMP_OFFSET_TRANSPARENT = 0, /* 露出部分留空（不环绕） */
@@ -422,6 +480,13 @@ typedef struct comp_filter_desc {
   comp_filter_clouds           clouds;            /* kind == CLOUDS */
   comp_filter_difference_clouds difference_clouds; /* kind == DIFFERENCE_CLOUDS */
   comp_filter_picture_frame    picture_frame;     /* kind == PICTURE_FRAME */
+  /* A49 尾部追加：模糊画廊 5 子模式。旧宿主按旧头文件编译时描述符更小，新宿主必须
+   * 用同一份头文件（两端同源构建，不提供跨版本结构体协商）。 */
+  comp_filter_field_blur       field_blur;        /* kind == FIELD_BLUR */
+  comp_filter_iris_blur        iris_blur;         /* kind == IRIS_BLUR */
+  comp_filter_tilt_shift       tilt_shift;        /* kind == TILT_SHIFT */
+  comp_filter_spin_blur        spin_blur;         /* kind == SPIN_BLUR */
+  comp_filter_path_blur        path_blur;         /* kind == PATH_BLUR */
 } comp_filter_desc;
 
 /*

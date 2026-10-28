@@ -3089,3 +3089,188 @@ COMP_TEST(filters_abi_maps_the_a47_fields) {
   COMP_CHECK_MSG(changed == 1, "分层云彩过 ABI 生效");
   COMP_CHECK_MSG(changed_pixels(dbefore, pixels_of(doc3, did)) > 0, "分层云彩确实改了像素");
 }
+
+COMP_TEST(filters_a49_blur_gallery_identity_at_zero_initialisation) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 24;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const std::vector<uint8_t> pattern = checkerboard(size, size);
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+  const FilterKind kinds[] = {kFilterFieldBlur, kFilterIrisBlur, kFilterTiltShift, kFilterSpinBlur,
+                              kFilterPathBlur};
+  for (FilterKind kind : kinds) {
+    FilterSettings settings;
+    settings.kind = kind; /* 其余字段零初始化 */
+    const size_t undo_before = undo_depth(document);
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = true;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(!changed, "零初始化 = 恒等（未改动）");
+    COMP_CHECK_MSG(!document.txn_active(), "零初始化不开事务");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before, "零初始化不落撤销步");
+    COMP_CHECK_MSG(pixels_of(document, id) == pattern, "零初始化像素逐字节不变");
+  }
+}
+
+COMP_TEST(filters_a49_reject_out_of_range_before_the_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 10, 20, 30);
+  const size_t undo_before = undo_depth(document);
+  auto expect_invalid = [&](const FilterSettings& s) {
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(!filter_apply(&document, id, s, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  };
+  FilterSettings s;
+  s.kind = kFilterFieldBlur;
+  s.field_blur.radius = 1001.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterFieldBlur;
+  s.field_blur.pin_count = 5; /* 越界（非 0..4） */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterIrisBlur;
+  s.iris_blur.radius = 10.0;
+  s.iris_blur.feather = 150.0; /* 越界（非 0..100） */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterTiltShift;
+  s.tilt_shift.radius = 10.0;
+  s.tilt_shift.feather = 20000.0; /* 越界（非 0..10000） */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterSpinBlur;
+  s.spin_blur.radius = 5000.0; /* 越界（非 0..1000） */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterPathBlur;
+  s.path_blur.radius = 3000.0; /* 越界（非 0..2000） */
+  expect_invalid(s);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before, "越界参数不留撤销步");
+}
+
+COMP_TEST(filters_spin_blur_is_deterministic_and_keeps_alpha) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 24;
+  auto run = [&]() {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const std::vector<uint8_t> pattern = checkerboard(size, size);
+    const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+    FilterSettings settings;
+    settings.kind = kFilterSpinBlur;
+    settings.spin_blur.radius = 8.0;
+    settings.spin_blur.center_x = size / 2.0;
+    settings.spin_blur.center_y = size / 2.0;
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(changed, "旋转模糊改动了像素");
+    return pixels_of(document, id);
+  };
+  const std::vector<uint8_t> first = run();
+  const std::vector<uint8_t> second = run();
+  COMP_CHECK_MSG(first == second, "同参数逐字节可复现");
+  COMP_CHECK_MSG(all_alpha_are(first, 255), "旋转模糊不改 alpha");
+}
+
+COMP_TEST(filters_tilt_shift_keeps_the_clear_band_sharp) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 32;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const std::vector<uint8_t> pattern = checkerboard(size, size);
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+  const double cy = size / 2.0;
+  FilterSettings settings;
+  settings.kind = kFilterTiltShift;
+  settings.tilt_shift.radius = 6.0;
+  settings.tilt_shift.x0 = 0.0;
+  settings.tilt_shift.y0 = cy;
+  settings.tilt_shift.x1 = static_cast<double>(size);
+  settings.tilt_shift.y1 = cy;
+  settings.tilt_shift.band = 1.0;
+  settings.tilt_shift.feather = 2.0;
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  /* 中轴线半宽 band = 1 内（y 与 cy 相差 <= 1）像素半径 0，应逐字节保持。 */
+  for (int32_t x = 0; x < size; ++x) {
+    for (int32_t dy = -1; dy <= 1; ++dy) {
+      const int32_t y = static_cast<int32_t>(cy) + dy;
+      const size_t idx =
+          (static_cast<size_t>(y) * static_cast<size_t>(size) + static_cast<size_t>(x)) * 4u;
+      COMP_CHECK_MSG(after[idx] == pattern[idx] && after[idx + 1] == pattern[idx + 1] &&
+                         after[idx + 2] == pattern[idx + 2] && after[idx + 3] == pattern[idx + 3],
+                     "清晰带内像素逐字节不变");
+    }
+  }
+  COMP_CHECK_MSG(changed_pixels(pattern, after) > 0, "带外确实被模糊");
+  COMP_CHECK_MSG(all_alpha_are(after, 255), "倾斜偏移不改 alpha");
+}
+
+COMP_TEST(filters_abi_maps_the_a49_fields) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 24;
+  const std::vector<uint8_t> pattern = checkerboard(size, size);
+
+  /* 场景模糊过 ABI：pin_count == 0 时全体半径生效。 */
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_layer_with(&document, pattern, comp_rect{0, 0, size, size});
+  comp_filter_desc uniform{};
+  uniform.kind = COMP_FILTER_FIELD_BLUR;
+  uniform.field_blur.radius = 5.0;
+  int32_t changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &uniform, 1.0, &changed, nullptr,
+                               0, nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "场景模糊过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(pattern, pixels_of(document, id)) > 0, "场景模糊确实改了像素");
+
+  /* 场景模糊过 ABI：锚点场（pin_count + 锚点半径）被读取。 */
+  Document doc2(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id2 = add_layer_with(&doc2, pattern, comp_rect{0, 0, size, size});
+  comp_filter_desc pinned{};
+  pinned.kind = COMP_FILTER_FIELD_BLUR;
+  pinned.field_blur.pin_count = 2;
+  pinned.field_blur.pin_x[0] = 4.0;
+  pinned.field_blur.pin_y[0] = 4.0;
+  pinned.field_blur.pin_radius[0] = 0.0; /* 左上锚点清晰 */
+  pinned.field_blur.pin_x[1] = static_cast<double>(size - 4);
+  pinned.field_blur.pin_y[1] = static_cast<double>(size - 4);
+  pinned.field_blur.pin_radius[1] = 8.0; /* 右下锚点模糊 */
+  changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&doc2), id2, &pinned, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "锚点场景模糊过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(pattern, pixels_of(doc2, id2)) > 0, "锚点场确实改了像素");
+
+  /* 光圈模糊过 ABI：椭圆几何 + feather 生效。 */
+  Document doc3(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id3 = add_layer_with(&doc3, pattern, comp_rect{0, 0, size, size});
+  comp_filter_desc iris{};
+  iris.kind = COMP_FILTER_IRIS_BLUR;
+  iris.iris_blur.radius = 6.0;
+  iris.iris_blur.center_x = size / 2.0;
+  iris.iris_blur.center_y = size / 2.0;
+  iris.iris_blur.rx = 4.0;
+  iris.iris_blur.ry = 4.0;
+  iris.iris_blur.feather = 40.0;
+  changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&doc3), id3, &iris, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "光圈模糊过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(pattern, pixels_of(doc3, id3)) > 0, "光圈模糊确实改了像素");
+}

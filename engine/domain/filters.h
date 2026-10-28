@@ -482,6 +482,57 @@ struct PictureFrameSettings {
   double color[3] = {0.0, 0.0, 0.0};
 };
 
+/*
+ * 模糊画廊（A49，2026-10-28）—— PS Filter > Blur Gallery 的 5 个子模式。
+ *
+ * 共用一台引擎（见 filters.cpp）：把整幅图按半径等分 kBlurGalleryLevels 档各模糊
+ * 一次，每个像素按自己的半径在相邻两档间做三角加权——与 Progressive Blur 同手法，
+ * 因此「全场同一半径」时与单一 sigma 的 `blur_rgba8_copy` 逐字节一致。
+ *
+ * **坐标口径**：所有锚点 / 中心 / 椭圆半轴 / 带半宽 / 路径端点一律按**图层像素**
+ * 解释（与 Custom 的核、Grain 的采样同一口径），不按文档坐标。因此智能滤镜在
+ * 对象像素空间求值时，图层被移动/缩放/旋转后这些几何随层像素一起走，结果不变。
+ * 各模式的模糊半径 `radius` 同样是图层像素，预览再乘 `scale`。
+ *
+ * 恒等：每种的「模糊量」为 0（见各结构注释）。
+ */
+struct FieldBlurSettings {   /* 场景模糊：多锚点模糊场 */
+  double radius = 0.0;       /* pin_count == 0 时的全场半径；0 = 恒等 */
+  int32_t pin_count = 0;     /* 0..4；>0 时用锚点半径做反距离插值，radius 忽略 */
+  double pin_x[4] = {0.0, 0.0, 0.0, 0.0};
+  double pin_y[4] = {0.0, 0.0, 0.0, 0.0};
+  double pin_radius[4] = {0.0, 0.0, 0.0, 0.0};
+};
+
+struct IrisBlurSettings {    /* 光圈模糊：椭圆清晰区 + 向外羽化 */
+  double radius = 0.0;       /* 最大模糊半径（0 = 恒等） */
+  double center_x = 0.0;
+  double center_y = 0.0;     /* 清晰椭圆中心（图层像素） */
+  double rx = 100.0;         /* 半轴（图层像素；取 |值| 且至少 1） */
+  double ry = 100.0;
+  double feather = 50.0;     /* 0..100：过渡带宽度（占椭圆半径的比例，最小 0.05） */
+};
+
+struct TiltShiftSettings {   /* 倾斜偏移：清晰带 + 羽化 */
+  double radius = 0.0;       /* 最大模糊半径（0 = 恒等） */
+  double x0 = 0.0, y0 = 0.0;
+  double x1 = 0.0, y1 = 0.0; /* 清晰带中轴线两端（图层像素） */
+  double band = 50.0;        /* 清晰带半宽（图层像素，>= 0） */
+  double feather = 50.0;     /* 羽化带宽（图层像素，>= 0；0 时按 1 处理，避免硬切） */
+};
+
+struct SpinBlurSettings {    /* 旋转模糊：绕中心的角度模糊 */
+  double radius = 0.0;       /* 外缘的弧长模糊量（图层像素，0 = 恒等） */
+  double center_x = 0.0;
+  double center_y = 0.0;     /* 旋转中心（图层像素） */
+};
+
+struct PathBlurSettings {    /* 路径模糊：沿路径端点的方向运动模糊 */
+  double radius = 0.0;       /* 模糊长度（图层像素，0 = 恒等） */
+  double x0 = 0.0, y0 = 0.0;
+  double x1 = 0.0, y1 = 0.0; /* 路径两端（图层像素；决定方向） */
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -512,6 +563,12 @@ enum FilterKind {
   kFilterClouds = 23,
   kFilterDifferenceClouds = 24,
   kFilterPictureFrame = 25,
+  /* A49（2026-10-28）尾部追加：模糊画廊 5 子模式。 */
+  kFilterFieldBlur = 26,
+  kFilterIrisBlur = 27,
+  kFilterTiltShift = 28,
+  kFilterSpinBlur = 29,
+  kFilterPathBlur = 30,
 };
 
 /*
@@ -546,6 +603,11 @@ struct FilterSettings {
   CloudsSettings clouds;
   DifferenceCloudsSettings difference_clouds;
   PictureFrameSettings picture_frame;
+  FieldBlurSettings field_blur;
+  IrisBlurSettings iris_blur;
+  TiltShiftSettings tilt_shift;
+  SpinBlurSettings spin_blur;
+  PathBlurSettings path_blur;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

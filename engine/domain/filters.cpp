@@ -365,6 +365,74 @@ bool picture_frame_valid(const PictureFrameSettings& s, std::string* error) {
   return true;
 }
 
+/* 模糊画廊（A49）参数闸：半径一律 0 = 恒等，越界拒绝不静默夹取。 */
+bool field_blur_valid(const FieldBlurSettings& s, std::string* error) {
+  if (!finite(s.radius) || !in_range(s.radius, 0.0, 1000.0)) {
+    return set_error(error, "field blur radius out of 0..1000");
+  }
+  if (s.pin_count < 0 || s.pin_count > 4) {
+    return set_error(error, "field blur pin_count out of 0..4");
+  }
+  for (int j = 0; j < s.pin_count && j < 4; ++j) {
+    if (!finite(s.pin_x[j]) || !finite(s.pin_y[j]) || !finite(s.pin_radius[j])) {
+      return set_error(error, "field blur pin is not finite");
+    }
+    if (!in_range(s.pin_radius[j], 0.0, 1000.0)) {
+      return set_error(error, "field blur pin radius out of 0..1000");
+    }
+  }
+  return true;
+}
+
+bool iris_blur_valid(const IrisBlurSettings& s, std::string* error) {
+  if (!finite(s.radius) || !in_range(s.radius, 0.0, 1000.0)) {
+    return set_error(error, "iris blur radius out of 0..1000");
+  }
+  if (!finite(s.center_x) || !finite(s.center_y) || !finite(s.rx) || !finite(s.ry)) {
+    return set_error(error, "iris blur geometry is not finite");
+  }
+  if (!finite(s.feather) || !in_range(s.feather, 0.0, 100.0)) {
+    return set_error(error, "iris blur feather out of 0..100");
+  }
+  return true;
+}
+
+bool tilt_shift_valid(const TiltShiftSettings& s, std::string* error) {
+  if (!finite(s.radius) || !in_range(s.radius, 0.0, 1000.0)) {
+    return set_error(error, "tilt shift radius out of 0..1000");
+  }
+  if (!finite(s.x0) || !finite(s.y0) || !finite(s.x1) || !finite(s.y1)) {
+    return set_error(error, "tilt shift line is not finite");
+  }
+  if (!finite(s.band) || !in_range(s.band, 0.0, 10000.0)) {
+    return set_error(error, "tilt shift band out of 0..10000");
+  }
+  if (!finite(s.feather) || !in_range(s.feather, 0.0, 10000.0)) {
+    return set_error(error, "tilt shift feather out of 0..10000");
+  }
+  return true;
+}
+
+bool spin_blur_valid(const SpinBlurSettings& s, std::string* error) {
+  if (!finite(s.radius) || !in_range(s.radius, 0.0, 1000.0)) {
+    return set_error(error, "spin blur radius out of 0..1000");
+  }
+  if (!finite(s.center_x) || !finite(s.center_y)) {
+    return set_error(error, "spin blur center is not finite");
+  }
+  return true;
+}
+
+bool path_blur_valid(const PathBlurSettings& s, std::string* error) {
+  if (!finite(s.radius) || !in_range(s.radius, 0.0, 2000.0)) {
+    return set_error(error, "path blur radius out of 0..2000");
+  }
+  if (!finite(s.x0) || !finite(s.y0) || !finite(s.x1) || !finite(s.y1)) {
+    return set_error(error, "path blur endpoints are not finite");
+  }
+  return true;
+}
+
 /* ------------------------------------------------------------ 像素算子 */
 
 /* Vignette：帧 = 图层自身像素矩形（上游非空图层 `job.canvas == nil` 的分支）。
@@ -1590,6 +1658,363 @@ comp_result picture_frame_pixels(uint8_t* rgba, int32_t width, int32_t height, s
   return COMP_OK;
 }
 
+/* ==================================================== 模糊画廊（A49，2026-10-28）
+
+ * 5 个子模式共用一台「离散模糊阶梯 + 逐像素半径场」引擎：把整幅图按半径等分
+ * kBlurGalleryLevels 档各模糊一次，每个像素按自己的半径在相邻两档间做三角加权。
+ * 与 Progressive Blur 同手法——「全场同一半径」时与单一 sigma 的 `blur_rgba8_copy`
+ * 逐字节一致（权重恰为 1.0f）。
+ *
+ * field 里存的是**图层像素**半径；阶梯调用时 sigma = radius * scale 落到缓冲像素。
+ * 几何（中心/半轴/带半宽/端点）按图层像素给出，构造 field 时乘 scale 落到缓冲像素；
+ * 中心 / 半轴 / 端点全 0 = **按图层自动**（图层中心、四分之一宽高、过中心的水平线），
+ * 这样面板不做画布定位也有像样的缺省；比值型的位置量（椭圆归一距离 d、带距离/带宽）
+ * 在缩放中自动抵消，见各构造函数。
+ */
+constexpr int kBlurGalleryLevels = 8;
+
+double smooth01(double t) {
+  if (t <= 0.0) return 0.0;
+  if (t >= 1.0) return 1.0;
+  return t * t * (3.0 - 2.0 * t);
+}
+
+/* 阶梯混合：field[i] 为该像素的图层像素半径。max_r 为 0 视作恒等。 */
+comp_result blur_gallery_ladder(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                const std::vector<double>& field, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  double max_r = 0.0;
+  for (size_t i = 0; i < pixel_count; ++i) {
+    if (field[i] > max_r) max_r = field[i];
+  }
+  if (!(max_r > 0.0)) return COMP_OK; /* 全场零半径 = 恒等，不碰像素 */
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  std::vector<float> accumulated(pixel_count * 4u, 0.0f);
+  std::vector<uint8_t> blurred;
+  const double inv_max = 1.0 / max_r;
+  for (int level = 0; level <= kBlurGalleryLevels; ++level) {
+    const uint8_t* image = source.data();
+    const double t = static_cast<double>(level) / static_cast<double>(kBlurGalleryLevels);
+    const double radius = max_r * t;
+    if (radius > 0.0) {
+      const double sigma = std::max(0.1, radius * scale);
+      if (!blur_rgba8_copy(source.data(), width, height, row_bytes, static_cast<float>(sigma),
+                           &blurred)) {
+        return COMP_ERR_OUT_OF_MEMORY;
+      }
+      image = blurred.data();
+    }
+    const double level_value = static_cast<double>(level);
+    for (size_t i = 0; i < pixel_count; ++i) {
+      const double position = field[i] * inv_max * static_cast<double>(kBlurGalleryLevels);
+      const double weight = 1.0 - std::fabs(position - level_value);
+      if (weight <= 0.0) continue;
+      const uint8_t* p = image + i * 4u;
+      float* a = accumulated.data() + i * 4u;
+      a[0] += static_cast<float>(weight * static_cast<double>(p[0]));
+      a[1] += static_cast<float>(weight * static_cast<double>(p[1]));
+      a[2] += static_cast<float>(weight * static_cast<double>(p[2]));
+      a[3] += static_cast<float>(weight * static_cast<double>(p[3]));
+    }
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const size_t base = static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int32_t x = 0; x < width; ++x) {
+      const float* a = accumulated.data() + (base + static_cast<size_t>(x)) * 4u;
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 4; ++c) {
+        const long value = std::lround(a[c]);
+        pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* 场景模糊：pin_count == 0 时全场 uniform；否则按锚点半径做反距离加权插值。 */
+void build_field_blur_field(std::vector<double>& field, int32_t width, int32_t height,
+                            const FieldBlurSettings& s, double scale) {
+  const int use = s.pin_count > 4 ? 4 : (s.pin_count < 0 ? 0 : static_cast<int>(s.pin_count));
+  if (use <= 0) {
+    const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    for (size_t i = 0; i < pixel_count; ++i) field[i] = s.radius;
+    return;
+  }
+  double px[4], py[4], pr[4];
+  for (int j = 0; j < use; ++j) {
+    px[j] = s.pin_x[j] * scale;
+    py[j] = s.pin_y[j] * scale;
+    pr[j] = s.pin_radius[j];
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width);
+    for (int32_t x = 0; x < width; ++x) {
+      double num = 0.0;
+      double den = 0.0;
+      for (int j = 0; j < use; ++j) {
+        const double ddx = static_cast<double>(x) - px[j];
+        const double ddy = static_cast<double>(y) - py[j];
+        const double w = 1.0 / (ddx * ddx + ddy * ddy + 1.0);
+        num += w * pr[j];
+        den += w;
+      }
+      field[row + static_cast<size_t>(x)] = den > 0.0 ? num / den : 0.0;
+    }
+  }
+}
+
+/* 光圈模糊：椭圆内（d <= 1）清晰，向外在 [1, 1 + ramp] 内 smoothstep 升到 radius。 */
+void build_iris_field(std::vector<double>& field, int32_t width, int32_t height,
+                      const IrisBlurSettings& s, double scale) {
+  /* 中心 / 半轴为 0 时按图层自动：中心 = 图层中心，半轴 = 四分之一宽 / 高。 */
+  double cx = static_cast<double>(width) / 2.0;
+  double cy = static_cast<double>(height) / 2.0;
+  if (!(s.center_x == 0.0 && s.center_y == 0.0)) {
+    cx = s.center_x * scale;
+    cy = s.center_y * scale;
+  }
+  double rx = s.rx > 0.0 ? s.rx * scale : static_cast<double>(width) / 4.0;
+  double ry = s.ry > 0.0 ? s.ry * scale : static_cast<double>(height) / 4.0;
+  if (rx < 1.0) rx = 1.0;
+  if (ry < 1.0) ry = 1.0;
+  double ramp = s.feather / 100.0;
+  if (ramp < 0.05) ramp = 0.05;
+  for (int32_t y = 0; y < height; ++y) {
+    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width);
+    const double ddy = (static_cast<double>(y) - cy) / ry;
+    for (int32_t x = 0; x < width; ++x) {
+      const double ddx = (static_cast<double>(x) - cx) / rx;
+      const double d = std::sqrt(ddx * ddx + ddy * ddy);
+      field[row + static_cast<size_t>(x)] = s.radius * smooth01((d - 1.0) / ramp);
+    }
+  }
+}
+
+/* 倾斜偏移：到中轴线的垂距在 [band, band + feather] 内 smoothstep 升到 radius。 */
+void build_tilt_shift_field(std::vector<double>& field, int32_t width, int32_t height,
+                            const TiltShiftSettings& s, double scale) {
+  /* 端点全 0 时按图层自动：过图层中心的水平线。 */
+  double x0;
+  double y0;
+  double x1;
+  double y1;
+  if (s.x0 == 0.0 && s.y0 == 0.0 && s.x1 == 0.0 && s.y1 == 0.0) {
+    x0 = 0.0;
+    y0 = static_cast<double>(height) / 2.0;
+    x1 = static_cast<double>(width);
+    y1 = static_cast<double>(height) / 2.0;
+  } else {
+    x0 = s.x0 * scale;
+    y0 = s.y0 * scale;
+    x1 = s.x1 * scale;
+    y1 = s.y1 * scale;
+  }
+  double dx = x1 - x0;
+  double dy = y1 - y0;
+  const double len = std::hypot(dx, dy);
+  if (len < 0.5) {
+    dx = 0.0;
+    dy = 1.0;
+  } else {
+    dx /= len;
+    dy /= len;
+  }
+  const double band = std::max(0.0, s.band * scale);
+  double feather = s.feather * scale;
+  if (feather < 1.0) feather = 1.0;
+  for (int32_t y = 0; y < height; ++y) {
+    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width);
+    const double vy = static_cast<double>(y) - y0;
+    for (int32_t x = 0; x < width; ++x) {
+      const double vx = static_cast<double>(x) - x0;
+      const double dist = std::fabs(vx * dy - vy * dx);
+      field[row + static_cast<size_t>(x)] = s.radius * smooth01((dist - band) / feather);
+    }
+  }
+}
+
+comp_result blur_gallery_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                const FilterSettings& s, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  std::vector<double> field(pixel_count, 0.0);
+  switch (s.kind) {
+    case kFilterFieldBlur:
+      build_field_blur_field(field, width, height, s.field_blur, scale);
+      break;
+    case kFilterIrisBlur:
+      build_iris_field(field, width, height, s.iris_blur, scale);
+      break;
+    case kFilterTiltShift:
+      build_tilt_shift_field(field, width, height, s.tilt_shift, scale);
+      break;
+    default:
+      return COMP_ERR_INVALID_ARGUMENT;
+  }
+  return blur_gallery_ladder(rgba, width, height, stride, field, scale);
+}
+
+/* 旋转模糊：绕中心的角度（弧线）模糊。外缘弧长 = radius；越靠外弧度越大。 */
+comp_result spin_blur_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                             const SpinBlurSettings& s, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const double blur_len = s.radius * scale;
+  if (!(blur_len >= 0.5)) return COMP_OK;
+  double cx = static_cast<double>(width) / 2.0;
+  double cy = static_cast<double>(height) / 2.0;
+  if (!(s.center_x == 0.0 && s.center_y == 0.0)) {
+    cx = s.center_x * scale;
+    cy = s.center_y * scale;
+  }
+  const double last_x = static_cast<double>(width - 1);
+  const double last_y = static_cast<double>(height - 1);
+  double rmax = 0.0;
+  const double corners[4][2] = {{0.0, 0.0}, {last_x, 0.0}, {0.0, last_y}, {last_x, last_y}};
+  for (int i = 0; i < 4; ++i) {
+    const double d = std::hypot(corners[i][0] - cx, corners[i][1] - cy);
+    if (d > rmax) rmax = d;
+  }
+  if (!(rmax > 0.0)) return COMP_OK;
+  const double half_outer = blur_len / (2.0 * rmax); /* 外缘半角 */
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  auto fetch = [&](double x, double y, double out[4]) {
+    x = std::min(std::max(x, 0.0), last_x);
+    y = std::min(std::max(y, 0.0), last_y);
+    const int32_t x0 = static_cast<int32_t>(x);
+    const int32_t y0 = static_cast<int32_t>(y);
+    const int32_t x1 = x0 < width - 1 ? x0 + 1 : x0;
+    const int32_t y1 = y0 < height - 1 ? y0 + 1 : y0;
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+    const uint8_t* row0 = source.data() + static_cast<size_t>(y0) * row_bytes;
+    const uint8_t* row1 = source.data() + static_cast<size_t>(y1) * row_bytes;
+    const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p10 = row0 + static_cast<size_t>(x1) * 4u;
+    const uint8_t* p01 = row1 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p11 = row1 + static_cast<size_t>(x1) * 4u;
+    for (int c = 0; c < 4; ++c) {
+      const double top = p00[c] + (p10[c] - p00[c]) * fx;
+      const double bottom = p01[c] + (p11[c] - p01[c]) * fx;
+      out[c] = top + (bottom - top) * fy;
+    }
+  };
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      const double ddx = static_cast<double>(x) - cx;
+      const double ddy = static_cast<double>(y) - cy;
+      const double r = std::hypot(ddx, ddy);
+      if (r < 0.5) continue; /* 中心点不动 */
+      double frac = r / rmax;
+      if (frac > 1.0) frac = 1.0;
+      const double half = half_outer * frac;
+      const double arc = 2.0 * half * r;
+      if (!(arc >= 0.5)) continue;
+      int taps = static_cast<int>(std::ceil(arc)) + 1;
+      if (taps < 2) taps = 2;
+      if (taps > 257) taps = 257;
+      const double theta0 = std::atan2(ddy, ddx);
+      const double first = -half;
+      const double step = (2.0 * half) / static_cast<double>(taps - 1);
+      double sum[4] = {0.0, 0.0, 0.0, 0.0};
+      for (int t = 0; t < taps; ++t) {
+        const double theta = theta0 + first + step * static_cast<double>(t);
+        double sample[4];
+        fetch(cx + r * std::cos(theta), cy + r * std::sin(theta), sample);
+        for (int c = 0; c < 4; ++c) sum[c] += sample[c];
+      }
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 4; ++c) {
+        long value = std::lround(sum[c] / static_cast<double>(taps));
+        pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* 路径模糊：沿路径端点方向的方向运动模糊（盒式线积分，与 Motion Blur 同口径）。 */
+comp_result path_blur_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                             const PathBlurSettings& s, double scale) {
+  if (width <= 0 || height <= 0) return COMP_OK;
+  const double length = s.radius * scale;
+  if (!(length >= 0.5)) return COMP_OK;
+  double dx = s.x1 - s.x0;
+  double dy = s.y1 - s.y0;
+  const double len = std::hypot(dx, dy);
+  if (len < 0.5) {
+    dx = 1.0;
+    dy = 0.0;
+  } else {
+    dx /= len;
+    dy /= len;
+  }
+  int taps = static_cast<int>(std::ceil(length)) + 1;
+  if (taps < 2) taps = 2;
+  if (taps > 257) taps = 257;
+  const double first = -length / 2.0;
+  const double step = length / static_cast<double>(taps - 1);
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  const double last_x = static_cast<double>(width - 1);
+  const double last_y = static_cast<double>(height - 1);
+  auto fetch = [&](double x, double y, double out[4]) {
+    x = std::min(std::max(x, 0.0), last_x);
+    y = std::min(std::max(y, 0.0), last_y);
+    const int32_t x0 = static_cast<int32_t>(x);
+    const int32_t y0 = static_cast<int32_t>(y);
+    const int32_t x1 = x0 < width - 1 ? x0 + 1 : x0;
+    const int32_t y1 = y0 < height - 1 ? y0 + 1 : y0;
+    const double fx = x - static_cast<double>(x0);
+    const double fy = y - static_cast<double>(y0);
+    const uint8_t* row0 = source.data() + static_cast<size_t>(y0) * row_bytes;
+    const uint8_t* row1 = source.data() + static_cast<size_t>(y1) * row_bytes;
+    const uint8_t* p00 = row0 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p10 = row0 + static_cast<size_t>(x1) * 4u;
+    const uint8_t* p01 = row1 + static_cast<size_t>(x0) * 4u;
+    const uint8_t* p11 = row1 + static_cast<size_t>(x1) * 4u;
+    for (int c = 0; c < 4; ++c) {
+      const double top = p00[c] + (p10[c] - p00[c]) * fx;
+      const double bottom = p01[c] + (p11[c] - p01[c]) * fx;
+      out[c] = top + (bottom - top) * fy;
+    }
+  };
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    for (int32_t x = 0; x < width; ++x) {
+      double sum[4] = {0.0, 0.0, 0.0, 0.0};
+      for (int t = 0; t < taps; ++t) {
+        const double offset = first + step * static_cast<double>(t);
+        double sample[4];
+        fetch(static_cast<double>(x) + dx * offset, static_cast<double>(y) + dy * offset, sample);
+        for (int c = 0; c < 4; ++c) sum[c] += sample[c];
+      }
+      uint8_t* pixel = row + static_cast<size_t>(x) * 4u;
+      for (int c = 0; c < 4; ++c) {
+        long value = std::lround(sum[c] / static_cast<double>(taps));
+        pixel[c] = static_cast<uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -1652,6 +2077,14 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
                                       scale, origin_x, origin_y);
     case kFilterPictureFrame:
       return picture_frame_pixels(rgba, width, height, stride, settings.picture_frame, scale);
+    case kFilterFieldBlur:
+    case kFilterIrisBlur:
+    case kFilterTiltShift:
+      return blur_gallery_pixels(rgba, width, height, stride, settings, scale);
+    case kFilterSpinBlur:
+      return spin_blur_pixels(rgba, width, height, stride, settings.spin_blur, scale);
+    case kFilterPathBlur:
+      return path_blur_pixels(rgba, width, height, stride, settings.path_blur, scale);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -1696,6 +2129,11 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterClouds: return clouds_valid(settings.clouds, error);
     case kFilterDifferenceClouds: return difference_clouds_valid(settings.difference_clouds, error);
     case kFilterPictureFrame: return picture_frame_valid(settings.picture_frame, error);
+    case kFilterFieldBlur: return field_blur_valid(settings.field_blur, error);
+    case kFilterIrisBlur: return iris_blur_valid(settings.iris_blur, error);
+    case kFilterTiltShift: return tilt_shift_valid(settings.tilt_shift, error);
+    case kFilterSpinBlur: return spin_blur_valid(settings.spin_blur, error);
+    case kFilterPathBlur: return path_blur_valid(settings.path_blur, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -1735,6 +2173,21 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterClouds: return settings.clouds.amount == 0.0;
     case kFilterDifferenceClouds: return settings.difference_clouds.amount == 0.0;
     case kFilterPictureFrame: return settings.picture_frame.width == 0.0;
+    case kFilterFieldBlur: {
+      const FieldBlurSettings& f = settings.field_blur;
+      if (f.pin_count > 0) {
+        double m = 0.0;
+        for (int j = 0; j < f.pin_count && j < 4; ++j) {
+          if (f.pin_radius[j] > m) m = f.pin_radius[j];
+        }
+        return m <= 0.0;
+      }
+      return f.radius == 0.0;
+    }
+    case kFilterIrisBlur: return settings.iris_blur.radius == 0.0;
+    case kFilterTiltShift: return settings.tilt_shift.radius == 0.0;
+    case kFilterSpinBlur: return settings.spin_blur.radius == 0.0;
+    case kFilterPathBlur: return settings.path_blur.radius == 0.0;
   }
   return true;
 }
@@ -1823,6 +2276,36 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
              a.picture_frame.color[0] == b.picture_frame.color[0] &&
              a.picture_frame.color[1] == b.picture_frame.color[1] &&
              a.picture_frame.color[2] == b.picture_frame.color[2];
+    case kFilterFieldBlur: {
+      const FieldBlurSettings& x = a.field_blur;
+      const FieldBlurSettings& y = b.field_blur;
+      if (x.radius != y.radius || x.pin_count != y.pin_count) return false;
+      for (int j = 0; j < 4; ++j) {
+        if (x.pin_x[j] != y.pin_x[j] || x.pin_y[j] != y.pin_y[j] ||
+            x.pin_radius[j] != y.pin_radius[j]) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case kFilterIrisBlur:
+      return a.iris_blur.radius == b.iris_blur.radius &&
+             a.iris_blur.center_x == b.iris_blur.center_x &&
+             a.iris_blur.center_y == b.iris_blur.center_y && a.iris_blur.rx == b.iris_blur.rx &&
+             a.iris_blur.ry == b.iris_blur.ry && a.iris_blur.feather == b.iris_blur.feather;
+    case kFilterTiltShift:
+      return a.tilt_shift.radius == b.tilt_shift.radius && a.tilt_shift.x0 == b.tilt_shift.x0 &&
+             a.tilt_shift.y0 == b.tilt_shift.y0 && a.tilt_shift.x1 == b.tilt_shift.x1 &&
+             a.tilt_shift.y1 == b.tilt_shift.y1 && a.tilt_shift.band == b.tilt_shift.band &&
+             a.tilt_shift.feather == b.tilt_shift.feather;
+    case kFilterSpinBlur:
+      return a.spin_blur.radius == b.spin_blur.radius &&
+             a.spin_blur.center_x == b.spin_blur.center_x &&
+             a.spin_blur.center_y == b.spin_blur.center_y;
+    case kFilterPathBlur:
+      return a.path_blur.radius == b.path_blur.radius && a.path_blur.x0 == b.path_blur.x0 &&
+             a.path_blur.y0 == b.path_blur.y0 && a.path_blur.x1 == b.path_blur.x1 &&
+             a.path_blur.y1 == b.path_blur.y1;
   }
   return false;
 }
@@ -1855,6 +2338,11 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterClouds: return "Clouds";
     case kFilterDifferenceClouds: return "Difference Clouds";
     case kFilterPictureFrame: return "Picture Frame";
+    case kFilterFieldBlur: return "Field Blur";
+    case kFilterIrisBlur: return "Iris Blur";
+    case kFilterTiltShift: return "Tilt-Shift";
+    case kFilterSpinBlur: return "Spin Blur";
+    case kFilterPathBlur: return "Path Blur";
   }
   return "filter";
 }

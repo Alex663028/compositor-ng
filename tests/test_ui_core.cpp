@@ -790,10 +790,10 @@ COMP_TEST(ui_core_tool_buttons_hit_test_without_overlap) {
 COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   size_t count = 0;
   const comp_ui::FilterSpec* table = comp_ui::filter_table(&count);
-  COMP_CHECK(count == 26);
+  COMP_CHECK(count == 31);
   COMP_CHECK(comp_ui::filter_count() == static_cast<int>(count));
 
-  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..25 一一对齐（shell_internal.h 里也有 static_assert）。 */
+  /* 枚举值必须与 ABI `comp_filter_kind` 的 0..30 一一对齐（shell_internal.h 里也有 static_assert）。 */
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Vignette) == 0);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::TonalContrast) == 1);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Bloom) == 2);
@@ -820,11 +820,16 @@ COMP_TEST(ui_core_filter_table_matches_documented_ranges) {
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::Clouds) == 23);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::DifferenceClouds) == 24);
   COMP_CHECK(static_cast<int>(comp_ui::FilterId::PictureFrame) == 25);
-  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 26);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::FieldBlur) == 26);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::IrisBlur) == 27);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::TiltShift) == 28);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::SpinBlur) == 29);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::PathBlur) == 30);
+  COMP_CHECK(static_cast<int>(comp_ui::FilterId::Count) == 31);
 
   /* 面板行数：docs/filters.md §3 各表的数据行数。 */
   const int row_counts[] = {5, 5, 2, 1, 2, 4, 4, 2, 4, 3, 3, 1, 1, 1, 3, 27, 1, 2,
-                            1, 1, 1, 1, 3, 3, 3, 1};
+                            1, 1, 1, 1, 3, 3, 3, 1, 1, 4, 3, 1, 2};
   for (size_t i = 0; i < count; ++i) {
     /* 只有 Custom 是网格面板（5 列）；其余滤镜必须保持整宽单列，绘制不变。 */
     if (table[i].id == comp_ui::FilterId::Custom) {

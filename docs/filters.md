@@ -423,6 +423,36 @@ Picture Frame 是沿四边落一圈等厚纯色带的扁平相框。
   `COMP_ERR_INVALID_ARGUMENT`，参数闸先于事务；非零参数恰好一步撤销。
 - 与 A45 / A46 一样，A47 只追加 kind 与子结构，ABI 导出数不变（见 §5 尾部追加清单）。
 
+### 3.20 模糊画廊：Field / Iris / Tilt-Shift / Spin / Path Blur（A49）
+
+A49（2026-10-28）尾部追加的五项（`COMP_FILTER_FIELD_BLUR = 26` …
+`COMP_FILTER_PATH_BLUR = 30`）。五项共用一台**离散模糊阶梯 + 逐像素半径场**引擎：
+整幅图按半径等分 8 档各自模糊一次，每个像素按自己的半径在相邻两档间做三角加权
+（与 §3.9 Progressive Blur 同手法）——「全场同一半径」时与单一 sigma 的
+`blur_rgba8_copy` 逐字节一致（权重恰为 1）。所有半径 / 几何一律按**图层像素**解释
+（与 §3.14 Custom 的核同口径），预览时几何乘 `scale`。
+
+| 滤镜 | kind | 参数 | 量程 / 恒等 | 口径 |
+|------|------|------|-------------|------|
+| Field Blur | 26 | `radius` / `pin_count` / `pin_x[4]` / `pin_y[4]` / `pin_radius[4]` | `radius` 0 = 恒等；否则 0..1000 / 0..4 / — / — / 0..1000 | `pin_count == 0` → 全场 `radius`；否则 4 锚点半径按反距离 `1/(d²+1)` 插值 |
+| Iris Blur | 27 | `radius` / `center_x` / `center_y` / `rx` / `ry` / `feather` | `radius` 0 = 恒等；0..1000 / — / — / — / — / 0..100 | 归一化椭圆距离 `d`，`d <= 1` 清晰，向外在 `[1, 1+feather/100]` 内 smoothstep 升到 `radius` |
+| Tilt-Shift | 28 | `radius` / `x0` / `y0` / `x1` / `y1` / `band` / `feather` | `radius` 0 = 恒等；0..1000 / — / — / — / — / 0..10000 / 0..10000 | 到中轴线垂距在 `[band, band+feather]` 内 smoothstep 升到 `radius` |
+| Spin Blur | 29 | `radius` / `center_x` / `center_y` | `radius` 0 = 恒等；0..1000 / — / — | 绕中心角度模糊；外缘弧长 = `radius`，越靠外角跨度越大（`frac = min(1, r/rmax)`） |
+| Path Blur | 30 | `radius` / `x0` / `y0` / `x1` / `y1` | `radius` 0 = 恒等；0..2000 / — / — / — / — | 沿端点方向的方向运动模糊（盒式线积分，与 §3.8 Motion Blur 同口径） |
+
+- **几何量 0 = 按图层自动**：中心 `(center_x, center_y)` 全 0 → 图层中心；椭圆半轴
+  `rx`/`ry` 为 0 → 图层四分之一宽 / 高；倾斜偏移端点全 0 → 过图层中心的水平线。
+  这样面板不做画布定位也有像样的缺省（PS Blur Gallery 是在画布上拖几何，本仓
+  面板 v1 只承载标量幅度，几何默认居中；画布交互留待后续 UI 轮次）。
+- **零初始化 = 恒等**：五项 `radius` 默认 0，`pin_count` 默认 0、端点全 0，故
+  `FilterSettings{}` 对任一 kind 都是恒等（不碰像素、不开事务）。
+- 参数闸先于事务：越界（如 `radius = 1001`、`pin_count = 5`、`feather = 150`）
+  一律 `COMP_ERR_INVALID_ARGUMENT`；非零参数恰好一步撤销。
+- 边界：上游 Blur Gallery 走 Core Image 的连续半径掩膜与真实光学模糊；本仓是
+  **8 档离散阶梯**，过渡带内不声称逐像素等同。Path Blur 只做直线方向模糊，
+  上游的**曲率（弯路径）不实现**。
+- 与 A45 / A46 / A47 一样，A49 只追加 kind 与子结构，ABI 导出数不变（见 §5 尾部追加清单）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage
