@@ -529,6 +529,17 @@ static_assert(static_cast<int>(comp_ui::FilterId::Custom) == COMP_FILTER_CUSTOM,
   void selection_handle_cancel(ShellState& shell);
   void selection_handle_end(HWND window, ShellState& shell);
   HCURSOR selection_handle_cursor(int index);
+  /* S17 快速选择：折线采集 + 松手时一次 comp_selection_quick_select。 */
+  bool quick_select_available(const ShellState& shell);
+  void quick_select_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout);
+  void quick_select_end(HWND window, ShellState& shell);
+  /* P18 魔术橡皮擦：单击一次泛洪清除。 */
+  bool magic_eraser_available(const ShellState& shell);
+  void magic_eraser_click(HWND window, ShellState& shell, int x, int y, const Layout& layout);
+  /* P18 背景橡皮擦：折线采集 + 松手时一次 comp_tool_apply（一步撤销）。 */
+  bool bg_eraser_available(const ShellState& shell);
+  void bg_eraser_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout);
+  void bg_eraser_end(HWND window, ShellState& shell);
   bool wand_available(const ShellState& shell);
   void wand_click(HWND window, ShellState& shell, int x, int y, const Layout& layout);
   bool pen_available(const ShellState& shell);

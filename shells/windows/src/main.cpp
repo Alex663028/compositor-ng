@@ -149,6 +149,21 @@ std::string narrow_utf8(const std::wstring& text) {
 
 using namespace comp_shell;
 
+namespace {
+
+/* 自检线程的参数与入口（见 wWinMain 里 --selftest 分支的注释）。 */
+struct SelfTestArgs {
+  const wchar_t* out_path = nullptr;
+};
+
+DWORD WINAPI selftest_thread_main(LPVOID param) {
+  const SelfTestArgs* args = static_cast<const SelfTestArgs*>(param);
+  return static_cast<DWORD>(run_selftest(args->out_path));
+}
+
+}  // namespace
+
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show) {
   /*
    * ROI #7：DPI 感知必须在**任何窗口创建之前**设置（含 --present-bench 的窗口）。
@@ -159,7 +174,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
   /* --selftest[=报告文件]：无窗口端到端自检（只走 C ABI），用于真机可审计验证。 */
   if (command_line != nullptr && wcsstr(command_line, L"--selftest") != nullptr) {
     const wchar_t* equals = wcschr(command_line, L'=');
-    return run_selftest(equals != nullptr ? equals + 1 : L"compositor_shell_selftest.txt");
+    /*
+     * 自检跑在**独立线程 + 16 MB 栈**上：默认主线程栈只有 1 MB，而自检要
+     * 顺序跑 290+ 条断言，每条都可能在栈上放 comp_document / vector /
+     * 嵌套 lambda。2026-10-27 加 S17/P18 那批时就撞上过：断言全绿到某一条
+     * 后直接段错误（EXIT=139），本质是栈耗尽而不是逻辑错。
+     * 显式给大栈比「谁也不敢再加断言」好——以后加自检项不会再受这个限制。
+     */
+    SelfTestArgs args{equals != nullptr ? equals + 1 : L"compositor_shell_selftest.txt"};
+    HANDLE thread = CreateThread(nullptr, 16u * 1024u * 1024u, selftest_thread_main, &args, 0,
+                                 nullptr);
+    if (thread == nullptr) {
+      return run_selftest(args.out_path);
+    }
+    WaitForSingleObject(thread, INFINITE);
+    DWORD code = 1;
+    GetExitCodeThread(thread, &code);
+    CloseHandle(thread);
+    return static_cast<int>(code);
   }
 
   /* --present-bench[=帧数]：S16 窗口直呈基准（GPU 直呈 vs CPU flatten+GDI 上屏）。 */

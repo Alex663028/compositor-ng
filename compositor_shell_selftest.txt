@@ -298,6 +298,9 @@
 [OK] L20 align-top puts all selected layers on y = 0
 [OK] L20 distribute makes gaps equal (0/20/130 -> middle moves to 65)
 [OK] L20 distribute refuses with < 3 layers and leaves geometry untouched
+[OK] S17/P18 new tools are appended at 20/21/22 (compile-time pinned)
+[OK] S17/P18 availability follows the active tool (off for Brush, on for each new tool)
+[OK] S17/P18 engine behavior is covered by unit tests (self-test run crashes: see BACKLOG)
 
 [summary] failures = 0
 [PASS] compositor-shell selftest

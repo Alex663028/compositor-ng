@@ -1036,6 +1036,8 @@ struct ShellState {
   int panel_toggle_hover = 0;
   int marquee_shape = comp_ui::kMarqueeRect;
   int wand_tolerance = comp_ui::kDefaultWandTolerance;
+  /* P18 背景橡皮擦独立容差（魔术橡皮擦/快速选择与魔棒共用 wand_tolerance）。 */
+  int bg_eraser_tolerance = 32;
   bool wand_contiguous = true;
   bool wand_merged = false;
   int wand_radius = comp_ui::kDefaultWandRadius;

@@ -1040,4 +1040,245 @@ bool crop_commit(ShellState& shell) {
   return true;
 }
 
+/*
+ * ---------------------------------------------------------------- S17 / P18 壳接线
+ *
+ * 引擎侧（ABI 20/21/22 + comp_selection_quick_select）已在 6dcf755 落地并有单测；
+ * 本段只做**壳层入口**：工具栏按钮 → 折线采集 → 松手时一次调用。
+ *
+ * 三个入口的交互模式各自对齐 PS，不自创：
+ *   - 快速选择（Quick Select）：像画笔那样拖着刷，笔迹经过处**累加**进当前选区
+ *     （PS 的默认行为）。落笔前捕获 Shift/Alt 决定加选/减选，与魔棒同一把尺子。
+ *   - 魔术橡皮擦（Magic Eraser）：单击一次，泛洪到的像素被擦掉（不拖）。
+ *   - 背景橡皮擦（Bg Eraser）：拖着刷，沿折线逐 dab 取样参考色并擦除近似色。
+ *
+ * 为什么快速选择与背景橡皮擦都走「折线采集 + 松手一次调用」而不是逐 dab 调用：
+ * 引擎两个 ABI 都是**整条折线一次求值**（quick_select 的 points、BG_ERASER 的
+ * points），逐 dab 调用会把一步撤销拆成几十步，且泛洪的连通性会按 dab 切断。
+ * 这与既有 Heal / Clone / Smudge 的取舍一致（它们同样在 end 时一次应用）。
+ */
+namespace {
+
+/* 折线采集的共同起点：与 heal_stroke_begin 同构，只是 StrokeKind 不同。 */
+bool begin_polyline(HWND window, ShellState& shell, int x, int y, const Layout& layout,
+                    comp_ui::StrokeKind kind) {
+  if (!stroke_begin(shell, x, y, layout, kind)) return false;
+  SetCapture(window);
+  return true;
+}
+
+/* 折线采集的共同终点：先搬走 points 再 ReleaseCapture（后者会同步触发取消）。 */
+bool take_polyline(ShellState& shell, comp_ui::StrokeKind kind, std::vector<float>& points) {
+  if (shell.doc.stroke_kind != kind) return false;
+  shell.doc.stroke_kind = comp_ui::StrokeKind::None;
+  points.swap(shell.doc.stroke_points);
+  return !points.empty();
+}
+
+const wchar_t* combine_text(comp_selection_combine combine, const wchar_t* base) {
+  static wchar_t buffer[160];
+  const wchar_t* suffix = combine == COMP_SELECTION_ADD      ? L"（加选）"
+                          : combine == COMP_SELECTION_SUBTRACT ? L"（减选）"
+                                                               : L"";
+  wsprintfW(buffer, L"%s%s", base, suffix);
+  return buffer;
+}
+
+}  // namespace
+
+/* ---------------------------------------------------------------- S17 快速选择 */
+
+bool quick_select_available(const ShellState& shell) {
+  return shell.doc.document != nullptr &&
+         comp_ui::tool_entry_enabled(shell.tool, comp_ui::ToolId::QuickSelect);
+}
+
+void quick_select_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!quick_select_available(shell)) return;
+  if (selected_layer_id(shell) == 0) {
+    set_status(shell, L"快速选择：请先选择一个图层");
+    return;
+  }
+  if (!begin_polyline(window, shell, x, y, layout, comp_ui::StrokeKind::QuickSelect)) return;
+  wchar_t buffer[256];
+  wsprintfW(buffer,
+            L"快速选择：拖过要选中的区域，松开应用（直径 %d px · 容差 %d；Shift 加选 / Alt 减选）",
+            static_cast<int>(shell.brush_size + 0.5), shell.wand_tolerance);
+  set_status(shell, buffer);
+}
+
+void quick_select_end(HWND window, ShellState& shell) {
+  std::vector<float> points;
+  if (!take_polyline(shell, comp_ui::StrokeKind::QuickSelect, points)) {
+    ReleaseCapture();
+    return;
+  }
+  ReleaseCapture();
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"快速选择：没有文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"快速选择：请先选择一个图层");
+    return;
+  }
+  comp_selection_combine combine = COMP_SELECTION_REPLACE;
+  if ((GetKeyState(VK_SHIFT) & 0x8000) != 0) {
+    combine = COMP_SELECTION_ADD;
+  } else if ((GetKeyState(VK_MENU) & 0x8000) != 0) {
+    combine = COMP_SELECTION_SUBTRACT;
+  }
+  const comp_selection_wand_source source =
+      shell.wand_merged ? COMP_SELECTION_WAND_MERGED : COMP_SELECTION_WAND_LAYER;
+  finish_new_selection(
+      shell, "Quick Selection",
+      combine_text(combine, L"快速选择：已应用"), L"快速选择：没有匹配的像素，选区未变",
+      L"快速选择失败：参数无效或该图层非 1:1 变换（Shift+W 切合并取样）",
+      [&](int32_t* changed) {
+        return comp_selection_quick_select(
+            shell.doc.document, id, source, points.data(),
+            static_cast<int32_t>(points.size() / 2), static_cast<float>(shell.brush_size),
+            shell.wand_tolerance, shell.wand_contiguous ? 1 : 0, shell.wand_radius, combine,
+            changed);
+      });
+}
+
+/* ------------------------------------------------------------- P18 魔术橡皮擦 */
+
+bool magic_eraser_available(const ShellState& shell) {
+  return shell.doc.document != nullptr &&
+         comp_ui::tool_entry_enabled(shell.tool, comp_ui::ToolId::MagicEraser);
+}
+
+void magic_eraser_click(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  (void)window;
+  if (!magic_eraser_available(shell)) return;
+  if (shell.doc.document == nullptr) return;
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"魔术橡皮擦：请先选择一个图层");
+    return;
+  }
+  const comp_ui::Point doc =
+      shell.doc.view.screen_to_doc(x, y, layout.canvas, shell.doc.width, shell.doc.height);
+  /*
+   * 单击 = 一次 comp_tool_apply（kind 21）。ABI 侧把它定义成「单点泛洪擦除」，
+   * 所以这里只传一个点；`select` 复用魔棒的容差/半径/连续，壳不另建一套参数。
+   */
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_MAGIC_ERASER;
+  desc.select.tolerance = shell.wand_tolerance;
+  desc.select.contiguous = shell.wand_contiguous ? 1 : 0;
+  desc.select.radius = shell.wand_radius;
+  /* 引擎按「折线第一点」当种子；单击就是一个点。 */
+  const float point[2] = {static_cast<float>(doc.x), static_cast<float>(doc.y)};
+  desc.stroke_points = point;
+  desc.stroke_point_count = 1;
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document, "Magic Eraser", &txn) != COMP_OK) {
+    set_status(shell, L"魔术橡皮擦：无法开始事务");
+    return;
+  }
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.doc.document, id, &desc, note, sizeof(note), &note_size);
+  if (result != COMP_OK) {
+    comp_txn_abort(txn);
+    set_status(shell, L"魔术橡皮擦失败：该图层不支持擦除（组 / 非 1:1 变换）");
+    return;
+  }
+  /* 空操作由引擎自己「不开事务/不落步」；这里靠 note 判「没有匹配」。 */
+  if (note_size <= 1) {
+    comp_txn_abort(txn);
+    set_status(shell, L"魔术橡皮擦：没有匹配的像素，未改动");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"魔术橡皮擦：提交失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"魔术橡皮擦：已擦除");
+}
+
+/* ----------------------------------------------------------- P18 背景橡皮擦 */
+
+bool bg_eraser_available(const ShellState& shell) {
+  return shell.doc.document != nullptr &&
+         comp_ui::tool_entry_enabled(shell.tool, comp_ui::ToolId::BgEraser);
+}
+
+void bg_eraser_begin(HWND window, ShellState& shell, int x, int y, const Layout& layout) {
+  if (!bg_eraser_available(shell)) return;
+  if (selected_layer_id(shell) == 0) {
+    set_status(shell, L"背景橡皮擦：请先选择一个图层");
+    return;
+  }
+  if (!begin_polyline(window, shell, x, y, layout, comp_ui::StrokeKind::BgEraser)) return;
+  wchar_t buffer[256];
+  wsprintfW(buffer,
+            L"背景橡皮擦：拖过要清除的背景，松开应用（直径 %d px · 容差 %d；"
+            L"沿笔迹取样参考色，近似色被擦除）",
+            static_cast<int>(shell.brush_size + 0.5), shell.bg_eraser_tolerance);
+  set_status(shell, buffer);
+}
+
+void bg_eraser_end(HWND window, ShellState& shell) {
+  std::vector<float> points;
+  if (!take_polyline(shell, comp_ui::StrokeKind::BgEraser, points)) {
+    ReleaseCapture();
+    return;
+  }
+  ReleaseCapture();
+  if (shell.doc.document == nullptr) {
+    set_status(shell, L"背景橡皮擦：没有文档");
+    return;
+  }
+  const comp_layer_id id = selected_layer_id(shell);
+  if (id == 0) {
+    set_status(shell, L"背景橡皮擦：请先选择一个图层");
+    return;
+  }
+  comp_tool_op_desc desc{};
+  desc.kind = COMP_TOOL_BG_ERASER;
+  desc.brush.diameter = static_cast<float>(shell.brush_size);
+  desc.brush.hardness = static_cast<float>(shell.brush_hardness);
+  desc.brush.pressure = 1.0f;
+  desc.brush.flow = 1.0f;
+  desc.select.tolerance = shell.bg_eraser_tolerance;
+  desc.select.contiguous = 1;
+  desc.select.radius = 0;
+  desc.stroke_points = points.data();
+  desc.stroke_point_count = static_cast<int32_t>(points.size() / 2);
+  comp_txn txn = nullptr;
+  if (comp_txn_begin(shell.doc.document, "Background Eraser", &txn) != COMP_OK) {
+    set_status(shell, L"背景橡皮擦：无法开始事务");
+    return;
+  }
+  char note[256] = {0};
+  size_t note_size = 0;
+  const comp_result result =
+      comp_tool_apply(shell.doc.document, id, &desc, note, sizeof(note), &note_size);
+  if (result != COMP_OK) {
+    comp_txn_abort(txn);
+    set_status(shell, L"背景橡皮擦失败：该图层不支持擦除（组 / 非 1:1 变换）");
+    return;
+  }
+  if (note_size <= 1) {
+    comp_txn_abort(txn);
+    set_status(shell, L"背景橡皮擦：笔迹下的像素都超出容差，未改动");
+    return;
+  }
+  if (comp_txn_commit(txn) != COMP_OK) {
+    set_status(shell, L"背景橡皮擦：提交失败");
+    return;
+  }
+  refresh_layers(shell);
+  shell.doc.needs_render = true;
+  refresh_history_status(shell, L"背景橡皮擦：已清除背景");
+}
+
 }  // namespace comp_shell

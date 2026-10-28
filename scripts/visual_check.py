@@ -145,6 +145,9 @@ TOOL = {
     "crop": 6, "eyedropper": 7, "brush": 8, "eraser": 9, "heal": 10,
     "clone": 11, "retouch": 12, "tone": 13, "gradient": 14, "shape": 15,
     "type": 16, "hand": 17, "zoom": 18, "history": 19,
+    # S17/P18（2026-10-27，Zcode 落地引擎、本机接线壳层）：
+    # quick_select / magic_eraser / bg_eraser 都追在工具表尾部，旧下标不移动。
+    "quickselect": 20, "magiceraser": 21, "bgeraser": 22,
 }
 
 # ui_core.h 的布局常量（客户区坐标）

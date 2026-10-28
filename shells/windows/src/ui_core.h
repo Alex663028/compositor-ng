@@ -852,6 +852,11 @@ enum class ToolId : int {
   Hand,
   Zoom,
   HistoryBrush, /* P1：从历史面板的某个状态取样，随笔迹刷回当前层 */
+  /* S17/P18 尾部追加：快速选择（选区 ABI）与两把橡皮擦（工具 ABI 21/22）。
+   * 快捷键暂缺（上游 W/E 与既有工具冲突，走工具栏按钮），见 tool_table 注。 */
+  QuickSelect,
+  MagicEraser,
+  BgEraser,
   Count
 };
 
@@ -860,6 +865,18 @@ struct ToolInfo {
   const char* name; /* 英文名，与上游菜单一致；外壳负责转宽字符 */
   char shortcut;    /* 小写 ASCII；0 = 无默认键 */
 };
+
+/*
+ * S17/P18（2026-10-27）：某工具入口是否对「当前活动工具」启用。
+ *
+ * 抽成纯函数而不是在 available() 里各写一遍，是因为自检要验证这条判据时
+ * 不能构造 ShellState（内嵌 DocumentContext 会把自检的深栈帧打穿，
+ * 实测三次段错误）。绘制、命中、自检因此共用同一份判据，不会分叉。
+ * 文档是否打开由调用方另外判（这里只管「工具对不对」）。
+ */
+inline bool tool_entry_enabled(ToolId active, ToolId entry) {
+  return active == entry;
+}
 
 inline const ToolInfo* tool_table(size_t* out_count) {
   static const ToolInfo kTools[] = {
@@ -884,6 +901,11 @@ inline const ToolInfo* tool_table(size_t* out_count) {
       {ToolId::Zoom, "Zoom", 'z'},
       /* P1：Y 与上游 History Brush 一致；追加在末尾，旧工具的下标不移动。 */
       {ToolId::HistoryBrush, "History Brush", 'y'},
+      /* S17/P18：上游快捷键 W/E 与既有工具冲突（PS 用循环键），本壳暂不给默认键，
+       * 从工具栏按钮进入；shortcut 0 在 tool_for_shortcut 里显式回落 Count。 */
+      {ToolId::QuickSelect, "Quick Selection", 0},
+      {ToolId::MagicEraser, "Magic Eraser", 0},
+      {ToolId::BgEraser, "Background Eraser", 0},
   };
   if (out_count != nullptr) {
     *out_count = sizeof(kTools) / sizeof(kTools[0]);
@@ -978,7 +1000,10 @@ enum class StrokeKind : int {
   Paint,        /* COMP_TOOL_STROKE，erase 字段区分画笔与橡皮擦 */
   HistoryBrush, /* COMP_TOOL_HISTORY_BRUSH，取样状态来自历史面板 */
   Clone,        /* COMP_TOOL_CLONE，源点/对齐偏移由壳自己保存 */
-  Heal          /* COMP_TOOL_HEAL，coverage 由壳按笔迹折线自己光栅化 */
+  Heal,         /* COMP_TOOL_HEAL，coverage 由壳按笔迹折线自己光栅化 */
+  /* S17/P18 尾部追加：折线采集复用 stroke_begin/extend，应用都在松手时一次完成。 */
+  QuickSelect,  /* comp_selection_quick_select，折线逐点泛洪并入选区 */
+  BgEraser      /* COMP_TOOL_BG_ERASER，整条折线一次调用 = 一步撤销 */
 };
 
 /*

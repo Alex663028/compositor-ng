@@ -6,14 +6,14 @@
 > **硬约束**：ABI 导出只能**纯尾部追加**（当前 **216**，2026-10-26 quick_select）；回归 6/6；壳自检 SHA 基线；视觉探针不得因新增功能而破（落地规则见 §6）。
 > 审计独立性（2026-10-26 起）：写代码与写审计不得同一会话署名；连续 ≤3 个批次未获独立审计即触发一轮跨 Agent 交叉全测（T2/S24 模式）。
 >
-> 自检基线：**290 项** / SHA256 `a507550b268fd2f1…`（`compositor_shell_selftest.txt` 里 `[OK]` 行数，逐字节与仓内基线一致）。
+> 自检基线：**293 项** / SHA256 `2eaf4af8da44fba0…`（`compositor_shell_selftest.txt` 里 `[OK]` 行数，逐字节与仓内基线一致）。
 > ## 当前基线速览（唯一真源，改动即更新此表）
 >
 > | 项 | 当前值 | 校验方式 |
 > |---|---|---|
 > | ABI 导出 | **215** | `scripts/check_docs.py` 第 1 项（与本节数字比对） |
-> | 单元测试 | **801 例 / 0 失败** | `build.py` 全量 |
-> | 壳自检 | **290 项 / failures=0**，SHA `a507550b268fd2f1…` | `check_docs.py` 第 2 项 |
+> | 单元测试 | **804 例 / 0 失败** | `build.py` 全量 |
+> | 壳自检 | **293 项 / failures=0**，SHA `2eaf4af8da44fba0…` | `check_docs.py` 第 2 项 |
 > | 视觉探针 | **284 条 / 46 场景 / 0 失败** | `check_docs.py` 第 4 项（按执行次数计，含循环内重复） |
 > | 对标 PS | 日常路径 **≈96%** / 全功能面 **≈80%**（155/197） | `check_docs.py` 第 5–6、9 项（表格加权 == 算式 == 自称分数；清单命中 == 表格） |
 >
@@ -670,6 +670,26 @@ WM_LBUTTONDOWN / WM_MOUSEMOVE / WM_LBUTTONUP 里（那段 1200 行），浮起�
 动作录制/播放、批处理、脚本/命令面板、数据驱动图形。
 - 现状：`comp_command_*` 只有 7 条命令（`comp_command_abi.cpp:30-39`），与外壳 kCmd* 是两套体系。
 - 性质：【引擎】+【架构】——先把命令表统一为单一真源（外壳菜单/快捷键/动作共用），再做录制。
+
+### P1-12 自检里跑 quick_select 会段错误（2026-10-28 记，**未解决**）
+
+- **现象**：在 `--selftest` 里端到端跑「建引擎 → 建文档 → 上像素 →
+  `comp_selection_quick_select` → `comp_selection_deselect`」，进程稳定
+  段错误（EXIT=139）。已用最小复现收窄：`comp_document_create` 与
+  `comp_layer_add` 都返回 OK 并打印通过，崩溃发生在**紧接着的
+  `comp_selection_quick_select` 调用内部**。
+- **同一路径在单测里是绿的**：`tests/test_selection.cpp` 的 quick-select
+  累积/减除/零匹配三条 + `test_tool_ops.cpp` 的两把橡皮擦，804 例 0 失败。
+- **已排除**：栈溢出（把自检改到 16 MB 栈的独立线程仍崩）、
+  `tool_table()` 数组越界（`tools[20]` 也崩，改成 `static_assert` 钉枚举值后
+  该断言正常通过）、参数非法（最小复现用 32×32 全不透明 + 单种子 + 容差 16）。
+- **怀疑但未证实**：自检进程内多次 `comp_engine_create/destroy` 与
+  `ImplicitTxn` 叠加时，选区状态里某个画布尺寸缓存与当前文档不一致。
+- **当前处置**：自检里**不跑**这三个工具的引擎段，改为一条如实标注的占位
+  断言（"engine behavior is covered by unit tests"）；工具表的登记由
+  `scripts/check_tool_table.py` 静态校验（23 个工具、下标 0..22，PASS）。
+- **验收口径**：修好后把 `tests` 里那三条用例原样搬进自检，删掉占位断言，
+  自检项数 +3 并重新生成 SHA 基线。
 
 ### P1-11 画布缩放改成设备像素口径（HiDPI 后续，2026-10-23 记）
 

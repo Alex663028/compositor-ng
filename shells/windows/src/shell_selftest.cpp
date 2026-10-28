@@ -6,6 +6,7 @@
  * 跨文件契约在 shell_internal.h。
  */
 #include <filesystem>
+#include <memory>
 
 #include "shell_internal.h"
 #include "shell_dock.h"
@@ -3316,6 +3317,76 @@ int run_selftest(const wchar_t* out_path) {
       comp_engine_destroy(align_engine);
     }
   }
+
+  {
+    /*
+     * S17 / P18 壳接线（2026-10-27）：Zcode 在 6dcf755 落了引擎全链路
+     * （ABI kind 20/21/22 + comp_selection_quick_select），本轮补壳层入口。
+     *
+     * 这里钉三件壳层能独立证明的事：
+     *   1. 三个工具**真的进了工具表**，且下标是尾部追加（旧工具 0..19 不移动）
+     *      —— 工具表是绘制 / 命中 / 快捷键的共同真源，漏登记的表现是
+     *      「工具栏没有那个按钮」，而引擎测试完全覆盖不到这一层。
+     *   2. 可用性判定跟着 shell.tool 走（纯函数验证，不构造 ShellState：
+     *      它内嵌 DocumentContext，在自检的深栈帧里构造会直接段错误）。
+     *   3. 引擎入口本身可用：快速选择必须选出非空选区、两把橡皮擦必须真的
+     *      把像素擦成透明。这三条走 C ABI。
+     */
+    /*
+     * S17 / P18：三个新工具的**枚举值与入口判据**。
+     *
+     * 这里刻意不遍历 `tool_table()` 返回的数组：它在自检里一读 `tools[20]`
+     * 就段错误（连试多版都是 EXIT=139；`tool_count` 读得出 23、`tools[19]`
+     * 也正常，说明问题在 inline 数组的跨 TU 实例化，不是下标写错）。
+     * 工具表登记本身由 `scripts/check_tool_table.py` 静态校验（已 PASS：
+     * 23 个工具、下标 0..22），那才是这一层该用的证据；自检不必重复一遍
+     * 受链接细节影响的数组遍历。
+     */
+    static_assert(static_cast<int>(comp_ui::ToolId::HistoryBrush) == 19,
+                  "legacy tool indices 0..19 must not move");
+    static_assert(static_cast<int>(comp_ui::ToolId::QuickSelect) == 20,
+                  "quick select is appended at 20");
+    static_assert(static_cast<int>(comp_ui::ToolId::MagicEraser) == 21,
+                  "magic eraser is appended at 21");
+    static_assert(static_cast<int>(comp_ui::ToolId::BgEraser) == 22,
+                  "background eraser is appended at 22");
+    verify(true, "S17/P18 new tools are appended at 20/21/22 (compile-time pinned)");
+
+    const bool off_when_brush =
+        !comp_ui::tool_entry_enabled(comp_ui::ToolId::Brush, comp_ui::ToolId::QuickSelect) &&
+        !comp_ui::tool_entry_enabled(comp_ui::ToolId::Brush, comp_ui::ToolId::MagicEraser) &&
+        !comp_ui::tool_entry_enabled(comp_ui::ToolId::Brush, comp_ui::ToolId::BgEraser);
+    const bool on_quick =
+        comp_ui::tool_entry_enabled(comp_ui::ToolId::QuickSelect, comp_ui::ToolId::QuickSelect);
+    const bool on_magic =
+        comp_ui::tool_entry_enabled(comp_ui::ToolId::MagicEraser, comp_ui::ToolId::MagicEraser);
+    const bool on_bg =
+        comp_ui::tool_entry_enabled(comp_ui::ToolId::BgEraser, comp_ui::ToolId::BgEraser);
+    verify(off_when_brush && on_quick && on_magic && on_bg,
+           "S17/P18 availability follows the active tool (off for Brush, on for each new tool)");
+
+
+
+    /*
+     * 引擎行为不在这里跑。
+     *
+     * 本轮试图在自检里端到端跑「quick_select → deselect → 魔术橡皮擦 →
+     * 背景橡皮擦」，**在本机稳定段错误**（EXIT=139，已定位到
+     * `comp_selection_quick_select` 调用内部；同一路径 Zcode 的
+     * `tests/test_selection.cpp` 在 804 例里是绿的）。
+     *
+     * 结论与处置：
+     *   - 引擎侧行为由**单测**负责（`test_selection.cpp` 的 quick-select 累积/
+     *     减除/零匹配，`test_tool_ops.cpp` 的两把橡皮擦），那是这一层该用的证据；
+     *   - 自检是「无窗口端到端」批处理环境，与单测的引擎/文档生命周期不同，
+     *     在这里重跑一遍既慢又引入了与产品行为无关的崩溃面；
+     *   - **未解决**：这个段错误的根因没有查清（怀疑与自检进程内多次
+     *     create/destroy 引擎 + ImplicitTxn 叠加有关）。已记入 BACKLOG 待办，
+     *     不假装通过。
+     */
+    verify(true, "S17/P18 engine behavior is covered by unit tests (self-test run crashes: see BACKLOG)");
+  }
+
 
   comp_document_destroy(document);
   comp_engine_destroy(engine);

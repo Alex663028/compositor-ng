@@ -3278,6 +3278,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
               lasso_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (wand_available(*shell)) {
               wand_click(window, *shell, mouse_x, mouse_y, layout);
+            } else if (quick_select_available(*shell)) {
+              quick_select_begin(window, *shell, mouse_x, mouse_y, layout);
+            } else if (magic_eraser_available(*shell)) {
+              magic_eraser_click(window, *shell, mouse_x, mouse_y, layout);
+            } else if (bg_eraser_available(*shell)) {
+              bg_eraser_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (gradient_available(*shell)) {
               gradient_begin(window, *shell, mouse_x, mouse_y, layout);
             } else if (shape_available(*shell)) {
@@ -3616,6 +3622,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
       }
       if (shell != nullptr && shell->doc.stroke_kind == comp_ui::StrokeKind::Paint) {
         paint_stroke_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      /* S17 / P18：快速选择与背景橡皮擦都是「折线采集 + 松手一次应用」。 */
+      if (shell != nullptr && shell->doc.stroke_kind == comp_ui::StrokeKind::QuickSelect) {
+        quick_select_end(window, *shell);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      if (shell != nullptr && shell->doc.stroke_kind == comp_ui::StrokeKind::BgEraser) {
+        bg_eraser_end(window, *shell);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
       }
