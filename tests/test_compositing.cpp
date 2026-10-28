@@ -177,39 +177,53 @@ COMP_TEST(premultiplied_blend_is_not_double_alpha_scaled) {
  * 没有 GPU 的机器上，这是防止「三端三套公式」的唯一可靠护栏。
  */
 COMP_TEST(gpu_kernel_mirror_matches_cpu_scalar_blend) {
-  const comp_blend_mode modes[] = {COMP_BLEND_NORMAL,  COMP_BLEND_MULTIPLY, COMP_BLEND_SCREEN,
-                                   COMP_BLEND_OVERLAY, COMP_BLEND_DIFFERENCE};
+  /*
+   * A50：把三种扩展模式纳入逐字节比对。Dissolve 依赖文档坐标（非 Dissolve 模式忽略
+   * 坐标），故补一圈**非负**画布坐标——GPU 端 tid.x/tid.y 恒非负，负坐标与 CPU 的
+   * uint32 强转不一致（见 composite_ops.cpp / gpu_kernel.cpp 注释），不在本护栏范围内。
+   */
+  const comp_blend_mode modes[] = {COMP_BLEND_NORMAL,   COMP_BLEND_MULTIPLY,     COMP_BLEND_SCREEN,
+                                   COMP_BLEND_OVERLAY,  COMP_BLEND_DIFFERENCE,   COMP_BLEND_DISSOLVE,
+                                   COMP_BLEND_DARKER_COLOR, COMP_BLEND_LIGHTER_COLOR};
   const uint8_t bases[][4] = {{0, 0, 0, 0}, {32, 64, 0, 128}, {200, 100, 50, 255}};
   const uint8_t sources[][4] = {{64, 128, 0, 192}, {0, 0, 0, 0}, {255, 255, 255, 128}};
   /* 两侧参数口径不同，见 gpu_kernel.h：
    *   CPU 标量入口 src_alpha = 有效 alpha（已含像素自身 alpha）；
    *   GPU 镜像 layer_opacity = 图层不透明度（内部再乘像素 alpha）。 */
   const double layer_opacities[] = {0.0, 0.5, 1.0};
-  char detail[192];
+  /* 非负画布坐标：CPU 与 GPU 用同一对 (px, py)，Dissolve 的哈希才可比。 */
+  const int32_t coords[] = {0, 3, 17, 64, 200};
+  const size_t coord_count = sizeof(coords) / sizeof(coords[0]);
+  char detail[256];
 
   for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); ++m) {
     for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); ++b) {
       for (size_t s = 0; s < sizeof(sources) / sizeof(sources[0]); ++s) {
         for (size_t a = 0; a < sizeof(layer_opacities) / sizeof(layer_opacities[0]); ++a) {
-          uint8_t cpu[4];
-          uint8_t gpu[4];
-          std::memcpy(cpu, bases[b], 4);
-          std::memcpy(gpu, bases[b], 4);
-          const double pixel_alpha = static_cast<double>(sources[s][3]) / 255.0;
-          compositor_blend_pixel_scalar(cpu, sources[s], modes[m], pixel_alpha * layer_opacities[a]);
-          gpu_kernel_blend_pixel(gpu, sources[s], modes[m], layer_opacities[a]);
-          int max_delta = 0;
-          for (int i = 0; i < 4; ++i) {
-            const int delta = static_cast<int>(cpu[i]) - static_cast<int>(gpu[i]);
-            const int magnitude = delta < 0 ? -delta : delta;
-            if (magnitude > max_delta) max_delta = magnitude;
+          for (size_t c = 0; c < coord_count; ++c) {
+            uint8_t cpu[4];
+            uint8_t gpu[4];
+            std::memcpy(cpu, bases[b], 4);
+            std::memcpy(gpu, bases[b], 4);
+            const double pixel_alpha = static_cast<double>(sources[s][3]) / 255.0;
+            const int32_t px = coords[c];
+            const int32_t py = coords[(c + 1) % coord_count];
+            compositor_blend_pixel_scalar(cpu, sources[s], modes[m],
+                                          pixel_alpha * layer_opacities[a], px, py);
+            gpu_kernel_blend_pixel(gpu, sources[s], modes[m], layer_opacities[a], px, py);
+            int max_delta = 0;
+            for (int i = 0; i < 4; ++i) {
+              const int delta = static_cast<int>(cpu[i]) - static_cast<int>(gpu[i]);
+              const int magnitude = delta < 0 ? -delta : delta;
+              if (magnitude > max_delta) max_delta = magnitude;
+            }
+            std::snprintf(detail, sizeof(detail),
+                          "gpu mirror deviates > 1 LSB: mode=%d alpha=%.2f px=%d py=%d cpu "
+                          "(%u,%u,%u,%u) gpu (%u,%u,%u,%u)",
+                          static_cast<int>(modes[m]), layer_opacities[a], px, py, cpu[0], cpu[1],
+                          cpu[2], cpu[3], gpu[0], gpu[1], gpu[2], gpu[3]);
+            COMP_CHECK_MSG(max_delta <= 1, detail);
           }
-          std::snprintf(detail, sizeof(detail),
-                        "gpu mirror deviates > 1 LSB: mode=%d alpha=%.2f cpu (%u,%u,%u,%u) "
-                        "gpu (%u,%u,%u,%u)",
-                        static_cast<int>(modes[m]), layer_opacities[a], cpu[0], cpu[1], cpu[2], cpu[3],
-                        gpu[0], gpu[1], gpu[2], gpu[3]);
-          COMP_CHECK_MSG(max_delta <= 1, detail);
         }
       }
     }

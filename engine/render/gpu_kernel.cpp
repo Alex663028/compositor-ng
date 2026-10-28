@@ -408,7 +408,11 @@ void gpu_kernel_blend_pixel(uint8_t* dst_premultiplied, const uint8_t* src_premu
   /* 有效源 alpha：像素 alpha × 图层不透明度（镜像着色器 s.a * g_alpha）。 */
   double alpha = sa * layer_opacity;
 
-  /* A50 Dissolve：按文档坐标的确定性哈希把有效 alpha 二值化（镜像着色器 main()）。 */
+  /*
+   * A50 Dissolve：按文档坐标的确定性哈希把有效 alpha 二值化（镜像着色器 main()）。
+   * 边界：CPU 端坐标走 static_cast<uint32_t>，负坐标与 GPU 的 tid.xy（恒非负）不一致，
+   * 故镜像仅在**非负画布坐标**下与 CPU 逐式一致（<=1 LSB）。
+   */
   if (mode == COMP_BLEND_DISSOLVE) {
     if (alpha >= 1.0) {
       alpha = 1.0;

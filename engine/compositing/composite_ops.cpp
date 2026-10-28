@@ -62,6 +62,10 @@ namespace {
  * A50 Dissolve：按文档坐标的确定性哈希决定该像素是否落墨。
  * 口径与 PS 一致：有效 alpha >= 1 恒落墨；否则 hash01(px,py) < alpha 时落墨。
  * 哈希必须与 GPU 着色器逐式一致（GPU == CPU，<=1 LSB）；见 gpu_kernel.cpp。
+ *
+ * 边界：坐标按 static_cast<uint32_t> 参与运算，负坐标会落到 uint32 的高位；GPU 着色器
+ * 用的是 tid.x / tid.y（恒非负），故 **GPU == CPU 仅在非负画布坐标下成立**。合成栈按
+ * 画布坐标（非负）调用本函数，负坐标只可能出现在越界探测里，不参与落墨。
  */
 uint32_t blend_dissolve_hash(int32_t x, int32_t y) {
   uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B1u ^ static_cast<uint32_t>(y) * 0x85EBCA6Bu;

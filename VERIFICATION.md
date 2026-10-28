@@ -8374,6 +8374,9 @@ HLSL/GLSL 均含 Dissolve / Darker Color / Lighter Color 的存在性断言。
 
 - `scripts/build.py`：**821 cases / 0 failed / 0 check failures**。本批为既有用例的护栏
   增强，不新增 `COMP_TEST`，用例数维持 821。
+- 护栏扩展（`tests/test_compositing.cpp`）：`gpu_kernel_mirror_matches_cpu_scalar_blend`
+  由 5 模式扩到 8 模式（含 Dissolve / Darker Color / Lighter Color）+ 5 组非负坐标对；
+  仍是既有用例，不新增 `COMP_TEST`，用例数维持 821。
 - ABI 导出数不变（纯尾部追加枚举值，`^COMP_API` 计数 216 不变）。
 - 外壳自检：**293 项 / failures = 0 / SHA256 `2eaf4af8da44fba0…` 与基线逐字节一致**
   （自检走 ABI 直连，不枚举 `blend_mode` 表，故加档不改基线）。
@@ -8387,9 +8390,12 @@ HLSL/GLSL 均含 Dissolve / Darker Color / Lighter Color 的存在性断言。
 - 上游 `.comp` 规范只定义 0..23；本仓 24..26 是**扩展**，互通以 0..23 为准（已写进
   `comp_core.h` 注释）。含 24..26 的 `.comp` 被上游读回时会视为未知模式。
 - Dissolve 的 CPU 哈希对 `px` 走 `static_cast<uint32_t>(px)`，负画布坐标与 GPU 的非负
-  `tid.xy` 不一致——**GPU ≡ CPU 仅在非负画布坐标成立**；既有 ≤1 LSB 护栏用例
-  （`rhi_gpu_kernel_matches_cpu_blend` / `gpu_kernel_mirror_matches_cpu_scalar_blend`）
-  仍只扫 0..23 分离型，**未把 Dissolve 纳入逐字节比对**。
+  `tid.xy` 不一致——**GPU ≡ CPU 仅在非负画布坐标成立**；该边界已写进 `composite_ops.cpp`
+  与 `gpu_kernel.cpp` 的实现注释。
+- 后续补丁把三种扩展模式纳入 ≤1 LSB 逐字节护栏：`gpu_kernel_mirror_matches_cpu_scalar_blend`
+  由 5 模式扩到 8 模式（含 Dissolve / Darker Color / Lighter Color）× 5 组非负坐标对
+  （0/3/17/64/200），Dissolve 的哈希路径与 Darker/Lighter Color 的整像素择色都在护栏内。
+  负坐标仍**刻意不进护栏**（GPU 无非负 tid 对应物，计入会得到假不等）。
 - Darker / Lighter Color 为整像素择色；HDR（直通色 >1）下按 `lum()` 比较，与 PS 一致，
   但不声称对超白像素逐字节等同。
 
