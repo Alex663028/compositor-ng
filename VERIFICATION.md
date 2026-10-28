@@ -8231,6 +8231,50 @@ divisor = (scale == 0 ? 1 : scale)        // 面板允许把除数清成 0，引
 直接结果，与 §3.4 一致）；马赛克吃掉了格内的高频，是像素化滤镜的预期行为；浮雕
 无「结构 / 纹理 / 不透明区域」三个 PS 高级参数。
 
+### 6.119 滤镜 A47：渲染组三项纯 CPU 尾部追加（P1-5，2026-10-28，deepseek-v4.1-flash）
+
+**缺口。** BACKLOG 的「滤镜」行原列「无模糊画廊 / 渲染」；渲染组的云彩 / 分层云彩 /
+画框在引擎里没有通路。本批把渲染组补上（模糊画廊留待后续，见 BACKLOG）。
+
+**做法（全部尾部追加，冻结面不动）：**
+
+- `domain/filters.h`：新增 `CloudsSettings` / `DifferenceCloudsSettings` /
+  `PictureFrameSettings` 三个结构；`FilterKind` 尾追加 `kFilterClouds = 23` …
+  `kFilterPictureFrame = 25`；`FilterSettings` 尾追加三个字段。
+- `domain/filters.cpp`：三组的参数闸（0 = 恒等；非 0 按上游量程，越界拒绝）、
+  identity / equal / label、**确定性值噪声（5 八度 fBm）**与三个内核
+  （Clouds 端色插值混合 / Difference Clouds 灰度差分 / Picture Frame 四边色带）
+  与 dispatch。噪声不用 `rand()`：哈希把 `(ix, iy, seed)` 混成 32 位、格点间
+  smoothstep 插值、5 个八度按振幅折半叠加，同 seed + 同坐标逐字节可复现。
+- ABI（`comp_filter.h` / `comp_filter_abi.cpp`）：`comp_filter_kind` 尾追加 23..25；
+  新增 `comp_filter_clouds` / `_difference_clouds` / `_picture_frame` 与
+  `comp_filter_desc` 对应字段；`to_domain` / `from_domain` 双向补齐。
+
+**顺带修掉的环境坑（本批实测发现）：**
+
+- 编辑工具在 `tests/test_filters.cpp` 中把 5 处 `¬e` 写成 `&`+U+00AC+`e`
+  （`unexpected character <U+00AC>`，编译失败）。用 PowerShell
+  `[System.IO.File]::ReadAllText/WriteAllText` + `UTF8Encoding($false)` 直改修回
+  （残留 U+00AC = 0）。非系统性，但涉及本文件后续编辑需自查杂字符。
+
+**验证：**
+
+- `scripts/build.py`：**816 cases / 0 failed / 0 check failures**——用例数 810 → 816
+  （新增 6 例，全部通过）。改动前上批为 810 cases 全绿。
+- 新增 6 例：`filters_a47_render_kinds_are_identity_at_zero_initialisation`、
+  `filters_a47_reject_out_of_range_before_the_transaction`、
+  `filters_clouds_are_deterministic_and_keep_alpha`、
+  `filters_difference_clouds_are_deterministic_and_keep_alpha`、
+  `filters_picture_frame_rings_the_border_at_requested_thickness`、
+  `filters_abi_maps_the_a47_fields`。
+- ABI 导出数不变（纯尾部追加 kind 与子结构）。
+- `scripts/check_docs.py`：**PASS**（清单命中数一致性、§N 引用无裸编号悬空全过）。
+
+**已知边界：** 云彩逐字节保留原 alpha、透明区不上色（上游 Clouds 会铺满整张画布）；
+画框是**扁平色带**（上游是带浮雕的立体相框）；噪声是自研值噪声 fBm，只保证
+「分形云纹 / 可复现 / 端色可控」三条可观察口径，**不声称逐像素等同**
+Core Image 的 `CIRandomGenerator`。
+
 
 
 

@@ -394,6 +394,35 @@ A46（2026-10-28）尾部追加的五项（`COMP_FILTER_SPHERIZE = 18` …
   `COMP_ERR_INVALID_ARGUMENT`，参数闸先于事务；非零参数恰好一步撤销。
 - 与 A45 一样，A46 只追加 kind 与子结构，ABI 导出数不变（见 §5 尾部追加清单）。
 
+### 3.19 渲染：Clouds / Difference Clouds / Picture Frame（A47）
+
+A47（2026-10-28）尾部追加的三项（`COMP_FILTER_CLOUDS = 23` …
+`COMP_FILTER_PICTURE_FRAME = 25`）。Clouds / Difference Clouds 共用一套
+**确定性值噪声（5 八度 fBm）**，噪声锚在**文档坐标**（origin = 图层
+`effective_bounds` 原点），图层移动后图案不游动（与 §3.6 Add Noise 同款）；
+Picture Frame 是沿四边落一圈等厚纯色带的扁平相框。
+
+| 滤镜 | kind | 参数 | 量程 / 恒等 | 口径 |
+|------|------|------|-------------|------|
+| Clouds | 23 | `amount` / `size` / `seed` / `color_low[3]` / `color_high[3]` | 0 = 恒等；否则 1..100 / 2..1000（文档像素）/ — / 0..1 / 0..1 | 云纹按噪声值在端色间插值，再按 `amount/100` 与原像素预乘混合 |
+| Difference Clouds | 24 | `amount` / `size` / `seed` | 0 = 恒等；否则 1..100 / 2..1000 / — | 灰度云纹与原像素差分 `|cloud - src|`，按 `amount/100` 混合 |
+| Picture Frame | 25 | `width` / `color[3]` | 0 = 恒等；否则 1..500（图层像素）/ 0..1 | 像素到最近图层边界的距离 `< width*scale` 即着色为 `color` |
+
+- 噪声不用 `rand()`：哈希把 `(ix, iy, seed)` 混成 32 位、格点间 smoothstep
+  插值、5 个八度按振幅折半叠加，返回 0..1。**同 seed + 同坐标逐字节可复现**，
+  智能滤镜重求值、撤销 / 重做都依赖这一点（回归锁见
+  `test_filters.cpp` 的 `filters_clouds_are_deterministic_and_keep_alpha` /
+  `filters_difference_clouds_are_deterministic_and_keep_alpha`）。
+- 两项云彩都**逐字节保留原 alpha**：`alpha == 0` 的像素直接跳过，不上色
+  （上游 Clouds 会铺满整张画布，本仓只改图层已有像素——与 §5 差异逐条对齐）。
+  端色是**直通 sRGB** 0..1，与 §3.3 Bloom 的直通色口径一致。
+- Picture Frame 的 `width` 在预览时乘 `scale` 后取整、下限 1；alpha 逐字节不变
+  （透明区不会被框上色）。上游是带浮雕的**立体相框**，本仓只做扁平色带——差异
+  记在 §5。
+- 越界参数（如 `amount = 101`、`size = 1`、`width = 501`）一律
+  `COMP_ERR_INVALID_ARGUMENT`，参数闸先于事务；非零参数恰好一步撤销。
+- 与 A45 / A46 一样，A47 只追加 kind 与子结构，ABI 导出数不变（见 §5 尾部追加清单）。
+
 ## 4. 选区与坐标
 
 有选区（`SelectionState.active` 且非空）时，结果按 **文档分辨率**的 coverage

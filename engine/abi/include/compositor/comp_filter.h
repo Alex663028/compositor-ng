@@ -61,7 +61,11 @@ typedef enum comp_filter_kind {
   COMP_FILTER_PINCH            = 19, /* 挤压：amount -100..100，0 = 恒等 */
   COMP_FILTER_TWIRL            = 20, /* 旋转扭曲：angle -999..999，0 = 恒等 */
   COMP_FILTER_MOSAIC           = 21, /* 马赛克：cell_size 0 = 恒等，否则 2..200 */
-  COMP_FILTER_EMBOSS           = 22  /* 浮雕：amount 0 = 恒等，否则 1..500 */
+  COMP_FILTER_EMBOSS           = 22, /* 浮雕：amount 0 = 恒等，否则 1..500 */
+  /* A47（2026-10-28）尾部追加：渲染（Render）组三项。 */
+  COMP_FILTER_CLOUDS           = 23, /* 云彩：amount 0 = 恒等，否则 1..100 */
+  COMP_FILTER_DIFFERENCE_CLOUDS = 24, /* 分层云彩：amount 0 = 恒等，否则 1..100 */
+  COMP_FILTER_PICTURE_FRAME    = 25  /* 画框：width 0 = 恒等，否则 1..500 */
 } comp_filter_kind;
 
 /*
@@ -290,6 +294,53 @@ typedef struct comp_filter_emboss {
   double height;
 } comp_filter_emboss;
 
+/*
+ * Clouds（上游 Filter > Render > Clouds）。
+ *   amount      0 = 恒等；否则 1..100（云彩覆盖强度百分比）
+ *   size        2..1000（噪声尺度，文档像素；越大云团越大）
+ *   seed        噪声场种子；同 seed + 同图层原点逐字节可复现
+ *   color_low   直通 sRGB 0..1 的暗端色（上游缺省黑）
+ *   color_high  直通 sRGB 0..1 的亮端色（上游缺省白）
+ *
+ * 口径 = 5 八度值噪声 fBm，按文档坐标锚定；输出逐字节保留原 alpha（透明区
+ * 不上色）。上游会铺满整张画布（透明底也照铺），本仓只改图层已有像素，差异
+ * 记入 note。`amount` 作云彩与原像素的混合权重。
+ */
+typedef struct comp_filter_clouds {
+  double amount;
+  double size;
+  uint32_t seed;
+  double color_low[3];
+  double color_high[3];
+} comp_filter_clouds;
+
+/*
+ * Difference Clouds（上游 Filter > Render > Difference Clouds）。
+ *   amount  0 = 恒等；否则 1..100
+ *   size    2..1000（噪声尺度，文档像素）
+ *   seed    噪声场种子
+ *
+ * 口径 = 灰度云纹与原像素做差分（`|cloud - src|`），再按 amount 混合。
+ */
+typedef struct comp_filter_difference_clouds {
+  double amount;
+  double size;
+  uint32_t seed;
+} comp_filter_difference_clouds;
+
+/*
+ * Picture Frame（上游 Filter > Render > Picture Frame 的扁平色带子集）。
+ *   width  0 = 恒等；否则 1..500（四边色带厚度，图层像素；预览再乘 scale）
+ *   color  直通 sRGB 0..1 的边框色
+ *
+ * 口径 = 四边等厚纯色环（像素到最近图层边界的距离 < width*scale 即着色），
+ * alpha 逐字节不变。上游是带浮雕的立体相框，本仓只做扁平色带，差异记入 note。
+ */
+typedef struct comp_filter_picture_frame {
+  double width;
+  double color[3];
+} comp_filter_picture_frame;
+
 /* Offset 的露出区域处理方式（数值即域层 `OffsetSettings.wrap`）。 */
 typedef enum comp_offset_wrap {
   COMP_OFFSET_TRANSPARENT = 0, /* 露出部分留空（不环绕） */
@@ -366,6 +417,11 @@ typedef struct comp_filter_desc {
   comp_filter_twirl            twirl;          /* kind == TWIRL */
   comp_filter_mosaic           mosaic;         /* kind == MOSAIC */
   comp_filter_emboss           emboss;         /* kind == EMBOSS */
+  /* A47 尾部追加：渲染组三项。旧宿主按旧头文件编译时描述符更小，新宿主必须用
+   * 同一份头文件（两端同源构建，不提供跨版本结构体协商）。 */
+  comp_filter_clouds           clouds;            /* kind == CLOUDS */
+  comp_filter_difference_clouds difference_clouds; /* kind == DIFFERENCE_CLOUDS */
+  comp_filter_picture_frame    picture_frame;     /* kind == PICTURE_FRAME */
 } comp_filter_desc;
 
 /*

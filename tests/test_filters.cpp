@@ -2872,3 +2872,220 @@ COMP_TEST(filters_abi_maps_the_a46_fields_without_touching_custom) {
   COMP_CHECK_MSG(changed == 1, "Spherize amount 过 ABI 生效");
   COMP_CHECK_MSG(changed_pixels(before, pixels_of(doc2, gid)) > 0, "球面化确实改了像素");
 }
+
+/*
+ * A47（2026-10-28）：渲染（Render）组三项（Clouds / Difference Clouds /
+ * Picture Frame）的入口契约。三条承诺与 A45 / A46 同款：
+ *   1. 零初始化（amount / width = 0）= 真 no-op：不开事务、不落撤销步、
+ *      像素逐字节不变；
+ *   2. 参数闸先于事务：越界参数 -> INVALID_ARGUMENT，不进撤销栈；
+ *   3. 非零参数可观察地改像素、恰好一步撤销、alpha 逐字节不变；云纹同 seed
+ *      逐字节可复现（智能滤镜重求值 / 撤销重做依赖这一点）。
+ */
+
+COMP_TEST(filters_a47_render_kinds_are_identity_at_zero_initialisation) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 30, 90, 150);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  const FilterKind kinds[] = {kFilterClouds, kFilterDifferenceClouds, kFilterPictureFrame};
+  for (FilterKind kind : kinds) {
+    FilterSettings settings;
+    settings.kind = kind; /* 其余字段零初始化 */
+    const size_t undo_before = undo_depth(document);
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = true;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(!changed, "零初始化 = 恒等（未改动）");
+    COMP_CHECK_MSG(!document.txn_active(), "零初始化不开事务");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before, "零初始化不落撤销步");
+    COMP_CHECK_MSG(pixels_of(document, id) == before, "零初始化像素逐字节不变");
+  }
+}
+
+COMP_TEST(filters_a47_reject_out_of_range_before_the_transaction) {
+  Engine engine(test_engine_desc());
+  Document document(&engine, 16, 16, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 10, 20, 30);
+  const size_t undo_before = undo_depth(document);
+  auto expect_invalid = [&](const FilterSettings& s) {
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(!filter_apply(&document, id, s, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_ERR_INVALID_ARGUMENT);
+  };
+  FilterSettings s;
+  s.kind = kFilterClouds;
+  s.clouds.amount = 101.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterClouds;
+  s.clouds.amount = 50.0;
+  s.clouds.size = 1.0; /* 小于 2 越界（不是「0 = 恒等」那一档） */
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterDifferenceClouds;
+  s.difference_clouds.amount = 150.0;
+  expect_invalid(s);
+  s = FilterSettings{};
+  s.kind = kFilterPictureFrame;
+  s.picture_frame.width = 501.0;
+  expect_invalid(s);
+  COMP_CHECK_MSG(undo_depth(document) == undo_before, "越界参数不留撤销步");
+  COMP_CHECK_MSG(pixels_of(document, id) != std::vector<uint8_t>{}, "图层仍在");
+}
+
+COMP_TEST(filters_clouds_are_deterministic_and_keep_alpha) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  Document ref(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id rid = add_solid_layer(&ref, 40, 80, 120);
+  const std::vector<uint8_t> source = pixels_of(ref, rid);
+
+  auto run = [&](uint32_t seed) {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_solid_layer(&document, 40, 80, 120);
+    const size_t undo_before = undo_depth(document);
+    FilterSettings settings;
+    settings.kind = kFilterClouds;
+    settings.clouds.amount = 80.0;
+    settings.clouds.size = 8.0;
+    settings.clouds.seed = seed;
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(changed, "云彩报告已改动");
+    COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "云彩恰好一步撤销");
+    return pixels_of(document, id);
+  };
+  const std::vector<uint8_t> a = run(12345u);
+  const std::vector<uint8_t> b = run(12345u);
+  const std::vector<uint8_t> c = run(999u);
+  COMP_CHECK_MSG(a == b, "同 seed 云纹逐字节可复现");
+  COMP_CHECK_MSG(a != c, "换 seed 云纹不同");
+  COMP_CHECK_MSG(changed_pixels(source, a) > 0, "云彩确实改了像素");
+  COMP_CHECK_MSG(all_alpha_are(a, 255), "云彩逐字节保留原 alpha");
+}
+
+COMP_TEST(filters_difference_clouds_are_deterministic_and_keep_alpha) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  Document ref(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id rid = add_solid_layer(&ref, 90, 90, 90);
+  const std::vector<uint8_t> source = pixels_of(ref, rid);
+
+  auto run = [&](uint32_t seed) {
+    Document document(&engine, size, size, 72.0f, "sRGB");
+    const comp_layer_id id = add_solid_layer(&document, 90, 90, 90);
+    FilterSettings settings;
+    settings.kind = kFilterDifferenceClouds;
+    settings.difference_clouds.amount = 100.0;
+    settings.difference_clouds.size = 8.0;
+    settings.difference_clouds.seed = seed;
+    comp_result code = COMP_ERR_INTERNAL;
+    bool changed = false;
+    std::string note;
+    std::string error;
+    COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+    COMP_CHECK(code == COMP_OK);
+    COMP_CHECK_MSG(changed, "分层云彩报告已改动");
+    return pixels_of(document, id);
+  };
+  const std::vector<uint8_t> a = run(777u);
+  const std::vector<uint8_t> b = run(777u);
+  const std::vector<uint8_t> c = run(778u);
+  COMP_CHECK_MSG(a == b, "同 seed 分层云彩逐字节可复现");
+  COMP_CHECK_MSG(a != c, "换 seed 分层云彩不同");
+  COMP_CHECK_MSG(changed_pixels(source, a) > 0, "分层云彩确实改了像素");
+  COMP_CHECK_MSG(all_alpha_are(a, 255), "分层云彩逐字节保留原 alpha");
+}
+
+COMP_TEST(filters_picture_frame_rings_the_border_at_requested_thickness) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 100, 100, 100);
+  const size_t undo_before = undo_depth(document);
+
+  FilterSettings settings;
+  settings.kind = kFilterPictureFrame;
+  settings.picture_frame.width = 2.0;
+  settings.picture_frame.color[0] = 1.0; /* 红 */
+  comp_result code = COMP_ERR_INTERNAL;
+  bool changed = false;
+  std::string note;
+  std::string error;
+  COMP_CHECK(filter_apply(&document, id, settings, 1.0, &code, &changed, &note, &error));
+  COMP_CHECK(code == COMP_OK);
+  COMP_CHECK(changed);
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 255, 0, 0, 255), "左上角落在 2px 红框内");
+  COMP_CHECK_MSG(pixel_is(after, size, 1, 8, 255, 0, 0, 255), "左边第 2 列（索引 1）仍在框内");
+  COMP_CHECK_MSG(pixel_is(after, size, 2, 8, 100, 100, 100, 255), "第 3 列（索引 2）已出框、保持原色");
+  COMP_CHECK_MSG(pixel_is(after, size, 8, 8, 100, 100, 100, 255), "内部保持原色");
+  COMP_CHECK_MSG(pixel_is(after, size, 15, 15, 255, 0, 0, 255), "右下角也在框内");
+  COMP_CHECK_MSG(all_alpha_are(after, 255), "画框不改 alpha");
+  COMP_CHECK_MSG(undo_depth(document) == undo_before + 1, "画框恰好一步撤销");
+}
+
+COMP_TEST(filters_abi_maps_the_a47_fields) {
+  Engine engine(test_engine_desc());
+  const int32_t size = 16;
+
+  /* 画框过 ABI：width 与颜色都生效。 */
+  Document document(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id id = add_solid_layer(&document, 100, 100, 100);
+  const std::vector<uint8_t> before = pixels_of(document, id);
+  comp_filter_desc frame{};
+  frame.kind = COMP_FILTER_PICTURE_FRAME;
+  frame.picture_frame.width = 3.0;
+  frame.picture_frame.color[1] = 1.0; /* 绿 */
+  int32_t changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&document), id, &frame, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "画框过 ABI 生效");
+  const std::vector<uint8_t> after = pixels_of(document, id);
+  COMP_CHECK_MSG(pixel_is(after, size, 0, 0, 0, 255, 0, 255), "ABI 传的画框颜色（绿）生效");
+  COMP_CHECK_MSG(changed_pixels(before, after) > 0, "画框确实改了像素");
+
+  /* 云彩过 ABI：amount + seed + 端色生效。 */
+  Document doc2(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id cid = add_solid_layer(&doc2, 40, 80, 120);
+  const std::vector<uint8_t> cbefore = pixels_of(doc2, cid);
+  comp_filter_desc clouds{};
+  clouds.kind = COMP_FILTER_CLOUDS;
+  clouds.clouds.amount = 70.0;
+  clouds.clouds.size = 6.0;
+  clouds.clouds.seed = 4242u;
+  clouds.clouds.color_low[0] = 0.0;
+  clouds.clouds.color_high[1] = 1.0;
+  clouds.clouds.color_high[2] = 1.0;
+  changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&doc2), cid, &clouds, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "云彩过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(cbefore, pixels_of(doc2, cid)) > 0, "云彩确实改了像素");
+
+  /* 分层云彩过 ABI：amount 生效。 */
+  Document doc3(&engine, size, size, 72.0f, "sRGB");
+  const comp_layer_id did = add_solid_layer(&doc3, 90, 90, 90);
+  const std::vector<uint8_t> dbefore = pixels_of(doc3, did);
+  comp_filter_desc diff{};
+  diff.kind = COMP_FILTER_DIFFERENCE_CLOUDS;
+  diff.difference_clouds.amount = 100.0;
+  diff.difference_clouds.size = 6.0;
+  diff.difference_clouds.seed = 4242u;
+  changed = -1;
+  COMP_CHECK(comp_filter_apply(as_document_handle(&doc3), did, &diff, 1.0, &changed, nullptr, 0,
+                               nullptr) == COMP_OK);
+  COMP_CHECK_MSG(changed == 1, "分层云彩过 ABI 生效");
+  COMP_CHECK_MSG(changed_pixels(dbefore, pixels_of(doc3, did)) > 0, "分层云彩确实改了像素");
+}

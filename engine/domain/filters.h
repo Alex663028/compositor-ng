@@ -431,6 +431,57 @@ struct EmbossSettings {
   double height = 0.0;
 };
 
+/*
+ * Clouds / Difference Clouds（上游 Filter > Render > Clouds / Difference Clouds）。
+ *
+ * 生成式滤镜：用**确定性 fBm 值噪声**铺一层云纹，再按 `amount` 与原像素混合。
+ *
+ *   amount      0 = 恒等（不开事务、不动像素）；否则 0.1..100（混合权重 %），
+ *               100 = 完全用云纹替换原色（保留原 alpha 覆盖率）。
+ *   size        2..1000（云纹特征尺度，图层像素；预览再乘 scale）
+ *   seed        噪声场种子；同 seed + 同图层原点逐字节可复现
+ *   color_low / color_high  噪声 0 / 1 两端的**直通 sRGB** 0..1 颜色
+ *
+ * 口径（与上游的差异如实记录，见 docs/filters.md）：上游走 CIRandomGenerator +
+ * 更复杂的退火，本仓是 5 个八度、光滑插值的值噪声，只保证「分形云纹、可复现、
+ * 端色可控」三条可观察口径，不声称逐像素等同。噪声锚在**文档坐标**
+ * （origin = 图层 effective_bounds 原点），图层移动后图案不游动（同 Add Noise）。
+ * 逐字节保留原 alpha：透明区不上色（上游 Clouds 会铺满画布，本仓不铺底）。
+ */
+struct CloudsSettings {
+  double amount = 0.0;
+  double size = 200.0;
+  uint32_t seed = 0;
+  double color_low[3] = {0.0, 0.0, 0.0};
+  double color_high[3] = {1.0, 1.0, 1.0};
+};
+
+/*
+ * Difference Clouds：`|cloud - src|`。噪声取灰度云纹（0..255），逐通道
+ *   `out = src*(1-a) + |cloud - src|*a`（a = amount/100），alpha 不变。
+ * 与 Clouds 共用同一份噪声与端色约定；零初始化 = amount 0 = 恒等。
+ */
+struct DifferenceCloudsSettings {
+  double amount = 0.0;
+  double size = 200.0;
+  uint32_t seed = 0;
+};
+
+/*
+ * Picture Frame（上游 Filter > Render > Picture Frame）。
+ *
+ *   width  0 = 恒等；否则 1..500（画框厚度，图层像素；预览再乘 scale 后至少 1）
+ *   color  画框**直通 sRGB** 0..1 颜色
+ *
+ * 沿图层四边落一圈等厚的纯色带（到最近边界的像素数 < width）；逐字节保留原
+ * alpha（透明区不会被框上色）。上游按灰度图做立体相框，本仓是扁平色带，只保证
+ * 「四边等厚、颜色可控」两条可观察口径（见 docs/filters.md）。
+ */
+struct PictureFrameSettings {
+  double width = 0.0;
+  double color[3] = {0.0, 0.0, 0.0};
+};
+
 /* 滤镜种类。数值与 ABI `comp_filter_kind` 一一对应（尾部追加，不改既有值）。 */
 enum FilterKind {
   kFilterVignette = 0,
@@ -457,6 +508,10 @@ enum FilterKind {
   kFilterTwirl = 20,
   kFilterMosaic = 21,
   kFilterEmboss = 22,
+  /* A47（2026-10-28）尾部追加：渲染组三项。 */
+  kFilterClouds = 23,
+  kFilterDifferenceClouds = 24,
+  kFilterPictureFrame = 25,
 };
 
 /*
@@ -488,6 +543,9 @@ struct FilterSettings {
   TwirlSettings twirl;
   MosaicSettings mosaic;
   EmbossSettings emboss;
+  CloudsSettings clouds;
+  DifferenceCloudsSettings difference_clouds;
+  PictureFrameSettings picture_frame;
 };
 
 /* 参数闸：逐项检查量程（越界拒绝而不是静默 clamp，与 camera_raw 同规矩）。 */

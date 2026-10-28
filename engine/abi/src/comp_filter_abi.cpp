@@ -141,6 +141,24 @@ FilterSettings to_domain(const comp_filter_desc& desc) {
   settings.emboss.amount = desc.emboss.amount;
   settings.emboss.angle = desc.emboss.angle;
   settings.emboss.height = desc.emboss.height;
+
+  /* A47：渲染组三项的参数（尾部追加，老宿主零初始化 = 恒等）。 */
+  settings.clouds.amount = desc.clouds.amount;
+  settings.clouds.size = desc.clouds.size;
+  settings.clouds.seed = desc.clouds.seed;
+  settings.clouds.color_low[0] = desc.clouds.color_low[0];
+  settings.clouds.color_low[1] = desc.clouds.color_low[1];
+  settings.clouds.color_low[2] = desc.clouds.color_low[2];
+  settings.clouds.color_high[0] = desc.clouds.color_high[0];
+  settings.clouds.color_high[1] = desc.clouds.color_high[1];
+  settings.clouds.color_high[2] = desc.clouds.color_high[2];
+  settings.difference_clouds.amount = desc.difference_clouds.amount;
+  settings.difference_clouds.size = desc.difference_clouds.size;
+  settings.difference_clouds.seed = desc.difference_clouds.seed;
+  settings.picture_frame.width = desc.picture_frame.width;
+  settings.picture_frame.color[0] = desc.picture_frame.color[0];
+  settings.picture_frame.color[1] = desc.picture_frame.color[1];
+  settings.picture_frame.color[2] = desc.picture_frame.color[2];
   return settings;
 }
 
@@ -278,6 +296,25 @@ comp_filter_desc from_domain(const FilterSettings& s) {
   desc.emboss.amount = s.emboss.amount;
   desc.emboss.angle = s.emboss.angle;
   desc.emboss.height = s.emboss.height;
+
+  /* A47：渲染组三项。Clouds 的 color_low / color_high 零初始化时域层缺省是黑/白，
+   * 但这里是**回读**（from_domain）：把域层当前值原样写回，不重新造缺省。 */
+  desc.clouds.amount = s.clouds.amount;
+  desc.clouds.size = s.clouds.size;
+  desc.clouds.seed = s.clouds.seed;
+  desc.clouds.color_low[0] = s.clouds.color_low[0];
+  desc.clouds.color_low[1] = s.clouds.color_low[1];
+  desc.clouds.color_low[2] = s.clouds.color_low[2];
+  desc.clouds.color_high[0] = s.clouds.color_high[0];
+  desc.clouds.color_high[1] = s.clouds.color_high[1];
+  desc.clouds.color_high[2] = s.clouds.color_high[2];
+  desc.difference_clouds.amount = s.difference_clouds.amount;
+  desc.difference_clouds.size = s.difference_clouds.size;
+  desc.difference_clouds.seed = s.difference_clouds.seed;
+  desc.picture_frame.width = s.picture_frame.width;
+  desc.picture_frame.color[0] = s.picture_frame.color[0];
+  desc.picture_frame.color[1] = s.picture_frame.color[1];
+  desc.picture_frame.color[2] = s.picture_frame.color[2];
   return desc;
 }
 

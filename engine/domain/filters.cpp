@@ -324,6 +324,47 @@ bool emboss_valid(const EmbossSettings& s, std::string* error) {
   return true;
 }
 
+/* A47：渲染组三项的参数闸（0 = 恒等；非 0 按上游量程，越界拒绝）。 */
+bool clouds_valid(const CloudsSettings& s, std::string* error) {
+  if (!in_range(s.amount, 0.0, 100.0)) {
+    return set_error(error, "clouds amount out of 0..100");
+  }
+  if (!in_range(s.size, 2.0, 1000.0)) {
+    return set_error(error, "clouds size out of 2..1000");
+  }
+  for (int c = 0; c < 3; ++c) {
+    if (!in_range(s.color_low[c], 0.0, 1.0)) {
+      return set_error(error, "clouds color_low out of 0..1");
+    }
+    if (!in_range(s.color_high[c], 0.0, 1.0)) {
+      return set_error(error, "clouds color_high out of 0..1");
+    }
+  }
+  return true;
+}
+
+bool difference_clouds_valid(const DifferenceCloudsSettings& s, std::string* error) {
+  if (!in_range(s.amount, 0.0, 100.0)) {
+    return set_error(error, "difference clouds amount out of 0..100");
+  }
+  if (!in_range(s.size, 2.0, 1000.0)) {
+    return set_error(error, "difference clouds size out of 2..1000");
+  }
+  return true;
+}
+
+bool picture_frame_valid(const PictureFrameSettings& s, std::string* error) {
+  if (s.width != 0.0 && !in_range(s.width, 1.0, 500.0)) {
+    return set_error(error, "picture frame width must be 0 or in 1..500");
+  }
+  for (int c = 0; c < 3; ++c) {
+    if (!in_range(s.color[c], 0.0, 1.0)) {
+      return set_error(error, "picture frame color out of 0..1");
+    }
+  }
+  return true;
+}
+
 /* ------------------------------------------------------------ 像素算子 */
 
 /* Vignette：帧 = 图层自身像素矩形（上游非空图层 `job.canvas == nil` 的分支）。
@@ -1389,6 +1430,166 @@ comp_result emboss_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t s
   return COMP_OK;
 }
 
+/* ============================================================ A47：渲染组
+ *
+ * 确定性值噪声（fBm）——Clouds / Difference Clouds 的唯一随机源。不用 rand()：
+ * 同 seed + 同坐标必须逐字节可复现（智能滤镜重求值、撤销/重做都依赖这一点）。
+ * 哈希把 (ix, iy, seed) 混成一个 32 位数，值噪声在格点间用 smoothstep 插值，
+ * 5 个八度按振幅折半叠加。
+ */
+uint32_t cloud_hash(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+double cloud_lattice(int32_t ix, int32_t iy, uint32_t seed) {
+  const uint32_t hx = cloud_hash(static_cast<uint32_t>(ix) * 0x9e3779b9u ^ seed);
+  const uint32_t h = cloud_hash(hx ^ (static_cast<uint32_t>(iy) * 0x85ebca6bu));
+  return static_cast<double>(h) * (1.0 / 4294967296.0);
+}
+
+double cloud_smooth(double t) { return t * t * (3.0 - 2.0 * t); }
+
+double cloud_value(double x, double y, uint32_t seed) {
+  const double fx = std::floor(x);
+  const double fy = std::floor(y);
+  const int32_t ix = static_cast<int32_t>(fx);
+  const int32_t iy = static_cast<int32_t>(fy);
+  const double tx = cloud_smooth(x - fx);
+  const double ty = cloud_smooth(y - fy);
+  const double v00 = cloud_lattice(ix, iy, seed);
+  const double v10 = cloud_lattice(ix + 1, iy, seed);
+  const double v01 = cloud_lattice(ix, iy + 1, seed);
+  const double v11 = cloud_lattice(ix + 1, iy + 1, seed);
+  const double lo = v00 + (v10 - v00) * tx;
+  const double hi = v01 + (v11 - v01) * tx;
+  return lo + (hi - lo) * ty;
+}
+
+/* 5 个八度的分形叠加，返回 0..1。 */
+double cloud_fbm(double x, double y, uint32_t seed) {
+  double sum = 0.0;
+  double amp = 0.5;
+  double freq = 1.0;
+  double norm = 0.0;
+  for (int octave = 0; octave < 5; ++octave) {
+    sum += amp * cloud_value(x * freq, y * freq, seed + static_cast<uint32_t>(octave) * 0x9e37u);
+    norm += amp;
+    amp *= 0.5;
+    freq *= 2.0;
+  }
+  return norm > 0.0 ? sum / norm : 0.0;
+}
+
+/* Clouds：云纹端色按噪声值在 color_low / color_high 之间线性插值，再按 amount
+ * 与原像素做预乘混合（alpha 逐字节不变）。噪声锚在文档坐标（origin = 图层
+ * effective_bounds 原点），图层移动后图案不游动（同 Add Noise）。 */
+comp_result clouds_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                          const CloudsSettings& s, double scale, int64_t origin_x,
+                          int64_t origin_y) {
+  if (s.amount <= 0.0 || width <= 0 || height <= 0) return COMP_OK;
+  const double feature = std::max(1.0, s.size * (scale > 0.0 ? scale : 1.0));
+  const double weight = s.amount / 100.0;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const double ny = static_cast<double>(origin_y + y) / feature;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      const double alpha = p[3];
+      if (alpha <= 0.0) continue;
+      const double nx = static_cast<double>(origin_x + x) / feature;
+      const double c = cloud_fbm(nx, ny, s.seed);
+      const uint8_t* src = source.data() + static_cast<size_t>(y) * row_bytes +
+                           static_cast<size_t>(x) * 4u;
+      for (int ch = 0; ch < 3; ++ch) {
+        const double cloud =
+            (s.color_low[ch] + (s.color_high[ch] - s.color_low[ch]) * c) * 255.0;
+        double value = static_cast<double>(src[ch]) * (1.0 - weight) +
+                       cloud * (alpha / 255.0) * weight;
+        if (value < 0.0) value = 0.0;
+        if (value > alpha) value = alpha;
+        p[ch] = static_cast<uint8_t>(std::lround(value));
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* Difference Clouds：灰度云纹 c（0..255），逐通道 out = src*(1-a) + |c - src| * a
+ * （src 为直通色），alpha 逐字节不变。 */
+comp_result difference_clouds_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                     const DifferenceCloudsSettings& s, double scale,
+                                     int64_t origin_x, int64_t origin_y) {
+  if (s.amount <= 0.0 || width <= 0 || height <= 0) return COMP_OK;
+  const double feature = std::max(1.0, s.size * (scale > 0.0 ? scale : 1.0));
+  const double weight = s.amount / 100.0;
+  const size_t row_bytes = static_cast<size_t>(width) * 4u;
+  std::vector<uint8_t> source(row_bytes * static_cast<size_t>(height));
+  for (int32_t y = 0; y < height; ++y) {
+    std::memcpy(source.data() + static_cast<size_t>(y) * row_bytes,
+                rgba + static_cast<size_t>(y) * stride, row_bytes);
+  }
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const double ny = static_cast<double>(origin_y + y) / feature;
+    for (int32_t x = 0; x < width; ++x) {
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      const double alpha = p[3];
+      if (alpha <= 0.0) continue;
+      const double nx = static_cast<double>(origin_x + x) / feature;
+      const double cloud = cloud_fbm(nx, ny, s.seed) * 255.0;
+      const uint8_t* src = source.data() + static_cast<size_t>(y) * row_bytes +
+                           static_cast<size_t>(x) * 4u;
+      for (int ch = 0; ch < 3; ++ch) {
+        const double straight = std::min(255.0, static_cast<double>(src[ch]) * 255.0 / alpha);
+        const double diff = std::fabs(cloud - straight);
+        const double straight_out = straight * (1.0 - weight) + diff * weight;
+        double value = std::lround(straight_out * alpha / 255.0);
+        if (value < 0.0) value = 0.0;
+        if (value > alpha) value = alpha;
+        p[ch] = static_cast<uint8_t>(value);
+      }
+    }
+  }
+  return COMP_OK;
+}
+
+/* Picture Frame：沿四边落一圈等厚色带（到最近边界的像素数 < t），alpha 不变。 */
+comp_result picture_frame_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
+                                 const PictureFrameSettings& s, double scale) {
+  if (s.width <= 0.0 || width <= 0 || height <= 0) return COMP_OK;
+  int64_t t = std::llround(s.width * (scale > 0.0 ? scale : 1.0));
+  if (t < 1) t = 1;
+  for (int32_t y = 0; y < height; ++y) {
+    uint8_t* row = rgba + static_cast<size_t>(y) * stride;
+    const int64_t dy = std::min<int64_t>(y, static_cast<int64_t>(height) - 1 - y);
+    for (int32_t x = 0; x < width; ++x) {
+      const int64_t dx = std::min<int64_t>(x, static_cast<int64_t>(width) - 1 - x);
+      if (std::min(dx, dy) >= t) continue;
+      uint8_t* p = row + static_cast<size_t>(x) * 4u;
+      const double alpha = p[3];
+      if (alpha <= 0.0) continue;
+      for (int ch = 0; ch < 3; ++ch) {
+        double value = std::lround(s.color[ch] * 255.0 * alpha / 255.0);
+        if (value < 0.0) value = 0.0;
+        if (value > alpha) value = alpha;
+        p[ch] = static_cast<uint8_t>(value);
+      }
+    }
+  }
+  return COMP_OK;
+}
+
 comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t stride,
                          const FilterSettings& settings, double scale, int64_t origin_x,
                          int64_t origin_y, const ProgressiveLine& line) {
@@ -1443,6 +1644,14 @@ comp_result apply_pixels(uint8_t* rgba, int32_t width, int32_t height, size_t st
       return mosaic_pixels(rgba, width, height, stride, settings.mosaic, scale);
     case kFilterEmboss:
       return emboss_pixels(rgba, width, height, stride, settings.emboss, scale);
+    case kFilterClouds:
+      return clouds_pixels(rgba, width, height, stride, settings.clouds, scale, origin_x,
+                           origin_y);
+    case kFilterDifferenceClouds:
+      return difference_clouds_pixels(rgba, width, height, stride, settings.difference_clouds,
+                                      scale, origin_x, origin_y);
+    case kFilterPictureFrame:
+      return picture_frame_pixels(rgba, width, height, stride, settings.picture_frame, scale);
   }
   return COMP_ERR_INVALID_ARGUMENT;
 }
@@ -1484,6 +1693,9 @@ bool filter_settings_valid(const FilterSettings& settings, std::string* error) {
     case kFilterTwirl: return twirl_valid(settings.twirl, error);
     case kFilterMosaic: return mosaic_valid(settings.mosaic, error);
     case kFilterEmboss: return emboss_valid(settings.emboss, error);
+    case kFilterClouds: return clouds_valid(settings.clouds, error);
+    case kFilterDifferenceClouds: return difference_clouds_valid(settings.difference_clouds, error);
+    case kFilterPictureFrame: return picture_frame_valid(settings.picture_frame, error);
   }
   return set_error(error, "unknown filter kind");
 }
@@ -1520,6 +1732,9 @@ bool filter_settings_identity(const FilterSettings& settings) {
     case kFilterTwirl: return settings.twirl.angle == 0.0;
     case kFilterMosaic: return settings.mosaic.cell_size == 0.0;
     case kFilterEmboss: return settings.emboss.amount == 0.0;
+    case kFilterClouds: return settings.clouds.amount == 0.0;
+    case kFilterDifferenceClouds: return settings.difference_clouds.amount == 0.0;
+    case kFilterPictureFrame: return settings.picture_frame.width == 0.0;
   }
   return true;
 }
@@ -1591,6 +1806,23 @@ bool filter_settings_equal(const FilterSettings& a, const FilterSettings& b) {
     case kFilterEmboss:
       return a.emboss.amount == b.emboss.amount && a.emboss.angle == b.emboss.angle &&
              a.emboss.height == b.emboss.height;
+    case kFilterClouds: {
+      const CloudsSettings& x = a.clouds;
+      const CloudsSettings& y = b.clouds;
+      return x.amount == y.amount && x.size == y.size && x.seed == y.seed &&
+             x.color_low[0] == y.color_low[0] && x.color_low[1] == y.color_low[1] &&
+             x.color_low[2] == y.color_low[2] && x.color_high[0] == y.color_high[0] &&
+             x.color_high[1] == y.color_high[1] && x.color_high[2] == y.color_high[2];
+    }
+    case kFilterDifferenceClouds:
+      return a.difference_clouds.amount == b.difference_clouds.amount &&
+             a.difference_clouds.size == b.difference_clouds.size &&
+             a.difference_clouds.seed == b.difference_clouds.seed;
+    case kFilterPictureFrame:
+      return a.picture_frame.width == b.picture_frame.width &&
+             a.picture_frame.color[0] == b.picture_frame.color[0] &&
+             a.picture_frame.color[1] == b.picture_frame.color[1] &&
+             a.picture_frame.color[2] == b.picture_frame.color[2];
   }
   return false;
 }
@@ -1620,6 +1852,9 @@ const char* filter_kind_label(FilterKind kind) {
     case kFilterTwirl: return "Twirl";
     case kFilterMosaic: return "Mosaic";
     case kFilterEmboss: return "Emboss";
+    case kFilterClouds: return "Clouds";
+    case kFilterDifferenceClouds: return "Difference Clouds";
+    case kFilterPictureFrame: return "Picture Frame";
   }
   return "filter";
 }
@@ -1817,6 +2052,14 @@ bool filter_apply(Document* document, comp_layer_id target, const FilterSettings
     if (settings.kind == kFilterCustom) {
       *note += " as a 5x5 convolution on straight colour with edge-clamped neighbours "
                "(alpha untouched; previews do not rescale the kernel)";
+    }
+    if (settings.kind == kFilterClouds || settings.kind == kFilterDifferenceClouds) {
+      *note += " as a five-octave value-noise fractal (CIRandomGenerator's field is not public; "
+               "the pattern is reproducible per seed but not pixel-identical)";
+    }
+    if (settings.kind == kFilterPictureFrame) {
+      *note += " as a flat-colour ring of equal thickness (the upstream frame is a shaded picture "
+               "frame; only the thickness and colour are matched)";
     }
     if (clip) *note += ", clipped to the document selection";
   }
