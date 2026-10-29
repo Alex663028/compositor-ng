@@ -87,3 +87,8 @@ shells/ohos/**/oh_modules/
 *.hap
 # zig 编译器缓存：与产物分开，--clean 不该牵连它（见 scripts/build.py child_env）
 .zig-cache/
+
+# ---------------------------------------------- 审计报告与探针截图（不入库）
+# 内部审计报告、`visual_check.py` 的逐步骤截图与运行日志都落在 report/ 下；
+# 它们是过程证据，可由脚本重新生成，不入库（公开仓库只留源码与契约文档）。
+report/

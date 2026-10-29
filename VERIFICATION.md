@@ -2,6 +2,8 @@
 
 > 编号沿用 README §6.x（BACKLOG 与 report/ 的「§6.116」式引用不断链）。
 > 本文件只追加，不改既有条目；维护规则见 README §5 与 BACKLOG §6。
+> 文中 `report/…` / `../report/…` 指向内部审计报告与本地探针截图，均未随仓库发布；
+> 截图可由 `scripts/visual_check.py` 在本地重新生成。
 
 ## §6. 验证记录
 
@@ -110,7 +112,7 @@ but cannot be used because it is not an import library`）。`comp_blocks_rt.c` 
 本轮真机验证还**修出一处真实缺陷**：`vulkan_backend.cpp` 的 `kImageUsageStorage` 原误写为
 `0x00000020`（`DEPTH_STENCIL_ATTACHMENT_BIT`），正确值应为 `0x00000008`（`STORAGE_IMAGE`）。
 错误值使 rgba8 图像缺少 STORAGE 用法，`imageStore` 被驱动静默丢弃（`vkCmd*` 无返回码、无校验层），
-表现为全零输出；已修正并复验为 20/20（诊断链见 `scripts/once/_diag_vulkan_real.py`）。
+表现为全零输出；已修正并复验为 20/20（诊断链所用的一次性脚本未随仓库发布）。
 
 ### 6.1.3 调整面板与真实编解码（M5 本轮）
 

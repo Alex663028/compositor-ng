@@ -20,8 +20,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   对齐上游 DocumentHistory 的「独占字节」账本，快照不再逐字节拷贝像素）、**向下合并 /
   组合并 / 拼合图像**（对齐上游 ⌘E 家族，渲染不变）、一键回归入口
   `scripts/run_regression.py`（含鸿蒙交叉编译，6 步全绿）。
-  2026-10-15 再追加（第二轮独立审计）：修复 12 个缺陷并补10 条回归护栏，
-  详见 `../report/AUDIT2-compositor-ng-20261015-claude.md`——
+  2026-10-15 再追加（第二轮独立审计）：修复 12 个缺陷并补 10 条回归护栏——
   含 `remove_subtree` 悬垂指针（UAF）、`.comp` 非法像素格式导致步长归零、
   事务句柄悬垂、活动事务内可undo/redo 导致历史链错位、跨父级 reorder、
   6 个 adjustment ABI 缺异常护栏（可`std::terminate` 宿主）等。
@@ -36,7 +35,6 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   2026-10-16 第四轮（工具算子产品通路）：7 组原「孤立内核」接入新 ABI
   `comp_tool_apply`（Wand/Heal/Patch/Dither/Lens/Brush/Deep），逐算子参数契约见
   `docs/tool-ops.md`；基线 184 → **204 用例**，6/6 回归全绿。
-  详见 `../report/AUDIT7-compositor-ng-20261016-dsh.md`。
   2026-10-17 第五轮（16 位通路收口）：`comp_layer_set_pixels` 接受 `COMP_PIXEL_RGBA16`
   之后，把「16 位资产的 8 位工作副本」补成真实现——`domain/layer.h` 的 `deep_to_rgba8`
   是唯一生产者（对齐上游 `DeepLayer.dithered`），合成 / 缩略图、裁剪基底取 alpha、
@@ -44,7 +42,6 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   不报错但画面是垃圾。同时把 `COMP_PIXEL_RGBA16` 的 ABI 口径从「非预乘」改正为
   「预乘」（与上游布局一致；该格式此前在任何入口都被拒绝，无宿主可依赖旧措辞）。
   基线 204 → **207 用例**，6/6 回归全绿。
-  详见 `../report/AUDIT8-compositor-ng-20261017-grok.md`。
   2026-10-17 第六轮（内核收口 + 完成度对标）：修掉 4 处真实缺陷——**剪贴栈 alpha 语义**
   （旧实现「先合成基底再按基底 alpha 缩放」，软 alpha 基底 + MULTIPLY 子层得到 `a=0`，
   改为上游 `LiveMaskRenderer.drawComposite` 的 extract → 不透明基底上混合 → restore，实测
@@ -55,7 +52,7 @@ Compositor 跨平台统一架构的**引擎核**实现（单仓）。同一份 C
   Chunky、deep round trip、16 位通道混合调整、`extract/restore_alpha`。
   基线 207 → **212 用例**，6/6 回归全绿。
   同轮产出**双口径完成度对标**：引擎核内 **≈92%**、作为「Photoshop 替代品」的产品口径 **≈45%**
-  （详见 §6.4 与 `../report/AUDIT9-compositor-ng-20261017-pi.md`）。
+  （详见 §6.4）。
   2026-10-18 第七轮（F1 选区几何）：新增 `comp_selection_*` 一族 10 个 ABI，把上游
   `Document/Selection.swift` 的产品通路补上——矩形/椭圆/多边形/三次贝塞尔路径栅格化
   （非零缠绕，反向子路径成洞）、replace/add/subtract、全选/取消/反选、feather/expand/contract。
@@ -268,7 +265,11 @@ M1 的验收标准是「**能编过、能跑过**」，不是「功能完整」�
 compositor-ng/
 ├── CMakeLists.txt                 # 标准构建（优先级最高）
 ├── README.md
-├── .gitignore                     # 构建产物 / Python 缓存 / 历史产物目录（P2-6：此前缺失）
+├── LICENSE                        # MIT（上游版权 + 本仓）
+├── .gitignore                     # 构建产物 / Python 缓存 / 审计报告目录
+├── .gitattributes                 # LF 归一 + 二进制资产声明
+├── BACKLOG.md                     # 路线图 / 待办（§6 维护规则）
+├── VERIFICATION.md                # 验证记录（§6.x 编号，只追加）
 ├── scripts/
 │   ├── build.py                   # 可移植构建（无需 CMake，借 PyPI ziglang 的 clang）
 │   ├── build.sh                   # POSIX / Git Bash 入口
@@ -280,14 +281,22 @@ compositor-ng/
 │   ├── gen_vulkan_bindings.py     # ★ 从 GLSL 抽取 Vulkan 绑定/推送常量布局常量头
 │   ├── check_vulkan_slice.py      # ★ Vulkan 切片自检（双变体编译 + 回归 + 外壳链接）
 │   ├── run_regression.py          # ★ 一键回归（构建+单测+壳自检+两个 crosscheck+shared+鸿蒙交叉编译）
-│   ├── visual_check.py            # ★ Windows 壳自动化目视（真消息驱动 + PrintWindow 像素断言，S15）
-│   └── once/                      # 一次性补丁 / 诊断脚本（P2-7：已从 scripts/ 根移入，非构建入口）
+│   └── visual_check.py            # ★ Windows 壳自动化目视（真消息驱动 + PrintWindow 像素断言，S15）
 ├── docs/
 │   ├── adjustment-json-keys.md    # ★ 调整参数 JSON 键名表（对齐上游 $LayerAdjustment）
+│   ├── camera-raw.md              # ★ Camera Raw 参数/曲线表与 JSON 契约
 │   ├── codec-migration.md         # ★ M5 编解码替换：探测证据、能力矩阵与接入步骤
+│   ├── filters.md                 # ★ 滤镜能力与参数契约
 │   ├── format-import-matrix.md    # ★ 格式导入策略矩阵：HEIC/WebP/SVG/PSB 判定链与失败不变式
-│   ├── manual-test.md             # ★ Windows 壳人工目视清单（M1–M16，与 visual_check.py 互补，S15）
-│   └── shell-parity.md            # ★ 两壳一致性：能力矩阵、冻结常量与共享回归护栏（M5）
+│   ├── gpu-layer-revision.md      # ★ GPU 后端逐层缓存/修订号设计
+│   ├── manual-test.md             # ★ Windows 壳人工目视清单（与 visual_check.py 互补，S15）
+│   ├── ps-parity.md / ps-parity-items.md # ★ 与 Photoshop 的对标口径与逐条清单
+│   ├── shell-parity.md            # ★ 两壳一致性：能力矩阵、冻结常量与共享回归护栏（M5）
+│   ├── THIRD-PARTY.md             # ★ 第三方组件清单与许可证
+│   └── tool-ops.md                # ★ 工具算子参数契约
+├── resources/                     # 运行期资源（Camera Raw 表、字体子集）
+├── packaging/                     # Windows 图标 / 资源脚本
+├── tools/                         # 交叉检查与真机测试辅助程序
 ├── engine/
 │   ├── engine.h / engine.cpp      # 引擎实例：分配器、后端、线程池、错误状态
 │   ├── core/                      # 平台无关基础层
@@ -536,4 +545,6 @@ typedef，故对契约零影响。
 
 上游 `robbietilton/Compositor` 为 MIT 许可；本仓沿用 MIT，并保留上游版权声明。
 `engine/imaging/` 下的像素内核移植自上游 C 源码，文件头保留原始注释。
+完整许可见 [LICENSE](LICENSE)；第三方组件与各自许可见
+[docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
 

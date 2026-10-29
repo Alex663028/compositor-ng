@@ -356,7 +356,7 @@ S4–S14 的每一份报告都记着同一条边界：「未经人手 Win32 目�
 `pen_up` / `eyedropper` 的 `*_cancel` 只清 active 标志，不受影响（已逐一核对）。
 
 **2. 自动化目视（`scripts/visual_check.py`，新增）。** 11 个场景、45 项像素/几何断言、
-32 张 PNG（`../report/assets/s15/`），走真 `PostMessage` 键鼠 + `PrintWindow` 抓客户区像素：
+32 张 PNG（`../report/assets/s15/`，本地生成、不随仓库发布），走真 `PostMessage` 键鼠 + `PrintWindow` 抓客户区像素：
 `start / brush / selection / wand / gradient / shape / type / filter / adjustment / layers / view`。
 几条值得记的口径：
 
