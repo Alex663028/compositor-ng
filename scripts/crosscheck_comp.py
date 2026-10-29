@@ -45,9 +45,14 @@ def log(message: str) -> None:
 
 def zig_env() -> dict:
     env = dict(os.environ)
-    env.setdefault("LOCALAPPDATA", "<local-workspace>/tmp/localappdata")
-    env.setdefault("HOME", "<local-workspace>/tmp/home")
-    env.setdefault("XDG_CACHE_HOME", "<local-workspace>/tmp/xdgcache")
+    # zig 需要一个可写的缓存目录；把 HOME / LOCALAPPDATA / XDG_CACHE_HOME 圈到
+    # build/ 下面，避免写进用户目录（沙箱/CI 里也不会互相污染）。
+    base = OUT / "env"
+    for name in ("localappdata", "home", "xdgcache"):
+        (base / name).mkdir(parents=True, exist_ok=True)
+    env.setdefault("LOCALAPPDATA", str(base / "localappdata"))
+    env.setdefault("HOME", str(base / "home"))
+    env.setdefault("XDG_CACHE_HOME", str(base / "xdgcache"))
     return env
 
 

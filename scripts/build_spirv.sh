@@ -28,7 +28,7 @@ OUT_DIR="$ROOT/engine/render/spirv"
 GLSL_SRC="$OUT_DIR/gpu_kernel.comp"
 SPV_OUT="$OUT_DIR/gpu_kernel.comp.spv"
 HEADER_OUT="$OUT_DIR/gpu_kernel_spv.h"
-PYTHON="${PYTHON:-<local-workspace>/tools/python/python.exe}"
+PYTHON="${PYTHON:-python3}"
 
 if [ ! -f "$GLSLANG" ]; then
   echo "[spirv] 未找到 glslang_validator: $GLSLANG" >&2

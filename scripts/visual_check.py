@@ -33,7 +33,7 @@ from ctypes import wintypes
 try:
     from PIL import Image
 except ImportError:  # pragma: no cover - 工具链 python 自带 Pillow
-    sys.exit("需要 Pillow：本仓约定使用 <local-workspace>\\\\tools\\python\\python.exe")
+    sys.exit("需要 Pillow：请用装了 Pillow 的 Python 运行（pip install pillow）")
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
