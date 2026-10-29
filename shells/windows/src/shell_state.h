@@ -204,15 +204,22 @@ constexpr UINT kCmdImageRotate180 = 1055; /* 画布 180° */
 constexpr UINT kCmdImageTrim = 1056;      /* 修边（模态面板，回车应用） */
 constexpr UINT kCmdImageInvert = 1057;    /* 图层反相（Ctrl+I） */
 /*
- * ROI #8 图像 > 调整（1590 段，空号段）：PS 的 Image > Adjustments 是**破坏性**
+ * ROI #8 图像 > 调整（1750 段）：PS 的 Image > Adjustments 是**破坏性**
  * 一次性落墨——与「调整」面板里的可编辑调整层是两个对象，引擎侧对应
  * comp_layer_apply_adjustment（ABI 尾部第 164 项）。
  *
  * 命令 id = kCmdImageAdjustBase + kind，只给「逐像素可破坏」的 kind 发号
  * （见 kImageAdjustKinds）；无参数的 Desaturate 点菜单即落墨，其余进破坏性
  * 面板态：调参 → Ctrl+Shift+U 应用 → Esc 退出。
+ *
+ * 号段史（踩过的坑，别再犯）：本段原驻 1590，与 L20 的图层对齐/分布常量
+ * （kCmdLayerAlignBase = 1595、kCmdLayerDistributeH = 1601、
+ * kCmdLayerDistributeV = 1602）撞号——switch 精确匹配先命中，Color Balance /
+ * Brightness-Contrast / Black-White 三项永久失效。1750 位于全部已占段
+ * （最高至 1746）之外，且 1750..1813 的 64 宽宽容间内没有任何其他命令。
+ * **加新段前必须先 grep 全表**，不要假设某段为空。
  */
-constexpr UINT kCmdImageAdjustBase = 1590;
+constexpr UINT kCmdImageAdjustBase = 1750;
 constexpr uint32_t kImageAdjustKinds[] = {
     COMP_ADJUSTMENT_HUE_SATURATION, COMP_ADJUSTMENT_LEVELS,  COMP_ADJUSTMENT_CURVES,
     COMP_ADJUSTMENT_EXPOSURE,       COMP_ADJUSTMENT_GRADIENT_MAP,
@@ -282,12 +289,12 @@ constexpr UINT kCmdViewClearGuides = 1584; /* 视图 > 清除参考线 */
 constexpr UINT kCmdSelectChannels = 1585;    /* 选择 > 通道面板… */
 constexpr UINT kCmdSelectSaveChannel = 1586; /* 选择 > 存储选区到通道… */
 /*
- * P1-2 命令号（1660 段）：图层锁与颜色标签。**不能落在 1590..1653**——
+ * P1-2 命令号（1660 段）：图层锁与颜色标签。**不能落在 1750..1813**——
  * 那是 kCmdImageAdjustBase + kind 的号段（kind 是 COMP_ADJUSTMENT_* 枚举值，
- * 已用到 24，即 1590..1614），早先按「1600 空段」发号时 1610..1614 正好压住
+ * 已用到 24，即 1750..1774），早先按「1600 空段」发号时 1610..1614 正好压住
  * Color Lookup / Shadows-Highlights / 自动色调 / 自动对比度 / 自动颜色五项，
  * 菜单点下去变成给图层上锁（视觉探针 Auto Tone 一条当场报红）。1660 起
- * 在 64 宽宽容区间（1590..1653）之外，也不会被它的无条件 break 吞掉。
+ * 在 64 宽宽容区间（1750..1813）之外，也不会被它的无条件 break 吞掉。
  *
  * 锁定用 5 个独立 id 而不是 kCmdLayerLockBase + 位号：菜单是 radio 组，
  * 「无」不是位组合能表达的槽位，混在一个基址里会让 0 号位与「透明」撞车。
@@ -376,7 +383,7 @@ constexpr UINT kCmdLayerFillStatus = 1719;    /* 状态栏报填充层种类/参
  * ⑦ 只把「叠加一条 / 整栈清除」接到 UI；单条参数编辑与单条开关当时只有引擎导出。
  * 这一段把 comp_layer_smart_filter_at / _set / _remove 接上：面板逐条列出滤镜栈，
  * 空格开关、回车改参数（滤镜面板进入「编辑该条」模式，回车走 _set）、Del 删除。
- * 命令号取自 1719 之后的空段，避开 1590..1653 的调整段与 1660..1719 的已用段。
+ * 命令号取自 1719 之后的空段，避开 1750..1813 的调整段与 1660..1719 的已用段。
  */
 constexpr UINT kCmdLayerSmartPanel = 1720;        /* 图层 > 智能对象 > 智能滤镜面板… */
 constexpr UINT kCmdLayerSmartPanelToggle = 1721;  /* 开/关当前条（不改参数） */

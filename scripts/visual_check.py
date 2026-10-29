@@ -126,11 +126,12 @@ CMD_ADJ_VALUE_UP = 1021
 # Sharpen、1211..1214 是 High Pass / Minimum / Maximum / Offset、1215 是 Custom 的
 # 菜单项，旧的应用号会和菜单项抢同一个 id（见 shell_state.h）。面板动作号 1220..1222。
 CMD_FILTER_APPLY = 1220
-# 图像 > 调整：kCmdImageAdjustBase(1590) + kind。kind 12..24 是本仓追加的破坏性调整
+# 图像 > 调整：kCmdImageAdjustBase(1750) + kind。kind 12..24 是本仓追加的破坏性调整
 # （亮度对比、去色、阈值、色调分离、自然饱和度、可选颜色、照片滤镜、通道混合器、
 # 颜色查找、阴影高光、自动三档），0..11 里只有逐像素可做的那几项才发号
 # （见 shells/windows/src/shell_state.h::kImageAdjustKinds）。
-CMD_IMAGE_ADJUST_BASE = 1590
+# 号段迁移史：原 1590 与 kCmdLayerAlignBase(1595) / kCmdLayerDistributeH(1601) / kCmdLayerDistributeV(1602) 撞号，B&W / Color Balance / Brightness-Contrast 指令被 switch 精确分发吃掉。现已迁至 1750（同步更改 shells/windows/src/shell_state.h）。
+CMD_IMAGE_ADJUST_BASE = 1750
 # 图层 > 效果：kCmdEffectBase(1510) + kind。kind 9 = Pattern Overlay（P1-1 第二段）。
 CMD_EFFECT_BASE = 1510
 CMD_NEW_DOCUMENT_DIALOG = 1560
@@ -150,7 +151,14 @@ TOOL = {
     "quickselect": 20, "magiceraser": 21, "bgeraser": 22,
 }
 
-# ui_core.h 的布局常量（客户区坐标）
+# ui_core.h 的布局常量（客户区坐标）。
+#
+# 这些值与 shells/windows/src/ui_core.h::Layout 的具名常量逐条对应。改壳里
+# 的布局常量时**必须同步改这里**——不过更稳妥的做法是永远不要依赖下面这
+# 份复算：layout 属性优先问壳（kMsgLayoutQuery），复算只在壳不可问时兜底。
+# 2026-10-28 实测核对：默认布局与窄窗各档降级（600x360 下限 / 矮窗收选项栏）
+# 复算与壳返值逐像素一致；复算与壳唯一的分叉是 **prefs 维度**（面板拖宽 /
+# 收起 / 分组 / 浮窗），那些状态只有真实布局近得。
 TOOLBAR_H = 46
 STATUS_H = 26
 LAYER_W = 248
@@ -502,6 +510,8 @@ class Shell:
         # 复算是第二份真源，壳里改了布局公式就会失真——所以退回复算这件事
         # 必须**看得见**（否则断言会静默地量错地方，还报"通过"）。
         self.layout_source = "unknown"
+        # 场景是否取过 layout：没取过的场景不需要报布局来源 WARN。
+        self.layout_used = False
         os.makedirs(out_dir, exist_ok=True)
 
     # -- 生命周期 --------------------------------------------------
@@ -639,6 +649,25 @@ class Shell:
     def wait(self, seconds=0.15):
         time.sleep(seconds)
 
+    def pump_barrier(self):
+        """排空屏障：等壳把已投递的异步消息全部处理完。
+
+        为什么需要它：`press` / `click` / `drag` 走 PostMessageW（**异步**），
+        投出去就返回，壳可能还没处理。紧接着 `shot()` 时若壳还没处理完
+        Ctrl+Z，拍到的就是**撤销前**的画面——「点击穿透到画布」这类断言
+        因此把上一步的笔迹算成本步的差异，误报成真 bug。单跑时机器不忙、
+        处理得快，几乎必定撞不上；连跑（48 场景、上一个进程刚退）时偶发，
+        症状是**失败项每轮不同、单独跑该场景必过**。
+
+        手段：`SendMessageW(hwnd, WM_NULL)` 是**同步**调用——直接调进壳的
+        窗口过程，等它返回才回来。它不是「队列尾排队」，而是插队执行，
+        但这就足够：它返回时壳给自己投递的 InvalidateRect 已经在本次
+        处理中发生，后续的重绘会同步完成（WM_PAINT 由 PrintWindow 触发）。
+        连发两条是为了给壳多一轮消息循环空转（定时器/绘制的挂起动作）。
+        """
+        user32.SendMessageW(self.hwnd, 0x0000, 0, 0)  # WM_NULL
+        user32.SendMessageW(self.hwnd, 0x0000, 0, 0)
+
     def _read_client(self):
         rect = RECT()
         user32.GetClientRect(self.hwnd, ctypes.byref(rect))
@@ -716,10 +745,21 @@ class Shell:
 
     @property
     def layout(self):
-        """当前布局（客户区坐标）。优先问壳，问不到才用 Python 复算。"""
+        """当前布局（客户区坐标）。优先问壳，问不到才用 Python 复算。
+
+        **复算的边界（2026-10-28 实测）**：默认布局与窄窗各档降级
+        （600x360 下限 / 矮窗收选项栏）与壳逐像素一致；但复算不含
+        **prefs 维度**——面板拖宽 / 收起 / 分组 / 浮窗 / 多文档标签栏。
+        场景中途改了这些状态后再取 layout，复算会给出**旧默认值**
+        （例：图层栏收起后复算仍给 248 而壳给 24）。
+        所以：改面板状态的场景必须保证问壳成功（layout_source == "shell"），
+        否则断言会量错地方。
+        """
         queried = self.query_layout()
         if queried is not None:
+            self.layout_used = True
             return queried
+        self.layout_used = True
         w, h = self.client_w, self.client_h
         toolbar_h = min(h, TOOLBAR_H)
         status_h = min(h - toolbar_h, STATUS_H)
@@ -733,10 +773,17 @@ class Shell:
         return {
             "toolbar": (0, 0, w, toolbar_h),
             "options": (0, toolbar_h, w, toolbar_h + options_h),
+            # 复算不含 prefs 维度：标签栏（多文档）与分组标签栏一律给空矩形，
+            # 与壳返值的键集合保持一致——用到的场景拿到空矩形会报 FAIL，
+            # 而不是 KeyError 崩溃。
+            "tabbar": (0, body_top, w, body_top),
             "layer": (0, body_top, layer_w, body_top + body_h),
             "adjust": (w - adjust_w, body_top, w, body_top + body_h),
             "canvas": (layer_w, body_top, w - adjust_w, body_top + body_h),
             "status": (0, body_top + body_h, w, body_top + body_h + status_h),
+            "group_bar": (0, 0, 0, 0),
+            "group_count": 0,
+            "group_active": 0,
         }
 
     def option_group_rect(self, index):
@@ -1166,7 +1213,27 @@ class Shell:
         判据用**逐字节相同**：画面稳定时两帧完全一致；还在变就继续等。
         上限 tries 次，避免遇到真·持续变化的画面时死等。
         """
-        image = self.capture()
+        # 截图前先排空壳向未处理的异步消息（见 pump_barrier）：否则两帧
+        # 「看起来稳定」可能是壳还没开始处理本步的按键，拍的是上一步的画
+        # 面，「画面稳定」判据对此无能为力（它只能等「不再变」，等不到
+        # 「还没开始变」）。
+        self.pump_barrier()
+        # 空帧保护：初帧也可能是 0×0（窗口刚销毁 / PrintWindow 失败 /
+        # SW_RESTORE 过渡期内客户区还没画出来）。以前初帧直接用，PIL 到
+        # L1183 image.save 才抛 `ValueError: cannot write empty image`，
+        # 报的错跟场景毫无关系——根因其实是这里。现在初帧也纳入重试，
+        # 与重试循环同一个判据，超时报明确的错误。
+        image = None
+        for _ in range(self.SHOT_STABLE_TRIES + 1):
+            current = self.capture()
+            if current.width > 0 and current.height > 0:
+                image = current
+                break
+            self.wait(self.SHOT_STABLE_DELAY)
+        if image is None:
+            raise RuntimeError(
+                "截图失败：连续 %d 次拿到空帧（窗口可能已销毁或尚未完成首帧绘制）: %s"
+                % (self.SHOT_STABLE_TRIES + 1, name))
         previous = image.tobytes()
         for _ in range(self.SHOT_STABLE_TRIES):
             self.wait(self.SHOT_STABLE_DELAY)
@@ -3501,7 +3568,7 @@ def scene_guides(shell, checker):
 
 
 def scene_destructive_adjust(shell, checker):
-    """ROI #8：图像 > 调整 的破坏性落墨（命令号 1590 + kind）。
+    """ROI #8：图像 > 调整 的破坏性落墨（命令号 1750 + kind）。
 
     与 `adjustment` / `curve_levels` 的分工：那两场验的是**调整图层**（非破坏、可再
     编辑）；这里验的是同一批求值器的一次性落墨入口。断言覆盖：面板能开（标题换字样，
@@ -3526,7 +3593,7 @@ def scene_destructive_adjust(shell, checker):
     title_band = (adjust[0] + 6, adjust[1] + 6, adjust[2] - 6, adjust[1] + 26)
     idle_title = img
 
-    # 1) 1590+12 = Brightness/Contrast：进破坏性面板，参数行与调整面板共用。
+    # 1) 1750+12 = Brightness/Contrast：进破坏性面板，参数行与调整面板共用。
     shell.command(CMD_IMAGE_ADJUST_BASE + 12)
     img = shell.shot("101_bc_panel")
     checker.check(scene, "图像 > 调整 > Brightness/Contrast 打开破坏性面板",
@@ -3550,7 +3617,7 @@ def scene_destructive_adjust(shell, checker):
                   abs(brightness(undo) - brightness(before)) < 8,
                   "撤销后 %s 原 %s" % (undo, before))
 
-    # 2) 1590+13 = Desaturate：无参数，单击即落墨（不该停在面板态）。
+    # 2) 1750+13 = Desaturate：无参数，单击即落墨（不该停在面板态）。
     shell.command(CMD_IMAGE_ADJUST_BASE + 13)
     shell.wait(0.8)
     img = shell.shot("104_desaturate")
@@ -3559,7 +3626,7 @@ def scene_destructive_adjust(shell, checker):
                   max(gray) - min(gray) <= 3 and (max(before) - min(before)) > 40,
                   "前 %s 后 %s" % (before, gray))
 
-    # 3) 1590+14 = Threshold：默认 128，中灰（≈92）落到黑。
+    # 3) 1750+14 = Threshold：默认 128，中灰（≈92）落到黑。
     shell.command(CMD_IMAGE_ADJUST_BASE + 14)
     shell.type_text("128")
     shell.press(VK_RETURN)
@@ -3581,7 +3648,7 @@ def scene_destructive_adjust(shell, checker):
                   abs(brightness(restored) - brightness(gray)) < 8,
                   "撤销后 %s 阈值前 %s" % (restored, gray))
 
-    # 4) 1590+15 = Posterize：中灰 3 级量化到中间档（≈128），仍是平的。
+    # 4) 1750+15 = Posterize：中灰 3 级量化到中间档（≈128），仍是平的。
     shell.command(CMD_IMAGE_ADJUST_BASE + 15)
     shell.type_text("3")
     shell.press(VK_RETURN)
@@ -3593,7 +3660,7 @@ def scene_destructive_adjust(shell, checker):
                   region_std(img, region) < 1.5 and abs(brightness(poster) - brightness(gray)) > 15,
                   "灰 %s -> %s σ %.1f" % (gray, poster, region_std(img, region)))
 
-    # 5) 1590+2 = Curves：点列没有可写的调整对象，走壳的寄存串；拖中点抬亮后落墨。
+    # 5) 1750+2 = Curves：点列没有可写的调整对象，走壳的寄存串；拖中点抬亮后落墨。
     shell.command(CMD_IMAGE_ADJUST_BASE + 2)
     px, py, side = adjust_curve_plot(shell)
     # 恒等曲线上没有控制点：按在绘图区中间 = 加点，同一次拖动把它抬到 y≈0.8。
@@ -3615,7 +3682,7 @@ def scene_destructive_adjust(shell, checker):
                   pixel_diff(idle_title, img, title_band) == 0,
                   "标题带差异像素 %d" % pixel_diff(idle_title, img, title_band))
 
-    # 7) 1590+18 = Photo Filter：5 行参数，Tab 到 density（第 4 行）后 100% 加温。
+    # 7) 1750+18 = Photo Filter：5 行参数，Tab 到 density（第 4 行）后 100% 加温。
     #    这条同时验证「追加 kind 的参数表能经 ABI 送到外壳」——面板行数由
     #    comp_layer_adjustment_param_count 决定，外壳没有第二张表。
     shell.command(CMD_IMAGE_ADJUST_BASE + 18)
@@ -3635,7 +3702,7 @@ def scene_destructive_adjust(shell, checker):
                   warm[0] - warm[2] > 30,
                   "落墨后 %s" % (warm,))
 
-    # 8) 1590+22 = Auto Tone：无参数，必须**不进面板态**（标题带保持 Adjustment）。
+    # 8) 1750+22 = Auto Tone：无参数，必须**不进面板态**（标题带保持 Adjustment）。
     #    若零参数 kind 误走面板路径，这里会看到标题换字样。
     shell.command(CMD_IMAGE_ADJUST_BASE + 22)
     shell.wait(0.6)
@@ -4175,7 +4242,10 @@ def scene_panel_group(shell, checker):
     # （layer / adjust 里非空的那个）在它下面。用真实布局时不能再拿
     # adjust 矩形当整列——那会把内容区当成标签栏。
     layout = shell.layout
-    bar = layout["group_bar"]
+    # group_bar 只有真实布局才近得（复算不含 prefs 维度，见 layout 属性注释）。
+    # 退回复算时这里拿到空矩形，断言会报 FAIL 而不是 KeyError 崩溃——
+    # 与 panel_drag_dock 同一口径（见本文件 panel_drag_dock 场景）。
+    bar = layout.get("group_bar", (0, 0, 0, 0))
     # 组列的内容矩形：激活的是调整 -> adjust 非空；激活的是图层 -> layer 非空。
     content = layout["adjust"] if layout["adjust"][2] > layout["adjust"][0] else layout["layer"]
     checker.check(scene, "合并后左栏让位（两块住进同一列，画布变宽）",
@@ -4744,7 +4814,10 @@ def main():
                                            "" if not detail else "  —— " + detail))
             # 布局来源必须**看得见**：退回复算 = 探针在用第二份真源，
             # 壳里改了布局公式时断言会量错地方却报「通过」。
-            if shell.layout_source != "shell":
+            # 只有**真用过 layout** 的场景才报：没取过 layout 的场景
+            # layout_source 停在初值 "unknown"，报出来全是噪声（2026-10-28
+            # float_clamp 单跑证实该 WARN 与本场景无关）。
+            if shell.layout_used and shell.layout_source != "shell":
                 print("  [WARN] 布局来源 = %s（问壳要真实布局失败，已退回 Python 复算）"
                       % shell.layout_source)
             lines.append("%s: %d 项检查，%d 失败" % (

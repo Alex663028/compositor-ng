@@ -2773,9 +2773,9 @@ void run_shell_command(HWND window, ShellState& shell, UINT id) {
       }
       /*
        * 颜色标签菜单项（P1-2）：kCmdLayerColorBase + label 0..7，0 = 无。
-       * 号段在 1665..1672，已在图像调整的 64 宽宽容区间（1590..1653）之外；
-       * 仍排在调整之前只是防御性顺序，别把锁/标签挪回 1610 段——那里是
-       * COMP_ADJUSTMENT_* 枚举值 20..24 的号，会与自动三档等菜单项互相顶飞。
+       * 号段在 1665..1672，已在图像调整的 64 宽容约区间（1750..1813）之外；
+       * 仍排在调整之前只是防御性顺序。号段史：调整段原驻 1590，
+       * 与 kCmdLayerAlignBase(1595)/kCmdLayerDistributeH(1601)/kCmdLayerDistributeV(1602) 撞号，B&W / Color Balance / Brightness-Contrast 三项指令被本 switch 精确分发吃掉。
        */
       if (id >= kCmdLayerColorBase && id < kCmdLayerColorBase + COMP_LAYER_COLOR_COUNT) {
         panel_set_color_label(shell, static_cast<uint32_t>(id - kCmdLayerColorBase));
